@@ -3726,6 +3726,7 @@ mod wasm_tests {
                window.__TAURI__ = window.__TAURI__ || {}; \
                window.__TAURI__.core = window.__TAURI__.core || {}; \
                window.__TAURI__.core.invoke = function(cmd, args){ \
+                 console.debug('Review fixture invoke', cmd, Boolean(args && args.line)); \
                  try { \
                    if (cmd === 'send_host_line' && args) { \
                      var line = (args.line !== undefined) ? args.line \
@@ -4081,6 +4082,10 @@ mod wasm_tests {
         run_btn.click();
         next_tick().await;
 
+        wasm_bindgen_test::console_log!(
+            "Review launch button disabled={}",
+            run_btn.has_attribute("disabled")
+        );
         let sent = sent_lines_joined();
         assert!(
             sent.contains("start_ai_review"),

@@ -1376,7 +1376,8 @@ pub fn ChatInput(
         let measure_ref = textarea_measure_ref;
         leptos::prelude::request_animation_frame(move || {
             pending.set(false);
-            let Some(measure) = measure_ref.get() else {
+            // Switching projects can dispose the composer before this frame runs.
+            let Some(measure) = measure_ref.try_get_untracked().flatten() else {
                 return;
             };
             let measure: web_sys::HtmlElement = (*measure).clone().unchecked_into();

@@ -45,7 +45,11 @@ pub async fn send_binary_frame<T: serde::Serialize>(
     payload: &T,
     binary: &[u8],
 ) -> Result<(), String> {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_bindgen_test::console_log!("Send gate requested kind={}", kind);
     let _send_lock = acquire_send_lock(host_id, &stream).await;
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_bindgen_test::console_log!("Send gate acquired kind={}", kind);
     let reservation = reserve_seq(host_id, &stream);
     let envelope = Envelope::from_payload(stream.clone(), kind, reservation.seq, payload)
         .map_err(|error| error.to_string())?;
@@ -291,7 +295,11 @@ pub async fn send_frame_unreported<T: Serialize>(
     {
         crate::notices::clear_request(scope, kind);
     }
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_bindgen_test::console_log!("Send gate requested kind={}", kind);
     let _send_lock = acquire_send_lock(host_id, &stream).await;
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_bindgen_test::console_log!("Send gate acquired kind={}", kind);
     let reservation = reserve_seq(host_id, &stream);
     let seq = reservation.seq;
     log::info!(

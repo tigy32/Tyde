@@ -5,7 +5,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::{
-    create_workbench, delete_project, remove_workbench, rename_project, reorder_projects,
+    begin_new_chat_default, create_workbench, delete_project, remove_workbench, rename_project,
+    reorder_projects,
 };
 use crate::components::host_browser::open_project_browser;
 use crate::state::{ActiveProjectRef, AppState, TabContent, WorkbenchRemovePrompt};
@@ -686,6 +687,18 @@ fn RailContextMenuView(
         })
     };
 
+    let state_for_new_agent = state.clone();
+    let host_id_for_new_agent = menu.host_id.clone();
+    let project_id_for_new_agent = menu.project_id.clone();
+    let on_new_agent = move |_| {
+        context_menu.set(None);
+        state_for_new_agent.switch_active_project(Some(ActiveProjectRef {
+            host_id: host_id_for_new_agent.clone(),
+            project_id: project_id_for_new_agent.clone(),
+        }));
+        begin_new_chat_default(&state_for_new_agent);
+    };
+
     let host_id_for_rename = menu.host_id.clone();
     let project_id_for_rename = menu.project_id.clone();
     let on_rename = move |_| {
@@ -799,6 +812,7 @@ fn RailContextMenuView(
                 style=format!("left: {}px; top: {}px;", menu.x, menu.y)
                 on:click=stop_in_menu
             >
+                <button class="context-menu-item" on:click=on_new_agent>"New Agent"</button>
                 <button class="context-menu-item" on:click=on_rename>"Rename"</button>
                 {move || (!is_workbench()).then(|| view! {
                     <button class="context-menu-item" on:click=on_new_workbench.clone()>
@@ -1862,13 +1876,17 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn selecting_project_via_rail_click_sends_project_accessed() {
+    async fn project_rail_selection_and_new_agent_flow() {
         install_send_stub();
         let container = make_container();
+        let state = make_state_with_fixture();
+        let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = make_state_with_fixture();
-            provide_context(state);
-            view! { <ProjectRail /> }
+            provide_context(state_for_mount);
+            view! {
+                <ProjectRail />
+                <crate::components::center_zone::CenterZone />
+            }
         });
         next_tick().await;
 
@@ -1887,6 +1905,83 @@ mod wasm_tests {
             "clicking the first project row should send project_accessed on \
              /project/p-tyde, got {streams:?}"
         );
+
+        for (name, project_id, expected_draft) in [
+            ("OrphanProj", "p-orphan", ""),
+            ("feature-login", "wb-feat", ""),
+            ("feature-login", "wb-feat", "Keep this existing draft"),
+        ] {
+            let buttons = container
+                .query_selector_all(".rail-project-row button")
+                .unwrap();
+            let target = (0..buttons.length())
+                .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+                .find(|button| button.get_attribute("title").as_deref() == Some(name))
+                .expect("target project button");
+            target
+                .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
+                .unwrap();
+            next_tick().await;
+            let items = container
+                .query_selector_all(".context-menu button")
+                .unwrap();
+            let new_agent = (0..items.length())
+                .filter_map(|i| items.item(i)?.dyn_into::<HtmlElement>().ok())
+                .find(|button| button.text_content().as_deref().map(str::trim) == Some("New Agent"))
+                .expect("project menu must offer New Agent");
+            new_agent.click();
+            next_tick().await;
+            assert!(
+                container
+                    .query_selector(".rail-context-menu")
+                    .unwrap()
+                    .is_none(),
+                "launching closes the menu"
+            );
+            assert_eq!(
+                state.active_project.get_untracked(),
+                Some(ActiveProjectRef {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId(project_id.to_owned()),
+                }),
+                "launch targets the clicked project, not the previous selection"
+            );
+            let composer = container
+                .query_selector(".chat-textarea")
+                .unwrap()
+                .expect("new agent opens a composer")
+                .dyn_into::<web_sys::HtmlTextAreaElement>()
+                .unwrap();
+            // New Chat reuses an unsent draft; repeating the shortcut must not erase it.
+            assert_eq!(composer.value(), expected_draft);
+            assert!(container.text_content().unwrap().contains("New Chat"));
+            composer.set_value("Keep this existing draft");
+            composer
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+            next_tick().await;
+        }
+        let tabs = container
+            .query_selector_all(".tab-strip-scroll button.tab")
+            .unwrap();
+        assert_eq!(
+            tabs.length(),
+            1,
+            "repeated launches reuse the unsent draft instead of duplicating it"
+        );
+        tabs.item(0)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let composer = container
+            .query_selector(".chat-textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        assert_eq!(composer.value(), "Keep this existing draft");
     }
 
     #[wasm_bindgen_test]

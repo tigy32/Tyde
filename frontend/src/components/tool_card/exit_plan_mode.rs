@@ -687,6 +687,11 @@ mod wasm_tests {
                 window.__TAURI__.core.invoke = function(cmd, args) {
                     window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
                     if (cmd === "send_host_line") {
+                        console.debug("Deferred plan-card fixture send", JSON.stringify({
+                            kind: JSON.parse(args.line).kind,
+                            foreignStream: JSON.parse(args.line).stream !== "/agent/agent-1/inst",
+                            resolverAlreadyPresent: window.__test_send_resolve !== null
+                        }));
                         return new Promise(function(resolve) {
                             window.__test_send_resolve = resolve;
                         });
