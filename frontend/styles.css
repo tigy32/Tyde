@@ -13369,6 +13369,35 @@ pre.tool-error-pre {
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.review-comments-toolbar .review-btn,
+.review-comments-root-header .review-btn {
+    padding: 3px var(--space-2);
+    font-size: 0.8rem;
+    font-weight: 500;
+}
+
+.review-comments-root-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-width: 0;
+    margin-bottom: var(--space-2);
+}
+
+.review-comments-root-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
 }
 
 .review-actions,
@@ -13382,7 +13411,9 @@ pre.tool-error-pre {
 .review-history > summary {
     padding: var(--space-2) var(--space-3);
     cursor: pointer;
-    font-weight: 550;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-secondary);
 }
 
 .review-actions .review-sidebar {
@@ -13397,7 +13428,10 @@ pre.tool-error-pre {
 
 .review-comments-title {
     font-weight: 600;
-    font-size: 0.95rem;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
 }
 
 .review-comments-empty {
