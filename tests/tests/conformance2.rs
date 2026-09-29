@@ -2701,11 +2701,15 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     assert_cancellation_contract(&mid_tool);
     assert_foreground_command_stayed_foreground(mid_tool.turn());
     assert_open_tool_was_cancelled(&mid_tool);
+    // Sent the moment the stop is reported, as a user does when they stop a
+    // command to say something else. Hermes reported the stop while its turn
+    // was still unwinding, so this message was folded into the dying turn:
+    // it was answered with an error and never reached the model.
+    let after_tool = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&after_tool);
     let killed = drain_events_for(host, KILL_SETTLE).await;
     assert_no_error_message(&format!("{:?} kill settle", host.backend()), &killed);
     assert_cancelled_command_really_stopped(&mid_tool, &proof);
-    let after_tool = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
-    assert_ready_handshake(&after_tool);
 
     let follow_up_payload = unique_payload();
     let follow_up_tool = ask(host, &agent, write_prompt(&workspace, &follow_up_payload)).await;

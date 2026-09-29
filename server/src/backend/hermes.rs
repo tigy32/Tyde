@@ -427,21 +427,30 @@ def _tyde_interrupt(rid, params):
     session = _tyde_gateway_server._sessions.get(sid)
     worker = session.get("_run_thread") if session is not None else None
     response = _tyde_original_interrupt(rid, params)
-    if pending_clarify and "error" not in response:
+    if "error" in response:
+        return response
+    if pending_clarify:
         print(
             f"TYDE HERMES CLARIFY INTERRUPT worker_present={worker is not None}",
             file=sys.stderr, flush=True,
         )
         if worker is None:
             return _tyde_gateway_server._err(rid, 5000, "Hermes clarify interrupt has no turn worker")
-        # Native interrupt only requests cancellation; the worker still owns history.
-        worker.join(timeout=60)
-        if worker.is_alive():
-            return _tyde_gateway_server._err(rid, 5000, "Hermes clarify interrupt did not settle within 60 seconds")
+    if worker is None:
+        return response
+    # Native interrupt only requests cancellation; the worker still owns the
+    # turn, and a prompt submitted before it exits is folded into that dying
+    # turn instead of starting a new one.
+    worker.join(timeout=60)
+    if worker.is_alive():
+        return _tyde_gateway_server._err(rid, 5000, "Hermes interrupt did not settle within 60 seconds")
+    if pending_clarify:
         print("TYDE HERMES CLARIFY INTERRUPT settled", file=sys.stderr, flush=True)
     return response
 
 _tyde_gateway_server._methods["session.interrupt"] = _tyde_interrupt
+# Waiting for the worker must not stall the RPC reader.
+_tyde_gateway_server._LONG_HANDLERS = _tyde_gateway_server._LONG_HANDLERS | {"session.interrupt"}
 
 _tyde_original_session_row_summary = _tyde_gateway_server._session_row_summary
 
