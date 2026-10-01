@@ -10,9 +10,9 @@ use axum::{
 };
 use futures_util::StreamExt;
 use protocol::{
-    MOBILE_RTC_PROTOCOL_VERSION, MobilePairingId, MobilePeerRole, MobileRtcCredentials,
-    MobileRtcCredentialsRequest, MobileRtcDescription, MobileSdpKind, MobileSignalCommand,
-    MobileSignalEvent, MobileSignalingUrl,
+    CustomAgent, CustomAgentId, MOBILE_RTC_PROTOCOL_VERSION, MobileDeviceId, MobilePairingId,
+    MobilePeerRole, MobileRtcCredentials, MobileRtcCredentialsRequest, MobileRtcDescription,
+    MobileSdpKind, MobileSignalCommand, MobileSignalEvent, MobileSignalingUrl, ToolPolicy,
 };
 use rtc_transport::{Peer, authenticate_description, verify_description};
 use tokio::sync::Mutex;
@@ -29,10 +29,32 @@ struct Fixture {
     answers: Mutex<HashMap<String, MobileRtcDescription>>,
     host: server::HostHandle,
     store: tempfile::TempDir,
+    dev_host_addr: Option<std::net::SocketAddr>,
 }
 
 pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router {
+    let dev_host_addr = std::env::var_os("TYDE_RTC_TEST_DEV_HOST_ADDR").map(|value| {
+        let address: std::net::SocketAddr = value
+            .to_str()
+            .expect("dev host address must be UTF-8")
+            .parse()
+            .expect("typed dev-instance host address");
+        assert!(address.ip().is_loopback(), "dev host must be loopback");
+        address
+    });
     let store = tempfile::tempdir().expect("reconnect host store");
+    server::store::custom_agents::CustomAgentStore::load(store.path().join("custom_agents.json"))
+        .expect("reconnect custom agents")
+        .upsert(CustomAgent {
+            id: CustomAgentId("rtc-bootstrap".to_owned()),
+            name: "RTC bootstrap agent".to_owned(),
+            description: "Initial state spans multiple acknowledgement windows".to_owned(),
+            instructions: Some("Follow the project instructions.\n".repeat(4096)),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        })
+        .expect("seed reconnect initial state");
     let host = server::spawn_host_with_mock_backend(
         store.path().join("sessions.json"),
         store.path().join("projects.json"),
@@ -54,6 +76,7 @@ pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router 
             answers: Mutex::new(HashMap::new()),
             host,
             store,
+            dev_host_addr,
         }))
 }
 
@@ -176,12 +199,22 @@ async fn signal(
                 );
                 let flow = async {
                     let stream = peer.into_stream().await.map_err(std::io::Error::other)?;
+                    if let Some(address) = fixture.dev_host_addr {
+                        let mut stream = stream;
+                        let mut host = tokio::net::TcpStream::connect(address).await?;
+                        tokio::io::copy_bidirectional(&mut stream, &mut host).await?;
+                        return Ok(());
+                    }
                     let connection = server::accept(&server::ServerConfig::current(), stream)
                         .await
                         .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
-                    server::run_connection(connection, fixture.host.clone())
-                        .await
-                        .map_err(std::io::Error::other)
+                    server::run_mobile_connection(
+                        connection,
+                        fixture.host.clone(),
+                        MobileDeviceId("rtc-reconnect".to_owned()),
+                    )
+                    .await
+                    .map_err(std::io::Error::other)
                 };
                 if let Err(error) = flow.await {
                     eprintln!("reconnect fixture: host connection ended: {error}");

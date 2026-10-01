@@ -485,7 +485,14 @@ where
                 })?;
                 message_id = message_id.wrapping_add(1).max(1);
                 let first = records.remove(0);
+                let write_started = std::time::Instant::now();
+                if queued.frame.envelope.kind == FrameKind::HostBootstrap {
+                    tracing::info!(target: "tyde::connection_bootstrap", bytes = first.bytes.len(), records = records.len() + 1, "host bootstrap transport write started");
+                }
                 writer.write_all(&first.bytes).await?;
+                if queued.frame.envelope.kind == FrameKind::HostBootstrap {
+                    tracing::info!(target: "tyde::connection_bootstrap", bytes = first.bytes.len(), elapsed_ms = write_started.elapsed().as_millis(), "host bootstrap transport write completed");
+                }
                 output.record_written();
                 if records.is_empty() {
                     output.complete(&queued);
@@ -503,6 +510,9 @@ where
                 }
                 if interleaved || pending_records.is_empty() {
                     writer.flush().await?;
+                    if queued.frame.envelope.kind == FrameKind::HostBootstrap {
+                        tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = write_started.elapsed().as_millis(), "host bootstrap transport flush completed");
+                    }
                 }
             }
         }

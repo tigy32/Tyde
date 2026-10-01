@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/webrtc"]
+exclude = ["vendor/webrtc", "vendor/rtc-sctp"]
 members = [
     "protocol",
     "time",
@@ -35,6 +35,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [patch.crates-io]
+rtc-sctp = { path = "vendor/rtc-sctp" }
 webrtc = { path = "vendor/webrtc" }
 webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }
 

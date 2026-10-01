@@ -124,6 +124,7 @@ def native_voice_authorization_is_validated(source: str) -> bool:
 
 NATIVE_VOICE_AEC_VENDOR = "vendor/webrtc-audio-processing-sys"
 MOBILE_RTC_VENDOR = "vendor/webrtc"
+MOBILE_SCTP_VENDOR = "vendor/rtc-sctp"
 MOBILE_RTC_PATCH = 'webrtc = { path = "vendor/webrtc" }'
 NATIVE_VOICE_AEC_PATCH = (
     'webrtc-audio-processing-sys = { path = '
@@ -489,6 +490,8 @@ def expected_native_voice_patch_surface(root_manifest: str) -> bool:
     return saw_patch and patch in (
         {"crates-io": aec},
         {"crates-io": {**aec, "webrtc": {"path": MOBILE_RTC_VENDOR}}},
+        {"crates-io": {**aec, "webrtc": {"path": MOBILE_RTC_VENDOR},
+                       "rtc-sctp": {"path": MOBILE_SCTP_VENDOR}}},
     )
 
 
@@ -506,14 +509,22 @@ def native_voice_vendor_surface_violations(
         for path in vendor_files
         if pathlib.PurePosixPath(path).parts[:1] == ("vendor",)
     }
-    # Mobile now has an explicit WebRTC byte transport. The old global ban
-    # rejected that requested dependency; keep the voice DSP itself network-free.
-    if vendor_roots not in ({NATIVE_VOICE_AEC_VENDOR}, {NATIVE_VOICE_AEC_VENDOR, MOBILE_RTC_VENDOR}):
+    # SCTP is the existing mobile transport's fragmentation layer. Its pinned
+    # MTU patch fixes real relay bootstrap failures, not a new voice network stack.
+    if vendor_roots not in (
+        {NATIVE_VOICE_AEC_VENDOR},
+        {NATIVE_VOICE_AEC_VENDOR, MOBILE_RTC_VENDOR},
+        {NATIVE_VOICE_AEC_VENDOR, MOBILE_RTC_VENDOR, MOBILE_SCTP_VENDOR},
+    ):
         violations.append("vendor surface contains an unapproved dependency")
     if MOBILE_RTC_VENDOR in vendor_roots:
         rtc_manifest = vendor_files.get(f"{MOBILE_RTC_VENDOR}/Cargo.toml", "")
         if not re.search(r'(?m)^name = "webrtc"$', rtc_manifest) or not re.search(r'(?m)^version = "0.20.5"$', rtc_manifest):
             violations.append("mobile WebRTC vendor provenance is missing")
+    if MOBILE_SCTP_VENDOR in vendor_roots:
+        sctp_manifest = vendor_files.get(f"{MOBILE_SCTP_VENDOR}/Cargo.toml", "")
+        if not re.search(r'(?m)^name = "rtc-sctp"$', sctp_manifest) or not re.search(r'(?m)^version = "0.20.5"$', sctp_manifest):
+            violations.append("mobile SCTP vendor provenance is missing")
 
     manifest_path = f"{NATIVE_VOICE_AEC_VENDOR}/Cargo.toml"
     manifest = vendor_files.get(manifest_path)
@@ -598,7 +609,7 @@ def native_voice_vendor_surface_violations(
         re.IGNORECASE,
     )
     for path, source in vendor_files.items():
-        if path.startswith(f"{MOBILE_RTC_VENDOR}/"):
+        if path.startswith((f"{MOBILE_RTC_VENDOR}/", f"{MOBILE_SCTP_VENDOR}/")):
             continue
         if pathlib.PurePosixPath(path).name == "Cargo.toml":
             section = ""

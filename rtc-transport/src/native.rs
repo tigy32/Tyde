@@ -276,6 +276,7 @@ impl Peer {
                     .send(bytes)
                     .await
                     .map_err(|error| failure("send data", error))?;
+                tracing::debug!(target: "tyde::rtc_flow", bytes = outbound.bytes.len(), "WebRTC stream chunk sent");
             }
             Ok(())
         };
@@ -300,12 +301,14 @@ impl Peer {
                         }
                         match message.data.first() {
                             Some(0) if message.data.len() > 1 => {
+                                tracing::debug!(target: "tyde::rtc_flow", bytes = message.data.len() - 1, "WebRTC stream chunk received");
                                 if pending_data.len() == WINDOW_CHUNKS {
                                     return Err(failure("receive data", "peer exceeded the unacknowledged chunk window"));
                                 }
                                 pending_data.push_back(message.data[1..].to_vec());
                             }
                             Some(1) if message.data.len() == 1 => {
+                                tracing::debug!(target: "tyde::rtc_flow", "WebRTC stream chunk acknowledged");
                                 let ack = pending_rx.try_recv().map_err(|error| {
                                     failure("unexpected acknowledgement", error)
                                 })?;

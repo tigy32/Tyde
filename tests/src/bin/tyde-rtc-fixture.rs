@@ -62,8 +62,12 @@ async fn answer(
     Ok(signed)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter("off,tyde::connection_bootstrap=info,tyde::rtc_flow=debug")
+        .with_ansi(false)
+        .init();
     let ready_path = std::env::args()
         .nth(1)
         .ok_or("expected readiness file argument")?;

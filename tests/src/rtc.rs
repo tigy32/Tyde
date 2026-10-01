@@ -148,11 +148,18 @@ impl RelayFixture {
 struct RelayOutage {
     active: AtomicBool,
     dropped: AtomicUsize,
+    oversized: AtomicUsize,
 }
 
 impl RelayOutage {
-    fn drop_packet(&self) -> bool {
-        if self.active.load(Ordering::SeqCst) {
+    fn drop_packet(&self, bytes: usize) -> bool {
+        // Model the 1232-byte UDP budget on an IPv6 minimum-MTU path.
+        if bytes > 1232 {
+            if self.oversized.fetch_add(1, Ordering::SeqCst) == 0 {
+                eprintln!("TURN path dropped oversized datagram: bytes={bytes} limit=1232");
+            }
+            true
+        } else if self.active.load(Ordering::SeqCst) {
             self.dropped.fetch_add(1, Ordering::SeqCst);
             true
         } else {
@@ -195,7 +202,7 @@ async fn tls_frontend(
             let mut packet = vec![0; length + padding];
             packet[..4].copy_from_slice(&header);
             reader.read_exact(&mut packet[4..]).await?;
-            if !outage.drop_packet() {
+            if !outage.drop_packet(length) {
                 udp.send(&packet[..length]).await?;
             }
         }
@@ -204,7 +211,7 @@ async fn tls_frontend(
         let mut packet = vec![0; 65536];
         loop {
             let count = udp.recv(&mut packet).await?;
-            if outage.drop_packet() {
+            if outage.drop_packet(count) {
                 continue;
             }
             writer.write_all(&packet[..count]).await?;
