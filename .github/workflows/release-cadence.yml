@@ -85,7 +85,11 @@ jobs:
 
       - name: Install repository Rust toolchain
         if: needs.plan.outputs.action == 'promote'
-        run: ./dev.sh rust-toolchain
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
 
       - name: Setup Node.js
         if: needs.plan.outputs.action == 'promote'

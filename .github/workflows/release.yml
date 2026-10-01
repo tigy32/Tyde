@@ -172,7 +172,11 @@ jobs:
         run: npm ci
 
       - name: Install repository Rust toolchain
-        run: ./dev.sh rust-toolchain
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
 
       - name: Install build Rust targets
         run: rustup target add ${{ matrix.rust-target }} ${{ matrix.server-target }}
@@ -603,7 +607,11 @@ jobs:
         run: node --version && npm --version
 
       - name: Install repository Rust toolchain
-        run: ./dev.sh rust-toolchain
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
 
       - name: Install trunk
         uses: taiki-e/install-action@v2

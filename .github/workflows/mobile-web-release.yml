@@ -72,6 +72,8 @@ jobs:
         working-directory: deploy-tools
         shell: bash
         run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           ./dev.sh rust-toolchain
           echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_ENV"
 

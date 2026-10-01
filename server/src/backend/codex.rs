@@ -17411,7 +17411,7 @@ fn codex_message_usage(
             request: usage
                 .latest_request
                 .clone()
-                .map(&known)
+                .map(known)
                 .unwrap_or_else(unavailable),
             turn: known(usage.turn.clone()),
             cumulative: usage

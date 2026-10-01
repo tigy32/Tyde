@@ -166,7 +166,9 @@ dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>
 dispatch!(reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
-dispatch!(send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<Accepted, SendRejected>);
+dispatch!(
+    send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<Accepted, SendRejected>
+);
 dispatch!(ack_host_line(local_host_id: &LocalHostId, delivery_id: u64) -> Result<(), String>);
 dispatch!(scan_qr() -> Result<BarcodeScanResult, String>);
 dispatch!(ensure_camera_permission() -> Result<(), String>);

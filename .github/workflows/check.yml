@@ -42,7 +42,11 @@ jobs:
             --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
 
       - name: Install repository Rust toolchain
-        run: ./dev.sh rust-toolchain
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

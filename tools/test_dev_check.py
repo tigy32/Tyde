@@ -983,7 +983,11 @@ class PreTagReleaseBuildContractTests(unittest.TestCase):
             "tools/provision-native-build-tools.py",
             '--github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"',
             "run: npm ci",
-            "run: ./dev.sh rust-toolchain",
+            """shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain""",
             "uses: swatinem/rust-cache@v2",
             "uses: taiki-e/install-action@v2",
             "tool: trunk@0.21.14",
@@ -2049,6 +2053,91 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(
             self._log_lines(), [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG]
         )
+
+        runner_temp = pathlib.Path(self.temp.name) / "runner-temp"
+        runner_home = runner_temp / "preinstalled-rustup"
+        runner_home.mkdir(parents=True)
+        conflict = runner_home / "cargo-fmt"
+        conflict.write_text("runner-owned executable\n", encoding="utf-8")
+        rustup = self.bin / "rustup"
+        original = rustup.read_text(encoding="utf-8")
+        rustup.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s home=%s\\n' "$*" "$RUSTUP_HOME" >> "$DEV_CHECK_RUSTUP_HOME_LOG"
+if [[ "$RUSTUP_HOME" == "$DEV_CHECK_RUNNER_RUSTUP_HOME" ]]; then
+  echo "error: failed to install component: rustfmt, detected conflict: bin/cargo-fmt" >&2
+  exit 9
+fi
+""" + original,
+            encoding="utf-8",
+        )
+
+        workflows = sorted((REPO_ROOT / ".github/workflows").glob("*.yml"))
+        tested = []
+        for workflow in workflows:
+            source = workflow.read_text(encoding="utf-8")
+            if "./dev.sh rust-toolchain" not in source:
+                continue
+            toolchain_steps = source.split(
+                "      - name: Install repository Rust toolchain\n"
+            )[1:]
+            self.assertTrue(toolchain_steps, workflow.name)
+            for index, step in enumerate(toolchain_steps):
+                step = step.split("\n      - ", 1)[0]
+                run = re.search(r"^        run: (.+)", step, re.MULTILINE)
+                self.assertIsNotNone(run, workflow.name)
+                script = run.group(1)
+                if script == "|":
+                    script = "\n".join(
+                        line[10:] for line in step.split("        run: |\n", 1)[1].splitlines()
+                    )
+                with self.subTest(workflow=workflow.name, step=index):
+                    home_log = runner_temp / f"{workflow.stem}-{index}.log"
+                    github_env = runner_temp / f"{workflow.stem}-{index}.env"
+                    github_env.touch()
+                    env = self.env.copy()
+                    env.update({
+                        "RUNNER_TEMP": str(runner_temp),
+                        "RUSTUP_HOME": str(runner_home),
+                        "GITHUB_ENV": str(github_env),
+                        "DEV_CHECK_RUNNER_RUSTUP_HOME": str(runner_home),
+                        "DEV_CHECK_RUSTUP_HOME_LOG": str(home_log),
+                    })
+
+                    install = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", script],
+                        cwd=self.root, env=env, text=True, capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(install.returncode, 0, install.stderr)
+                    for declaration in github_env.read_text(encoding="utf-8").splitlines():
+                        name, value = declaration.split("=", 1)
+                        env[name] = value
+                    targets = subprocess.run(
+                        [str(rustup), "target", "list", "--installed"],
+                        cwd=self.root, env=env, text=True, capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(targets.returncode, 0, targets.stderr)
+                    self.assertIn("wasm32-unknown-unknown", targets.stdout)
+                    if "./dev.sh check" in source:
+                        self._run(env=env)
+                    invocations = home_log.read_text(encoding="utf-8").splitlines()
+                    isolated_home = runner_temp / "tyde-rustup"
+                    self.assertTrue(all(
+                        line.endswith(f"home={isolated_home}")
+                        for line in invocations
+                    ), invocations)
+                    self.assertEqual(
+                        conflict.read_text(encoding="utf-8"),
+                        "runner-owned executable\n",
+                    )
+                tested.append(workflow.name)
+        self.assertEqual(tested, [
+            "check.yml", "mobile-web-release.yml", "pretag-release-build.yml",
+            "release-cadence.yml", "release.yml", "release.yml",
+        ])
 
     def test_pr_and_local_release_guards_use_canonical_check(self) -> None:
         ci_env = self.env.copy()
@@ -3616,12 +3705,18 @@ profile = "minimal"
         ).read_text(encoding="utf-8")
 
         root_install = """      - name: Install repository Rust toolchain
-        run: ./dev.sh rust-toolchain
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
 """
         nested_install = """      - name: Install repository Rust toolchain
         working-directory: deploy-tools
         shell: bash
         run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           ./dev.sh rust-toolchain
 """
 
