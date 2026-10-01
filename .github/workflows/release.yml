@@ -68,7 +68,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          release_sha=$(git rev-parse HEAD)
           if [[ "$RELEASE_TAG" == *-* ]]; then
             edit_prerelease_flag=(--prerelease)
             create_prerelease_flag=(--prerelease)
@@ -77,6 +76,8 @@ jobs:
             create_prerelease_flag=()
           fi
 
+          # The verified tag pins source. Main metadata avoids workflow-write
+          # scope for older tagged workflows on draft retries and publication.
           # Fail closed on API/auth errors rather than treating them as absence.
           releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp)
           existing=$(jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")
@@ -85,9 +86,9 @@ jobs:
               echo '::error::Published releases are immutable; refusing to rebuild'
               exit 1
             fi
-            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --target "$release_sha" "${edit_prerelease_flag[@]}"
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --target main "${edit_prerelease_flag[@]}"
           else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Tyde $RELEASE_TAG" --generate-notes --target "$release_sha" "${create_prerelease_flag[@]}"
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Tyde $RELEASE_TAG" --generate-notes --target main "${create_prerelease_flag[@]}"
           fi
 
   build:

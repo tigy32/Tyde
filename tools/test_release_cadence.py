@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -272,6 +273,94 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         selected = self.command(sys.executable, str(ROOT / "tools/release_tool.py"),
                                 "select-run", plan["tag"], sha, "--input", str(runs))
         self.assertEqual(selected.stdout.strip(), "10")
+
+    def test_workflow_creates_and_retries_drafts_after_main_workflow_changes(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        lines = workflow.split("      - name: Create draft release\n", 1)[1].splitlines()
+        start = lines.index("        run: |") + 1
+        end = next(i for i in range(start, len(lines))
+                   if lines[i] and not lines[i].startswith("          "))
+        script = textwrap.dedent("\n".join(lines[start:end]))
+        workflows = self.root / ".github/workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "release.yml").write_text(workflow)
+        self.commit("Change workflows after the tagged source")
+        self.sync()
+        self.git("checkout", "--detach", self.beta_sha)
+        self.git("tag", "v1.2.3", self.beta_sha)
+
+        state = self.directory / "release.json"
+        mutations = self.directory / "mutations.jsonl"
+        binary = self.directory / "bin"
+        binary.mkdir()
+        gh = binary / "gh"
+        # Model the documented GitHub token boundary, resolving targets through
+        # real Git: workflow changes need a scope GITHUB_TOKEN cannot acquire.
+        gh.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+state = pathlib.Path(os.environ["RELEASE_STATE"])
+release = json.loads(state.read_text())
+args = sys.argv[1:]
+if args[0] == "api":
+    if os.environ.get("RELEASE_API_FAILURE"):
+        sys.exit("HTTP 403: Resource not accessible by integration")
+    print(json.dumps([[release] if release else []]))
+    sys.exit(0)
+assert args[:2] in (["release", "create"], ["release", "edit"]), args
+creating = args[1] == "create"
+tag = args[2]
+subprocess.run(["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
+               check=True, stdout=subprocess.DEVNULL)
+if creating:
+    assert "--verify-tag" in args and release is None
+else:
+    assert release["tag_name"] == tag and release["draft"]
+target = (args[args.index("--target") + 1] if "--target" in args
+          else "main" if creating else release["target_commitish"])
+diff = subprocess.check_output(["git", "diff", target, "main", "--", ".github/workflows"])
+if diff:
+    sys.exit("HTTP 403: Resource not accessible by integration (workflow scope required)")
+assert "--draft" in args
+release = {"tag_name": tag, "draft": True, "target_commitish": target,
+           "prerelease": "--prerelease" in args}
+state.write_text(json.dumps(release))
+with open(os.environ["RELEASE_MUTATIONS"], "a") as output:
+    output.write(json.dumps(args) + "\\n")
+''')
+        gh.chmod(0o755)
+        env = {**self.env, "PATH": f"{binary}:{self.env['PATH']}",
+               "GITHUB_REPOSITORY": "example/repository",
+               "RELEASE_STATE": str(state), "RELEASE_MUTATIONS": str(mutations)}
+        for tag in ("v1.2.3-beta.2", "v1.2.3"):
+            for existing in (None, {"tag_name": tag, "draft": True,
+                                    "target_commitish": self.beta_sha, "prerelease": False}):
+                with self.subTest(tag=tag, retry=existing is not None):
+                    state.write_text(json.dumps(existing))
+                    result = self.command("bash", "-e", "-o", "pipefail", "-c", script,
+                                          env={**env, "RELEASE_TAG": tag}, ok=False)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    release = json.loads(state.read_text())
+                    self.assertTrue(release["draft"])
+                    self.assertEqual(release["tag_name"], tag)
+                    self.assertEqual(release["prerelease"], "-" in tag)
+                    self.assertEqual(self.git("rev-parse", f"{tag}^{{commit}}"), self.beta_sha)
+                    self.assertEqual(self.git("rev-parse", "HEAD"), self.beta_sha)
+                    self.assertEqual((self.root / "application.txt").read_text(), "tested beta source\n")
+
+        before = mutations.read_text() if mutations.exists() else ""
+        published = {"tag_name": "v1.2.3-beta.2", "draft": False,
+                     "target_commitish": "main", "prerelease": True}
+        state.write_text(json.dumps(published))
+        result = self.command("bash", "-e", "-o", "pipefail", "-c", script,
+                              env={**env, "RELEASE_TAG": published["tag_name"]}, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Published releases are immutable", result.stdout)
+        result = self.command("bash", "-e", "-o", "pipefail", "-c", script,
+                              env={**env, "RELEASE_TAG": published["tag_name"],
+                                   "RELEASE_API_FAILURE": "1"}, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(state.read_text()), published)
+        self.assertEqual(mutations.read_text() if mutations.exists() else "", before)
 
     def test_promotion_refuses_drafts_and_off_main_tags(self):
         self.catalog.write_text(json.dumps([
