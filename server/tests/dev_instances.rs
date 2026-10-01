@@ -121,10 +121,16 @@ async fn start_dev_instance_expecting_exit() -> String {
         ..Default::default()
     })
     .await;
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("nextest must provide the current package directory");
+    let repo_root = Path::new(&manifest_dir)
         .parent()
         .expect("server crate has a repo root")
         .to_path_buf();
+    eprintln!(
+        "DEV INSTANCE test paths: runtime_root_exists={}",
+        repo_root.is_dir()
+    );
     let transport = StreamableHttpClientTransport::from_uri(format!("http://{debug_mcp_addr}/mcp"));
     let service = ().serve(transport).await.expect("connect to debug MCP");
     let result = service

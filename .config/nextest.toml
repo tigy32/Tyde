@@ -7,7 +7,7 @@
 # The canonical wrapper invokes nextest. Do not run this stage directly; use
 # `./dev.sh check` so repetition, time limits, compact logs, and cleanup apply.
 
-nextest-version = "0.9.100"
+nextest-version = "0.9.113"
 experimental = ["wrapper-scripts"]
 
 [scripts.wrapper.macos-test-binary]

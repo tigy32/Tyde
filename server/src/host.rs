@@ -6576,7 +6576,18 @@ impl HostHandle {
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
         let project = {
-            let mut project_store = state.project_store.lock().await;
+            let project_store = state.project_store.clone();
+            let mut project_store = project_store.lock().await;
+            // Finish stopping readers while their project still exists;
+            // deletion must not race a background metadata refresh.
+            if let Some(mut subscription) = state.project_streams.remove(&payload.id) {
+                subscription.task.abort();
+                if let Err(error) = (&mut subscription.task).await
+                    && !error.is_cancelled()
+                {
+                    return Err(AppError::internal(OPERATION, anyhow!(error)));
+                }
+            }
             project_store
                 .delete(&payload.id)
                 .map_err(|error| project_store_error(OPERATION, error))?
@@ -6584,9 +6595,6 @@ impl HostHandle {
         cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
         if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
             router.shutdown_all();
-        }
-        if let Some(subscription) = state.project_streams.remove(&payload.id) {
-            subscription.task.abort();
         }
         for id in deleted_steering_ids {
             fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;

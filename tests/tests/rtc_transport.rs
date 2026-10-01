@@ -7,8 +7,12 @@ use tokio::time::{sleep, timeout};
 #[tokio::test]
 async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect() {
     timeout(Duration::from_secs(60), async {
+        let fixture_binary = std::env::var_os("NEXTEST_BIN_EXE_tyde_rtc_fixture")
+            .expect("nextest must provide the current browser relay fixture");
+        let fixture_exists = std::path::Path::new(&fixture_binary).is_file();
+        eprintln!("RTC test paths: runtime_fixture_exists={fixture_exists}");
         assert!(
-            std::path::Path::new(env!("CARGO_BIN_EXE_tyde-rtc-fixture")).is_file(),
+            fixture_exists,
             "browser relay fixture must be built with native tests"
         );
         tracing_subscriber::fmt()

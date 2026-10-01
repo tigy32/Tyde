@@ -3983,6 +3983,10 @@ async fn project_watch_failures_keep_other_projects_live() {
         .await
         .unwrap();
     next_frame_matching_on(&mut fixture.client, "delete stale watch owner", |event| {
+        if event.kind == FrameKind::CommandError {
+            let error = event.parse_payload::<CommandErrorPayload>().expect("typed project deletion error");
+            eprintln!("PROJECT DELETE unexpected error: operation={} fatal={}", error.operation, error.fatal);
+        }
         assert_ne!(event.kind, FrameKind::CommandError);
         event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == projects[0].id)
     }).await;
