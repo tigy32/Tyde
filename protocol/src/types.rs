@@ -4371,7 +4371,7 @@ pub struct AgentStartPayload {
 pub struct AgentMovePayload {
     pub request_id: String,
     pub agent_id: AgentId,
-    pub project_id: ProjectId,
+    pub project_id: Option<ProjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

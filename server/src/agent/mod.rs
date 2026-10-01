@@ -334,7 +334,7 @@ enum AgentCommand {
         reply: oneshot::Sender<()>,
     },
     MoveToProject {
-        project_id: protocol::ProjectId,
+        project_id: Option<protocol::ProjectId>,
         roots: Vec<String>,
         reply: oneshot::Sender<Result<AgentStartPayload, String>>,
     },
@@ -1511,7 +1511,7 @@ impl AgentHandle {
 
     pub async fn move_to_project(
         &self,
-        project_id: protocol::ProjectId,
+        project_id: Option<protocol::ProjectId>,
         roots: Vec<String>,
     ) -> Result<AgentStartPayload, String> {
         if !self.accepting_input.load(Ordering::SeqCst) {
@@ -8530,21 +8530,25 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::MoveToProject { project_id, roots, reply } => {
                             let result = if !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
                                 Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned())
-                            } else if current_start.project_id.as_ref() == Some(&project_id) && current_start.workspace_roots == roots {
+                            } else if current_start.project_id == project_id && current_start.workspace_roots == roots {
                                 Ok(current_start.clone())
                             } else {
                                 let session_id = current_session_id.as_ref().expect("running agent has session");
                                 let previous_roots = current_start.workspace_roots.clone();
                                 let live = backend.as_mut().expect("running actor has backend");
-                                tracing::info!(%agent_id, ?project_id, ?roots, "Moving agent workspace and project");
-                                let moved = live.set_workspace_roots(roots.clone()).await;
+                                tracing::info!(%agent_id, project_assigned = project_id.is_some(), root_count = roots.len(), roots_changed = previous_roots != roots, "Moving agent workspace and project");
+                                let moved = if previous_roots == roots {
+                                    Ok(())
+                                } else {
+                                    live.set_workspace_roots(roots.clone()).await
+                                };
                                 let moved = match moved {
-                                    Ok(()) => session_store.move_to_project(session_id, Some(project_id.clone()), roots.clone()).await,
+                                    Ok(()) => session_store.move_to_project(session_id, project_id.clone(), roots.clone()).await,
                                     Err(error) => Err(error),
                                 };
                                 match moved {
                                     Ok(()) => {
-                                        current_start.project_id = Some(project_id);
+                                        current_start.project_id = project_id;
                                         current_start.workspace_roots = roots.clone();
                                         workspace_emitter.set_workspace_roots(roots);
                                         compaction_spawn_config.subagent_emitter = Some(workspace_emitter.clone());
@@ -8554,7 +8558,7 @@ pub(crate) fn spawn_agent_actor(
                                     }
                                     Err(error) => {
                                         // Native transports can fail after mutation. Reconcile before accepting another turn.
-                                        if let Err(rollback) = live.set_workspace_roots(previous_roots).await {
+                                        if previous_roots != roots && let Err(rollback) = live.set_workspace_roots(previous_roots).await {
                                             accepting_input_task.store(false, Ordering::SeqCst);
                                             lifecycle = ActorLifecycle::Closing;
                                             close_deadline = Some(tokio::time::Instant::now());

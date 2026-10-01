@@ -2381,7 +2381,7 @@ fn MoveAgentProjectDialog(
     open: RwSignal<bool>,
 ) -> impl IntoView {
     let search = RwSignal::new(String::new());
-    let selected = RwSignal::new(None::<ProjectId>);
+    let selected = RwSignal::new(None::<Option<ProjectId>>);
     let pending = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let input = NodeRef::<leptos::html::Input>::new();
@@ -2404,6 +2404,7 @@ fn MoveAgentProjectDialog(
     });
     let host = agent.host_id.clone();
     let current = agent.project_id.clone();
+    let can_unassign = current.is_some();
     let projects = state.projects;
     let destinations = Memo::new(move |_| {
         let query = search.get().to_lowercase();
@@ -2507,10 +2508,9 @@ fn MoveAgentProjectDialog(
         });
     };
     view! {
-        <div class="modal-backdrop" style="position:fixed;inset:0;z-index:1100;background:rgba(0,0,0,.4)"
+        <div class="modal-backdrop agent-move-backdrop"
             on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); if pending.get_untracked().is_none() { open.set(false); } } />
         <div class="modal workbench-create-modal agent-move-modal" role="dialog" aria-modal="true" aria-label="Move agent to project"
-            style="position:fixed;left:50%;top:15%;transform:translateX(-50%);z-index:1101;width:min(480px,calc(100vw - 32px));max-height:75vh;overflow:auto"
             on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 use wasm_bindgen::JsCast;
@@ -2525,29 +2525,70 @@ fn MoveAgentProjectDialog(
                     else if !ev.shift_key() && active.as_ref() == Some(last.as_ref()) { ev.prevent_default(); let _ = first.focus(); }
                 }
             }>
-            <div class="modal-title">"Move "{agent.name}" to project"</div>
-            <div class="modal-body">
-                <p>"Continue this conversation in all folders of the selected project. The agent keeps its current instructions and tool settings."</p>
-                <input class="modal-input" type="search" aria-label="Search projects" placeholder="Search projects or folders…" node_ref=input
-                    disabled=move || pending.get().is_some() prop:value=move || search.get() on:input=move |ev| search.set(event_target_value(&ev)) />
-                <div role="group" aria-label="Destination project" style="display:flex;flex-direction:column;gap:8px;margin:12px 0">
-                    {move || destinations.get().into_iter().map(|item| {
-                        let project = item.project;
-                        let id = project.id.clone();
-                        let selected_id = id.clone();
-                        let roots = project.root_paths();
-                        let detail = match project.source { protocol::ProjectSource::GitWorkbench { branch, .. } => format!("Workbench · {}", branch.0), _ => "Project".to_owned() };
-                        view! {
-                            <button type="button" class="modal-input agent-move-choice" style="text-align:left;white-space:normal" aria-pressed=move || (selected.get().as_ref() == Some(&selected_id)).to_string()
-                                disabled=move || pending.get().is_some() on:click=move |_| { selected.set(Some(id.clone())); error.set(None); }>
-                                <strong>{project.name}</strong>" · "{detail}
-                                {roots.into_iter().enumerate().map(|(index, root)| view! { <div style="font-size:12px;overflow-wrap:anywhere">{root.0}{if index == 0 { " (default directory)" } else { "" }}</div> }).collect_view()}
-                            </button>
-                        }
-                    }).collect_view()}
-                    <Show when=move || destinations.get().is_empty()><p>"No other matching projects on this host."</p></Show>
-                </div>
-                {move || unavailable.get().map(|message| view! { <p role="status">{message}</p> })}
+            <header class="agent-move-header">
+                <div class="modal-title">"Move to project"</div>
+                <p class="agent-move-description" title=agent.name.clone()>"Choose a new home for “"{agent.name.clone()}"”."</p>
+                <label class="agent-move-search">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true">
+                        <circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 4 4" />
+                    </svg>
+                    <input type="search" aria-label="Search projects" placeholder="Search projects or folders…" node_ref=input
+                        disabled=move || pending.get().is_some() prop:value=move || search.get() on:input=move |ev| search.set(event_target_value(&ev)) />
+                </label>
+            </header>
+            <div class="agent-move-destinations" role="group" aria-label="Destination project">
+                <Show when=move || can_unassign>
+                    <button type="button" class="agent-move-choice agent-move-unassigned" aria-pressed=move || (selected.get() == Some(None)).to_string()
+                        disabled=move || pending.get().is_some() on:click=move |_| { selected.set(Some(None)); error.set(None); }>
+                        <span class="agent-move-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <rect x="4" y="4" width="16" height="16" rx="4" /><path d="M8 12h8" />
+                            </svg>
+                        </span>
+                        <span class="agent-move-copy"><strong>"No project"</strong><span>"Keep current folders, without a project"</span></span>
+                        <span class="agent-move-check" aria-hidden="true">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4 10-10" /></svg>
+                        </span>
+                    </button>
+                </Show>
+                <div class="agent-move-section-label">"Projects"</div>
+                {move || destinations.get().into_iter().map(|item| {
+                    let project = item.project;
+                    let id = project.id.clone();
+                    let selected_id = id.clone();
+                    let roots = project.root_paths();
+                    let full_paths = roots.iter().map(|root| root.0.as_str()).collect::<Vec<_>>().join("\n");
+                    let extra_roots = roots.len().saturating_sub(1);
+                    let branch = match project.source {
+                        protocol::ProjectSource::GitWorkbench { branch, .. } => Some(branch.0),
+                        protocol::ProjectSource::Standalone { .. } => None,
+                    };
+                    view! {
+                        <button type="button" class="agent-move-choice" title=full_paths aria-pressed=move || (selected.get().as_ref() == Some(&Some(selected_id.clone()))).to_string()
+                            disabled=move || pending.get().is_some() on:click=move |_| { selected.set(Some(Some(id.clone()))); error.set(None); }>
+                            <span class="agent-move-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                                </svg>
+                            </span>
+                            <span class="agent-move-copy">
+                                <span class="agent-move-name"><strong title=project.name.clone()>{project.name.clone()}</strong>{branch.map(|branch| view! { <span class="agent-move-badge" title=branch>"Workbench"</span> })}</span>
+                                <span class="agent-move-folders">
+                                    {roots.first().map(|root| view! { <span class="agent-move-path">{root.0.clone()}</span> })}
+                                    {(extra_roots > 0).then(|| view! { <span class="agent-move-count">{format!("+{extra_roots} {}", if extra_roots == 1 { "folder" } else { "folders" })}</span> })}
+                                </span>
+                            </span>
+                            <span class="agent-move-check" aria-hidden="true">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4 10-10" /></svg>
+                            </span>
+                        </button>
+                    }
+                }).collect_view()}
+                <Show when=move || destinations.get().is_empty()><p class="agent-move-empty">"No matching projects on this host."</p></Show>
+            </div>
+            <footer class="agent-move-footer">
+                <p class="agent-move-note">"Instructions and tool settings stay the same."</p>
+                {move || unavailable.get().map(|message| view! { <p class="agent-move-note" role="status">{message}</p> })}
                 {move || error.get().map(|message| view! { <p class="modal-error" role="alert">{message}</p> })}
                 <div class="modal-actions">
                     <button type="button" class="modal-button" disabled=move || pending.get().is_some() on:click=move |_| open.set(false)>"Cancel"</button>
@@ -2555,7 +2596,7 @@ fn MoveAgentProjectDialog(
                         {move || if pending.get().is_some() { "Moving…" } else { "Move agent" }}
                     </button>
                 </div>
-            </div>
+            </footer>
         </div>
     }
 }
@@ -5007,6 +5048,22 @@ mod wasm_tests {
             project_info("h", "destination", "Destination", 0),
             project_info("other", "foreign", "Other host project", 0),
         ]);
+        state.projects.update(|projects| {
+            projects[1].project.source = ProjectSource::Standalone {
+                roots: vec![
+                    ProjectRootPath(format!("/tmp/destination/{}", "nested-folder/".repeat(12))),
+                    ProjectRootPath("/tmp/additional-folder".to_owned()),
+                ],
+            };
+            for index in 0..12 {
+                projects.push(project_info(
+                    "h",
+                    &format!("other-{index}"),
+                    &format!("Project {index}"),
+                    0,
+                ));
+            }
+        });
         let agent = state.agents.get_untracked()[0].clone();
         open_agent_chat(&state, &agent);
         state.open_tab(TabContent::AgentMonitor, "Source overview".to_owned(), true);
@@ -5026,16 +5083,24 @@ mod wasm_tests {
             .set("Keep this draft".to_owned());
         let open = RwSignal::new(true);
         let mounted_state = state.clone();
-        let _handle = mount_to(
-            container.clone(),
-            move || view! { <MoveAgentProjectDialog state=mounted_state.clone() agent=agent.clone() open=open /> },
-        );
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <MoveAgentProjectDialog state=mounted_state.clone() agent=agent.clone() open=open />
+            }
+        });
         for _ in 0..4 {
             next_tick().await;
         }
         let text = container.text_content().unwrap();
+        assert!(
+            text.contains("No project"),
+            "a chat can be moved out of its project"
+        );
         assert!(text.contains("Destination") && text.contains("/tmp/destination"));
         assert!(!text.contains("Other host project"));
+        assert!(text.contains("+1 folder"));
+        assert!(!text.contains("(default directory)"));
         let buttons = container.query_selector_all("button").unwrap();
         let find = |label: &str| -> HtmlElement {
             (0..buttons.length())
@@ -5044,6 +5109,71 @@ mod wasm_tests {
                 .unwrap()
         };
         let submit = find("Move agent");
+        let destination = find("Destination");
+        assert!(
+            destination
+                .get_attribute("title")
+                .unwrap()
+                .contains("/tmp/additional-folder")
+        );
+        let window = web_sys::window().unwrap();
+        let search: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Search projects']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let font = |element: &web_sys::Element| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-family")
+                .unwrap()
+        };
+        let heading = container.query_selector("header").unwrap().unwrap();
+        assert_eq!(font(&destination), font(&heading));
+        assert_eq!(font(&search), font(&heading));
+        let dialog: HtmlElement = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        dialog.style().set_property("width", "320px").unwrap();
+        dialog.style().set_property("max-height", "400px").unwrap();
+        dialog.style().set_property("animation", "none").unwrap();
+        next_tick().await;
+        let list: HtmlElement = container
+            .query_selector("[role='group']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let bounds = dialog.get_bounding_client_rect();
+        assert!(
+            destination.get_bounding_client_rect().height() < 72.0,
+            "long paths must not create tall, wrapped destination rows"
+        );
+        assert!(
+            dialog.scroll_width() <= dialog.client_width(),
+            "the narrow dialog must not overflow horizontally"
+        );
+        assert!(
+            list.scroll_height() > list.client_height(),
+            "a long project list scrolls inside the dialog"
+        );
+        let submit_before_scroll = submit.get_bounding_client_rect();
+        assert!(submit_before_scroll.bottom() <= bounds.bottom());
+        assert!(search.get_bounding_client_rect().top() >= bounds.top());
+        list.set_scroll_top(list.scroll_height());
+        next_tick().await;
+        assert_eq!(
+            submit.get_bounding_client_rect().top(),
+            submit_before_scroll.top(),
+            "the move action stays visible while browsing projects"
+        );
+        list.set_scroll_top(0);
         assert!(submit.has_attribute("disabled"));
         find("Destination").click();
         next_tick().await;
@@ -5119,7 +5249,7 @@ mod wasm_tests {
             &protocol::types::AgentMoveResultPayload {
                 request_id: retry["request_id"].as_str().unwrap().to_owned(),
                 agent_id: start.agent_id.clone(),
-                result: Ok(start),
+                result: Ok(start.clone()),
             },
         );
         for _ in 0..4 {
@@ -5164,6 +5294,94 @@ mod wasm_tests {
             host_id: "h".to_owned(),
             project_id: ProjectId("destination".to_owned()),
         }));
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "Keep this draft"
+        );
+        let unassign_container = make_container();
+        let moved_agent = state.agents.get_untracked()[0].clone();
+        let unassign_open = RwSignal::new(true);
+        let mounted_state = state.clone();
+        let _unassign_handle = mount_to(unassign_container.clone(), move || {
+            view! { <MoveAgentProjectDialog state=mounted_state.clone() agent=moved_agent.clone() open=unassign_open /> }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let buttons = unassign_container.query_selector_all("button").unwrap();
+        let find = |label: &str| -> HtmlElement {
+            (0..buttons.length())
+                .map(|i| buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
+                .find(|button| button.text_content().unwrap_or_default().contains(label))
+                .unwrap()
+        };
+        let submit = find("Move agent");
+        assert!(submit.has_attribute("disabled"));
+        let search: web_sys::HtmlInputElement = unassign_container
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        search.set_value("no matching project");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            unassign_container
+                .text_content()
+                .unwrap()
+                .contains("No matching projects")
+        );
+        find("No project").click();
+        next_tick().await;
+        assert_eq!(
+            find("No project").get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert!(!submit.has_attribute("disabled"));
+        submit.click();
+        for _ in 0..6 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let (_, payload, stream) = frames
+            .iter()
+            .rev()
+            .find(|(kind, _, _)| kind == "agent_move")
+            .unwrap();
+        assert_eq!(payload["agent_id"], "move-me");
+        assert!(payload.get("project_id").unwrap().is_null());
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath(stream.clone()),
+            FrameKind::AgentMoveResult,
+            2,
+            &protocol::types::AgentMoveResultPayload {
+                request_id: payload["request_id"].as_str().unwrap().to_owned(),
+                agent_id: AgentId("move-me".to_owned()),
+                result: Ok(protocol::AgentStartPayload {
+                    project_id: None,
+                    ..start
+                }),
+            },
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(!unassign_open.get_untracked());
+        assert!(state.active_project.get_untracked().is_none());
+        assert!(state.agents.get_untracked()[0].project_id.is_none());
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id.0,
+            "move-me"
+        );
+        assert_eq!(
+            state.agents.get_untracked()[0].workspace_roots,
+            vec!["/tmp/destination"]
+        );
         assert_eq!(
             state.composer_untracked().text.get_untracked(),
             "Keep this draft"

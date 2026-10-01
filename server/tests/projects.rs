@@ -5473,7 +5473,7 @@ async fn sha256_root_history_uses_repository_empty_tree() {
 async fn restart_moved_agent(
     fixture: &mut Fixture,
     session_id: &protocol::SessionId,
-    project_id: &ProjectId,
+    project_id: Option<&ProjectId>,
     roots: &[String],
 ) -> (fixture::TestAgent, protocol::AgentStartPayload) {
     // The old flow launched three inspection hosts over the original live
@@ -5488,7 +5488,7 @@ async fn restart_moved_agent(
         .find(|session| &session.id == session_id)
         .expect("moved session persisted across restart");
     assert_eq!(saved.workspace_roots, roots);
-    assert_eq!(saved.project_id.as_ref(), Some(project_id));
+    assert_eq!(saved.project_id.as_ref(), project_id);
     let mut descriptors = bootstrap.agents;
     let env = next_frame_matching_on(&mut fixture.client, "moved agent auto-restoration", |env| {
         if env.kind == FrameKind::NewAgent {
@@ -5518,7 +5518,7 @@ async fn restart_moved_agent(
         "restart must preserve the conversation identity"
     );
     assert_eq!(start.workspace_roots, roots);
-    assert_eq!(start.project_id.as_ref(), Some(project_id));
+    assert_eq!(start.project_id.as_ref(), project_id);
     let replay_messages = replay
         .events
         .iter()
@@ -5564,7 +5564,7 @@ async fn restart_moved_agent(
         .find(|agent| agent.agent_id == start.agent_id)
         .expect("restored agent descriptor");
     assert_eq!(descriptor.workspace_roots, roots);
-    assert_eq!(descriptor.project_id.as_ref(), Some(project_id));
+    assert_eq!(descriptor.project_id.as_ref(), project_id);
     let (_, settled) = fixture.connect_with_bootstrap().await;
     let saved = settled
         .sessions
@@ -5572,7 +5572,7 @@ async fn restart_moved_agent(
         .find(|session| &session.id == session_id)
         .expect("saved session after auto-restoration");
     assert_eq!(saved.workspace_roots, roots);
-    assert_eq!(saved.project_id.as_ref(), Some(project_id));
+    assert_eq!(saved.project_id.as_ref(), project_id);
     assert_eq!(
         settled
             .agents
@@ -5652,7 +5652,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
         .move_agent(protocol::types::AgentMovePayload {
             request_id: "busy".to_owned(),
             agent_id: start.agent_id.clone(),
-            project_id: destination.id.clone(),
+            project_id: Some(destination.id.clone()),
         })
         .await
         .unwrap();
@@ -5671,13 +5671,23 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
         .await;
     let mut observer = fixture.connect().await;
     for (request_id, project_id, expected) in [
-        ("missing", ProjectId("missing-project".to_owned()), None),
+        (
+            "missing",
+            Some(ProjectId("missing-project".to_owned())),
+            None,
+        ),
         (
             "move",
-            destination.id.clone(),
+            Some(destination.id.clone()),
             Some(project_roots(&destination)),
         ),
-        ("return", source.id.clone(), Some(project_roots(&source))),
+        ("unassign", None, Some(project_roots(&destination))),
+        ("unassigned-again", None, Some(project_roots(&destination))),
+        (
+            "return",
+            Some(source.id.clone()),
+            Some(project_roots(&source)),
+        ),
     ] {
         fixture
             .client
@@ -5701,7 +5711,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 let moved = result.result.unwrap();
                 assert_eq!(moved.agent_id, start.agent_id);
                 assert_eq!(moved.session_id, start.session_id);
-                assert_eq!(moved.project_id, Some(project_id.clone()));
+                assert_eq!(moved.project_id, project_id);
                 assert_eq!(moved.workspace_roots, roots);
                 let broadcast = next_frame_matching_on(&mut observer, "observer move", |env| {
                     env.kind == FrameKind::AgentMoveResult
@@ -5709,10 +5719,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 .await
                 .parse_payload::<protocol::types::AgentMoveResultPayload>()
                 .unwrap();
-                assert_eq!(
-                    broadcast.result.unwrap().project_id,
-                    Some(project_id.clone())
-                );
+                assert_eq!(broadcast.result.unwrap().project_id, project_id.clone());
                 eprintln!(
                     "PROJECT MOVE PERSISTENCE connecting observer expected_root_count={}",
                     roots.len()
@@ -5753,7 +5760,8 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 );
                 let prior_agent_id = start.agent_id.clone();
                 (agent, start) =
-                    restart_moved_agent(&mut fixture, &session_id, &project_id, &roots).await;
+                    restart_moved_agent(&mut fixture, &session_id, project_id.as_ref(), &roots)
+                        .await;
                 assert!(
                     start.agent_id == prior_agent_id,
                     "restart must reconstruct the owner under its persisted agent id"
@@ -5765,7 +5773,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
     let (restored, restored_start) = restart_moved_agent(
         &mut fixture,
         &session_id,
-        &source.id,
+        Some(&source.id),
         &project_roots(&source),
     )
     .await;

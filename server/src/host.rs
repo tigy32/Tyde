@@ -6318,7 +6318,7 @@ impl HostHandle {
         output: &Stream,
     ) -> AppResult<()> {
         let result = self
-            .move_agent_to_project(&payload.agent_id, &payload.project_id)
+            .move_agent_to_project(&payload.agent_id, payload.project_id.as_ref())
             .await;
         let success = result.is_ok();
         let response = protocol::types::AgentMoveResultPayload {
@@ -6344,7 +6344,7 @@ impl HostHandle {
     async fn move_agent_to_project(
         &self,
         agent_id: &AgentId,
-        project_id: &ProjectId,
+        project_id: Option<&ProjectId>,
     ) -> Result<AgentStartPayload, String> {
         let (handle, project) = {
             let state = self.state.lock().await;
@@ -6352,26 +6352,35 @@ impl HostHandle {
                 .registry
                 .agent_handle(agent_id)
                 .ok_or("This agent is no longer running")?;
-            let project = state
-                .project_store
-                .lock()
-                .await
-                .get(project_id)
-                .ok_or("Destination project no longer exists")?;
+            let project = match project_id {
+                Some(id) => Some(
+                    state
+                        .project_store
+                        .lock()
+                        .await
+                        .get(id)
+                        .ok_or("Destination project no longer exists")?,
+                ),
+                None => None,
+            };
             (handle, project)
         };
-        let lock_id = match &project.source {
-            ProjectSource::GitWorkbench {
-                parent_project_id, ..
-            } => parent_project_id,
-            _ => project_id,
+        let lock = match project.as_ref() {
+            Some(project) => {
+                let lock_id = match &project.source {
+                    ProjectSource::GitWorkbench {
+                        parent_project_id, ..
+                    } => parent_project_id,
+                    _ => &project.id,
+                };
+                Some(self.workbench_parent_lock(lock_id).await)
+            }
+            None => None,
         };
-        let lock = self.workbench_parent_lock(lock_id).await;
-        let _guard = lock.lock().await;
-        let roots = self
-            .resolve_spawn_workspace_roots(Some(project_id), &[])
-            .await?;
-        let roots = crate::backend::validate_local_workspace_roots(roots)?;
+        let _guard = match lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let start = handle.snapshot();
         if !crate::backend::capabilities_for_backend_kind(start.backend_kind)
             .contains(tyde_agent_adapter::BackendCapability::SetWorkspaceRoots)
@@ -6389,7 +6398,15 @@ impl HostHandle {
             }
             guard
         };
-        handle.move_to_project(project_id.clone(), roots).await
+        let roots = match project_id {
+            Some(id) => {
+                let roots = self.resolve_spawn_workspace_roots(Some(id), &[]).await?;
+                crate::backend::validate_local_workspace_roots(roots)?
+            }
+            // Removing the assignment must not change the conversation's workspace.
+            None => handle.snapshot().workspace_roots,
+        };
+        handle.move_to_project(project_id.cloned(), roots).await
     }
 
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
