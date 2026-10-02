@@ -227,6 +227,25 @@ def validate_manifest_entry(
         raise CheckError(f"versions[{version!r}].artifacts must include a .wasm artifact")
 
 
+def validate_startup_authority(
+    manifest: dict[str, Any], version: str, *, direct_hosted: bool = False
+) -> None:
+    if not direct_hosted:
+        if "servedClientRelease" in manifest:
+            raise CheckError("shared manifests must not declare servedClientRelease")
+        return
+    if manifest.get("servedClientRelease") != version:
+        raise CheckError("manifest.servedClientRelease must equal the built release")
+    if manifest.get("minSupported") != version or set(_versions_object(manifest)) != {version}:
+        raise CheckError("servedClientRelease requires a single release and matching minSupported")
+    entry = manifest["versions"][version]
+    if not isinstance(entry, dict):
+        raise CheckError("servedClientRelease must name a valid release entry")
+    capability = entry.get("followsSelectedHost")
+    if type(capability) is not int or capability != 1:
+        raise CheckError("servedClientRelease requires followsSelectedHost: 1")
+
+
 def _entry_has_protocol_version(entry: Any) -> bool:
     return isinstance(entry, dict) and isinstance(entry.get("protocolVersion"), int)
 
@@ -296,6 +315,8 @@ def merge_target_entry(
     expected_protocol_version: int,
 ) -> dict[str, Any]:
     version = normalize_release_version(version)
+    validate_startup_authority(base_manifest, version)
+    validate_startup_authority(entry_source_manifest, version)
     validate_manifest_entry(entry_source_manifest, version, expected_protocol_version)
     merged = copy.deepcopy(base_manifest)
     versions = _versions_object(merged)
@@ -326,6 +347,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="manifest path to verify (default: web/loader/manifest.json)",
     )
     parser.add_argument(
+        "--direct-hosted",
+        action="store_true",
+        help="require the single-release servedClientRelease startup declaration",
+    )
+    parser.add_argument(
         "--protocol-source",
         type=pathlib.Path,
         default=root / "protocol" / "src" / "types.rs",
@@ -340,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         version = normalize_release_version(args.version)
         protocol_version = read_protocol_version(args.protocol_source)
         manifest = load_manifest(args.manifest)
+        validate_startup_authority(manifest, version, direct_hosted=args.direct_hosted)
         validate_manifest_entry(manifest, version, protocol_version)
         validate_supported_entries_have_protocol_versions(manifest)
         validate_min_supported_floor(manifest)

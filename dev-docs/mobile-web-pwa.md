@@ -396,6 +396,17 @@ forgotten. A still-selected known target remains fail-closed under the fresh
 manifest, including while switching is deferred. Exact boot preserves the
 owner rather than rewriting an anonymous target.
 
+Direct origins explicitly declare `servedClientRelease` in their single-release
+manifest. Cold startup runs that served executable rather than attempting to
+load a replaced historical pin. It does not compare the new entry's protocol
+against an old handshake, or overwrite selected-host authority before a fresh
+Welcome/Reject. The declaration describes the bundle, not the running host;
+developer bundle overrides still surface mismatches through the existing
+coordinator. Shared-site exact-host startup and live-app safety are unchanged.
+The Chrome loader flow covers different-protocol upgrades, repeated launches
+without a connection, confirmation, retained pairings, malformed declarations,
+policy denial, missing protocol metadata, tampering and offline startup.
+
 The worker's network-first shell path picks up new loader code on navigation.
 Worker activation/foreground resume alone does **not** replace an already
 executing immutable WASM app. An installation still running old code therefore

@@ -158,12 +158,14 @@ if version not in versions:
     raise SystemExit(f"generated manifest has no entry for {version}")
 manifest["versions"] = {version: versions[version]}
 manifest["minSupported"] = version
+manifest["servedClientRelease"] = version
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, indent=2)
     handle.write("\n")
 PRUNE
 
 "${PYTHON}" "${REPO_ROOT}/tools/check_mobile_web_manifest.py" \
+  --direct-hosted \
   --manifest "${OUT_DIR}/manifest.json" \
   --protocol-source "${REPO_ROOT}/protocol/src/types.rs" \
   "${VERSION}" \

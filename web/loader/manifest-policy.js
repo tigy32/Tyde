@@ -206,6 +206,24 @@ export function resolveBootTarget(version, manifest) {
   };
 }
 
+// A direct origin declares its executable bootstrap, not the selected host's
+// live release. Cached handshake authority cannot gate these replacement files.
+export function resolveServedClientBootTarget(manifest) {
+  const version = validateReleaseVersion(manifest?.servedClientRelease);
+  if (!version || version !== manifest.servedClientRelease
+      || manifest.minSupported !== version
+      || !manifest.versions || Object.keys(manifest.versions).length !== 1
+      || manifest.versions[version]?.followsSelectedHost !== 1) {
+    return { ok: false, reason: "bad-policy" };
+  }
+  const resolved = resolveBootTarget(version, manifest);
+  if (!resolved.ok) return resolved;
+  if (resolved.protocolVersion === null) {
+    return { ok: false, reason: "protocol-unpublished" };
+  }
+  return resolved;
+}
+
 // Resolves the newest bootable version present in the manifest. Used when the
 // loader has no host-specific remembered version (for example a fresh install
 // or a browser whose paired hosts were deleted): in that case we should show

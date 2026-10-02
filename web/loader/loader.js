@@ -15,6 +15,7 @@ import { parsePairingUri, extractPairingUri } from "./pairing.js";
 import {
   resolveBootTarget,
   resolveLatestBootTarget,
+  resolveServedClientBootTarget,
   selectBootUrls,
 } from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
@@ -206,6 +207,10 @@ export function resolveFollowHostBootstrap(manifest, remembered, pairedHosts, pa
     handoff = null;
     console.info("tyde_bundle_switch retired unowned startup target");
   }
+  if (Object.hasOwn(manifest, "servedClientRelease")) {
+    console.info("tyde_bundle_switch resolving declared served client");
+    return { ...resolveServedClientBootTarget(manifest), servedClient: true };
+  }
   // Legacy QR/rejection repairs have no selected-host owner. Until a capable
   // boot succeeds they must not prevent the one-time capability migration.
   if (!handoff?.host && pairedHosts !== false && localStorage.getItem(FOLLOW_MIGRATION_KEY) !== "1") {
@@ -273,7 +278,7 @@ function reasonToMessage(reason) {
     case "blocked":
       return "This host version has been blocked for safety. Update the host, then re-pair.";
     case "below-min-supported":
-      return "This host is too old for the current web client. Update the host, then re-pair.";
+      return "The saved client release is no longer supported. Open a fresh pairing link from the host.";
     case "not-in-manifest":
       return "No matching client build is published for this host version yet. Try again later or re-pair after updating the host.";
     case "protocol-unpublished":
@@ -360,7 +365,7 @@ async function bootTarget(target, followsSelectedHost = false) {
   }
   if (!result.ok) {
     await deleteCachedArtifacts(target);
-    forgetVersion();
+    if (!target.servedClient) forgetVersion();
     setError(
       "The client bundle failed its integrity check and was not started.",
       `version ${target.version}: ${result.failures.join(", ")}`,
@@ -378,7 +383,7 @@ async function bootTarget(target, followsSelectedHost = false) {
   const urls = selectBootUrls(target);
   if (!urls.ok) {
     await deleteCachedArtifacts(target);
-    forgetVersion();
+    if (!target.servedClient) forgetVersion();
     setError(
       "The client failed to start.",
       `version ${target.version}: ${urls.reason}`,
@@ -427,7 +432,7 @@ async function bootTarget(target, followsSelectedHost = false) {
     // failure after we (somehow) hid it still shows the error view, not a blank
     // page.
     await deleteCachedArtifacts(target);
-    forgetVersion();
+    if (!target.servedClient) forgetVersion();
     setError(
       "The client failed to start.",
       String(err && err.message ? err.message : err),
@@ -1407,8 +1412,12 @@ async function init() {
     setError(reasonToMessage(startup.reason), "The selected host target was retained.");
     return;
   }
+  if (!startup.ok && startup.servedClient) {
+    setError(reasonToMessage(startup.reason), "The declared served client was not started. The saved host target was retained.");
+    return;
+  }
   if (startup.ok) {
-    if (remembered && startup.source !== "remembered") forgetVersion();
+    if (remembered && startup.source !== "remembered" && !startup.servedClient) forgetVersion();
     await bootTarget(startup, manifest.versions?.[startup.version]?.followsSelectedHost === 1);
     return;
   }

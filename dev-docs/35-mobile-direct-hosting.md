@@ -80,6 +80,24 @@ every executable artifact and the loader enforces it, so a shell copied from
 one build and a bundle from another produces an origin that loads and then
 refuses its own scripts.
 
+The single-release manifest declares `servedClientRelease`, equal to its sole
+version and `minSupported`. On a cold launch the loader boots that declared
+client even if the browser remembers an older host release. This allows an
+upgraded host to replace its embedded bundle without stranding paired phones.
+The declaration selects executable files, not a host or its live release:
+selection, credentials and saved handshake authority remain unchanged until
+the selected host sends Welcome/Reject. The declared entry must support
+selected-host synchronization and include protocol metadata; policy and all
+executable integrity checks still apply. A malformed or unavailable declaration
+fails visibly, never selecting another release.
+
+The builder validates this contract with
+`tools/check_mobile_web_manifest.py --direct-hosted`. Shared `tycode.dev`
+manifests reject the field and retain remembered-host startup. The updated
+loader ships inside the host; updating the shared site alone cannot repair a
+direct origin. Existing phones pick it up on their next navigation/cold launch
+after the host updates, without clearing storage or re-pairing.
+
 ## Pairing
 
 Direct pairing is its own QR variant (`tyde-pair://v3`), and it is deliberately

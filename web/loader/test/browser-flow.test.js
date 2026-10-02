@@ -13,7 +13,7 @@ import { once } from "node:events";
 test("installed storage migrates once, then follows exact targets without losing pairing", { timeout: 90000 }, async t => {
   assert.ok(process.env.CHROME && process.env.CHROMEDRIVER, "dev.sh must provision browser tools");
   const root = new URL("../", import.meta.url);
-  const old = "1.0.0", capable = "1.0.1";
+  const old = "1.0.0", capable = "1.0.1", upgraded = "1.0.2";
   const wasm = Buffer.from([0,97,115,109,1,0,0,0]);
   const code = version => Buffer.from(`export default async function() { document.getElementById('app-root').textContent = 'Client ${version}'; }`);
   const directory = await mkdtemp(join(tmpdir(), "tyde-loader-flow-"));
@@ -24,11 +24,12 @@ test("installed storage migrates once, then follows exact targets without losing
   const marker = (await readFile(new URL("../../../mobile-frontend/index.html", import.meta.url),"utf8"))
     .match(/<meta name="tyde-follow-selected-host" content="1" \/>/)?.[0];
   assert.ok(marker,"the built client declares its capability");
-  for (const version of [old,capable]) {
+  for (const version of [old,capable,upgraded]) {
+    await writeFile(protocolSource, `pub const PROTOCOL_VERSION: u32 = ${version === upgraded ? 67 : 66};`);
     const dist = join(directory,version);await mkdir(dist);
     await writeFile(join(dist,"app.js"),code(version));
     await writeFile(join(dist,"app_bg.wasm"),wasm);
-    await writeFile(join(dist,"index.html"),'<!doctype html>'+(version===capable?marker:"")+'<script type="module">import init from "/tyde/v'+version+'/app.js";</script>');
+    await writeFile(join(dist,"index.html"),'<!doctype html>'+(version!==old?marker:"")+'<script type="module">import init from "/tyde/v'+version+'/app.js";</script>');
     await promisify(execFile)(process.execPath,[new URL("../../deploy/generate-manifest.mjs",import.meta.url).pathname,
       "--dist",dist,"--version",version,"--manifest",manifestPath,"--protocol-source",protocolSource]);
   }
@@ -36,11 +37,20 @@ test("installed storage migrates once, then follows exact targets without losing
   assert.equal(generated.versions[old].followsSelectedHost,undefined,"historical artifact gains no capability during backfill");
   assert.equal(generated.versions[capable].followsSelectedHost,1);
   let published = false, legacy = true, offline = false, tamper = false, blocked = false;
+  let servedClient = null, directPolicy = {}, directEntry = {};
   let manifestRequests = 0;
   const manifest = () => {
     const value = structuredClone(generated);
     value.blocked = blocked ? [old] : [];
     if (!published) delete value.versions[capable].followsSelectedHost;
+    if (servedClient !== null) {
+      value.versions = { [servedClient]: { ...value.versions[servedClient], ...directEntry } };
+      value.minSupported = servedClient;
+      value.servedClientRelease = servedClient;
+      Object.assign(value, directPolicy);
+    } else {
+      delete value.versions[upgraded];
+    }
     return value;
   };
   const setup = `window.setupReady = new Promise((resolve,reject) => {
@@ -76,9 +86,10 @@ test("installed storage migrates once, then follows exact targets without losing
         res.statusCode = offline ? 503 : 200;
         res.end(JSON.stringify(manifest())); return;
       }
-      const artifact = /^\/tyde\/v(1\.0\.[01])\/(app\.js|app_bg\.wasm|index\.html)$/.exec(path);
+      const artifact = /^\/tyde\/v(1\.0\.[012])\/(app\.js|app_bg\.wasm|index\.html)$/.exec(path);
       if (artifact) {
         const [, version, file] = artifact;
+        if (servedClient !== null && version !== servedClient) { res.statusCode=404;res.end();return; }
         res.setHeader("Content-Type", file.endsWith(".js") ? "text/javascript" : file.endsWith(".wasm") ? "application/wasm" : "text/html");
         res.end(file === "index.html" ? "<!doctype html>" : file === "app.js" ? code(version) : tamper ? Buffer.from("tampered") : wasm);
         return;
@@ -87,7 +98,7 @@ test("installed storage migrates once, then follows exact targets without losing
       if (!path.startsWith("/tyde/") || !assets.has(asset)) { res.statusCode=404;res.end();return; }
       let body = await readFile(new URL(asset, root));
       if (legacy && asset === "loader.js") body = Buffer.from(legacyLoader);
-      if (legacy && asset === "sw.js") body = Buffer.from(body.toString().replace("tyde-loader-v10", "tyde-loader-v9"));
+      if (legacy && asset === "sw.js") body = Buffer.from(body.toString().replace("tyde-loader-v11", "tyde-loader-v9"));
       res.setHeader("Content-Type", asset.endsWith(".js") ? "text/javascript" : asset.endsWith(".css") ? "text/css" : asset.endsWith(".svg") ? "image/svg+xml" : asset.endsWith(".html") ? "text/html" : "application/json");
       res.end(body);
     } catch { res.statusCode=500;res.end("fixture failure"); }
@@ -154,7 +165,7 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}const timer=setTimeout(()=>done(false),10000);worker.addEventListener('statechange',()=>{if(worker.state==='activated'){clearTimeout(timer);done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
-    assert.ok(cacheNames.includes("tyde-loader-v10"),"updated worker precaches the new root shell");
+    assert.ok(cacheNames.includes("tyde-loader-v11"),"updated worker precaches the new root shell");
     assert.ok(!cacheNames.includes("tyde-loader-v9"),"updated worker retires only the old shell cache");
     const retained = await evaluateAsync(`const done=arguments[arguments.length-1];const r=indexedDB.open('tyde-mobile',1);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['paired_hosts','psk']);const a=tx.objectStore('paired_hosts').get('all');const b=tx.objectStore('psk').get('retained-key');tx.oncomplete=()=>{done([a.result,b.result]);db.close();};};`);
     assert.ok(retained[0]===JSON.stringify([{localHostId:"retained-host"},{localHostId:"second-host"},{localHostId:"third-host"}]) && retained[1]==="fixture-only-key","pairing and key stores remain byte-identical");
@@ -213,6 +224,69 @@ test("installed storage migrates once, then follows exact targets without losing
       assert.equal(await waitFor(`Client ${capable}`),true,"forgotten A must not block boot with two remaining pairings");
       assert.equal(await evaluate("return localStorage.getItem('tyde.loader.host-target.v1')"),null);
       assert.equal(await evaluate("return localStorage.getItem('tyde.selected-host.v1')"),null,"loader must leave host choice to picker");
+    });
+    await t.test("direct origin upgrades its served client without inventing host authority", async () => {
+      blocked = false;
+      servedClient = capable;
+      await navigate("/tyde/");
+      assert.equal(await waitFor(`Client ${capable}`),true);
+      assert.deepEqual(await evaluate(`window.__tydeLoader.selectHost('second-host');return window.__tydeLoader.confirmHostRelease('${capable}',66,'second-host');`),{status:"matching"});
+      const handoff = await evaluate("return localStorage.getItem('tyde.loader.host-target.v1');");
+      const pin = await evaluate("return localStorage.getItem('tyde.loader.version');");
+      const pairing = await evaluateAsync(`const done=arguments[arguments.length-1];const r=indexedDB.open('tyde-mobile',1);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['paired_hosts','psk']);const hosts=tx.objectStore('paired_hosts').get('all');const key=tx.objectStore('psk').get('retained-key');tx.oncomplete=()=>{done([hosts.result,key.result]);db.close();};};`);
+      servedClient = upgraded;
+      for (let launch = 0; launch < 2; launch++) {
+        await navigate("/tyde/");
+        assert.equal(await waitFor(`Client ${upgraded}`),true,"an upgraded origin must boot its declared client even when the old pin has another protocol");
+        assert.equal(await evaluate("return window.__tydeLoader.bootVersion();"),upgraded);
+        assert.equal(await evaluate("return localStorage.getItem('tyde.loader.host-target.v1');"),handoff,"loading code is not a host announcement");
+        assert.equal(await evaluate("return localStorage.getItem('tyde.loader.version');"),pin,"a disconnected boot must retain the last confirmed host pin");
+        assert.equal(await evaluate("return localStorage.getItem('tyde.selected-host.v1');"),'second-host');
+      }
+      const afterUpgrade = await evaluateAsync(`const done=arguments[arguments.length-1];const r=indexedDB.open('tyde-mobile',1);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['paired_hosts','psk']);const hosts=tx.objectStore('paired_hosts').get('all');const key=tx.objectStore('psk').get('retained-key');tx.oncomplete=()=>{done([hosts.result,key.result]);db.close();};};`);
+      assert.ok(afterUpgrade[0] === pairing[0] && afterUpgrade[1] === pairing[1],"cold upgrades must preserve pairing and key stores byte-for-byte");
+      assert.deepEqual(await evaluate(`return window.__tydeLoader.confirmHostRelease('${upgraded}',66,'second-host');`),{status:"unavailable",reason:"protocol"},"stale protocol authority cannot confirm the new client");
+      assert.deepEqual(await evaluate(`return window.__tydeLoader.confirmHostRelease('${upgraded}',67,'second-host');`),{status:"matching"});
+      await navigate("/tyde/");
+      assert.equal(await waitFor(`Client ${upgraded}`),true);
+      assert.equal(await evaluate("return JSON.parse(localStorage.getItem('tyde.loader.host-target.v1')).protocolVersion;"),67);
+    });
+    await t.test("direct client startup fails closed without discarding host pins", async () => {
+      servedClient = upgraded;
+      const handoff = await evaluate("return localStorage.getItem('tyde.loader.host-target.v1');");
+      const pin = await evaluate("return localStorage.getItem('tyde.loader.version');");
+      const cases = [
+        { policy: { servedClientRelease: capable }, text: "release manifest is malformed" },
+        { policy: { servedClientRelease: null }, text: "release manifest is malformed" },
+        { policy: { minSupported: capable }, text: "release manifest is malformed" },
+        { entry: { followsSelectedHost: undefined }, text: "release manifest is malformed" },
+        { entry: { protocolVersion: undefined }, text: "mobile client has not been published" },
+        { policy: { blocked: [upgraded] }, text: "blocked for safety" },
+        { tamper: true, text: "failed its integrity check" },
+        { offline: true, text: "Could not load the release manifest" },
+      ];
+      for (const scenario of cases) {
+        directPolicy = scenario.policy || {};
+        directEntry = scenario.entry || {};
+        tamper = scenario.tamper || false;
+        offline = scenario.offline || false;
+        if (tamper) await evaluateAsync("const done=arguments[arguments.length-1];caches.delete('tyde-bundle-v1').then(done);");
+        await navigate("/tyde/");
+        assert.equal(await waitFor(scenario.text),true);
+        assert.equal(await evaluate("return document.getElementById('app-root').textContent;"),"","a rejected declared client must never execute another version");
+        assert.equal(await evaluate("return localStorage.getItem('tyde.loader.host-target.v1');"),handoff);
+        assert.equal(await evaluate("return localStorage.getItem('tyde.loader.version');"),pin);
+      }
+      directPolicy = {}; directEntry = {}; tamper = false; offline = false;
+      await navigate("/tyde/");
+      assert.equal(await waitFor(`Client ${upgraded}`),true,"retry must read repaired policy rather than stay wedged");
+      await writeFile(manifestPath, JSON.stringify(manifest()));
+      const checker = new URL("../../../tools/check_mobile_web_manifest.py", import.meta.url).pathname;
+      const args = [checker,upgraded,"--manifest",manifestPath,"--protocol-source",protocolSource];
+      await promisify(execFile)("python3",[...args,"--direct-hosted"]);
+      await assert.rejects(promisify(execFile)("python3",args),error => error.stderr.includes("servedClientRelease"),"a direct startup declaration cannot be deployed to the shared origin");
+      await writeFile(manifestPath,JSON.stringify({...manifest(),servedClientRelease:capable}));
+      await assert.rejects(promisify(execFile)("python3",[...args,"--direct-hosted"]),error => error.stderr.includes("servedClientRelease"),"the release guard must reject an incorrect startup declaration");
     });
     await request(`/session/${session}`,null,"DELETE");session=null;
   } finally {
