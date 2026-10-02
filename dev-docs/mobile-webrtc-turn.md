@@ -85,8 +85,11 @@ TLS endpoint explicitly; absence is an error rather than a transport fallback.
 WebRTC's DTLS encryption still protects the application data end to end. TLS
 additionally authenticates the Cloudflare relay and encrypts the host-to-relay
 connection, including TURN control messages. TCP alone does not add encryption.
-Browser/mobile peers retain the browser's UDP/TCP/TLS TURN connectivity. Relays
-may exchange UDP internally; that does not require UDP access on the host.
+The service issues browser/mobile peers the same single TLS relay URL. The data
+channel is reliable and ordered and the host leg is already TCP, so UDP relays
+gave no benefit, while networks that silently drop UDP or port 3478 stalled
+browser candidate gathering past its deadline. Relays may exchange UDP
+internally; that does not require UDP access on either peer.
 
 The MQTT crate, loopback override, broker settings and credential APIs have been
 removed. Existing managed pairing records keep their identities and keys while
