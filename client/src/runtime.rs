@@ -153,6 +153,12 @@ pub enum HostEvent {
     McpServerNotify(McpServerNotifyPayload),
     MobileAccessState(MobileAccessStatePayload),
     MobilePairingOffer(MobilePairingOfferPayload),
+    SwarmNotify(protocol::SwarmNotifyPayload),
+    SwarmDraftNotify(protocol::SwarmDraftNotifyPayload),
+    SwarmPostNotify(protocol::SwarmPostNotifyPayload),
+    SwarmBoardNotify(protocol::SwarmBoardNotifyPayload),
+    SwarmThreadNotify(protocol::SwarmThreadNotifyPayload),
+    SwarmErrorNotify(protocol::SwarmErrorNotifyPayload),
     TeamNotify(TeamNotifyPayload),
     TeamsStoreStatusNotify(protocol::TeamsStoreStatusNotifyPayload),
     AgentRestorationStatus(protocol::AgentRestorationStatusPayload),
@@ -271,6 +277,12 @@ impl TerminalEvents {
 }
 
 impl HostCommands {
+    pub async fn swarm_command(
+        &self,
+        payload: protocol::SwarmCommandPayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::SwarmCommand, &payload).await
+    }
     pub async fn spawn_agent(&self, payload: SpawnAgentPayload) -> Result<(), ClientError> {
         self.send(FrameKind::SpawnAgent, &payload).await
     }
@@ -1130,6 +1142,54 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::WorkflowRunNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmNotify => {
+            let payload: protocol::SwarmNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmDraftNotify => {
+            let payload: protocol::SwarmDraftNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmDraftNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmPostNotify => {
+            let payload: protocol::SwarmPostNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmPostNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmBoardNotify => {
+            let payload: protocol::SwarmBoardNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmBoardNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmThreadNotify => {
+            let payload: protocol::SwarmThreadNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmThreadNotify(payload)).await;
+            true
+        }
+        FrameKind::SwarmErrorNotify => {
+            let payload: protocol::SwarmErrorNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SwarmErrorNotify(payload)).await;
             true
         }
         FrameKind::TeamNotify => {

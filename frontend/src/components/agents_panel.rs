@@ -5224,6 +5224,7 @@ mod wasm_tests {
             .find(|(kind, _, _)| kind == "agent_move")
             .unwrap();
         let start = protocol::AgentStartPayload {
+            swarm_membership: None,
             agent_id: AgentId("move-me".to_owned()),
             name: "Moving agent".to_owned(),
             origin: AgentOrigin::User,
@@ -5362,6 +5363,7 @@ mod wasm_tests {
                 request_id: payload["request_id"].as_str().unwrap().to_owned(),
                 agent_id: AgentId("move-me".to_owned()),
                 result: Ok(protocol::AgentStartPayload {
+                    swarm_membership: None,
                     project_id: None,
                     ..start
                 }),
@@ -5568,6 +5570,7 @@ mod wasm_tests {
             FrameKind::NewAgent,
             host_seq,
             &NewAgentPayload {
+                swarm_membership: None,
                 agent_id: AgentId(agent_id.to_owned()),
                 name: name.to_owned(),
                 origin: AgentOrigin::User,
@@ -5595,6 +5598,7 @@ mod wasm_tests {
             host_id,
             &agent_stream(agent_id),
             &protocol::AgentStartPayload {
+                swarm_membership: None,
                 agent_id: AgentId(agent_id.to_owned()),
                 name: name.to_owned(),
                 origin: AgentOrigin::User,

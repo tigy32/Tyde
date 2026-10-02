@@ -804,6 +804,7 @@ impl AgentRegistry {
             }
         }
         let start = AgentStartPayload {
+            swarm_membership: request.resolved_spawn_config.swarm_membership.clone(),
             agent_id: agent_id.clone(),
             name: request.name.clone(),
             origin: request.origin,
@@ -860,6 +861,7 @@ impl AgentRegistry {
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         let start = AgentStartPayload {
+            swarm_membership: None,
             agent_id: agent_id.clone(),
             name: request.name.clone(),
             origin: request.origin,

@@ -490,6 +490,7 @@ fn origin_label(origin: AgentOrigin) -> &'static str {
         AgentOrigin::AgentControl => "Agent control",
         AgentOrigin::BackendNative => "Native",
         AgentOrigin::TeamMember => "Team",
+        AgentOrigin::SwarmMember => "Swarm",
         AgentOrigin::Workflow => "Workflow",
     }
 }
@@ -609,11 +610,12 @@ const BACKENDS: [BackendKind; 6] = [
     BackendKind::Grok,
 ];
 
-const ORIGINS: [AgentOrigin; 5] = [
+const ORIGINS: [AgentOrigin; 6] = [
     AgentOrigin::User,
     AgentOrigin::AgentControl,
     AgentOrigin::BackendNative,
     AgentOrigin::TeamMember,
+    AgentOrigin::SwarmMember,
     AgentOrigin::Workflow,
 ];
 

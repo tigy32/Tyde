@@ -200,6 +200,8 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             team_templates: Vec::new(),
         },
         team_drafts: Vec::new(),
+        swarms: Vec::new(),
+        swarm_drafts: Vec::new(),
         teams: Vec::new(),
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
@@ -3069,10 +3071,163 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
+            Ok(payload) => {
+                let swarm = payload.swarm;
+                state.swarms.update(|map| {
+                    map.entry(host_id.to_string())
+                        .or_default()
+                        .insert(swarm.id.clone(), swarm);
+                });
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse swarm_notify payload: {error}"),
+            ),
+        },
+        FrameKind::SwarmDraftNotify => {
+            match envelope.parse_payload::<protocol::SwarmDraftNotifyPayload>() {
+                Ok(payload) => apply_swarm_draft_notify(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_draft_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::SwarmPostNotify => {
+            match envelope.parse_payload::<protocol::SwarmPostNotifyPayload>() {
+                Ok(payload) => {
+                    let post = payload.post;
+                    state.swarm_posts.update(|map| {
+                        map.entry((host_id.to_string(), post.swarm_id.clone()))
+                            .or_default()
+                            .posts
+                            .insert(post.id.clone(), post);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_post_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::SwarmBoardNotify => {
+            match envelope.parse_payload::<protocol::SwarmBoardNotifyPayload>() {
+                Ok(payload) => {
+                    let page = payload.page;
+                    state.swarm_posts.update(|map| {
+                        map.entry((host_id.to_string(), page.swarm_id.clone()))
+                            .or_default()
+                            .apply_board_page(page);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_board_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::SwarmThreadNotify => {
+            match envelope.parse_payload::<protocol::SwarmThreadNotifyPayload>() {
+                Ok(payload) => {
+                    let page = payload.page;
+                    state.swarm_posts.update(|map| {
+                        map.entry((host_id.to_string(), page.swarm_id.clone()))
+                            .or_default()
+                            .apply_thread_page(page);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_thread_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::SwarmErrorNotify => {
+            match envelope.parse_payload::<protocol::SwarmErrorNotifyPayload>() {
+                Ok(error) => {
+                    log::warn!(
+                        "swarm error host={} code={:?} swarm={:?} draft={:?}",
+                        host_id,
+                        error.code,
+                        error.swarm_id,
+                        error.draft_id
+                    );
+                    state.swarm_errors.update(|errors| {
+                        let serial = errors
+                            .iter()
+                            .map(|entry| entry.serial + 1)
+                            .max()
+                            .unwrap_or(0);
+                        errors.push(crate::state::SwarmErrorEntry {
+                            host_id: host_id.to_string(),
+                            serial,
+                            error,
+                        });
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_error_notify payload: {error}"),
+                ),
+            }
+        }
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
     }
+}
+
+/// A new revision of a draft supersedes errors raised against the earlier
+/// revision, and a deleted draft has nothing left to report against; the
+/// dialog renders the current draft's own `conflicts`.
+fn apply_swarm_draft_notify(
+    state: &AppState,
+    host_id: &str,
+    payload: protocol::SwarmDraftNotifyPayload,
+) {
+    let draft_id = match payload {
+        protocol::SwarmDraftNotifyPayload::Upsert { draft } => {
+            let draft_id = draft.id.clone();
+            state.swarm_drafts.update(|map| {
+                map.entry(host_id.to_string())
+                    .or_default()
+                    .insert(draft.id.clone(), *draft);
+            });
+            draft_id
+        }
+        protocol::SwarmDraftNotifyPayload::Delete { draft_id } => {
+            state.swarm_drafts.update(|map| {
+                if let Some(drafts) = map.get_mut(host_id) {
+                    drafts.remove(&draft_id);
+                }
+            });
+            draft_id
+        }
+    };
+    state.swarm_errors.update(|errors| {
+        errors.retain(|entry| {
+            entry.host_id != host_id || entry.error.draft_id.as_ref() != Some(&draft_id)
+        })
+    });
 }
 
 fn apply_native_settings_write_result(
@@ -6680,6 +6835,24 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_map.insert(draft.id.clone(), draft);
         }
     });
+    state.swarms.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for swarm in payload.swarms {
+            host_map.insert(swarm.id.clone(), swarm);
+        }
+    });
+    state.swarm_drafts.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for draft in payload.swarm_drafts {
+            host_map.insert(draft.id.clone(), draft);
+        }
+    });
+    // Board pages are re-read by each open swarm view after a (re)attach.
+    state
+        .swarm_posts
+        .update(|map| map.retain(|(post_host, _), _| post_host != host_id));
     state.teams.update(|map| {
         let host_map = map.entry(host_id.to_string()).or_default();
         host_map.clear();
@@ -7409,6 +7582,8 @@ pub(crate) mod restore_fixtures {
                     team_templates: Vec::new(),
                 },
                 team_drafts: Vec::new(),
+                swarms: Vec::new(),
+                swarm_drafts: Vec::new(),
                 teams: Vec::new(),
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
@@ -7465,6 +7640,7 @@ pub(crate) mod restore_fixtures {
         session: Option<&str>,
     ) -> NewAgentPayload {
         NewAgentPayload {
+            swarm_membership: None,
             agent_id: AgentId(agent.to_owned()),
             name: format!("Agent {agent}"),
             origin: AgentOrigin::User,

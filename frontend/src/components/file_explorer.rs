@@ -1182,31 +1182,94 @@ mod wasm_tests {
     /// off must actually win, which an earlier block in the file does not.
     #[wasm_bindgen_test]
     async fn the_reduced_motion_rule_for_menus_is_not_overridden() {
-        // A media query cannot be forced on in a headless browser, so this
-        // asserts the property that made the first attempt useless: the rule
-        // that disables the animation has the same specificity as the rule that
-        // sets it, so it only wins if it comes *later* in the sheet.
-        let source = PROD_STYLES;
-        let animates = source
-            .rfind(".context-menu {")
-            .expect("the menu carries the animation");
-        let reduced = source
-            .rfind("@media (prefers-reduced-motion: reduce)")
-            .expect("reduced motion is honored");
-        assert!(
-            reduced > animates,
-            "the reduced-motion block must come after the rule it overrides, or \
-             source order silently beats it"
+        // The later swarm media block correctly affects only its spinner, not
+        // menus. Selecting the last media block rejected valid CSS. Activate
+        // the browser-parsed production media rules in an isolated document so
+        // the computed cascade, including source order, is the assertion.
+        let container = make_container();
+        let mount_root = js_sys::Function::new_with_args(
+            "container",
+            r#"
+                const frame = document.createElement('iframe');
+                container.appendChild(frame);
+                // Adoption retains the outer realm's HTMLElement prototype.
+                const root = document.createElement('div');
+                frame.contentDocument.body.appendChild(root);
+                return root;
+            "#,
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, container.as_ref())
+        .expect("create an isolated menu document")
+        .dyn_into::<HtmlElement>()
+        .expect("menu mount root");
+        let _handle = mount_to(mount_root.clone(), move || {
+            use crate::components::card_menu::CardContextMenu;
+            view! {
+                <CardContextMenu
+                    menu=RwSignal::new(Some((8.0, 8.0)))
+                    label="File actions"
+                    anchor=NodeRef::new()
+                >
+                    <button class="context-menu-item" role="menuitem">"Open file"</button>
+                </CardContextMenu>
+            }
+        });
+        next_tick().await;
+        let probe = js_sys::Function::new_with_args(
+            "root, css",
+            r#"
+                const doc = root.ownerDocument;
+                const frame = doc.defaultView.frameElement;
+                try {
+                    const style = doc.createElement('style');
+                    style.textContent = css;
+                    doc.head.appendChild(style);
+                    const menu = root.querySelector('[role="menu"]');
+                    if (!menu) throw new Error('Production menu did not render');
+                    const reducedRules = Array.from(style.sheet.cssRules).filter(
+                        rule => rule.conditionText === '(prefers-reduced-motion: reduce)'
+                    );
+                    const setReduced = enabled => {
+                        for (const rule of reducedRules) {
+                            rule.media.mediaText = enabled ? 'all' : 'not all';
+                        }
+                        return frame.contentWindow.getComputedStyle(menu).animationName;
+                    };
+                    return [setReduced(false), setReduced(true), setReduced(false), reducedRules.length];
+                } finally {
+                    frame.remove();
+                }
+            "#,
         );
-        let block = &source[reduced..];
-        assert!(
-            block.contains(".context-menu"),
-            "it must name the element that actually animates — the menus inherit \
-             `menu-in` from .context-menu, not from their own classes"
+        let observed = probe
+            .call2(
+                &wasm_bindgen::JsValue::NULL,
+                mount_root.as_ref(),
+                &wasm_bindgen::JsValue::from_str(PROD_STYLES),
+            )
+            .expect("render the production menu stylesheet")
+            .dyn_into::<js_sys::Array>()
+            .expect("computed menu animation states");
+        let normal = observed.get(0).as_string().unwrap();
+        let reduced = observed.get(1).as_string().unwrap();
+        let restored = observed.get(2).as_string().unwrap();
+        let media_rules = observed.get(3).as_f64().unwrap();
+        console_log!(
+            "menu motion cascade: media_rules={}, normal={}, reduced={}, restored={}",
+            media_rules,
+            normal,
+            reduced,
+            restored
         );
-        assert!(
-            block.contains("animation: none"),
-            "and it must actually turn the animation off"
+        assert!(media_rules > 0.0, "production honors reduced motion");
+        assert_eq!(normal, "menu-in", "ordinary menus retain their animation");
+        assert_eq!(
+            reduced, "none",
+            "the production reduced-motion rule must win the actual menu cascade"
+        );
+        assert_eq!(
+            restored, "menu-in",
+            "only reduced motion disables animation"
         );
     }
 

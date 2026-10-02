@@ -61,9 +61,9 @@
   },
   {
     "slug": "delegation",
-    "title": "Subagents and teams",
+    "title": "Swarms and delegation",
     "part": "Hosts and configuration",
-    "description": "Configure delegation, ask an agent to create a Tyde subagent, and inspect the delegated conversation."
+    "description": "Talk to a group through shared swarm boards, configure its constraints, or delegate work to a Tyde subagent."
   },
   {
     "slug": "workflows",

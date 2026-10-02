@@ -108,6 +108,8 @@ exhaustive_capabilities! {
     ContextBreakdownReported,
     CompactionReported,
     Subagents,
+    ExcludeAgentDelegation,
+    EnforcedReadOnly,
     NativeSubagentWaitProgress,
     ForegroundSubagents,
     BackgroundSubagents,

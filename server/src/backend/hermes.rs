@@ -1178,6 +1178,9 @@ impl Backend for HermesBackend {
         for category in categories {
             match category {
                 protocol::ToolCategory::AskUser => {}
+                protocol::ToolCategory::AgentDelegation => {
+                    return Err("Backend cannot enforce agent-delegation exclusion".into());
+                }
             }
         }
         Ok(())
@@ -4090,9 +4093,12 @@ impl HermesGatewayHandle {
             .excluded_tool_categories
             .iter()
             .map(|category| match category {
-                protocol::ToolCategory::AskUser => "clarify",
+                protocol::ToolCategory::AskUser => Ok("clarify"),
+                protocol::ToolCategory::AgentDelegation => {
+                    Err("Hermes cannot enforce delegation exclusion".to_owned())
+                }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         if target.remote_host.is_some() && !excluded_toolsets.is_empty() {
             return Err("Hermes tool category exclusions require a host-local runtime".to_owned());
         }

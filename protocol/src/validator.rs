@@ -693,6 +693,12 @@ impl ProtocolValidator {
             FrameKind::McpServerNotify => {
                 parse_host_payload::<McpServerNotifyPayload>(self, envelope, "McpServerNotify")
             }
+            FrameKind::SwarmNotify => parse_host_payload::<crate::types::SwarmNotifyPayload>(self, envelope, "SwarmNotify"),
+            FrameKind::SwarmDraftNotify => parse_host_payload::<crate::types::SwarmDraftNotifyPayload>(self, envelope, "SwarmDraftNotify"),
+            FrameKind::SwarmPostNotify => parse_host_payload::<crate::types::SwarmPostNotifyPayload>(self, envelope, "SwarmPostNotify"),
+            FrameKind::SwarmBoardNotify => parse_host_payload::<crate::types::SwarmBoardNotifyPayload>(self, envelope, "SwarmBoardNotify"),
+            FrameKind::SwarmThreadNotify => parse_host_payload::<crate::types::SwarmThreadNotifyPayload>(self, envelope, "SwarmThreadNotify"),
+            FrameKind::SwarmErrorNotify => parse_host_payload::<crate::types::SwarmErrorNotifyPayload>(self, envelope, "SwarmErrorNotify"),
             FrameKind::TeamNotify => {
                 parse_host_payload::<TeamNotifyPayload>(self, envelope, "TeamNotify")
             }
@@ -919,6 +925,7 @@ impl ProtocolValidator {
             FrameKind::McpServerDelete => {
                 parse_host_payload::<McpServerDeletePayload>(self, envelope, "McpServerDelete")
             }
+            FrameKind::SwarmCommand => parse_host_payload::<crate::types::SwarmCommandPayload>(self, envelope, "SwarmCommand"),
             FrameKind::TeamCreate => {
                 parse_host_payload::<TeamCreatePayload>(self, envelope, "TeamCreate")
             }
@@ -1127,6 +1134,7 @@ impl ProtocolValidator {
                     payload.team_id.as_ref(),
                     payload.team_member_id.as_ref(),
                     payload.workflow.as_ref(),
+                    payload.swarm_membership.as_ref(),
                 ) {
                     return Err(build_violation(
                         &recent_frames,
@@ -1368,6 +1376,7 @@ impl ProtocolValidator {
             payload.team_id.as_ref(),
             payload.team_member_id.as_ref(),
             payload.workflow.as_ref(),
+            payload.swarm_membership.as_ref(),
         )
         .map_err(|message| self.violation(envelope, Some(payload.backend_kind), message))?;
 
@@ -1646,7 +1655,11 @@ fn validate_agent_origin(
     team_id: Option<&crate::TeamId>,
     team_member_id: Option<&crate::TeamMemberId>,
     workflow: Option<&crate::AgentWorkflowMetadata>,
+    swarm_membership: Option<&crate::SwarmMembership>,
 ) -> Result<(), String> {
+    if (origin == AgentOrigin::SwarmMember) != swarm_membership.is_some() {
+        return Err("swarm_member origin and swarm membership must be present together".to_owned());
+    }
     match origin {
         AgentOrigin::BackendNative if parent_agent_id.is_none() => {
             Err("backend_native agents must include parent_agent_id".to_owned())
@@ -1658,6 +1671,7 @@ fn validate_agent_origin(
             Err("workflow agents must include workflow metadata".to_owned())
         }
         AgentOrigin::User
+        | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative
         | AgentOrigin::Workflow
@@ -1666,6 +1680,7 @@ fn validate_agent_origin(
             Err("non-team_member agents must not include team_id or team_member_id".to_owned())
         }
         AgentOrigin::User
+        | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative
         | AgentOrigin::TeamMember
@@ -1674,6 +1689,7 @@ fn validate_agent_origin(
             Err("non-workflow agents must not include workflow metadata".to_owned())
         }
         AgentOrigin::User
+        | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative
         | AgentOrigin::TeamMember
@@ -1877,6 +1893,7 @@ fn validate_agent_bootstrap_event(
                 payload.team_id.as_ref(),
                 payload.team_member_id.as_ref(),
                 payload.workflow.as_ref(),
+                payload.swarm_membership.as_ref(),
             )
             .map_err(|message| {
                 build_violation(recent_frames, envelope, Some(state.backend_kind), message)

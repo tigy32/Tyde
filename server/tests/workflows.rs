@@ -1149,6 +1149,13 @@ async fn workflow_save_allows_read_only_guidance_mode() {
     let _global = GlobalWorkflowsEnv::new().await;
     let project_root = tempfile::tempdir().expect("create project root");
     let mut fixture = Fixture::new().await;
+    fixture
+        .host_for_test()
+        .set_session_schema_unavailable_for_test(
+            BackendKind::Codex,
+            "ordinary caller schema intentionally unavailable",
+        )
+        .await;
     let readonly = spawn_test_agent(
         &mut fixture.client,
         project_root.path(),
@@ -1157,6 +1164,30 @@ async fn workflow_save_allows_read_only_guidance_mode() {
         "readonly-author",
     )
     .await;
+    // A fatal native startup parks an ordinary actor without revoking its
+    // registered management authority; await that boundary, not just NewAgent.
+    let failure: protocol::AgentErrorPayload = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "ordinary author is parked after native startup failure",
+        |env| {
+            env.stream == readonly.instance_stream
+                && env.kind == FrameKind::AgentError
+                && env
+                    .parse_payload::<protocol::AgentErrorPayload>()
+                    .is_ok_and(|error| error.fatal)
+        },
+    )
+    .await
+    .parse_payload()
+    .expect("parse ordinary author's terminal startup failure");
+    assert!(
+        failure.fatal
+            && failure
+                .message
+                .contains("ordinary caller schema intentionally unavailable"),
+        "ordinary MCP positive control must actually be parked after the requested schema failure"
+    );
+    assert_eq!(fixture.agent_ids().await.len(), 1);
     let agent_control_url = fixture.agent_control_http_url().await;
     let target_file = _global.path().join("readonly.md");
 

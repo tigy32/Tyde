@@ -18,6 +18,7 @@ use crate::components::home_view::HomeView;
 use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
 use crate::components::review_view::ReviewCommentsSurface;
 use crate::components::settings_panel::SettingsPanel;
+use crate::components::swarm_view::SwarmView;
 use crate::components::workflow_view::WorkflowView;
 use crate::send::send_frame;
 use crate::state::{
@@ -25,7 +26,7 @@ use crate::state::{
     TabContent, TabId, ToolCallId,
 };
 
-use protocol::{FrameKind, ProjectId, SetAgentNamePayload};
+use protocol::{FrameKind, ProjectId, SetAgentNamePayload, SwarmId};
 
 /// Minimum width of one editor pane. Enforced three independent ways
 /// (dev-docs/32 §11): this constant feeds the split-availability check and the
@@ -874,6 +875,7 @@ enum TabRenderKey {
     Diff(DiffKey),
     Comments(String, ProjectId),
     Workflow(ActiveAgentRef, ToolCallId),
+    Swarm(String, SwarmId),
     Missing,
 }
 
@@ -922,6 +924,9 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                     agent_ref,
                     tool_call_id,
                 }) => TabRenderKey::Workflow(agent_ref.clone(), tool_call_id.clone()),
+                Some(TabContent::Swarm { host_id, swarm_id }) => {
+                    TabRenderKey::Swarm(host_id.clone(), swarm_id.clone())
+                }
                 None => TabRenderKey::Missing,
             }
         })
@@ -1001,6 +1006,10 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                     }
                     TabRenderKey::Workflow(agent_ref, tool_call_id) => {
                         view! { <WorkflowView agent_ref=agent_ref tool_call_id=tool_call_id /> }.into_any()
+                    }
+                    TabRenderKey::Swarm(host_id, swarm_id) => {
+                        let visible: Signal<bool> = Signal::derive(is_active);
+                        view! { <SwarmView host_id=host_id swarm_id=swarm_id visible=visible /> }.into_any()
                     }
                     // A tab whose content vanished is an explicit state, not a
                     // blank pane (plan §3.8).

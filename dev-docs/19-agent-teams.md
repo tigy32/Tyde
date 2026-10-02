@@ -1,8 +1,8 @@
 # Agent Teams
 
-For the proposed evolution from manager/report teams to peer groups with
-shared Briefing and Coordination boards, see [Agent Swarms](proposals/agent-swarms.md).
-That proposal is not implemented; this document still describes Teams.
+For the desktop evolution to peer groups with shared Briefing and Coordination
+boards, see [Agent Swarms](proposals/agent-swarms.md). This document describes
+legacy Teams, retained until explicitly converted; it is not the swarm contract.
 
 Spec for **Agent Teams**: persistent, server-owned teams of agents
 organized as one manager and N direct reports. The user opens a chat

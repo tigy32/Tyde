@@ -4191,31 +4191,68 @@ fn directory_has_inotify_watch(path: &Path) -> bool {
 }
 
 async fn expect_watched_change(client: &mut client::Connection, relative_path: &str) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    expect_watched_change_at_phase(client, relative_path, "native change").await;
+}
+
+async fn expect_watched_change_at_phase(
+    client: &mut client::Connection,
+    relative_path: &str,
+    phase: &'static str,
+) {
+    let mut frames = 0;
+    let mut change_batches = 0;
+    let mut changed_paths = 0;
+    let mut listings = 0;
+    let mut target_listed = false;
+    eprintln!("PROJECT WATCH PHASE begin={phase}");
+    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let env = client
                 .next_event()
                 .await
                 .expect("project event")
                 .expect("open connection");
+            frames += 1;
             assert_ne!(
                 env.kind,
                 FrameKind::CommandError,
                 "watching failed: {env:?}"
             );
-            if env.kind == FrameKind::ProjectEvent
-                && let protocol::ProjectEventPayload::FilesChanged { files } =
-                    env.parse_payload().expect("file changes")
-                && files
-                    .iter()
-                    .any(|change| change.path.relative_path == relative_path)
-            {
-                return;
+            match env.kind {
+                FrameKind::ProjectEvent => {
+                    if let protocol::ProjectEventPayload::FilesChanged { files } =
+                        env.parse_payload().expect("file changes")
+                    {
+                        change_batches += 1;
+                        changed_paths += files.len();
+                        if files
+                            .iter()
+                            .any(|change| change.path.relative_path == relative_path)
+                        {
+                            return;
+                        }
+                    }
+                }
+                FrameKind::ProjectFileList => {
+                    let listing: ProjectFileListPayload =
+                        env.parse_payload().expect("watch phase file listing");
+                    listings += 1;
+                    target_listed |= listing.roots.iter().any(|root| {
+                        root.entries.iter().any(|entry| {
+                            entry.relative_path == relative_path && entry.op == FileEntryOp::Add
+                        })
+                    });
+                }
+                _ => {}
             }
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("live update missing for {relative_path}"));
+    .await;
+    eprintln!(
+        "PROJECT WATCH PHASE end={phase} delivered={} frames={frames} change_batches={change_batches} changed_paths={changed_paths} listings={listings} target_listed={target_listed}",
+        outcome.is_ok()
+    );
+    outcome.unwrap_or_else(|_| panic!("live update missing for {relative_path}, phase={phase}"));
 }
 
 async fn assert_no_watched_changes(client: &mut client::Connection, paths: &[&str]) {
@@ -4747,9 +4784,15 @@ async fn project_watcher_prunes_ignored_build_trees() {
     fs::write(repo.path().join("fresh/deep/new.rs"), "second\n").unwrap();
     expect_watched_change(&mut fixture.client, "fresh/deep/new.rs").await;
     fs::rename(repo.path().join("fresh"), repo.path().join("moved")).unwrap();
-    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    expect_watched_change_at_phase(&mut fixture.client, "moved/deep/new.rs", "directory rename")
+        .await;
     fs::write(repo.path().join("moved/deep/new.rs"), "after move\n").unwrap();
-    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    expect_watched_change_at_phase(
+        &mut fixture.client,
+        "moved/deep/new.rs",
+        "write after directory rename",
+    )
+    .await;
 
     write_file(&repo.path().join("shape"), "was a file\n");
     expect_watched_change(&mut fixture.client, "shape").await;
@@ -4810,7 +4853,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
     fs::write(repo.path().join(".gitignore"), "/target/\n/tracked/\n").unwrap();
     expect_watched_change(&mut fixture.client, ".gitignore").await;
     fs::write(repo.path().join("moved/deep/new.rs"), "visible again\n").unwrap();
-    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    expect_watched_change_at_phase(
+        &mut fixture.client,
+        "moved/deep/new.rs",
+        "write after root ignore removed",
+    )
+    .await;
 
     write_file(&repo.path().join("moved/.gitignore"), "deep/\n");
     expect_watched_change(&mut fixture.client, "moved/.gitignore").await;
@@ -4826,7 +4874,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
         "nested rule removed\n",
     )
     .unwrap();
-    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    expect_watched_change_at_phase(
+        &mut fixture.client,
+        "moved/deep/new.rs",
+        "write after nested ignore removed",
+    )
+    .await;
 
     fs::write(repo.path().join(".git/info/exclude"), "moved/\n").unwrap();
     #[cfg(target_os = "linux")]
@@ -4838,7 +4891,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
     .await
     .expect("repository excludes must release watches");
     fs::write(repo.path().join(".git/info/exclude"), "").unwrap();
-    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    expect_watched_change_at_phase(
+        &mut fixture.client,
+        "moved/deep/new.rs",
+        "repository exclusion removed",
+    )
+    .await;
 
     fixture
         .client

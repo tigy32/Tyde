@@ -719,6 +719,14 @@ pub async fn cancel_workflow(
     .await
 }
 
+pub async fn swarm_command(
+    host_id: &str,
+    host_stream: StreamPath,
+    command: protocol::SwarmCommandPayload,
+) -> Result<(), String> {
+    send_frame(host_id, host_stream, FrameKind::SwarmCommand, &command).await
+}
+
 pub async fn team_delete(host_id: &str, host_stream: StreamPath, id: TeamId) -> Result<(), String> {
     send_frame(
         host_id,

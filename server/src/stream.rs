@@ -716,6 +716,9 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SteeringNotify
         | FrameKind::SkillNotify
         | FrameKind::McpServerNotify
+        | FrameKind::SwarmNotify
+        | FrameKind::SwarmDraftNotify
+        | FrameKind::SwarmPostNotify
         | FrameKind::TeamNotify
         | FrameKind::TeamsStoreStatusNotify
         | FrameKind::AgentRestorationStatus
@@ -731,7 +734,9 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::WorkflowNotify
         | FrameKind::WorkflowRunNotify
         | FrameKind::AgentClosed => OutputLane::Chat,
-        FrameKind::ProjectGitDiff
+        FrameKind::SwarmBoardNotify
+        | FrameKind::SwarmThreadNotify
+        | FrameKind::ProjectGitDiff
         | FrameKind::ProjectGitStatus
         | FrameKind::ProjectFileContents
         | FrameKind::ProjectFileList
@@ -885,6 +890,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::TerminalError
         | FrameKind::HostBrowseOpened
         | FrameKind::HostBrowseError
+        | FrameKind::SwarmCommand
+        | FrameKind::SwarmErrorNotify
         | FrameKind::CommandError
         | FrameKind::BackendCapacity
         | FrameKind::MobileAccessState

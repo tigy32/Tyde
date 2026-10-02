@@ -206,7 +206,18 @@ struct AgentNameChangeContext<'a> {
     subscribers: &'a mut Vec<Stream>,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+pub(crate) struct SwarmStartupTestGates {
+    pub reservation: Option<Arc<crate::host::SpawnOperationTestGateInner>>,
+    pub session: Option<Arc<crate::host::SpawnOperationTestGateInner>>,
+    pub stopped: tokio_util::sync::CancellationToken,
+}
+
 pub(crate) struct AgentActorRuntimeContext {
+    #[cfg(feature = "test-support")]
+    pub swarm_startup_test_gates: SwarmStartupTestGates,
+    pub(crate) startup_admission: Option<oneshot::Receiver<()>>,
     pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
@@ -223,6 +234,9 @@ pub(crate) struct AgentActorRuntimeContext {
 }
 
 pub(crate) struct AgentActorRuntimeResources {
+    #[cfg(feature = "test-support")]
+    pub swarm_startup_test_gates: SwarmStartupTestGates,
+    pub(crate) startup_admission: Option<oneshot::Receiver<()>>,
     pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
@@ -245,6 +259,9 @@ impl AgentActorRuntimeResources {
         status_handle: registry::AgentStatusHandle,
     ) -> AgentActorRuntimeContext {
         AgentActorRuntimeContext {
+            #[cfg(feature = "test-support")]
+            swarm_startup_test_gates: self.swarm_startup_test_gates,
+            startup_admission: self.startup_admission,
             session_store: self.session_store,
             transcript_store: self.transcript_store,
             host_sub_agent_spawn_tx: self.host_sub_agent_spawn_tx,
@@ -265,6 +282,7 @@ impl AgentActorRuntimeResources {
 /// How a steer message treats the turn that is running when it arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunningTurnRedirect {
+    IdleOnly,
     /// Join the turn natively; interrupt it and send next when the backend
     /// cannot take the message mid-turn. The chat input's Steer action.
     SteerElseInterrupt,
@@ -282,7 +300,7 @@ enum AgentCommand {
     DeliverMessage {
         input: AgentInput,
         redirect: RunningTurnRedirect,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
     },
     Compact {
         summary_prompt: String,
@@ -641,6 +659,7 @@ pub(crate) struct AgentHandle {
     processes: crate::backend::subprocess::ProcessOwner,
     actor_abort: tokio::task::AbortHandle,
     actor_status: registry::AgentStatusHandle,
+    startup_ready: tokio_util::sync::CancellationToken,
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
@@ -1286,6 +1305,30 @@ impl AgentHandle {
         self.accepting_input.store(false, Ordering::SeqCst);
     }
 
+    pub(crate) async fn wait_for_swarm_startup_ready(&self) {
+        self.startup_ready.cancelled().await;
+    }
+
+    pub(crate) fn enqueue_swarm_message(
+        &self,
+        payload: SendMessagePayload,
+    ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
+        self.enqueue_delivery(
+            AgentInput::SendMessage(payload),
+            RunningTurnRedirect::IdleOnly,
+        )
+    }
+
+    pub(crate) fn enqueue_message(
+        &self,
+        payload: SendMessagePayload,
+    ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
+        self.enqueue_delivery(
+            AgentInput::SendMessage(payload),
+            RunningTurnRedirect::SteerElseInterrupt,
+        )
+    }
+
     /// Delivers an agent-control follow-up and waits for the actor's own
     /// acceptance.
     ///
@@ -1341,26 +1384,33 @@ impl AgentHandle {
         input: AgentInput,
         redirect: RunningTurnRedirect,
     ) -> Result<(), String> {
+        let receipt = self
+            .enqueue_delivery(input, redirect)
+            .map_err(|error| error.to_string())?;
+        receipt.wait().await.map_err(|error| error.to_string())
+    }
+
+    fn enqueue_delivery(
+        &self,
+        input: AgentInput,
+        redirect: RunningTurnRedirect,
+    ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
         if self.closing.load(Ordering::SeqCst) {
-            return Err(DELIVERY_REJECTED_CLOSING.to_owned());
+            return Err(AgentDeliveryFailure::Rejected(
+                DELIVERY_REJECTED_CLOSING.to_owned(),
+            ));
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
+        let (reply, receipt) = oneshot::channel();
+        self.tx
             .send(AgentCommand::DeliverMessage {
                 input,
                 redirect,
-                reply: reply_tx,
+                reply,
             })
-            .is_err()
-        {
-            return Err(DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned());
-        }
-        // A dropped acknowledgement means the actor ended without resolving the
-        // delivery. Fail closed: the caller must never read that as delivered.
-        reply_rx
-            .await
-            .unwrap_or_else(|_| Err(DELIVERY_NOT_ACKNOWLEDGED.to_owned()))
+            .map_err(|_| {
+                AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned())
+            })?;
+        Ok(AgentDeliveryReceipt(receipt))
     }
 
     pub fn begin_compact(
@@ -2746,6 +2796,7 @@ async fn spawn_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
 ) -> BackendSpawnResult {
+    B::validate_access_mode(config.resolved_spawn_config.access_mode)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::spawn(workspace_roots, config, initial_input).await?;
     let session_id = Backend::session_id(&backend);
@@ -2774,6 +2825,7 @@ async fn resume_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     session_id: SessionId,
 ) -> BackendResumeResult {
+    B::validate_access_mode(config.resolved_spawn_config.access_mode)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::resume(workspace_roots, config, session_id).await?;
     Ok((Box::new(backend), events))
@@ -2811,6 +2863,8 @@ async fn fork_through_trait<B: Backend>(
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
 ) -> BackendForkResult {
+    B::validate_access_mode(config.resolved_spawn_config.access_mode)
+        .map_err(BackendStartupError::backend_failed)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)
         .map_err(BackendStartupError::backend_failed)?;
     let (backend, events) =
@@ -2826,6 +2880,9 @@ pub(crate) fn spawn_agent_actor(
     runtime: AgentActorRuntimeContext,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
     let AgentActorRuntimeContext {
+        #[cfg(feature = "test-support")]
+        swarm_startup_test_gates,
+        startup_admission,
         session_store,
         transcript_store,
         host_sub_agent_spawn_tx,
@@ -2861,8 +2918,18 @@ pub(crate) fn spawn_agent_actor(
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
+    let startup_ready = tokio_util::sync::CancellationToken::new();
+    let actor_startup_ready = startup_ready.clone();
+    let ready_completion = actor_startup_ready.clone().drop_guard();
     let actor_task = crate::backend::subprocess::spawn(async move {
+        let ready_completion = ready_completion;
         actor_processes.scope(async move {
+        if let Some(admission) = startup_admission
+            && admission.await.is_err()
+        {
+            let _ = startup_tx.send(Err("Swarm startup admission was withdrawn".into()));
+            return;
+        }
         let ResolvedSpawnRequest {
             parent_session_id,
             restoration,
@@ -2984,6 +3051,17 @@ pub(crate) fn spawn_agent_actor(
         } else {
             Vec::new()
         };
+        #[cfg(feature = "test-support")]
+        if current_start.swarm_membership.is_some() && resume_session_id.is_none() && startup_failure.is_none()
+            && let Some(gate) = &swarm_startup_test_gates.reservation
+        {
+            tracing::warn!("Swarm startup boundary diagnostic: durable reservation before provider startup");
+            tokio::select! {
+                biased;
+                () = swarm_startup_test_gates.stopped.cancelled() => return,
+                () = crate::host::wait_for_spawn_operation_test_gate_inner(gate) => {},
+            }
+        }
         if let Some(session_id) = resume_session_id.as_ref() {
             status_handle
                 .bind_recovery(Arc::clone(&session_store), session_id.clone())
@@ -3344,7 +3422,11 @@ pub(crate) fn spawn_agent_actor(
                                 ),
                             }
                         }
-                        AgentCommand::DeliverMessage { input, reply, .. } => {
+                        AgentCommand::DeliverMessage { input, redirect, reply } => {
+                            if redirect == RunningTurnRedirect::IdleOnly {
+                                let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                continue;
+                            }
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
@@ -3368,7 +3450,7 @@ pub(crate) fn spawn_agent_actor(
                                     let _ = reply.send(Ok(()));
                                 }
                                 Err(_) => {
-                                    let _ = reply.send(Err(DELIVERY_REJECTED_UNRECORDED.to_owned()));
+                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_UNRECORDED.to_owned())));
                                 }
                             }
                         }
@@ -3582,6 +3664,29 @@ pub(crate) fn spawn_agent_actor(
         {
             Ok(restore_state) => restore_state,
             Err(err) => {
+                if current_start.swarm_membership.is_some() {
+                    tracing::error!("Failed to persist owned swarm session startup state; activation stopped");
+                    if let Some(backend) = backend.take() {
+                        backend.shutdown().await;
+                    }
+                    let payload = AgentErrorPayload {
+                        agent_id: current_start.agent_id.clone(),
+                        code: AgentErrorCode::Internal,
+                        message: format!("Cannot persist swarm session ownership: {err}"),
+                        fatal: true,
+                    };
+                    append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentStart, &current_start).await;
+                    append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &payload).await;
+                    status_handle.update(|status| {
+                        status.terminated = true;
+                        status.is_thinking = false;
+                        status.turn_completed = true;
+                        status.last_error = Some(payload.message.clone());
+                        status.activity_counter = status.activity_counter.saturating_add(1);
+                    }).await;
+                    let _ = startup_tx.send(Err(payload.message));
+                    return;
+                }
                 tracing::error!(
                     agent_id = %current_start.agent_id,
                     session_id = %actor_session_id,
@@ -3591,6 +3696,17 @@ pub(crate) fn spawn_agent_actor(
                 None
             }
         };
+        #[cfg(feature = "test-support")]
+        if current_start.swarm_membership.is_some()
+            && let Some(gate) = &swarm_startup_test_gates.session
+        {
+            tracing::warn!("Swarm startup boundary diagnostic: owned session persisted before swarm completion");
+            tokio::select! {
+                biased;
+                () = swarm_startup_test_gates.stopped.cancelled() => return,
+                () = crate::host::wait_for_spawn_operation_test_gate_inner(gate) => {},
+            }
+        }
         // A fresh spawn's first prompt went to the provider during startup,
         // before its session existed, recorded on its startup reservation;
         // the session takes that over atomically now that it exists.
@@ -3611,6 +3727,9 @@ pub(crate) fn spawn_agent_actor(
             !resume_replay_gate_pending && !status_handle.restarting(),
             Ordering::SeqCst,
         );
+        if !resume_replay_gate_pending {
+            actor_startup_ready.cancel();
+        }
         let has_acknowledged_gated_deliveries = acknowledged_gated_deliveries > 0;
         let continuation_pending = status_handle.pending_restart_continuation();
         status_handle
@@ -3844,7 +3963,10 @@ pub(crate) fn spawn_agent_actor(
             // The loop turns whenever a backend event or command lands, which
             // is exactly when this agent's status can have changed, so the
             // supervisor sees every transition without polling anything.
-            let supervisor_settings = *supervisor_settings_rx.borrow();
+            let mut supervisor_settings = *supervisor_settings_rx.borrow();
+            if current_start.swarm_membership.is_some() {
+                supervisor_settings.settings.enabled = false;
+            }
             if supervisor_settings != last_supervisor_settings {
                 supervisor_state.apply_settings_change(
                     last_supervisor_settings.settings,
@@ -4450,9 +4572,9 @@ pub(crate) fn spawn_agent_actor(
                 Some((launched_at, result)) = supervisor_verdict_rx.recv() => {
                     let now = Instant::now();
                     let launched_settings = supervisor_state.in_flight_verdict(launched_at);
-                    if usage_paused {
+                    if current_start.swarm_membership.is_some() || usage_paused {
                         supervisor_state.settle(now);
-                        tracing::info!(agent_id = %current_start.agent_id, "usage recovery superseded an in-flight supervision verdict");
+                        tracing::info!(swarm_owned = current_start.swarm_membership.is_some(), "Actor execution policy withheld an in-flight supervision verdict");
                     } else if launched_settings.is_none() {
                         tracing::debug!(
                             agent_id = %current_start.agent_id,
@@ -4902,6 +5024,7 @@ pub(crate) fn spawn_agent_actor(
                                 "resume replay boundary reached in backend stream order"
                             );
                             resume_replay_gate_pending = false;
+                            actor_startup_ready.cancel();
                             match result {
                                 Ok(()) => {
                                     if let Some(recovery) = resume_recovery {
@@ -6208,7 +6331,7 @@ pub(crate) fn spawn_agent_actor(
                     // the `SendInput` arm below must resolve it on every exit.
                     // An unresolved acknowledgement drops with this iteration,
                     // which the caller reads as a failed delivery.
-                    let mut delivery_ack: Option<oneshot::Sender<Result<(), String>>> = None;
+                    let mut delivery_ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>> = None;
                     let mut redirect = RunningTurnRedirect::SteerElseInterrupt;
                     let command = match command {
                         AgentCommand::DeliverMessage {
@@ -6216,6 +6339,12 @@ pub(crate) fn spawn_agent_actor(
                             redirect: delivery_redirect,
                             reply,
                         } => {
+                            if delivery_redirect == RunningTurnRedirect::IdleOnly
+                                && (in_turn || resume_replay_gate_pending || usage_paused || !queue.is_empty())
+                            {
+                                let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                continue;
+                            }
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
                             AgentCommand::SendInput(input)
@@ -6228,7 +6357,7 @@ pub(crate) fn spawn_agent_actor(
                             // `SendInput`, so this is unreachable. Fail closed
                             // rather than assert: a caller must never read an
                             // unhandled command as a delivered message.
-                            let _ = reply.send(Err(DELIVERY_NOT_ACKNOWLEDGED.to_owned()));
+                            let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_NOT_ACKNOWLEDGED.to_owned())));
                         }
                         AgentCommand::SendInput(input) => {
                             if resume_replay_gate_pending {
@@ -6567,6 +6696,12 @@ pub(crate) fn spawn_agent_actor(
                                         continue;
                                     }
                                     if admission != Some(registry::DispatchAdmission::Admitted) {
+                                        if redirect == RunningTurnRedirect::IdleOnly {
+                                            if let Some(reply) = delivery_ack.take() {
+                                                let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                            }
+                                            continue;
+                                        }
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
                                         let sequence = next_queue_sequence;
@@ -6655,6 +6790,14 @@ pub(crate) fn spawn_agent_actor(
                                             .send_with_outcome(AgentInput::SendMessage(msg))
                                             .await;
                                         if let SendOutcome::Busy(input) = outcome {
+                                            if redirect == RunningTurnRedirect::IdleOnly {
+                                                tracing::info!("Swarm native admission deferred: backend is busy; no ordinary message queued");
+                                                mark_agent_turn_active(&status_handle).await;
+                                                if let Some(reply) = delivery_ack.take() {
+                                                    let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                                }
+                                                continue;
+                                            }
                                             match input {
                                                 AgentInput::SendMessage(payload)
                                                     if payload.tool_response.is_none() =>
@@ -9086,6 +9229,7 @@ pub(crate) fn spawn_agent_actor(
             }
         }
     }).await;
+        drop(ready_completion);
     });
 
     (
@@ -9093,6 +9237,7 @@ pub(crate) fn spawn_agent_actor(
             processes,
             actor_abort: actor_task.abort_handle(),
             actor_status,
+            startup_ready,
             tx,
             accepting_input,
             closing,
@@ -9168,6 +9313,8 @@ pub(crate) fn spawn_relay_agent_actor(
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
+    let startup_ready = tokio_util::sync::CancellationToken::new();
+    startup_ready.cancel();
     let actor_task = crate::backend::subprocess::spawn(async move {
         actor_processes.scope(async move {
         status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
@@ -9605,7 +9752,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             // accepts direct input. Answering the caller is the
                             // whole fix: the old path left the target marked
                             // active for a message it would never run.
-                            let _ = reply.send(Err(DELIVERY_REJECTED_RELAY.to_owned()));
+                            let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_RELAY.to_owned())));
                         }
                         AgentCommand::Interrupt { reply } => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
@@ -9856,6 +10003,7 @@ pub(crate) fn spawn_relay_agent_actor(
         processes,
         actor_abort: actor_task.abort_handle(),
         actor_status,
+        startup_ready,
         tx,
         accepting_input,
         closing,
@@ -10095,6 +10243,33 @@ async fn finish_actor_close(
     let _ = reply.send(());
 }
 
+#[derive(Debug)]
+pub(crate) enum AgentDeliveryFailure {
+    Busy,
+    Rejected(String),
+}
+
+impl std::fmt::Display for AgentDeliveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("Swarm delivery deferred: member is busy"),
+            Self::Rejected(message) => formatter.write_str(message),
+        }
+    }
+}
+
+pub(crate) struct AgentDeliveryReceipt(oneshot::Receiver<Result<(), AgentDeliveryFailure>>);
+
+impl AgentDeliveryReceipt {
+    pub(crate) async fn wait(self) -> Result<(), AgentDeliveryFailure> {
+        self.0.await.unwrap_or_else(|_| {
+            Err(AgentDeliveryFailure::Rejected(
+                DELIVERY_NOT_ACKNOWLEDGED.to_owned(),
+            ))
+        })
+    }
+}
+
 /// Rejection reasons for an acknowledged [`AgentCommand::DeliverMessage`].
 ///
 /// These reach the agent-control caller as the tool's error text, so they
@@ -10122,11 +10297,14 @@ const DELIVERY_NOT_ACKNOWLEDGED: &str = "agent actor did not acknowledge the mes
 /// Returns whether there was an acknowledgement to resolve, so a shared
 /// rejection site can skip the transcript error it would otherwise append for
 /// fire-and-forget input.
-fn reject_agent_delivery(ack: Option<oneshot::Sender<Result<(), String>>>, reason: &str) -> bool {
+fn reject_agent_delivery(
+    ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>>,
+    reason: &str,
+) -> bool {
     let Some(reply) = ack else {
         return false;
     };
-    let _ = reply.send(Err(reason.to_owned()));
+    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(reason.to_owned())));
     true
 }
 
@@ -10802,7 +10980,9 @@ async fn park_terminal_agent(
                 // An acknowledged delivery has a caller to answer instead, and
                 // appending here would overwrite the fatal error that explains
                 // why the agent is parked.
-                let _ = reply.send(Err(DELIVERY_REJECTED_TERMINAL.to_owned()));
+                let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                    DELIVERY_REJECTED_TERMINAL.to_owned(),
+                )));
             }
             AgentCommand::Interrupt { reply } => {
                 let _ = reply.send(InterruptOutcome::NotRunning);
@@ -11004,7 +11184,9 @@ async fn park_relay_terminal_agent(
                 // Parked relay: terminal is the more actionable of the two
                 // reasons, since resume/fork applies and "does not accept
                 // direct input" would read as a routing mistake.
-                let _ = reply.send(Err(DELIVERY_REJECTED_TERMINAL.to_owned()));
+                let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                    DELIVERY_REJECTED_TERMINAL.to_owned(),
+                )));
             }
             AgentCommand::Interrupt { reply } => {
                 let payload = relay_input_rejected_payload(&current_start.agent_id);
@@ -11340,6 +11522,7 @@ fn startup_reservation(
         },
     };
     crate::store::session::StartupReservation {
+        swarm_membership: start.swarm_membership.clone(),
         agent_id: start.agent_id.clone(),
         spawn: protocol::SpawnAgentPayload {
             name: Some(start.name.clone()),
@@ -11493,12 +11676,13 @@ async fn persist_agent_session(
     {
         let store = session_store.as_ref();
         store
-            .upsert_backend_session(
+            .upsert_owned_backend_session(
                 &session,
                 parent_session_id,
                 current_start.project_id.clone(),
                 current_start.custom_agent_id.clone(),
                 current_start.launch_profile_id.clone(),
+                current_start.swarm_membership.clone(),
             )
             .await?;
         store

@@ -766,6 +766,21 @@ async fn require_authenticated_caller(
     if server.host.agent_handle(&caller).await.is_none() {
         return Err("authenticated agent-control caller is not active".to_owned());
     }
+    if server
+        .host
+        .is_swarm_agent(&caller)
+        .await
+        .map_err(|error| error.message)?
+        && !matches!(
+            tool_name,
+            "tyde_swarm_describe"
+                | "tyde_swarm_read_board"
+                | "tyde_swarm_read_thread"
+                | "tyde_swarm_post"
+        )
+    {
+        return Err("Swarm callers have only the four shared-board tools; child/workflow/review/team execution is not authorized".into());
+    }
     Ok(caller)
 }
 
@@ -1259,6 +1274,124 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
+        description = "Describe your authenticated swarm identity, equal-peer roster, shared project/workspace scope, guidance, finite wake budget, actual runtime states, and delivery dispositions. No model-supplied author identity is accepted.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_describe(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_swarm_describe").await {
+            Ok(caller) => caller,
+            Err(error) => {
+                return err_json(protocol::SwarmFailure {
+                    code: protocol::SwarmErrorCode::Unauthorized,
+                    message: error,
+                });
+            }
+        };
+        match self.host.describe_swarm_for_agent(caller).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+
+    #[tool(
+        description = "Read ordered Briefing or Coordination post/reply activity in your authenticated swarm. Default limit 50, maximum 100. Return next_cursor, snapshot high_water, and has_more. Reading never creates wake notifications.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_read_board(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmBoardRead>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_swarm_read_board").await
+        {
+            Ok(caller) => caller,
+            Err(error) => {
+                return err_json(protocol::SwarmFailure {
+                    code: protocol::SwarmErrorCode::Unauthorized,
+                    message: error,
+                });
+            }
+        };
+        match self.host.read_swarm_board_for_agent(caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+
+    #[tool(
+        description = "Read a shared thread root and bounded ordered replies. thread_id must come from your swarm's board. Default limit 50, maximum 100. Reading never schedules execution.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_read_thread(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmThreadRead>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_read_thread").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        match self.host.read_swarm_thread_for_agent(caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+
+    #[tool(
+        description = "Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_post(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmPublication>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_swarm_post").await {
+            Ok(caller) => caller,
+            Err(error) => {
+                return err_json(protocol::SwarmFailure {
+                    code: protocol::SwarmErrorCode::Unauthorized,
+                    message: error,
+                });
+            }
+        };
+        match self.host.post_swarm_for_agent(caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+
+    #[tool(
         description = "Describe the calling team member's team, roster, optional custom-agent summaries, and live bindings."
     )]
     async fn tyde_team_describe(
@@ -1381,8 +1514,20 @@ impl ServerHandler for TydeAgentControlMcpServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let swarm_caller = match context.extensions.get::<axum::http::request::Parts>() {
+            Some(parts) => match authenticated_caller_from_parts(&self.credentials, parts) {
+                Ok(Some(caller)) => self
+                    .host
+                    .is_swarm_agent(&caller)
+                    .await
+                    .map_err(|error| McpError::internal_error(error.message, None))?,
+                Ok(None) => false,
+                Err(error) => return Err(McpError::invalid_params(error, None)),
+            },
+            None => false,
+        };
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| match self.surface {
             AgentControlMcpSurface::Control => !matches!(
@@ -1394,6 +1539,17 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 "tyde_await_agents" | "tyde_await_review"
             ),
         });
+        if swarm_caller {
+            tools.retain(|tool| {
+                matches!(
+                    tool.name.as_ref(),
+                    "tyde_swarm_describe"
+                        | "tyde_swarm_read_board"
+                        | "tyde_swarm_read_thread"
+                        | "tyde_swarm_post"
+                )
+            });
+        }
         let tiers_enabled = self
             .host
             .read_settings()
@@ -1425,6 +1581,76 @@ impl ServerHandler for TydeAgentControlMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(parts) = context.extensions.get::<axum::http::request::Parts>() {
+            match authenticated_caller_from_parts(&self.credentials, parts) {
+                Ok(Some(caller)) => {
+                    let Some(handle) = self.host.agent_handle(&caller).await else {
+                        tracing::info!(
+                            caller_registered = false,
+                            "Authenticated MCP invocation rejected for unregistered caller"
+                        );
+                        return err_json(protocol::SwarmFailure {
+                            code: protocol::SwarmErrorCode::Unauthorized,
+                            message: "Authenticated agent-control caller is closing or no longer registered"
+                                .into(),
+                        });
+                    };
+                    let swarm_owned = if handle.snapshot().swarm_membership.is_some() {
+                        Ok(true)
+                    } else {
+                        self.host.is_swarm_agent(&caller).await
+                    };
+                    match swarm_owned {
+                        Ok(true) => {
+                            let active = !handle.is_closing()
+                                && self
+                                    .host
+                                    .agent_status_snapshot(&caller)
+                                    .await
+                                    .is_some_and(|status| !status.terminated);
+                            if !active {
+                                tracing::info!(
+                                    caller_registered = true,
+                                    swarm_owned = true,
+                                    closing = handle.is_closing(),
+                                    "Authenticated MCP invocation rejected for inactive swarm caller"
+                                );
+                                return err_json(protocol::SwarmFailure {
+                                    code: protocol::SwarmErrorCode::Unauthorized,
+                                    message: "Authenticated swarm caller is no longer active"
+                                        .into(),
+                                });
+                            }
+                            if !matches!(
+                                request.name.as_ref(),
+                                "tyde_swarm_describe"
+                                    | "tyde_swarm_read_board"
+                                    | "tyde_swarm_read_thread"
+                                    | "tyde_swarm_post"
+                            ) {
+                                return err_json(protocol::SwarmFailure {
+                                    code: protocol::SwarmErrorCode::Unauthorized,
+                                    message: "Swarm callers have only the four shared-board tools; child/workflow/review/team execution is not authorized".into(),
+                                });
+                            }
+                        }
+                        Ok(false) => {
+                            // Registered parked ordinary actors retain management authority;
+                            // closing/execution restrictions belong to their per-tool lifecycle checks.
+                            tracing::debug!(
+                                caller_registered = true,
+                                swarm_owned = false,
+                                closing = handle.is_closing(),
+                                "Authenticated MCP invocation using ordinary caller authority"
+                            );
+                        }
+                        Err(error) => return err_json(error),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Ok(err_text(error)),
+            }
+        }
         let allowed = match self.surface {
             AgentControlMcpSurface::Control => !matches!(
                 request.name.as_ref(),

@@ -4,6 +4,9 @@
 #[path = "conformance2/mod.rs"]
 pub mod fixture;
 
+#[path = "conformance2/swarm.rs"]
+pub mod swarm_conformance;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -1394,15 +1397,16 @@ fn assert_web_search_maps_to_web_search(turn: &Turn) {
         .collect::<Vec<_>>();
     let [(tool_call_id, query)] = searches.as_slice() else {
         panic!(
-            "{}: expected exactly one WebSearch card, saw {searches:?}; requests: {:?}",
-            turn.label(),
-            turn.tool_request_names()
+            "{:?}: expected exactly one WebSearch card; search_count={}; request_count={}",
+            turn.backend(),
+            searches.len(),
+            turn.tool_requests().count()
         );
     };
     assert!(
         query.to_ascii_lowercase().contains("rust"),
-        "{}: WebSearch card lost the requested Rust query: {query:?}",
-        turn.label()
+        "{:?}: WebSearch card lost the requested Rust query",
+        turn.backend()
     );
     let outcome = turn
         .tool_completions()
@@ -1415,8 +1419,8 @@ fn assert_web_search_maps_to_web_search(turn: &Turn) {
                 result: ToolExecutionResult::WebSearch
             })
         ),
-        "{}: web search must succeed with WebSearch; actual outcome: {outcome:?}",
-        turn.label()
+        "{:?}: web search must succeed with its correlated WebSearch result",
+        turn.backend()
     );
 }
 
@@ -3094,6 +3098,1227 @@ conformance2_scenario!(
     [
         BackendCapability::UserQuestionRequests,
         BackendCapability::ForkSession
+    ]
+);
+
+fn excluded_delegation_prompt<B: Backend>() -> &'static str {
+    match B::session_settings_schema().backend_kind {
+        BackendKind::Claude => {
+            "Use the native Agent or Task tool to start exactly one child. Ask it to reply \
+             with exactly SWARM_CHILD_FINISHED, no other text, and no tools, then return that result. If neither native delegation tool \
+             is available, reply SWARM_DELEGATION_UNAVAILABLE instead. Do not use a shell, \
+             MCP delegation, or another workaround. Do not invent a child result."
+        }
+        _ => {
+            "Use the native spawn_agent collaboration tool to start exactly one child. Ask \
+             it to reply with exactly SWARM_CHILD_FINISHED, no other text, and no tools, wait for it, and close it, then return its \
+             result. If native spawn_agent is unavailable, reply \
+             SWARM_DELEGATION_UNAVAILABLE instead. Do not use a shell, MCP delegation, or \
+             another workaround. Do not invent a child result."
+        }
+    }
+}
+
+fn assert_native_catalog_owner(
+    catalog: &protocol::NativeToolCatalog,
+    agent: &Agent,
+    backend: BackendKind,
+) {
+    assert!(
+        catalog.backend_kind == backend && catalog.session_id == agent.session_id,
+        "native tool catalog must belong to this live provider session"
+    );
+}
+
+fn assert_delegation_excluded(
+    turn: &Turn,
+    agent: &Agent,
+    catalog: Option<&protocol::NativeToolCatalog>,
+) {
+    if let Some(catalog) = catalog {
+        assert_native_catalog_owner(catalog, agent, turn.backend());
+        assert!(
+            catalog.tools.iter().all(|tool| tool.kind
+                != protocol::NativeToolKind::Controlled {
+                    category: protocol::ToolCategory::AgentDelegation,
+                }),
+            "provider-confirmed catalog must not advertise a classified native delegation pathway"
+        );
+    }
+    assert_no_native_delegation_events(turn.events(), catalog);
+    assert!(
+        turn.final_text().contains("SWARM_DELEGATION_UNAVAILABLE"),
+        "restricted member did not report native delegation unavailable"
+    );
+    assert!(
+        !turn.events().iter().any(|event| matches!(event,
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+        )),
+        "restricted member turn failed rather than excluding native delegation"
+    );
+}
+
+fn assert_no_native_delegation_events(
+    events: &[ChatEvent],
+    catalog: Option<&protocol::NativeToolCatalog>,
+) {
+    let catalog_has_no_classified_delegation = catalog.is_some_and(|catalog| {
+        catalog.tools.iter().all(|tool| {
+            tool.kind
+                != protocol::NativeToolKind::Controlled {
+                    category: protocol::ToolCategory::AgentDelegation,
+                }
+        })
+    });
+    // An unavailable native tool can still be attempted. Only its correlated
+    // rejection proves it did not spawn; a missing completion is not rejection.
+    for request in events.iter().filter_map(|event| match event {
+        ChatEvent::ToolRequest(request)
+            if matches!(request.tool_type, ToolRequestType::AgentSpawn { .. }) =>
+        {
+            Some(request)
+        }
+        _ => None,
+    }) {
+        let completions = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == request.tool_call_id =>
+                {
+                    Some(completion)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [completion] = completions.as_slice() else {
+            panic!(
+                "restricted native delegation attempt needs exactly one observed rejection; completion_count={}",
+                completions.len()
+            );
+        };
+        let ToolExecutionOutcome::Failed {
+            message,
+            normalization_failure: None,
+            ..
+        } = &completion.outcome
+        else {
+            panic!(
+                "restricted native delegation must be rejected, not successful, cancelled, or a normalization failure"
+            );
+        };
+        let declarations = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamEnd(end) => Some(&end.message.tool_calls),
+                ChatEvent::MessageAdded(message) => Some(&message.tool_calls),
+                _ => None,
+            })
+            .flatten()
+            .filter(|call| call.tool_call_id == request.tool_call_id)
+            .collect::<Vec<_>>();
+        // Agent errors are deliberately sanitized. A complete live catalog
+        // can still prove this exact attempted native tool was unavailable;
+        // unrelated Unknown tools cannot certify category-wide exclusion.
+        let catalog_excludes_attempt = catalog_has_no_classified_delegation
+            && !declarations.is_empty()
+            && catalog.is_some_and(|catalog| {
+                declarations
+                    .iter()
+                    .all(|call| !catalog.tools.iter().any(|tool| tool.name == call.name))
+            });
+        let native_unavailable = declarations.iter().any(|call| {
+            let unavailable = format!("No such tool available: {}", call.name);
+            message.lines().any(|line| {
+                line.split_once(unavailable.as_str())
+                    .is_some_and(|(_, tail)| {
+                        tail.is_empty()
+                            || tail
+                                .chars()
+                                .next()
+                                .is_some_and(|ch| matches!(ch, '.' | ' ' | '('))
+                    })
+            })
+        });
+        eprintln!(
+            "native delegation rejection evidence: catalog_excludes_exact_attempt={catalog_excludes_attempt}; documented_native_unavailable={native_unavailable}"
+        );
+        assert!(
+            catalog_excludes_attempt || native_unavailable,
+            "a failed native spawn needs owner-verified catalog absence of its exact declared tool or that exact call's documented unavailable-tool rejection; generic argument/runtime failures and advertised Unknown tools do not prove exclusion"
+        );
+    }
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolProgress(progress)
+                if matches!(progress.update, ToolProgressUpdate::SubAgent(_))
+        )),
+        "restricted member emitted native child progress"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeRestrictionPhase {
+    Unrestricted,
+    Advisory,
+    Fresh,
+    Fork,
+    Resumed,
+    OrdinaryRead,
+}
+
+fn log_native_restriction_facts(
+    turn: &Turn,
+    catalog: Option<&protocol::NativeToolCatalog>,
+    phase: NativeRestrictionPhase,
+) {
+    let requests = turn.tool_requests().count();
+    let completions = turn.tool_completions().count();
+    let rejected = turn
+        .tool_completions()
+        .filter(|completion| {
+            matches!(
+                completion.outcome,
+                ToolExecutionOutcome::Failed {
+                    normalization_failure: None,
+                    ..
+                }
+            )
+        })
+        .count();
+    let spawns = turn
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::AgentSpawn { .. }))
+        .count();
+    let progress = turn.events().iter().filter(|event| matches!(
+        event, ChatEvent::ToolProgress(progress) if matches!(progress.update, ToolProgressUpdate::SubAgent(_))
+    )).count();
+    let catalog_commands = catalog.map(|catalog| {
+        catalog
+            .tools
+            .iter()
+            .filter(|tool| tool.kind == protocol::NativeToolKind::CommandExecution)
+            .count()
+    });
+    let catalog_unknown = catalog.map(|catalog| {
+        catalog
+            .tools
+            .iter()
+            .filter(|tool| tool.kind == protocol::NativeToolKind::Unknown)
+            .count()
+    });
+    eprintln!(
+        "native restriction evidence: backend={:?}; phase={phase:?}; requests={requests}; completions={completions}; rejected={rejected}; spawn_attempts={spawns}; child_progress={progress}; catalog_commands={catalog_commands:?}; catalog_unknown={catalog_unknown:?}",
+        turn.backend()
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeProbeCommandForm {
+    Direct,
+    BashLoginEnvelope,
+    BashNonLoginEnvelope,
+}
+
+fn native_probe_command_form(actual: &str, probe: &str) -> Option<NativeProbeCommandForm> {
+    if actual == probe {
+        Some(NativeProbeCommandForm::Direct)
+    } else if actual == format!("/bin/bash -lc \"{probe}\"") {
+        // Recorded commandExecution events wrap the script in this shell
+        // envelope. The probe body stays exact: even a trailing '.' changes
+        // the final redirect target and must not match.
+        Some(NativeProbeCommandForm::BashLoginEnvelope)
+    } else if actual == format!("/bin/bash -c \"{probe}\"") {
+        // The real fork read uses the non-login envelope with the same body.
+        Some(NativeProbeCommandForm::BashNonLoginEnvelope)
+    } else {
+        None
+    }
+}
+
+async fn assert_restricted_clean_close<B: Backend>(host: &mut Harness<B>, agent: &Agent) {
+    let catalog = host.native_tool_catalog().await;
+    if let Some(catalog) = &catalog {
+        assert_native_catalog_owner(catalog, agent, host.backend());
+    }
+    let closing = close_agent(host, agent).await;
+    assert_no_native_delegation_events(&closing, catalog.as_ref());
+    assert!(
+        !closing.iter().any(|event| matches!(event,
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+        )),
+        "restricted native session did not close cleanly"
+    );
+}
+
+const NATIVE_WRITE_PREAMBLE: &str = "WRITE_PROBE_START";
+const NATIVE_READ_PREAMBLE: &str = "READ_PROBE_START";
+
+fn assert_native_probe_chronology(
+    turn: &Turn,
+    tool_call_id: &str,
+    preamble: &str,
+    final_marker: &str,
+) {
+    let request_position = turn.events().iter().position(|event| {
+        matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == tool_call_id)
+    });
+    let completion_position = turn.events().iter().position(|event| {
+        matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == tool_call_id)
+    });
+    let mut streamed = String::new();
+    let mut preamble_position = None;
+    let mut final_position = None;
+    for (position, event) in turn.events().iter().enumerate() {
+        let text = match event {
+            ChatEvent::StreamStart(_) => {
+                streamed.clear();
+                None
+            }
+            ChatEvent::StreamDelta(delta) => {
+                streamed.push_str(&delta.text);
+                Some(streamed.as_str())
+            }
+            ChatEvent::StreamEnd(end)
+                if matches!(end.message.sender, MessageSender::Assistant { .. }) =>
+            {
+                Some(end.message.content.as_str())
+            }
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Assistant { .. }) =>
+            {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            if preamble_position.is_none() && text.contains(preamble) {
+                preamble_position = Some(position);
+            }
+            if final_position.is_none() && text.contains(final_marker) {
+                final_position = Some(position);
+            }
+        }
+    }
+    eprintln!(
+        "native probe chronology evidence: backend={:?}; preamble_position={preamble_position:?}; request_position={request_position:?}; completion_position={completion_position:?}; final_position={final_position:?}",
+        turn.backend()
+    );
+    let (Some(preamble), Some(request), Some(completion), Some(final_text)) = (
+        preamble_position,
+        request_position,
+        completion_position,
+        final_position,
+    ) else {
+        panic!(
+            "native probe must expose its assistant preamble, exact request, correlated completion, and final report"
+        );
+    };
+    assert!(
+        preamble < request && request < completion && completion < final_text,
+        "native probe must preserve observed preamble -> exact request -> correlated completion -> final report chronology"
+    );
+    assert!(
+        turn.final_text().contains(final_marker),
+        "native probe final response must retain its expected report"
+    );
+}
+
+async fn assert_swarm_ordinary_tools<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    preamble: Option<&str>,
+) {
+    let path = host.workspace().join("README.txt");
+    let contents = std::fs::read_to_string(&path).expect("read ordinary-tool fixture baseline");
+    let path = path.to_str().expect("fixture read path is UTF-8");
+    let mut barrier = preamble.map(|_| {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::Builder::new()
+            .prefix(".native-read-barrier-")
+            .tempdir_in(host.workspace())
+            .expect("create isolated native read barrier directory");
+        let path = directory.path().join("gate");
+        let native_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .expect("native read barrier path contains no NUL");
+        // SAFETY: the NUL-terminated path remains alive for the syscall.
+        if unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) } != 0 {
+            panic!(
+                "create native read barrier failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .expect("open both native read barrier endpoints without blocking");
+        (directory, path, file)
+    });
+    let read_command = format!("cat '{}'", path.replace('\'', "'\\''"));
+    let command = match barrier.as_ref() {
+        Some((_, gate, _)) => format!(
+            "IFS= read -r < '{}' && {read_command}",
+            gate.to_str()
+                .expect("native read barrier path is UTF-8")
+                .replace('\'', "'\\''")
+        ),
+        None => read_command,
+    };
+    let matches_read = |request: &protocol::ToolRequest| match &request.tool_type {
+        ToolRequestType::ReadFiles { file_paths } => file_paths.iter().any(|file| file == path),
+        ToolRequestType::RunCommand {
+            command: actual, ..
+        } => native_probe_command_form(actual, &command).is_some(),
+        _ => false,
+    };
+    let prompt = match B::session_settings_schema().backend_kind {
+        BackendKind::Claude => format!(
+            "Use the native Read tool to read {path} and report its contents. Do not use another tool or merely recall the contents."
+        ),
+        _ => format!(
+            "Use exec_command to run the verbatim native read command inside the code fence below. Do not include the fence or append sentence punctuation. Report its contents. Do not use another tool or merely recall the contents.\n```sh\n{command}\n```"
+        ),
+    };
+    let prompt = match preamble {
+        Some(preamble) => format!(
+            "First send the short assistant message {preamble} BEFORE invoking the native read tool. Do not put the preamble in reasoning or tool arguments. Then perform this read; report its contents only AFTER the native result, without quoting the command or predicting the contents beforehand. If using exec_command, set yield_time_ms=30000, keep it in the foreground, and do not poll or use another tool. The command's pipe is released by the conformance harness; do not bypass or modify it. {prompt}"
+        ),
+        None => prompt,
+    };
+    let mut barrier_released = false;
+    let turn = if let Some((_, _, gate)) = barrier.as_mut() {
+        use std::io::Write;
+
+        let mut turn = host.turn(&prompt);
+        tokio::time::timeout(Duration::from_secs(90), async {
+            send_prompt(host, agent, &prompt).await;
+            collect_turn_until(host, &mut turn, |event| {
+                if let ChatEvent::ToolRequest(request) = event
+                    && matches_read(request)
+                {
+                    assert!(
+                        !barrier_released,
+                        "native read barrier received more than one matching canonical request"
+                    );
+                    gate.write_all(b"continue\n")
+                        .expect("release native read barrier after its canonical request");
+                    barrier_released = true;
+                    eprintln!(
+                        "native read barrier evidence: canonical_request_observed=true; gate_released=true; command_request={}",
+                        matches!(request.tool_type, ToolRequestType::RunCommand { .. })
+                    );
+                }
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+        })
+        .await
+        .expect("native read boundary did not settle within its deadline");
+        turn
+    } else {
+        ask(host, agent, &prompt).await
+    };
+    let catalog = host.native_tool_catalog().await;
+    if let Some(catalog) = &catalog {
+        assert_native_catalog_owner(catalog, agent, host.backend());
+    }
+    log_native_restriction_facts(
+        &turn,
+        catalog.as_ref(),
+        NativeRestrictionPhase::OrdinaryRead,
+    );
+    let matching_reads = turn
+        .tool_requests()
+        .filter(|request| matches_read(request))
+        .collect::<Vec<_>>();
+    let [request] = matching_reads.as_slice() else {
+        panic!(
+            "ordinary native file read must expose exactly one matching canonical request; matching_read_count={}",
+            matching_reads.len()
+        );
+    };
+    let completions = turn
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == request.tool_call_id)
+        .collect::<Vec<_>>();
+    let [completion] = completions.as_slice() else {
+        panic!(
+            "ordinary native file read needs exactly one correlated completion; completion_count={}",
+            completions.len()
+        );
+    };
+    assert!(
+        match &completion.outcome {
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::ReadFiles { files },
+            } => files
+                .iter()
+                .any(|file| file.path == path && file.bytes == contents.len() as u64),
+            ToolExecutionOutcome::Succeeded {
+                result:
+                    ToolExecutionResult::RunCommand {
+                        exit_code, stdout, ..
+                    },
+            } => *exit_code == 0 && stdout == &contents,
+            _ => false,
+        },
+        "restriction removed or prevented the actual ordinary native file read"
+    );
+    assert!(
+        turn.final_text().contains("tyde conformance workspace"),
+        "ordinary file read failed"
+    );
+    if let Some(preamble) = preamble {
+        assert!(
+            barrier_released,
+            "native read fixture must release only after its matching canonical request"
+        );
+        assert_native_probe_chronology(
+            &turn,
+            &request.tool_call_id,
+            preamble,
+            "tyde conformance workspace",
+        );
+    }
+    assert_no_native_delegation_events(turn.events(), catalog.as_ref());
+    assert_universal_contract(&[turn]);
+}
+
+fn native_child_observation_count<B: Backend>(host: &Harness<B>) -> usize {
+    host.observer
+        .children
+        .lock()
+        .expect("native child observations")
+        .len()
+}
+
+fn assert_no_new_native_children<B: Backend>(host: &Harness<B>, before: usize) {
+    eprintln!(
+        "native restriction child evidence: backend={:?}; before={before}; observed={}",
+        host.backend(),
+        native_child_observation_count(host)
+    );
+    assert_eq!(
+        native_child_observation_count(host),
+        before,
+        "restricted probe created a new observed native child"
+    );
+}
+
+async fn real_excludes_agent_delegation<B: Backend>(host: &mut Harness<B>) {
+    let prompt = excluded_delegation_prompt::<B>();
+    let unrestricted = spawn_agent(host, &launch_prompt()).await;
+    let ready = collect_turn(host, &unrestricted, &launch_prompt()).await;
+    assert_ready_handshake(&ready);
+    assert_universal_contract(&[ready]);
+    let before = native_child_observation_count(host);
+    let child_prompt =
+        "Reply with exactly SWARM_CHILD_FINISHED and no other text. Do not use tools.";
+    let [delegated, child] = delegate_native(
+        host,
+        &unrestricted,
+        prompt,
+        child_prompt,
+        "SWARM_CHILD_FINISHED",
+    )
+    .await;
+    let spawns: Vec<_> = delegated
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::AgentSpawn { .. }))
+        .collect();
+    assert!(
+        spawns.len() == 1,
+        "unrestricted control must make exactly one native child spawn"
+    );
+    for request in spawns {
+        assert!(
+            delegated
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == request.tool_call_id
+                    && matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. })),
+            "unrestricted native delegation did not succeed"
+        );
+    }
+    assert!(
+        delegated.final_text().contains("SWARM_CHILD_FINISHED"),
+        "unrestricted child result missing"
+    );
+    let child_ids = native_subagent_ids(&delegated);
+    assert!(
+        child_ids.len() == 1,
+        "unrestricted spawn must correlate with exactly one observed native child"
+    );
+    {
+        let observations = host
+            .observer
+            .children
+            .lock()
+            .expect("native child observations");
+        let [observed] = &observations[before..] else {
+            panic!("unrestricted control must create exactly one new native child observation");
+        };
+        assert!(
+            observed.id == child_ids[0]
+                && delegated.tool_requests().any(|request| {
+                    matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })
+                        && request.tool_call_id == observed.tool_use_id
+                }),
+            "native child observation must belong to the unrestricted spawn request"
+        );
+    }
+    assert!(
+        child.assistant_messages().last().is_some_and(|message| {
+            message.content.trim() == "SWARM_CHILD_FINISHED" && message.tool_calls.is_empty()
+        }) && matches!(
+            child.events().last(),
+            Some(ChatEvent::TypingStatusChanged(false))
+        ),
+        "native child itself must produce its final response and reach terminal idle"
+    );
+    assert!(
+        delegated.events().iter().any(|event| matches!(event,
+            ChatEvent::ToolProgress(progress)
+                if matches!(&progress.update, ToolProgressUpdate::SubAgent(state)
+                    if state.agent_id == child_ids[0]
+                        && state.completed
+                        && state.status == protocol::SubAgentProgressStatus::Completed)
+        )),
+        "parent must observe successful terminal progress for that same native child"
+    );
+    assert!(
+        !child.events().iter().any(|event| matches!(event,
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+        )),
+        "native child failed before its final response"
+    );
+    assert_universal_contract(&[delegated]);
+    if let Some(catalog) = host.native_tool_catalog().await {
+        assert_native_catalog_owner(&catalog, &unrestricted, host.backend());
+        assert!(
+            catalog.tools.iter().any(|tool| tool.kind
+                == protocol::NativeToolKind::Controlled {
+                    category: protocol::ToolCategory::AgentDelegation,
+                }),
+            "provider catalog must report the native delegation that actually executed"
+        );
+    }
+    let unrestricted_session = unrestricted.session_id.clone();
+    close_agent(host, &unrestricted).await;
+    let unrestricted_children = native_child_observation_count(host);
+
+    B::validate_tool_categories(&[protocol::ToolCategory::AgentDelegation])
+        .expect("declared exclusion capability must be enforceable");
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AgentDelegation];
+    let restricted = spawn_agent(host, prompt).await;
+    let turn = collect_turn(host, &restricted, prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fresh);
+    assert_no_new_native_children(host, unrestricted_children);
+    assert_delegation_excluded(&turn, &restricted, catalog.as_ref());
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &restricted, None).await;
+    assert_restricted_clean_close(host, &restricted).await;
+    assert_no_new_native_children(host, unrestricted_children);
+
+    // Fork must consume the unrestricted source before Resume updates its policy.
+    let forked = fork_agent(host, &unrestricted_session, prompt).await;
+    assert!(
+        forked.session_id != unrestricted_session,
+        "native fork must establish a new provider identity rather than reuse its source"
+    );
+    let turn = collect_turn(host, &forked, prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fork);
+    assert_no_new_native_children(host, unrestricted_children);
+    assert_delegation_excluded(&turn, &forked, catalog.as_ref());
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &forked, None).await;
+    assert_restricted_clean_close(host, &forked).await;
+    assert_no_new_native_children(host, unrestricted_children);
+
+    let resumed = resume_agent(host, &unrestricted_session).await;
+    assert!(
+        resumed.session_id == unrestricted_session,
+        "native resume must preserve the source provider identity"
+    );
+    let turn = ask(host, &resumed, prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Resumed);
+    assert_no_new_native_children(host, unrestricted_children);
+    assert_delegation_excluded(&turn, &resumed, catalog.as_ref());
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &resumed, None).await;
+    assert_restricted_clean_close(host, &resumed).await;
+    assert_no_new_native_children(host, unrestricted_children);
+}
+conformance2_scenario!(
+    real_excludes_agent_delegation,
+    [
+        BackendCapability::ExcludeAgentDelegation,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession
+    ]
+);
+
+async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
+    let home = std::env::var_os("HOME").expect("real read-only probe requires a home directory");
+    let outside = tempfile::Builder::new()
+        .prefix(".tyde-read-only-probe-")
+        .tempdir_in(home)
+        .expect("create isolated outside-workspace probe directory");
+    let existing = [
+        host.workspace().join("read-only-sentinel.txt"),
+        outside.path().join("protected.txt"),
+    ];
+    let created = [
+        host.workspace().join("read-only-created.txt"),
+        outside.path().join("created.txt"),
+    ];
+    let paths: Vec<_> = existing
+        .iter()
+        .chain(&created)
+        .map(|path| {
+            path.to_str()
+                .expect("fixture write path is UTF-8")
+                .to_owned()
+        })
+        .collect();
+    let targets = serde_json::to_string(&paths).expect("encode authorized probe paths");
+    let commands = paths
+        .iter()
+        .map(|path| format!("printf WRITE_SUCCEEDED > '{}'", path.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let prompt = match B::session_settings_schema().backend_kind {
+        BackendKind::Claude => format!(
+            "Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use Bash exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. If Bash is absent, or permissions reject any write, report WRITE_BLOCKED. Otherwise report WRITE_SUCCEEDED. Do not request escalation or use alternate paths/tools.\n```sh\n{commands}\n```"
+        ),
+        _ => format!(
+            "This is an explicitly authorized negative permissions test on four disposable fixture files, not a request to bypass read-only policy. You are authorized to SUBMIT the probe to exec_command under the CURRENT sandbox; you are not authorized to relax the sandbox or request escalation. A read-only sandbox is the expected test condition, not a reason to skip submitting the native call: let the native filesystem enforce it. A textual refusal or WRITE_BLOCKED without a native attempt is not test evidence. Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use exec_command exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. If the shell tool is absent or the sandbox rejects any write, report WRITE_BLOCKED; otherwise report WRITE_SUCCEEDED. Do not use alternate paths/tools.\n```sh\n{commands}\n```"
+        ),
+    };
+    let prompt = format!(
+        "First send the short assistant message {NATIVE_WRITE_PREAMBLE} BEFORE invoking the native command. Do not put the preamble in reasoning or tool arguments. Only AFTER the native result, report WRITE_BLOCKED or WRITE_SUCCEEDED as instructed below; do not quote the command or either final status beforehand. {prompt}"
+    );
+    // The advisory control must still write under identical probe authorization;
+    // otherwise model obedience, rather than provider enforcement, could pass.
+    host.config.resolved_spawn_config.instructions = Some("This is a controlled permissions conformance task in disposable fixtures. The four exact paths supplied by the task are authorized write probes. This narrow test authorization explicitly overrides best-effort read-only guidance for those four paths only: attempt each requested native write once, but never request elevated permissions, change policy, or find a workaround after denial. Native enforcement must remain intact. Do not modify anything else.".to_owned());
+    let mut unrestricted_session = None;
+    for (mode, phase) in [
+        (
+            protocol::BackendAccessMode::Unrestricted,
+            NativeRestrictionPhase::Unrestricted,
+        ),
+        (
+            protocol::BackendAccessMode::ReadOnly,
+            NativeRestrictionPhase::Advisory,
+        ),
+    ] {
+        reset_read_only_probe(&existing, &created);
+        host.config.resolved_spawn_config.access_mode = mode;
+        let control = spawn_agent(host, &prompt).await;
+        let turn = collect_turn(host, &control, &prompt).await;
+        let catalog = host.native_tool_catalog().await;
+        log_native_restriction_facts(&turn, catalog.as_ref(), phase);
+        assert_native_write_probe(&turn, &commands, &paths, NativeWriteExpectation::Written);
+        if let Some(catalog) = catalog {
+            assert_native_catalog_owner(&catalog, &control, host.backend());
+            assert!(
+                catalog
+                    .tools
+                    .iter()
+                    .any(|tool| tool.kind == protocol::NativeToolKind::CommandExecution),
+                "provider catalog must report the native command that actually wrote all four targets"
+            );
+        }
+        assert!(
+            existing
+                .iter()
+                .chain(&created)
+                .all(|path| std::fs::read(path).is_ok_and(|bytes| bytes == b"WRITE_SUCCEEDED")),
+            "ordinary unrestricted/advisory control must write all four authorized targets, proving the enforcement oracle is not mere instruction compliance"
+        );
+        assert_universal_contract(&[turn]);
+        if mode == protocol::BackendAccessMode::Unrestricted {
+            unrestricted_session = Some(control.session_id.clone());
+        }
+        close_agent(host, &control).await;
+    }
+    let session = unrestricted_session.expect("unrestricted control session was recorded");
+    reset_read_only_probe(&existing, &created);
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AgentDelegation];
+    let restricted_children = native_child_observation_count(host);
+    let restricted = spawn_agent(host, &prompt).await;
+    let turn = collect_turn(host, &restricted, &prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fresh);
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_read_only(
+        &existing,
+        &created,
+        &commands,
+        &paths,
+        &turn,
+        &restricted,
+        catalog.as_ref(),
+    );
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &restricted, Some(NATIVE_READ_PREAMBLE)).await;
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_delegation_probe(host, &restricted, restricted_children).await;
+    assert_restricted_clean_close(host, &restricted).await;
+    assert_no_new_native_children(host, restricted_children);
+    // Fork must consume the unrestricted source before Resume updates its policy.
+    let forked = fork_agent(host, &session, &prompt).await;
+    assert!(
+        forked.session_id != session,
+        "native fork must establish a new provider identity rather than reuse its source"
+    );
+    let turn = collect_turn(host, &forked, &prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fork);
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_read_only(
+        &existing,
+        &created,
+        &commands,
+        &paths,
+        &turn,
+        &forked,
+        catalog.as_ref(),
+    );
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &forked, Some(NATIVE_READ_PREAMBLE)).await;
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_delegation_probe(host, &forked, restricted_children).await;
+    assert_restricted_clean_close(host, &forked).await;
+    assert_no_new_native_children(host, restricted_children);
+    let resumed = resume_agent(host, &session).await;
+    assert!(
+        resumed.session_id == session,
+        "native resume must preserve the source provider identity"
+    );
+    let turn = ask(host, &resumed, &prompt).await;
+    let catalog = host.native_tool_catalog().await;
+    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Resumed);
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_read_only(
+        &existing,
+        &created,
+        &commands,
+        &paths,
+        &turn,
+        &resumed,
+        catalog.as_ref(),
+    );
+    assert_universal_contract(&[turn]);
+    assert_swarm_ordinary_tools(host, &resumed, Some(NATIVE_READ_PREAMBLE)).await;
+    assert_no_new_native_children(host, restricted_children);
+    assert_enforced_delegation_probe(host, &resumed, restricted_children).await;
+    assert_restricted_clean_close(host, &resumed).await;
+    assert_no_new_native_children(host, restricted_children);
+}
+
+async fn assert_enforced_delegation_probe<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    children_before: usize,
+) {
+    let turn = tokio::time::timeout(
+        Duration::from_secs(90),
+        ask(host, agent, excluded_delegation_prompt::<B>()),
+    )
+    .await
+    .expect("enforced read-only native delegation probe exceeded its deadline");
+    let catalog = host.native_tool_catalog().await;
+    assert_no_new_native_children(host, children_before);
+    assert_delegation_excluded(&turn, agent, catalog.as_ref());
+    assert_universal_contract(&[turn]);
+}
+
+fn reset_read_only_probe(existing: &[std::path::PathBuf], created: &[std::path::PathBuf]) {
+    for path in existing {
+        std::fs::write(path, "ORIGINAL_READ_ONLY_CONTENT").expect("seed protected probe file");
+    }
+    for path in created {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => panic!("remove the previous authorized new-file probe"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeWriteExpectation {
+    Written,
+    FilesystemDenied,
+    ToolUnavailable,
+}
+
+fn assert_native_write_probe(
+    turn: &Turn,
+    command: &str,
+    paths: &[String],
+    expectation: NativeWriteExpectation,
+) {
+    let requests = turn
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
+        .collect::<Vec<_>>();
+    let [request] = requests.as_slice() else {
+        panic!("permission probe must make exactly one observed native command attempt");
+    };
+    let ToolRequestType::RunCommand {
+        command: actual, ..
+    } = &request.tool_type
+    else {
+        unreachable!("native write probe filters command requests");
+    };
+    let command_form = native_probe_command_form(actual, command);
+    eprintln!(
+        "native write evidence: backend={:?}; expectation={expectation:?}; command_form={command_form:?}; authorized_targets={}",
+        turn.backend(),
+        paths.len()
+    );
+    assert!(
+        command_form.is_some(),
+        "native permission probe did not attempt the exact four authorized writes"
+    );
+    let completions = turn
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == request.tool_call_id)
+        .collect::<Vec<_>>();
+    let [completion] = completions.as_slice() else {
+        panic!(
+            "native permission attempt needs exactly one observed completion; completion_count={}",
+            completions.len()
+        );
+    };
+    if expectation == NativeWriteExpectation::ToolUnavailable {
+        assert!(
+            matches!(
+                completion.outcome,
+                ToolExecutionOutcome::Failed {
+                    normalization_failure: None,
+                    ..
+                }
+            ),
+            "an unavailable catalogued command must expose actual native rejection, not success, cancellation, or normalization failure"
+        );
+    }
+    let result = match &completion.outcome {
+        ToolExecutionOutcome::Succeeded { result } => result.clone(),
+        ToolExecutionOutcome::Failed {
+            details: Some(details),
+            normalization_failure: None,
+            ..
+        } if expectation != NativeWriteExpectation::Written => {
+            serde_json::from_str::<ToolExecutionResult>(details).unwrap_or_else(|_| {
+                panic!("native command rejection must expose its canonical execution result")
+            })
+        }
+        _ => panic!("native permission probe did not expose its expected execution outcome"),
+    };
+    let ToolExecutionResult::RunCommand {
+        exit_code,
+        stdout,
+        stderr,
+    } = result
+    else {
+        panic!("native permission probe completion must describe the actual command result");
+    };
+    if expectation != NativeWriteExpectation::Written {
+        assert_ne!(
+            exit_code, 0,
+            "protected native write command unexpectedly succeeded"
+        );
+    }
+    if expectation == NativeWriteExpectation::FilesystemDenied {
+        let denied_targets = paths
+            .iter()
+            .filter(|path| {
+                stdout.lines().chain(stderr.lines()).any(|line| {
+                    line.contains(path.as_str())
+                        && [
+                            "permission denied",
+                            "read-only file system",
+                            "operation not permitted",
+                        ]
+                        .iter()
+                        .any(|denial| line.to_ascii_lowercase().contains(denial))
+                })
+            })
+            .count();
+        eprintln!(
+            "native filesystem rejection evidence: backend={:?}; denied_targets={denied_targets}; authorized_targets={}",
+            turn.backend(),
+            paths.len()
+        );
+        assert!(
+            paths.iter().all(|path| {
+                stdout.lines().chain(stderr.lines()).any(|line| {
+                    line.contains(path)
+                        && [
+                            "permission denied",
+                            "read-only file system",
+                            "operation not permitted",
+                        ]
+                        .iter()
+                        .any(|denial| line.to_ascii_lowercase().contains(denial))
+                })
+            }),
+            "native command must report an actual filesystem permission rejection for each of the four authorized writes"
+        );
+    } else if expectation == NativeWriteExpectation::Written {
+        assert_eq!(
+            exit_code, 0,
+            "unrestricted/advisory native write command failed"
+        );
+    } else {
+        assert!(
+            stdout.is_empty(),
+            "an unavailable native shell must not expose executed probe output"
+        );
+    }
+    assert_native_probe_chronology(
+        turn,
+        &request.tool_call_id,
+        NATIVE_WRITE_PREAMBLE,
+        if expectation == NativeWriteExpectation::Written {
+            "WRITE_SUCCEEDED"
+        } else {
+            "WRITE_BLOCKED"
+        },
+    );
+}
+
+fn assert_enforced_read_only(
+    existing: &[std::path::PathBuf],
+    created: &[std::path::PathBuf],
+    command: &str,
+    paths: &[String],
+    turn: &Turn,
+    agent: &Agent,
+    catalog: Option<&protocol::NativeToolCatalog>,
+) {
+    if let Some(catalog) = catalog {
+        assert_native_catalog_owner(catalog, agent, turn.backend());
+    }
+    assert_no_native_delegation_events(turn.events(), catalog);
+    let command_absent = catalog.is_some_and(|catalog| {
+        catalog
+            .tools
+            .iter()
+            .all(|tool| tool.kind != protocol::NativeToolKind::CommandExecution)
+    });
+    if command_absent {
+        // The recorded disabled-shell rejection happens before a shell exists,
+        // so it cannot produce filesystem errors. This provider-confirmed
+        // catalog, not a model claim or launch configuration, proves absence.
+        let catalog = catalog.expect("command absence came from a live catalog");
+        assert!(
+            catalog.tools.iter().all(|tool| matches!(
+                tool.kind,
+                protocol::NativeToolKind::ReadOnly
+                    | protocol::NativeToolKind::SessionControl
+                    | protocol::NativeToolKind::Controlled {
+                        category: protocol::ToolCategory::AskUser
+                    }
+            )),
+            "provider-confirmed read-only catalog must exclude filesystem mutation, shell execution, native delegation, and unclassified tools"
+        );
+        if turn
+            .tool_requests()
+            .any(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
+        {
+            assert_native_write_probe(
+                turn,
+                command,
+                paths,
+                NativeWriteExpectation::ToolUnavailable,
+            );
+        }
+    } else {
+        // Missing catalog is not absence. An available or unreported shell
+        // must attempt and natively reject all four exact write targets.
+        assert_native_write_probe(
+            turn,
+            command,
+            paths,
+            NativeWriteExpectation::FilesystemDenied,
+        );
+    }
+    assert!(
+        existing
+            .iter()
+            .all(|path| std::fs::read(path)
+                .is_ok_and(|bytes| bytes == b"ORIGINAL_READ_ONLY_CONTENT")),
+        "enforced read-only provider changed an existing workspace or outside-workspace file"
+    );
+    assert!(
+        created.iter().all(|path| matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)),
+        "enforced read-only provider created a workspace or outside-workspace file"
+    );
+    assert!(
+        turn.final_text().contains("WRITE_BLOCKED"),
+        "real provider did not report its unavailable or rejected write capability"
+    );
+}
+conformance2_scenario!(
+    real_enforced_read_only,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::ExcludeAgentDelegation,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession
+    ]
+);
+
+const NATIVE_WEB_SEARCH_PREAMBLE: &str = "WEB_SEARCH_START";
+const NATIVE_WEB_SEARCH_QUERY: &str = "Rust programming language official website";
+
+fn protected_web_search_prompt(backend: BackendKind) -> String {
+    let tool = match backend {
+        BackendKind::Antigravity => "native search_web tool",
+        BackendKind::Kiro => "native web_search tool",
+        _ => "native provider's built-in web-search tool",
+    };
+    format!(
+        "This is an authorized native web-search probe in this read-only session. First emit a \
+         short assistant preamble containing {NATIVE_WEB_SEARCH_PREAMBLE} before using any \
+         tool. Then use your {tool} exactly once with the single search query exactly \
+         `{NATIVE_WEB_SEARCH_QUERY}`. Do not alter the query, issue multiple queries, fetch or \
+         open a result, or use a shell, code-mode wrapper, MCP tool, or any other tool. After \
+         the real search result completes, reply with exactly {MAPPED_WEB_MARKER} and nothing \
+         else. Do not include that final marker in your preamble."
+    )
+}
+
+fn assert_protected_web_search(turn: &Turn) {
+    assert_web_search_maps_to_web_search(turn);
+    assert_eq!(
+        turn.tool_requests().count(),
+        1,
+        "protected search must invoke exactly one native tool"
+    );
+    let request = turn
+        .tool_requests()
+        .next()
+        .expect("the single native search request was verified");
+    let ToolRequestType::WebSearch { query } = &request.tool_type else {
+        panic!("protected search must expose a canonical WebSearch request");
+    };
+    assert!(
+        query == NATIVE_WEB_SEARCH_QUERY,
+        "protected search must preserve the exact authorized query"
+    );
+    assert_eq!(
+        turn.tool_completions()
+            .filter(|completion| completion.tool_call_id == request.tool_call_id)
+            .count(),
+        1,
+        "protected search must complete its native request exactly once with the same ID"
+    );
+    assert_native_probe_chronology(
+        turn,
+        &request.tool_call_id,
+        NATIVE_WEB_SEARCH_PREAMBLE,
+        MAPPED_WEB_MARKER,
+    );
+}
+
+async fn real_protected_native_web_search_lifecycle<B: Backend>(host: &mut Harness<B>) {
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::Unrestricted;
+    let (original, launched) = tokio::time::timeout(Duration::from_secs(90), async {
+        let prompt = launch_prompt();
+        let agent = spawn_agent(host, &prompt).await;
+        let turn = collect_turn(host, &agent, &prompt).await;
+        (agent, turn)
+    })
+    .await
+    .expect("native search source handshake exceeded its bound");
+    assert_ready_handshake(&launched);
+    assert_eq!(
+        launched.tool_requests().count(),
+        0,
+        "native search source handshake must not invoke a tool"
+    );
+    let session = original.session_id.clone();
+    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &original))
+        .await
+        .expect("native search source shutdown exceeded its bound");
+
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    let prompt = protected_web_search_prompt(host.backend());
+    let (forked, searched_fork) = tokio::time::timeout(Duration::from_secs(120), async {
+        let agent = fork_agent(host, &session, &prompt).await;
+        assert!(
+            agent.session_id != session,
+            "native search fork must establish a new provider identity"
+        );
+        let turn = collect_turn(host, &agent, &prompt).await;
+        (agent, turn)
+    })
+    .await
+    .expect("protected native fork search exceeded its bound");
+    assert_protected_web_search(&searched_fork);
+    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &forked))
+        .await
+        .expect("protected native fork shutdown exceeded its bound");
+
+    let (resumed, searched_resume) = tokio::time::timeout(Duration::from_secs(120), async {
+        let agent = resume_agent(host, &session).await;
+        assert!(
+            agent.session_id == session,
+            "native search resume must preserve the original provider identity"
+        );
+        let turn = ask(host, &agent, &prompt).await;
+        (agent, turn)
+    })
+    .await
+    .expect("protected native resumed search exceeded its bound");
+    assert_protected_web_search(&searched_resume);
+    assert_universal_contract(&[launched, searched_fork, searched_resume]);
+    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &resumed))
+        .await
+        .expect("protected native resumed shutdown exceeded its bound");
+}
+conformance2_scenario!(
+    real_protected_native_web_search_lifecycle,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::GenericWebSearch,
+        BackendCapability::ForkSession,
+        BackendCapability::ResumeSession
+    ]
+);
+
+async fn real_swarm_board_coordination<B: Backend>(host: &mut Harness<B>) {
+    swarm_conformance::run(
+        B::session_settings_schema().backend_kind,
+        host.workspace(),
+        host.config
+            .session_settings
+            .clone()
+            .expect("real swarm model selection"),
+    )
+    .await;
+}
+conformance2_scenario!(
+    real_swarm_board_coordination,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::ExcludeAgentDelegation,
+        BackendCapability::ResumeSession
     ]
 );
 

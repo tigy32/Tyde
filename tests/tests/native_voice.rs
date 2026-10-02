@@ -1163,6 +1163,44 @@ async fn real_amazon_transcribe_streams_prerecorded_dictation() {
         .expect("server task");
 }
 
+struct RecordPrefixGate<R> {
+    reader: R,
+    remaining: usize,
+    opened: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RecordPrefixGate<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if output.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if this.opened.load(std::sync::atomic::Ordering::SeqCst) {
+            return std::pin::Pin::new(&mut this.reader).poll_read(context, output);
+        }
+        if this.remaining == 0 {
+            this.entered.notify_one();
+            return std::task::Poll::Pending;
+        }
+        let length = this.remaining.min(output.remaining());
+        let mut limited = tokio::io::ReadBuf::new(output.initialize_unfilled_to(length));
+        match std::pin::Pin::new(&mut this.reader).poll_read(context, &mut limited) {
+            std::task::Poll::Ready(Ok(())) => {
+                let read = limited.filled().len();
+                this.remaining -= read;
+                output.advance(read);
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
 #[tokio::test]
 async fn production_writer_interleaves_four_megabyte_bulk() {
     let diagnostic_path =
@@ -1305,6 +1343,51 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
         vec![0, 1],
         "priority and drops must not create sequence holes"
     );
+    // A gate wait or observation deadline may cancel a read after transport
+    // bytes arrive. The next read must continue that record, not treat its
+    // remaining bytes as another header. This uses the real writer and TURN.
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut reader = FrameReader::new(RecordPrefixGate {
+        reader: reader.into_inner(),
+        remaining: 7,
+        opened: opened.clone(),
+        entered: entered.clone(),
+    });
+    for ordinal in [2, 3] {
+        probe
+            .send(
+                StreamPath("/project/bulk".into()),
+                FrameKind::HeartbeatAck,
+                serde_json::json!({"ordinal": ordinal}),
+                Vec::new(),
+            )
+            .expect("queue real records across a cancelled read");
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let read = reader.read_frame();
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            () = entered.notified() => {},
+            result = &mut read => panic!("a seven-byte prefix must not produce a complete record; completed={}", result.is_ok()),
+        }
+    }).await.expect("real record reaches the partial-header gate");
+    opened.store(true, std::sync::atomic::Ordering::SeqCst);
+    for expected_sequence in [2, 3] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), reader.read_frame())
+            .await
+            .expect("continue cancelled record within the transport bound")
+            .unwrap_or_else(|error| panic!("cancelled real record must remain decodable: {error}"))
+            .expect("production writer remains connected");
+        assert_eq!(frame.envelope.kind, FrameKind::HeartbeatAck);
+        assert_eq!(
+            frame.envelope.seq, expected_sequence,
+            "cancelling a read must neither discard nor duplicate a record"
+        );
+        assert_eq!(frame.envelope.payload["ordinal"], expected_sequence);
+        assert!(frame.binary.is_empty());
+    }
     probe.close();
     writer.await.expect("writer task").expect("writer success");
 }

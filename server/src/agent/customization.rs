@@ -32,11 +32,13 @@ pub struct ResolvedSpawnConfig {
     pub tool_policy: ToolPolicy,
     pub excluded_tool_categories: Vec<protocol::ToolCategory>,
     pub access_mode: BackendAccessMode,
+    pub swarm_membership: Option<protocol::SwarmMembership>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnConfigPolicy {
     User,
+    Swarm,
     Reviewer,
     InferenceOnly,
     FailedStartup,
@@ -47,6 +49,7 @@ impl ResolvedSpawnConfig {
     fn empty(policy: SpawnConfigPolicy) -> Self {
         Self {
             policy,
+            swarm_membership: None,
             instructions: None,
             steering_body: String::new(),
             builtin_steering: String::new(),
@@ -81,13 +84,19 @@ impl ResolvedSpawnConfig {
         Self::empty(SpawnConfigPolicy::FailedStartup)
     }
 
+    pub(crate) fn bind_swarm_membership(&mut self, membership: protocol::SwarmMembership) {
+        self.policy = SpawnConfigPolicy::Swarm;
+        self.swarm_membership = Some(membership);
+    }
+
     /// Whether a plain `Resume` rebuilds this configuration faithfully.
     ///
     /// Only the user policy is reconstructed from the session record alone. A
     /// reviewer carries dedicated instructions, a read-only tool policy, its
     /// review MCP and a tool bridge that live entirely outside the record, so
     /// resuming one produces an ordinary user agent wearing its name. The
-    /// remaining policies never describe a session a user has open.
+    /// swarm policy must instead be restored through its owning swarm. The
+    /// remaining policies do not describe independently restorable user sessions.
     pub(crate) fn is_rebuilt_by_resume(&self) -> bool {
         matches!(self.policy, SpawnConfigPolicy::User)
     }
@@ -96,7 +105,7 @@ impl ResolvedSpawnConfig {
         assert!(
             matches!(
                 self.policy,
-                SpawnConfigPolicy::User | SpawnConfigPolicy::Reviewer
+                SpawnConfigPolicy::User | SpawnConfigPolicy::Swarm | SpawnConfigPolicy::Reviewer
             ) || (startup_failed && self.policy == SpawnConfigPolicy::FailedStartup),
             "agent session bypassed spawn resolution: {:?}",
             self.policy

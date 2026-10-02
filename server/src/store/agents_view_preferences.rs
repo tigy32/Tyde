@@ -947,6 +947,7 @@ fn canonicalize_origins(mut origins: Vec<AgentOrigin>) -> Vec<AgentOrigin> {
         AgentOrigin::BackendNative => 2,
         AgentOrigin::TeamMember => 3,
         AgentOrigin::Workflow => 4,
+        AgentOrigin::SwarmMember => 5,
     });
     origins.dedup();
     origins

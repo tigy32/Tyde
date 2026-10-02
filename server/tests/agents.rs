@@ -3431,12 +3431,16 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
 #[tokio::test]
 async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
     let mut fixture = Fixture::new().await;
+    let shutdown_gate = MockGateHandle::new();
     let parent = fixture
         .spawn_scripted(
             "closing-spawn-parent",
-            MockScript::one(MockTurn::held_text_uninterruptible(
+            // The shutdown gate holds the closing window; ignoring interrupt
+            // would instead wait the entire native close grace before this gate.
+            MockScript::one(MockTurn::held_text(
                 "mock backend held response to: parent never settles",
-            )),
+            ))
+            .with_shutdown_gate(&shutdown_gate),
         )
         .await;
     let event = fixture
@@ -3457,6 +3461,9 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
         .close_agent(&parent.stream)
         .await
         .expect("close closing-spawn parent failed");
+    tokio::time::timeout(Duration::from_secs(10), shutdown_gate.wait_until_entered())
+        .await
+        .expect("closing-parent phase: native teardown must be entered before invoking MCP");
 
     let error = mcp_spawn_agent_error_as(
         &caller,
@@ -3474,6 +3481,17 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
         error.contains("closing"),
         "a spawn under a closing parent must say why it was refused, got: {error}"
     );
+    assert_eq!(fixture.agent_ids().await.len(), 1);
+    shutdown_gate.release_one();
+    fixture
+        .next_frame_matching("closing parent teardown completes without a child", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == parent.new_agent.agent_id)
+        })
+        .await;
+    assert!(fixture.agent_ids().await.is_empty());
 }
 
 #[tokio::test]

@@ -231,6 +231,9 @@ fn prepare_antigravity_tool_policy(
     for category in categories {
         let tool = match category {
             protocol::ToolCategory::AskUser => "ask_question",
+            protocol::ToolCategory::AgentDelegation => {
+                return Err("Antigravity cannot enforce delegation exclusion".into());
+            }
         };
         let response = json!({
             "decision": "deny",
@@ -279,6 +282,7 @@ impl AgyLaunch {
             BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
                 args.push("--dangerously-skip-permissions".to_string())
             }
+            BackendAccessMode::EnforcedReadOnly => {}
         }
         args.push("--model".to_string());
         args.push(self.model.clone());
@@ -315,6 +319,9 @@ impl AgyProcess {
         resume: Option<&str>,
         emitter: Arc<TurnEmitter>,
     ) -> Result<Self, String> {
+        if launch.access_mode == BackendAccessMode::EnforcedReadOnly {
+            return Err("Antigravity cannot enforce read-only workspace access".into());
+        }
         let mut command = crate::process_env::command("agy")?;
         command.args(launch.args(resume));
         if let Some(path) = process_env::resolved_child_process_path() {
@@ -2641,6 +2648,9 @@ impl Backend for AntigravityBackend {
         for category in categories {
             match category {
                 protocol::ToolCategory::AskUser => {}
+                protocol::ToolCategory::AgentDelegation => {
+                    return Err("Backend cannot enforce agent-delegation exclusion".into());
+                }
             }
         }
         Ok(())

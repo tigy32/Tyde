@@ -1309,6 +1309,19 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
+    fn validate_access_mode(mode: BackendAccessMode) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        if mode == BackendAccessMode::EnforcedReadOnly
+            && !Self::capabilities()
+                .contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly)
+        {
+            return Err("Backend cannot enforce read-only workspace access".to_owned());
+        }
+        Ok(())
+    }
+
     fn validate_tool_policy(policy: &protocol::ToolPolicy) -> Result<(), String>
     where
         Self: Sized,
@@ -1445,6 +1458,14 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Return the backend-native session ID for this live handle.
     fn session_id(&self) -> SessionId;
+
+    /// Snapshot the current process's provider-reported tool set. `None` means
+    /// no confirmed evidence is available; requested policy is not evidence.
+    fn native_tool_catalog(
+        &self,
+    ) -> impl std::future::Future<Output = Option<protocol::NativeToolCatalog>> + Send {
+        std::future::ready(None)
+    }
 
     /// Replace an idle session's workspace without starting a turn or losing
     /// its conversation. The first root is the default working directory.
@@ -2364,7 +2385,10 @@ pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value 
 
 pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -> Option<String> {
     let mut sections = Vec::new();
-    if config.access_mode == BackendAccessMode::ReadOnly {
+    if matches!(
+        config.access_mode,
+        BackendAccessMode::ReadOnly | BackendAccessMode::EnforcedReadOnly
+    ) {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if !config.builtin_steering.trim().is_empty() {

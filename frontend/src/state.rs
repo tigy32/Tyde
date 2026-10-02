@@ -23,10 +23,12 @@ use protocol::{
     ProjectSearchFileResult, QueuedMessageEntry, RequestedCompactionAvailability, Review,
     ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
     SessionSettingsSchema, SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId,
-    Steering, SteeringId, StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft,
-    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
-    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    Steering, SteeringId, StreamPath, Swarm, SwarmBoard, SwarmBoardPage, SwarmDraft, SwarmDraftId,
+    SwarmErrorNotifyPayload, SwarmId, SwarmPost, SwarmPostId, SwarmReadCursor, SwarmThreadId,
+    SwarmThreadPage, TaskList, TaskTokenUsagePayload, Team, TeamDraft, TeamDraftId, TeamId,
+    TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
+    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
     WorkflowSummary,
 };
@@ -1251,6 +1253,13 @@ pub enum TabContent {
         agent_ref: ActiveAgentRef,
         tool_call_id: ToolCallId,
     },
+    /// A swarm's shared boards. Bound to the explicit `(host, swarm)` pair, so
+    /// opening it never depends on `active_agent`; members' individual
+    /// conversations remain ordinary chat tabs.
+    Swarm {
+        host_id: String,
+        swarm_id: SwarmId,
+    },
 }
 
 impl TabContent {
@@ -2115,7 +2124,7 @@ pub enum LeftTab {
 pub enum RightTab {
     Agents,
     Sessions,
-    Teams,
+    Swarms,
     Workflows,
 }
 
@@ -3215,6 +3224,9 @@ fn close_host_runtime_tabs_in_cz(
             } => tab_host == host_id,
             TabContent::Workflow { agent_ref, .. } => agent_ref.host_id == host_id,
             TabContent::File { key } => key.host_id == host_id,
+            TabContent::Swarm {
+                host_id: tab_host, ..
+            } => tab_host == host_id,
             TabContent::Home | TabContent::AgentMonitor => false,
         })
         .map(|(_, tab)| tab.id)
@@ -3295,6 +3307,74 @@ type PendingAgentSessionSettingsByProject =
 pub struct TeamMemberShuffleSuggestionEntry {
     pub suggestion: TeamMemberShuffleSuggestion,
     pub serial: u64,
+}
+
+/// Pagination position of the most recent page the server delivered for one
+/// board or thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwarmPageMeta {
+    /// Opaque continuation cursor; submitted back unchanged.
+    pub next_cursor: SwarmReadCursor,
+    pub high_water: u64,
+    pub has_more: bool,
+}
+
+/// Every post the server has delivered for one swarm. Rows are server
+/// records; threads are grouped by the post's own `thread_id`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SwarmPostsState {
+    pub posts: HashMap<SwarmPostId, SwarmPost>,
+    pub briefing_page: Option<SwarmPageMeta>,
+    pub coordination_page: Option<SwarmPageMeta>,
+    pub threads: HashMap<SwarmThreadId, SwarmPageMeta>,
+}
+
+impl SwarmPostsState {
+    pub fn page(&self, board: SwarmBoard) -> Option<SwarmPageMeta> {
+        match board {
+            SwarmBoard::Briefing => self.briefing_page.clone(),
+            SwarmBoard::Coordination => self.coordination_page.clone(),
+        }
+    }
+
+    pub fn apply_board_page(&mut self, page: SwarmBoardPage) {
+        let meta = SwarmPageMeta {
+            next_cursor: page.next_cursor,
+            high_water: page.high_water,
+            has_more: page.has_more,
+        };
+        match page.board {
+            SwarmBoard::Briefing => self.briefing_page = Some(meta),
+            SwarmBoard::Coordination => self.coordination_page = Some(meta),
+        }
+        for post in page.posts {
+            self.posts.insert(post.id.clone(), post);
+        }
+    }
+
+    pub fn apply_thread_page(&mut self, page: SwarmThreadPage) {
+        self.threads.insert(
+            page.thread_id,
+            SwarmPageMeta {
+                next_cursor: page.next_cursor,
+                high_water: page.high_water,
+                has_more: page.has_more,
+            },
+        );
+        self.posts.insert(page.root.id.clone(), page.root);
+        for post in page.posts {
+            self.posts.insert(post.id.clone(), post);
+        }
+    }
+}
+
+/// One `SwarmErrorNotify`, kept until the user dismisses it. `serial` is a
+/// client-local row key only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwarmErrorEntry {
+    pub host_id: String,
+    pub serial: u64,
+    pub error: SwarmErrorNotifyPayload,
 }
 
 /// Agents panel filter predicate input, derived from the server-owned sidebar
@@ -3934,6 +4014,18 @@ pub struct AppState {
     /// (never replayed on host attach).
     pub team_member_shuffle_suggestions:
         RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
+    /// Server-owned swarm records keyed by host then swarm id, from bootstrap
+    /// and `SwarmNotify`. Membership, runtime state, limits, unread positions,
+    /// delivery outcomes and change previews are all read from here.
+    pub swarms: RwSignal<HashMap<String, HashMap<SwarmId, Swarm>>>,
+    /// Server-owned swarm drafts keyed by host then draft id.
+    pub swarm_drafts: RwSignal<HashMap<String, HashMap<SwarmDraftId, SwarmDraft>>>,
+    /// Board posts the server has delivered for each `(host, swarm)` through
+    /// board/thread pages and live `SwarmPostNotify` frames.
+    pub swarm_posts: RwSignal<HashMap<(String, SwarmId), SwarmPostsState>>,
+    /// Server-reported swarm failures, rendered next to their subject until
+    /// the user dismisses them.
+    pub swarm_errors: RwSignal<Vec<SwarmErrorEntry>>,
     /// Durable Agents-tab view preferences (filters, sort, group, density,
     /// manual order, plus deprecated protocol fields). The server is the single
     /// source of truth:
@@ -4323,6 +4415,10 @@ impl AppState {
             team_preset_catalogs: RwSignal::new(HashMap::new()),
             team_drafts: RwSignal::new(HashMap::new()),
             team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
+            swarms: RwSignal::new(HashMap::new()),
+            swarm_drafts: RwSignal::new(HashMap::new()),
+            swarm_posts: RwSignal::new(HashMap::new()),
+            swarm_errors: RwSignal::new(Vec::new()),
             agents_view_preferences: RwSignal::new(AgentsViewPreferencesSnapshot {
                 preferences: AgentsViewPreferences::default(),
                 sidebar: Default::default(),
@@ -6999,6 +7095,16 @@ impl AppState {
         self.team_member_shuffle_suggestions.update(|map| {
             map.remove(host_id);
         });
+        self.swarms.update(|map| {
+            map.remove(host_id);
+        });
+        self.swarm_drafts.update(|map| {
+            map.remove(host_id);
+        });
+        self.swarm_posts
+            .update(|map| map.retain(|(post_host, _), _| post_host != host_id));
+        self.swarm_errors
+            .update(|errors| errors.retain(|entry| entry.host_id != host_id));
         self.projects
             .update(|projects| projects.retain(|project| project.host_id != host_id));
         self.agents

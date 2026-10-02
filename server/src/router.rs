@@ -355,6 +355,11 @@ pub(crate) async fn route_client_envelope(
                     parse_payload(&envelope, "mcp_server_delete")?;
                 host.delete_mcp_server(payload).await?;
             }
+            FrameKind::SwarmCommand => {
+                let payload: protocol::SwarmCommandPayload =
+                    parse_payload(&envelope, "swarm_command")?;
+                host.swarm_command(connection_host_stream, payload).await?;
+            }
             FrameKind::TeamCreate => {
                 let payload: TeamCreatePayload = parse_payload(&envelope, "team_create")?;
                 ensure_non_empty("team_create", "name", payload.name.as_str())?;
@@ -1712,6 +1717,28 @@ async fn deliver_agent_input(
     stream_path: StreamPath,
     host_output_stream: &Stream,
 ) {
+    match host.deliver_swarm_private_input(&agent_id, &input).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            let stream = host_output_stream.with_path(stream_path);
+            let payload = AgentErrorPayload {
+                agent_id,
+                code: AgentErrorCode::Unsupported,
+                message: error.message,
+                fatal: false,
+            };
+            match serde_json::to_value(payload) {
+                Ok(value) => {
+                    let _ = stream.send_value(FrameKind::AgentError, value);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Cannot encode swarm private-input rejection")
+                }
+            }
+            return;
+        }
+    }
     let reason = match host.agent_handle(&agent_id).await {
         Some(agent) => {
             if agent.send_input(input).await {

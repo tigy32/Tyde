@@ -122,8 +122,13 @@ fn build_update(
 
 type ActiveTeamSelection = Option<(String, TeamMemberId, TeamId)>;
 
+/// Legacy manager/report teams. Mounted inside the Swarms dock tab so existing
+/// teams and their history stay reachable; `on_convert_team` offers the
+/// explicit, server-previewed conversion to a swarm.
 #[component]
-pub fn TeamsPanel() -> impl IntoView {
+pub fn TeamsPanel(
+    #[prop(optional)] on_convert_team: Option<Callback<(String, TeamId)>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let new_team_open: RwSignal<bool> = RwSignal::new(false);
@@ -254,6 +259,8 @@ pub fn TeamsPanel() -> impl IntoView {
                             let host_for_delete_member = host_id.clone();
                             let host_for_open_member = host_id.clone();
                             let host_for_promote = host_id.clone();
+                            let host_for_convert = host_id.clone();
+                            let tid_convert = team_id.clone();
                             let host_for_card = host_id;
                             let tid_open = team_id.clone();
                             let tid_add = team_id.clone();
@@ -290,6 +297,9 @@ pub fn TeamsPanel() -> impl IntoView {
                                     on_promote_member=Callback::new(move |member_id: TeamMemberId| {
                                         promote_member(&state_promote, host_for_promote.clone(), tid_promote.clone(), member_id)
                                     })
+                                    on_convert=on_convert_team.map(|convert| Callback::new(move |_: ()| {
+                                        convert.run((host_for_convert.clone(), tid_convert.clone()))
+                                    }))
                                 />
                             }
                         }
@@ -322,6 +332,7 @@ fn TeamCard(
     on_delete_member: Callback<TeamMemberId>,
     on_open_member: Callback<TeamMemberId>,
     on_promote_member: Callback<TeamMemberId>,
+    on_convert: Option<Callback<()>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -589,6 +600,15 @@ fn TeamCard(
                     })}
                 </button>
                 <div class="team-card-actions">
+                    {on_convert.map(|convert| view! {
+                        <button
+                            class="filter-toggle"
+                            type="button"
+                            on:click=move |_| convert.run(())
+                        >
+                            "Convert to swarm\u{2026}"
+                        </button>
+                    })}
                     <button
                         class="filter-toggle"
                         type="button"

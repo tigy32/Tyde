@@ -2449,7 +2449,7 @@ pub(crate) fn open_project_path(
     Ok(())
 }
 
-fn resolve_project_file_path(
+pub(crate) fn resolve_project_file_path(
     project: &Project,
     path: &ProjectPath,
 ) -> Result<Option<PathBuf>, String> {

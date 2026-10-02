@@ -28,6 +28,7 @@ pub mod steering;
 pub mod store;
 pub(crate) mod stream;
 pub(crate) mod sub_agent;
+pub(crate) mod swarm_registry;
 pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
 pub(crate) mod voice;
@@ -57,8 +58,8 @@ pub use host::{
 #[cfg(feature = "test-support")]
 pub use host::{
     InstalledAgentNameGate, InstalledSpawnOperationTestGate, InstalledWorkbenchRemoveHook,
-    MockLaunchReservation, SpawnOperationTestGateInner, UsageWakeupLaunchForTest,
-    new_spawn_operation_test_gate,
+    MockLaunchReservation, PendingMockLaunchBehavior, SpawnOperationTestGateInner,
+    UsageWakeupLaunchForTest, new_spawn_operation_test_gate,
 };
 pub use process_env::init_process_env;
 #[cfg(feature = "test-support")]

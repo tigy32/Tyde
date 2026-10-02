@@ -2152,6 +2152,7 @@ impl MobileAccessActor {
                     AgentOrigin::AgentControl
                     | AgentOrigin::BackendNative
                     | AgentOrigin::TeamMember
+                    | AgentOrigin::SwarmMember
                     | AgentOrigin::Workflow => continue,
                 }
 

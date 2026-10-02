@@ -208,16 +208,38 @@ pub fn encode_frame(
     Ok(records)
 }
 
+async fn fill_record<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    record: &mut Vec<u8>,
+    length: usize,
+) -> Result<(), io::Error> {
+    let mut chunk = vec![0; 8192];
+    while record.len() < length {
+        let remaining = (length - record.len()).min(chunk.len());
+        let read = reader.read(&mut chunk[..remaining]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF during TYD2 record",
+            ));
+        }
+        record.extend_from_slice(&chunk[..read]);
+    }
+    Ok(())
+}
+
 async fn read_record<R: AsyncRead + Unpin>(
     reader: &mut R,
+    record: &mut Vec<u8>,
 ) -> Result<Option<(RecordKind, Vec<u8>, Vec<u8>)>, FrameError> {
-    let mut fixed = [0u8; FIXED_HEADER_LEN];
-    match reader.read_exact(&mut fixed[..1]).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+    match fill_record(reader, record, FIXED_HEADER_LEN).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && record.is_empty() => {
+            return Ok(None);
+        }
         Err(err) => return Err(err.into()),
     }
-    reader.read_exact(&mut fixed[1..]).await?;
+    let fixed = &record[..FIXED_HEADER_LEN];
     if fixed[..4] != RECORD_MAGIC {
         return Err(FrameError::Protocol("invalid TYD2 record magic".into()));
     }
@@ -239,18 +261,22 @@ async fn read_record<R: AsyncRead + Unpin>(
     if header_len > MAX_RECORD_HEADER || body_len > MAX_RECORD_BODY {
         return Err(FrameError::Protocol("record length exceeds bound".into()));
     }
-    let mut header = vec![0; header_len];
-    let mut body = vec![0; body_len];
-    reader.read_exact(&mut header).await?;
-    reader.read_exact(&mut body).await?;
+    let header_end = FIXED_HEADER_LEN + header_len;
+    fill_record(reader, record, header_end + body_len).await?;
+    let header = record[FIXED_HEADER_LEN..header_end].to_vec();
+    let body = record[header_end..].to_vec();
     if crc32(&[&header, &body]) != expected_crc {
         return Err(FrameError::Protocol("record checksum mismatch".into()));
     }
+    record.clear();
     Ok(Some((kind, header, body)))
 }
 
 pub struct FrameReader<R> {
     reader: R,
+    // A cancelled read must retain every consumed transport byte, including
+    // a partial fixed header, until the complete record can be decoded.
+    record: Vec<u8>,
     partial: HashMap<u64, PartialFrame>,
     reassembly_bytes: usize,
 }
@@ -259,6 +285,7 @@ impl<R> FrameReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
+            record: Vec::new(),
             partial: HashMap::new(),
             reassembly_bytes: 0,
         }
@@ -282,11 +309,14 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub async fn read_frame(&mut self) -> Result<Option<ProtocolFrame>, FrameError> {
         loop {
             let record = if self.partial.is_empty() {
-                read_record(&mut self.reader).await?
+                read_record(&mut self.reader, &mut self.record).await?
             } else {
-                reassembly_timeout(REASSEMBLY_TIMEOUT, read_record(&mut self.reader))
-                    .await
-                    .map_err(|_| FrameError::Protocol("fragment reassembly timed out".into()))??
+                reassembly_timeout(
+                    REASSEMBLY_TIMEOUT,
+                    read_record(&mut self.reader, &mut self.record),
+                )
+                .await
+                .map_err(|_| FrameError::Protocol("fragment reassembly timed out".into()))??
             };
             let Some((kind, header, body)) = record else {
                 if self.partial.is_empty() {

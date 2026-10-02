@@ -548,6 +548,50 @@ async fn mcp_spawn_agent(caller: &server::AgentControlMcpCaller, name: &str) {
     assert!(!is_error, "tyde_spawn_agent failed: {response}");
 }
 
+async fn swarm_push_frame(
+    fixture: &mut Fixture,
+    phase: &str,
+    predicate: impl Fn(&protocol::Envelope) -> bool,
+) -> protocol::Envelope {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = match fixture.client.next_event().await {
+                Ok(Some(event)) => event,
+                Ok(None) => panic!("swarm push protocol connection closed during {phase}"),
+                Err(error) => match error {
+                    protocol::FrameError::Io(error) => panic!(
+                        "swarm push protocol read failed during {phase}: FrameError::Io kind={:?} os_code={:?}",
+                        error.kind(), error.raw_os_error()
+                    ),
+                    protocol::FrameError::Json(error) => panic!(
+                        "swarm push protocol read failed during {phase}: FrameError::Json category={:?} line={} column={}",
+                        error.classify(), error.line(), error.column()
+                    ),
+                    protocol::FrameError::Protocol(message) => panic!(
+                        "swarm push protocol read failed during {phase}: FrameError::Protocol invalid_magic={} checksum_mismatch={} sequence_mismatch={}",
+                        message == "invalid TYD2 record magic",
+                        message == "record checksum mismatch",
+                        message.starts_with("sequence mismatch for stream ")
+                    ),
+                },
+            };
+            assert!(
+                !matches!(
+                    event.kind,
+                    FrameKind::SwarmErrorNotify | FrameKind::AgentError | FrameKind::CommandError
+                ),
+                "swarm push lifecycle failed during {phase}: {:?}",
+                event.kind
+            );
+            if predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("swarm push lifecycle timed out during {phase}"))
+}
+
 /// Orchestrated agents must not notify: a workflow or team fanning out to a
 /// dozen sub-agents would otherwise buzz the phone a dozen times for work the
 /// user never personally started. The paired user-origin spawn is the control —
@@ -557,7 +601,11 @@ async fn only_agents_the_user_started_notify() {
     let _pairings_dir = seed_paired_device();
     let (endpoint, mut pushes) = spawn_push_endpoint("201 Created").await;
 
-    let mut fixture = Fixture::new().await;
+    // The swarm phase needs the bootstrap's ready launch catalog, not a
+    // background probe. Explicitly enable Claude while keeping the MOCK backend.
+    let mut fixture =
+        Fixture::new_with_mock_backend_for_enabled_backends(vec![protocol::BackendKind::Claude])
+            .await;
     enable_mobile_access(&mut fixture).await;
     let keys = DeviceKeys::generate();
 
@@ -632,6 +680,173 @@ async fn only_agents_the_user_started_notify() {
                 .is_ok_and(|p| p.agent_id == parent_id && !p.has_background_work)
     })
     .await;
+
+    let root = fixture.store_dir().join("mobile-push-swarm-workspace");
+    std::fs::create_dir(&root).expect("create actual swarm push workspace");
+    fixture
+        .client
+        .project_create(protocol::ProjectCreatePayload {
+            name: "Swarm push scope".to_owned(),
+            roots: vec![protocol::ProjectRootPath(
+                root.to_string_lossy().into_owned(),
+            )],
+        })
+        .await
+        .expect("create swarm project over the real protocol");
+    let project_event = swarm_push_frame(&mut fixture, "project creation", |event| {
+        event.kind == FrameKind::ProjectNotify
+            && matches!(event.parse_payload::<protocol::ProjectNotifyPayload>()
+            .expect("swarm push project event"), protocol::ProjectNotifyPayload::Upsert { project }
+                if project.name == "Swarm push scope")
+    })
+    .await;
+    let protocol::ProjectNotifyPayload::Upsert { project } = project_event
+        .parse_payload()
+        .expect("actual swarm push project")
+    else {
+        panic!("swarm push project unexpectedly deleted")
+    };
+    let profile = fixture
+        .bootstrap
+        .launch_profile_catalog
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            protocol::LaunchProfileEntry::Ready { profile }
+                if profile.backend_kind == protocol::BackendKind::Claude
+                    && profile.kind == protocol::LaunchProfileKind::BackendDefault =>
+            {
+                Some(profile.clone())
+            }
+            _ => None,
+        })
+        .expect("mock fixture must expose a canonical ready Claude launch profile");
+    let draft_id = protocol::SwarmDraftId(uuid::Uuid::new_v4().to_string());
+    fixture
+        .client
+        .swarm_command(protocol::SwarmCommandPayload::GenerateDraft {
+            draft_id: draft_id.clone(),
+            expected_revision: None,
+            name: "Push-suppressed swarm".to_owned(),
+            opening_brief: "A swarm peer completes one board activation".to_owned(),
+            constraints: protocol::SwarmConstraints {
+                project_id: project.id.clone(),
+                workspace_policy: protocol::SwarmWorkspacePolicy::ReadOnly,
+                max_live_agents: 1,
+                allocations: vec![protocol::SwarmBackendAllocation {
+                    backend_kind: profile.backend_kind,
+                    launch_profile_id: profile.id,
+                    session_settings: profile.session_settings,
+                    count: 1,
+                }],
+                shared_guidance: "Publish board-facing results".to_owned(),
+                agent_wake_budget: protocol::SWARM_DEFAULT_AGENT_WAKE_BUDGET,
+            },
+        })
+        .await
+        .expect("review actual swarm lineup through protocol");
+    let draft_event = swarm_push_frame(&mut fixture, "reviewed swarm draft", |event| {
+        event.kind == FrameKind::SwarmDraftNotify && matches!(event.parse_payload::<protocol::SwarmDraftNotifyPayload>()
+            .expect("swarm push draft event"), protocol::SwarmDraftNotifyPayload::Upsert { draft } if draft.id == draft_id)
+    }).await;
+    let protocol::SwarmDraftNotifyPayload::Upsert { draft } = draft_event
+        .parse_payload()
+        .expect("actual reviewed swarm push draft")
+    else {
+        panic!("swarm push draft unexpectedly deleted")
+    };
+    assert!(draft.conflicts.is_empty() && draft.members.len() == 1);
+    let swarm_turn_gate = MockGateHandle::new();
+    let swarm_reservation = fixture
+        .reserve_next_mock_launch(
+            &draft.members[0].name,
+            MockScript::one(MockTurn::gated_text(
+                "Swarm native turn finishes without a personal push",
+                &swarm_turn_gate,
+            )),
+        )
+        .await;
+    fixture
+        .client
+        .swarm_command(protocol::SwarmCommandPayload::Launch {
+            draft_id: draft.id.clone(),
+            expected_revision: draft.revision,
+        })
+        .await
+        .expect("launch exactly the reviewed swarm peer");
+    let member_event = swarm_push_frame(&mut fixture, "swarm member native activation", |event| {
+        event.kind == FrameKind::NewAgent
+            && event
+                .parse_payload::<protocol::NewAgentPayload>()
+                .expect("swarm push activation descriptor")
+                .swarm_membership
+                .as_ref()
+                .is_some_and(|membership| membership.member_id == draft.members[0].id)
+    })
+    .await;
+    let member: protocol::NewAgentPayload = member_event
+        .parse_payload()
+        .expect("actual swarm push member");
+    assert_eq!(member.origin, protocol::AgentOrigin::SwarmMember);
+    assert!(member.project_id.as_ref() == Some(&project.id));
+    let membership = member
+        .swarm_membership
+        .as_ref()
+        .expect("canonical active swarm membership");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        swarm_turn_gate.wait_until_entered(),
+    )
+    .await
+    .expect("actual mock-native swarm turn must reach its completion boundary");
+    let swarm_control = fixture.mock_by_id(&member.agent_id).await;
+    swarm_turn_gate.release_one();
+    let idle_event = swarm_push_frame(&mut fixture, "canonical member idle completion", |event| {
+        event.kind == FrameKind::SwarmNotify && {
+            let state = event
+                .parse_payload::<protocol::SwarmNotifyPayload>()
+                .expect("swarm push idle state")
+                .swarm;
+            state.id == membership.swarm_id
+                && state.lifecycle == protocol::SwarmLifecycle::Running
+                && state.members.iter().any(|peer| {
+                    peer.spec.id == membership.member_id
+                        && peer.state == protocol::SwarmMemberState::Live
+                        && peer.runtime_status == Some(protocol::AgentControlStatus::Idle)
+                        && peer.agent_id.as_ref() == Some(&member.agent_id)
+                        && peer.session_id.is_some()
+                })
+                && state.notifications.len() == 1
+                && state.notifications[0].state == protocol::SwarmDeliveryState::Accepted
+        }
+    })
+    .await;
+    let idle: protocol::SwarmNotifyPayload = idle_event
+        .parse_payload()
+        .expect("completed real swarm lifecycle");
+    assert!(idle.swarm.opening_post_id.is_some());
+    assert_eq!(
+        swarm_control
+            .requests()
+            .await
+            .iter()
+            .filter(|request| matches!(
+                request,
+                server::backend::mock::MockRequest::Launch { .. }
+                    | server::backend::mock::MockRequest::Input(_)
+            ))
+            .count(),
+        1,
+        "push suppression must follow an actually accepted native activation, not an inactive or failed member"
+    );
+    assert!(swarm_control.violations().await.is_empty());
+    drop(swarm_reservation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), pushes.recv())
+            .await
+            .is_err(),
+        "an actual SwarmMember completing its native turn must not deliver any personal idle push"
+    );
 
     // Now a second spawn the user made themselves. Its notification is what
     // proves the delivery path was working the whole time.

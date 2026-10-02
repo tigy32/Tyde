@@ -33,6 +33,7 @@ tokio-rustls = "0.26"
 rcgen = "0.14"
 
 [dev-dependencies]
+libc = "0.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "visit"] }

@@ -38,7 +38,12 @@ impl EventSink {
         } else {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             if !self.rescan.swap(true, Ordering::Relaxed) {
-                tracing::warn!("project watch queue full; scheduling catch-up rescan");
+                tracing::warn!(
+                    event_kind = ?event.kind,
+                    dropped_paths = event.paths.len(),
+                    queue_limit = 128,
+                    "project watch queue full; scheduling catch-up rescan"
+                );
                 let _ = self.tx.send(Command::Rescan);
                 #[cfg(feature = "test-support")]
                 for root in &self.roots {
@@ -834,6 +839,13 @@ impl WatchState {
             relevant.extend(self.explicit.iter().cloned());
             relevant.extend(self.roots.iter().cloned());
             relevant.extend(self.roots.iter().map(|root| root.join(".git/index")));
+            tracing::warn!(
+                observed_files = self.explicit.len(),
+                visible_entries = self.inventory.visible.len(),
+                registered_directories = self.registered.len(),
+                relevant_paths = relevant.len(),
+                "project watcher catch-up rescan reconciled inventory and invalidated observed files"
+            );
         }
         relevant.sort();
         relevant.dedup();

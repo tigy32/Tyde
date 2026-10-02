@@ -549,10 +549,18 @@ fn default_mock_script() -> MockScript {
 }
 
 impl Backend for MockBackend {
+    fn validate_access_mode(mode: BackendAccessMode) -> Result<(), String> {
+        match mode {
+            BackendAccessMode::Unrestricted
+            | BackendAccessMode::ReadOnly
+            | BackendAccessMode::EnforcedReadOnly => Ok(()),
+        }
+    }
+
     fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
         for category in categories {
             match category {
-                protocol::ToolCategory::AskUser => {}
+                protocol::ToolCategory::AskUser | protocol::ToolCategory::AgentDelegation => {}
             }
         }
         Ok(())

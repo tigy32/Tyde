@@ -186,6 +186,8 @@ pub fn prime_host_with_bootstrap_for_tests(
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         teams_store_load_error: None,
+        swarms: Vec::new(),
+        swarm_drafts: Vec::new(),
         agent_restoration_failures: Vec::new(),
         agents: Vec::new(),
         task_token_usages: Vec::new(),
@@ -1010,6 +1012,14 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     }
                 });
             }
+        }
+        FrameKind::SwarmNotify
+        | FrameKind::SwarmDraftNotify
+        | FrameKind::SwarmPostNotify
+        | FrameKind::SwarmBoardNotify
+        | FrameKind::SwarmThreadNotify
+        | FrameKind::SwarmErrorNotify => {
+            // Swarm boards are desktop-only; mobile keeps ordinary member chat/history.
         }
         FrameKind::TeamNotify => {
             if let Ok(payload) = envelope.parse_payload::<TeamNotifyPayload>() {
@@ -3872,6 +3882,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 0,
                 &protocol::NewAgentPayload {
+                    swarm_membership: None,
                     agent_id: old_agent_id.clone(),
                     name: "Old".to_owned(),
                     origin: protocol::AgentOrigin::User,
@@ -3931,6 +3942,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 1,
                 &protocol::NewAgentPayload {
+                    swarm_membership: None,
                     agent_id: new_agent_id.clone(),
                     name: "Replacement".to_owned(),
                     origin: protocol::AgentOrigin::User,
@@ -4156,6 +4168,7 @@ mod wasm_tests {
             sort_order: 0,
         };
         let agent_payload = protocol::NewAgentPayload {
+            swarm_membership: None,
             agent_id: AgentId("a-1".to_owned()),
             name: "Agent One".to_owned(),
             origin: protocol::AgentOrigin::User,
@@ -4241,6 +4254,8 @@ mod wasm_tests {
                 personality_presets: Vec::new(),
                 team_templates: Vec::new(),
             },
+            swarms: Vec::new(),
+            swarm_drafts: Vec::new(),
             team_drafts: Vec::new(),
             teams: Vec::new(),
             team_members: Vec::new(),
@@ -4369,6 +4384,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 0,
                 &protocol::NewAgentPayload {
+                    swarm_membership: None,
                     agent_id: agent_id.clone(),
                     name: "Agent One".to_owned(),
                     origin: protocol::AgentOrigin::User,
@@ -4391,6 +4407,7 @@ mod wasm_tests {
         );
 
         let agent_start = protocol::AgentStartPayload {
+            swarm_membership: None,
             agent_id: agent_id.clone(),
             name: "Agent One".to_owned(),
             origin: protocol::AgentOrigin::User,
@@ -4484,6 +4501,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 seq,
                 &protocol::NewAgentPayload {
+                    swarm_membership: None,
                     agent_id: AgentId(agent_id.to_owned()),
                     name: "Agent One".to_owned(),
                     origin: protocol::AgentOrigin::User,

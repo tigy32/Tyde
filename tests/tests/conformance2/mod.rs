@@ -581,6 +581,13 @@ impl<B: Backend> Harness<B> {
         B::session_settings_schema().backend_kind
     }
 
+    pub async fn native_tool_catalog(&self) -> Option<protocol::NativeToolCatalog> {
+        match self.backend.as_ref() {
+            Some(backend) => backend.native_tool_catalog().await,
+            None => None,
+        }
+    }
+
     pub fn workspace(&self) -> &Path {
         self.workspace.path()
     }
@@ -715,7 +722,7 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
 
 /// Records the running turn's events into `turn` through the first chat event
 /// `stop` accepts. The turn must not go idle before then.
-async fn collect_turn_until<B: Backend>(
+pub(super) async fn collect_turn_until<B: Backend>(
     host: &mut Harness<B>,
     turn: &mut Turn,
     mut stop: impl FnMut(&ChatEvent) -> bool,

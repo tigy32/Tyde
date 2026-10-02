@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 68;
+pub const PROTOCOL_VERSION: u32 = 69;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -728,6 +728,8 @@ pub enum BackendAccessMode {
     /// This does not reduce backend permissions, remove tools, or reject MCP
     /// operations.
     ReadOnly,
+    /// Enforces provider-side removal or sandbox denial of filesystem writes.
+    EnforcedReadOnly,
 }
 
 /// Provenance of a live agent — who created it.
@@ -743,6 +745,8 @@ pub enum AgentOrigin {
     BackendNative,
     /// Spawned as a persistent member of a server-owned agent team.
     TeamMember,
+    /// Admitted as a peer of a server-owned swarm.
+    SwarmMember,
     /// Spawned by a Tyde Workflow coordinator or by a workflow coordinator via MCP.
     Workflow,
 }
@@ -1040,6 +1044,13 @@ pub enum FrameKind {
     BackendCapacityRefresh,
     McpServerUpsert,
     McpServerDelete,
+    SwarmCommand,
+    SwarmNotify,
+    SwarmDraftNotify,
+    SwarmPostNotify,
+    SwarmBoardNotify,
+    SwarmThreadNotify,
+    SwarmErrorNotify,
     TeamCreate,
     TeamRename,
     TeamDelete,
@@ -1248,6 +1259,13 @@ impl fmt::Display for FrameKind {
             Self::BackendCapacityRefresh => f.write_str("backend_capacity_refresh"),
             Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
             Self::McpServerDelete => f.write_str("mcp_server_delete"),
+            Self::SwarmCommand => f.write_str("swarm_command"),
+            Self::SwarmNotify => f.write_str("swarm_notify"),
+            Self::SwarmDraftNotify => f.write_str("swarm_draft_notify"),
+            Self::SwarmPostNotify => f.write_str("swarm_post_notify"),
+            Self::SwarmBoardNotify => f.write_str("swarm_board_notify"),
+            Self::SwarmThreadNotify => f.write_str("swarm_thread_notify"),
+            Self::SwarmErrorNotify => f.write_str("swarm_error_notify"),
             Self::TeamCreate => f.write_str("team_create"),
             Self::TeamRename => f.write_str("team_rename"),
             Self::TeamDelete => f.write_str("team_delete"),
@@ -1751,6 +1769,10 @@ pub struct HostBootstrapPayload<S = Value> {
     pub custom_agents: Vec<CustomAgent>,
     pub team_preset_catalog: TeamPresetCatalog,
     pub team_drafts: Vec<TeamDraft>,
+    #[serde(default)]
+    pub swarms: Vec<Swarm>,
+    #[serde(default)]
+    pub swarm_drafts: Vec<SwarmDraft>,
     pub teams: Vec<Team>,
     pub team_members: Vec<TeamMember>,
     pub team_member_bindings: Vec<TeamMemberBindingPayload>,
@@ -4037,6 +4059,36 @@ pub struct SlashCommandCatalog {
     pub commands: Vec<SlashCommand>,
 }
 
+/// The complete tool set reported by this live provider session, never a
+/// projection of requested launch policy. A missing snapshot is not an empty set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolCatalog {
+    pub backend_kind: BackendKind,
+    pub session_id: SessionId,
+    pub tools: Vec<NativeTool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTool {
+    pub name: String,
+    pub kind: NativeToolKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeToolKind {
+    ReadOnly,
+    FileMutation,
+    CommandExecution,
+    Controlled {
+        category: ToolCategory,
+    },
+    SessionControl,
+    /// The adapter has not established this tool's effects. It cannot certify
+    /// the absence of a prohibited capability.
+    Unknown,
+}
+
 impl SlashCommandCatalog {
     /// The advertised command `message` invokes, if any. Only the leading
     /// token counts: `/compact focus` invokes `compact`; `see /tmp` and an
@@ -4345,6 +4397,8 @@ pub struct SessionSettingsPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStartPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_membership: Option<SwarmMembership>,
     pub agent_id: AgentId,
     pub name: String,
     pub origin: AgentOrigin,
@@ -4699,6 +4753,8 @@ pub enum TaskTokenUsageUnavailableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgentPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_membership: Option<SwarmMembership>,
     pub agent_id: AgentId,
     pub name: String,
     pub origin: AgentOrigin,
@@ -4747,6 +4803,7 @@ pub struct CustomAgent {
 #[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
     AskUser,
+    AgentDelegation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5595,7 +5652,7 @@ impl fmt::Display for GitBranchName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectPath {
     pub root: ProjectRootPath,
     pub relative_path: String,
@@ -8827,4 +8884,556 @@ impl SeqValidator {
         self.expected.insert(stream.clone(), expected + 1);
         Ok(())
     }
+}
+
+macro_rules! swarm_identifier {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+swarm_identifier!(SwarmId);
+swarm_identifier!(SwarmDraftId);
+swarm_identifier!(SwarmMemberId);
+swarm_identifier!(SwarmPostId);
+swarm_identifier!(SwarmThreadId);
+swarm_identifier!(SwarmPublicationId);
+swarm_identifier!(SwarmRoundId);
+swarm_identifier!(SwarmNotificationId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmBoard {
+    Briefing,
+    Coordination,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmLifecycle {
+    Launching,
+    Running,
+    Pausing,
+    Paused,
+    AttentionRequired,
+    Transitioning,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmMemberState {
+    Proposed,
+    Dormant,
+    Reserved,
+    Live,
+    Retiring,
+    RetiringReserved,
+    Retired,
+    Failed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmDeliveryState {
+    Pending,
+    Dispatching,
+    Accepted,
+    Uncertain,
+    Undeliverable,
+    Failed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmDraftGeneration {
+    DeterministicGeneralists,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmRetirementPolicy {
+    FinishTurn,
+    InterruptNow,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmErrorCode {
+    Busy,
+    Invalid,
+    NotFound,
+    Conflict,
+    Unauthorized,
+    Storage,
+    CommittedDurabilityUncertain,
+    Lifecycle,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmMembership {
+    pub swarm_id: SwarmId,
+    pub member_id: SwarmMemberId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmRecoveryRequirement {
+    #[default]
+    None,
+    ExplicitResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmBackendAllocation {
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+    pub backend_kind: BackendKind,
+    pub launch_profile_id: LaunchProfileId,
+    pub count: u32,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmWorkspacePolicy {
+    #[default]
+    ReadOnly,
+    SharedWorkbench {
+        writable_consent: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmConstraints {
+    pub project_id: ProjectId,
+    #[serde(default)]
+    pub workspace_policy: SwarmWorkspacePolicy,
+    pub max_live_agents: u32,
+    pub allocations: Vec<SwarmBackendAllocation>,
+    pub shared_guidance: String,
+    pub agent_wake_budget: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmMemberSpec {
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+    pub id: SwarmMemberId,
+    pub name: String,
+    pub focus: Option<String>,
+    pub backend_kind: BackendKind,
+    pub launch_profile_id: LaunchProfileId,
+    pub project_id: ProjectId,
+    pub pinned: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmDraft {
+    #[serde(default)]
+    pub legacy_source: Option<SwarmLegacySource>,
+    #[serde(default)]
+    pub retained_sessions: HashMap<SwarmMemberId, SessionId>,
+    pub id: SwarmDraftId,
+    pub revision: u64,
+    pub name: String,
+    pub opening_brief: String,
+    pub constraints: SwarmConstraints,
+    pub members: Vec<SwarmMemberSpec>,
+    pub conflicts: Vec<String>,
+    pub generation: SwarmDraftGeneration,
+    pub legacy_team_id: Option<TeamId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmMember {
+    pub spec: SwarmMemberSpec,
+    pub state: SwarmMemberState,
+    pub agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
+    pub runtime_status: Option<AgentControlStatus>,
+    /// Highest contiguous post cursor accepted as complete inline wake context;
+    /// references and bodies read separately through tools do not advance it.
+    pub context_cursor: u64,
+    pub current_round_id: Option<SwarmRoundId>,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmBoardPosition {
+    pub board: SwarmBoard,
+    pub high_water: u64,
+    pub human_read_cursor: u64,
+    pub unread_count: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmNotification {
+    pub id: SwarmNotificationId,
+    pub member_id: SwarmMemberId,
+    pub post_ids: Vec<SwarmPostId>,
+    pub round_id: SwarmRoundId,
+    pub state: SwarmDeliveryState,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmRound {
+    pub id: SwarmRoundId,
+    pub agent_activations_remaining: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmChangePreview {
+    pub revision: u64,
+    pub base_revision: u64,
+    pub constraints: SwarmConstraints,
+    pub retained: Vec<SwarmMemberId>,
+    pub additions: Vec<SwarmMemberSpec>,
+    pub retirements: Vec<SwarmMemberId>,
+    pub conflicts: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Swarm {
+    #[serde(default)]
+    pub recovery_requirement: SwarmRecoveryRequirement,
+    #[serde(default)]
+    pub source_draft_id: Option<SwarmDraftId>,
+    pub id: SwarmId,
+    pub host_id: HostFilterId,
+    pub name: String,
+    pub revision: u64,
+    pub constraints: SwarmConstraints,
+    pub lifecycle: SwarmLifecycle,
+    pub members: Vec<SwarmMember>,
+    pub opening_post_id: Option<SwarmPostId>,
+    pub board_positions: Vec<SwarmBoardPosition>,
+    pub notifications: Vec<SwarmNotification>,
+    pub rounds: Vec<SwarmRound>,
+    #[serde(default)]
+    pub change_preview_revision: u64,
+    pub change_preview: Option<SwarmChangePreview>,
+    pub error: Option<String>,
+    pub legacy_team_id: Option<TeamId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SwarmBodySegment {
+    Text { text: String },
+    MemberMention { member_id: SwarmMemberId },
+    PostLink { post_id: SwarmPostId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmAttachment {
+    pub project_id: ProjectId,
+    pub path: ProjectPath,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmAuthor {
+    Human,
+    Member { member_id: SwarmMemberId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmPublication {
+    pub board: SwarmBoard,
+    pub publication_id: SwarmPublicationId,
+    pub body: Vec<SwarmBodySegment>,
+    #[serde(default)]
+    pub thread_id: Option<SwarmThreadId>,
+    #[serde(default)]
+    pub attachments: Vec<SwarmAttachment>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmPost {
+    pub id: SwarmPostId,
+    pub swarm_id: SwarmId,
+    pub thread_id: SwarmThreadId,
+    pub board: SwarmBoard,
+    pub cursor: u64,
+    pub author: SwarmAuthor,
+    pub publication_id: SwarmPublicationId,
+    pub body: Vec<SwarmBodySegment>,
+    pub attachments: Vec<SwarmAttachment>,
+    pub round_id: SwarmRoundId,
+    pub created_at_ms: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmCursorTarget {
+    Board { board: SwarmBoard },
+    Thread { thread_id: SwarmThreadId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmReadCursor {
+    pub swarm_id: SwarmId,
+    pub target: SwarmCursorTarget,
+    pub position: u64,
+    pub snapshot_high_water: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmBoardRead {
+    pub board: SwarmBoard,
+    #[serde(default)]
+    pub after_cursor: Option<SwarmReadCursor>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThreadRead {
+    pub thread_id: SwarmThreadId,
+    #[serde(default)]
+    pub after_cursor: Option<SwarmReadCursor>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmBoardPage {
+    pub swarm_id: SwarmId,
+    pub board: SwarmBoard,
+    pub posts: Vec<SwarmPost>,
+    pub next_cursor: SwarmReadCursor,
+    pub high_water: u64,
+    pub has_more: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmThreadPage {
+    pub swarm_id: SwarmId,
+    pub thread_id: SwarmThreadId,
+    pub root: SwarmPost,
+    pub posts: Vec<SwarmPost>,
+    pub next_cursor: SwarmReadCursor,
+    pub high_water: u64,
+    pub has_more: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmDescribe {
+    pub swarm: Swarm,
+    pub member_id: SwarmMemberId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmPublicationOutcome {
+    #[serde(default)]
+    pub commit_status: SwarmCommitStatus,
+    pub post: SwarmPost,
+    pub duplicate: bool,
+    pub deliveries: Vec<SwarmNotification>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmCommandPayload {
+    GenerateDraft {
+        draft_id: SwarmDraftId,
+        expected_revision: Option<u64>,
+        name: String,
+        opening_brief: String,
+        constraints: SwarmConstraints,
+    },
+    DiscardDraft {
+        draft_id: SwarmDraftId,
+    },
+    DiscardChangePreview {
+        swarm_id: SwarmId,
+    },
+    RetryNotification {
+        swarm_id: SwarmId,
+        notification_id: SwarmNotificationId,
+    },
+    EditDraftMember {
+        draft_id: SwarmDraftId,
+        expected_revision: u64,
+        member: SwarmMemberSpec,
+    },
+    Launch {
+        draft_id: SwarmDraftId,
+        expected_revision: u64,
+    },
+    ReadBoard {
+        swarm_id: SwarmId,
+        query: SwarmBoardRead,
+    },
+    ReadThread {
+        swarm_id: SwarmId,
+        query: SwarmThreadRead,
+    },
+    ReadPost {
+        swarm_id: SwarmId,
+        post_id: SwarmPostId,
+    },
+    Post {
+        swarm_id: SwarmId,
+        publication: SwarmPublication,
+    },
+    MarkRead {
+        swarm_id: SwarmId,
+        board: SwarmBoard,
+        cursor: u64,
+    },
+    Pause {
+        swarm_id: SwarmId,
+    },
+    Resume {
+        swarm_id: SwarmId,
+    },
+    PreviewChange {
+        swarm_id: SwarmId,
+        expected_revision: u64,
+        constraints: SwarmConstraints,
+    },
+    ApplyChange {
+        swarm_id: SwarmId,
+        preview_revision: u64,
+        retirement: SwarmRetirementPolicy,
+    },
+    PreviewMigration {
+        team_id: TeamId,
+    },
+    ApplyMigration {
+        draft_id: SwarmDraftId,
+        expected_revision: u64,
+    },
+    RetryMember {
+        swarm_id: SwarmId,
+        member_id: SwarmMemberId,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmNotifyPayload {
+    pub swarm: Swarm,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmDraftNotifyPayload {
+    Upsert { draft: Box<SwarmDraft> },
+    Delete { draft_id: SwarmDraftId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmPostNotifyPayload {
+    pub post: SwarmPost,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmBoardNotifyPayload {
+    pub page: SwarmBoardPage,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmThreadNotifyPayload {
+    pub page: SwarmThreadPage,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmErrorNotifyPayload {
+    pub publication_id: Option<SwarmPublicationId>,
+    pub swarm_id: Option<SwarmId>,
+    pub draft_id: Option<SwarmDraftId>,
+    pub code: SwarmErrorCode,
+    pub message: String,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmStoreSnapshot {
+    #[serde(default)]
+    pub commit_status: SwarmCommitStatus,
+    pub version: u32,
+    pub swarms: Vec<Swarm>,
+    pub drafts: Vec<SwarmDraft>,
+    pub posts: Vec<SwarmPost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmEventPayload {
+    Swarm(Box<SwarmNotifyPayload>),
+    Draft(SwarmDraftNotifyPayload),
+    Post(SwarmPostNotifyPayload),
+    Board(SwarmBoardNotifyPayload),
+    Thread(SwarmThreadNotifyPayload),
+    Error(SwarmErrorNotifyPayload),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmDispatch {
+    #[serde(default)]
+    pub previous_round_id: Option<SwarmRoundId>,
+    pub agent_activation_charged: bool,
+    pub notification_post_ids: Vec<SwarmPostId>,
+    pub swarm_id: SwarmId,
+    pub member: SwarmMember,
+    pub constraints: SwarmConstraints,
+    pub notification_ids: Vec<SwarmNotificationId>,
+    pub posts: Vec<SwarmPost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmFailure {
+    pub code: SwarmErrorCode,
+    pub message: String,
+}
+impl fmt::Display for SwarmFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for SwarmFailure {}
+
+pub const SWARM_MAX_LIVE_AGENTS: u32 = 16;
+pub const SWARM_MAX_AGENT_WAKE_BUDGET: u32 = 128;
+pub const SWARM_DEFAULT_AGENT_WAKE_BUDGET: u32 = 16;
+pub const SWARM_DEFAULT_PAGE_LIMIT: u32 = 50;
+pub const SWARM_MAX_PAGE_LIMIT: u32 = 100;
+pub const SWARM_MAX_BODY_BYTES: usize = 65536;
+pub const SWARM_MAX_INLINE_CONTEXT_BYTES: usize = 128 * 1024;
+pub const SWARM_MAX_ATTACHMENTS: usize = 16;
+pub const SWARM_MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
+pub const SWARM_READ_PAGE_CONTAINER_BYTES: usize = 4096;
+// A thread page must fit its root, one maximum reply, and the reply separator.
+pub const SWARM_MAX_POST_BYTES: usize =
+    (SWARM_MAX_READ_PAGE_BYTES - SWARM_READ_PAGE_CONTAINER_BYTES - 1) / 2;
+
+pub fn swarm_publication_recipients(
+    swarm: &Swarm,
+    author: &SwarmAuthor,
+    board: SwarmBoard,
+    root_author: Option<&SwarmAuthor>,
+    body: &[SwarmBodySegment],
+) -> Vec<SwarmMemberId> {
+    let mut recipients = body
+        .iter()
+        .filter_map(|segment| match segment {
+            SwarmBodySegment::MemberMention { member_id } => Some(member_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match author {
+        SwarmAuthor::Human => match root_author {
+            Some(SwarmAuthor::Member { member_id }) => recipients.push(member_id.clone()),
+            None if board == SwarmBoard::Briefing && recipients.is_empty() => recipients.extend(
+                swarm
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        !matches!(
+                            member.state,
+                            SwarmMemberState::Retiring
+                                | SwarmMemberState::RetiringReserved
+                                | SwarmMemberState::Retired
+                        )
+                    })
+                    .map(|member| member.spec.id.clone()),
+            ),
+            _ => {}
+        },
+        SwarmAuthor::Member { member_id } => recipients.retain(|id| id != member_id),
+    }
+    recipients.sort_by(|left, right| left.0.cmp(&right.0));
+    recipients.dedup();
+    recipients
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmCommitStatus {
+    #[default]
+    Durable,
+    CommittedDurabilityUncertain {
+        message: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCommit<T> {
+    pub value: T,
+    pub status: SwarmCommitStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmLegacySource {
+    pub team: Team,
+    pub members: Vec<TeamMember>,
 }

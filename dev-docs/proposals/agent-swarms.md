@@ -1,12 +1,11 @@
 # Agent Swarms
 
-Status: design proposal, not implemented. Updated 2026-09-25.
+Status: desktop implementation and product contract. Updated 2026-10-02.
 
-This proposal evolves [Agent Teams](../19-agent-teams.md) into peer groups
-with durable shared conversations. The product direction and screenshots
-come from the desktop design discussion; runtime policies explicitly marked
-as proposed still need implementation-time validation. Existing Teams
-behavior remains authoritative until the replacement ships.
+This feature evolves [Agent Teams](../19-agent-teams.md) into peer groups
+with durable shared conversations. The product direction and concept images
+come from the desktop design discussion. Section 9 records the implemented
+runtime policy. Legacy Teams remain available until explicitly converted.
 
 **Tyde handles membership, delivery, and lifecycle. Models coordinate through
 ordinary posts.** The user addresses the swarm, not its manager.
@@ -106,7 +105,7 @@ a visible conflict rather than silently changing it or exceeding a limit.
 
 The draft shows exactly which members will start. It can propose fewer than
 the allowed maximum, but never silently launch more or fewer than the approved
-preview. Proposed v1: human-applied previews control member creation; agents
+preview. Human-applied previews control member creation; agents
 do not autonomously fill spare capacity. Existing members may become idle.
 
 Save draft starts no work. Generating a model-assisted preview may itself use
@@ -186,9 +185,8 @@ completion is out of scope.
 
 ## 3. Model-facing tools
 
-These four tools are proposed additions to the embedded agent-control MCP
-server, not existing APIs. They are thin adapters over canonical typed
-protocol operations. Authenticate the caller through the existing connection
+These four tools are implemented in the embedded agent-control MCP server.
+They are thin adapters over canonical typed protocol operations. Authenticate the caller through the existing connection
 context; resolve swarm membership from that identity, never from model-supplied
 author or host fields. Reject nonmembers and retired callers explicitly.
 
@@ -287,7 +285,7 @@ not a substitute for publishing shared coordination.
 **Visibility is not activation.** Every member can read both boards, but a
 conversation must not wake every member on every reply.
 
-### 4.1 Proposed v1 routing
+### 4.1 Routing
 
 | Event | Notification recipients |
 | --- | --- |
@@ -305,8 +303,9 @@ reply turns. Reading historical posts cannot create new notification intents.
 
 For an eligible idle member, schedule a turn when permitted by lifecycle and
 capacity. For a busy member, persist pending notifications and deliver at the
-next turn boundary without automatic interruption. Coalesce multiple pending
-notifications into a bounded batch retaining every underlying post reference.
+next turn boundary without automatic interruption. Coalesce pending
+notifications only within the same causal round, in bounded batches retaining
+every underlying post reference. Separate human rounds remain separate turns.
 All board activity since the context cursor remains discoverable, even if it
 did not qualify to wake that member.
 
@@ -324,7 +323,7 @@ do not release a slot merely because the UI expects a stop to succeed. Idle
 session history does not consume a live activation slot, but a live idle agent
 still does. Expose this distinction in state and labels.
 
-Proposed v1: swarm members cannot spawn direct children through either Tyde
+Swarm members cannot spawn direct children through either Tyde
 or backend-native delegation. Supporting extra workers later requires
 server-visible reservations that count against the same limits. Use native
 capability/tool policy where available; reject unsupported launch profiles
@@ -337,8 +336,8 @@ discussion, not a reason to add a hidden claim system. It also does not solve
 concurrent file writes: integrate the existing workbench/workspace controls,
 show workspace scope explicitly, and preserve repository branch rules. Do not
 silently give every member an unsafe shared writable checkout. Workspace
-isolation and landing policy must be settled before implementation launches
-code-writing swarms.
+policy is explicit: read-only project access or consented shared writes in a
+Tyde workbench. Members coordinate edits; Tyde does not automatically land them.
 
 ### 4.3 Prevent wake storms
 
@@ -350,9 +349,8 @@ must not mint new allowances. Authors cannot spoof human provenance.
 On exhaustion, persist further posts but stop automatic agent-only dispatch,
 emit an explicit attention-required state, and let the human continue or pause.
 Never silently drop posts, truncate findings, or manufacture a successful
-completion. Exact allowance, reset rules for new human activity, and how
-coalesced causes consume allowances are pre-implementation policy decisions
-(section 9). A concurrency limit alone does not bound cumulative spend.
+completion. Section 9 records allowance and reset rules. A concurrency limit
+alone does not bound cumulative spend.
 
 ### 4.4 Durability and restart
 
@@ -449,8 +447,9 @@ versioning and compatibility policy must be designed before enabling migration.
 
 ## 7. Validation and acceptance
 
-This document changes no runtime behavior. Its implementation must be proven
-through real boundaries, not unit tests or scripted backend stand-ins.
+Validate the implementation through real boundaries, not unit tests or
+scripted provider stand-ins. Mock backends in server protocol sims establish
+server behavior only; paid provider conformance establishes provider behavior.
 
 ### Server protocol scenarios
 
@@ -499,7 +498,8 @@ only when they establish a specific additional property.
 New regression scenarios must fail against their broken behavior and pass with
 the fix. Implementation commits must pass `./dev.sh check` in their completed
 workbench and again on clean main before pushing, plus the required scoped
-real-backend coverage. This documentation-only change needs no paid backend run.
+real-backend coverage. Dev-instance screenshots must come from the rendered
+application, not the concept mockups above.
 
 ## 8. Implementation slices
 
@@ -517,24 +517,103 @@ Each slice follows the workbench, validation, and upstream landing rules. Do
 not ship an automatically running swarm before its delivery and capacity
 boundaries are ready.
 
-## 9. Decisions to settle before implementation
+## 9. Implemented runtime policy
 
-These are explicit design work, not permission to infer behavior in the UI:
+- **Desktop scope:** Swarms replaces the desktop Teams dock destination and
+  opens a first-class central tab independent of any active agent. Mobile
+  retains individual conversations/history; it does not expose swarm boards.
+- **Generation:** deterministic generalists, no paid generation session. Draft
+  and publication identities are explicit domain keys. Preview and launch use
+  reviewed revisions; pinned edits survive draft regeneration or produce
+  conflicts. Pins do not veto explicitly reviewed live-member retirement.
+  Live change identities are monotonic, including after discarding a preview.
+- **Capacity:** 1–16 live/reserved/retiring members, including live idle agents.
+  Allocation totals may not exceed the cap. Spare capacity does not create
+  agents automatically. Members cannot use Tyde child/workflow/review/team
+  execution to bypass admission, and native delegation is excluded. Claude and
+  Codex currently declare enforceable native exclusion; other real backends
+  are rejected rather than silently weakening the constraint.
+- **Models:** allocations and optional member overrides carry schema-validated
+  session settings and explicit launch-profile identities. Unavailable values
+  fail visibly; they do not select a substitute model. A retained legacy
+  session cannot silently acquire incompatible model/profile overrides;
+  retire and add a member for a different selection.
+- **Workspace:** one explicit project shared by all members. Read-only is the
+  default and is enforced separately from the existing advisory read-only
+  agent mode. Codex uses its native read-only sandbox; Claude exposes only
+  a restricted native tool set without file writes or shell execution, disables hooks and
+  external settings, and rejects other tool permissions. Writable access
+  requires a Git workbench and explicit shared-write consent. No automatic per-member checkout, file lock, merge, or landing is
+  implied. Members retain policy-permitted native tools plus the four board
+  MCP tools; other configured MCP servers are not added to swarm sessions.
+  Hidden MCP methods are also rejected at invocation, not merely omitted
+  from discovery.
+- **Causality:** default 16 agent-triggered activations per human round,
+  configurable from 1–128. New human posts and approved member additions create
+  finite rounds. Agent posts inherit their delivered cause; changing boards or
+  threads cannot reset it. Only same-round notifications coalesce. Exhaustion
+  retains posts/intents and requires human attention; explicit Resume renews
+  exhausted allowances. A human post alone does not silently clear attention.
+- **Durability:** a versioned, atomically replaced swarm store persists boards,
+  membership, drafts, publication identities, notification intent and causal
+  accounting. After restart, uncertain dispatch is not replayed automatically;
+  inspect and explicitly retry it before resuming. Transport acceptance is not
+  evidence of model understanding or task completion. A directory-sync
+  failure after a successful atomic rename is a typed committed-but-durability-
+  uncertain outcome: canonical committed state still reaches clients, the
+  warning is visible, and an idempotent retry does not duplicate publication.
+  Running groups require attention and withhold new execution until explicit
+  Resume; paused groups remain paused. A typed recovery requirement survives
+  member retries and read-position updates; neither authorizes recovery.
+  Existing turns may finish and report. Swarm ownership is persisted with
+  startup reservations and the first session record, so a restart cannot
+  restore an unfinished swarm launch as an ordinary independent agent. Native
+  resume replay carries no board prompt; delivery is admitted only after replay
+  is ready and the server rechecks current swarm policy. Retained sessions
+  without a runtime render as Ready to resume; they do not block a reviewed
+  lineup change. Pause and checked mailbox admission are serialized, but the
+  host does not hold its command lock while awaiting native acknowledgement.
+  Work admitted before Pause may finish its handoff and is then interrupted;
+  work refused as busy stays in the durable swarm intent, not a private queue.
+- **Retention:** persisted posts, publication identities and delivery/causal
+  history are retained; there is no automatic archival or ledger pruning in
+  this version. Page and wake bounds do not bound total stored history.
+  Dispatch signals coalesce and unchanged runtime state is not rebroadcast.
+- **Read bounds:** pages default to 50 and are limited to 100. Continuation
+  cursors include swarm identity, board/thread scope, position, and a fixed
+  snapshot high-water mark. New live posts remain separate from that snapshot.
+  UI deep links resolve the exact post through the server, including old replies.
+  Bodies are limited to 64 KiB and posts to 16 authorized file references.
+  Serialized pages are additionally byte-bounded (1 MiB, including a reserved
+  container allowance), so a page can contain fewer than its requested limit.
+  The returned cursor and `has_more`, not the requested count, govern paging.
+  Wake input inlines at most 128 KiB of complete chronological posts, never
+  truncates a body, and retains every required notification reference. Agents
+  read omitted bodies through the board tools; omitted content does not
+  advance the member’s inline-context cursor.
+- **Human unread:** one host-owner read position, shared across connected UI
+  clients. The host protocol does not currently represent multiple independent
+  human principals. Reading from a model never changes that position.
+- **Private conversations:** live member chats remain inspectable. Private
+  human input to an idle, running member creates a finite cause without
+  publishing its contents. Busy/paused private input is explicitly refused;
+  use the board for durable queued delivery. Independent resume/fork and model
+  edits cannot bypass swarm ownership; use reviewed swarm lifecycle controls.
+  Ordinary autonomous agent supervision is disabled for swarm members: board
+  notifications and admitted private human input are the only work triggers.
+  A failed or terminated member credential never becomes ordinary MCP authority.
+- **Migration:** explicit, quiescent, same-project conversion only, with
+  reviewed compatible profile settings. Stable member/session identities and
+  historical legacy records remain. Converted records disappear from the live
+  Teams projection and cannot be activated as a second group. No private
+  transcript becomes a board post.
 
-- Numerical activation allowance, human reset semantics, and coalesced causal
-  accounting. Show the limit and attention-required behavior in user settings.
-- Whether "active agents" should be labeled live agents or simultaneous turns.
-  This proposal counts live/reserved activations; the UI must match the chosen
-  enforced resource, including backend-native delegation restrictions.
-- Workspace/workbench isolation and who lands concurrent code changes. The
-  board itself is not a filesystem concurrency control mechanism.
-- Draft-generation provider selection, resource accounting, and cancellation.
-  Preview generation is distinct from launching the proposed agents.
-- Persistent store/versioning, wire enum variants, retention/page bounds, and
-  exact backend-acceptance reconciliation. Avoid undocumented recovery guesses.
-- Legacy profile migration, cross-project shared visibility, and continued
-  access to unconverted Teams during the transition.
+The authoritative wire types and policy constants live in
+`protocol/src/types.rs`; registry transactions live in
+`server/src/swarm_registry.rs`, host integration in `server/src/swarm_host.rs`,
+and authenticated tool adapters in `server/src/agent_control_mcp.rs`.
+Desktop projections live in the three `swarm_*`/`swarms_panel` components.
 
-The agreed starting point remains small: two boards, high-level constraints,
-optional lineup tweaks, four tools, and reliable server-owned delivery. Add
-coordination structure only when real use demonstrates a concrete need.
+The product remains two boards, high-level constraints, optional lineup tweaks,
+four model tools, and server-owned delivery. Add coordination structure only
+when real use demonstrates a concrete need.

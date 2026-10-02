@@ -102,6 +102,8 @@ pub(crate) struct SessionRestoreState {
 /// transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StartupReservation {
+    #[serde(default)]
+    pub swarm_membership: Option<protocol::SwarmMembership>,
     pub agent_id: protocol::AgentId,
     pub spawn: protocol::SpawnAgentPayload,
     pub origin: AgentOrigin,
@@ -140,6 +142,8 @@ impl TurnRecovery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub swarm_membership: Option<protocol::SwarmMembership>,
     #[serde(default)]
     pub turn_recovery: Option<TurnRecovery>,
     pub id: SessionId,
@@ -342,11 +346,31 @@ impl SessionStore {
         custom_agent_id: Option<CustomAgentId>,
         launch_profile_id: Option<LaunchProfileId>,
     ) -> Result<SessionRecord, String> {
+        self.upsert_owned_backend_session(
+            session,
+            parent_id,
+            project_id,
+            custom_agent_id,
+            launch_profile_id,
+            None,
+        )
+    }
+
+    pub(crate) fn upsert_owned_backend_session(
+        &self,
+        session: &BackendSession,
+        parent_id: Option<SessionId>,
+        project_id: Option<ProjectId>,
+        custom_agent_id: Option<CustomAgentId>,
+        launch_profile_id: Option<LaunchProfileId>,
+        swarm_membership: Option<protocol::SwarmMembership>,
+    ) -> Result<SessionRecord, String> {
         let now = now_ms();
         self.read_modify_write(&[&session.id], |records| {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    swarm_membership: swarm_membership.clone(),
                     turn_recovery: None,
                     id: session.id.clone(),
                     backend_kind: session.backend_kind,
@@ -382,6 +406,17 @@ impl SessionStore {
                     restore_state: None,
                 });
 
+            if let Some(membership) = &swarm_membership {
+                if entry
+                    .swarm_membership
+                    .as_ref()
+                    .is_some_and(|owner| owner != membership)
+                {
+                    return Err("Session already belongs to a different swarm member".into());
+                }
+                entry.swarm_membership = Some(membership.clone());
+                entry.restore_state = None;
+            }
             entry.backend_kind = session.backend_kind;
             if launch_profile_id.is_some() {
                 entry.launch_profile_id = launch_profile_id.clone();
@@ -1218,6 +1253,29 @@ impl SessionStoreHandle {
                 project_id,
                 custom_agent_id,
                 launch_profile_id,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn upsert_owned_backend_session(
+        &self,
+        session: &BackendSession,
+        parent_id: Option<SessionId>,
+        project_id: Option<ProjectId>,
+        custom_agent_id: Option<CustomAgentId>,
+        launch_profile_id: Option<LaunchProfileId>,
+        swarm_membership: Option<protocol::SwarmMembership>,
+    ) -> Result<SessionRecord, String> {
+        let session = session.clone();
+        self.call(move |store| {
+            store.upsert_owned_backend_session(
+                &session,
+                parent_id,
+                project_id,
+                custom_agent_id,
+                launch_profile_id,
+                swarm_membership,
             )
         })
         .await

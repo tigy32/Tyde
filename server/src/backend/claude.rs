@@ -20,12 +20,12 @@ use protocol::{
     BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage,
     CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
     CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ContextBreakdown,
-    CurrentContextUsage, ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo,
-    ReasoningData, SendMessageToolResponse, SessionId, SlashCommand, SlashCommandCatalog,
-    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolProgressData, ToolProgressUpdate,
-    ToolRequestType, ToolUseData, ValueProvenance, WorkflowAgentState, WorkflowAgentStatus,
-    WorkflowRunState, WorkflowRunStatus,
+    CurrentContextUsage, ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo, NativeTool,
+    NativeToolCatalog, NativeToolKind, ReasoningData, SendMessageToolResponse, SessionId,
+    SlashCommand, SlashCommandCatalog, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolProgressData,
+    ToolProgressUpdate, ToolRequestType, ToolUseData, ValueProvenance, WorkflowAgentState,
+    WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::backend::claude_skills::{
@@ -204,6 +204,18 @@ impl ClaudeCommandHandle {
                     BackendCompactionCapabilityEvidence::None,
                 )
             })
+    }
+
+    async fn native_tool_catalog(&self) -> Option<NativeToolCatalog> {
+        let state = self.inner.state.lock().await;
+        if state.closing
+            || state
+                .stale_process_generation
+                .is_some_and(|stale| state.process_generation <= stale)
+        {
+            return None;
+        }
+        state.native_tool_catalog.clone()
     }
 
     async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
@@ -519,6 +531,7 @@ impl ClaudeSession {
             state: Mutex::new(ClaudeState {
                 program: None,
                 native_models: None,
+                native_tool_catalog: None,
                 workspace_root,
                 workspace_roots: configured_workspace_roots,
                 ssh_host: resolved_ssh_host,
@@ -529,6 +542,7 @@ impl ClaudeSession {
                 model: None,
                 effort: None,
                 fast_mode: None,
+                access_mode: mode.access_mode,
                 permission_mode: Some(
                     claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
                 ),
@@ -736,6 +750,7 @@ impl ClaudeEffort {
 struct ClaudeState {
     program: Option<String>,
     native_models: Option<Vec<ClaudeModelMetadata>>,
+    native_tool_catalog: Option<NativeToolCatalog>,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
     ssh_host: Option<String>,
@@ -746,6 +761,7 @@ struct ClaudeState {
     model: Option<String>,
     effort: Option<ClaudeEffort>,
     fast_mode: Option<bool>,
+    access_mode: BackendAccessMode,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -812,6 +828,7 @@ impl Default for ClaudeState {
         Self {
             program: None,
             native_models: None,
+            native_tool_catalog: None,
             workspace_root: String::new(),
             workspace_roots: None,
             ssh_host: None,
@@ -822,6 +839,7 @@ impl Default for ClaudeState {
             model: None,
             effort: None,
             fast_mode: None,
+            access_mode: BackendAccessMode::Unrestricted,
             permission_mode: None,
             startup_mcp_config_json: None,
             steering_content: None,
@@ -1364,6 +1382,93 @@ fn claude_init_frame_skills(value: &Value) -> Option<Result<Option<Vec<String>>,
     Some(Ok(Some(names)))
 }
 
+fn claude_native_tool_kind(name: &str) -> NativeToolKind {
+    if claude_is_modify_tool_name(name) {
+        return NativeToolKind::FileMutation;
+    }
+    if claude_is_run_command_tool_name(name) {
+        return NativeToolKind::CommandExecution;
+    }
+    if DELEGATION_TOOL_NAMES.contains(&name) {
+        return NativeToolKind::Controlled {
+            category: protocol::ToolCategory::AgentDelegation,
+        };
+    }
+    if claude_is_ask_user_question_tool_name(name) {
+        return NativeToolKind::Controlled {
+            category: protocol::ToolCategory::AskUser,
+        };
+    }
+    match name {
+        "Read"
+        | "NotebookRead"
+        | "Glob"
+        | "Grep"
+        | "WebFetch"
+        | "WebSearch"
+        | "ListMcpResourcesTool"
+        | "ReadMcpResourceTool" => NativeToolKind::ReadOnly,
+        "EnterWorktree" | "ExitWorktree" => NativeToolKind::FileMutation,
+        "ExitPlanMode"
+        | "EnterPlanMode"
+        | "TodoWrite"
+        | "TaskCreate"
+        | "TaskGet"
+        | "TaskUpdate"
+        | "TaskList"
+        | "TaskStop"
+        | "Skill"
+        | "ToolSearch"
+        | "mcp__tyde-agent-control__tyde_swarm_describe"
+        | "mcp__tyde-agent-control__tyde_swarm_read_board"
+        | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+        | "mcp__tyde-agent-control__tyde_swarm_post" => NativeToolKind::SessionControl,
+        _ => NativeToolKind::Unknown,
+    }
+}
+
+fn claude_init_frame_native_tool_catalog(
+    value: &Value,
+) -> Option<Result<NativeToolCatalog, String>> {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("init")
+        || extract_parent_tool_use_id(value).is_some()
+    {
+        return None;
+    }
+    Some((|| {
+        let session_id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.trim() == *id)
+            .ok_or("Claude native tool catalog omitted its provider session identity")?;
+        let entries = value
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or("Claude init must report its native tools as an array")?;
+        let mut names = HashSet::new();
+        let mut tools = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry
+                .as_str()
+                .filter(|name| !name.is_empty() && name.trim() == *name)
+                .ok_or("Claude native tool catalog contains an invalid tool name")?;
+            if !names.insert(name) {
+                return Err("Claude native tool catalog contains duplicate tool names".to_owned());
+            }
+            tools.push(NativeTool {
+                name: name.to_owned(),
+                kind: claude_native_tool_kind(name),
+            });
+        }
+        Ok(NativeToolCatalog {
+            backend_kind: BackendKind::Claude,
+            session_id: SessionId(session_id.to_owned()),
+            tools,
+        })
+    })())
+}
+
 /// The slash commands a `system`/`init` frame reports: every user-invocable
 /// name, and the subset the CLI marks terminal-bound (`exit`, `statusline`, …)
 /// that a headless session cannot honor and remote UIs are told to hide.
@@ -1771,6 +1876,7 @@ struct ClaudeProcessSpawnConfig {
     model: Option<String>,
     effort: Option<ClaudeEffort>,
     fast_mode: Option<bool>,
+    access_mode: BackendAccessMode,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -1980,7 +2086,14 @@ impl ClaudeInner {
                         .or_else(|| obj.get("permissionMode"))
                         .or_else(|| obj.get("approval_policy"))
                     {
-                        if permission_mode_value.is_null() {
+                        if state.access_mode == BackendAccessMode::EnforcedReadOnly {
+                            if !matches!(permission_mode_value.as_str(), Some("dontAsk")) {
+                                return Err(
+                                    "Cannot change permissions under enforced read-only access"
+                                        .to_owned(),
+                                );
+                            }
+                        } else if permission_mode_value.is_null() {
                             changed_process_setting |= state.permission_mode.is_some();
                             state.permission_mode = None;
                         } else if let Some(permission_mode) =
@@ -3372,6 +3485,7 @@ impl ClaudeInner {
                 BackendCompactionCapabilityEvidence::None,
             );
             state.native_models = None;
+            state.native_tool_catalog = None;
             let config = ClaudeProcessSpawnConfig {
                 program: state.program.clone(),
                 workspace_root: state.workspace_root.clone(),
@@ -3391,6 +3505,7 @@ impl ClaudeInner {
                 model: state.model.clone(),
                 effort: state.effort,
                 fast_mode: state.fast_mode,
+                access_mode: state.access_mode,
                 permission_mode: state.permission_mode.clone(),
                 startup_mcp_config_json: state.startup_mcp_config_json.clone(),
                 steering_content: state.steering_content.clone(),
@@ -3800,6 +3915,105 @@ impl ClaudeInner {
         let mut state = self.state.lock().await;
         state.init_slash_commands = Some(update);
         self.publish_slash_commands(&mut state);
+    }
+
+    async fn record_native_tool_catalog(
+        &self,
+        process_generation: u64,
+        value: &Value,
+    ) -> Result<(), String> {
+        if extract_parent_tool_use_id(value).is_some() {
+            return Ok(());
+        }
+        let reported = claude_init_frame_native_tool_catalog(value);
+        let mut state = self.state.lock().await;
+        if state.process_generation != process_generation || state.closing {
+            return Ok(());
+        }
+        let verification_required = state.access_mode == BackendAccessMode::EnforcedReadOnly
+            || !state.excluded_tool_categories.is_empty();
+        let Some(reported) = reported else {
+            if state.native_tool_catalog.is_none()
+                && state.resume_bootstrap.is_none()
+                && verification_required
+                && matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("assistant" | "stream_event" | "event" | "result" | "control_request")
+                )
+            {
+                return Err(
+                    "Claude began a restricted turn without confirming its native tool catalog"
+                        .to_owned(),
+                );
+            }
+            return Ok(());
+        };
+        state.native_tool_catalog = None;
+        let catalog = match reported {
+            Ok(catalog) => catalog,
+            Err(error) if verification_required => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    process_generation,
+                    error,
+                    "Claude optional native tool catalog unavailable"
+                );
+                return Ok(());
+            }
+        };
+        if state
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id != &catalog.session_id.0)
+        {
+            let error = "Claude native tool catalog belongs to a different provider session";
+            if verification_required {
+                return Err(error.to_owned());
+            }
+            tracing::warn!(
+                process_generation,
+                error,
+                "Claude optional native tool catalog unavailable"
+            );
+            return Ok(());
+        }
+        for tool in &catalog.tools {
+            if let NativeToolKind::Controlled { category } = tool.kind
+                && state.excluded_tool_categories.contains(&category)
+            {
+                return Err("Claude advertised an excluded native tool category".to_owned());
+            }
+            if state.access_mode == BackendAccessMode::EnforcedReadOnly
+                && !matches!(
+                    tool.name.as_str(),
+                    "Read"
+                        | "Glob"
+                        | "Grep"
+                        | "AskUserQuestion"
+                        | "ExitPlanMode"
+                        | "mcp__tyde-agent-control__tyde_swarm_describe"
+                        | "mcp__tyde-agent-control__tyde_swarm_read_board"
+                        | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+                        | "mcp__tyde-agent-control__tyde_swarm_post"
+                )
+            {
+                return Err(
+                    "Claude advertised a tool outside its enforced read-only allowance".to_owned(),
+                );
+            }
+        }
+        tracing::info!(
+            process_generation,
+            tool_count = catalog.tools.len(),
+            unknown_tool_count = catalog
+                .tools
+                .iter()
+                .filter(|tool| tool.kind == NativeToolKind::Unknown)
+                .count(),
+            "Observed Claude provider-native tool catalog"
+        );
+        state.native_tool_catalog = Some(catalog);
+        Ok(())
     }
 
     /// Advertise the effective set once the `init` frame has arrived: it is
@@ -4536,13 +4750,14 @@ impl ClaudeInner {
     }
 
     async fn shutdown_process(&self) {
-        let resume_bootstrap_generation = self
-            .state
-            .lock()
-            .await
-            .resume_bootstrap
-            .as_ref()
-            .map(|bootstrap| bootstrap.generation);
+        let resume_bootstrap_generation = {
+            let mut state = self.state.lock().await;
+            state.native_tool_catalog = None;
+            state
+                .resume_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.generation)
+        };
         if let Some(process_generation) = resume_bootstrap_generation {
             self.fail_resume_bootstrap(
                 process_generation,
@@ -4565,6 +4780,7 @@ impl ClaudeInner {
     /// which is precisely why the group is signalled rather than the child alone.
     /// The requests could therefore only delay the kill, never change its result.
     async fn close_process(&self) {
+        self.state.lock().await.native_tool_catalog = None;
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {
             runtime.kill().await;
@@ -4577,6 +4793,7 @@ impl ClaudeInner {
     }
 
     async fn retire_process_for_replacement(&self) {
+        self.state.lock().await.native_tool_catalog = None;
         let runtime = self.runtime.lock().await.take();
         self.drain_background_tasks();
         if let Some(runtime) = runtime {
@@ -4586,6 +4803,7 @@ impl ClaudeInner {
     }
 
     async fn mark_process_exited(&self) {
+        self.state.lock().await.native_tool_catalog = None;
         self.drain_background_tasks();
         // Callers that know the real outcome (exited mid-turn, exited during a
         // compaction) have already delivered it and left `outcome_tx` empty, so
@@ -5047,14 +5265,6 @@ impl ClaudeInner {
         }
         if !emitted {
             return false;
-        }
-        if is_subagent_tool_name(&tool_call.name) {
-            let inserted = self
-                .native_subagent_tasks
-                .lock()
-                .expect("Claude native subagent task mutex poisoned")
-                .insert(tool_call.id.clone());
-            eprintln!("TYDE CLAUDE NATIVE TASK TRACK inserted={inserted}");
         }
         self.adopt_background_task_awaiting_tool_request(tool_call);
         true
@@ -5713,10 +5923,15 @@ async fn write_json_line_to_stdin(
 }
 
 fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
-    let effective_permission_mode = config
-        .permission_mode
-        .as_deref()
-        .unwrap_or(CLAUDE_DEFAULT_PERMISSION_MODE);
+    let enforced_read_only = config.access_mode == BackendAccessMode::EnforcedReadOnly;
+    let effective_permission_mode = if enforced_read_only {
+        "dontAsk"
+    } else {
+        config
+            .permission_mode
+            .as_deref()
+            .unwrap_or(CLAUDE_DEFAULT_PERMISSION_MODE)
+    };
     let mut cli_args: Vec<String> = vec![
         "--print".to_string(),
         "--verbose".to_string(),
@@ -5749,6 +5964,18 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     }
 
     let mut cli_settings = serde_json::Map::new();
+    if enforced_read_only {
+        cli_args.extend([
+            "--tools".to_owned(),
+            "Read,Glob,Grep,AskUserQuestion,ExitPlanMode".to_owned(),
+            "--setting-sources".to_owned(),
+            String::new(),
+            "--strict-mcp-config".to_owned(),
+            "--allowedTools".to_owned(),
+            "Read,Glob,Grep,mcp__tyde-agent-control__*".to_owned(),
+        ]);
+        cli_settings.insert("disableAllHooks".to_owned(), json!(true));
+    }
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
         cli_args.push("--model".to_string());
         cli_args.push(model_name.clone());
@@ -5796,6 +6023,9 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     for category in &config.excluded_tool_categories {
         match category {
             protocol::ToolCategory::AskUser => disallowed_tools.push("AskUserQuestion".to_owned()),
+            protocol::ToolCategory::AgentDelegation => {
+                disallowed_tools.extend(DELEGATION_TOOL_NAMES.iter().map(|name| (*name).to_owned()))
+            }
         }
     }
     match &config.tool_policy {
@@ -6013,6 +6243,14 @@ fn claude_startup_mcp_is_required(name: &str) -> bool {
 
 /// Tool names that indicate a sub-agent spawn in Claude Code.
 const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Agent"];
+const DELEGATION_TOOL_NAMES: &[&str] = &[
+    "Agent",
+    "Task",
+    "Workflow",
+    "SendMessage",
+    "TeamCreate",
+    "TeamDelete",
+];
 
 fn is_subagent_tool_name(name: &str) -> bool {
     SUBAGENT_TOOL_NAMES.contains(&name)
@@ -6217,6 +6455,7 @@ async fn read_claude_stdout_persistent(
     process_generation: u64,
 ) {
     let mut turn_state = PersistentStdoutTurnState::default();
+    let mut native_catalog_failure = None;
     let mut lines = BufReader::new(stdout).lines();
     let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
     let mut known_subagent_ids = HashSet::new();
@@ -6307,6 +6546,22 @@ async fn read_claude_stdout_persistent(
         // could ever emit an `init` frame.
         if route_control_response(&value, &control_waiters).await {
             continue;
+        }
+        if let Err(error) = inner
+            .record_native_tool_catalog(process_generation, &value)
+            .await
+        {
+            inner.state.lock().await.closing = true;
+            inner
+                .fail_resume_bootstrap(process_generation, &error)
+                .await;
+            tracing::error!(
+                process_generation,
+                "Claude native tool catalog verification failed"
+            );
+            inner.emit_error(&error);
+            native_catalog_failure = Some(error);
+            break;
         }
         inner.observe_process_metadata(&value).await;
         tracing::debug!(
@@ -6407,7 +6662,7 @@ async fn read_claude_stdout_persistent(
         if handle_ask_user_question_control_request(&value, &inner, &mut turn_state, &stdin).await {
             continue;
         }
-        if respond_to_control_request(&value, &stdin).await {
+        if respond_to_control_request(&value, &stdin, &inner).await {
             continue;
         }
 
@@ -6541,20 +6796,25 @@ async fn read_claude_stdout_persistent(
         }
 
         if let Some(ref emitter) = subagent_emitter {
-            detect_subagent_task_system_spawns(
+            confirm_subagent_spawns(
                 &value,
                 emitter.as_ref(),
-                &inner.emitter,
+                &inner,
+                &mut turn_state,
                 &mut subagent_streams,
+                &known_subagent_ids,
+                &mut pending_subagent_spawns,
             )
             .await;
-            observe_local_agent_task_usage(
-                &inner,
-                &value,
-                &mut local_agent_tasks,
-                &mut subagent_streams,
-            );
             known_subagent_ids.extend(subagent_streams.keys().cloned());
+        }
+        observe_local_agent_task_usage(
+            &inner,
+            &value,
+            &mut local_agent_tasks,
+            &mut subagent_streams,
+        );
+        if subagent_emitter.is_some() {
             // A background sub-agent completes via `task_notification`, which
             // arrives on the parent stream after the parent's turn `result`.
             // Handle it pre-gate so it lands even with no active turn.
@@ -6672,23 +6932,13 @@ async fn read_claude_stdout_persistent(
             interrupt_requested,
         );
         flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
-        if let Some(ref emitter) = subagent_emitter {
-            flush_pending_subagent_spawns(
-                emitter.as_ref(),
-                &inner.emitter,
-                &mut subagent_streams,
-                &mut pending_subagent_spawns,
-            )
-            .await;
-            detect_subagent_spawns(
+        if subagent_emitter.is_some() {
+            record_subagent_spawn_requests(
                 &value,
-                emitter.as_ref(),
-                &inner.emitter,
-                &mut subagent_streams,
                 &mut pending_subagent_prompts,
                 &mut pending_subagent_spawns,
-            )
-            .await;
+            );
+            refine_confirmed_subagent_spawns(&mut subagent_streams, &mut pending_subagent_spawns);
             finalize_ready_background_subagents(&mut subagent_streams);
             known_subagent_ids.extend(subagent_streams.keys().cloned());
             sync_persistent_background_activity(&inner, &subagent_streams, &workflow_runs).await;
@@ -6765,7 +7015,9 @@ async fn read_claude_stdout_persistent(
         } else {
             TurnOutcome::Failed {
                 summary,
-                error: "Claude process exited before returning a result".to_string(),
+                error: native_catalog_failure.unwrap_or_else(|| {
+                    "Claude process exited before returning a result".to_string()
+                }),
             }
         };
         inner
@@ -7071,8 +7323,13 @@ async fn handle_exit_plan_mode_control_request(
     true
 }
 
-async fn respond_to_control_request(value: &Value, stdin: &Arc<Mutex<ChildStdin>>) -> bool {
-    let Some(payload) = control_response_payload_for_request(value) else {
+async fn respond_to_control_request(
+    value: &Value,
+    stdin: &Arc<Mutex<ChildStdin>>,
+    inner: &Arc<ClaudeInner>,
+) -> bool {
+    let access_mode = inner.state.lock().await.access_mode;
+    let Some(payload) = control_response_payload_for_request(value, access_mode) else {
         return false;
     };
     if payload.is_null() {
@@ -7277,7 +7534,10 @@ fn ensure_exit_plan_mode_tool_request_emitted(
     tool_call
 }
 
-fn control_response_payload_for_request(value: &Value) -> Option<Value> {
+fn control_response_payload_for_request(
+    value: &Value,
+    access_mode: BackendAccessMode,
+) -> Option<Value> {
     if value.get("type").and_then(Value::as_str) != Some("control_request") {
         return None;
     }
@@ -7299,6 +7559,24 @@ fn control_response_payload_for_request(value: &Value) -> Option<Value> {
 
     let response = if is_tool_permission_subtype(subtype) {
         let tool_name = control_request_tool_name(value, request).unwrap_or_default();
+        if access_mode == BackendAccessMode::EnforcedReadOnly
+            && !matches!(
+                tool_name,
+                "Read" | "Glob" | "Grep" | "AskUserQuestion" | "ExitPlanMode"
+            )
+            && !matches!(
+                tool_name,
+                "mcp__tyde-agent-control__tyde_swarm_describe"
+                    | "mcp__tyde-agent-control__tyde_swarm_read_board"
+                    | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+                    | "mcp__tyde-agent-control__tyde_swarm_post"
+            )
+        {
+            return Some(tool_permission_control_response_payload(
+                &request_id,
+                json!({"behavior": "deny", "message": "Tool unavailable under enforced read-only access."}),
+            ));
+        }
         if claude_is_ask_user_question_tool_name(tool_name) {
             return Some(tool_permission_control_response_payload(
                 &request_id,
@@ -7751,12 +8029,41 @@ struct SubAgentSpawnSpec {
     execution: SubAgentExecution,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SubAgentSpawnConfirmation {
+    NativeTaskStarted,
+    ChildFrame,
+    SuccessfulToolResult,
+}
+
+fn update_subagent_stream(stream: &mut SubAgentStream, spec: SubAgentSpawnSpec) {
+    if spec.execution != SubAgentExecution::Unknown {
+        stream.execution = spec.execution;
+    }
+    if let Some(parent_tool_name) = spec.parent_tool_name {
+        stream.parent_tool_name = parent_tool_name;
+    }
+    if crate::sub_agent::child_name_is_better(&stream.agent_name, &spec.name) {
+        stream.agent_name = spec.name.clone();
+        if let Some(tx) = &stream.name_update_tx {
+            let _ = tx.send(spec.name);
+        }
+        queue_subagent_progress(stream, false);
+        flush_subagent_progress(stream);
+    }
+}
+
 async fn ensure_subagent_stream(
     emitter: &dyn SubAgentEmitter,
     parent_emitter: &Arc<TurnEmitter>,
     streams: &mut HashMap<String, SubAgentStream>,
     spec: SubAgentSpawnSpec,
+    confirmation: SubAgentSpawnConfirmation,
 ) {
+    if let Some(stream) = streams.get_mut(&spec.tool_use_id) {
+        update_subagent_stream(stream, spec);
+        return;
+    }
     let SubAgentSpawnSpec {
         tool_use_id,
         parent_tool_name,
@@ -7766,26 +8073,9 @@ async fn ensure_subagent_stream(
         session_id_hint,
         execution,
     } = spec;
-    if let Some(stream) = streams.get_mut(&tool_use_id) {
-        if execution != SubAgentExecution::Unknown {
-            stream.execution = execution;
-        }
-        if let Some(parent_tool_name) = parent_tool_name {
-            stream.parent_tool_name = parent_tool_name;
-        }
-        if crate::sub_agent::child_name_is_better(&stream.agent_name, &name) {
-            stream.agent_name = name.clone();
-            if let Some(tx) = &stream.name_update_tx {
-                let _ = tx.send(name);
-            }
-            queue_subagent_progress(stream, false);
-            flush_subagent_progress(stream);
-        }
-        return;
-    }
-
     tracing::info!(
-        "registering Claude sub-agent stream tool_use_id={tool_use_id} name={name} agent_type={agent_type}"
+        ?confirmation,
+        "Registering provider-confirmed Claude native child stream"
     );
     let handle = match emitter
         .on_subagent_spawned(
@@ -8990,11 +9280,109 @@ fn handle_background_bash_task_frame_with_owners(
     }
 }
 
+async fn confirm_subagent_spawns(
+    value: &Value,
+    emitter: &dyn SubAgentEmitter,
+    inner: &Arc<ClaudeInner>,
+    turn: &mut PersistentStdoutTurnState,
+    streams: &mut HashMap<String, SubAgentStream>,
+    known_subagent_ids: &HashSet<String>,
+    pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
+) {
+    let task_started = value.get("type").and_then(Value::as_str) == Some("system")
+        && value.get("subtype").and_then(Value::as_str) == Some("task_started")
+        && value.get("task_type").and_then(Value::as_str) == Some("local_agent");
+    let correlated_spawn = extract_parent_tool_use_id(value)
+        .filter(|id| pending_spawns.contains_key(*id) && !known_subagent_ids.contains(*id));
+    let native_results = if value.get("type").and_then(Value::as_str) == Some("user")
+        && extract_parent_tool_use_id(value).is_none()
+    {
+        value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .filter_map(|block| {
+                let id = block.get("tool_use_id").and_then(Value::as_str)?;
+                pending_spawns.contains_key(id).then(|| {
+                    (
+                        id.to_owned(),
+                        block.get("is_error").and_then(Value::as_bool) == Some(true),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !task_started && correlated_spawn.is_none() && native_results.is_empty() {
+        return;
+    }
+
+    // Native execution can precede message_stop. Declare the completed parent
+    // calls without ending their response before registering/routing its child.
+    let _turn_event_guard = inner.turn_event_gate.lock().await;
+    declare_open_response_tool_calls(
+        &mut turn.summary,
+        &mut turn.segment,
+        inner,
+        &turn.current_message_id,
+    );
+    if task_started {
+        detect_subagent_task_system_spawns(
+            value,
+            emitter,
+            &inner.emitter,
+            streams,
+            known_subagent_ids,
+            pending_spawns,
+        )
+        .await;
+    }
+    if let Some(parent_id) = correlated_spawn
+        && inner.emitter.has_known_tool_request(parent_id)
+        && let Some(spec) = pending_spawns.remove(parent_id)
+    {
+        ensure_subagent_stream(
+            emitter,
+            &inner.emitter,
+            streams,
+            spec,
+            SubAgentSpawnConfirmation::ChildFrame,
+        )
+        .await;
+    }
+    for (id, failed) in native_results {
+        if failed {
+            pending_spawns.remove(&id);
+            tracing::info!(
+                relay_present = streams.contains_key(&id),
+                "Claude native child attempt failed"
+            );
+        } else if !known_subagent_ids.contains(&id)
+            && inner.emitter.has_known_tool_request(&id)
+            && let Some(spec) = pending_spawns.remove(&id)
+        {
+            ensure_subagent_stream(
+                emitter,
+                &inner.emitter,
+                streams,
+                spec,
+                SubAgentSpawnConfirmation::SuccessfulToolResult,
+            )
+            .await;
+        }
+    }
+}
+
 async fn detect_subagent_task_system_spawns(
     value: &Value,
     emitter: &dyn SubAgentEmitter,
     parent_emitter: &Arc<TurnEmitter>,
     streams: &mut HashMap<String, SubAgentStream>,
+    known_subagent_ids: &HashSet<String>,
+    pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
 ) {
     if value.get("type").and_then(Value::as_str) != Some("system") {
         return;
@@ -9024,6 +9412,11 @@ async fn detect_subagent_task_system_spawns(
     if !parent_emitter.has_known_tool_request(&tool_use_id) {
         return;
     }
+    if known_subagent_ids.contains(&tool_use_id) && !streams.contains_key(&tool_use_id) {
+        pending_spawns.remove(&tool_use_id);
+        tracing::warn!("Claude native start arrived after its confirmed child stream closed");
+        return;
+    }
 
     let task_name = system.description.as_deref().and_then(normalize_nonempty);
     let prompt = system.prompt.as_deref().and_then(normalize_nonempty);
@@ -9033,11 +9426,9 @@ async fn detect_subagent_task_system_spawns(
         .or_else(|| task_name.clone())
         .unwrap_or_else(|| name.clone());
 
-    ensure_subagent_stream(
-        emitter,
-        parent_emitter,
-        streams,
-        SubAgentSpawnSpec {
+    let spec = match pending_spawns.remove(&tool_use_id) {
+        Some(spec) => spec,
+        None => SubAgentSpawnSpec {
             tool_use_id: tool_use_id.clone(),
             parent_tool_name: None,
             name,
@@ -9046,6 +9437,13 @@ async fn detect_subagent_task_system_spawns(
             session_id_hint: None,
             execution: SubAgentExecution::Unknown,
         },
+    };
+    ensure_subagent_stream(
+        emitter,
+        parent_emitter,
+        streams,
+        spec,
+        SubAgentSpawnConfirmation::NativeTaskStarted,
     )
     .await;
 }
@@ -9079,7 +9477,6 @@ fn observe_local_agent_task_usage(
             .native_subagent_tasks
             .lock()
             .expect("Claude native subagent task mutex poisoned");
-        tasks.remove(tool_use_id);
         tasks.insert(task_id.to_owned());
     }
     if !matches!(
@@ -9158,6 +9555,8 @@ fn track_pending_subagent_prompt_event(
         let description = extract_spawn_description(Some(&parsed));
         if let Some(spawn) = pending_spawns.get_mut(&pending.tool_use_id) {
             spawn.description = description;
+            spawn.execution =
+                claude_subagent_execution(parsed.get("run_in_background").and_then(Value::as_bool));
         }
     }
 
@@ -9225,32 +9624,16 @@ fn track_pending_subagent_prompt_event(
     }
 }
 
-/// Scan a root-level event for tool_use blocks that spawn sub-agents.
-async fn detect_subagent_spawns(
+fn record_subagent_spawn_requests(
     value: &Value,
-    emitter: &dyn SubAgentEmitter,
-    parent_emitter: &Arc<TurnEmitter>,
-    streams: &mut HashMap<String, SubAgentStream>,
     pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
     pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
 ) {
     track_pending_subagent_prompt_event(value, pending_prompts, pending_spawns);
 
-    // Sub-agent spawns appear as tool_use content blocks in assistant messages
-    // or as content_block_start events in the stream.
     let blocks = collect_tool_use_blocks(value);
-    if blocks.is_empty() {
-        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("?");
-        tracing::trace!(
-            "detect_subagent_spawns: no tool_use blocks found in event type={event_type}"
-        );
-    }
     for block in blocks {
         let block_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let block_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        tracing::info!(
-            "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
-        );
         if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
             let requested_execution = claude_subagent_execution(extract_run_in_background(&block));
             let spec = SubAgentSpawnSpec {
@@ -9262,35 +9645,27 @@ async fn detect_subagent_spawns(
                 session_id_hint: None,
                 execution: requested_execution,
             };
-            if parent_emitter.has_known_tool_request(&tool_use_id) {
-                ensure_subagent_stream(emitter, parent_emitter, streams, spec).await;
-            } else {
-                pending_spawns.insert(tool_use_id.clone(), spec);
-                continue;
-            }
-            if let Some(stream) = streams.get_mut(&tool_use_id) {
-                stream.execution = requested_execution;
-            }
+            pending_spawns.insert(tool_use_id, spec);
         }
     }
 }
 
-async fn flush_pending_subagent_spawns(
-    emitter: &dyn SubAgentEmitter,
-    parent_emitter: &Arc<TurnEmitter>,
+fn refine_confirmed_subagent_spawns(
     streams: &mut HashMap<String, SubAgentStream>,
     pending_spawns: &mut HashMap<String, SubAgentSpawnSpec>,
 ) {
     let ready = pending_spawns
         .keys()
-        .filter(|tool_use_id| parent_emitter.has_known_tool_request(tool_use_id))
+        .filter(|tool_use_id| streams.contains_key(*tool_use_id))
         .cloned()
         .collect::<Vec<_>>();
     for tool_use_id in ready {
         let Some(spec) = pending_spawns.remove(&tool_use_id) else {
             continue;
         };
-        ensure_subagent_stream(emitter, parent_emitter, streams, spec).await;
+        if let Some(stream) = streams.get_mut(&tool_use_id) {
+            update_subagent_stream(stream, spec);
+        }
     }
 }
 
@@ -9366,16 +9741,27 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
             Some(id) => id,
             None => continue,
         };
+        let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
         // A background sub-agent's tool_result is the synthetic "launched"
         // placeholder — its real output streams *afterwards*. Keep the stream
         // alive; it is finalized on the `task_notification` completion frame
         // (see `finalize_background_subagent_completion`).
-        match streams.get(tool_use_id).map(|stream| stream.execution) {
-            Some(SubAgentExecution::Background | SubAgentExecution::Unknown) => continue,
-            Some(SubAgentExecution::Foreground) | None => {}
+        if !failed
+            && matches!(
+                streams.get(tool_use_id).map(|stream| stream.execution),
+                Some(SubAgentExecution::Background | SubAgentExecution::Unknown)
+            )
+        {
+            continue;
         }
-        if let Some(stream) = streams.remove(tool_use_id) {
-            finalize_subagent_stream(stream, final_outcome.take().unwrap_or_default());
+        if let Some(mut stream) = streams.remove(tool_use_id) {
+            stream.execution_failed |= failed;
+            let outcome = if failed {
+                SubAgentFinalOutcome::default()
+            } else {
+                final_outcome.take().unwrap_or_default()
+            };
+            finalize_subagent_stream(stream, outcome);
         }
     }
 }
@@ -10159,7 +10545,7 @@ fn consume_user_tool_result(
                                 .unwrap_or(false)
                     }
                 });
-        if background_launch {
+        if background_launch && completion.success {
             continue;
         }
         inner.emit_tool_execution_completed(
@@ -13825,6 +14211,7 @@ fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'s
         BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
             CLAUDE_DEFAULT_PERMISSION_MODE
         }
+        BackendAccessMode::EnforcedReadOnly => "dontAsk",
     }
 }
 
@@ -14205,7 +14592,10 @@ fn claude_steering_content(
     skills: ClaudeSkillSteering,
 ) -> Result<Option<String>, String> {
     let mut sections = Vec::new();
-    if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
+    if matches!(
+        config.resolved_spawn_config.access_mode,
+        BackendAccessMode::ReadOnly | BackendAccessMode::EnforcedReadOnly
+    ) {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if !config
@@ -14827,7 +15217,7 @@ impl Backend for ClaudeBackend {
     fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
         for category in categories {
             match category {
-                protocol::ToolCategory::AskUser => {}
+                protocol::ToolCategory::AskUser | protocol::ToolCategory::AgentDelegation => {}
             }
         }
         Ok(())
@@ -14875,6 +15265,8 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::ExcludeAgentDelegation,
+            tyde_agent_adapter::BackendCapability::EnforcedReadOnly,
             tyde_agent_adapter::BackendCapability::ForegroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
@@ -15183,6 +15575,16 @@ impl Backend for ClaudeBackend {
             .expect("claude session_id mutex poisoned")
             .clone()
             .expect("claude session_id not initialized")
+    }
+
+    async fn native_tool_catalog(&self) -> Option<NativeToolCatalog> {
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone();
+        let handle = handle?;
+        handle.native_tool_catalog().await
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {

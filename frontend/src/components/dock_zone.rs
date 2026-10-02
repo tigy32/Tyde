@@ -6,7 +6,7 @@ use crate::components::git_panel::GitPanel;
 use crate::components::references_panel::ReferencesPanel;
 use crate::components::search_panel::SearchPanel;
 use crate::components::sessions_panel::SessionsPanel;
-use crate::components::teams_panel::TeamsPanel;
+use crate::components::swarms_panel::SwarmsPanel;
 use crate::components::terminal_view::TerminalView;
 use crate::components::workflows_panel::WorkflowsPanel;
 use crate::state::{AppState, LeftTab, RightTab};
@@ -59,8 +59,8 @@ fn RightDock() -> impl IntoView {
             "display: none;"
         }
     };
-    let teams_style = move || {
-        if active_tab.get() == RightTab::Teams {
+    let swarms_style = move || {
+        if active_tab.get() == RightTab::Swarms {
             ""
         } else {
             "display: none;"
@@ -83,8 +83,8 @@ fn RightDock() -> impl IntoView {
                 <button class={tab_class(RightTab::Sessions)} on:click=move |_| active_tab.set(RightTab::Sessions)>
                     "History"
                 </button>
-                <button class={tab_class(RightTab::Teams)} on:click=move |_| active_tab.set(RightTab::Teams)>
-                    "Teams"
+                <button class={tab_class(RightTab::Swarms)} on:click=move |_| active_tab.set(RightTab::Swarms)>
+                    "Swarms"
                 </button>
                 <button class={tab_class(RightTab::Workflows)} on:click=move |_| active_tab.set(RightTab::Workflows)>
                     "Workflows"
@@ -97,8 +97,8 @@ fn RightDock() -> impl IntoView {
                 <div class="dock-tab-mount" style=sessions_style>
                     <SessionsPanel />
                 </div>
-                <div class="dock-tab-mount" style=teams_style>
-                    <TeamsPanel />
+                <div class="dock-tab-mount" style=swarms_style>
+                    <SwarmsPanel />
                 </div>
                 <div class="dock-tab-mount" style=workflows_style>
                     <WorkflowsPanel />

@@ -30,6 +30,88 @@ use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 ///   as display. See [`rewrite_math_delimiters`] for which delimiters are
 ///   honored and why a lone `$` is not.
 pub fn render_markdown(input: &str) -> String {
+    render_markdown_with_tokens(input, &[])
+}
+
+/// A typed inline fragment (a member mention, a post link) carried through
+/// markdown as a placeholder from [`inline_token_placeholder`].
+pub struct InlineToken {
+    /// Trusted markup emitted where the placeholder sits in prose.
+    pub html: String,
+    /// Plain text used in every non-prose context: code, link text, image
+    /// alt text, URLs, titles, math, and footnote labels.
+    pub text: String,
+}
+
+const TOKEN_OPEN: char = '\u{E000}';
+const TOKEN_CLOSE: char = '\u{E001}';
+
+/// Placeholder for `tokens[index]`. Callers must strip the private-use marker
+/// characters from untrusted text so only real placeholders reach the parser.
+pub fn inline_token_placeholder(index: usize) -> String {
+    format!("{TOKEN_OPEN}{index}{TOKEN_CLOSE}")
+}
+
+/// Remove placeholder marker characters from untrusted text.
+pub fn strip_token_markers(text: &str) -> String {
+    text.replace([TOKEN_OPEN, TOKEN_CLOSE], "")
+}
+
+enum TokenPiece {
+    Text(String),
+    Token(usize),
+}
+
+fn split_tokens(text: &str, count: usize) -> Vec<TokenPiece> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    let push_text = |pieces: &mut Vec<TokenPiece>, chunk: &str| {
+        let chunk = chunk.replace(TOKEN_CLOSE, "");
+        if !chunk.is_empty() {
+            pieces.push(TokenPiece::Text(chunk));
+        }
+    };
+    while let Some(open) = rest.find(TOKEN_OPEN) {
+        push_text(&mut pieces, &rest[..open]);
+        let after = &rest[open + TOKEN_OPEN.len_utf8()..];
+        let token = after.find(TOKEN_CLOSE).and_then(|close| {
+            after[..close]
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < count)
+                .map(|index| (index, close))
+        });
+        match token {
+            Some((index, close)) => {
+                pieces.push(TokenPiece::Token(index));
+                rest = &after[close + TOKEN_CLOSE.len_utf8()..];
+            }
+            // A stray marker is dropped; the text after it stays literal.
+            None => rest = after,
+        }
+    }
+    push_text(&mut pieces, rest);
+    pieces
+}
+
+fn plain_tokens<'a>(text: CowStr<'a>, tokens: &[InlineToken]) -> CowStr<'a> {
+    if tokens.is_empty() || !text.contains([TOKEN_OPEN, TOKEN_CLOSE]) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    for piece in split_tokens(&text, tokens.len()) {
+        match piece {
+            TokenPiece::Text(chunk) => out.push_str(&chunk),
+            TokenPiece::Token(index) => out.push_str(&tokens[index].text),
+        }
+    }
+    CowStr::Boxed(out.into_boxed_str())
+}
+
+/// [`render_markdown`] with typed inline tokens. Substitution happens on parser
+/// events, never on the rendered HTML, so a placeholder inside an attribute,
+/// code, or another link can only ever become escaped plain text.
+pub fn render_markdown_with_tokens(input: &str, tokens: &[InlineToken]) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -53,7 +135,7 @@ pub fn render_markdown(input: &str) -> String {
     let events = parser.filter_map(|ev| match ev {
         Event::Start(Tag::CodeBlock(kind)) => {
             let lang = match kind {
-                CodeBlockKind::Fenced(l) => l.to_string(),
+                CodeBlockKind::Fenced(l) => plain_tokens(l, tokens).to_string(),
                 CodeBlockKind::Indented => String::new(),
             };
             in_code = Some((lang, String::new()));
@@ -66,7 +148,7 @@ pub fn render_markdown(input: &str) -> String {
         }),
         Event::Text(t) if in_code.is_some() => {
             if let Some((_, code)) = in_code.as_mut() {
-                code.push_str(&t);
+                code.push_str(&plain_tokens(t, tokens));
             }
             None
         }
@@ -76,6 +158,8 @@ pub fn render_markdown(input: &str) -> String {
             title,
             id,
         }) => {
+            let dest_url = plain_tokens(dest_url, tokens);
+            let title = plain_tokens(title, tokens);
             if is_safe_url(&dest_url) {
                 link_suppressed.push(false);
                 Some(Event::Start(Tag::Link {
@@ -104,6 +188,8 @@ pub fn render_markdown(input: &str) -> String {
             title,
             id,
         }) => {
+            let dest_url = plain_tokens(dest_url, tokens);
+            let title = plain_tokens(title, tokens);
             if is_safe_url(&dest_url) {
                 image_suppressed.push(false);
                 Some(Event::Start(Tag::Image {
@@ -130,11 +216,18 @@ pub fn render_markdown(input: &str) -> String {
         // on desktop and mobile, Chromium under test), so a formula costs no
         // client-side pass and no math font — unlike a JS typesetter.
         Event::InlineMath(latex) => Some(Event::InlineHtml(CowStr::Boxed(
-            render_math(&latex, DisplayMode::Inline).into_boxed_str(),
+            render_math(&plain_tokens(latex, tokens), DisplayMode::Inline).into_boxed_str(),
         ))),
         Event::DisplayMath(latex) => Some(Event::InlineHtml(CowStr::Boxed(
-            render_math(&latex, DisplayMode::Block).into_boxed_str(),
+            render_math(&plain_tokens(latex, tokens), DisplayMode::Block).into_boxed_str(),
         ))),
+        Event::Code(code) => Some(Event::Code(plain_tokens(code, tokens))),
+        Event::FootnoteReference(label) => {
+            Some(Event::FootnoteReference(plain_tokens(label, tokens)))
+        }
+        Event::Start(Tag::FootnoteDefinition(label)) => Some(Event::Start(
+            Tag::FootnoteDefinition(plain_tokens(label, tokens)),
+        )),
         Event::Html(s) => Some(Event::Text(s)),
         Event::InlineHtml(s) => Some(Event::Text(s)),
         other => Some(other),
@@ -152,30 +245,52 @@ pub fn render_markdown(input: &str) -> String {
     let mut linked: Vec<Event> = Vec::new();
     let mut text_buf = String::new();
     let mut wrap_depth = 0usize;
-    fn flush<'a>(buf: &mut String, out: &mut Vec<Event<'a>>) {
-        if !buf.is_empty() {
-            let merged = CowStr::Boxed(std::mem::take(buf).into_boxed_str());
-            out.extend(linkify_text(merged));
+    // Typed tokens are spliced in here, after raw HTML was downgraded to text
+    // and before autolinking, so a URL can never run into a token.
+    fn flush<'a>(buf: &mut String, out: &mut Vec<Event<'a>>, tokens: &[InlineToken]) {
+        if buf.is_empty() {
+            return;
+        }
+        let merged = std::mem::take(buf);
+        if tokens.is_empty() {
+            out.extend(linkify_text(CowStr::Boxed(merged.into_boxed_str())));
+            return;
+        }
+        for piece in split_tokens(&merged, tokens.len()) {
+            match piece {
+                TokenPiece::Text(chunk) => {
+                    out.extend(linkify_text(CowStr::Boxed(chunk.into_boxed_str())))
+                }
+                TokenPiece::Token(index) => out.push(Event::InlineHtml(CowStr::Boxed(
+                    tokens[index].html.clone().into_boxed_str(),
+                ))),
+            }
         }
     }
     for ev in events {
-        match &ev {
+        match ev {
             Event::Text(t) if wrap_depth == 0 => {
-                text_buf.push_str(t);
+                text_buf.push_str(&t);
+                continue;
+            }
+            // Link text and image alt text: a nested <a> or markup in an alt
+            // attribute is invalid, so tokens collapse to their plain text.
+            Event::Text(t) => {
+                linked.push(Event::Text(plain_tokens(t, tokens)));
                 continue;
             }
             Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {
-                flush(&mut text_buf, &mut linked);
+                flush(&mut text_buf, &mut linked, tokens);
                 wrap_depth += 1;
             }
             Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
                 wrap_depth = wrap_depth.saturating_sub(1);
             }
-            _ => flush(&mut text_buf, &mut linked),
+            _ => flush(&mut text_buf, &mut linked, tokens),
         }
         linked.push(ev);
     }
-    flush(&mut text_buf, &mut linked);
+    flush(&mut text_buf, &mut linked, tokens);
 
     let mut out = String::with_capacity(input.len() * 2);
     html::push_html(&mut out, linked.into_iter());

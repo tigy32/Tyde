@@ -1,3 +1,10 @@
+use crate::swarm_registry::SwarmRegistryHandle;
+use protocol::{
+    SwarmCommandPayload, SwarmErrorCode, SwarmErrorNotifyPayload, SwarmEventPayload, SwarmFailure,
+    SwarmId, SwarmLifecycle, SwarmMemberId, SwarmMemberState, SwarmWorkspacePolicy,
+};
+#[path = "swarm_host.rs"]
+mod swarms;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -718,6 +725,8 @@ enum SessionSchemaResolution {
 type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
+    pub swarm_registry: SwarmRegistryHandle,
+    swarm_dispatch_tx: mpsc::Sender<()>,
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
     pub team_registry: TeamRegistryHandle,
@@ -816,6 +825,12 @@ pub(crate) struct HostState {
     #[cfg(feature = "test-support")]
     resume_admission_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
+    swarm_admission_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    swarm_conversion_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    swarm_startup_test_gates: crate::agent::SwarmStartupTestGates,
+    #[cfg(feature = "test-support")]
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     agent_restoration_failures: Vec<protocol::AgentRestorationFailure>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
@@ -898,6 +913,7 @@ struct RestartShutdown {
     // prevent the shutdown deadline from killing its owned processes.
     agents: StdMutex<Vec<AgentHandle>>,
     control: std::sync::OnceLock<AgentControlMcpHandle>,
+    swarm_registry: Option<SwarmRegistryHandle>,
     started: std::sync::atomic::AtomicBool,
     stopped: CancellationToken,
     complete: tokio::sync::watch::Sender<bool>,
@@ -912,6 +928,7 @@ impl Default for RestartShutdown {
         Self {
             agents: StdMutex::new(Vec::new()),
             control: std::sync::OnceLock::new(),
+            swarm_registry: None,
             started: std::sync::atomic::AtomicBool::new(false),
             stopped: CancellationToken::new(),
             complete: tokio::sync::watch::channel(false).0,
@@ -1563,7 +1580,7 @@ struct PendingMockLaunch {
 
 /// What a consumed reservation does to the reserved spawn.
 #[cfg(feature = "test-support")]
-enum PendingMockLaunchBehavior {
+pub enum PendingMockLaunchBehavior {
     /// Thread a launch behavior (script / close-before-resume-barrier) into
     /// the mock backend construction.
     Launch(crate::backend::mock::MockLaunch),
@@ -2037,6 +2054,9 @@ impl HostHandle {
     #[cfg(feature = "test-support")]
     pub async fn hard_stop_for_conformance(&self) {
         self.restart.stopped.cancel();
+        if let Some(registry) = &self.restart.swarm_registry {
+            registry.wait_stopped().await;
+        }
         if let Some(owner) = self.spawn_operations.owner.upgrade() {
             owner.begin_shutdown();
         }
@@ -2199,7 +2219,7 @@ impl HostHandle {
     }
 
     #[cfg(feature = "test-support")]
-    async fn reserve_mock_launch_behaviors(
+    pub async fn reserve_mock_launch_behaviors(
         &self,
         behaviors: Vec<(String, PendingMockLaunchBehavior)>,
     ) -> MockLaunchReservation {
@@ -2948,6 +2968,26 @@ impl HostHandle {
                 return Vec::new();
             }
         };
+        let swarm_snapshot = state.swarm_registry.snapshot().await;
+        let (swarms, swarm_drafts, swarm_load_error) = match swarm_snapshot {
+            Ok(snapshot) => {
+                let warning = match snapshot.commit_status {
+                    protocol::SwarmCommitStatus::Durable => None,
+                    protocol::SwarmCommitStatus::CommittedDurabilityUncertain { message } => {
+                        Some(protocol::SwarmFailure {
+                            code: SwarmErrorCode::CommittedDurabilityUncertain,
+                            message,
+                        })
+                    }
+                };
+                (snapshot.swarms, snapshot.drafts, warning)
+            }
+            Err(error) => (Vec::new(), Vec::new(), Some(error)),
+        };
+        let converted_teams = swarms
+            .iter()
+            .filter_map(|swarm| swarm.legacy_team_id.clone())
+            .collect::<HashSet<_>>();
         let workflow_summaries = state.workflow_catalog.summaries();
         let workflow_diagnostics = state.workflow_catalog.diagnostics();
         let workflow_runs = state.workflow_run_store.list();
@@ -2994,6 +3034,7 @@ impl HostHandle {
             };
             let instance_stream = new_instance_stream(&start.agent_id);
             let new_agent = NewAgentPayload {
+                swarm_membership: start.swarm_membership.clone(),
                 agent_id: start.agent_id.clone(),
                 name: start.name.clone(),
                 origin: start.origin,
@@ -3077,8 +3118,18 @@ impl HostHandle {
             custom_agents,
             team_preset_catalog: team_snapshot.catalog,
             team_drafts: team_snapshot.drafts,
-            teams: team_snapshot.teams,
-            team_members: team_snapshot.members,
+            swarms,
+            swarm_drafts,
+            teams: team_snapshot
+                .teams
+                .into_iter()
+                .filter(|team| !converted_teams.contains(&team.id))
+                .collect(),
+            team_members: team_snapshot
+                .members
+                .into_iter()
+                .filter(|member| !converted_teams.contains(&member.team_id))
+                .collect(),
             team_member_bindings: team_snapshot.bindings,
             teams_store_load_error: team_snapshot.load_error,
             agent_restoration_failures,
@@ -3121,6 +3172,18 @@ impl HostHandle {
                 return Vec::new();
             }
             subscriber.bootstrapped = true;
+            if let Some(error) = swarm_load_error
+                && let Ok(payload) = serde_json::to_value(SwarmErrorNotifyPayload {
+                    swarm_id: None,
+                    draft_id: None,
+                    publication_id: None,
+                    code: error.code,
+                    message: error.message,
+                })
+            {
+                let _ = emit_or_queue_host_frame(subscriber, FrameKind::SwarmErrorNotify, payload);
+            }
+
             if subscriber.voice_desktop.is_some()
                 && emit_voice_capabilities_for_subscriber(&bootstrap.settings, subscriber).is_err()
             {
@@ -3504,6 +3567,9 @@ impl HostHandle {
                 control.expire_await_requests();
                 for handle in &handles {
                     handle.kill_for_restart();
+                }
+                if let Some(registry) = &host.restart.swarm_registry {
+                    registry.wait_stopped().await;
                 }
                 tracing::info!(
                     agents = handles.len(),
@@ -4559,6 +4625,7 @@ impl HostHandle {
             mut origin,
             resolved_spawn_config_override,
             team_context,
+            swarm_binding,
             mut workflow,
             operation_terminal_claim,
             admitted_session,
@@ -4570,6 +4637,37 @@ impl HostHandle {
             requested_name = ?payload.name,
             "host spawn_agent requested"
         );
+        if let Some(parent) = payload.parent_agent_id.as_ref()
+            && self
+                .is_swarm_agent(parent)
+                .await
+                .map_err(|error| AppError::conflict("spawn_agent", error.message))?
+        {
+            return Err(AppError::conflict(
+                "spawn_agent",
+                "Swarm members cannot create child agents",
+            ));
+        }
+        let source_session = match &payload.params {
+            SpawnAgentParams::Resume { session_id, .. } => Some(session_id),
+            SpawnAgentParams::Fork {
+                from_session_id, ..
+            } => Some(from_session_id),
+            SpawnAgentParams::New { .. } => None,
+        };
+        if swarm_binding.is_none()
+            && let Some(session) = source_session
+            && self
+                .swarm_session_owner(session)
+                .await
+                .map_err(|error| AppError::conflict("spawn_agent", error.message))?
+                .is_some()
+        {
+            return Err(AppError::conflict(
+                "spawn_agent",
+                "Swarm sessions are owned by swarm lifecycle; use Resume swarm, not independent resume/fork",
+            ));
+        }
         // Claim the session before resolving anything. A resume resolves
         // discovery and its spawn configuration before it registers an actor,
         // so without the claim two resumes of one session interleave between
@@ -5525,8 +5623,25 @@ impl HostHandle {
             }
         };
 
-        let request = self.apply_complexity_tier_settings(request).await;
+        let mut request = self.apply_complexity_tier_settings(request).await;
+        if let Some((swarm_id, member_id, policy)) = &swarm_binding {
+            request
+                .resolved_spawn_config
+                .bind_swarm_membership(protocol::SwarmMembership {
+                    swarm_id: swarm_id.clone(),
+                    member_id: member_id.clone(),
+                });
+            swarms::apply_swarm_spawn_policy(&mut request, *policy)
+                .map_err(|error| AppError::invalid("swarm_activate", error.message))?;
+        }
         let request = self.resolve_backend_launch(request).await;
+        let (mut swarm_startup_tx, mut swarm_startup_rx) = match &swarm_binding {
+            Some(_) => {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
         let diagnose_side_question_fanout = request.fork_from_session_id.is_some();
         tracing::info!(
             backend_kind = ?request.backend_kind,
@@ -5545,8 +5660,47 @@ impl HostHandle {
             None => None,
         };
 
-        let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
+        let (
+            start,
+            agent_handle,
+            startup_rx,
+            agent_visibility,
+            session_summary_count_tx,
+            swarm_startup_admission,
+        ) = {
             let mut state = self.state.lock().await;
+            if swarm_binding.is_none()
+                && let Some(source) = request
+                    .resume_session_id
+                    .as_ref()
+                    .or(request.fork_from_session_id.as_ref())
+                && (state
+                    .swarm_registry
+                    .snapshot()
+                    .await
+                    .map_err(|error| AppError::conflict("spawn_agent", error.message))?
+                    .swarms
+                    .iter()
+                    .any(|swarm| {
+                        swarm
+                            .members
+                            .iter()
+                            .any(|member| member.session_id.as_ref() == Some(source))
+                    })
+                    || state
+                        .session_store
+                        .get(source)
+                        .await
+                        .is_some_and(|record| record.swarm_membership.is_some()))
+            {
+                tracing::info!(
+                    "Independent session activation rejected at final swarm ownership admission"
+                );
+                return Err(AppError::conflict(
+                    "spawn_agent",
+                    "Swarm-owned sessions require reviewed swarm admission, not independent resume/fork",
+                ));
+            }
             if let Some(parent_agent_id) = request.parent_agent_id.as_ref() {
                 let parent = state.registry.agent_handle(parent_agent_id);
                 match parent {
@@ -5576,6 +5730,54 @@ impl HostHandle {
                         ));
                     }
                 }
+            }
+            if let Some((swarm_id, member_id, policy)) = &swarm_binding {
+                let admitted = state
+                    .swarm_registry
+                    .snapshot()
+                    .await
+                    .map_err(|error| AppError::conflict("swarm_activate", error.message))?
+                    .swarms
+                    .iter()
+                    .any(|swarm| {
+                        swarm.id == *swarm_id
+                            && swarm.recovery_requirement
+                                == protocol::SwarmRecoveryRequirement::None
+                            && matches!(
+                                swarm.lifecycle,
+                                SwarmLifecycle::Running
+                                    | SwarmLifecycle::Launching
+                                    | SwarmLifecycle::Transitioning
+                            )
+                            && swarm.constraints.workspace_policy == *policy
+                            && request.project_id.as_ref() == Some(&swarm.constraints.project_id)
+                            && swarm.members.iter().any(|member| {
+                                member.spec.id == *member_id
+                                    && member.state == SwarmMemberState::Reserved
+                                    && member.agent_id.is_none()
+                                    && member.session_id.as_ref()
+                                        == request.resume_session_id.as_ref()
+                            })
+                    });
+                if !admitted {
+                    tracing::info!(
+                        "Swarm startup deferred before actor creation at final lifecycle admission"
+                    );
+                    #[cfg(feature = "test-support")]
+                    tracing::warn!(
+                        resumed = request.resume_session_id.is_some(),
+                        "Swarm startup admission diagnostic: rejected before launch reservation consumption"
+                    );
+                    return Err(AppError::conflict(
+                        "swarm_activate",
+                        "Swarm lifecycle or session ownership changed before startup admission",
+                    ));
+                }
+                #[cfg(feature = "test-support")]
+                tracing::warn!(
+                    resumed = request.resume_session_id.is_some(),
+                    "Swarm startup admission diagnostic: admitted before actor creation"
+                );
             }
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5621,10 +5823,18 @@ impl HostHandle {
                     "restored agent identity is already registered",
                 ));
             }
+            #[cfg(feature = "test-support")]
+            let swarm_startup_test_gates = crate::agent::SwarmStartupTestGates {
+                stopped: self.restart.stopped.clone(),
+                ..state.swarm_startup_test_gates.clone()
+            };
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    #[cfg(feature = "test-support")]
+                    swarm_startup_test_gates,
+                    startup_admission: swarm_startup_rx.take(),
                     usage_limits_rx,
                     session_store: Arc::clone(&session_store),
                     supervisor_settings_rx,
@@ -5645,16 +5855,85 @@ impl HostHandle {
                     .insert(spawned.start.agent_id.clone(), terminal_claim.clone());
             }
             self.register_restart_handle(&spawned.handle);
+            // Pause/retirement must not commit between actor creation, durable
+            // member binding and release of the backend startup barrier.
+            let swarm_startup_admission = async {
+                if let Some((swarm_id, member_id, _)) = &swarm_binding {
+                    let registry = state.swarm_registry.clone();
+                    let events = registry
+                        .bind(
+                            swarm_id.clone(),
+                            member_id.clone(),
+                            spawned.start.agent_id.clone(),
+                        )
+                        .await?;
+                    swarms::fan_out_swarm_events_locked(&mut state, events);
+                    let admitted = registry.snapshot().await?.swarms.iter().any(|swarm| {
+                        swarm.id == *swarm_id
+                            && swarm.recovery_requirement
+                                == protocol::SwarmRecoveryRequirement::None
+                            && matches!(
+                                swarm.lifecycle,
+                                SwarmLifecycle::Running
+                                    | SwarmLifecycle::Launching
+                                    | SwarmLifecycle::Transitioning
+                            )
+                            && swarm.members.iter().any(|member| {
+                                member.spec.id == *member_id
+                                    && member.state == SwarmMemberState::Reserved
+                                    && member.agent_id.as_ref() == Some(&spawned.start.agent_id)
+                            })
+                    });
+                    if !admitted {
+                        return Err(SwarmFailure {
+                            code: SwarmErrorCode::Conflict,
+                            message: "Committed startup requires attention before native execution"
+                                .into(),
+                        });
+                    }
+                    let release = swarm_startup_tx.take().ok_or_else(|| SwarmFailure {
+                        code: SwarmErrorCode::Lifecycle,
+                        message: "Swarm startup admission barrier is unavailable".into(),
+                    })?;
+                    release.send(()).map_err(|_| SwarmFailure {
+                        code: SwarmErrorCode::Lifecycle,
+                        message: "Swarm actor withdrew startup admission".into(),
+                    })?;
+                    #[cfg(feature = "test-support")]
+                    tracing::warn!(
+                        "Swarm startup admission diagnostic: bound and startup released"
+                    );
+                }
+                Ok(())
+            }
+            .await;
             (
                 spawned.start,
                 spawned.handle,
                 spawned.startup_rx,
                 state.agent_visibility.clone(),
                 session_summary_count_tx,
+                swarm_startup_admission,
             )
         };
 
         let agent_id = start.agent_id.clone();
+        if let Err(error) = swarm_startup_admission {
+            // Close cannot await an actor still blocked on this sender.
+            drop(swarm_startup_tx.take());
+            #[cfg(feature = "test-support")]
+            tracing::warn!(
+                code = ?error.code,
+                "Swarm startup admission diagnostic: startup withheld, closing unpublished actor"
+            );
+            self.close_agent(&agent_id).await;
+            return Err(AppError::internal_message(
+                "swarm_activate",
+                error.message.clone(),
+                anyhow!(error),
+            ));
+        }
+
         let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
         let session_registration_publish = self.schedule_agent_session_registration(
@@ -6036,6 +6315,21 @@ impl HostHandle {
     }
 
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AppResult<AgentId> {
+        if let Some(session) = request
+            .resume_session_id
+            .as_ref()
+            .or(request.fork_from_session_id.as_ref())
+            && self
+                .swarm_session_owner(session)
+                .await
+                .map_err(|error| AppError::conflict("spawn_agent", error.message))?
+                .is_some()
+        {
+            return Err(AppError::conflict(
+                "spawn_agent",
+                "Swarm session is owned by swarm lifecycle",
+            ));
+        }
         let restoring = request.restoration.is_some();
         let request = self.apply_complexity_tier_settings(request).await;
         let request = self.resolve_backend_launch(request).await;
@@ -6098,6 +6392,9 @@ impl HostHandle {
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    #[cfg(feature = "test-support")]
+                    swarm_startup_test_gates: Default::default(),
+                    startup_admission: None,
                     usage_limits_rx,
                     session_store,
                     supervisor_settings_rx,
@@ -6346,6 +6643,13 @@ impl HostHandle {
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
     ) -> Result<AgentStartPayload, String> {
+        if self
+            .is_swarm_agent(agent_id)
+            .await
+            .map_err(|error| error.message)?
+        {
+            return Err("Swarm member scope cannot be moved independently".into());
+        }
         let (handle, project) = {
             let state = self.state.lock().await;
             let handle = state
@@ -7431,12 +7735,16 @@ impl HostHandle {
         images: Option<Vec<ImageData>>,
     ) -> AppResult<TeamMemberMessageOutcome> {
         const OPERATION: &str = "team_member_activate";
-        let registry = { self.state.lock().await.team_registry.clone() };
-        let has_prompt = prompt.is_some();
-        let plan = registry
-            .plan_user_activation(member_id.clone(), has_prompt)
-            .await
-            .map_err(|error| team_member_activation_error(OPERATION, error))?;
+        let (registry, plan) = {
+            let state = self.state.lock().await;
+            swarms::ensure_team_member_unconverted_locked(&state, &member_id).await?;
+            let registry = state.team_registry.clone();
+            let plan = registry
+                .plan_user_activation(member_id.clone(), prompt.is_some())
+                .await
+                .map_err(|error| team_member_activation_error(OPERATION, error))?;
+            (registry, plan)
+        };
         match plan.activation.clone() {
             TeamMemberActivation::Reuse { agent_id } => {
                 if let Some(prompt) = prompt {
@@ -7462,7 +7770,7 @@ impl HostHandle {
                 }
             }
             TeamMemberActivation::Resume { session_id } => {
-                if !has_prompt {
+                if prompt.is_none() {
                     // Defer until a real message arrives.
                     return Ok(TeamMemberMessageOutcome {
                         member_id: plan.member.id.clone(),
@@ -7549,10 +7857,17 @@ impl HostHandle {
         message: String,
         images: Option<Vec<ImageData>>,
     ) -> Result<TeamMemberMessageOutcome, String> {
-        let registry = { self.state.lock().await.team_registry.clone() };
-        let plan = registry
-            .plan_message_member(caller_agent_id, member_id.clone())
-            .await?;
+        let (registry, plan) = {
+            let state = self.state.lock().await;
+            swarms::ensure_team_member_unconverted_locked(&state, &member_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let registry = state.team_registry.clone();
+            let plan = registry
+                .plan_message_member(caller_agent_id, member_id.clone())
+                .await?;
+            (registry, plan)
+        };
         match plan.activation.clone() {
             TeamMemberActivation::Reuse { agent_id } => {
                 self.message_bound_team_member(
@@ -7845,45 +8160,52 @@ impl HostHandle {
 
     pub(crate) async fn create_team(&self, payload: TeamCreatePayload) -> AppResult<()> {
         const OPERATION: &str = "team_create";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.create_team(payload, refs).await
-            })
-            .await?;
-        self.fan_out_team_registry_events(events).await;
+        self.serialized_team_registry_mutation(
+            OPERATION,
+            None,
+            None,
+            |registry, refs| async move { registry.create_team(payload, refs).await },
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn rename_team(&self, payload: TeamRenamePayload) -> AppResult<()> {
         const OPERATION: &str = "team_rename";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        swarms::ensure_team_unconverted_locked(&state, &payload.id).await?;
+        let registry = state.team_registry.clone();
         let events = registry
             .rename_team(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
     pub(crate) async fn delete_team(&self, payload: TeamDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "team_delete";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        swarms::ensure_team_unconverted_locked(&state, &payload.id).await?;
+        let registry = state.team_registry.clone();
         let events = registry
             .delete_team(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
     pub(crate) async fn set_team_manager(&self, payload: TeamSetManagerPayload) -> AppResult<()> {
         const OPERATION: &str = "team_set_manager";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        swarms::ensure_team_unconverted_locked(&state, &payload.team_id).await?;
+        let registry = state.team_registry.clone();
         let events = registry
             .set_manager(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
@@ -7892,12 +8214,13 @@ impl HostHandle {
         payload: TeamMemberCreatePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "team_member_create";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.create_member(payload, refs).await
-            })
-            .await?;
-        self.fan_out_team_registry_events(events).await;
+        self.serialized_team_registry_mutation(
+            OPERATION,
+            Some(payload.team_id.clone()),
+            None,
+            |registry, refs| async move { registry.create_member(payload, refs).await },
+        )
+        .await?;
         Ok(())
     }
 
@@ -7906,12 +8229,13 @@ impl HostHandle {
         payload: TeamMemberUpdatePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "team_member_update";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.update_member(payload, refs).await
-            })
-            .await?;
-        self.fan_out_team_registry_events(events).await;
+        self.serialized_team_registry_mutation(
+            OPERATION,
+            None,
+            Some(payload.id.clone()),
+            |registry, refs| async move { registry.update_member(payload, refs).await },
+        )
+        .await?;
         Ok(())
     }
 
@@ -7920,23 +8244,26 @@ impl HostHandle {
         payload: TeamMemberDeletePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "team_member_delete";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        swarms::ensure_team_member_unconverted_locked(&state, &payload.id).await?;
+        let registry = state.team_registry.clone();
         let events = registry
             .delete_member(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
     pub(crate) async fn reset_teams_store(&self) -> AppResult<()> {
         const OPERATION: &str = "teams_store_reset";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        let registry = state.team_registry.clone();
         let events = registry
             .reset_store()
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
@@ -7981,12 +8308,14 @@ impl HostHandle {
         payload: TeamMemberShufflePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "team_member_shuffle";
-        let registry = { self.state.lock().await.team_registry.clone() };
+        let mut state = self.state.lock().await;
+        swarms::ensure_team_unconverted_locked(&state, &payload.team_id).await?;
+        let registry = state.team_registry.clone();
         let events = registry
             .shuffle_member_suggestion(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        self.fan_out_team_registry_events(events).await;
+        fan_out_team_registry_events(&mut state, events).await;
         Ok(())
     }
 
@@ -8006,12 +8335,13 @@ impl HostHandle {
 
     pub(crate) async fn commit_team_draft(&self, payload: TeamDraftCommitPayload) -> AppResult<()> {
         const OPERATION: &str = "team_draft_commit";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.commit_draft(payload, refs).await
-            })
-            .await?;
-        self.fan_out_team_registry_events(events).await;
+        self.serialized_team_registry_mutation(
+            OPERATION,
+            None,
+            None,
+            |registry, refs| async move { registry.commit_draft(payload, refs).await },
+        )
+        .await?;
         Ok(())
     }
 
@@ -8032,13 +8362,21 @@ impl HostHandle {
     async fn serialized_team_registry_mutation<F, Fut>(
         &self,
         operation: &'static str,
+        team: Option<TeamId>,
+        member: Option<TeamMemberId>,
         mutate: F,
-    ) -> AppResult<TeamRegistryEvents>
+    ) -> AppResult<()>
     where
         F: FnOnce(TeamRegistryHandle, AgentTeamValidationRefs) -> Fut,
         Fut: Future<Output = Result<TeamRegistryEvents, String>>,
     {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        if let Some(team) = team {
+            swarms::ensure_team_unconverted_locked(&state, &team).await?;
+        }
+        if let Some(member) = member {
+            swarms::ensure_team_member_unconverted_locked(&state, &member).await?;
+        }
         let registry = state.team_registry.clone();
         let refs = agent_team_validation_refs(&state, operation).await?;
         // Hold host_state through the registry mutation so the validation-ref
@@ -8046,8 +8384,8 @@ impl HostHandle {
         let events = mutate(registry, refs)
             .await
             .map_err(|error| team_registry_error(operation, error))?;
-        drop(state);
-        Ok(events)
+        fan_out_team_registry_events(&mut state, events).await;
+        Ok(())
     }
 
     async fn fan_out_team_registry_events(&self, events: TeamRegistryEvents) {
@@ -10030,8 +10368,31 @@ impl HostHandle {
         }
 
         for closed_agent_id in close_ids {
+            let session = closing_sessions_by_agent.get(&closed_agent_id).cloned();
             let parent = state.registry.parent_agent_id(&closed_agent_id);
             let removed = state.registry.remove_agent(&closed_agent_id);
+            #[cfg(feature = "test-support")]
+            tracing::warn!(
+                registry_agent_count = state.registry.agent_ids().len(),
+                removed = removed.is_some(),
+                "Swarm retirement diagnostic: registry removed before canonical close publication"
+            );
+            match state
+                .swarm_registry
+                .status(
+                    closed_agent_id.clone(),
+                    AgentControlStatus::Idle,
+                    session,
+                    true,
+                    None,
+                )
+                .await
+            {
+                Ok(events) => swarms::fan_out_swarm_events_locked(&mut state, events),
+                Err(error) => {
+                    tracing::error!(code = ?error.code, "Closed swarm member could not be persisted")
+                }
+            }
             if let Some(parent) = parent {
                 fan_out_agent_background_work(&mut state, &parent).await;
             }
@@ -10761,6 +11122,13 @@ impl HostHandle {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<AgentId, String> {
         if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
+            if self
+                .is_swarm_agent(parent_agent_id)
+                .await
+                .map_err(|error| error.message)?
+            {
+                return Err("Swarm members cannot spawn children".into());
+            }
             self.validate_sub_agent_depth(parent_agent_id).await?;
         }
         // A closing agent must not grow the subtree being torn down.
@@ -15041,6 +15409,11 @@ fn spawn_host_inner(
         legacy_backend_kind: host_settings.default_backend,
         purged_gemini_session_ids,
     };
+    let swarm_store_path = paths.agent_team.with_file_name("agent_swarms.json");
+    let stopped = CancellationToken::new();
+    let swarm_registry =
+        SwarmRegistryHandle::spawn(swarm_store_path, stopped.clone(), session_store.list()?);
+    let (swarm_dispatch_tx, swarm_dispatch_rx) = mpsc::channel(1);
     let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs);
     let project_store = Arc::new(Mutex::new(project_store));
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
@@ -15121,8 +15494,14 @@ fn spawn_host_inner(
         owner: Arc::downgrade(&spawn_operations),
     };
     let host = HostHandle {
-        restart: Arc::new(RestartShutdown::default()),
+        restart: Arc::new(RestartShutdown {
+            stopped,
+            swarm_registry: Some(swarm_registry.clone()),
+            ..Default::default()
+        }),
         state: Arc::new(Mutex::new(HostState {
+            swarm_registry,
+            swarm_dispatch_tx,
             registry: AgentRegistry::new(),
             supervisor_compaction_tx,
             review_registry,
@@ -15219,6 +15598,12 @@ fn spawn_host_inner(
             rejected_restoration_sessions: runtime_config.rejected_restoration_sessions.clone(),
             #[cfg(feature = "test-support")]
             resume_admission_test_gate: None,
+            #[cfg(feature = "test-support")]
+            swarm_admission_test_gate: None,
+            #[cfg(feature = "test-support")]
+            swarm_conversion_test_gate: None,
+            #[cfg(feature = "test-support")]
+            swarm_startup_test_gates: Default::default(),
             #[cfg(feature = "test-support")]
             restore_marker_withdraw_test_gate: None,
             agent_restoration_failures: Vec::new(),
@@ -15391,6 +15776,7 @@ fn spawn_host_inner(
         .expect("newly created host state must be unlocked")
         .workflow_mcp = workflow_mcp;
 
+    swarms::spawn_swarm_dispatch_task(host.clone(), swarm_dispatch_rx);
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
     spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
     spawn_host_review_ai_task(host.clone(), review_ai_spawn_rx);
@@ -15410,6 +15796,7 @@ struct SpawnAgentContext {
     origin: AgentOrigin,
     resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
     team_context: Option<TeamSpawnContext>,
+    swarm_binding: Option<(SwarmId, SwarmMemberId, SwarmWorkspacePolicy)>,
     workflow: Option<AgentWorkflowMetadata>,
     operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
     /// A resume admission claim the caller already holds. Restoration takes the
@@ -15426,6 +15813,7 @@ impl Default for SpawnAgentContext {
             origin: AgentOrigin::User,
             resolved_spawn_config_override: None,
             team_context: None,
+            swarm_binding: None,
             workflow: None,
             operation_terminal_claim: None,
             admitted_session: None,
@@ -15578,6 +15966,24 @@ impl HostHandle {
             .into_iter()
             .filter(|record| record.restore_state.is_some())
             .collect::<Vec<_>>();
+
+        let swarm_registry = self.state.lock().await.swarm_registry.clone();
+        let swarm_owned = swarm_registry
+            .snapshot()
+            .await
+            .map_err(|error| error.message)?
+            .swarms
+            .into_iter()
+            .flat_map(|swarm| {
+                swarm
+                    .members
+                    .into_iter()
+                    .filter_map(|member| member.session_id)
+            })
+            .collect::<HashSet<_>>();
+        records.retain(|record| {
+            record.swarm_membership.is_none() && !swarm_owned.contains(&record.id)
+        });
 
         // A marked session that the resume path would reject is not restorable.
         // Reconstructing it anyway produces a failed card the user has to
@@ -15869,6 +16275,15 @@ impl HostHandle {
                 return Ok(());
             }
             let agent_id = reservation.agent_id.clone();
+            if reservation.swarm_membership.is_some() {
+                session_store
+                    .remove_startup_reservation(&agent_id)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to withdraw swarm-owned startup reservation: {error}")
+                    })?;
+                continue;
+            }
             if !reservation.restorable {
                 if let Err(error) = session_store.remove_startup_reservation(&agent_id).await {
                     tracing::error!(%agent_id, %error, "failed to drop an unrestorable startup reservation");
@@ -16077,6 +16492,29 @@ fn spawn_host_team_status_task(host: HostHandle) {
                     continue;
                 }
                 last_seen.insert(agent_id.clone(), status.activity_counter);
+                let session_id = {
+                    host.state
+                        .lock()
+                        .await
+                        .agent_sessions
+                        .get(&agent_id)
+                        .cloned()
+                };
+                match host
+                    .record_swarm_status(
+                        agent_id.clone(),
+                        status.status(),
+                        session_id,
+                        status.terminated,
+                    )
+                    .await
+                {
+                    Ok(true) => host.schedule_swarm_dispatch().await,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(code = ?error.code, "Failed to record swarm lifecycle status")
+                    }
+                }
                 let registry = { host.state.lock().await.team_registry.clone() };
                 let result = if status.terminated {
                     registry.clear_binding_by_agent(agent_id.clone()).await
@@ -17983,6 +18421,10 @@ fn origin_system_tag(origin: AgentOrigin) -> (AgentSystemTagId, String) {
             AgentSystemTagId("system:origin:sub-agent".to_owned()),
             "Sub-agent".to_owned(),
         ),
+        AgentOrigin::SwarmMember => (
+            AgentSystemTagId("system:origin:swarm".to_owned()),
+            "Swarm".to_owned(),
+        ),
         AgentOrigin::TeamMember => (
             AgentSystemTagId("system:origin:team".to_owned()),
             "Team".to_owned(),
@@ -18164,6 +18606,7 @@ fn emit_new_agent_for_stream(
     activity: AgentActivity,
 ) -> Result<Option<DeferredAgentAttachment>, StreamClosed> {
     let new_agent = NewAgentPayload {
+        swarm_membership: start.swarm_membership.clone(),
         agent_id: start.agent_id.clone(),
         name: start.name.clone(),
         origin: start.origin,

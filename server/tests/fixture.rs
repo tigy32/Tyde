@@ -229,6 +229,20 @@ impl Fixture {
         .await
     }
 
+    // Shared fixture is compiled separately for each integration test binary.
+    #[allow(dead_code)]
+    pub async fn new_with_mock_backend_for_enabled_backends(
+        enabled_backends: Vec<BackendKind>,
+    ) -> Self {
+        Self::new_with_runtime_config_inner(
+            server::HostRuntimeConfig::default(),
+            true,
+            Some(enabled_backends),
+            true,
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
         Self::new_with_runtime_config_inner(runtime_config, true, None, true).await
@@ -576,6 +590,7 @@ impl Fixture {
         configure: impl FnOnce(&mut server::HostRuntimeConfig),
     ) -> HostBootstrapPayload {
         let prior_agent_count = self.host.agent_ids().await.len();
+        eprintln!("Fixture restart shutdown begin; prior_agent_count={prior_agent_count}");
         self.host.shutdown_for_restart().await;
         eprintln!(
             "Fixture restart retired old-host agents before replacement; prior_agent_count={prior_agent_count}"
@@ -589,7 +604,13 @@ impl Fixture {
             runtime_config,
         )
         .expect("initialize restarted host with existing stores");
+        eprintln!("Fixture restart replacement constructed; awaiting real protocol bootstrap");
         let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
+        eprintln!(
+            "Fixture restart replacement bootstrapped; agent_count={} swarm_count={}",
+            bootstrap.agents.len(),
+            bootstrap.swarms.len()
+        );
         self.host = host;
         self.client = client;
         self.bootstrap = bootstrap.clone();
@@ -606,9 +627,66 @@ impl Fixture {
         self.host.live_agent_session_ids().await
     }
 
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub fn read_persisted_sessions(&self) -> Vec<server::store::session::SessionRecord> {
+        server::store::session::SessionStore::load(self.session_store_path())
+            .unwrap_or_else(|_| panic!("cannot open actual persisted session database"))
+            .list()
+            .unwrap_or_else(|_| panic!("cannot read actual persisted session records"))
+    }
+
     #[allow(dead_code)]
     pub async fn install_agent_name_test_gate(&self) -> server::InstalledAgentNameGate {
         self.host.install_agent_name_test_gate().await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn install_swarm_admission_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_swarm_admission_test_gate().await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn install_swarm_conversion_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_swarm_conversion_test_gate().await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn install_swarm_startup_reservation_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host
+            .install_swarm_startup_reservation_test_gate()
+            .await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn install_swarm_session_persistence_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host
+            .install_swarm_session_persistence_test_gate()
+            .await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn fail_next_swarm_directory_sync(&self) {
+        assert!(
+            self.host
+                .fail_next_swarm_directory_sync_for_test()
+                .await
+                .is_ok(),
+            "install post-rename directory-sync failure on the real swarm store"
+        );
     }
 
     #[allow(dead_code)]
@@ -687,6 +765,12 @@ impl Fixture {
 
     pub fn session_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("sessions.json")
+    }
+
+    // Shared fixture is compiled separately for each integration test binary.
+    #[allow(dead_code)]
+    pub fn swarm_store_path(&self) -> PathBuf {
+        self.session_store_dir.path().join("agent_swarms.json")
     }
 
     fn project_store_path(&self) -> PathBuf {
@@ -1424,6 +1508,15 @@ impl Fixture {
         scripts: Vec<(String, server::backend::mock::MockScript)>,
     ) -> server::MockLaunchReservation {
         self.host.reserve_mock_launches(scripts).await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn reserve_mock_launch_behaviors(
+        &self,
+        behaviors: Vec<(String, server::PendingMockLaunchBehavior)>,
+    ) -> server::MockLaunchReservation {
+        self.host.reserve_mock_launch_behaviors(behaviors).await
     }
 
     /// Reserve the next mock launch for `name` to fail with `message`.

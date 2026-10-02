@@ -699,6 +699,14 @@ impl Connection {
             .await
     }
 
+    pub async fn swarm_command(
+        &mut self,
+        payload: protocol::SwarmCommandPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SwarmCommand, &payload)
+            .await
+    }
+
     pub async fn team_create(&mut self, payload: TeamCreatePayload) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::TeamCreate, &payload)
             .await
@@ -1415,6 +1423,30 @@ impl Connection {
                 }
                 FrameKind::WorkflowRunNotify => {
                     let _: WorkflowRunNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmNotify => {
+                    let _: protocol::SwarmNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmDraftNotify => {
+                    let _: protocol::SwarmDraftNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmPostNotify => {
+                    let _: protocol::SwarmPostNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmBoardNotify => {
+                    let _: protocol::SwarmBoardNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmThreadNotify => {
+                    let _: protocol::SwarmThreadNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SwarmErrorNotify => {
+                    let _: protocol::SwarmErrorNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::TeamNotify => {

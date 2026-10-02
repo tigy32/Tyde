@@ -31,6 +31,7 @@ pub(crate) struct TeamRegistryHandle {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TeamRegistrySnapshot {
+    pub pending_member_ids: Vec<TeamMemberId>,
     pub catalog: TeamPresetCatalog,
     pub drafts: Vec<TeamDraft>,
     pub teams: Vec<Team>,
@@ -742,6 +743,7 @@ impl TeamRegistryActor {
 
     fn snapshot(&self) -> TeamRegistrySnapshot {
         TeamRegistrySnapshot {
+            pending_member_ids: self.pending_activations.keys().cloned().collect(),
             catalog: team_preset_catalog(),
             drafts: self.drafts.clone(),
             teams: self.store.teams(),
@@ -922,7 +924,7 @@ impl TeamRegistryActor {
                 None => TeamMemberActivation::New,
             },
         };
-        if reserve {
+        if reserve || matches!(activation, TeamMemberActivation::Resume { .. }) {
             match &activation {
                 TeamMemberActivation::Reuse { .. } => {
                     self.pending_activations.remove(&target.id);

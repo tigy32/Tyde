@@ -1780,7 +1780,9 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         })
         .await
         .expect("send concurrent remove");
-    hook.wait_until_reached().await;
+    tokio::time::timeout(Duration::from_secs(10), hook.wait_until_reached())
+        .await
+        .expect("remove/spawn phase: removal must reach its production admission barrier");
 
     let caller_auth = fixture.agent_control_caller(&caller.agent_id).await;
     let bearer = caller_auth
@@ -1790,7 +1792,7 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         .to_owned();
     let url = fixture.agent_control_http_url().await;
     let project_id = workbench.id.0.clone();
-    let spawn_task = tokio::spawn(async move {
+    let mut spawn_task = tokio::spawn(async move {
         call_agent_control_request(
             url,
             Some(bearer),
@@ -1803,7 +1805,21 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         )
         .await
     });
-    hook.wait_until_spawn_waiting().await;
+    tokio::select! {
+        _ = hook.wait_until_spawn_waiting() => {}
+        early = &mut spawn_task => {
+            hook.resume();
+            let (is_error, body) = early.expect("early MCP spawn task join");
+            panic!(
+                "remove/spawn phase: authenticated MCP call returned before the production spawn barrier; error={is_error}, result_bytes={}",
+                body.len()
+            );
+        }
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+            hook.resume();
+            panic!("remove/spawn phase: MCP invocation did not reach the production spawn admission barrier");
+        }
+    }
     hook.resume();
 
     let (is_error, body) = spawn_task.await.expect("spawn task join");

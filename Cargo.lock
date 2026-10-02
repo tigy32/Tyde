@@ -8673,6 +8673,7 @@ dependencies = [
  "client",
  "futures-util",
  "image",
+ "libc",
  "mobile-pairing",
  "opus",
  "paste",

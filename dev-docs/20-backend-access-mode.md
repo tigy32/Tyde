@@ -1,18 +1,18 @@
 # Backend Access Mode
 
-`BackendAccessMode` is the protocol-level switch that adds read/write guidance
-to a new session. It is separate from `ToolPolicy`: tool policy is a
-backend-specific allow-list when a backend can express one, while access mode
-changes instructions only.
+`BackendAccessMode` is the protocol-level access contract for a session. It is
+separate from `ToolPolicy`, the backend-specific tool allowance. The existing
+`ReadOnly` mode remains advisory; `EnforcedReadOnly` is a distinct native
+restriction used by read-only swarms. The two must never be substituted.
 
-Read-only mode is guidance only. Tyde advises the agent not to mutate source or
+Advisory read-only mode is guidance only. Tyde advises the agent not to mutate source or
 external state, but it does not reduce sandbox permissions, remove tools, or
 reject MCP operations. A read-only agent has the same effective capabilities as
 an unrestricted agent and is instructed not to use them for mutation.
 
 ## Protocol flow
 
-`protocol::BackendAccessMode` has two values:
+`protocol::BackendAccessMode` has three values:
 
 - `Unrestricted` (default): the backend may use its normal tools and CLI
   permissions.
@@ -22,6 +22,9 @@ an unrestricted agent and is instructed not to use them for mutation.
   intentionally create, edit, or delete source files, use write/edit/apply-patch
   tools for source mutation, run destructive git commands, or modify external
   state.
+- `EnforcedReadOnly`: require backend-native filesystem/tool restrictions.
+  The host rejects a backend that does not declare this capability. Adding an
+  advisory or hiding a UI action is not enforcement.
 
 The value is carried on `SpawnAgentParams::New` from the frontend or
 agent-control MCP bridge into `HostHandle::spawn_agent`. The host resolves the
@@ -30,8 +33,11 @@ resolved config, and passes it to the backend through `BackendSpawnConfig`.
 Built-in spawns that already construct a `ResolvedSpawnConfig` directly, such as
 the AI reviewer, set the field explicitly.
 
-Resumes do not accept a new access mode. A resumed session uses the behavior
-encoded by the backend/session being resumed.
+Ordinary resume controls do not accept a new access mode. The server reapplies
+the resolved policy at the native lifecycle boundary. Swarm recovery and
+reviewed legacy conversion retain membership ownership and reapply the swarm's
+workspace policy before admitting work; unrestricted native history must not
+silently override that policy.
 
 ## Shared read-only advisory
 
@@ -43,12 +49,12 @@ commands such as `git status`, `git log`, `git diff`, `grep`/`rg`, `cat`, `ls`,
 and `find`, while forbidding file creation, edits, deletes, state-changing
 commands, and write/edit/apply-patch tools.
 
-Backend sandbox, permission, and tool choices are identical to unrestricted
-mode. The advisory is the only behavior access mode changes.
+For `ReadOnly`, sandbox, permission, and tool choices are identical to
+unrestricted mode. The advisory is its only access-mode difference.
 
 ## Enforcement model
 
-Read-only mode is entirely advisory:
+`ReadOnly` is entirely advisory:
 
 - The shared advisory tells the model what is permitted and what is forbidden.
 - Backend-native permissions and sandboxes are the same as unrestricted mode.
@@ -58,7 +64,47 @@ Read-only mode is entirely advisory:
 Independent authorization, ownership, and `ToolPolicy` checks still apply; they
 are not read-only enforcement.
 
-## Backend implementations
+### Enforced read-only swarms
+
+Read-only swarm admission requires both native enforced-read-only support and
+native agent-delegation exclusion. Claude and Codex implement those contracts;
+other backends fail admission rather than receiving a weaker substitute.
+
+- Claude restricts the native tool catalog, withholds shell and file-mutation
+  tools, disables ambient hooks/settings, and rejects other tool permissions.
+- Codex applies its native read-only sandbox and approval policy at process,
+  start, fork, resume, and turn boundaries. Code-execution kernels and native
+  delegation remain disabled; supported native read tools are exposed directly
+  rather than through a disabled wrapper. Native web search remains available;
+  filesystem read-only access is not a promise of network isolation.
+- Swarm members receive the four authenticated board tools, not the user's
+  other configured MCP servers. Server-side ownership and method admission
+  enforce the same boundary even for calls omitted from discovery.
+- Writable swarm work requires explicit consent and an existing Git workbench.
+  It is a separate policy, not a relaxation of an active read-only session.
+
+#### Native command visibility
+
+A denied command is still an actual tool attempt. Codex can reject an
+`exec_command` before emitting a typed execution-start event. Fresh sessions
+recover the actual call and terminal result from native raw-response events,
+preserving the native call ID and exactly one tool card.
+
+Installed Codex runtimes without raw-response subscriptions for protected
+Fork/Resume use the owning process's native execution trace as the sole model
+narrative source. This is native protocol evidence, not transcript inference.
+Bounded, no-follow reads validate source identities, sequence continuity,
+payload references, and the exact native turn-end fence. Original output-item
+order anchors actual runtime receipts; typed execution remains their owner.
+Missing or corrupt observation fails visibly without inventing an outcome or
+losing the actual terminal receipt.
+
+Private narrative can arrive at native inference boundaries on that transport.
+Shared board posts remain live server events and are never copied from private
+final messages. An unavailable trace transport is an explicit lifecycle error;
+a remote Tyde host running its CLI locally uses the same server-owned path.
+
+## Advisory backend implementations
 
 ### Claude
 
