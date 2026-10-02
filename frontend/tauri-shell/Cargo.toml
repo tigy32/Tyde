@@ -1,6 +1,6 @@
 [package]
 name = "tauri-shell"
-version = "0.9.4"
+version = "0.9.5-beta.1"
 edition.workspace = true
 default-run = "tyde"
 
