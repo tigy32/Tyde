@@ -212,7 +212,7 @@ fn validate_release_version(value: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteHostLifecycleConfig {
-    /// The user-provided remote command is responsible for reaching a Tyde host.
+    /// The standard SSH bridge reaches a user-managed Tyde host.
     #[default]
     Manual,
     /// The desktop shell may install versioned Tyde binaries under
@@ -231,13 +231,10 @@ pub enum HostTransportConfig {
     /// In-process host running inside the shell itself. There is always
     /// exactly one of these, with id = `LOCAL_HOST_ID`.
     LocalEmbedded,
-    /// Spawn `ssh <destination> [remote_command]` and speak NDJSON over its
-    /// stdio streams. For persistent remote hosts, the remote command is a
-    /// thin bridge like `tyde host --bridge-uds`.
+    /// Spawn SSH with the Tyde bridge command and speak NDJSON over its
+    /// stdio streams.
     SshStdio {
         ssh_destination: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        remote_command: Option<String>,
         #[serde(default)]
         lifecycle: RemoteHostLifecycleConfig,
     },

@@ -48,7 +48,6 @@ All four live under Settings → Mobile, and all four are host-scoped.
 | `mobile_direct_hosting_enabled` | Run the direct origin. |
 | `mobile_direct_bind_addr` | Where to listen. Default `127.0.0.1:8730` — loopback only, so a proxy on the same machine can reach it and nothing else can. |
 | `mobile_direct_public_origin` | The URL phones use, e.g. `https://tyde.corp.internal`. Required to generate a pairing QR. |
-| `mobile_direct_bundle_dir` | Optional. A bundle directory to serve instead of the one compiled into the binary. |
 
 The Mobile tab reports the host's own view back: whether the origin is serving,
 on what address, how many files, from which bundle, and the verbatim reason
@@ -70,9 +69,11 @@ bundle newer than the binary:
 ./dev.sh mobile-bundle --out /opt/tyde/web  # anywhere you like
 ```
 
-Then point **Mobile web bundle** at that directory. A configured directory
-always wins over the compiled-in bundle, so this is also how you test a bundle
-change without rebuilding the server.
+The Mobile settings UI uses the compiled-in bundle and exposes no bundle
+picker. Development hosts and HTTP-boundary tests can set the host setting
+`mobile_direct_bundle_dir` directly to serve a built directory without
+rebuilding the server. That developer override wins over the compiled-in
+bundle.
 
 Do not assemble the directory by hand. The manifest carries sha384 SRI over
 every executable artifact and the loader enforces it, so a shell copied from

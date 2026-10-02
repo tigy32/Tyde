@@ -18,7 +18,7 @@ use crate::host_store::{HostTransportConfig, RemoteHostLifecycleConfig};
 use crate::remote_bootstrap::{current_app_release_version, shell_quote};
 use host_config::TydeReleaseVersion;
 
-const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
+const REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 const SSH_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 const SSH_EXIT_WAIT: Duration = Duration::from_secs(2);
 pub const HOST_VOICE_FRAME_EVENT: &str = "tyde://host-voice-frame";
@@ -209,8 +209,7 @@ impl ProxyRouterHandle {
 
         let available = Arc::new(AtomicBool::new(true));
         let retry = Arc::new(tokio::sync::Notify::new());
-        let resumable = matches!(&transport, HostTransportConfig::SshStdio { remote_command, lifecycle, .. }
-            if matches!(lifecycle, RemoteHostLifecycleConfig::ManagedTyde) || remote_command.is_none());
+        let resumable = matches!(&transport, HostTransportConfig::SshStdio { .. });
         let setup = setup_connection_transport(
             &host_id,
             app.clone(),
@@ -978,7 +977,6 @@ async fn setup_connection_transport(
         }
         HostTransportConfig::SshStdio {
             ssh_destination,
-            remote_command,
             lifecycle,
         } => {
             if ssh_destination.trim_start().starts_with('-') {
@@ -987,9 +985,7 @@ async fn setup_connection_transport(
                 ));
             }
             let command = match lifecycle {
-                RemoteHostLifecycleConfig::Manual => {
-                    Ok(remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string()))
-                }
+                RemoteHostLifecycleConfig::Manual => Ok(REMOTE_HOST_COMMAND.to_string()),
                 RemoteHostLifecycleConfig::ManagedTyde => managed_remote_bridge_command(),
             }?;
             let mut child = server::process_env::command("ssh")?;

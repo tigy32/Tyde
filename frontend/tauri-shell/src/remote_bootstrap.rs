@@ -13,7 +13,7 @@ const GITHUB_RELEASE_DOWNLOADS: &str = "https://github.com/tigy32/Tyde/releases/
 
 pub(crate) fn current_app_release_version() -> Result<TydeReleaseVersion, String> {
     let tag = option_env!("TYDE_RELEASE_TAG").ok_or_else(|| {
-        "this Tyde build does not include release metadata, so managed remote install is disabled; use an official release build or configure a manual remote command"
+        "this Tyde build does not include release metadata, so managed remote install is disabled; use an official release build"
             .to_string()
     })?;
     tag.parse::<TydeReleaseVersion>()
@@ -93,7 +93,7 @@ pub async fn ensure_configured_host_ready(
             missing_target_binary_message(&snapshot.target_version),
         ),
         LifecycleAction::UnknownSocket => {
-            let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
+            let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually before connecting".to_string();
             lifecycle_error(&app, &host.id, message)
         }
     }
@@ -108,7 +108,7 @@ pub async fn force_upgrade_managed_host(
 
     let mut snapshot = probe_target_snapshot(&app, &host.id, &managed, target_version).await?;
     if matches!(snapshot.running, RemoteTydeRunningState::UnknownSocket) {
-        let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
+        let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually before connecting".to_string();
         return lifecycle_error(&app, &host.id, message);
     }
     if let Some((remote, running)) = remote_ahead_of_app(&snapshot) {
@@ -151,7 +151,7 @@ pub async fn force_upgrade_managed_host(
             .await
         }
         RemoteTydeRunningState::UnknownSocket => {
-            let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
+            let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually before connecting".to_string();
             lifecycle_error(&app, &host.id, message)
         }
     }
@@ -240,7 +240,6 @@ fn managed_ssh_host(host: &ConfiguredHost) -> Result<ManagedSshHost, String> {
         HostTransportConfig::SshStdio {
             ssh_destination,
             lifecycle: RemoteHostLifecycleConfig::ManagedTyde,
-            remote_command: None,
         } => {
             if ssh_destination.trim_start().starts_with('-') {
                 return Err(format!(
@@ -252,14 +251,6 @@ fn managed_ssh_host(host: &ConfiguredHost) -> Result<ManagedSshHost, String> {
                 ssh_destination: ssh_destination.clone(),
             })
         }
-        HostTransportConfig::SshStdio {
-            lifecycle: RemoteHostLifecycleConfig::ManagedTyde,
-            remote_command: Some(_),
-            ..
-        } => Err(format!(
-            "configured host '{}' has both managed lifecycle and a remote command override",
-            host.id
-        )),
         HostTransportConfig::SshStdio { .. } => Err(format!(
             "configured host '{}' uses a manual SSH lifecycle",
             host.id

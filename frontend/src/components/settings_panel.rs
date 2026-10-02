@@ -494,7 +494,6 @@ impl SettingsTab {
                 "Configured Hosts",
                 "Add remote host",
                 "SSH destination",
-                "Remote command",
                 "Auto-connect",
                 "Select host",
                 "Selected host",
@@ -1367,7 +1366,6 @@ fn HostsTab() -> impl IntoView {
     let state_for_configured_hosts = state.clone();
     let label_sig = RwSignal::new(String::new());
     let ssh_destination_sig = RwSignal::new(String::new());
-    let remote_command_sig = RwSignal::new(String::new());
     let auto_connect_sig = RwSignal::new(true);
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
     let disconnecting_hosts = RwSignal::new(std::collections::HashSet::<String>::new());
@@ -1377,22 +1375,11 @@ fn HostsTab() -> impl IntoView {
         move |_| {
             let label = label_sig.get_untracked().trim().to_string();
             let ssh_destination = ssh_destination_sig.get_untracked().trim().to_string();
-            let remote_command = remote_command_sig.get_untracked().trim().to_string();
             let auto_connect = auto_connect_sig.get_untracked();
             if label.is_empty() || ssh_destination.is_empty() {
                 error_sig.set(Some("Label and SSH destination are required.".to_string()));
                 return;
             }
-            let remote_command = if remote_command.is_empty() {
-                None
-            } else {
-                Some(remote_command)
-            };
-            let lifecycle = if remote_command.is_none() {
-                bridge::RemoteHostLifecycleConfig::ManagedTyde
-            } else {
-                bridge::RemoteHostLifecycleConfig::Manual
-            };
 
             let state = state.clone();
             spawn_local(async move {
@@ -1401,8 +1388,7 @@ fn HostsTab() -> impl IntoView {
                     label,
                     transport: BridgeHostTransportConfig::SshStdio {
                         ssh_destination,
-                        remote_command,
-                        lifecycle,
+                        lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde,
                     },
                     auto_connect,
                 })
@@ -1413,7 +1399,6 @@ fn HostsTab() -> impl IntoView {
                         error_sig.set(None);
                         label_sig.set(String::new());
                         ssh_destination_sig.set(String::new());
-                        remote_command_sig.set(String::new());
                         auto_connect_sig.set(true);
                         let new_host_id = if auto_connect {
                             let existing_ids: std::collections::HashSet<String> = state
@@ -1658,7 +1643,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Add Remote Host"</label>
-            <p class="settings-description">"Configure a remote host over SSH. Leave Remote command blank for managed install/launch of the same Tyde release as this app. Set Remote command only for a manual bridge command."</p>
+            <p class="settings-description">"Configure a remote host over SSH. Tyde automatically installs and launches the same release as this app."</p>
             <div class="settings-form">
                 <div class="settings-form-row">
                     <label class="settings-form-label">
@@ -1690,20 +1675,6 @@ fn HostsTab() -> impl IntoView {
                         />
                     </label>
                 </div>
-                <label class="settings-form-label">
-                    <span>"Remote command"<span class="settings-form-hint">" (optional)"</span></span>
-                    <input
-                        class="settings-text-input"
-                        type="text"
-                        placeholder="tyde host --bridge-uds"
-                        prop:value=move || remote_command_sig.get()
-                        on:input=move |ev| remote_command_sig.set(event_target_value(&ev))
-                        spellcheck="false"
-                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
-                        autocapitalize="none"
-                        autocomplete="off"
-                    />
-                </label>
                 <div class="settings-form-footer">
                     <div class="settings-checkbox-row">
                         <label class="settings-toggle">
@@ -6821,8 +6792,6 @@ fn MobileDirectSection() -> AnyView {
                     asset_count,
                     source,
                 } => {
-                    // Which bundle is live decides whether editing the
-                    // directory below changes anything, so say it.
                     let which = match source {
                         MobileWebBundleSource::BuiltIn => "built-in bundle",
                         MobileWebBundleSource::Directory => "bundle directory",
@@ -6860,14 +6829,6 @@ fn MobileDirectSection() -> AnyView {
             pointer="/mobile_direct_bind_addr"
             slug="bind"
             read=|settings| settings.mobile_direct_bind_addr.clone()
-        />
-        <MobileDirectField
-            label="Mobile web bundle"
-            description="Optional. A bundle directory to serve instead of the one built into this host, produced by ./dev.sh mobile-bundle. Release builds already carry a bundle, so leave this blank unless you are serving one you built yourself."
-            placeholder="/opt/tyde/mobile-web"
-            pointer="/mobile_direct_bundle_dir"
-            slug="bundle"
-            read=|settings| settings.mobile_direct_bundle_dir.clone()
         />
 
         {move || {
@@ -10073,12 +10034,12 @@ mod wasm_tests {
         );
     }
 
-    /// The three direct-hosting text fields must reflect the host's values and
+    /// The direct-hosting address fields must reflect the host's values and
     /// commit edits to their own pointer, and a blank field must clear the
     /// override rather than committing an empty string the server would then
     /// have to treat as unset.
     #[wasm_bindgen_test]
-    async fn mobile_tab_direct_fields_commit_and_clear() {
+    async fn mobile_tab_direct_address_fields_commit_and_clear() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let state = AppState::new();
@@ -10098,17 +10059,29 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Mobile web bundle"),
+            "self-hosted mobile setup must not ask users to choose a bundle"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".settings-mobile-direct input[type=text]")
+                .unwrap()
+                .length(),
+            2,
+            "self-hosted mobile setup must expose only the public and listen addresses"
+        );
+
         assert_eq!(
             direct_input(&container, "origin").value(),
             "https://tyde.corp.internal",
             "the address field must reflect the host's configured origin"
         );
 
-        set_and_change(&direct_input(&container, "bind"), "0.0.0.0:9000");
-        set_and_change(
-            &direct_input(&container, "bundle"),
-            " /opt/tyde/mobile-web ",
-        );
+        set_and_change(&direct_input(&container, "bind"), " 0.0.0.0:9000 ");
         set_and_change(&direct_input(&container, "origin"), "   ");
         for _ in 0..4 {
             next_tick().await;
@@ -10125,12 +10098,12 @@ mod wasm_tests {
         assert_eq!(
             value_at("/mobile_direct_bind_addr"),
             Some(Value::String("0.0.0.0:9000".to_owned())),
-            "the listen address must commit to its own pointer: {settings:?}"
+            "the listen address must trim whitespace and commit to its own pointer: {settings:?}"
         );
         assert_eq!(
             value_at("/mobile_direct_bundle_dir"),
-            Some(Value::String("/opt/tyde/mobile-web".to_owned())),
-            "surrounding whitespace must be trimmed off the bundle path: {settings:?}"
+            None,
+            "editing addresses must not change the server's bundle configuration: {settings:?}"
         );
         assert_eq!(
             value_at("/mobile_direct_public_origin"),
@@ -13664,13 +13637,129 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn add_remote_host_uses_managed_setup_without_a_command() {
+        js_sys::eval(
+            r#"
+            window.__host_form_requests = [];
+            window.__host_form_store = {hosts: [], selected_host_id: null};
+            window.__TAURI__ = window.__TAURI__ || {};
+            window.__TAURI__.core = {invoke: (cmd, args) => {
+                if (cmd === 'upsert_configured_host') {
+                    window.__host_form_requests.push(args.request);
+                    window.__host_form_store.hosts.push({...args.request, id: 'new-host'});
+                    return Promise.resolve(window.__host_form_store);
+                }
+                if (cmd === 'list_configured_hosts') return Promise.resolve(window.__host_form_store);
+                return Promise.reject('Unexpected host form command');
+            }};
+        "#,
+        )
+        .unwrap();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(AppState::new());
+            view! { <HostsTab /> }
+        });
+        next_tick().await;
+
+        assert!(
+            !container.text_content().unwrap().contains("Remote command"),
+            "remote setup must not ask users to choose a command"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input[type=text]")
+                .unwrap()
+                .length(),
+            2,
+            "remote setup must ask only for a label and SSH destination"
+        );
+        let label = container
+            .query_selector("input[placeholder='e.g. Workstation']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlInputElement>()
+            .unwrap();
+        let destination = container
+            .query_selector("input[placeholder='user@host']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlInputElement>()
+            .unwrap();
+        let auto_connect = container
+            .query_selector("input[type=checkbox]")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlInputElement>()
+            .unwrap();
+        assert!(auto_connect.checked());
+        find_button_by_text(&container, "Add Host").unwrap().click();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Label and SSH destination are required.")
+        );
+        assert_eq!(
+            js_sys::eval("window.__host_form_requests.length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0),
+            "invalid input must not save a host"
+        );
+
+        set_input_value(&label, "  Workstation  ");
+        set_input_value(&destination, "  work  ");
+        auto_connect.set_checked(false);
+        dispatch_event_from_js(&auto_connect, "change", None);
+        find_button_by_text(&container, "Add Host").unwrap().click();
+        next_tick().await;
+        next_tick().await;
+        let requests: Vec<serde_json::Value> = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__host_form_requests)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]["transport"].get("remote_command").is_none());
+        let request: bridge::UpsertConfiguredHostRequest =
+            serde_json::from_value(requests[0].clone()).unwrap();
+        assert_eq!(request.label, "Workstation");
+        assert!(!request.auto_connect);
+        assert!(matches!(
+            request.transport,
+            bridge::HostTransportConfig::SshStdio {
+                ssh_destination,
+                lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde,
+                ..
+            } if ssh_destination == "work"
+        ));
+        assert!(container.text_content().unwrap().contains("Workstation"));
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Label and SSH destination are required.")
+        );
+        assert!(label.value().is_empty() && destination.value().is_empty());
+        assert!(
+            auto_connect.checked(),
+            "saving must reset the form defaults"
+        );
+        drop(handle);
+        container.remove();
+    }
+
     fn settings_host(id: &str, label: &str) -> crate::bridge::ConfiguredHost {
         crate::bridge::ConfiguredHost {
             id: id.to_owned(),
             label: label.to_owned(),
             transport: crate::bridge::HostTransportConfig::SshStdio {
                 ssh_destination: id.to_owned(),
-                remote_command: None,
                 lifecycle: Default::default(),
             },
             auto_connect: false,
@@ -13705,7 +13794,6 @@ mod wasm_tests {
         let mut host = settings_host("retry-host", "Work desktop");
         host.transport = bridge::HostTransportConfig::SshStdio {
             ssh_destination: "work".into(),
-            remote_command: Some("manual-bridge".into()),
             lifecycle: bridge::RemoteHostLifecycleConfig::Manual,
         };
         state.configured_hosts.set(vec![host]);
@@ -13885,7 +13973,6 @@ mod wasm_tests {
         let mut host = settings_host("manual-host", "Remote machine");
         host.transport = bridge::HostTransportConfig::SshStdio {
             ssh_destination: "remote".into(),
-            remote_command: Some("manual-bridge".into()),
             lifecycle: bridge::RemoteHostLifecycleConfig::Manual,
         };
         state.configured_hosts.set(vec![host]);

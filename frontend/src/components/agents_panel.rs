@@ -2901,7 +2901,6 @@ mod wasm_tests {
             } else {
                 crate::bridge::HostTransportConfig::SshStdio {
                     ssh_destination: id.to_owned(),
-                    remote_command: None,
                     lifecycle: Default::default(),
                 }
             },

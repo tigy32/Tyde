@@ -252,29 +252,13 @@ fn validate_transport(transport: &HostTransportConfig) -> Result<(), String> {
     match transport {
         HostTransportConfig::LocalEmbedded => Ok(()),
         HostTransportConfig::SshStdio {
-            ssh_destination,
-            remote_command,
-            lifecycle,
+            ssh_destination, ..
         } => {
             if ssh_destination.trim().is_empty() {
                 return Err("ssh_destination must not be empty".to_string());
             }
             if ssh_destination.trim_start().starts_with('-') {
                 return Err("ssh_destination must not start with '-'".to_string());
-            }
-            if remote_command
-                .as_ref()
-                .is_some_and(|command| command.trim().is_empty())
-            {
-                return Err("remote_command must not be blank when provided".to_string());
-            }
-            if matches!(lifecycle, RemoteHostLifecycleConfig::ManagedTyde)
-                && remote_command.is_some()
-            {
-                return Err(
-                    "managed Tyde remote hosts must use the shell-derived bridge command"
-                        .to_string(),
-                );
             }
             Ok(())
         }

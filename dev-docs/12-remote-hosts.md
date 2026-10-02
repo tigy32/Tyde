@@ -188,7 +188,7 @@ It may know:
 
 - host identity used by the app (`ConfiguredHostId`)
 - transport type (`local_embedded`, `ssh_stdio`)
-- transport settings (`ssh destination`, optional remote command override)
+- transport settings (`ssh destination`)
 
 It must **not** know:
 
@@ -262,9 +262,8 @@ pub enum HostTransportConfig {
         /// Usually an ssh config alias such as "workbox" or "prod-devbox".
         ssh_destination: String,
 
-        /// Optional remote command override. If absent, the shell uses the
-        /// default Tyde SSH bridge command (`tyde host --bridge-uds`).
-        remote_command: Option<String>,
+        /// New hosts use Tyde-managed installation and launch.
+        lifecycle: RemoteHostLifecycleConfig,
     },
 }
 
@@ -389,7 +388,7 @@ The router should generalize its connect path:
   use the current in-process duplex wiring into `server::accept` and
   `server::run_connection`
 - `SshStdio`:
-  spawn `ssh -T <ssh_destination> <remote_command>` and hand the child
+  spawn `ssh -T <ssh_destination> <tyde_bridge_command>` and hand the child
   stdin/stdout to the same `connection_actor`
 
 The important point is that both transports end up as the same raw line stream.
@@ -404,10 +403,13 @@ Tyde wire protocol over a byte stream.
 The transport seen by the shell remains:
 
 ```text
-ssh -T <destination> <remote_command>
+ssh -T <destination> <tyde_bridge_command>
 ```
 
-For a **persistent remote host**, `<remote_command>` should be a thin bridge:
+The shell derives `<tyde_bridge_command>`; users do not configure a command
+override. Managed hosts use the exact app release's versioned binary after
+automatic installation and launch. Existing user-managed hosts use the
+standard bridge:
 
 ```text
 tyde host --bridge-uds
