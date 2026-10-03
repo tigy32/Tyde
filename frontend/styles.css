@@ -15991,7 +15991,9 @@ pre.tool-error-pre {
     border: 1px solid var(--border-secondary);
     font-size: 0.769rem;
 }
-.swarm-scope-label[data-policy="shared_workbench"] { border-color: var(--warning); color: var(--warning); }
+.swarm-scope-label[data-policy="shared_workbench"],
+.swarm-scope-label[data-policy="shared_project"],
+.swarm-scope-label[data-policy="shared_host"] { border-color: var(--warning); color: var(--warning); }
 .swarm-header-actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 
 .swarm-lifecycle-pill {

@@ -206,6 +206,9 @@ impl ConstraintsForm {
 
     fn constraints(&self) -> Result<SwarmConstraints, String> {
         let project_id = self.project_id.get_untracked().ok_or("Choose a project.")?;
+        if self.policy.get_untracked().writable_consent() == Some(false) {
+            return Err("Confirm write access to the selected scope.".to_owned());
+        }
         let allocations = self
             .allocations
             .get_untracked()
@@ -413,7 +416,6 @@ fn ConstraintsFields(
             })
         })
     });
-    // A writable policy is only admissible for a workbench project.
     Effect::new(move |_| {
         if !locked_scope
             && !selected_is_workbench.get()
@@ -457,7 +459,12 @@ fn ConstraintsFields(
                 </label>
             })}
             <label class="swarm-field">
-                <span class="swarm-field-label">"Project"</span>
+                <span class="swarm-field-label">{move || match form.policy.get() {
+                    SwarmWorkspacePolicy::SharedHost { .. } => "Starting project",
+                    SwarmWorkspacePolicy::ReadOnly
+                    | SwarmWorkspacePolicy::SharedProject { .. }
+                    | SwarmWorkspacePolicy::SharedWorkbench { .. } => "Project",
+                }}</span>
                 <select
                     class="swarm-input"
                     data-field="project"
@@ -480,6 +487,8 @@ fn ConstraintsFields(
                             <option
                                 value=id.0.clone()
                                 selected=move || form.project_id.get().as_ref() == Some(&id_for_selected)
+                                disabled=move || info.project.is_workbench()
+                                    && matches!(form.policy.get(), SwarmWorkspacePolicy::SharedProject { .. })
                             >
                                 {label}
                             </option>
@@ -489,6 +498,41 @@ fn ConstraintsFields(
             </label>
             <fieldset class="swarm-field swarm-policy" disabled=locked_scope>
                 <legend class="swarm-field-label">"Workspace access"</legend>
+                <label class="swarm-radio">
+                    <input
+                        type="radio"
+                        name="swarm-policy"
+                        data-policy="shared_host"
+                        prop:checked=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedHost { .. })
+                        on:change=move |_| form.policy.set(SwarmWorkspacePolicy::SharedHost { writable_consent: false })
+                    />
+                    <span>
+                        <span class="swarm-radio-title">"Host scope — writable"</span>
+                        <span class="swarm-field-help">"Members can edit all projects and workbenches on this host, including ones added later."</span>
+                    </span>
+                </label>
+                <label class="swarm-radio">
+                    <input
+                        type="radio"
+                        name="swarm-policy"
+                        data-policy="shared_project"
+                        prop:checked=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedProject { .. })
+                        on:change=move |_| {
+                            if selected_is_workbench.get_untracked() {
+                                let selected = form.project_id.get_untracked();
+                                let parent = projects.get_untracked().iter()
+                                    .find(|info| Some(&info.project.id) == selected.as_ref())
+                                    .and_then(|info| info.project.parent_project_id().cloned());
+                                form.project_id.set(parent);
+                            }
+                            form.policy.set(SwarmWorkspacePolicy::SharedProject { writable_consent: false });
+                        }
+                    />
+                    <span>
+                        <span class="swarm-radio-title">"Project scope — writable"</span>
+                        <span class="swarm-field-help">"Members can edit the selected project and all its workbenches, including newly created workbenches."</span>
+                    </span>
+                </label>
                 <label class="swarm-radio">
                     <input
                         type="radio"
@@ -512,32 +556,43 @@ fn ConstraintsFields(
                         on:change=move |_| form.policy.set(SwarmWorkspacePolicy::SharedWorkbench { writable_consent: false })
                     />
                     <span>
-                        <span class="swarm-radio-title">"Shared writable workbench"</span>
+                        <span class="swarm-radio-title">"Workbench scope — writable"</span>
                         <span class="swarm-field-help">
                             {move || if selected_is_workbench.get() {
                                 "Members can edit this workbench. Nothing is landed on main automatically."
                             } else {
-                                "Only available for a workbench project, never for main."
+                                "Select a workbench to limit writes to that working tree."
                             }}
                         </span>
                     </span>
                 </label>
-                <Show when=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedWorkbench { .. })>
+                <Show when=move || form.policy.get().writable_consent().is_some()>
                     <div class="swarm-banner" data-tone="warn" role="note">
                         <span class="swarm-banner-text">
-                            "All members share one working tree. Edits are not serialized: two members can change the same file at the same time."
+                            "Members can edit files in this scope. Edits are not serialized: two members can change the same file at the same time. Repository rules still apply."
                         </span>
                     </div>
                     <label class="swarm-consent">
                         <input
                             type="checkbox"
                             data-field="writable-consent"
-                            prop:checked=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedWorkbench { writable_consent: true })
-                            on:change=move |ev| form.policy.set(SwarmWorkspacePolicy::SharedWorkbench {
-                                writable_consent: event_target_checked(&ev),
-                            })
+                            prop:checked=move || form.policy.get().writable_consent() == Some(true)
+                            on:change=move |ev| {
+                                let writable_consent = event_target_checked(&ev);
+                                form.policy.update(|policy| match policy {
+                                    SwarmWorkspacePolicy::ReadOnly => {},
+                                    SwarmWorkspacePolicy::SharedWorkbench { writable_consent: consent }
+                                    | SwarmWorkspacePolicy::SharedProject { writable_consent: consent }
+                                    | SwarmWorkspacePolicy::SharedHost { writable_consent: consent } => *consent = writable_consent,
+                                });
+                            }
                         />
-                        <span>"I understand and allow members to write to this workbench."</span>
+                        <span>{move || match form.policy.get() {
+                            SwarmWorkspacePolicy::ReadOnly => "",
+                            SwarmWorkspacePolicy::SharedWorkbench { .. } => "I allow members to write to this workbench.",
+                            SwarmWorkspacePolicy::SharedProject { .. } => "I allow members to write to this project and all its workbenches.",
+                            SwarmWorkspacePolicy::SharedHost { .. } => "I allow members to write to all projects and workbenches on this host.",
+                        }}</span>
                     </label>
                 </Show>
             </fieldset>
@@ -1097,13 +1152,11 @@ pub fn SwarmDraftDialog(
     }
 }
 
-/// Swarm sessions get the four board tools and no other configured MCP
-/// servers; the user sees that before launching or applying a change.
 #[component]
 fn SwarmToolPolicyNote() -> impl IntoView {
     view! {
         <p class="swarm-field-help swarm-tool-policy" data-field="tool-policy">
-            "Tools: members get the four swarm board tools plus their backend's built-in tools. Your other configured MCP servers are not attached; file writes follow the project access above."
+            "Tools: members get the four swarm board tools plus their backend's built-in tools. Writable host and project scopes also get scoped workbench listing, creation, and removal. Your other configured MCP servers are not attached; file writes follow the workspace access above."
         </p>
     }
 }
@@ -1769,6 +1822,108 @@ mod wasm_tests {
             harness.commands_of("apply_change").is_empty(),
             "edited constraints cannot apply the old preview"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn writable_scope_choices_require_matching_consent_and_emit_typed_constraints() {
+        for (key, expected, scope_text, selected) in [
+            (
+                "shared_host",
+                SwarmWorkspacePolicy::SharedHost {
+                    writable_consent: true,
+                },
+                "all projects and workbenches on this host",
+                PROJECT,
+            ),
+            (
+                "shared_project",
+                SwarmWorkspacePolicy::SharedProject {
+                    writable_consent: true,
+                },
+                "this project and all its workbenches",
+                PROJECT,
+            ),
+            (
+                "shared_workbench",
+                SwarmWorkspacePolicy::SharedWorkbench {
+                    writable_consent: true,
+                },
+                "this workbench",
+                "scope-workbench",
+            ),
+        ] {
+            let harness = host_with_catalog("host-swarm-scopes");
+            let (container, handle) = mount_panel(&harness);
+            settle().await;
+            button(&container, "+ New swarm").click();
+            settle().await;
+            let dialog = modal(&container).expect("scope dialog");
+            let content = text_of(&dialog);
+            assert!(content.contains("Host scope — writable"));
+            assert!(content.contains("Project scope — writable"));
+            assert!(content.contains("Workbench scope — writable"));
+            assert!(content.contains("Read-only project access"));
+            assert!(
+                one(&dialog, "[data-policy='shared_workbench']")
+                    .dyn_ref::<web_sys::HtmlInputElement>()
+                    .expect("workspace scope is a radio input")
+                    .disabled()
+            );
+            harness.emit(
+                FrameKind::ProjectNotify,
+                &protocol::ProjectNotifyPayload::Upsert {
+                    project: Project {
+                        id: ProjectId("scope-workbench".to_owned()),
+                        name: "Scope workbench".to_owned(),
+                        sort_order: 1,
+                        source: ProjectSource::GitWorkbench {
+                            parent_project_id: ProjectId(PROJECT.to_owned()),
+                            branch: protocol::GitBranchName("scope-workbench".to_owned()),
+                            roots: Vec::new(),
+                        },
+                    },
+                },
+            );
+            settle().await;
+            change_control(&field(&dialog, "project"), "scope-workbench");
+            settle().await;
+            one(&dialog, &format!("[data-policy='{key}']")).click();
+            settle().await;
+            if key == "shared_host" {
+                change_control(&field(&dialog, "project"), PROJECT);
+                settle().await;
+                assert!(text_of(&dialog).contains("Starting project"));
+            }
+            assert_eq!(
+                field(&dialog, "project")
+                    .dyn_ref::<web_sys::HtmlSelectElement>()
+                    .expect("project selector")
+                    .value(),
+                selected
+            );
+            assert!(text_of(&dialog).contains(scope_text));
+            type_into(&field(&dialog, "name"), "Scoped swarm");
+            action(&dialog, "generate").click();
+            settle().await;
+            assert!(
+                harness.commands_of("generate_draft").is_empty(),
+                "unconsented scope cannot reach the server"
+            );
+            assert!(text_of(&dialog).contains("Confirm write access to the selected scope."));
+            field(&dialog, "writable-consent").click();
+            settle().await;
+            action(&dialog, "generate").click();
+            settle().await;
+            let commands = harness.commands_of("generate_draft");
+            assert_eq!(commands.len(), 1);
+            let constraints: SwarmConstraints =
+                serde_json::from_value(commands[0]["constraints"].clone())
+                    .expect("typed scope constraints");
+            assert_eq!(constraints.workspace_policy, expected);
+            assert_eq!(constraints.project_id, ProjectId(selected.to_owned()));
+            drop(handle);
+            container.remove();
+        }
     }
 
     /// Constraints first, then the host's preview, then launch of exactly the

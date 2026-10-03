@@ -727,6 +727,15 @@ Creation requires that exact parent id; an unrelated project id is rejected.
 The explicit id is retained as a confirmation guard rather than inferred from
 ambient paths.
 
+Swarm workspace authorization is separate from ordinary caller scope.
+Writable project members list the selected parent and its current workbenches
+and may create or remove workbenches under that parent. Writable host members
+list every current project/workbench and may create or remove workbenches under
+any parent project on that host. These lists include workbenches created after
+swarm launch. Read-only and single-workbench members cannot manage workbenches.
+All swarm members remain unable to spawn children, reviews, workflows, or
+teams; their additional workspace authority is not delegation authority.
+
 Creation accepts a branch, an optional non-blank display name, and optional
 `base_ref`. The server resolves the base in every parent root before mutation,
 passes only full commit SHAs to git, and reports each parent root, worktree

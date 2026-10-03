@@ -9000,6 +9000,23 @@ pub enum SwarmWorkspacePolicy {
     SharedWorkbench {
         writable_consent: bool,
     },
+    SharedProject {
+        writable_consent: bool,
+    },
+    SharedHost {
+        writable_consent: bool,
+    },
+}
+
+impl SwarmWorkspacePolicy {
+    pub fn writable_consent(self) -> Option<bool> {
+        match self {
+            Self::ReadOnly => None,
+            Self::SharedWorkbench { writable_consent }
+            | Self::SharedProject { writable_consent }
+            | Self::SharedHost { writable_consent } => Some(writable_consent),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9201,6 +9218,8 @@ pub struct SwarmThreadPage {
 pub struct SwarmDescribe {
     pub swarm: Swarm,
     pub member_id: SwarmMemberId,
+    #[serde(default)]
+    pub workspace_projects: Vec<Project>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmPublicationOutcome {

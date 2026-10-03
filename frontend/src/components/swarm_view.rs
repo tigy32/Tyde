@@ -171,7 +171,9 @@ pub(crate) fn board_unread(swarm: &Swarm, board: SwarmBoard) -> u64 {
 pub(crate) fn workspace_policy_label(policy: SwarmWorkspacePolicy) -> &'static str {
     match policy {
         SwarmWorkspacePolicy::ReadOnly => "Read-only project access",
-        SwarmWorkspacePolicy::SharedWorkbench { .. } => "Shared writable workbench",
+        SwarmWorkspacePolicy::SharedWorkbench { .. } => "Workbench scope — writable",
+        SwarmWorkspacePolicy::SharedProject { .. } => "Project scope — writable",
+        SwarmWorkspacePolicy::SharedHost { .. } => "Host scope — writable",
     }
 }
 
@@ -692,6 +694,8 @@ pub fn SwarmView(
                             data-policy=match policy {
                                 SwarmWorkspacePolicy::ReadOnly => "read_only",
                                 SwarmWorkspacePolicy::SharedWorkbench { .. } => "shared_workbench",
+                                SwarmWorkspacePolicy::SharedProject { .. } => "shared_project",
+                                SwarmWorkspacePolicy::SharedHost { .. } => "shared_host",
                             }
                         >
                             {workspace_policy_label(policy)}
@@ -2039,20 +2043,12 @@ fn SwarmComposer(
         .into_any()
     };
 
-    // Files the user already has open from this swarm's project.
     let attachable = Memo::new(move |_| {
-        let Some(project_id) = swarm.with(|swarm| {
-            swarm
-                .as_ref()
-                .map(|swarm| swarm.constraints.project_id.clone())
-        }) else {
-            return Vec::new();
-        };
         let host_id = host.get_value();
         let mut files: Vec<SwarmAttachment> = open_files.with(|files| {
             files
                 .keys()
-                .filter(|key| key.host_id == host_id && key.project_id == project_id)
+                .filter(|key| key.host_id == host_id)
                 .map(|key| SwarmAttachment {
                     project_id: key.project_id.clone(),
                     path: key.path.clone(),

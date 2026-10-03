@@ -120,6 +120,47 @@ impl Scenario {
         }
     }
 
+    async fn add_project(&mut self, name: &str) -> Project {
+        let root = self.fixture.store_dir().join(name);
+        std::fs::create_dir(&root).expect("create additional project root");
+        std::fs::write(root.join("reference.txt"), "Project reference\n")
+            .expect("write additional reference");
+        self.fixture
+            .client
+            .project_create(ProjectCreatePayload {
+                name: name.to_owned(),
+                roots: vec![ProjectRootPath(root.to_string_lossy().into_owned())],
+            })
+            .await
+            .expect("create additional project over protocol");
+        let event: ProjectNotifyPayload = self.wait(FrameKind::ProjectNotify, "additional project", |event| {
+            matches!(event, ProjectNotifyPayload::Upsert { project } if project.name == name)
+        }).await;
+        match event {
+            ProjectNotifyPayload::Upsert { project } => project,
+            ProjectNotifyPayload::Delete { .. } => panic!("expected additional project"),
+        }
+    }
+
+    async fn add_workbench(&mut self, parent: &Project, branch: &str) -> Project {
+        self.fixture
+            .client
+            .workbench_create(protocol::WorkbenchCreatePayload {
+                parent_project_id: parent.id.clone(),
+                branch: protocol::GitBranchName(branch.to_owned()),
+                name: branch.to_owned(),
+            })
+            .await
+            .expect("create workbench over protocol");
+        let event: ProjectNotifyPayload = self.wait(FrameKind::ProjectNotify, "new workbench", |event| {
+            matches!(event, ProjectNotifyPayload::Upsert { project } if project.name == branch)
+        }).await;
+        match event {
+            ProjectNotifyPayload::Upsert { project } => project,
+            ProjectNotifyPayload::Delete { .. } => panic!("expected new workbench"),
+        }
+    }
+
     fn constraints(&self, count: u32) -> protocol::SwarmConstraints {
         let profile = self
             .fixture
@@ -1666,6 +1707,335 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     );
 }
 
+fn initialize_scope_repository(project: &Project) {
+    for root in project.root_paths() {
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "tests@example.com"],
+            vec!["config", "user.name", "Tests"],
+            vec!["add", "."],
+            vec!["commit", "-m", "Initial reference"],
+        ] {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("run fixture git");
+            assert!(
+                result.status.success(),
+                "real git fixture setup must succeed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_roots() {
+    for policy in [
+        SwarmWorkspacePolicy::SharedProject {
+            writable_consent: true,
+        },
+        SwarmWorkspacePolicy::SharedHost {
+            writable_consent: true,
+        },
+        SwarmWorkspacePolicy::SharedWorkbench {
+            writable_consent: true,
+        },
+        SwarmWorkspacePolicy::ReadOnly,
+    ] {
+        let mut scenario = Scenario::new().await;
+        initialize_scope_repository(&scenario.project);
+        let other = scenario.add_project("other-project").await;
+        initialize_scope_repository(&other);
+        let parent = scenario.project.clone();
+        let existing = scenario.add_workbench(&parent, "existing-workbench").await;
+        let broad = matches!(
+            policy,
+            SwarmWorkspacePolicy::SharedProject { .. } | SwarmWorkspacePolicy::SharedHost { .. }
+        );
+        let host_scope = matches!(policy, SwarmWorkspacePolicy::SharedHost { .. });
+        let mut constraints = scenario.constraints(1);
+        constraints.workspace_policy = policy;
+        if matches!(policy, SwarmWorkspacePolicy::SharedWorkbench { .. }) {
+            constraints.project_id = existing.id.clone();
+        }
+        let draft = scenario.generate(constraints).await;
+        let launched = scenario.launch(&draft).await;
+        let swarm = scenario.swarm(&launched.id, ready).await;
+        scenario.pause(&swarm.id).await;
+        let agent = swarm.members[0]
+            .agent_id
+            .as_ref()
+            .expect("scoped live member");
+        let caller = scenario.fixture.agent_control_caller(agent).await;
+        let describe: SwarmDescribe =
+            tool_value(&call_tool(&caller, "tyde_swarm_describe", json!({})).await);
+        assert_eq!(
+            describe.workspace_projects.len(),
+            if host_scope {
+                3
+            } else if broad {
+                2
+            } else {
+                1
+            }
+        );
+        assert!(
+            describe
+                .workspace_projects
+                .iter()
+                .any(|project| project.id == other.id)
+                == host_scope
+        );
+        let start = scenario.start_for_agent(agent).await;
+        let expected_roots = describe
+            .workspace_projects
+            .iter()
+            .flat_map(|project| project.root_paths())
+            .map(|root| root.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            start.workspace_roots, expected_roots,
+            "activation must carry server-authorized roots"
+        );
+        let bearer = caller
+            .authorization
+            .strip_prefix("Bearer ")
+            .expect("fixture bearer")
+            .to_owned();
+        let service = ()
+            .serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(caller.url.clone())
+                    .auth_header(bearer),
+            ))
+            .await
+            .expect("connect scoped catalog");
+        let tools = service.list_all_tools().await.expect("list scoped tools");
+        assert_eq!(tools.len(), if broad { 7 } else { 4 });
+        assert!(!tools.iter().any(|tool| tool.name == "tyde_spawn_agent"));
+        service.cancel().await.expect("close scoped catalog");
+        tool_error(
+            &call_tool(
+                &caller,
+                "tyde_spawn_agent",
+                json!({ "prompt": "Do not spawn" }),
+            )
+            .await,
+        );
+
+        let create_args = json!({ "parent_project_id": parent.id.0, "branch": "new-workbench" });
+        if !broad {
+            tool_error(&call_tool(&caller, "tyde_create_workbench", create_args).await);
+            tool_error(&call_tool(&caller, "tyde_list_workbenches", json!({})).await);
+            let mut outside = publication(
+                SwarmBoard::Coordination,
+                "outside-scope",
+                vec![text("Reference")],
+            );
+            outside.attachments.push(protocol::SwarmAttachment {
+                project_id: other.id.clone(),
+                path: protocol::ProjectPath {
+                    root: other.root_paths()[0].clone(),
+                    relative_path: "reference.txt".to_owned(),
+                },
+            });
+            swarm_tool_error(
+                &call_tool(
+                    &caller,
+                    "tyde_swarm_post",
+                    serde_json::to_value(outside).expect("attachment publication"),
+                )
+                .await,
+                SwarmErrorCode::Unauthorized,
+            );
+            continue;
+        }
+        let created: Value =
+            tool_value(&call_tool(&caller, "tyde_create_workbench", create_args).await);
+        let fresh_id = protocol::ProjectId(
+            created["project_id"]
+                .as_str()
+                .expect("created ID")
+                .to_owned(),
+        );
+        let current: SwarmDescribe =
+            tool_value(&call_tool(&caller, "tyde_swarm_describe", json!({})).await);
+        let fresh = current
+            .workspace_projects
+            .iter()
+            .find(|project| project.id == fresh_id)
+            .expect("new workbench joins the active scope without recreating the swarm")
+            .clone();
+        let listed: Value =
+            tool_value(&call_tool(&caller, "tyde_list_workbenches", json!({})).await);
+        assert_eq!(
+            listed["projects"]
+                .as_array()
+                .expect("scoped projects")
+                .len(),
+            current.workspace_projects.len()
+        );
+        let mut attached = publication(
+            SwarmBoard::Coordination,
+            "new-workbench-reference",
+            vec![text("Reference")],
+        );
+        attached.attachments.push(protocol::SwarmAttachment {
+            project_id: fresh.id.clone(),
+            path: protocol::ProjectPath {
+                root: fresh.root_paths()[0].clone(),
+                relative_path: "reference.txt".to_owned(),
+            },
+        });
+        let published: SwarmPublicationOutcome = tool_value(
+            &call_tool(
+                &caller,
+                "tyde_swarm_post",
+                serde_json::to_value(attached).expect("attachment publication"),
+            )
+            .await,
+        );
+        assert_eq!(published.post.attachments.len(), 1);
+        let late = scenario.add_project("late-project").await;
+        initialize_scope_repository(&late);
+        let after_add: SwarmDescribe =
+            tool_value(&call_tool(&caller, "tyde_swarm_describe", json!({})).await);
+        assert!(
+            after_add
+                .workspace_projects
+                .iter()
+                .any(|project| project.id == late.id)
+                == host_scope
+        );
+        let outside_args = json!({ "parent_project_id": late.id.0, "branch": "late-workbench" });
+        if host_scope {
+            let _: Value =
+                tool_value(&call_tool(&caller, "tyde_create_workbench", outside_args).await);
+        } else {
+            tool_error(&call_tool(&caller, "tyde_create_workbench", outside_args).await);
+            let mut outside = publication(
+                SwarmBoard::Coordination,
+                "outside-project",
+                vec![text("Reference")],
+            );
+            outside.attachments.push(protocol::SwarmAttachment {
+                project_id: late.id.clone(),
+                path: protocol::ProjectPath {
+                    root: late.root_paths()[0].clone(),
+                    relative_path: "reference.txt".to_owned(),
+                },
+            });
+            swarm_tool_error(
+                &call_tool(
+                    &caller,
+                    "tyde_swarm_post",
+                    serde_json::to_value(outside).expect("outside publication"),
+                )
+                .await,
+                SwarmErrorCode::Unauthorized,
+            );
+        }
+        scenario
+            .post(
+                &swarm.id,
+                publication(
+                    SwarmBoard::Briefing,
+                    "resume-with-current-scope",
+                    vec![text("Inspect the current workspace scope")],
+                ),
+            )
+            .await;
+        let resumed_bootstrap = scenario.fixture.restart_host().await;
+        scenario.pending.clear();
+        assert!(
+            resumed_bootstrap
+                .swarms
+                .iter()
+                .any(|saved| saved.id == swarm.id && saved.constraints == swarm.constraints)
+        );
+        scenario
+            .send(SwarmCommandPayload::Resume {
+                swarm_id: swarm.id.clone(),
+            })
+            .await;
+        let resumed = scenario.swarm(&swarm.id, ready).await;
+        let resumed_agent = resumed.members[0]
+            .agent_id
+            .as_ref()
+            .expect("resumed member");
+        let resumed_caller = scenario.fixture.agent_control_caller(resumed_agent).await;
+        let resumed_scope: SwarmDescribe =
+            tool_value(&call_tool(&resumed_caller, "tyde_swarm_describe", json!({})).await);
+        let resumed_start = scenario.start_for_agent(resumed_agent).await;
+        let resumed_roots = resumed_scope
+            .workspace_projects
+            .iter()
+            .flat_map(|project| project.root_paths())
+            .map(|root| root.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed_start.workspace_roots, resumed_roots,
+            "resume must resolve new workbenches, not retain original roots"
+        );
+        assert!(
+            resumed_start
+                .workspace_roots
+                .contains(&fresh.root_paths()[0].0)
+        );
+        let _: Value = tool_value(
+            &call_tool(
+                &resumed_caller,
+                "tyde_remove_workbench",
+                json!({ "project_id": fresh.id.0 }),
+            )
+            .await,
+        );
+        let after_remove: SwarmDescribe =
+            tool_value(&call_tool(&resumed_caller, "tyde_swarm_describe", json!({})).await);
+        assert!(
+            !after_remove
+                .workspace_projects
+                .iter()
+                .any(|project| project.id == fresh.id)
+        );
+        scenario.pause(&swarm.id).await;
+        scenario
+            .post(
+                &swarm.id,
+                publication(
+                    SwarmBoard::Briefing,
+                    "resume-after-removal",
+                    vec![text("Inspect the remaining workspace")],
+                ),
+            )
+            .await;
+        scenario.fixture.restart_host().await;
+        scenario.pending.clear();
+        scenario
+            .send(SwarmCommandPayload::Resume {
+                swarm_id: swarm.id.clone(),
+            })
+            .await;
+        let resumed_after_removal = scenario.swarm(&swarm.id, ready).await;
+        let remaining_start = scenario
+            .start_for_agent(
+                resumed_after_removal.members[0]
+                    .agent_id
+                    .as_ref()
+                    .expect("remaining scope member"),
+            )
+            .await;
+        assert!(
+            !remaining_start
+                .workspace_roots
+                .contains(&fresh.root_paths()[0].0),
+            "removed workbenches must not survive in resumed configuration"
+        );
+        scenario.pause(&swarm.id).await;
+    }
+}
+
 #[tokio::test]
 async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() {
     let mut scenario = Scenario::new().await;
@@ -1695,6 +2065,18 @@ async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() 
         writable_consent: true,
     };
     invalid_constraints.push(unsafe_workspace);
+    for workspace_policy in [
+        SwarmWorkspacePolicy::SharedProject {
+            writable_consent: false,
+        },
+        SwarmWorkspacePolicy::SharedHost {
+            writable_consent: false,
+        },
+    ] {
+        let mut unconsented = valid.clone();
+        unconsented.workspace_policy = workspace_policy;
+        invalid_constraints.push(unconsented);
+    }
     let mut invalid_settings = valid.clone();
     invalid_settings.allocations[0].session_settings.0.insert(
         "not_a_schema_owned_field".to_owned(),

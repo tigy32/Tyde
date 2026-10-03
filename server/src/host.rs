@@ -4782,6 +4782,39 @@ impl HostHandle {
             .and_then(|depth| depth.checked_add(1))
             .unwrap_or(1);
 
+        let swarm_workspace = if let Some((swarm_id, _, policy)) = &swarm_binding {
+            let registry = self.state.lock().await.swarm_registry.clone();
+            let swarm = registry
+                .snapshot()
+                .await
+                .map_err(|error| AppError::invalid("swarm_activate", error.message))?
+                .swarms
+                .into_iter()
+                .find(|swarm| swarm.id == *swarm_id)
+                .ok_or_else(|| AppError::not_found("swarm_activate", "Swarm no longer exists"))?;
+            let projects = self
+                .swarm_workspace_projects(&swarm.constraints)
+                .await
+                .map_err(|error| AppError::invalid("swarm_activate", error.message))?;
+            let mut roots = Vec::new();
+            for project in &projects {
+                for root in project.root_paths() {
+                    if !roots.contains(&root.0) {
+                        roots.push(root.0);
+                    }
+                }
+            }
+            tracing::info!(
+                workspace_policy = ?policy,
+                project_count = projects.len(),
+                root_count = roots.len(),
+                "Resolved swarm workspace scope"
+            );
+            Some((projects, roots))
+        } else {
+            None
+        };
+
         let mut generated_name_request = None;
         let request = match payload.params {
             SpawnAgentParams::New {
@@ -4794,6 +4827,10 @@ impl HostHandle {
                 access_mode,
                 session_settings,
             } => {
+                let workspace_roots = match &swarm_workspace {
+                    Some((_, roots)) => roots.clone(),
+                    None => workspace_roots,
+                };
                 let (session_settings, session_settings_source) = self
                     .resolve_launch_profile_session_settings(
                         backend_kind,
@@ -4967,7 +5004,7 @@ impl HostHandle {
             }
             SpawnAgentParams::Resume { session_id, prompt } => {
                 let record = session_store.get(&session_id).await;
-                let Some(record) = record else {
+                let Some(mut record) = record else {
                     let resolved_name = payload
                         .name
                         .clone()
@@ -5088,6 +5125,9 @@ impl HostHandle {
                         requested_custom_agent_id,
                         record.custom_agent_id
                     );
+                }
+                if let Some((_, roots)) = &swarm_workspace {
+                    record.workspace_roots = roots.clone();
                 }
                 let requested_project_id = payload.project_id.or(record.project_id.clone());
                 let (project_id, missing_project_warning) = match requested_project_id {
@@ -5625,6 +5665,15 @@ impl HostHandle {
 
         let mut request = self.apply_complexity_tier_settings(request).await;
         if let Some((swarm_id, member_id, policy)) = &swarm_binding {
+            let (projects, roots) = swarm_workspace.as_ref().ok_or_else(|| {
+                AppError::invalid("swarm_activate", "Swarm workspace was not resolved")
+            })?;
+            request.workspace_roots = roots.clone();
+            let scope = serde_json::to_string(projects)
+                .map_err(|error| AppError::invalid("swarm_activate", error.to_string()))?;
+            request.resolved_spawn_config.builtin_steering.push_str(&format!(
+                "\n\nYour server-authorized workspace policy is {policy:?}. Current projects and roots in scope: {scope}. Use tyde_swarm_describe to obtain the current workspace_projects before accessing another project or workbench; the server resolves this list dynamically. Project scope includes newly created workbenches of the selected parent project. Host scope includes all current and newly added projects on this host. Workbench scope covers only the selected workbench. Writable host/project members can use tyde_list_workbenches, tyde_create_workbench, and tyde_remove_workbench within their scope. Do not edit outside the authorized scope. Repository-specific workbench, validation, and landing instructions still apply."
+            ));
             request
                 .resolved_spawn_config
                 .bind_swarm_membership(protocol::SwarmMembership {

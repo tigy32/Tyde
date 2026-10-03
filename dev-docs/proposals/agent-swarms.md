@@ -363,8 +363,9 @@ discussion, not a reason to add a hidden claim system. It also does not solve
 concurrent file writes: integrate the existing workbench/workspace controls,
 show workspace scope explicitly, and preserve repository branch rules. Do not
 silently give every member an unsafe shared writable checkout. Workspace
-policy is explicit: read-only project access or consented shared writes in a
-Tyde workbench. Members coordinate edits; Tyde does not automatically land them.
+policy is explicit: read-only project access or consented shared writes at
+host, parent-project (including all current and future workbenches), or single
+Tyde workbench scope. Members coordinate edits; Tyde does not automatically land them.
 
 ### 4.3 Prevent wake storms
 

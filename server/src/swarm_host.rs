@@ -90,13 +90,25 @@ pub(super) fn apply_swarm_spawn_policy(
         SwarmWorkspacePolicy::ReadOnly => protocol::BackendAccessMode::EnforcedReadOnly,
         SwarmWorkspacePolicy::SharedWorkbench {
             writable_consent: true,
+        }
+        | SwarmWorkspacePolicy::SharedProject {
+            writable_consent: true,
+        }
+        | SwarmWorkspacePolicy::SharedHost {
+            writable_consent: true,
         } => protocol::BackendAccessMode::Unrestricted,
         SwarmWorkspacePolicy::SharedWorkbench {
+            writable_consent: false,
+        }
+        | SwarmWorkspacePolicy::SharedProject {
+            writable_consent: false,
+        }
+        | SwarmWorkspacePolicy::SharedHost {
             writable_consent: false,
         } => {
             return Err(fail(
                 SwarmErrorCode::Invalid,
-                "Writable shared workbench requires explicit consent",
+                "Writable swarm scope requires explicit consent",
             ));
         }
     };
@@ -330,7 +342,45 @@ impl HostHandle {
         agent: AgentId,
     ) -> Result<SwarmDescribe, SwarmFailure> {
         let registry = self.state.lock().await.swarm_registry.clone();
-        registry.describe(agent).await
+        let mut describe = registry.describe(agent).await?;
+        describe.workspace_projects = self
+            .swarm_workspace_projects(&describe.swarm.constraints)
+            .await?;
+        Ok(describe)
+    }
+
+    pub(crate) async fn swarm_workspace_projects(
+        &self,
+        constraints: &SwarmConstraints,
+    ) -> Result<Vec<protocol::Project>, SwarmFailure> {
+        let mut projects = self
+            .list_projects()
+            .await
+            .map_err(|error| fail(SwarmErrorCode::Storage, error))?;
+        let anchor_index = projects
+            .iter()
+            .position(|project| project.id == constraints.project_id)
+            .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Swarm project does not exist"))?;
+        projects.swap(0, anchor_index);
+        match constraints.workspace_policy {
+            SwarmWorkspacePolicy::ReadOnly | SwarmWorkspacePolicy::SharedWorkbench { .. } => {
+                projects.truncate(1);
+            }
+            SwarmWorkspacePolicy::SharedProject { .. } => {
+                if projects[0].is_workbench() {
+                    return Err(fail(
+                        SwarmErrorCode::Invalid,
+                        "Project scope requires a parent project, not a workbench",
+                    ));
+                }
+                projects.retain(|project| {
+                    project.id == constraints.project_id
+                        || project.parent_project_id() == Some(&constraints.project_id)
+                });
+            }
+            SwarmWorkspacePolicy::SharedHost { .. } => {}
+        }
+        Ok(projects)
     }
     pub(crate) async fn read_swarm_board_for_agent(
         &self,
@@ -565,7 +615,17 @@ impl HostHandle {
                     ));
                 }
             }
+            SwarmWorkspacePolicy::SharedProject { writable_consent }
+            | SwarmWorkspacePolicy::SharedHost { writable_consent } => {
+                if !writable_consent {
+                    return Err(fail(
+                        SwarmErrorCode::Invalid,
+                        "Writable swarm scope requires explicit consent",
+                    ));
+                }
+            }
         }
+        self.swarm_workspace_projects(constraints).await?;
         let settings = self
             .read_settings()
             .await
@@ -671,20 +731,18 @@ impl HostHandle {
             .into_iter()
             .find(|swarm| swarm.id == *id)
             .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Swarm does not exist"))?;
-        let project_store = Arc::clone(&self.state.lock().await.project_store);
-        let project = project_store
-            .lock()
-            .await
-            .get(&swarm.constraints.project_id)
-            .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Swarm project no longer exists"))?;
+        let projects = self.swarm_workspace_projects(&swarm.constraints).await?;
         for attachment in &publication.attachments {
-            if attachment.project_id != project.id {
-                return Err(fail(
-                    SwarmErrorCode::Unauthorized,
-                    "Attachment project is outside swarm scope",
-                ));
-            }
-            let path = crate::project_stream::resolve_project_file_path(&project, &attachment.path)
+            let project = projects
+                .iter()
+                .find(|project| project.id == attachment.project_id)
+                .ok_or_else(|| {
+                    fail(
+                        SwarmErrorCode::Unauthorized,
+                        "Attachment project is outside swarm scope",
+                    )
+                })?;
+            let path = crate::project_stream::resolve_project_file_path(project, &attachment.path)
                 .map_err(|error| fail(SwarmErrorCode::Unauthorized, error))?
                 .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Attachment file does not exist"))?;
             let metadata = std::fs::metadata(&path).map_err(|error| {
@@ -1439,7 +1497,9 @@ impl HostHandle {
                         SwarmWorkspacePolicy::ReadOnly => {
                             protocol::BackendAccessMode::EnforcedReadOnly
                         }
-                        SwarmWorkspacePolicy::SharedWorkbench { .. } => {
+                        SwarmWorkspacePolicy::SharedWorkbench { .. }
+                        | SwarmWorkspacePolicy::SharedProject { .. }
+                        | SwarmWorkspacePolicy::SharedHost { .. } => {
                             protocol::BackendAccessMode::Unrestricted
                         }
                     },

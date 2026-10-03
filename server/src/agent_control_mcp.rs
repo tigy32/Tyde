@@ -771,17 +771,55 @@ async fn require_authenticated_caller(
         .is_swarm_agent(&caller)
         .await
         .map_err(|error| error.message)?
-        && !matches!(
-            tool_name,
-            "tyde_swarm_describe"
-                | "tyde_swarm_read_board"
-                | "tyde_swarm_read_thread"
-                | "tyde_swarm_post"
-        )
+        && !swarm_tool_allowed(&server.host, &caller, tool_name).await?
     {
-        return Err("Swarm callers have only the four shared-board tools; child/workflow/review/team execution is not authorized".into());
+        return Err("Tool is outside the swarm workspace scope; child/workflow/review/team execution is not authorized".into());
     }
     Ok(caller)
+}
+
+async fn swarm_tool_allowed(
+    host: &HostHandle,
+    caller: &AgentId,
+    tool_name: &str,
+) -> Result<bool, String> {
+    if !matches!(
+        tool_name,
+        "tyde_list_workbenches" | "tyde_create_workbench" | "tyde_remove_workbench"
+    ) {
+        return Ok(swarm_tool_allowed_for_policy(
+            protocol::SwarmWorkspacePolicy::ReadOnly,
+            tool_name,
+        ));
+    }
+    let describe = host
+        .describe_swarm_for_agent(caller.clone())
+        .await
+        .map_err(|error| error.message)?;
+    Ok(swarm_tool_allowed_for_policy(
+        describe.swarm.constraints.workspace_policy,
+        tool_name,
+    ))
+}
+
+fn swarm_tool_allowed_for_policy(policy: protocol::SwarmWorkspacePolicy, tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "tyde_swarm_describe"
+            | "tyde_swarm_read_board"
+            | "tyde_swarm_read_thread"
+            | "tyde_swarm_post"
+    ) || (matches!(
+        policy,
+        protocol::SwarmWorkspacePolicy::SharedHost {
+            writable_consent: true
+        } | protocol::SwarmWorkspacePolicy::SharedProject {
+            writable_consent: true
+        }
+    ) && matches!(
+        tool_name,
+        "tyde_list_workbenches" | "tyde_create_workbench" | "tyde_remove_workbench"
+    ))
 }
 
 async fn authorize_direct_children(
@@ -1024,7 +1062,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Create a git workbench under the authenticated caller's project. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Uncommitted and untracked parent changes are disclosed but never copied. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
+        description = "Create a git workbench under the authenticated caller's project. Writable host/project swarms use their explicit workspace scope. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Uncommitted and untracked parent changes are disclosed but never copied. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
     )]
     async fn tyde_create_workbench(
         &self,
@@ -1043,7 +1081,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List the authenticated caller's canonical project and its git workbenches for safe creation recovery and project_id-based spawning."
+        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning."
     )]
     async fn tyde_list_workbenches(
         &self,
@@ -1062,7 +1100,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Remove a git workbench in the authenticated caller's canonical project. Cascades through its active agents, terminals, sessions, steering, team references, reviews, and workflow runs. Dirty worktrees are refused unless force=true, which permanently discards their uncommitted and untracked files. Cannot remove the caller's own active workbench."
+        description = "Remove a git workbench in the authenticated caller's canonical project or writable swarm scope. Cascades through its active agents, terminals, sessions, steering, team references, reviews, and workflow runs. Dirty worktrees are refused unless force=true, which permanently discards their uncommitted and untracked files. Cannot remove the caller's own active workbench."
     )]
     async fn tyde_remove_workbench(
         &self,
@@ -1540,15 +1578,22 @@ impl ServerHandler for TydeAgentControlMcpServer {
             ),
         });
         if swarm_caller {
-            tools.retain(|tool| {
-                matches!(
-                    tool.name.as_ref(),
-                    "tyde_swarm_describe"
-                        | "tyde_swarm_read_board"
-                        | "tyde_swarm_read_thread"
-                        | "tyde_swarm_post"
-                )
-            });
+            let parts = context
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .ok_or_else(|| McpError::invalid_params("Missing caller authentication", None))?;
+            let caller = authenticated_caller_from_parts(&self.credentials, parts)
+                .map_err(|error| McpError::invalid_params(error, None))?
+                .ok_or_else(|| McpError::invalid_params("Missing caller authentication", None))?;
+            let policy = self
+                .host
+                .describe_swarm_for_agent(caller)
+                .await
+                .map_err(|error| McpError::internal_error(error.message, None))?
+                .swarm
+                .constraints
+                .workspace_policy;
+            tools.retain(|tool| swarm_tool_allowed_for_policy(policy, tool.name.as_ref()));
         }
         let tiers_enabled = self
             .host
@@ -1621,16 +1666,25 @@ impl ServerHandler for TydeAgentControlMcpServer {
                                         .into(),
                                 });
                             }
-                            if !matches!(
+                            let allowed = match swarm_tool_allowed(
+                                &self.host,
+                                &caller,
                                 request.name.as_ref(),
-                                "tyde_swarm_describe"
-                                    | "tyde_swarm_read_board"
-                                    | "tyde_swarm_read_thread"
-                                    | "tyde_swarm_post"
-                            ) {
+                            )
+                            .await
+                            {
+                                Ok(allowed) => allowed,
+                                Err(message) => {
+                                    return err_json(protocol::SwarmFailure {
+                                        code: protocol::SwarmErrorCode::Unauthorized,
+                                        message,
+                                    });
+                                }
+                            };
+                            if !allowed {
                                 return err_json(protocol::SwarmFailure {
                                     code: protocol::SwarmErrorCode::Unauthorized,
-                                    message: "Swarm callers have only the four shared-board tools; child/workflow/review/team execution is not authorized".into(),
+                                    message: "Tool is outside the swarm workspace scope; child/workflow/review/team execution is not authorized".into(),
                                 });
                             }
                         }
@@ -1949,6 +2003,20 @@ async fn caller_project_scope(
     host: &HostHandle,
     caller: &AgentId,
 ) -> Result<(ProjectId, Vec<protocol::Project>), String> {
+    if host
+        .is_swarm_agent(caller)
+        .await
+        .map_err(|error| error.message)?
+    {
+        let describe = host
+            .describe_swarm_for_agent(caller.clone())
+            .await
+            .map_err(|error| error.message)?;
+        return Ok((
+            describe.swarm.constraints.project_id,
+            describe.workspace_projects,
+        ));
+    }
     let caller_project_id = host
         .project_id_for_agent(caller)
         .await
@@ -1978,8 +2046,11 @@ async fn do_create_workbench(
     input: CreateWorkbenchToolInput,
 ) -> Result<CreateWorkbenchResult, String> {
     let parent_project_id = parse_project_id(&input.parent_project_id)?;
-    let (canonical_project_id, _) = caller_project_scope(host, caller).await?;
-    if parent_project_id != canonical_project_id {
+    let (canonical_project_id, projects) = caller_project_scope(host, caller).await?;
+    if !projects
+        .iter()
+        .any(|project| project.id == parent_project_id && !project.is_workbench())
+    {
         return Err(format!(
             "parent_project_id {} is outside caller project scope {}",
             parent_project_id, canonical_project_id
@@ -2109,7 +2180,7 @@ async fn do_remove_workbench(
                 project_id, canonical_project_id
             )
         })?;
-    if target.parent_project_id() != Some(&canonical_project_id) {
+    if !target.is_workbench() {
         return Err(format!("project_id {project_id} is not a workbench"));
     }
     host.remove_workbench(WorkbenchRemovePayload {

@@ -77,11 +77,29 @@ other backends fail admission rather than receiving a weaker substitute.
   delegation remain disabled; supported native read tools are exposed directly
   rather than through a disabled wrapper. Native web search remains available;
   filesystem read-only access is not a promise of network isolation.
-- Swarm members receive the four authenticated board tools, not the user's
-  other configured MCP servers. Server-side ownership and method admission
-  enforce the same boundary even for calls omitted from discovery.
-- Writable swarm work requires explicit consent and an existing Git workbench.
-  It is a separate policy, not a relaxation of an active read-only session.
+- Read-only and single-workbench members receive the four authenticated board
+  tools, not the user's other configured MCP servers. Writable project and
+  host members additionally receive scoped workbench listing, creation, and
+  removal. Server-side ownership and method admission enforce the same
+  boundary even for calls omitted from discovery. Native delegation remains
+  excluded for every swarm scope.
+- Writable swarm work requires explicit consent to one of three scopes:
+  a selected Git workbench, a parent project and all its workbenches, or every
+  project and workbench on the selected host. The selected project is the
+  starting working directory for host scope, not its permission boundary.
+  These policies are separate from enforced read-only, not a relaxation of an
+  active read-only session. Existing sessions cannot change workspace policy.
+- The server resolves project membership and workspace roots from the current
+  project registry at launch and resume. `tyde_swarm_describe` returns typed
+  `workspace_projects` from that same registry on every call. Project scope
+  includes workbenches created after launch; host scope includes projects and
+  workbenches added after launch. Scoped workbench operations and board file
+  attachments use this current authorization rather than a creation snapshot.
+- Writable scopes use existing native `Unrestricted` permissions; they are
+  server authorization and agent guidance, not OS filesystem sandboxes.
+  Live members discover new paths through the authenticated tools without
+  restarting native sessions. Repository-specific workbench, validation, and
+  landing rules still apply within every writable scope.
 
 #### Native command visibility
 

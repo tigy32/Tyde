@@ -166,6 +166,7 @@ impl SwarmRegistryHandle {
                                     return Ok(SwarmDescribe {
                                         member_id: member.spec.id.clone(),
                                         swarm,
+                                        workspace_projects: Vec::new(),
                                     });
                                 }
                             }
