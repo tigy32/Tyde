@@ -240,7 +240,7 @@ impl ConstraintsForm {
             agent_wake_budget: parse_number(
                 &self.wake_budget.get_untracked(),
                 SWARM_MAX_AGENT_WAKE_BUDGET,
-                "Agent wake-ups",
+                "Agent-to-agent turn limit",
             )?,
         })
     }
@@ -252,7 +252,12 @@ impl ConstraintsForm {
         parse_number(&max_live, SWARM_MAX_LIVE_AGENTS, "Live agents")
             .err()
             .or_else(|| {
-                parse_number(&wake_budget, SWARM_MAX_AGENT_WAKE_BUDGET, "Agent wake-ups").err()
+                parse_number(
+                    &wake_budget,
+                    SWARM_MAX_AGENT_WAKE_BUDGET,
+                    "Agent-to-agent turn limit",
+                )
+                .err()
             })
             .or_else(|| {
                 allocations.iter().find_map(|row| {
@@ -536,19 +541,16 @@ fn ConstraintsFields(
                     </label>
                 </Show>
             </fieldset>
-            {show_identity.then(|| view! {
+            <Show when=move || show_identity && !form.brief.get().is_empty()>
                 <label class="swarm-field">
-                    <span class="swarm-field-label">"Opening brief"</span>
-                    <textarea
-                        class="swarm-input swarm-textarea"
-                        rows="4"
-                        data-field="brief"
-                        placeholder="What should the swarm accomplish? This becomes the first Briefing post."
+                    <span class="swarm-field-label">"Saved opening message"</span>
+                    <span class="swarm-field-help">"This older draft includes a first message. Clear it to start with an empty conversation."</span>
+                    <textarea class="swarm-input swarm-textarea" rows="3" data-field="brief"
                         prop:value=move || form.brief.get()
                         on:input=move |ev| form.brief.set(event_target_value(&ev))
                     ></textarea>
                 </label>
-            })}
+            </Show>
             <div class="swarm-field">
                 <span class="swarm-field-label" id="swarm-live-label">"Live agents"</span>
                 <div class="swarm-stepper">
@@ -622,19 +624,23 @@ fn ConstraintsFields(
                     </div>
                 </div>
             </div>
+            {(!show_identity).then(|| view! {
+                <details class="swarm-advanced">
+                    <summary>"Advanced settings"</summary>
+                    <div class="swarm-advanced-fields">
             <label class="swarm-field">
-                <span class="swarm-field-label">"Shared guidance"</span>
+                <span class="swarm-field-label">"Standing instructions (optional)"</span>
                 <textarea
                     class="swarm-input swarm-textarea"
                     rows="3"
                     data-field="guidance"
-                    placeholder="Conventions every member should follow (optional)."
+                    placeholder="Ongoing rules for all agents, such as how to test or format code."
                     prop:value=move || form.guidance.get()
                     on:input=move |ev| form.guidance.set(event_target_value(&ev))
                 ></textarea>
             </label>
             <label class="swarm-field">
-                <span class="swarm-field-label">"Agent wake-ups per human post"</span>
+                <span class="swarm-field-label">"Agent-to-agent turn limit"</span>
                 <span class="swarm-field-row">
                     <input
                         class="swarm-input swarm-stepper-input"
@@ -642,14 +648,17 @@ fn ConstraintsFields(
                         min="1"
                         max=SWARM_MAX_AGENT_WAKE_BUDGET.to_string()
                         data-field="wake-budget"
-                        aria-invalid=move || parse_number(&form.wake_budget.get(), SWARM_MAX_AGENT_WAKE_BUDGET, "Agent wake-ups").is_err().to_string()
+                        aria-invalid=move || parse_number(&form.wake_budget.get(), SWARM_MAX_AGENT_WAKE_BUDGET, "Agent-to-agent turn limit").is_err().to_string()
                         prop:value=move || form.wake_budget.get()
                         on:input=move |ev| form.wake_budget.set(event_target_value(&ev))
                         on:change=move |ev| form.wake_budget.set(event_target_value(&ev))
                     />
-                    <span class="swarm-field-help">"After this many agent-triggered wake-ups the swarm waits for you."</span>
+                    <span class="swarm-field-help">"Limits agent-to-agent turns in each conversation you start. At the limit, new turns stop until you choose Resume."</span>
                 </span>
             </label>
+                    </div>
+                </details>
+            })}
         </div>
     }
 }
@@ -990,7 +999,6 @@ pub fn SwarmDraftDialog(
             Some(draft) if !draft.conflicts.is_empty() => {
                 Some("Resolve the conflicts listed in the preview")
             }
-            Some(draft) if draft.opening_brief.trim().is_empty() => Some("Add an opening brief"),
             Some(_) => None,
         })
     };
@@ -1023,7 +1031,7 @@ pub fn SwarmDraftDialog(
             <header class="swarm-modal-header">
                 <h2 id="swarm-draft-title" class="swarm-modal-title">{title}</h2>
                 <p class="swarm-modal-subtitle">
-                    "Set the constraints, preview the lineup the host proposes, then launch exactly that preview."
+                    "Choose your agents, review the lineup, then start talking in Briefing. You can adjust advanced settings later in Manage."
                 </p>
             </header>
             <div class="swarm-modal-body swarm-modal-split">
@@ -1041,7 +1049,7 @@ pub fn SwarmDraftDialog(
                     })}
                     <Show when=move || draft.with(|draft| draft.is_some()) fallback=|| view! {
                         <div class="swarm-empty">
-                            "Generate a preview to see the proposed members. Nothing starts until you launch."
+                            "Preview the proposed agents before creating your swarm. They start when you send a message."
                         </div>
                     }>
                         <DraftPreview host=host draft=draft member_editors=member_editors />
@@ -1081,8 +1089,7 @@ pub fn SwarmDraftDialog(
                 >
                     {move || {
                         let revision = draft.with(|d| d.as_ref().map(|d| format!(" revision {}", d.revision)));
-                        let verb = if is_migration() { "Convert" } else { "Launch" };
-                        format!("{verb}{}", revision.unwrap_or_default())
+                        if is_migration() { format!("Convert{}", revision.unwrap_or_default()) } else { "Create swarm".to_owned() }
                     }}
                 </button>
             </footer>
@@ -1826,10 +1833,15 @@ mod wasm_tests {
         );
 
         type_into(&name, "Checkout reliability");
-        type_into(
-            &field(&dialog, "brief"),
-            "Find why checkout retries double-charge.",
-        );
+        for field_name in ["brief", "guidance", "wake-budget"] {
+            assert!(
+                dialog
+                    .query_selector(&format!("[data-field='{field_name}']"))
+                    .unwrap()
+                    .is_none(),
+                "creation contains only essential setup"
+            );
+        }
         action(&dialog, "generate").click();
         settle().await;
 
@@ -1839,8 +1851,8 @@ mod wasm_tests {
         assert_eq!(command["expected_revision"], serde_json::Value::Null);
         assert_eq!(command["name"], "Checkout reliability");
         assert_eq!(
-            command["opening_brief"],
-            "Find why checkout retries double-charge."
+            command["opening_brief"], "",
+            "the first message belongs in the conversation, not setup"
         );
         let constraints: SwarmConstraints =
             serde_json::from_value(command["constraints"].clone()).unwrap();
@@ -1872,7 +1884,7 @@ mod wasm_tests {
             id: draft_id.clone(),
             revision: 1,
             name: "Checkout reliability".to_owned(),
-            opening_brief: "Find why checkout retries double-charge.".to_owned(),
+            opening_brief: String::new(),
             constraints: constraints.clone(),
             members,
             conflicts: Vec::new(),
@@ -1895,7 +1907,7 @@ mod wasm_tests {
             "the tool restriction is shown before launch"
         );
         let launch = action(&dialog, "launch");
-        assert_eq!(text_of(&launch), "Launch revision 1");
+        assert_eq!(text_of(&launch), "Create swarm");
         assert!(!is_disabled(&launch));
         for (control, invalid, original, message) in [
             (
@@ -2137,7 +2149,7 @@ mod wasm_tests {
         assert!(!has_button(&rows[1], "Save"));
         assert!(has_button(&rows[1], "Pinned"));
         assert!(!is_disabled(&launch));
-        assert_eq!(text_of(&launch), "Launch revision 4");
+        assert_eq!(text_of(&launch), "Create swarm");
 
         launch.focus().unwrap();
         reviewed_draft.members.swap(0, 1);
@@ -2164,7 +2176,7 @@ mod wasm_tests {
                 == "alternate-model"
         );
         assert!(!is_disabled(&launch));
-        assert_eq!(text_of(&launch), "Launch revision 5");
+        assert_eq!(text_of(&launch), "Create swarm");
         launch.click();
         settle().await;
         assert_eq!(
@@ -2313,6 +2325,13 @@ mod wasm_tests {
         manage.click();
         settle().await;
         let dialog = modal(&container).expect("manage dialog");
+        let advanced = one(&dialog, ".swarm-advanced");
+        assert!(!advanced.has_attribute("open"));
+        one(&advanced, "summary")
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap()
+            .click();
+        settle().await;
         assert_eq!(
             text_of(&one(&dialog, ".swarm-modal-title")),
             "Manage Manage me"
@@ -2382,7 +2401,7 @@ mod wasm_tests {
                 field(&dialog, "wake-budget"),
                 approved.agent_wake_budget.to_string(),
                 SWARM_MAX_AGENT_WAKE_BUDGET,
-                "Agent wake-ups",
+                "Agent-to-agent turn limit",
             ),
             (
                 one(&dialog, "[aria-label='Agents from this profile']"),

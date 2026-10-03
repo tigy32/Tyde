@@ -16646,3 +16646,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
     .swarm-modal-header,
     .swarm-modal-footer { padding-left: var(--space-3); padding-right: var(--space-3); }
 }
+
+.swarm-advanced { border-top: 1px solid var(--border-primary); padding-top: 14px; }
+.swarm-advanced summary { cursor: pointer; color: var(--text-secondary); font-weight: 600; padding: 8px 0; }
+.swarm-advanced-fields { display: flex; flex-direction: column; gap: 18px; padding-top: 12px; }

@@ -34,6 +34,8 @@ pub fn TeamsView() -> impl IntoView {
                         .teams_by_host
                         .with(|m| m.get(&host).cloned())
                         .unwrap_or_default();
+                    let converted = state.swarms_by_host.with(|m| m.get(&host).map(|swarms| swarms.values().filter_map(|s| s.legacy_team_id.clone()).collect::<Vec<_>>()).unwrap_or_default());
+                    let teams = teams.into_iter().filter(|(id, _)| !converted.contains(id)).collect::<std::collections::HashMap<_, _>>();
                     if teams.is_empty() {
                         return view! {
                             <EmptyState

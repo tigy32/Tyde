@@ -17,6 +17,7 @@ mod project_picker;
 mod session_settings;
 mod sessions_view;
 pub mod settings_view;
+mod swarms_view;
 mod teams_view;
 mod tool_card;
 pub mod ui;

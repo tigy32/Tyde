@@ -523,6 +523,20 @@ pub async fn send_review_action(
     send_action(host, stream, protocol::FrameKind::ReviewAction, &action).await
 }
 
+pub async fn swarm_command(
+    state: &AppState,
+    host: &LocalHostId,
+    command: protocol::SwarmCommandPayload,
+) -> Result<(), String> {
+    send_action(
+        host,
+        host_stream(state, host)?,
+        protocol::FrameKind::SwarmCommand,
+        &command,
+    )
+    .await
+}
+
 pub async fn create_team(
     state: &AppState,
     host: &LocalHostId,

@@ -94,6 +94,9 @@ pub fn seed_state(state: &AppState) {
     state.host_streams.update(|streams| {
         streams.insert(host.clone(), StreamPath("/host/fixture".to_owned()));
     });
+    state.bootstrapped_host_streams.update(|streams| {
+        streams.insert(host.clone(), StreamPath("/host/fixture".to_owned()));
+    });
     state.connection_statuses.update(|statuses| {
         statuses.insert(
             host.clone(),
@@ -245,6 +248,31 @@ pub fn seed_state(state: &AppState) {
                 ..Default::default()
             },
         );
+    });
+
+    let event_state = state.clone();
+    let event_host = host.clone();
+    let envelope =
+        wasm_bindgen::closure::Closure::<dyn Fn(String) -> bool>::new(move |line: String| {
+            match serde_json::from_str::<protocol::Envelope>(&line) {
+                Ok(envelope) => {
+                    crate::dispatch::dispatch_envelope(&event_state, &event_host, envelope);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_ENVELOPE__".into(),
+        envelope.as_ref(),
+    )
+    .expect("fixture event hook");
+    let envelope = send_wrapper::SendWrapper::new(envelope);
+    on_cleanup(move || {
+        js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_ENVELOPE__".into())
+            .expect("remove fixture event hook");
+        drop(envelope.take());
     });
 
     let probe_state = state.clone();

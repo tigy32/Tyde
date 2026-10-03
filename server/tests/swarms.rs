@@ -861,6 +861,104 @@ fn swarm_tool_error(result: &CallToolResult, expected: SwarmErrorCode) {
 }
 
 #[tokio::test]
+async fn empty_swarm_waits_for_conversation_and_new_members_wait_for_real_posts() {
+    let mut scenario = Scenario::new().await;
+    let id = SwarmDraftId(uuid::Uuid::new_v4().to_string());
+    scenario
+        .send(SwarmCommandPayload::GenerateDraft {
+            draft_id: id.clone(),
+            expected_revision: None,
+            name: "Interactive peers".into(),
+            opening_brief: String::new(),
+            constraints: scenario.constraints(1),
+        })
+        .await;
+    let draft = scenario.draft(&id, 0).await;
+    let swarm = scenario.launch(&draft).await;
+    assert_eq!(swarm.lifecycle, SwarmLifecycle::Running);
+    assert!(swarm.opening_post_id.is_none());
+    assert!(swarm.notifications.is_empty() && swarm.rounds.is_empty());
+    assert!(
+        swarm
+            .members
+            .iter()
+            .all(|member| member.state == SwarmMemberState::Proposed && member.agent_id.is_none())
+    );
+    for board in [SwarmBoard::Briefing, SwarmBoard::Coordination] {
+        let page = scenario.board(&swarm.id, read_board(board)).await;
+        assert!(page.posts.is_empty());
+        assert_eq!(page.high_water, 0);
+    }
+    scenario
+        .observe_for(Duration::from_millis(150), "empty swarm awaits the human")
+        .await;
+    assert!(scenario.fixture.agent_ids().await.is_empty());
+    assert!(scenario.fixture.agent_session_ids().await.is_empty());
+
+    scenario
+        .send(SwarmCommandPayload::PreviewChange {
+            swarm_id: swarm.id.clone(),
+            expected_revision: swarm.revision,
+            constraints: scenario.constraints(2),
+        })
+        .await;
+    let previewed = scenario
+        .swarm(&swarm.id, |s| s.change_preview.is_some())
+        .await;
+    let preview = previewed.change_preview.as_ref().unwrap();
+    assert!(preview.conflicts.is_empty());
+    scenario
+        .send(SwarmCommandPayload::ApplyChange {
+            swarm_id: swarm.id.clone(),
+            preview_revision: preview.revision,
+            retirement: SwarmRetirementPolicy::FinishTurn,
+        })
+        .await;
+    let expanded = scenario
+        .swarm(&swarm.id, |s| s.revision > swarm.revision)
+        .await;
+    assert_eq!(
+        expanded.lifecycle,
+        SwarmLifecycle::Running,
+        "configured peers are not unfinished startup work"
+    );
+    assert_eq!(expanded.members.len(), 2);
+    assert!(expanded.notifications.is_empty());
+    assert!(scenario.fixture.agent_ids().await.is_empty());
+
+    let first = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "first-real-message",
+                vec![text("Let's look at the project together")],
+            ),
+        )
+        .await;
+    let active = scenario.swarm(&swarm.id, ready).await;
+    for control in controls(&scenario, &active).await {
+        let requests = control.requests().await;
+        let (references, context) = last_dispatch_context(&requests);
+        assert!(references.contains(&first.id));
+        assert!(
+            context
+                .iter()
+                .any(|post| post.id == first.id && post.author == SwarmAuthor::Human)
+        );
+    }
+    let page = scenario
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
+        .await;
+    assert_eq!(
+        page.posts.len(),
+        1,
+        "creation and constraint edits invent no messages"
+    );
+    assert!(page.posts[0].id == first.id);
+}
+
+#[tokio::test]
 async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect() {
     let mut scenario = Scenario::new().await;
     let initial = scenario.generate(scenario.constraints(2)).await;
@@ -8963,11 +9061,30 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             .any(|intent| intent.post_ids.contains(&paused_post.id)
                 && intent.state == SwarmDeliveryState::Pending)
     );
+    // Admission can emit Accepted with the pre-turn Idle status before native
+    // Thinking/Idle arrives. Establish the actual follow-up turn boundary so
+    // the later equality assertion cannot compare an intermediate snapshot.
+    let authorized_turn_gate = MockGateHandle::new();
+    member_control
+        .enqueue(MockTurn::gated_echo(&authorized_turn_gate))
+        .await;
     scenario
         .send(SwarmCommandPayload::Resume {
             swarm_id: unsupervised.id.clone(),
         })
         .await;
+    scenario
+        .wait_mock_turn(
+            &authorized_turn_gate,
+            "authorized supervision control follow-up",
+        )
+        .await;
+    scenario
+        .swarm(&unsupervised.id, |state| {
+            state.members[0].runtime_status == Some(AgentControlStatus::Thinking)
+        })
+        .await;
+    authorized_turn_gate.release_one();
     let authorized_followup = scenario
         .swarm(&unsupervised.id, |state| {
             ready(state)
@@ -9014,6 +9131,21 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         "ordinary Continue cannot queue an unaccounted turn after swarm durability attention"
     );
     let after_attention_supervision = scenario.snapshot(&unsupervised.id).await;
+    if after_attention_supervision != before_attention_supervision {
+        eprintln!(
+            "Swarm attention snapshot comparison: lifecycle_equal={} members_equal={} notifications_equal={} rounds_equal={} boards_equal={} revision_equal={} error_equal={} recovery_equal={}",
+            after_attention_supervision.lifecycle == before_attention_supervision.lifecycle,
+            after_attention_supervision.members == before_attention_supervision.members,
+            after_attention_supervision.notifications == before_attention_supervision.notifications,
+            after_attention_supervision.rounds == before_attention_supervision.rounds,
+            after_attention_supervision.board_positions
+                == before_attention_supervision.board_positions,
+            after_attention_supervision.revision == before_attention_supervision.revision,
+            after_attention_supervision.error == before_attention_supervision.error,
+            after_attention_supervision.recovery_requirement
+                == before_attention_supervision.recovery_requirement
+        );
+    }
     assert!(
         after_attention_supervision == before_attention_supervision
             && after_attention_supervision.members[0].context_cursor

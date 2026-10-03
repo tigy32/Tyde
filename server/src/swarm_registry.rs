@@ -992,16 +992,11 @@ fn apply(
                     "resolve draft conflicts before launch",
                 ));
             }
-            if draft.opening_brief.trim().is_empty() {
-                return Err(failure(
-                    SwarmErrorCode::Invalid,
-                    "opening brief is required",
-                ));
-            }
+            let has_opening_post = !draft.opening_brief.trim().is_empty();
             if file.swarms.iter().any(|swarm| swarm.id.0 == draft.id.0) {
                 return Err(failure(SwarmErrorCode::Conflict, "draft already launched"));
             }
-            let mut swarm = Swarm {
+            let swarm = Swarm {
                 recovery_requirement: SwarmRecoveryRequirement::None,
                 source_draft_id: Some(draft.id.clone()),
                 id: SwarmId(draft.id.0.clone()),
@@ -1009,7 +1004,11 @@ fn apply(
                 name: draft.name.clone(),
                 revision: 1,
                 constraints: draft.constraints.clone(),
-                lifecycle: SwarmLifecycle::Launching,
+                lifecycle: if has_opening_post {
+                    SwarmLifecycle::Launching
+                } else {
+                    SwarmLifecycle::Running
+                },
                 members: draft
                     .members
                     .iter()
@@ -1056,31 +1055,33 @@ fn apply(
                 }
             }
             let id = swarm.id.clone();
-            swarm.lifecycle = SwarmLifecycle::Launching;
             file.swarms.push(swarm);
-            let outcome = publish(
-                file,
-                &id,
-                SwarmAuthor::Human,
-                SwarmPublication {
-                    board: SwarmBoard::Briefing,
-                    publication_id: SwarmPublicationId("opening-brief".into()),
-                    body: vec![SwarmBodySegment::Text {
-                        text: draft.opening_brief,
-                    }],
-                    thread_id: None,
-                    attachments: Vec::new(),
-                },
-            )?;
-            let swarm = swarm_mut(file, &id)?;
-            swarm.opening_post_id = Some(outcome.post.id.clone());
-            let event = swarm_event(swarm);
+            let mut events = vec![SwarmEventPayload::Draft(SwarmDraftNotifyPayload::Delete {
+                draft_id: draft_id.clone(),
+            })];
+            if has_opening_post {
+                let outcome = publish(
+                    file,
+                    &id,
+                    SwarmAuthor::Human,
+                    SwarmPublication {
+                        board: SwarmBoard::Briefing,
+                        publication_id: SwarmPublicationId("opening-brief".into()),
+                        body: vec![SwarmBodySegment::Text {
+                            text: draft.opening_brief,
+                        }],
+                        thread_id: None,
+                        attachments: Vec::new(),
+                    },
+                )?;
+                swarm_mut(file, &id)?.opening_post_id = Some(outcome.post.id.clone());
+                events.push(SwarmEventPayload::Post(SwarmPostNotifyPayload {
+                    post: outcome.post,
+                }));
+            }
+            events.push(swarm_event(swarm_mut(file, &id)?));
             file.drafts.retain(|draft| draft.id != draft_id);
-            Ok(vec![
-                SwarmEventPayload::Draft(SwarmDraftNotifyPayload::Delete { draft_id }),
-                SwarmEventPayload::Post(SwarmPostNotifyPayload { post: outcome.post }),
-                event,
-            ])
+            Ok(events)
         }
         SwarmCommandPayload::ReadBoard { swarm_id, query } => {
             Ok(vec![SwarmEventPayload::Board(SwarmBoardNotifyPayload {
@@ -1381,7 +1382,8 @@ fn apply(
                     }
                 }
             }
-            let addition_round = if preview.additions.is_empty() {
+            let addition_round = if preview.additions.is_empty() || swarm.opening_post_id.is_none()
+            {
                 None
             } else {
                 let id = SwarmRoundId(fresh());
@@ -1425,15 +1427,7 @@ fn apply(
                     | SwarmLifecycle::Pausing
                     | SwarmLifecycle::AttentionRequired
             ) {
-                swarm.lifecycle = if swarm.members.iter().any(|member| {
-                    matches!(
-                        member.state,
-                        SwarmMemberState::Proposed
-                            | SwarmMemberState::Reserved
-                            | SwarmMemberState::Retiring
-                            | SwarmMemberState::RetiringReserved
-                    )
-                }) {
+                swarm.lifecycle = if has_pending_members(swarm) {
                     SwarmLifecycle::Transitioning
                 } else {
                     SwarmLifecycle::Running
@@ -2199,15 +2193,8 @@ fn complete(
     } else if matches!(
         swarm.lifecycle,
         SwarmLifecycle::Launching | SwarmLifecycle::Transitioning
-    ) && !swarm.members.iter().any(|member| {
-        matches!(
-            member.state,
-            SwarmMemberState::Proposed
-                | SwarmMemberState::Reserved
-                | SwarmMemberState::Retiring
-                | SwarmMemberState::RetiringReserved
-        )
-    }) {
+    ) && !has_pending_members(swarm)
+    {
         swarm.lifecycle = SwarmLifecycle::Running;
     }
     Ok(vec![swarm_event(swarm)])
@@ -2234,16 +2221,7 @@ fn record_status(
                     )
                 })
             }))
-            || (swarm.lifecycle == SwarmLifecycle::Transitioning
-                && !swarm.members.iter().any(|member| {
-                    matches!(
-                        member.state,
-                        SwarmMemberState::Proposed
-                            | SwarmMemberState::Reserved
-                            | SwarmMemberState::Retiring
-                            | SwarmMemberState::RetiringReserved
-                    )
-                }));
+            || (swarm.lifecycle == SwarmLifecycle::Transitioning && !has_pending_members(swarm));
         let Some(member) = swarm
             .members
             .iter_mut()
@@ -2306,17 +2284,7 @@ fn record_status(
         {
             swarm.lifecycle = SwarmLifecycle::Paused;
         }
-        if swarm.lifecycle == SwarmLifecycle::Transitioning
-            && !swarm.members.iter().any(|member| {
-                matches!(
-                    member.state,
-                    SwarmMemberState::Proposed
-                        | SwarmMemberState::Reserved
-                        | SwarmMemberState::Retiring
-                        | SwarmMemberState::RetiringReserved
-                )
-            })
-        {
+        if swarm.lifecycle == SwarmLifecycle::Transitioning && !has_pending_members(swarm) {
             swarm.lifecycle = SwarmLifecycle::Running;
         }
         events.push(swarm_event(swarm));
@@ -2341,6 +2309,25 @@ fn failure(code: SwarmErrorCode, message: impl Into<String>) -> SwarmFailure {
         code,
         message: message.into(),
     }
+}
+
+fn has_pending_members(swarm: &Swarm) -> bool {
+    swarm.members.iter().any(|member| match member.state {
+        SwarmMemberState::Reserved
+        | SwarmMemberState::Retiring
+        | SwarmMemberState::RetiringReserved => true,
+        SwarmMemberState::Proposed => swarm.notifications.iter().any(|notification| {
+            notification.member_id == member.spec.id
+                && matches!(
+                    notification.state,
+                    SwarmDeliveryState::Pending | SwarmDeliveryState::Dispatching
+                )
+        }),
+        SwarmMemberState::Live
+        | SwarmMemberState::Dormant
+        | SwarmMemberState::Failed
+        | SwarmMemberState::Retired => false,
+    })
 }
 
 fn occupies_slot(member: &SwarmMember) -> bool {

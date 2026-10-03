@@ -4352,7 +4352,7 @@ input, textarea, select {
     margin-top: var(--space-1);
 }
 
-/* Agents/Teams segmented */
+/* Agents/Swarms segmented */
 .agents-segmented {
     display: flex;
     gap: var(--space-1);
@@ -5227,3 +5227,46 @@ input, textarea, select {
 .chat-send-menu-hint{display:block;font-size:12px;font-weight:400;color:var(--text-secondary);white-space:normal;max-width:220px}
 .chat-send-menu-check{margin-left:auto}
 
+
+/* Shared swarm conversations, deliberately above individual agent streams. */
+.mobile-swarms { display: flex; flex-direction: column; gap: 14px; min-width: 0; padding: 4px 0 20px; }
+.mobile-swarm-intro h2, .mobile-swarm-header h2 { margin: 0; font-size: 22px; letter-spacing: -.03em; overflow-wrap: anywhere; }
+.mobile-swarm-intro p, .mobile-swarm-muted, .mobile-swarm-board-hint { color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.mobile-swarm-intro p { margin: 5px 0 8px; }
+.mobile-swarm-card { display: flex; flex-direction: column; gap: 10px; width: 100%; padding: 18px; text-align: left; border: 1px solid var(--border-default); border-radius: 16px; color: var(--text-primary); background: var(--bg-surface); }
+.mobile-swarm-card-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.mobile-swarm-card-heading strong { font-size: 17px; overflow-wrap: anywhere; }
+.mobile-swarm-status { color: var(--accent-success); background: var(--bg-surface-2); font-size: 11px; padding: 4px 8px; border-radius: 20px; white-space: nowrap; }
+.mobile-swarm-card-foot { color: var(--accent-primary); font-size: 13px; font-weight: 600; }
+.mobile-swarm-conversation { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.mobile-swarm-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.mobile-swarm-back, .mobile-swarm-link { border: 0; color: var(--accent-primary); background: transparent; min-height: 44px; padding: 5px 0; text-align: left; font: inherit; font-size: 13px; cursor: pointer; }
+.mobile-swarm-control { background: var(--bg-surface-2); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 10px; padding: 8px 13px; min-height: 44px; font: inherit; font-size: 13px; }
+.mobile-swarm-boards { display: flex; border-bottom: 1px solid var(--border-default); gap: 20px; }
+.mobile-swarm-boards button { padding: 12px 0; min-height: 44px; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--text-secondary); font: inherit; font-weight: 600; }
+.mobile-swarm-boards button[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--accent-primary); }
+.mobile-swarm-board-hint { margin: 0; }
+.mobile-swarm-posts { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.mobile-swarm-post { padding: 16px; background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: 14px; min-width: 0; }
+.mobile-swarm-post header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 14px; margin-bottom: 12px; }
+.mobile-swarm-post-body { font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mobile-swarm-mention { color: var(--accent-primary); margin-right: 4px; }
+.mobile-swarm-attachment { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.mobile-swarm-empty { padding: 24px 16px; background: var(--bg-surface); border: 1px dashed var(--border-default); border-radius: 14px; text-align: center; }
+.mobile-swarm-empty h3 { font-size: 16px; font-weight: 600; margin: 0 0 8px; }
+.mobile-swarm-empty p { font-size: 13px; color: var(--text-secondary); line-height: 1.6; margin: 0; }
+.mobile-swarm-members, .mobile-swarm-legacy, .mobile-swarm-mention-picker { color: var(--text-secondary); font-size: 13px; }
+.mobile-swarm-members summary, .mobile-swarm-legacy summary, .mobile-swarm-mention-picker summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
+.mobile-swarm-member { display: flex; gap: 12px; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--border-default); }
+.mobile-swarm-member strong { color: var(--text-primary); overflow-wrap: anywhere; }
+.mobile-swarm-composer { display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--border-default); background: var(--bg-surface); border-radius: 16px; margin-top: 8px; min-width: 0; }
+.mobile-swarm-composer label { font-size: 13px; font-weight: 600; }
+.mobile-swarm-composer textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 88px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-base); color: var(--text-primary); font: inherit; font-size: 16px; line-height: 1.5; padding: 12px; }
+.mobile-swarm-composer .mobile-swarm-muted { margin: 0; }
+.mobile-swarm-mention-picker div { display: flex; flex-wrap: wrap; gap: 8px; }
+.mobile-swarm-mention-option { min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border-default); color: var(--text-primary); background: var(--bg-surface-2); }
+.mobile-swarm-mention-option[aria-pressed="true"] { border-color: var(--accent-primary); color: var(--accent-primary); }
+.mobile-swarm-send { min-height: 44px; border: 0; border-radius: 10px; background: var(--accent-primary); color: white; font: inherit; font-size: 14px; font-weight: 600; padding: 10px 16px; }
+.mobile-swarms button:disabled, .mobile-swarms textarea:disabled { opacity: .55; cursor: default; }
+.mobile-swarms button:focus-visible, .mobile-swarms summary:focus-visible, .mobile-swarms textarea:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 3px; }
+.mobile-swarm-error { color: var(--accent-error); background: var(--accent-error-bg); font-size: 13px; line-height: 1.5; padding: 12px; border-radius: 10px; overflow-wrap: anywhere; }

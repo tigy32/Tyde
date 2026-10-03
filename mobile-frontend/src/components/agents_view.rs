@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::components::teams_view::TeamsView;
+use crate::components::swarms_view::SwarmsView;
 use crate::components::ui::{
     Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Spinner, StatusDot,
     StatusTone,
@@ -18,7 +18,7 @@ const BOOL_FALSE: &str = "false";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentsSegment {
     Agents,
-    Teams,
+    Swarms,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -77,7 +77,7 @@ fn restore_hide_sub_agents() -> bool {
 /// users get from color. Empty state guides a first-time user to
 /// spawn a chat.
 ///
-/// The segmented control toggles between Agents and Teams — Teams
+/// The segmented control toggles between Agents and Swarms — Swarms
 /// share the same host context, so it's natural to colocate them
 /// rather than spend a sixth bottom-nav tab.
 #[component]
@@ -93,7 +93,8 @@ pub fn AgentsView() -> impl IntoView {
         <div class="view agents-view" data-mobile-test="agents-view">
             <div class="shell-header tws-header">
             <header class="view-header">
-                <h1 class="view-title">"Agents"</h1>
+                <h1 class="view-title">{move || if segment.get() == AgentsSegment::Swarms { "Swarms" } else { "Agents" }}</h1>
+                <Show when=move || segment.get() == AgentsSegment::Agents>
                 <Button
                     label="New chat"
                     variant=ButtonVariant::Primary
@@ -101,11 +102,12 @@ pub fn AgentsView() -> impl IntoView {
                     data_mobile_test="agents-new-chat"
                     on_click=on_new_chat
                 />
+                </Show>
             </header>
-            <div class="agents-segmented" role="tablist" aria-label="Agents and teams" data-mobile-test="agents-segmented">
+            <div class="agents-segmented" role="tablist" aria-label="Agents and swarms" data-mobile-test="agents-segmented">
                 {
                     let on_agents = move |_| segment.set(AgentsSegment::Agents);
-                    let on_teams = move |_| segment.set(AgentsSegment::Teams);
+                    let on_swarms = move |_| segment.set(AgentsSegment::Swarms);
                     view! {
                         <button
                             type="button"
@@ -121,13 +123,13 @@ pub fn AgentsView() -> impl IntoView {
                         <button
                             type="button"
                             class="agents-segmented-button"
-                            class:active=move || segment.get() == AgentsSegment::Teams
+                            class:active=move || segment.get() == AgentsSegment::Swarms
                             role="tab"
-                            aria-selected=move || (segment.get() == AgentsSegment::Teams).to_string()
-                            data-mobile-test="agents-segment-teams"
-                            on:click=on_teams
+                            aria-selected=move || (segment.get() == AgentsSegment::Swarms).to_string()
+                            data-mobile-test="agents-segment-swarms"
+                            on:click=on_swarms
                         >
-                            "Teams"
+                            "Swarms"
                         </button>
                     }
                 }
@@ -136,8 +138,8 @@ pub fn AgentsView() -> impl IntoView {
             <div class="view-body">
                 <div class="shell-flow">
                 {move || {
-                    if segment.get() == AgentsSegment::Teams {
-                        return view! { <TeamsView /> }.into_any();
+                    if segment.get() == AgentsSegment::Swarms {
+                        return view! { <SwarmsView /> }.into_any();
                     }
                     view! {
                         <AgentRestorationNotice />

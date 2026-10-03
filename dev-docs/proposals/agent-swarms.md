@@ -1,6 +1,6 @@
 # Agent Swarms
 
-Status: desktop implementation and product contract. Updated 2026-10-02.
+Status: desktop creation and desktop/mobile shared conversations. Updated 2026-10-02.
 
 This feature evolves [Agent Teams](../19-agent-teams.md) into peer groups
 with durable shared conversations. The product direction and concept images
@@ -12,7 +12,8 @@ ordinary posts.** The user addresses the swarm, not its manager.
 
 ## 1. Product contract
 
-A swarm has members, an opening brief, human-owned constraints, and two boards:
+A swarm has members, human-owned constraints, and two boards. Create it without
+an objective, then talk to it interactively:
 
 - **Briefing:** human requests, discussion, questions, and results.
 - **Coordination:** agents discussing implementation, asking one another for
@@ -86,11 +87,14 @@ Inputs:
 
 1. Name and project scope. The common case shows one project; the underlying
    ownership model must preserve existing per-member project restrictions.
-2. Opening brief, published once as the initial Briefing post.
-3. Maximum active agents and backend/model allocations, such as up to three
+2. Maximum active agents and backend/model allocations, such as up to three
    Claude agents and two Codex agents.
-4. Optional shared guidance, delivered as shared instructions rather than
-   duplicated user-maintained role descriptions.
+
+Standing instructions and the agent-to-agent turn limit live under
+**Manage → Advanced settings**, after creation. Neither is part of new-swarm
+setup. Instructions are optional conventions shared by peers, not an objective.
+The turn limit bounds agent-triggered activations for one human-started cause;
+exhaustion stops new turns until explicit Resume.
 
 Use the server's launch-option catalog and backend settings schemas. The
 prototype's "Default" label means an explicitly resolved supported choice,
@@ -103,7 +107,7 @@ with no focus are valid. The user can regenerate the draft or pin individual
 edits. Regeneration preserves pins; constraints conflicting with a pin produce
 a visible conflict rather than silently changing it or exceeding a limit.
 
-The draft shows exactly which members will start. It can propose fewer than
+The draft shows exactly which members are configured. It can propose fewer than
 the allowed maximum, but never silently launch more or fewer than the approved
 preview. Human-applied previews control member creation; agents
 do not autonomously fill spare capacity. Existing members may become idle.
@@ -114,12 +118,35 @@ it. A generation failure stays visible and preserves the previous draft; it
 does not trigger a hidden provider fallback.
 
 Launch validates the draft revision, capacity, project access, launch options,
-and board-tool availability again, then persists the swarm and opening post
-before activating members. Show starting, ready, and failed members explicitly.
+and board-tool availability again, then persists a ready swarm with empty
+boards. Configured peers start no native agents or sessions until a real post
+notifies them. A saved legacy draft with an opening message can still publish
+that reviewed message once; new creation asks for none. Configured peers without
+notification work do not leave capacity changes stuck in Transitioning. Show
+starting, ready, and failed members explicitly.
 A partial failure is not full success; retry only the failed activations and
 do not republish the brief or restart successful members.
 
 ![Constraints with generated lineup and a preserved manual tweak](swarm-ui/constraints-preview.png)
+
+### Mobile
+
+The Agents screen has **Agents / Swarms**, not Teams as a peer destination.
+Swarms load from the authoritative host bootstrap and update from live events.
+Open Briefing or Coordination, publish typed mentions, read/reply to threads,
+follow post links, page history, and Pause/Resume. Existing legacy teams remain
+in a separate disclosure; already converted groups are excluded. Creation,
+lineup changes, advanced settings, and attachment selection remain desktop
+surfaces in this iteration; mobile displays existing attachment references.
+
+Mobile keeps message drafts separately by host, swarm, board, and thread.
+Transport acceptance is not durable publication: inputs clear only when a
+canonical human post matches the publication identity, including fetched
+board/thread pages after reconnect. Explicit delivery retry uses that same
+immutable publication. Reconnection re-reads the open board or thread. Root
+posts and reply activity both appear chronologically before loaded activity is
+marked read. Publication errors resolve on acknowledgement; other alerts can
+be dismissed.
 
 ### 2.3 Ordinary coordination
 
@@ -289,7 +316,7 @@ conversation must not wake every member on every reply.
 
 | Event | Notification recipients |
 | --- | --- |
-| Initial launch | Every approved initial member, with the opening post |
+| Creation | No notification without a reviewed legacy opening message; configured peers wait for real posts |
 | Human root post in Briefing | All eligible members unless explicit mentions narrow the audience |
 | Human reply in either board | Agent author of the thread root plus explicitly mentioned members |
 | Human root post in Coordination | Explicitly mentioned members; otherwise shared context only |
@@ -429,7 +456,7 @@ Proposed migration:
 3. Preserve identities and session history. The former manager becomes a peer;
    remove manager-only bootstrap/tool authorization on future turns. Explicit
    capability updates must apply to resumed sessions, not just new sessions.
-4. Create empty shared boards and ask for the opening brief. Do not fabricate
+4. Create empty shared boards and invite the human to start talking. Do not fabricate
    board posts from historical private conversations.
 5. Initialize constraints from the reviewed roster and supported launch options.
    Existing per-member project access must not silently widen to the union.

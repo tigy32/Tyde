@@ -1013,13 +1013,99 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 });
             }
         }
-        FrameKind::SwarmNotify
-        | FrameKind::SwarmDraftNotify
-        | FrameKind::SwarmPostNotify
-        | FrameKind::SwarmBoardNotify
-        | FrameKind::SwarmThreadNotify
-        | FrameKind::SwarmErrorNotify => {
-            // Swarm boards are desktop-only; mobile keeps ordinary member chat/history.
+        FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
+            Ok(payload) => state.swarms_by_host.update(|m| {
+                m.entry(host.clone())
+                    .or_default()
+                    .insert(payload.swarm.id.clone(), payload.swarm);
+            }),
+            Err(_) => invalid_swarm_payload(state, host),
+        },
+        FrameKind::SwarmDraftNotify => {
+            match envelope.parse_payload::<protocol::SwarmDraftNotifyPayload>() {
+                Ok(payload) => state.swarm_drafts_by_host.update(|m| {
+                    let drafts = m.entry(host.clone()).or_default();
+                    match payload {
+                        protocol::SwarmDraftNotifyPayload::Upsert { draft } => {
+                            drafts.insert(draft.id.clone(), *draft);
+                        }
+                        protocol::SwarmDraftNotifyPayload::Delete { draft_id } => {
+                            drafts.remove(&draft_id);
+                        }
+                    }
+                }),
+                Err(_) => invalid_swarm_payload(state, host),
+            }
+        }
+        FrameKind::SwarmPostNotify => {
+            match envelope.parse_payload::<protocol::SwarmPostNotifyPayload>() {
+                Ok(payload) => apply_swarm_post(state, host, payload.post),
+                Err(_) => invalid_swarm_payload(state, host),
+            }
+        }
+        FrameKind::SwarmBoardNotify => {
+            match envelope.parse_payload::<protocol::SwarmBoardNotifyPayload>() {
+                Ok(payload) => {
+                    let page = payload.page;
+                    for post in &page.posts {
+                        apply_swarm_post(state, host, post.clone());
+                    }
+                    state.swarm_board_pages.update(|m| {
+                        let pages = m.entry((host.clone(), page.swarm_id.clone())).or_default();
+                        let retain_progress = pages.iter().any(|existing| {
+                            existing.board == page.board
+                                && (existing.next_cursor.position > page.next_cursor.position
+                                    || (!existing.has_more && page.has_more))
+                        });
+                        if !retain_progress {
+                            pages.retain(|existing| existing.board != page.board);
+                            pages.push(page);
+                        }
+                    });
+                }
+                Err(_) => invalid_swarm_payload(state, host),
+            }
+        }
+        FrameKind::SwarmThreadNotify => {
+            match envelope.parse_payload::<protocol::SwarmThreadNotifyPayload>() {
+                Ok(payload) => {
+                    let page = payload.page;
+                    apply_swarm_post(state, host, page.root.clone());
+                    for post in &page.posts {
+                        apply_swarm_post(state, host, post.clone());
+                    }
+                    state.swarm_thread_pages.update(|m| {
+                        m.insert(
+                            (host.clone(), page.swarm_id.clone(), page.thread_id.clone()),
+                            page,
+                        );
+                    });
+                }
+                Err(_) => invalid_swarm_payload(state, host),
+            }
+        }
+        FrameKind::SwarmErrorNotify => {
+            match envelope.parse_payload::<protocol::SwarmErrorNotifyPayload>() {
+                Ok(payload) => {
+                    if payload.code != protocol::SwarmErrorCode::CommittedDurabilityUncertain {
+                        state.swarm_composer_drafts.update(|drafts| {
+                            for draft in drafts.iter_mut().filter(|draft| {
+                                draft.host == *host
+                                    && payload.swarm_id.as_ref() == Some(&draft.swarm_id)
+                                    && payload.publication_id.is_some()
+                                    && payload.publication_id == draft.publication_id
+                            }) {
+                                draft.pending = false;
+                                draft.error = Some(payload.message.clone());
+                            }
+                        });
+                    }
+                    state.swarm_errors_by_host.update(|m| {
+                        m.entry(host.clone()).or_default().push(payload);
+                    });
+                }
+                Err(_) => invalid_swarm_payload(state, host),
+            }
         }
         FrameKind::TeamNotify => {
             if let Ok(payload) = envelope.parse_payload::<TeamNotifyPayload>() {
@@ -1231,6 +1317,48 @@ fn unix_time_ms() -> u64 {
 /// this makes the client agree. A terminated connection reconnects on the
 /// existing backoff and rebootstraps from authoritative state, which is
 /// recoverable — a silently wedged stream is not.
+fn apply_swarm_post(state: &AppState, host: &LocalHostId, post: protocol::SwarmPost) {
+    if post.author == protocol::SwarmAuthor::Human {
+        state.swarm_composer_drafts.update(|drafts| {
+            for draft in drafts.iter_mut().filter(|draft| {
+                draft.host == *host
+                    && draft.swarm_id == post.swarm_id
+                    && draft.publication_id.as_ref() == Some(&post.publication_id)
+            }) {
+                draft.text.clear();
+                draft.mentions.clear();
+                draft.pending = false;
+                draft.publication_id = None;
+                draft.error = None;
+            }
+        });
+        state.swarm_errors_by_host.update(|m| {
+            if let Some(errors) = m.get_mut(host) {
+                errors.retain(|e| {
+                    e.code == protocol::SwarmErrorCode::CommittedDurabilityUncertain
+                        || e.swarm_id.as_ref() != Some(&post.swarm_id)
+                        || e.publication_id.as_ref() != Some(&post.publication_id)
+                });
+            }
+        });
+    }
+    state.swarm_posts.update(|m| {
+        m.entry((host.clone(), post.swarm_id.clone()))
+            .or_default()
+            .insert(post.id.clone(), post);
+    });
+}
+
+fn invalid_swarm_payload(state: &AppState, host: &LocalHostId) {
+    report_protocol_error(
+        state,
+        host,
+        bridge::ConnectionInvalidation::ProtocolViolation {
+            message: "Invalid swarm event payload".into(),
+        },
+    );
+}
+
 fn report_protocol_error(
     state: &AppState,
     host: &LocalHostId,
@@ -2876,6 +3004,35 @@ fn apply_host_bootstrap(
             crate::actions::deliver_push_subscription(&state, host).await;
         });
     }
+    state.swarms_by_host.update(|map| {
+        map.insert(
+            host.clone(),
+            payload
+                .swarms
+                .into_iter()
+                .map(|swarm| (swarm.id.clone(), swarm))
+                .collect(),
+        );
+    });
+    state.swarm_drafts_by_host.update(|map| {
+        map.insert(
+            host.clone(),
+            payload
+                .swarm_drafts
+                .into_iter()
+                .map(|draft| (draft.id.clone(), draft))
+                .collect(),
+        );
+    });
+    state
+        .swarm_posts
+        .update(|m| m.retain(|(h, _), _| h != host));
+    state
+        .swarm_board_pages
+        .update(|m| m.retain(|(h, _), _| h != host));
+    state
+        .swarm_thread_pages
+        .update(|m| m.retain(|(h, _, _), _| h != host));
     state.backend_setup_by_host.update(|map| {
         map.insert(host.clone(), payload.backend_setup.backends);
     });

@@ -111,9 +111,9 @@ test("installed storage migrates once, then follows exact targets without losing
   let request;
   try {
     const port = await new Promise((resolve,reject) => {
-      const timer = setTimeout(()=>reject(new Error("driver startup deadline")), 10000);
       let output = "";
-      const read = chunk => { output += chunk; const match = /started successfully on port (\d+)/.exec(output); if (match) {clearTimeout(timer);resolve(Number(match[1]));} };
+      const timer = setTimeout(()=>reject(new Error(`driver startup deadline; exit=${driver.exitCode}; signal=${driver.signalCode}; output=${output}`)), 10000);
+      const read = chunk => { output = (output + chunk).slice(-2000); const match = /started successfully on port (\d+)/.exec(output); if (match) {clearTimeout(timer);resolve(Number(match[1]));} };
       driver.stdout.on("data",read);driver.stderr.on("data",read);
       driver.once("error",error=>{clearTimeout(timer);reject(error);});
     });

@@ -25,6 +25,19 @@ use protocol::{
 };
 use settings_model::HostSettings;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwarmComposerDraft {
+    pub host: LocalHostId,
+    pub swarm_id: protocol::SwarmId,
+    pub board: protocol::SwarmBoard,
+    pub thread_id: Option<protocol::SwarmThreadId>,
+    pub text: String,
+    pub mentions: Vec<protocol::SwarmMemberId>,
+    pub publication_id: Option<protocol::SwarmPublicationId>,
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
 // ── Tool output viewing mode ───────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1041,6 +1054,27 @@ pub struct AppState {
         RwSignal<HashMap<AgentRef, VecDeque<(SessionId, CompactionOperationId)>>>,
     next_history_request_id: RwSignal<u64>,
 
+    pub swarm_composer_drafts: RwSignal<Vec<SwarmComposerDraft>>,
+    pub swarms_by_host: RwSignal<HashMap<LocalHostId, HashMap<protocol::SwarmId, protocol::Swarm>>>,
+    pub swarm_drafts_by_host:
+        RwSignal<HashMap<LocalHostId, HashMap<protocol::SwarmDraftId, protocol::SwarmDraft>>>,
+    pub swarm_posts: RwSignal<
+        HashMap<
+            (LocalHostId, protocol::SwarmId),
+            HashMap<protocol::SwarmPostId, protocol::SwarmPost>,
+        >,
+    >,
+    pub swarm_board_pages:
+        RwSignal<HashMap<(LocalHostId, protocol::SwarmId), Vec<protocol::SwarmBoardPage>>>,
+    pub swarm_thread_pages: RwSignal<
+        HashMap<
+            (LocalHostId, protocol::SwarmId, protocol::SwarmThreadId),
+            protocol::SwarmThreadPage,
+        >,
+    >,
+    pub swarm_errors_by_host:
+        RwSignal<HashMap<LocalHostId, Vec<protocol::SwarmErrorNotifyPayload>>>,
+
     // Teams
     pub teams_by_host: RwSignal<HashMap<LocalHostId, HashMap<protocol::TeamId, Team>>>,
     pub team_members_by_host: RwSignal<HashMap<LocalHostId, HashMap<TeamMemberId, TeamMember>>>,
@@ -1160,6 +1194,13 @@ impl AppState {
             context_compaction_terminal_operations: RwSignal::new(HashMap::new()),
             next_history_request_id: RwSignal::new(0),
 
+            swarm_composer_drafts: RwSignal::new(Vec::new()),
+            swarms_by_host: RwSignal::new(HashMap::new()),
+            swarm_drafts_by_host: RwSignal::new(HashMap::new()),
+            swarm_posts: RwSignal::new(HashMap::new()),
+            swarm_board_pages: RwSignal::new(HashMap::new()),
+            swarm_thread_pages: RwSignal::new(HashMap::new()),
+            swarm_errors_by_host: RwSignal::new(HashMap::new()),
             teams_by_host: RwSignal::new(HashMap::new()),
             team_members_by_host: RwSignal::new(HashMap::new()),
             team_bindings_by_host: RwSignal::new(HashMap::new()),
@@ -1911,6 +1952,22 @@ impl AppState {
         });
         self.context_compaction_terminal_operations.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.swarm_composer_drafts
+            .update(|drafts| drafts.retain(|draft| draft.host != *host));
+        self.swarms_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.swarm_drafts_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.swarm_posts.update(|m| m.retain(|(h, _), _| h != host));
+        self.swarm_board_pages
+            .update(|m| m.retain(|(h, _), _| h != host));
+        self.swarm_thread_pages
+            .update(|m| m.retain(|(h, _, _), _| h != host));
+        self.swarm_errors_by_host.update(|m| {
+            m.remove(host);
         });
         self.teams_by_host.update(|m| {
             m.remove(host);

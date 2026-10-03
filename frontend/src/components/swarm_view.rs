@@ -96,7 +96,7 @@ pub(crate) fn lifecycle_tone(lifecycle: SwarmLifecycle) -> &'static str {
 /// Human label for a member from its server-owned state and runtime status.
 pub(crate) fn member_status_label(member: &SwarmMember) -> &'static str {
     match member.state {
-        SwarmMemberState::Proposed => "Not started",
+        SwarmMemberState::Proposed => "Ready to chat",
         SwarmMemberState::Dormant => "Ready to resume",
         SwarmMemberState::Reserved => "Starting",
         SwarmMemberState::Live => match member.runtime_status {
@@ -114,7 +114,8 @@ pub(crate) fn member_status_label(member: &SwarmMember) -> &'static str {
 
 pub(crate) fn member_status_tone(member: &SwarmMember) -> &'static str {
     match member.state {
-        SwarmMemberState::Proposed | SwarmMemberState::Reserved => "busy",
+        SwarmMemberState::Proposed => "muted",
+        SwarmMemberState::Reserved => "busy",
         SwarmMemberState::Live => match member.runtime_status {
             Some(AgentControlStatus::Thinking) => "active",
             Some(AgentControlStatus::AwaitingUser) => "warn",
@@ -1030,7 +1031,7 @@ pub fn SwarmView(
                                 {move || if board_loading.get() {
                                     "Loading board…"
                                 } else if board.get() == SwarmBoard::Briefing {
-                                    "No briefing posts yet. Post direction for the swarm below."
+                                    "Your swarm is ready. Send the first message below."
                                 } else {
                                     "Members haven't coordinated here yet."
                                 }}
@@ -2882,7 +2883,7 @@ pub(crate) mod wasm_tests {
             "Status unavailable",
             "missing runtime status is never shown as idle"
         );
-        assert_eq!(status("Cy"), "Not started");
+        assert_eq!(status("Cy"), "Ready to chat");
         assert!(
             chips
                 .iter()
