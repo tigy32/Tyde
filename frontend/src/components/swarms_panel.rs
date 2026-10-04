@@ -37,7 +37,9 @@ impl DraftDialogTarget {
 #[component]
 pub fn SwarmsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let selected_host = state.selected_host_id;
+    let context_state = state.clone();
+    let swarm_host = Memo::new(move |_| context_state.chat_context_host_id());
+    let settings_host = state.selected_host_id;
     let swarms_signal = state.swarms;
     let drafts_signal = state.swarm_drafts;
     let errors_signal = state.swarm_errors;
@@ -69,7 +71,7 @@ pub fn SwarmsPanel() -> impl IntoView {
     });
 
     let swarm_ids: Memo<Vec<(String, SwarmId)>> = Memo::new(move |_| {
-        let Some(host_id) = selected_host.get() else {
+        let Some(host_id) = swarm_host.get() else {
             return Vec::new();
         };
         swarms_signal.with(|map| {
@@ -90,7 +92,7 @@ pub fn SwarmsPanel() -> impl IntoView {
         })
     });
     let drafts: Memo<Vec<(String, SwarmDraft)>> = Memo::new(move |_| {
-        let Some(host_id) = selected_host.get() else {
+        let Some(host_id) = swarm_host.get() else {
             return Vec::new();
         };
         drafts_signal.with(|map| {
@@ -112,7 +114,7 @@ pub fn SwarmsPanel() -> impl IntoView {
     });
     // Errors not tied to one swarm (draft generation, migration) surface here.
     let host_errors: Memo<Vec<SwarmErrorEntry>> = Memo::new(move |_| {
-        let Some(host_id) = selected_host.get() else {
+        let Some(host_id) = swarm_host.get() else {
             return Vec::new();
         };
         errors_signal.with(|errors| {
@@ -133,7 +135,7 @@ pub fn SwarmsPanel() -> impl IntoView {
         })
     });
     let legacy_team_count = Memo::new(move |_| {
-        let Some(host_id) = selected_host.get() else {
+        let Some(host_id) = settings_host.get() else {
             return 0;
         };
         teams_signal.with(|teams| teams.get(&host_id).map(|m| m.len()).unwrap_or(0))
@@ -156,9 +158,9 @@ pub fn SwarmsPanel() -> impl IntoView {
             <div class="panel-filters swarms-panel-toolbar">
                 <button
                     class="swarm-btn swarm-btn-primary"
-                    disabled=move || selected_host.get().is_none()
+                    disabled=move || swarm_host.get().is_none()
                     on:click=move |_| {
-                        if let Some(host_id) = selected_host.get_untracked() {
+                        if let Some(host_id) = swarm_host.get_untracked() {
                             dialog.set(Some((host_id, DraftDialogTarget::New(SwarmDraftId(mint_id())))));
                         }
                     }

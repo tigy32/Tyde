@@ -2493,6 +2493,26 @@ pub(crate) mod wasm_tests {
             out
         }
 
+        pub(crate) fn command_hosts(&self) -> Vec<String> {
+            self.calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().expect("entry");
+                    if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                        return None;
+                    }
+                    let args: Value =
+                        serde_json::from_str(&entry.get(1).as_string().expect("args"))
+                            .expect("args json");
+                    let envelope: Value =
+                        serde_json::from_str(args["line"].as_str().expect("line"))
+                            .expect("envelope");
+                    (envelope["kind"] == "swarm_command")
+                        .then(|| args["hostId"].as_str().expect("host").to_owned())
+                })
+                .collect()
+        }
+
         pub(crate) fn commands_of(&self, kind: &str) -> Vec<Value> {
             self.commands()
                 .into_iter()

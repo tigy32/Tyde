@@ -1680,6 +1680,7 @@ mod wasm_tests {
     use super::*;
 
     use crate::components::center_zone::CenterZone;
+    use crate::components::project_rail::ProjectRail;
     use crate::components::swarm_view::wasm_tests::{
         Harness, PROJECT, all, button, ensure_styles_loaded, has_button, idle, make_container,
         make_swarm, member, mount_view, one, press, press_with, settle, spec, text_of, type_into,
@@ -1932,6 +1933,52 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn new_swarm_previews_on_host_and_launches_the_reviewed_revision() {
         let harness = host_with_catalog("host-swarm-create");
+        let settings_host = "host-settings-local";
+        harness
+            .state
+            .selected_host_id
+            .set(Some(settings_host.to_owned()));
+        harness.state.active_project.set(None);
+        harness.state.configured_hosts.set(vec![
+            crate::bridge::ConfiguredHost {
+                id: settings_host.to_owned(),
+                label: "Local host".to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: true,
+            },
+            crate::bridge::ConfiguredHost {
+                id: harness.host.clone(),
+                label: "Remote host".to_owned(),
+                transport: crate::bridge::HostTransportConfig::SshStdio {
+                    ssh_destination: "remote-test".to_owned(),
+                    lifecycle: crate::bridge::RemoteHostLifecycleConfig::Manual,
+                },
+                auto_connect: true,
+            },
+        ]);
+        harness.state.projects.update(|projects| {
+            projects.push(ProjectInfo {
+                host_id: settings_host.to_owned(),
+                project: Project {
+                    id: ProjectId("local-checkout".to_owned()),
+                    name: "Local checkout".to_owned(),
+                    sort_order: 0,
+                    source: ProjectSource::Standalone { roots: Vec::new() },
+                },
+            })
+        });
+        harness.state.swarms.update(|hosts| {
+            let local = make_swarm("local-swarm", "Local settings swarm", Vec::new());
+            hosts.insert(
+                settings_host.to_owned(),
+                HashMap::from([(local.id.clone(), local)]),
+            );
+        });
+        harness.swarm(&make_swarm(
+            "remote-swarm",
+            "Remote project swarm",
+            Vec::new(),
+        ));
         harness.emit(
             FrameKind::SessionSchemas,
             &protocol::SessionSchemasPayload {
@@ -1958,8 +2005,29 @@ mod wasm_tests {
                 }],
             },
         );
-        let (container, _handle) = mount_panel(&harness);
+        ensure_styles_loaded();
+        let container = make_container();
+        let state = harness.state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <ProjectRail /> <SwarmsPanel /> <CenterZone /> }
+        });
         settle().await;
+        assert!(text_of(&container).contains("Local settings swarm"));
+        one(&container, ".rail-project-row button[title='Checkout']").click();
+        settle().await;
+        console_log!(
+            "swarm host routing: project_matches_settings={}, remote_card_visible={}",
+            harness.state.active_project.get_untracked().is_some_and(
+                |active| Some(active.host_id) == harness.state.selected_host_id.get_untracked()
+            ),
+            text_of(&container).contains("Remote project swarm")
+        );
+        assert!(
+            text_of(&container).contains("Remote project swarm"),
+            "the swarm list follows the selected remote project, not the Settings host"
+        );
+        assert!(!text_of(&container).contains("Local settings swarm"));
 
         let opener = button(&container, "+ New swarm");
         opener.focus().unwrap();
@@ -2368,6 +2436,62 @@ mod wasm_tests {
             text_of(&one(&container, ".swarm-view .swarm-title")),
             "Checkout reliability"
         );
+        assert!(
+            harness
+                .command_hosts()
+                .iter()
+                .all(|host| host == &harness.host),
+            "every preview, member edit, and launch command targets the remote project host"
+        );
+        assert!(
+            harness.state.selected_host_id.get_untracked().as_deref() == Some(settings_host),
+            "project navigation never changes the Settings host"
+        );
+
+        harness.state.selected_host_id.set(None);
+        settle().await;
+        assert!(
+            !is_disabled(&opener),
+            "a project's host is sufficient to create a swarm"
+        );
+        opener.click();
+        settle().await;
+        let dialog = modal(&container).expect("remote dialog without a Settings host");
+        assert_eq!(
+            field(&dialog, "project")
+                .dyn_ref::<web_sys::HtmlSelectElement>()
+                .unwrap()
+                .value(),
+            PROJECT
+        );
+        press(dialog.unchecked_ref(), "Escape");
+        settle().await;
+        harness
+            .state
+            .selected_host_id
+            .set(Some(settings_host.to_owned()));
+        one(
+            &container,
+            ".rail-project-row button[title='Local checkout']",
+        )
+        .click();
+        settle().await;
+        assert!(text_of(&container).contains("Local settings swarm"));
+        assert!(!text_of(&container).contains("Remote project swarm"));
+        opener.click();
+        settle().await;
+        let dialog = modal(&container).expect("local project dialog");
+        assert!(text_of(&field(&dialog, "project")).contains("Local checkout"));
+        assert!(
+            all(&field(&dialog, "project"), "option")
+                .iter()
+                .all(|option| text_of(option) != "Checkout")
+        );
+        press(dialog.unchecked_ref(), "Escape");
+        settle().await;
+        button(&container, "Home").click();
+        settle().await;
+        assert!(text_of(&container).contains("Local settings swarm"));
     }
 
     /// Tab and Shift+Tab stay inside the modal; Escape closes it and returns
