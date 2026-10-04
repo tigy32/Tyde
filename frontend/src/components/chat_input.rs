@@ -18,10 +18,10 @@ use protocol::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingImage {
-    name: String,
-    media_type: String,
-    data: String,
+pub(crate) struct PendingImage {
+    pub(crate) name: String,
+    pub(crate) media_type: String,
+    pub(crate) data: String,
 }
 
 fn target_instance_stream(
@@ -679,7 +679,7 @@ fn send_running_chat_input(
     });
 }
 
-fn data_transfer_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
+pub(crate) fn data_transfer_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
     let Some(files) = data_transfer.files() else {
         return Vec::new();
     };
@@ -693,7 +693,7 @@ fn data_transfer_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::Fi
     out
 }
 
-fn clipboard_image_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
+pub(crate) fn clipboard_image_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
     let files = data_transfer_files(data_transfer)
         .into_iter()
         .filter(|file| file.type_().starts_with("image/"))
@@ -737,7 +737,7 @@ fn js_error_to_string(err: JsValue) -> String {
     err.as_string().unwrap_or_else(|| format!("{err:?}"))
 }
 
-async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
+pub(crate) async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
     let name = if file.name().is_empty() {
         "Pasted image".to_string()
     } else {

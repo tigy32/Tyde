@@ -31,6 +31,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 indexmap = "2"
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }

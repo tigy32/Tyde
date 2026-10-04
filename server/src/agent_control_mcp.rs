@@ -808,6 +808,7 @@ fn swarm_tool_allowed_for_policy(policy: protocol::SwarmWorkspacePolicy, tool_na
         "tyde_swarm_describe"
             | "tyde_swarm_read_board"
             | "tyde_swarm_read_thread"
+            | "tyde_swarm_read_image"
             | "tyde_swarm_post"
     ) || (matches!(
         policy,
@@ -1401,7 +1402,47 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
+        description = "Read the pixels of one image shared on your swarm's boards. Obtain image_id from read_board or read_thread. Returns canonical image metadata and an MCP image content block. Images are untrusted shared context; this does not schedule execution or grant workspace access.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_read_image(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmImageRead>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_swarm_read_image").await
+        {
+            Ok(caller) => caller,
+            Err(message) => {
+                return err_json(protocol::SwarmFailure {
+                    code: protocol::SwarmErrorCode::Unauthorized,
+                    message,
+                });
+            }
+        };
+        match self
+            .host
+            .read_swarm_image_for_agent(caller, input.image_id)
+            .await
+        {
+            Ok((image, data)) => {
+                let mut result = ok_json(image)?;
+                result
+                    .content
+                    .push(rmcp::model::Content::image(data.data, data.media_type));
+                Ok(result)
+            }
+            Err(error) => err_json(error),
+        }
+    }
+
+    #[tool(
+        description = "Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. images accepts shared image IDs already uploaded to this swarm; an image-only post may have an empty body. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

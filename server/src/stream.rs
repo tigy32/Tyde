@@ -735,6 +735,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::WorkflowRunNotify
         | FrameKind::AgentClosed => OutputLane::Chat,
         FrameKind::SwarmBoardNotify
+        | FrameKind::SwarmImageNotify
         | FrameKind::SwarmThreadNotify
         | FrameKind::ProjectGitDiff
         | FrameKind::ProjectGitStatus

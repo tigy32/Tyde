@@ -33,6 +33,7 @@ enum BoardTool {
     Describe,
     ReadBoard,
     ReadThread,
+    ReadImage,
     Post,
 }
 
@@ -42,6 +43,7 @@ impl BoardTool {
             ("tyde_swarm_describe", Self::Describe),
             ("tyde_swarm_read_board", Self::ReadBoard),
             ("tyde_swarm_read_thread", Self::ReadThread),
+            ("tyde_swarm_read_image", Self::ReadImage),
             ("tyde_swarm_post", Self::Post),
         ]
         .into_iter()
@@ -54,6 +56,7 @@ enum BoardResult {
     Board(Box<SwarmBoardPage>),
     Thread(Box<SwarmThreadPage>),
     Post(Box<SwarmPublicationOutcome>),
+    Image(Box<SwarmImage>, ImageData),
 }
 
 struct ToolEvidence {
@@ -140,6 +143,46 @@ impl ToolEvidence {
             "board completion must report successful MCP execution; phase={:?}; tool={tool:?}",
             self.phase
         );
+        if tool == BoardTool::ReadImage {
+            // Claude's native transcript adds a source-path text annotation.
+            // Require one typed metadata block and one actual image; extra
+            // native text must not substitute for either or add extra pixels.
+            let mut metadata = Vec::new();
+            let mut pixels = Vec::new();
+            for content in &mcp.content {
+                match &content.raw {
+                    RawContent::Text(text) => {
+                        if let Ok(image) = serde_json::from_str::<SwarmImage>(&text.text) {
+                            metadata.push(image);
+                        }
+                    }
+                    RawContent::Image(image) => pixels.push(image),
+                    _ => panic!("shared image result contains unsupported content"),
+                }
+            }
+            assert_eq!(
+                metadata.len(),
+                1,
+                "image result must carry exactly one canonical metadata block"
+            );
+            assert_eq!(
+                pixels.len(),
+                1,
+                "image result must carry exactly one actual image block"
+            );
+            let image = metadata.remove(0);
+            let pixels = pixels[0];
+            let input: SwarmImageRead = self.input();
+            assert!(image.id == input.image_id && image.media_type == pixels.mime_type);
+            self.result = Some(BoardResult::Image(
+                Box::new(image),
+                ImageData {
+                    media_type: pixels.mime_type.clone(),
+                    data: pixels.data.clone(),
+                },
+            ));
+            return;
+        }
         let [content] = mcp.content.as_slice() else {
             panic!(
                 "board completion must carry exactly one canonical JSON payload; phase={:?}; tool={tool:?}; parts={}",
@@ -160,6 +203,7 @@ impl ToolEvidence {
             )
         });
         self.result = Some(match tool {
+            BoardTool::ReadImage => unreachable!("image content handled before JSON-only results"),
             BoardTool::Describe => {
                 let result: SwarmDescribe = decode(&value, "swarm describe completion");
                 assert!(
@@ -717,6 +761,7 @@ impl BoardClient {
         self.send(SwarmCommandPayload::Post {
             swarm_id: id.clone(),
             publication: SwarmPublication {
+                images: Vec::new(),
                 board: SwarmBoard::Briefing,
                 publication_id: publication_id.clone(),
                 body: body.clone(),
@@ -1164,4 +1209,77 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         Ok(Err(_)) => panic!("real swarm final shutdown exceeded its bounded deadline"),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+pub async fn run_images(
+    backend: BackendKind,
+    workspace: &Path,
+    settings: SessionSettingsValues,
+    pixels: ImageData,
+    answer: &str,
+) {
+    let store = tempfile::tempdir().expect("create isolated image swarm store");
+    let host = spawn_host(store.path(), backend);
+    let result = std::panic::AssertUnwindSafe(async {
+        let (mut client, bootstrap) = BoardClient::connect(host.clone(), Phase::Opening).await;
+        let profile = match backend_profile(&bootstrap.launch_profile_catalog, backend) {
+            Some(profile) => profile,
+            None => {
+                let payload: LaunchProfileCatalogPayload = client.wait(FrameKind::LaunchProfileCatalogNotify, "image provider readiness", |payload: &LaunchProfileCatalogPayload| backend_profile(&payload.catalog, backend).is_some()).await;
+                backend_profile(&payload.catalog, backend).expect("ready real launch profile")
+            }
+        };
+        let schema = match backend_schema(&bootstrap.session_schemas, backend) {
+            Some(schema) => schema,
+            None => {
+                let payload: SessionSchemasPayload = client.wait(FrameKind::SessionSchemas, "image model catalog", |payload: &SessionSchemasPayload| backend_schema(&payload.schemas, backend).is_some()).await;
+                backend_schema(&payload.schemas, backend).expect("ready real model catalog")
+            }
+        };
+        let settings = catalog_settings(&schema, settings);
+        tokio::time::timeout(CONNECTION_TIMEOUT, client.connection.project_create(ProjectCreatePayload { name:"Shared image conformance".into(), roots:vec![ProjectRootPath(workspace.to_string_lossy().into_owned())] })).await.expect("bounded project registration").expect("project transport");
+        let event: ProjectNotifyPayload = client.wait(FrameKind::ProjectNotify, "image project registration", |event| matches!(event, ProjectNotifyPayload::Upsert { .. })).await;
+        let ProjectNotifyPayload::Upsert { project } = event else { unreachable!() };
+        let prompt = match backend {
+            BackendKind::Codex => "Use the named tyde-agent-control MCP tools DIRECTLY through their native interfaces. Do not use functions.exec, exec, code-mode wrappers or tool-discovery code: code mode is disabled. ",
+            BackendKind::Claude => "Use the named tyde-agent-control MCP tools directly. Perform exactly these three actual tool calls in order, awaiting each successful result: (1) tyde_swarm_read_board for Briefing; (2) tyde_swarm_read_image for its shared attachment; (3) tyde_swarm_post the result. The board read is mandatory even when inline notification context already contains the human post and image ID; inline context is not a substitute for the actual read. Do not publish before both reads succeed. ",
+            _ => "Use the named tyde-agent-control MCP tools directly. ",
+        }.to_owned() + "Read the shared Briefing board with tyde_swarm_read_board. Find the human post with an image attachment. Call tyde_swarm_read_image with its exact image_id to view the actual pixels; metadata and filenames do not contain the answer. The image contains three equal vertical solid-color bands. Publish exactly one Briefing root using tyde_swarm_post, omitting thread_id, with one text segment containing IMAGE_RESULT followed by a space and the three lowercase CSS color names from left to right separated by colons. Use a fresh publication_id. Do not guess before reading the image. Do not create files or use any agent tools. A private final answer is not a board publication. Finish after posting.";
+        let draft_id = SwarmDraftId(uuid::Uuid::new_v4().to_string());
+        client.send(SwarmCommandPayload::GenerateDraft { draft_id:draft_id.clone(), expected_revision:None, name:"Shared pixels".into(), opening_brief:String::new(), constraints:SwarmConstraints {
+            project_id:project.id, workspace_policy:SwarmWorkspacePolicy::ReadOnly, max_live_agents:1,
+            allocations:vec![SwarmBackendAllocation {backend_kind:backend,launch_profile_id:profile.id,session_settings:settings,count:1}],shared_guidance:prompt.clone(),agent_wake_budget:2,
+        }}).await;
+        let event: SwarmDraftNotifyPayload = client.wait(FrameKind::SwarmDraftNotify, "image draft", |event| matches!(event, SwarmDraftNotifyPayload::Upsert {draft} if draft.id == draft_id)).await;
+        let SwarmDraftNotifyPayload::Upsert {draft} = event else { unreachable!() };
+        assert!(draft.conflicts.is_empty());
+        let member = draft.members[0].id.clone();
+        client.send(SwarmCommandPayload::Launch {draft_id:draft.id.clone(),expected_revision:draft.revision}).await;
+        let event: SwarmNotifyPayload = client.wait(FrameKind::SwarmNotify, "image swarm launch", |event: &SwarmNotifyPayload| event.swarm.source_draft_id.as_ref() == Some(&draft.id)).await;
+        let swarm_id = event.swarm.id;
+        assert!(event.swarm.opening_post_id.is_none(), "upload precedes the first provider wake");
+        let image_id = SwarmImageId(uuid::Uuid::new_v4().to_string());
+        client.send(SwarmCommandPayload::UploadImage {swarm_id:swarm_id.clone(),image:SwarmImageUpload {image_id:image_id.clone(),name:"shared-reference.png".into(),data:pixels.clone()}}).await;
+        let uploaded: SwarmImageNotifyPayload = client.wait(FrameKind::SwarmImageNotify, "actual image upload", |event: &SwarmImageNotifyPayload| event.swarm_id == swarm_id && event.image_id == image_id).await;
+        let SwarmImageOutcome::Ready {image, data:None} = uploaded.outcome else {panic!("valid real image must be durably stored")};
+        let publication_id = SwarmPublicationId(uuid::Uuid::new_v4().to_string());
+        client.send(SwarmCommandPayload::Post {swarm_id:swarm_id.clone(),publication:SwarmPublication {publication_id:publication_id.clone(),board:SwarmBoard::Briefing,thread_id:None,body:vec![SwarmBodySegment::Text {text:prompt}],attachments:Vec::new(),images:vec![image_id.clone()]}}).await;
+        let trigger: SwarmPostNotifyPayload = client.wait(FrameKind::SwarmPostNotify, "shared image trigger", |event: &SwarmPostNotifyPayload| event.post.publication_id == publication_id && event.post.author == SwarmAuthor::Human).await;
+        let posted = client.member_post(&member, SwarmBoard::Briefing, "IMAGE_RESULT", &trigger.post, trigger.post.cursor, None).await;
+        let text = posted.body.iter().map(|segment| match segment {SwarmBodySegment::Text {text} => text.as_str(), _ => panic!("image result must be ordinary text")}).collect::<String>().trim().to_ascii_lowercase().replace("fuchsia", "magenta");
+        assert!(text == format!("image_result {answer}"), "real member must identify the actual shared pixels correctly; backend={backend:?}");
+        client.require_tool(&member, Phase::Opening, BoardTool::ReadImage, |result| matches!(result, BoardResult::Image(metadata, data) if **metadata == image && *data == pixels)).await;
+        client.require_tool(&member, Phase::Opening, BoardTool::ReadBoard, |result| matches!(result, BoardResult::Board(page) if page.posts.contains(&trigger.post))).await;
+        require_publication(&mut client, &member, Phase::Opening, &posted).await;
+        client.quiescent(&swarm_id).await;
+        eprintln!("Shared image conformance passed: backend={backend:?}; actual image read and authenticated pixel answer published");
+    }).catch_unwind().await;
+    let cleanup = tokio::time::timeout(SHUTDOWN_TIMEOUT, host.shutdown_for_restart()).await;
+    if let Err(panic) = result {
+        if cleanup.is_err() {
+            eprintln!("image host cleanup exceeded deadline; preserving scenario failure");
+        }
+        std::panic::resume_unwind(panic);
+    }
+    cleanup.expect("bounded image host shutdown");
 }

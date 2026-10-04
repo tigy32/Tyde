@@ -695,6 +695,7 @@ impl ProtocolValidator {
             }
             FrameKind::SwarmNotify => parse_host_payload::<crate::types::SwarmNotifyPayload>(self, envelope, "SwarmNotify"),
             FrameKind::SwarmDraftNotify => parse_host_payload::<crate::types::SwarmDraftNotifyPayload>(self, envelope, "SwarmDraftNotify"),
+            FrameKind::SwarmImageNotify => parse_host_payload::<crate::types::SwarmImageNotifyPayload>(self, envelope, "SwarmImageNotify"),
             FrameKind::SwarmPostNotify => parse_host_payload::<crate::types::SwarmPostNotifyPayload>(self, envelope, "SwarmPostNotify"),
             FrameKind::SwarmBoardNotify => parse_host_payload::<crate::types::SwarmBoardNotifyPayload>(self, envelope, "SwarmBoardNotify"),
             FrameKind::SwarmThreadNotify => parse_host_payload::<crate::types::SwarmThreadNotifyPayload>(self, envelope, "SwarmThreadNotify"),

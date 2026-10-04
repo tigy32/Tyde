@@ -16286,6 +16286,24 @@ button.swarm-attachment:hover { border-color: var(--border-secondary); backgroun
 .swarm-delivery-group[data-tone="muted"] { color: var(--text-tertiary); }
 .swarm-delivery-group .swarm-link-btn { font-size: 0.72rem; }
 
+/* --- Shared images --- */
+.swarm-image-gallery { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.swarm-image-gallery:empty { display: none; }
+.swarm-shared-image { display: flex; flex-direction: column; gap: 4px; margin: 0; width: min(220px, 100%); min-width: 0; font-size: 0.769rem; }
+.swarm-image-open { display: flex; justify-content: center; align-items: center; width: 100%; height: 150px; padding: 4px; border: 1px solid var(--border-primary); border-radius: 6px; background: var(--surface-0); cursor: zoom-in; }
+.swarm-image-open:hover { border-color: var(--accent-primary); }
+.swarm-image-open img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
+.swarm-shared-image figcaption,
+.swarm-draft-image figcaption { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.swarm-image-placeholder { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: var(--space-2); padding: var(--space-2); min-height: 90px; background: var(--surface-1); border: 1px solid var(--border-primary); border-radius: 6px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.swarm-image-drafts { margin: 0; padding: 0 var(--space-2); }
+.swarm-draft-image { position: relative; margin: 0; width: 120px; min-width: 0; display: flex; flex-direction: column; gap: 3px; font-size: 0.72rem; overflow-wrap: anywhere; }
+.swarm-draft-image > img { width: 100%; height: 72px; object-fit: contain; border: 1px solid var(--border-primary); border-radius: 5px; background: var(--surface-0); }
+.swarm-image-remove { position: absolute; top: 2px; right: 2px; display: flex; justify-content: center; align-items: center; width: 22px; height: 22px; padding: 0; border: 1px solid var(--border-secondary); border-radius: 4px; background: var(--surface-2); color: var(--text-primary); cursor: pointer; }
+.swarm-image-remove:disabled { opacity: 0.5; cursor: not-allowed; }
+.swarm-image-status { color: var(--text-tertiary); font-size: 0.72rem; }
+.swarm-composer-dragging { border-color: var(--accent-primary); box-shadow: inset 0 0 0 1px var(--accent-primary); background: var(--accent-subtle); }
+
 /* --- Composer --- */
 .swarm-root-composer {
     border-top: 1px solid var(--border-primary);

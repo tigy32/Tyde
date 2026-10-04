@@ -4322,6 +4322,31 @@ conformance2_scenario!(
     ]
 );
 
+async fn real_swarm_shared_images<B: Backend>(host: &mut Harness<B>) {
+    swarm_conformance::run_images(
+        B::session_settings_schema().backend_kind,
+        host.workspace(),
+        host.config
+            .session_settings
+            .clone()
+            .expect("image conformance model"),
+        ImageData {
+            media_type: "image/png".into(),
+            data: VALID_IMAGE_PNG_BASE64.into(),
+        },
+        IMAGE_ANSWER,
+    )
+    .await;
+}
+conformance2_scenario!(
+    real_swarm_shared_images,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::ExcludeAgentDelegation,
+        BackendCapability::ImageInput
+    ]
+);
+
 async fn real_new_message_withdraws_async_question<B: Backend>(host: &mut Harness<B>) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;

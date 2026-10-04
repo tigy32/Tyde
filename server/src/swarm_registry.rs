@@ -1,7 +1,9 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use base64::Engine;
 use protocol::*;
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -24,6 +26,11 @@ enum Command {
     FailNextDirectorySync(oneshot::Sender<Result<(), SwarmFailure>>),
     PrivateAdmission(AgentId, bool, SwarmCommitReply<PrivateAdmissionOutcome>),
     Snapshot(oneshot::Sender<Result<SwarmStoreSnapshot, SwarmFailure>>),
+    ReadImage(
+        SwarmId,
+        SwarmImageId,
+        oneshot::Sender<Result<(SwarmImage, ImageData), SwarmFailure>>,
+    ),
     ContainsAgent(AgentId, oneshot::Sender<Result<bool, SwarmFailure>>),
     Apply(
         SwarmCommandPayload,
@@ -131,11 +138,14 @@ impl SwarmRegistryHandle {
                             .map_err(Clone::clone);
                         let _ = reply.send(result);
                     }
+                    Command::ReadImage(swarm_id, image_id, reply) => {
+                        let _ = reply.send(actor.read_image(&swarm_id, &image_id));
+                    }
                     Command::Snapshot(reply) => {
                         let _ = reply.send(actor.snapshot());
                     }
                     Command::Apply(payload, reply) => {
-                        let result = actor.transaction(|file| apply(file, payload));
+                        let result = actor.apply(payload);
                         let _ = reply.send(result);
                     }
                     Command::Publish(id, author, publication, reply) => {
@@ -385,6 +395,14 @@ impl SwarmRegistryHandle {
     pub(crate) async fn snapshot(&self) -> Result<SwarmStoreSnapshot, SwarmFailure> {
         self.request(Command::Snapshot).await
     }
+    pub(crate) async fn read_image(
+        &self,
+        swarm_id: SwarmId,
+        image_id: SwarmImageId,
+    ) -> Result<(SwarmImage, ImageData), SwarmFailure> {
+        self.request(|reply| Command::ReadImage(swarm_id, image_id, reply))
+            .await
+    }
     pub(crate) async fn apply(
         &self,
         payload: SwarmCommandPayload,
@@ -574,6 +592,276 @@ impl Actor {
         }
         actor
     }
+    fn image_path(&self, image_id: &SwarmImageId) -> Result<PathBuf, SwarmFailure> {
+        let id = Uuid::parse_str(&image_id.0)
+            .map_err(|_| failure(SwarmErrorCode::Invalid, "Image identity must be a UUID"))?;
+        Ok(self.path.with_extension("images").join(id.to_string()))
+    }
+    fn read_image(
+        &self,
+        swarm_id: &SwarmId,
+        image_id: &SwarmImageId,
+    ) -> Result<(SwarmImage, ImageData), SwarmFailure> {
+        let file = self.file.as_ref().map_err(Clone::clone)?;
+        let record = file
+            .images
+            .iter()
+            .find(|record| record.swarm_id == *swarm_id && record.image.id == *image_id)
+            .ok_or_else(|| {
+                failure(
+                    SwarmErrorCode::NotFound,
+                    "Image does not belong to this swarm",
+                )
+            })?;
+        let path = self.image_path(image_id)?;
+        let metadata = std::fs::metadata(&path).map_err(|_| {
+            failure(
+                SwarmErrorCode::Storage,
+                "Shared image is unavailable on the host",
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.len() != record.image.byte_len
+            || metadata.len() > SWARM_MAX_IMAGE_BYTES as u64
+        {
+            return Err(failure(
+                SwarmErrorCode::Storage,
+                "Shared image size does not match its record",
+            ));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| {
+                file.take(SWARM_MAX_IMAGE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|_| failure(SwarmErrorCode::Storage, "Shared image cannot be read"))?;
+        if bytes.len() as u64 != record.image.byte_len
+            || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+        {
+            return Err(failure(
+                SwarmErrorCode::Storage,
+                "Shared image integrity check failed",
+            ));
+        }
+        Ok((
+            record.image.clone(),
+            ImageData {
+                media_type: record.image.media_type.clone(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        ))
+    }
+    fn upload_image(
+        &mut self,
+        swarm_id: SwarmId,
+        upload: SwarmImageUpload,
+    ) -> Result<SwarmCommit<Vec<SwarmEventPayload>>, SwarmFailure> {
+        let file = self.file.as_ref().map_err(Clone::clone)?;
+        if !file.swarms.iter().any(|swarm| swarm.id == swarm_id) {
+            return Err(failure(SwarmErrorCode::NotFound, "Swarm does not exist"));
+        }
+        let path = self.image_path(&upload.image_id)?;
+        if upload.name.trim().is_empty()
+            || upload.name.len() > 256
+            || upload.name.chars().any(char::is_control)
+        {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Image name must be 1–256 bytes without control characters",
+            ));
+        }
+        if upload.data.data.len() > SWARM_MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Each image must be at most 4 MiB",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&upload.data.data)
+            .map_err(|_| failure(SwarmErrorCode::Invalid, "Image data is not valid base64"))?;
+        if bytes.is_empty() || bytes.len() > SWARM_MAX_IMAGE_BYTES {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Each image must be nonempty and at most 4 MiB",
+            ));
+        }
+        let format = match upload.data.media_type.as_str() {
+            "image/png" => image::ImageFormat::Png,
+            "image/jpeg" => image::ImageFormat::Jpeg,
+            "image/gif" => image::ImageFormat::Gif,
+            "image/webp" => image::ImageFormat::WebP,
+            _ => {
+                return Err(failure(
+                    SwarmErrorCode::Invalid,
+                    "Supported images are PNG, JPEG, GIF, and WebP",
+                ));
+            }
+        };
+        if image::guess_format(&bytes).ok() != Some(format) {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Image bytes do not match their media type",
+            ));
+        }
+        let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format)
+            .into_dimensions()
+            .map_err(|_| failure(SwarmErrorCode::Invalid, "Image header is invalid"))?;
+        if width == 0
+            || height == 0
+            || width > SWARM_MAX_IMAGE_DIMENSION
+            || height > SWARM_MAX_IMAGE_DIMENSION
+            || u64::from(width) * u64::from(height) > SWARM_MAX_IMAGE_PIXELS
+        {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Image dimensions exceed the shared-image limit",
+            ));
+        }
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(SWARM_MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(SWARM_MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
+        reader.limits(limits);
+        reader.decode().map_err(|_| {
+            failure(
+                SwarmErrorCode::Invalid,
+                "Image cannot be decoded within the shared-image limits",
+            )
+        })?;
+        let image = SwarmImage {
+            id: upload.image_id,
+            name: upload.name,
+            media_type: upload.data.media_type,
+            width,
+            height,
+            byte_len: bytes.len() as u64,
+        };
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if let Some(previous) = file
+            .images
+            .iter()
+            .find(|record| record.image.id == image.id)
+        {
+            if previous.swarm_id != swarm_id || previous.image != image || previous.sha256 != digest
+            {
+                return Err(failure(
+                    SwarmErrorCode::Conflict,
+                    "Image identity reused with different content or ownership",
+                ));
+            }
+            self.read_image(&swarm_id, &image.id)?;
+        } else {
+            let directory = path.parent().ok_or_else(|| {
+                failure(SwarmErrorCode::Storage, "Image directory is unavailable")
+            })?;
+            std::fs::create_dir_all(directory).map_err(|_| {
+                failure(
+                    SwarmErrorCode::Storage,
+                    "Cannot create shared-image directory",
+                )
+            })?;
+            let mut temporary = tempfile::NamedTempFile::new_in(directory)
+                .map_err(|_| failure(SwarmErrorCode::Storage, "Cannot stage shared image"))?;
+            temporary
+                .write_all(&bytes)
+                .and_then(|_| temporary.as_file().sync_all())
+                .map_err(|_| failure(SwarmErrorCode::Storage, "Cannot sync shared image"))?;
+            // A prior interrupted upload may have published the bytes but not
+            // the registry record. Never overwrite different bytes on retry.
+            match temporary.persist_noclobber(&path) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut existing = Vec::new();
+                    std::fs::File::open(&path)
+                        .and_then(|file| {
+                            file.take(SWARM_MAX_IMAGE_BYTES as u64 + 1)
+                                .read_to_end(&mut existing)
+                        })
+                        .map_err(|_| {
+                            failure(
+                                SwarmErrorCode::Storage,
+                                "Cannot inspect interrupted image upload",
+                            )
+                        })?;
+                    if existing != bytes {
+                        return Err(failure(
+                            SwarmErrorCode::Conflict,
+                            "Interrupted image upload has different content",
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Err(failure(
+                        SwarmErrorCode::Storage,
+                        "Cannot publish shared image",
+                    ));
+                }
+            }
+        }
+        let record = SwarmStoredImage {
+            swarm_id: swarm_id.clone(),
+            image: image.clone(),
+            sha256: digest,
+        };
+        self.transaction(move |file| {
+            if !file
+                .images
+                .iter()
+                .any(|previous| previous.image.id == record.image.id)
+            {
+                file.images.push(record);
+            }
+            Ok(vec![SwarmEventPayload::Image(SwarmImageNotifyPayload {
+                swarm_id,
+                image_id: image.id.clone(),
+                outcome: SwarmImageOutcome::Ready { image, data: None },
+            })])
+        })
+    }
+    fn apply(
+        &mut self,
+        payload: SwarmCommandPayload,
+    ) -> Result<SwarmCommit<Vec<SwarmEventPayload>>, SwarmFailure> {
+        match payload {
+            SwarmCommandPayload::UploadImage { swarm_id, image } => {
+                let image_id = image.image_id.clone();
+                match self.upload_image(swarm_id.clone(), image) {
+                    Ok(commit) => Ok(commit),
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "Shared image upload rejected");
+                        Ok(SwarmCommit {
+                            value: vec![SwarmEventPayload::Image(SwarmImageNotifyPayload {
+                                swarm_id,
+                                image_id,
+                                outcome: SwarmImageOutcome::Failed { error },
+                            })],
+                            status: SwarmCommitStatus::Durable,
+                        })
+                    }
+                }
+            }
+            SwarmCommandPayload::ReadImage { swarm_id, image_id } => {
+                let outcome = match self.read_image(&swarm_id, &image_id) {
+                    Ok((image, data)) => SwarmImageOutcome::Ready {
+                        image,
+                        data: Some(data),
+                    },
+                    Err(error) => SwarmImageOutcome::Failed { error },
+                };
+                Ok(SwarmCommit {
+                    value: vec![SwarmEventPayload::Image(SwarmImageNotifyPayload {
+                        swarm_id,
+                        image_id,
+                        outcome,
+                    })],
+                    status: SwarmCommitStatus::Durable,
+                })
+            }
+            payload => self.transaction(|file| apply(file, payload)),
+        }
+    }
     fn snapshot(&self) -> Result<SwarmStoreSnapshot, SwarmFailure> {
         self.file.clone()
     }
@@ -642,7 +930,15 @@ impl Actor {
                 format!("failed to publish swarm store: {error}"),
             )
         })?;
-        let sync_result = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+        let sync_result = std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .and_then(|()| {
+                if candidate.images.is_empty() {
+                    return Ok(());
+                }
+                std::fs::File::open(self.path.with_extension("images"))
+                    .and_then(|directory| directory.sync_all())
+            });
         #[cfg(feature = "test-support")]
         let sync_result = if std::mem::take(&mut self.fail_directory_sync) {
             Err(std::io::Error::other(
@@ -882,6 +1178,12 @@ fn apply(
     payload: SwarmCommandPayload,
 ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
     match payload {
+        SwarmCommandPayload::UploadImage { .. } | SwarmCommandPayload::ReadImage { .. } => {
+            Err(failure(
+                SwarmErrorCode::Invalid,
+                "Image commands require the media store",
+            ))
+        }
         SwarmCommandPayload::GenerateDraft {
             draft_id,
             expected_revision,
@@ -1066,6 +1368,7 @@ fn apply(
                     &id,
                     SwarmAuthor::Human,
                     SwarmPublication {
+                        images: Vec::new(),
                         board: SwarmBoard::Briefing,
                         publication_id: SwarmPublicationId("opening-brief".into()),
                         body: vec![SwarmBodySegment::Text {
@@ -1557,6 +1860,12 @@ fn publish(
         if post.board != publication.board
             || post.body != publication.body
             || post.attachments != publication.attachments
+            || post
+                .images
+                .iter()
+                .map(|image| &image.id)
+                .collect::<Vec<_>>()
+                != publication.images.iter().collect::<Vec<_>>()
             || !same_thread
         {
             return Err(failure(
@@ -1582,19 +1891,42 @@ fn publish(
             format!("body cannot serialize: {error}"),
         )
     })?;
-    if publication.body.is_empty()
-        || body_bytes.len() > SWARM_MAX_BODY_BYTES
-        || publication.attachments.len() > SWARM_MAX_ATTACHMENTS
+    if body_bytes.len() > SWARM_MAX_BODY_BYTES
+        || publication.attachments.len() + publication.images.len() > SWARM_MAX_ATTACHMENTS
     {
         return Err(failure(
             SwarmErrorCode::Invalid,
-            "body must be nonempty and <=64 KiB, attachments <=16",
+            "body must be <=64 KiB, attachments and images combined <=16",
         ));
     }
     if !publication.body.iter().any(
         |segment| !matches!(segment, SwarmBodySegment::Text { text } if text.trim().is_empty()),
-    ) {
+    ) && publication.images.is_empty()
+    {
         return Err(failure(SwarmErrorCode::Invalid, "empty post body"));
+    }
+    let mut images = Vec::new();
+    for image_id in &publication.images {
+        if images
+            .iter()
+            .any(|image: &SwarmImage| image.id == *image_id)
+        {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Duplicate image reference",
+            ));
+        }
+        let record = file
+            .images
+            .iter()
+            .find(|record| record.swarm_id == *id && record.image.id == *image_id)
+            .ok_or_else(|| {
+                failure(
+                    SwarmErrorCode::Unauthorized,
+                    "Image does not belong to this swarm",
+                )
+            })?;
+        images.push(record.image.clone());
     }
     let root = match publication.thread_id.as_ref() {
         Some(thread) => Some(
@@ -1675,6 +2007,7 @@ fn publish(
         + 1;
     let post_id = SwarmPostId(fresh());
     let post = SwarmPost {
+        images,
         id: post_id.clone(),
         swarm_id: id.clone(),
         thread_id: publication

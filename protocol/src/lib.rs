@@ -205,18 +205,20 @@ pub use types::{
     SwarmBoardNotifyPayload, SwarmBoardPage, SwarmBoardPosition, SwarmBoardRead, SwarmBodySegment,
     SwarmChangePreview, SwarmCommandPayload, SwarmConstraints, SwarmDeliveryState, SwarmDescribe,
     SwarmDraft, SwarmDraftGeneration, SwarmDraftId, SwarmDraftNotifyPayload, SwarmErrorCode,
-    SwarmErrorNotifyPayload, SwarmId, SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberSpec,
-    SwarmMemberState, SwarmNotification, SwarmNotificationId, SwarmNotifyPayload, SwarmPost,
-    SwarmPostId, SwarmPostNotifyPayload, SwarmPublication, SwarmPublicationId,
-    SwarmPublicationOutcome, SwarmRetirementPolicy, SwarmRound, SwarmRoundId, SwarmStoreSnapshot,
-    SwarmThreadId, SwarmThreadNotifyPayload, SwarmThreadPage, SwarmThreadRead,
-    SwarmWorkspacePolicy,
+    SwarmErrorNotifyPayload, SwarmId, SwarmImage, SwarmImageId, SwarmImageNotifyPayload,
+    SwarmImageOutcome, SwarmImageRead, SwarmImageUpload, SwarmLifecycle, SwarmMember,
+    SwarmMemberId, SwarmMemberSpec, SwarmMemberState, SwarmNotification, SwarmNotificationId,
+    SwarmNotifyPayload, SwarmPost, SwarmPostId, SwarmPostNotifyPayload, SwarmPublication,
+    SwarmPublicationId, SwarmPublicationOutcome, SwarmRetirementPolicy, SwarmRound, SwarmRoundId,
+    SwarmStoreSnapshot, SwarmStoredImage, SwarmThreadId, SwarmThreadNotifyPayload, SwarmThreadPage,
+    SwarmThreadRead, SwarmWorkspacePolicy,
 };
 pub use types::{SwarmDispatch, SwarmEventPayload};
 
 pub use types::{
     SWARM_DEFAULT_AGENT_WAKE_BUDGET, SWARM_DEFAULT_PAGE_LIMIT, SWARM_MAX_AGENT_WAKE_BUDGET,
-    SWARM_MAX_ATTACHMENTS, SWARM_MAX_BODY_BYTES, SWARM_MAX_LIVE_AGENTS, SWARM_MAX_PAGE_LIMIT,
+    SWARM_MAX_ATTACHMENTS, SWARM_MAX_BODY_BYTES, SWARM_MAX_IMAGE_BYTES, SWARM_MAX_IMAGE_DIMENSION,
+    SWARM_MAX_IMAGE_PIXELS, SWARM_MAX_LIVE_AGENTS, SWARM_MAX_PAGE_LIMIT,
 };
 
 pub use types::{SwarmCursorTarget, SwarmMembership, SwarmReadCursor, SwarmRecoveryRequirement};

@@ -3100,6 +3100,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::SwarmImageNotify => {
+            match envelope.parse_payload::<protocol::SwarmImageNotifyPayload>() {
+                Ok(payload) => state.swarm_posts.update(|map| {
+                    let images = &mut map.entry((host_id.to_owned(), payload.swarm_id))
+                        .or_default().images;
+                    if let protocol::SwarmImageOutcome::Ready { image, data: None } = &payload.outcome
+                        && matches!(images.get(&payload.image_id), Some(protocol::SwarmImageOutcome::Ready { image: loaded, data: Some(_) }) if loaded == image)
+                    {
+                        return;
+                    }
+                    images.insert(payload.image_id, payload.outcome);
+                }),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse swarm_image_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::SwarmPostNotify => {
             match envelope.parse_payload::<protocol::SwarmPostNotifyPayload>() {
                 Ok(payload) => {

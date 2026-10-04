@@ -1433,6 +1433,10 @@ impl Connection {
                     let _: protocol::SwarmDraftNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::SwarmImageNotify => {
+                    let _: protocol::SwarmImageNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::SwarmPostNotify => {
                     let _: protocol::SwarmPostNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 69;
+pub const PROTOCOL_VERSION: u32 = 70;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1048,6 +1048,7 @@ pub enum FrameKind {
     SwarmNotify,
     SwarmDraftNotify,
     SwarmPostNotify,
+    SwarmImageNotify,
     SwarmBoardNotify,
     SwarmThreadNotify,
     SwarmErrorNotify,
@@ -1263,6 +1264,7 @@ impl fmt::Display for FrameKind {
             Self::SwarmNotify => f.write_str("swarm_notify"),
             Self::SwarmDraftNotify => f.write_str("swarm_draft_notify"),
             Self::SwarmPostNotify => f.write_str("swarm_post_notify"),
+            Self::SwarmImageNotify => f.write_str("swarm_image_notify"),
             Self::SwarmBoardNotify => f.write_str("swarm_board_notify"),
             Self::SwarmThreadNotify => f.write_str("swarm_thread_notify"),
             Self::SwarmErrorNotify => f.write_str("swarm_error_notify"),
@@ -8356,7 +8358,7 @@ pub struct ContextBreakdown {
     pub context_window: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ImageData {
     pub media_type: String,
     pub data: String,
@@ -8902,6 +8904,7 @@ swarm_identifier!(SwarmId);
 swarm_identifier!(SwarmDraftId);
 swarm_identifier!(SwarmMemberId);
 swarm_identifier!(SwarmPostId);
+swarm_identifier!(SwarmImageId);
 swarm_identifier!(SwarmThreadId);
 swarm_identifier!(SwarmPublicationId);
 swarm_identifier!(SwarmRoundId);
@@ -9136,6 +9139,48 @@ pub struct SwarmAttachment {
     pub project_id: ProjectId,
     pub path: ProjectPath,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmImage {
+    pub id: SwarmImageId,
+    pub name: String,
+    pub media_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmImageUpload {
+    pub image_id: SwarmImageId,
+    pub name: String,
+    pub data: ImageData,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmImageRead {
+    pub image_id: SwarmImageId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmStoredImage {
+    pub swarm_id: SwarmId,
+    pub image: SwarmImage,
+    pub sha256: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmImageOutcome {
+    Ready {
+        image: SwarmImage,
+        data: Option<ImageData>,
+    },
+    Failed {
+        error: SwarmFailure,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmImageNotifyPayload {
+    pub swarm_id: SwarmId,
+    pub image_id: SwarmImageId,
+    pub outcome: SwarmImageOutcome,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwarmAuthor {
@@ -9151,6 +9196,8 @@ pub struct SwarmPublication {
     pub thread_id: Option<SwarmThreadId>,
     #[serde(default)]
     pub attachments: Vec<SwarmAttachment>,
+    #[serde(default)]
+    pub images: Vec<SwarmImageId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmPost {
@@ -9163,6 +9210,8 @@ pub struct SwarmPost {
     pub publication_id: SwarmPublicationId,
     pub body: Vec<SwarmBodySegment>,
     pub attachments: Vec<SwarmAttachment>,
+    #[serde(default)]
+    pub images: Vec<SwarmImage>,
     pub round_id: SwarmRoundId,
     pub created_at_ms: u64,
 }
@@ -9266,6 +9315,14 @@ pub enum SwarmCommandPayload {
         swarm_id: SwarmId,
         query: SwarmThreadRead,
     },
+    UploadImage {
+        swarm_id: SwarmId,
+        image: SwarmImageUpload,
+    },
+    ReadImage {
+        swarm_id: SwarmId,
+        image_id: SwarmImageId,
+    },
     ReadPost {
         swarm_id: SwarmId,
         post_id: SwarmPostId,
@@ -9345,6 +9402,8 @@ pub struct SwarmStoreSnapshot {
     pub swarms: Vec<Swarm>,
     pub drafts: Vec<SwarmDraft>,
     pub posts: Vec<SwarmPost>,
+    #[serde(default)]
+    pub images: Vec<SwarmStoredImage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9353,6 +9412,7 @@ pub enum SwarmEventPayload {
     Swarm(Box<SwarmNotifyPayload>),
     Draft(SwarmDraftNotifyPayload),
     Post(SwarmPostNotifyPayload),
+    Image(SwarmImageNotifyPayload),
     Board(SwarmBoardNotifyPayload),
     Thread(SwarmThreadNotifyPayload),
     Error(SwarmErrorNotifyPayload),
@@ -9390,6 +9450,9 @@ pub const SWARM_MAX_PAGE_LIMIT: u32 = 100;
 pub const SWARM_MAX_BODY_BYTES: usize = 65536;
 pub const SWARM_MAX_INLINE_CONTEXT_BYTES: usize = 128 * 1024;
 pub const SWARM_MAX_ATTACHMENTS: usize = 16;
+pub const SWARM_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const SWARM_MAX_IMAGE_DIMENSION: u32 = 8192;
+pub const SWARM_MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 pub const SWARM_MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
 pub const SWARM_READ_PAGE_CONTAINER_BYTES: usize = 4096;
 // A thread page must fit its root, one maximum reply, and the reply separator.

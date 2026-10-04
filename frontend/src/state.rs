@@ -3323,6 +3323,7 @@ pub struct SwarmPageMeta {
 /// records; threads are grouped by the post's own `thread_id`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SwarmPostsState {
+    pub images: HashMap<protocol::SwarmImageId, protocol::SwarmImageOutcome>,
     pub posts: HashMap<SwarmPostId, SwarmPost>,
     pub briefing_page: Option<SwarmPageMeta>,
     pub coordination_page: Option<SwarmPageMeta>,

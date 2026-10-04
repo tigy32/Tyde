@@ -16,9 +16,10 @@ use wasm_bindgen_futures::spawn_local;
 use protocol::{
     AgentControlStatus, BackendKind, ProjectId, ProjectPath, StreamPath, Swarm, SwarmAttachment,
     SwarmAuthor, SwarmBoard, SwarmBoardRead, SwarmBodySegment, SwarmCommandPayload,
-    SwarmDeliveryState, SwarmId, SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberState,
-    SwarmNotificationId, SwarmPost, SwarmPostId, SwarmPublication, SwarmPublicationId,
-    SwarmReadCursor, SwarmThreadId, SwarmThreadRead, SwarmWorkspacePolicy,
+    SwarmDeliveryState, SwarmId, SwarmImage, SwarmImageId, SwarmImageOutcome, SwarmImageUpload,
+    SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberState, SwarmNotificationId, SwarmPost,
+    SwarmPostId, SwarmPublication, SwarmPublicationId, SwarmReadCursor, SwarmThreadId,
+    SwarmThreadRead, SwarmWorkspacePolicy,
 };
 
 use crate::components::swarm_dialogs::ManageSwarmDialog;
@@ -1500,10 +1501,111 @@ fn SwarmPostCard(
                 </header>
                 <div class="swarm-post-body chat-card-body" on:click=on_body_click on:keydown=on_body_keydown inner_html=body_html></div>
                 {attachments}
+                <div class="swarm-image-gallery">
+                    {post.with_value(|post| post.images.clone()).into_iter().map(|image| view! {
+                        <SwarmSharedImage host=host swarm_id=post.with_value(|post| post.swarm_id.clone()) image=image />
+                    }).collect_view()}
+                </div>
                 {delivery}
             </div>
         </article>
     }
+}
+
+#[component]
+fn SwarmSharedImage(
+    host: StoredValue<String>,
+    swarm_id: SwarmId,
+    image: SwarmImage,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let posts = state.swarm_posts;
+    let host_streams = state.host_streams;
+    let swarm_id = StoredValue::new(swarm_id);
+    let image = StoredValue::new(image);
+    let requested: RwSignal<Option<StreamPath>> = RwSignal::new(None);
+    let transport_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let decode_error = RwSignal::new(false);
+    let current = RwSignal::new(None::<usize>);
+    let outcome = Memo::new(move |_| {
+        posts.with(|map| {
+            map.get(&(host.get_value(), swarm_id.get_value()))
+                .and_then(|posts| {
+                    posts
+                        .images
+                        .get(&image.with_value(|image| image.id.clone()))
+                        .cloned()
+                })
+        })
+    });
+    let source = Memo::new(move |_| match outcome.get() {
+        Some(SwarmImageOutcome::Ready {
+            data: Some(data), ..
+        }) => Some(format!("data:{};base64,{}", data.media_type, data.data)),
+        Some(SwarmImageOutcome::Ready { data: None, .. } | SwarmImageOutcome::Failed { .. })
+        | None => None,
+    });
+    let load_error = Memo::new(move |_| match outcome.get() {
+        Some(SwarmImageOutcome::Failed { error }) => Some(error.message),
+        _ => transport_error.get(),
+    });
+    let read = move || {
+        transport_error.set(None);
+        decode_error.set(false);
+        send_swarm_command(
+            host_streams,
+            &host.get_value(),
+            SwarmCommandPayload::ReadImage {
+                swarm_id: swarm_id.get_value(),
+                image_id: image.with_value(|image| image.id.clone()),
+            },
+            Some(Callback::new(move |message| {
+                transport_error.set(Some(message))
+            })),
+        );
+    };
+    Effect::new(move |_| {
+        let Some(stream) = host_streams.with(|streams| streams.get(&host.get_value()).cloned())
+        else {
+            return;
+        };
+        if source.get().is_some()
+            || load_error.get().is_some()
+            || requested.get_untracked().as_ref() == Some(&stream)
+        {
+            return;
+        }
+        requested.set(Some(stream));
+        read();
+    });
+    let name = image.with_value(|image| image.name.clone());
+    let alt = name.clone();
+    view! {
+        <figure class="swarm-shared-image">
+            {move || match source.get() {
+                Some(src) => view! {
+                    <button class="swarm-image-open" aria-label=format!("Open image {}", image.with_value(|image| image.name.clone())) on:click=move |_| current.set(Some(0))>
+                        <img src=src.clone() alt=alt.clone() loading="lazy" on:error=move |_| decode_error.set(true) />
+                    </button>
+                    {move || current.get().map(|_| view! { <crate::components::image_lightbox::ImageLightbox sources=vec![src.clone()].into() current=current /> })}
+                }.into_any(),
+                None => view! {
+                    <div class="swarm-image-placeholder">
+                        {move || load_error.get().unwrap_or_else(|| "Loading shared image…".to_owned())}
+                        <Show when=move || load_error.get().is_some()><button class="swarm-link-btn" on:click=move |_| read()>"Retry image"</button></Show>
+                    </div>
+                }.into_any(),
+            }}
+            <figcaption title=name.clone()>{name.clone()}</figcaption>
+            <Show when=move || decode_error.get()><span class="swarm-composer-error" role="alert">"This browser could not display the shared image."</span></Show>
+        </figure>
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct SwarmDraftImage {
+    upload: SwarmImageUpload,
+    transport_error: Option<String>,
 }
 
 // ── Composer ───────────────────────────────────────────────────────────────
@@ -1648,6 +1750,11 @@ fn SwarmComposer(
     let references: RwSignal<Vec<ComposerReference>> = RwSignal::new(Vec::new());
     let input_range: StoredValue<Option<(usize, usize)>> = StoredValue::new(None);
     let attachments: RwSignal<Vec<SwarmAttachment>> = RwSignal::new(Vec::new());
+    let images: RwSignal<Vec<SwarmDraftImage>> = RwSignal::new(Vec::new());
+    let reading_images = RwSignal::new(false);
+    let image_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let drag_depth = RwSignal::new(0u32);
+    let image_input_ref = NodeRef::<leptos::html::Input>::new();
     let pending: RwSignal<Option<PendingPublication>> = RwSignal::new(None);
     let send_error: RwSignal<Option<String>> = RwSignal::new(None);
     let completion: RwSignal<Option<(usize, String)>> = RwSignal::new(None);
@@ -1655,6 +1762,180 @@ fn SwarmComposer(
     let attach_open = RwSignal::new(false);
     let link_open = RwSignal::new(false);
     let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+    let upload_image = move |upload: SwarmImageUpload| {
+        let id = upload.image_id.clone();
+        images.update(|images| {
+            if let Some(image) = images.iter_mut().find(|image| image.upload.image_id == id) {
+                image.transport_error = None;
+            }
+        });
+        send_swarm_command(
+            host_streams,
+            &host.get_value(),
+            SwarmCommandPayload::UploadImage {
+                swarm_id: sid.get_value(),
+                image: upload,
+            },
+            Some(Callback::new(move |message: String| {
+                images.update(|images| {
+                    if let Some(image) = images.iter_mut().find(|image| image.upload.image_id == id)
+                    {
+                        image.transport_error = Some(message.clone());
+                    }
+                });
+            })),
+        );
+    };
+    let images_ready = Memo::new(move |_| {
+        if reading_images.get() {
+            return false;
+        }
+        let ids = images.with(|images| {
+            images
+                .iter()
+                .map(|image| image.upload.image_id.clone())
+                .collect::<Vec<_>>()
+        });
+        posts_signal.with(|map| {
+            ids.iter().all(|id| {
+                matches!(
+                    map.get(&(host.get_value(), sid.get_value()))
+                        .and_then(|posts| posts.images.get(id)),
+                    Some(SwarmImageOutcome::Ready { .. })
+                )
+            })
+        })
+    });
+    let attach_images = move |files: Vec<web_sys::File>| {
+        if pending.get_untracked().is_some() {
+            image_error.set(Some(
+                "Finish or edit the pending publication before adding images.".to_owned(),
+            ));
+            return;
+        }
+        if reading_images.get_untracked() {
+            image_error.set(Some(
+                "Wait for the current images to finish loading.".to_owned(),
+            ));
+            return;
+        }
+        let used = images.with_untracked(Vec::len) + attachments.with_untracked(Vec::len);
+        if files.len() + used > protocol::SWARM_MAX_ATTACHMENTS {
+            image_error.set(Some(format!(
+                "A post can carry at most {} images and file attachments combined.",
+                protocol::SWARM_MAX_ATTACHMENTS
+            )));
+            return;
+        }
+        image_error.set(None);
+        reading_images.set(true);
+        spawn_local(async move {
+            let mut errors = Vec::new();
+            for file in files {
+                if !matches!(
+                    file.type_().as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    errors.push("Supported images are PNG, JPEG, GIF, and WebP.".to_owned());
+                    continue;
+                }
+                if file.size() == 0.0 || file.size() > protocol::SWARM_MAX_IMAGE_BYTES as f64 {
+                    errors.push("Each image must be nonempty and at most 4 MiB.".to_owned());
+                    continue;
+                }
+                match crate::components::chat_input::read_image_file(file).await {
+                    Ok(image) => {
+                        let mut random = [0u8; 16];
+                        let entropy = web_sys::window()
+                            .ok_or("The browser window is unavailable.")
+                            .and_then(|window| {
+                                window
+                                    .crypto()
+                                    .map_err(|_| "Browser crypto is unavailable.")
+                            })
+                            .and_then(|crypto| {
+                                crypto
+                                    .get_random_values_with_u8_array(&mut random)
+                                    .map_err(|_| "Cannot generate a shared-image identity.")
+                            });
+                        if let Err(message) = entropy {
+                            errors.push(message.to_owned());
+                            continue;
+                        }
+                        random[6] = (random[6] & 0x0f) | 0x40;
+                        random[8] = (random[8] & 0x3f) | 0x80;
+                        let hex = format!("{:032x}", u128::from_be_bytes(random));
+                        let image_id = format!(
+                            "{}-{}-{}-{}-{}",
+                            &hex[..8],
+                            &hex[8..12],
+                            &hex[12..16],
+                            &hex[16..20],
+                            &hex[20..]
+                        );
+                        let upload = SwarmImageUpload {
+                            image_id: SwarmImageId(image_id),
+                            name: image.name,
+                            data: protocol::ImageData {
+                                media_type: image.media_type,
+                                data: image.data,
+                            },
+                        };
+                        if images
+                            .try_update(|images| {
+                                images.push(SwarmDraftImage {
+                                    upload: upload.clone(),
+                                    transport_error: None,
+                                })
+                            })
+                            .is_none()
+                        {
+                            return;
+                        }
+                        upload_image(upload);
+                    }
+                    Err(message) => errors.push(message),
+                }
+            }
+            image_error.try_set((!errors.is_empty()).then(|| errors.join(" ")));
+            reading_images.try_set(false);
+        });
+    };
+    let on_image_paste = move |ev: web_sys::ClipboardEvent| {
+        let Some(clipboard) = ev.clipboard_data() else {
+            return;
+        };
+        let files = crate::components::chat_input::clipboard_image_files(&clipboard);
+        if files.is_empty() {
+            return;
+        }
+        ev.prevent_default();
+        attach_images(files);
+    };
+    let on_image_dragover = move |ev: web_sys::DragEvent| {
+        if !crate::app::drag_event_offers_external_files(&ev) {
+            return;
+        }
+        ev.prevent_default();
+        if let Some(transfer) = ev.data_transfer() {
+            transfer.set_drop_effect("copy");
+        }
+        drag_depth.set(1);
+    };
+    let on_image_drop = move |ev: web_sys::DragEvent| {
+        if !crate::app::drag_event_offers_external_files(&ev) {
+            return;
+        }
+        ev.prevent_default();
+        ev.stop_propagation();
+        drag_depth.set(0);
+        let Some(transfer) = ev.data_transfer() else {
+            return;
+        };
+        attach_images(crate::components::chat_input::data_transfer_files(
+            &transfer,
+        ));
+    };
     let reply_root_author = Memo::new(move |_| {
         let thread_id = thread.get_value()?;
         posts_signal.with(|map| {
@@ -1763,6 +2044,8 @@ fn SwarmComposer(
             text.set(String::new());
             references.set(Vec::new());
             attachments.set(Vec::new());
+            images.set(Vec::new());
+            image_error.set(None);
             send_error.set(None);
             if let Some(on_cancel) = on_cancel {
                 on_cancel.run(());
@@ -1890,16 +2173,25 @@ fn SwarmComposer(
     };
 
     let submit = move || {
-        if pending.get_untracked().is_some() || !routing_available.get_untracked() {
+        if pending.get_untracked().is_some()
+            || !routing_available.get_untracked()
+            || !images_ready.get_untracked()
+        {
             return;
         }
         let body_text = text.get_untracked();
-        if body_text.trim().is_empty() {
+        if body_text.trim().is_empty() && images.with_untracked(Vec::is_empty) {
             return;
         }
         let waiting = PendingPublication {
             swarm_id: sid.get_value(),
             publication: SwarmPublication {
+                images: images.with_untracked(|images| {
+                    images
+                        .iter()
+                        .map(|image| image.upload.image_id.clone())
+                        .collect()
+                }),
                 board: board.get_untracked(),
                 publication_id: SwarmPublicationId(mint_id()),
                 body: compose_segments(&body_text, &references.get_untracked()),
@@ -2129,7 +2421,7 @@ fn SwarmComposer(
     };
 
     view! {
-        <div class="swarm-composer" class:swarm-composer-reply=is_reply>
+        <div class="swarm-composer" class:swarm-composer-reply=is_reply class:swarm-composer-dragging={move || drag_depth.get() > 0} on:paste=on_image_paste on:dragover=on_image_dragover on:dragleave=move |_| drag_depth.set(0) on:drop=on_image_drop>
             <Show when=move || completion.get().is_some() && !candidates.with(|c| c.is_empty())>
                 <ul class="swarm-mention-menu" role="listbox" aria-label="Mention a member">
                     {move || candidates.get().into_iter().enumerate().map(|(index, (id, name, status, detail))| {
@@ -2183,6 +2475,33 @@ fn SwarmComposer(
                     </div>
                 })
             }}
+            <Show when=move || !images.with(Vec::is_empty)>
+                <div class="swarm-image-gallery swarm-image-drafts">
+                    <For each=move || images.with(|images| images.iter().map(|image| image.upload.image_id.clone()).collect::<Vec<_>>()) key=|id| id.clone() let:id>
+                        {let image_id = StoredValue::new(id);
+                         let draft = Memo::new(move |_| images.with(|images| images.iter().find(|image| image.upload.image_id == image_id.get_value()).cloned()));
+                         let outcome = Memo::new(move |_| posts_signal.with(|map| map.get(&(host.get_value(), sid.get_value())).and_then(|posts| posts.images.get(&image_id.get_value()).cloned())));
+                         view! {
+                            <figure class="swarm-draft-image">
+                                <img src=move || draft.get().map(|image| format!("data:{};base64,{}", image.upload.data.media_type, image.upload.data.data)) alt=move || draft.get().map(|image| image.upload.name) />
+                                <button class="swarm-image-remove" aria-label=move || draft.get().map(|image| format!("Remove image {}", image.upload.name)) disabled=move || pending.get().is_some() on:click=move |_| images.update(|images| images.retain(|image| image.upload.image_id != image_id.get_value()))>"×"</button>
+                                <figcaption title=move || draft.get().map(|image| image.upload.name.clone())>{move || draft.get().map(|image| image.upload.name)}</figcaption>
+                                {move || match outcome.get() {
+                                    Some(SwarmImageOutcome::Ready { .. }) => view! { <span class="swarm-image-status">"Ready"</span> }.into_any(),
+                                    Some(SwarmImageOutcome::Failed { error }) => view! { <span class="swarm-composer-error" role="alert">{error.message}</span> }.into_any(),
+                                    None => view! { <span class="swarm-image-status">{move || draft.get().and_then(|image| image.transport_error).unwrap_or_else(|| "Uploading…".to_owned())}</span> }.into_any(),
+                                }}
+                                <Show when=move || !matches!(outcome.get(), Some(SwarmImageOutcome::Ready { .. }))>
+                                    <button class="swarm-link-btn" disabled=move || pending.get().is_some() on:click=move |_| { if let Some(image) = draft.get_untracked() { upload_image(image.upload); } }>"Retry image"</button>
+                                </Show>
+                            </figure>
+                         }
+                        }
+                    </For>
+                </div>
+            </Show>
+            <Show when=move || reading_images.get()><span class="swarm-image-status" role="status">"Reading images…"</span></Show>
+            {move || image_error.get().map(|message| view! { <span class="swarm-composer-error" role="alert">{message}</span> })}
             <textarea
                 class="swarm-composer-input"
                 node_ref=textarea_ref
@@ -2238,6 +2557,16 @@ fn SwarmComposer(
                 </div>
             <div class="swarm-composer-footer">
                 <div class="swarm-composer-tools">
+                    <input type="file" node_ref=image_input_ref accept="image/png,image/jpeg,image/gif,image/webp" multiple=true hidden=true aria-label="Choose images" on:change=move |_| {
+                        if let Some(input) = image_input_ref.get_untracked() {
+                            let files = input.files().map(|files| (0..files.length()).filter_map(|index| files.get(index)).collect::<Vec<_>>()).unwrap_or_default();
+                            input.set_value("");
+                            attach_images(files);
+                        }
+                    } />
+                    <Show when=move || pending.get().is_none()>
+                        <button class="swarm-btn swarm-btn-quiet" title="Add images, paste screenshots, or drop multiple images here" disabled={move || reading_images.get() || images.with(Vec::len) + attachments.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS} on:click=move |_| { if let Some(input) = image_input_ref.get_untracked() { input.click(); } }>"Add images"</button>
+                    </Show>
                     <Show when=move || pending.get().is_none()>
                         <div class="swarm-attach-wrap">
                             <button
@@ -2271,9 +2600,8 @@ fn SwarmComposer(
                                 class="swarm-btn swarm-btn-quiet"
                                 aria-haspopup="listbox"
                                 aria-expanded=move || attach_open.get().to_string()
-                                disabled=move || attachments.with(|list| list.len() >= protocol::SWARM_MAX_ATTACHMENTS)
-                                title=move || attachments
-                                    .with(|list| list.len() >= protocol::SWARM_MAX_ATTACHMENTS)
+                                disabled={move || attachments.with(Vec::len) + images.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS}
+                                title=move || (attachments.with(Vec::len) + images.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS)
                                     .then(|| format!("A post can carry at most {} attachments", protocol::SWARM_MAX_ATTACHMENTS))
                                 on:click=move |_| attach_open.update(|open| *open = !*open)
                             >
@@ -2337,7 +2665,7 @@ fn SwarmComposer(
                     })}
                     <button
                         class="swarm-btn swarm-btn-primary swarm-composer-send"
-                        disabled=move || pending.get().is_some() || !routing_available.get() || text.with(|t| t.trim().is_empty())
+                        disabled=move || pending.get().is_some() || !routing_available.get() || !images_ready.get() || (text.with(|t| t.trim().is_empty()) && images.with(Vec::is_empty))
                         on:click=move |_| submit()
                     >
                         {if is_reply { "Reply" } else { "Post" }}
@@ -2692,6 +3020,7 @@ pub(crate) mod wasm_tests {
         body: Vec<SwarmBodySegment>,
     ) -> SwarmPost {
         SwarmPost {
+            images: Vec::new(),
             id: SwarmPostId(id.to_owned()),
             swarm_id: SwarmId(swarm_id.to_owned()),
             thread_id: SwarmThreadId(thread.to_owned()),
@@ -3285,6 +3614,24 @@ pub(crate) mod wasm_tests {
         assert!(
             tabs.bottom() - header.top() <= 105.0,
             "a summary header and slim tabs leave space for content"
+        );
+        wasm_bindgen_test::console_log!(
+            "Swarm empty composer geometry: height={} children={:?}",
+            root_composer_rect.height(),
+            all(
+                &one(
+                    &container,
+                    ".swarm-root-composer:not([hidden]) .swarm-composer"
+                ),
+                ":scope > *"
+            )
+            .iter()
+            .map(|element| (
+                element.tag_name(),
+                element.class_name(),
+                element.get_bounding_client_rect().height()
+            ))
+            .collect::<Vec<_>>()
         );
         assert!(
             root_composer_rect.height() <= 135.0,
@@ -4373,6 +4720,319 @@ pub(crate) mod wasm_tests {
                     {"type":"member_mention","member_id":"nova-a"},
                     {"type":"text","text":" "}
                 ])
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn shared_images_can_be_added_previewed_and_published_on_boards_and_replies() {
+        use protocol::{
+            ImageData, SwarmFailure, SwarmImage, SwarmImageId, SwarmImageNotifyPayload,
+            SwarmImageOutcome,
+        };
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFUlEQVR4nGPg3fKVJMQwqmFUA3YEAK1USJCnamHcAAAAAElFTkSuQmCC";
+        fn add_files(target: &HtmlElement, method: &str, names: &[&str], png: &str) {
+            js_sys::Reflect::set(
+                &js_sys::global(),
+                &"__test_image_target".into(),
+                target.as_ref(),
+            )
+            .unwrap();
+            js_sys::eval(&format!(r#"(() => {{
+                const target = window.__test_image_target;
+                const transfer = new DataTransfer();
+                const bytes = Uint8Array.from(atob({png}), c => c.charCodeAt(0));
+                for (const name of {names}) transfer.items.add(new File([bytes], name, {{type:'image/png'}}));
+                if ({method} === 'picker') {{
+                    const input = target.querySelector('input[type=file]');
+                    input.files = transfer.files;
+                    input.dispatchEvent(new Event('change', {{bubbles:true}}));
+                }} else if ({method} === 'paste') {{
+                    target.querySelector('textarea').dispatchEvent(new ClipboardEvent('paste', {{clipboardData:transfer,bubbles:true,cancelable:true}}));
+                }} else {{
+                    target.dispatchEvent(new DragEvent('dragover', {{dataTransfer:transfer,bubbles:true,cancelable:true}}));
+                    target.dispatchEvent(new DragEvent('drop', {{dataTransfer:transfer,bubbles:true,cancelable:true}}));
+                }}
+            }})()"#, png=serde_json::to_string(png).unwrap(), names=serde_json::to_string(names).unwrap(), method=serde_json::to_string(method).unwrap())).expect("real File, FileReader and input events");
+        }
+        async fn uploads(harness: &Harness, count: usize) -> Vec<protocol::SwarmImageUpload> {
+            for _ in 0..40 {
+                settle().await;
+                if harness.commands_of("upload_image").len() >= count {
+                    break;
+                }
+            }
+            let uploads = harness.commands_of("upload_image");
+            assert_eq!(
+                uploads.len(),
+                count,
+                "every selected file crosses the host boundary exactly once"
+            );
+            uploads
+                .into_iter()
+                .map(|command| {
+                    let upload: protocol::SwarmImageUpload =
+                        serde_json::from_value(command["image"].clone()).unwrap();
+                    assert!(
+                        js_sys::RegExp::new(
+                            "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                            ""
+                        )
+                        .test(&upload.image_id.0),
+                        "the real composer sends a UUID accepted by the host image store"
+                    );
+                    upload
+                })
+                .collect()
+        }
+        fn metadata(upload: &protocol::SwarmImageUpload) -> SwarmImage {
+            SwarmImage {
+                id: upload.image_id.clone(),
+                name: upload.name.clone(),
+                media_type: upload.data.media_type.clone(),
+                width: 16,
+                height: 12,
+                byte_len: 78,
+            }
+        }
+        fn emit(harness: &Harness, sid: &str, image_id: SwarmImageId, outcome: SwarmImageOutcome) {
+            harness.emit(
+                FrameKind::SwarmImageNotify,
+                &SwarmImageNotifyPayload {
+                    swarm_id: SwarmId(sid.into()),
+                    image_id,
+                    outcome,
+                },
+            );
+        }
+        fn ready(harness: &Harness, sid: &str, upload: &protocol::SwarmImageUpload, pixels: bool) {
+            emit(
+                harness,
+                sid,
+                upload.image_id.clone(),
+                SwarmImageOutcome::Ready {
+                    image: metadata(upload),
+                    data: pixels.then(|| upload.data.clone()),
+                },
+            );
+        }
+        let harness = Harness::new("host-swarm-images");
+        let sid = "sw-images";
+        harness.swarm(&make_swarm(sid, "Images", vec![idle("ada", "Ada")]));
+        let (container, _handle) = mount_view(&harness, sid);
+        harness.board_page(page(sid, SwarmBoard::Briefing, Vec::new(), 0, false));
+        settle().await;
+        let composer = one(&container, ".swarm-root-composer:not([hidden])");
+        assert!(
+            button(&composer, "Add images")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        add_files(
+            &composer,
+            "picker",
+            &["one.png", "remove.png", "two.png"],
+            PNG,
+        );
+        let selected = uploads(&harness, 3).await;
+        assert!(selected.iter().all(|image| image.data
+            == ImageData {
+                media_type: "image/png".into(),
+                data: PNG.into()
+            }));
+        assert_eq!(all(&composer, "figure img").len(), 3);
+        one(&composer, "[aria-label='Remove image remove.png']").click();
+        settle().await;
+        assert_eq!(all(&composer, "figure img").len(), 2);
+        assert!(
+            button(&composer, "Post").has_attribute("disabled"),
+            "posting waits for host durability"
+        );
+        ready(&harness, sid, &selected[0], false);
+        emit(
+            &harness,
+            sid,
+            selected[2].image_id.clone(),
+            SwarmImageOutcome::Failed {
+                error: SwarmFailure {
+                    code: SwarmErrorCode::Storage,
+                    message: "Upload storage unavailable".into(),
+                },
+            },
+        );
+        settle().await;
+        assert!(text_of(&composer).contains("Upload storage unavailable"));
+        button(&composer, "Retry image").click();
+        let retried = uploads(&harness, 4).await;
+        assert!(
+            retried[3] == selected[2],
+            "upload retries preserve identity and exact bytes"
+        );
+        ready(&harness, sid, &selected[2], false);
+        settle().await;
+        assert!(
+            !button(&composer, "Post").has_attribute("disabled"),
+            "image-only posts are supported"
+        );
+        one(&container, "[data-board='Coordination']").click();
+        harness.board_page(page(sid, SwarmBoard::Coordination, Vec::new(), 0, false));
+        settle().await;
+        let coordination = one(&container, ".swarm-root-composer:not([hidden])");
+        add_files(&coordination, "paste", &["clipboard.png"], PNG);
+        let pasted = uploads(&harness, 5).await;
+        ready(&harness, sid, &pasted[4], false);
+        settle().await;
+        button(&container, "Agents").click();
+        settle().await;
+        one(&container, "[data-board='Briefing']").click();
+        settle().await;
+        assert_eq!(
+            all(&composer, "figure img").len(),
+            2,
+            "board and Agents switches preserve image drafts"
+        );
+        button(&composer, "Post").click();
+        settle().await;
+        let publication: SwarmPublication = serde_json::from_value(
+            harness.commands_of("post").last().unwrap()["publication"].clone(),
+        )
+        .unwrap();
+        assert!(publication.body.is_empty());
+        assert_eq!(
+            publication.images,
+            vec![selected[0].image_id.clone(), selected[2].image_id.clone()]
+        );
+        harness.error(
+            sid,
+            Some(&publication.publication_id),
+            SwarmErrorCode::Storage,
+            "Post not persisted",
+        );
+        settle().await;
+        assert_eq!(
+            all(&composer, "figure img").len(),
+            2,
+            "failed posts retain all images"
+        );
+        button(&composer, "Retry").click();
+        settle().await;
+        assert!(
+            harness.commands_of("post").last().unwrap()["publication"]
+                == serde_json::to_value(&publication).unwrap()
+        );
+        let mut posted = make_post(
+            sid,
+            "pictures",
+            "pictures",
+            SwarmBoard::Briefing,
+            1,
+            SwarmAuthor::Human,
+            Vec::new(),
+        );
+        posted.publication_id = publication.publication_id;
+        posted.images = vec![metadata(&selected[0]), metadata(&selected[2])];
+        harness.post(&posted);
+        harness.board_page(page(
+            sid,
+            SwarmBoard::Briefing,
+            vec![posted.clone()],
+            1,
+            false,
+        ));
+        settle().await;
+        assert!(
+            all(&composer, "figure img").is_empty(),
+            "only canonical publication clears the draft"
+        );
+        assert_eq!(harness.commands_of("read_image").len(), 2);
+        emit(
+            &harness,
+            sid,
+            selected[0].image_id.clone(),
+            SwarmImageOutcome::Failed {
+                error: SwarmFailure {
+                    code: SwarmErrorCode::Storage,
+                    message: "Shared pixels unavailable".into(),
+                },
+            },
+        );
+        settle().await;
+        let failed_image = one(&container, ".swarm-shared-image");
+        assert!(text_of(&failed_image).contains("Shared pixels unavailable"));
+        button(&failed_image, "Retry image").click();
+        settle().await;
+        assert_eq!(harness.commands_of("read_image").len(), 3);
+        ready(&harness, sid, &selected[0], true);
+        ready(&harness, sid, &selected[2], true);
+        settle().await;
+        let thread = one(&container, ".swarm-thread");
+        assert_eq!(all(&thread, ".swarm-shared-image img").len(), 2);
+        for thumb in all(&thread, ".swarm-shared-image img") {
+            let img = thumb.dyn_into::<web_sys::HtmlImageElement>().unwrap();
+            assert!(
+                img.complete() && img.natural_width() == 16,
+                "posted pixels decode in the real browser"
+            );
+        }
+        ready(&harness, sid, &selected[0], false);
+        settle().await;
+        assert_eq!(
+            all(&thread, ".swarm-shared-image img").len(),
+            2,
+            "a duplicate upload acknowledgement cannot erase loaded pixels"
+        );
+        one(&thread, "[aria-label='Open image one.png']").click();
+        settle().await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        assert!(
+            document
+                .query_selector("[aria-label='Image viewer']")
+                .unwrap()
+                .is_some()
+        );
+        document
+            .query_selector("[aria-label='Close image viewer']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        button(&thread, "Reply").click();
+        settle().await;
+        let reply = one(&thread, ".swarm-composer-reply");
+        add_files(&reply, "drop", &["drop-a.png", "drop-b.png"], PNG);
+        let dropped = uploads(&harness, 7).await;
+        ready(&harness, sid, &dropped[5], false);
+        ready(&harness, sid, &dropped[6], false);
+        settle().await;
+        button(&reply, "Reply").click();
+        settle().await;
+        let replied: SwarmPublication = serde_json::from_value(
+            harness.commands_of("post").last().unwrap()["publication"].clone(),
+        )
+        .unwrap();
+        assert!(
+            replied.thread_id == Some(posted.thread_id)
+                && replied.images == vec![dropped[5].image_id.clone(), dropped[6].image_id.clone()]
+        );
+        one(&container, "[data-board='Coordination']").click();
+        settle().await;
+        assert_eq!(
+            all(&coordination, "figure img").len(),
+            1,
+            "Briefing publication does not discard Coordination images"
+        );
+        button(&coordination, "Post").click();
+        settle().await;
+        assert!(
+            harness.commands_of("post").last().unwrap()["publication"]["board"] == "coordination"
+        );
+        assert!(
+            harness
+                .command_hosts()
+                .iter()
+                .all(|host| host == &harness.host),
+            "all media stays on the swarm's selected host"
         );
     }
 

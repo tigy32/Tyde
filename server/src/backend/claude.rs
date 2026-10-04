@@ -1422,6 +1422,7 @@ fn claude_native_tool_kind(name: &str) -> NativeToolKind {
         | "mcp__tyde-agent-control__tyde_swarm_describe"
         | "mcp__tyde-agent-control__tyde_swarm_read_board"
         | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+        | "mcp__tyde-agent-control__tyde_swarm_read_image"
         | "mcp__tyde-agent-control__tyde_swarm_post" => NativeToolKind::SessionControl,
         _ => NativeToolKind::Unknown,
     }
@@ -3994,6 +3995,7 @@ impl ClaudeInner {
                         | "mcp__tyde-agent-control__tyde_swarm_describe"
                         | "mcp__tyde-agent-control__tyde_swarm_read_board"
                         | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+                        | "mcp__tyde-agent-control__tyde_swarm_read_image"
                         | "mcp__tyde-agent-control__tyde_swarm_post"
                 )
             {
@@ -7569,6 +7571,7 @@ fn control_response_payload_for_request(
                 "mcp__tyde-agent-control__tyde_swarm_describe"
                     | "mcp__tyde-agent-control__tyde_swarm_read_board"
                     | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+                    | "mcp__tyde-agent-control__tyde_swarm_read_image"
                     | "mcp__tyde-agent-control__tyde_swarm_post"
             )
         {
@@ -12783,6 +12786,49 @@ fn claude_public_tool_result(tool_name: &str, success: bool, tool_result: Value)
     .expect("serialize Claude agent result")
 }
 
+fn normalize_claude_mcp_call_tool_result(block: &Value) -> super::NormalizedMcpToolResult {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum NativeImageSource {
+        #[serde(rename = "base64")]
+        Base64 { media_type: String, data: String },
+    }
+    let mut block = block.clone();
+    if let Some(content) = block.get_mut("content").and_then(Value::as_array_mut) {
+        for part in content {
+            if part.get("type").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+            let Some(source) = part.get("source") else {
+                continue;
+            };
+            tracing::warn!(
+                source_type_present = source.get("type").is_some(),
+                media_type_present = source.get("media_type").is_some(),
+                data_present = source.get("data").is_some(),
+                "Claude MCP image diagnostic: native image source requires canonical projection"
+            );
+            let NativeImageSource::Base64 { media_type, data } = match serde_json::from_value(
+                source.clone(),
+            ) {
+                Ok(source) => source,
+                Err(_) => {
+                    return super::NormalizedMcpToolResult {
+                        success: false,
+                        error: Some("Claude MCP image source is invalid or unsupported".to_owned()),
+                        tool_result: json!({"kind":"Error", "short_message":"Claude MCP image source is invalid or unsupported", "detailed_message":"The native image result could not be projected onto the MCP contract"}),
+                    };
+                }
+            };
+            // The CLI's transcript uses Anthropic image blocks, not MCP image
+            // blocks. Preserve the native pixels while restoring the MCP shape.
+            *part = serde_json::to_value(rmcp::model::Content::image(data, media_type))
+                .expect("serialize typed MCP image content");
+        }
+    }
+    normalize_mcp_call_tool_result(&block)
+}
+
 fn claude_tool_execution_outcome(
     success: bool,
     tool_result: Value,
@@ -13704,7 +13750,7 @@ fn extract_tool_result_events_from_message(
             .unwrap_or(false);
 
         if tool_name.starts_with("mcp__") {
-            let normalized = normalize_mcp_call_tool_result(block);
+            let normalized = normalize_claude_mcp_call_tool_result(block);
             events.push(ClaudeReplayToolExecution {
                 tool_call_id,
                 tool_name,

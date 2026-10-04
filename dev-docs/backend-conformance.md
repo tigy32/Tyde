@@ -672,3 +672,42 @@ placement, adoption of a backend's own resumed turn, and the manual-resume
 path are sims in `server/tests/session_resume.rs`. Providers that replay
 history from their own transcripts may still show the continuation as a user
 message on a later resume; that replay is not covered here.
+
+## Shared swarm images
+
+`real_swarm_shared_images` uses the real host and authenticated board MCP
+router, not synthetic provider events. It uploads a real PNG before the first
+member wake, publishes its metadata on Briefing, requires a real board read
+and `tyde_swarm_read_image` completion carrying the exact metadata and pixels,
+and requires the member to publish the pixel-derived color answer through
+`tyde_swarm_post`. Setup and assertions are identical for every eligible
+provider; only the prompt wording differs to require the same actual reads.
+The case requires image input, enforced read-only access and delegation
+exclusion; Claude and Codex are the currently eligible providers.
+
+Claude's real run reproduced a malformed public MCP completion: its native
+transcript uses Anthropic `image.source` blocks, while MCP uses `data` and
+`mimeType`. The Claude adapter now projects the actual native bytes onto typed
+MCP image content, preserving other native content. Its native source-path
+text annotation is not metadata; the oracle requires exactly one typed image
+metadata block and one exact image block rather than rejecting that annotation.
+Malformed or unsupported native image sources fail explicitly.
+
+Validation on 2026-10-04: the shared-pixel case passed Claude Haiku 4.5
+(12.82s) and Codex gpt-5.6-luna at low effort (10.22s). Server protocol simulations cover
+PNG, JPEG, GIF and WebP, bounded validation, upload and publication idempotency,
+image-only roots, replies, both boards, unpublished and foreign-swarm access
+refusal, corrupt media, committed-but-uncertain durability and host restart.
+The real-DOM flow covers picker, clipboard and multi-file drop, individual
+removal, readiness, upload/read/publication failures and retry, independent
+board drafts, Agents-tab preservation, decoded posted pixels and the viewer.
+Ordinary chat-image behavior and swarm notification routing are unchanged.
+
+The live Linux desktop flow additionally verified multi-image picker, paste and
+drop, image-only publication, replies, per-image removal, decoded pixels and
+the full-size viewer through the real host. Five published references matched
+the host-owned files and digests. The composer measured 132.69px empty, used
+the available pane width and did not overflow a 420px pane. This check caught
+the client sending opaque history IDs where the image store requires UUIDs;
+image uploads now mint cryptographically random UUIDs, and the mounted-DOM
+flow checks the actual outbound identity shape before host acknowledgement.

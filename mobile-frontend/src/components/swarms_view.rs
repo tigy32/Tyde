@@ -507,6 +507,7 @@ fn SwarmComposer(
             .publication_id
             .unwrap_or_else(|| SwarmPublicationId(uuid::Uuid::new_v4().to_string()));
         let publication = SwarmPublication {
+            images: Vec::new(),
             board: d.board,
             publication_id: publication_id.clone(),
             body: body.get_untracked(),
@@ -638,6 +639,7 @@ mod wasm_tests {
     fn acknowledged(swarm: &Swarm, publication: SwarmPublication, cursor: u64) -> SwarmPost {
         let id = SwarmPostId(format!("mobile-post-{cursor}"));
         SwarmPost {
+            images: Vec::new(),
             thread_id: publication
                 .thread_id
                 .unwrap_or_else(|| SwarmThreadId(id.0.clone())),
@@ -954,6 +956,7 @@ mod wasm_tests {
             acknowledged(
                 &swarm,
                 SwarmPublication {
+                    images: Vec::new(),
                     board: SwarmBoard::Briefing,
                     publication_id: SwarmPublicationId(format!("past-{cursor}")),
                     body: vec![SwarmBodySegment::Text {
@@ -1015,6 +1018,7 @@ mod wasm_tests {
         let mut reply = acknowledged(
             &swarm,
             SwarmPublication {
+                images: Vec::new(),
                 board: SwarmBoard::Briefing,
                 publication_id: SwarmPublicationId("agent-reply".into()),
                 body: vec![SwarmBodySegment::Text {
@@ -1147,6 +1151,7 @@ mod wasm_tests {
         let linked_root = acknowledged(
             &swarm,
             SwarmPublication {
+                images: Vec::new(),
                 board: SwarmBoard::Coordination,
                 publication_id: SwarmPublicationId("older-thread".into()),
                 body: vec![SwarmBodySegment::Text {
@@ -1162,6 +1167,7 @@ mod wasm_tests {
                 acknowledged(
                     &swarm,
                     SwarmPublication {
+                        images: Vec::new(),
                         board: SwarmBoard::Coordination,
                         publication_id: SwarmPublicationId(format!("older-reply-{cursor}")),
                         body: vec![SwarmBodySegment::Text {
@@ -1178,6 +1184,7 @@ mod wasm_tests {
         let link_source = acknowledged(
             &swarm,
             SwarmPublication {
+                images: Vec::new(),
                 board: SwarmBoard::Briefing,
                 publication_id: SwarmPublicationId("link-source".into()),
                 body: vec![SwarmBodySegment::PostLink {

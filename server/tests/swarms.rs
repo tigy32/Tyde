@@ -280,6 +280,7 @@ impl Scenario {
                     | FrameKind::SwarmPostNotify
                     | FrameKind::SwarmBoardNotify
                     | FrameKind::SwarmThreadNotify
+                    | FrameKind::SwarmImageNotify
                     | FrameKind::SwarmErrorNotify
                     | FrameKind::ProjectNotify
                     | FrameKind::TeamNotify
@@ -714,6 +715,7 @@ fn ready(swarm: &Swarm) -> bool {
 
 fn publication(board: SwarmBoard, key: &str, body: Vec<SwarmBodySegment>) -> SwarmPublication {
     SwarmPublication {
+        images: Vec::new(),
         board,
         publication_id: SwarmPublicationId(key.to_owned()),
         body,
@@ -1812,7 +1814,30 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             .await
             .expect("connect scoped catalog");
         let tools = service.list_all_tools().await.expect("list scoped tools");
-        assert_eq!(tools.len(), if broad { 7 } else { 4 });
+        let mut names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut expected = vec![
+            "tyde_swarm_describe",
+            "tyde_swarm_read_board",
+            "tyde_swarm_read_thread",
+            "tyde_swarm_read_image",
+            "tyde_swarm_post",
+        ];
+        if broad {
+            expected.extend([
+                "tyde_list_workbenches",
+                "tyde_create_workbench",
+                "tyde_remove_workbench",
+            ]);
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "scope exposes only its reviewed board and workbench tools"
+        );
         assert!(!tools.iter().any(|tool| tool.name == "tyde_spawn_agent"));
         service.cancel().await.expect("close scoped catalog");
         tool_error(
@@ -3203,6 +3228,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             event.kind,
             FrameKind::SwarmBoardNotify
                 | FrameKind::SwarmThreadNotify
+                | FrameKind::SwarmImageNotify
                 | FrameKind::SwarmErrorNotify
         )),
         "the live observer sees shared MarkRead, never the paused client's private bulk pages or errors"
@@ -4409,13 +4435,14 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .expect("list authenticated swarm tools over HTTP");
     assert_eq!(
         tools.len(),
-        4,
-        "a swarm caller must see exactly the four shared-board tools, not ordinary orchestration tools"
+        5,
+        "a swarm caller sees the five shared-board tools, never ordinary orchestration tools"
     );
     for (name, read_only) in [
         ("tyde_swarm_describe", true),
         ("tyde_swarm_read_board", true),
         ("tyde_swarm_read_thread", true),
+        ("tyde_swarm_read_image", true),
         ("tyde_swarm_post", false),
     ] {
         let tool = tools
@@ -9546,5 +9573,332 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     assert!(
         ordinary_control.violations().await.is_empty()
             && member_control.violations().await.is_empty()
+    );
+}
+
+#[tokio::test]
+async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members() {
+    use base64::Engine;
+    use protocol::{
+        ImageData, SwarmImage, SwarmImageId, SwarmImageNotifyPayload, SwarmImageOutcome,
+        SwarmImageUpload,
+    };
+
+    async fn image_event(
+        scenario: &mut Scenario,
+        swarm: &SwarmId,
+        id: &SwarmImageId,
+    ) -> SwarmImageOutcome {
+        let event: SwarmImageNotifyPayload = scenario
+            .wait(
+                FrameKind::SwarmImageNotify,
+                "shared image outcome",
+                |event: &SwarmImageNotifyPayload| event.swarm_id == *swarm && event.image_id == *id,
+            )
+            .await;
+        event.outcome
+    }
+    async fn upload(
+        scenario: &mut Scenario,
+        swarm: &SwarmId,
+        image: &SwarmImageUpload,
+    ) -> SwarmImageOutcome {
+        scenario
+            .send(SwarmCommandPayload::UploadImage {
+                swarm_id: swarm.clone(),
+                image: image.clone(),
+            })
+            .await;
+        image_event(scenario, swarm, &image.image_id).await
+    }
+    async fn read(
+        scenario: &mut Scenario,
+        swarm: &SwarmId,
+        id: &SwarmImageId,
+    ) -> SwarmImageOutcome {
+        scenario
+            .send(SwarmCommandPayload::ReadImage {
+                swarm_id: swarm.clone(),
+                image_id: id.clone(),
+            })
+            .await;
+        image_event(scenario, swarm, id).await
+    }
+    fn rejected(outcome: SwarmImageOutcome, code: SwarmErrorCode) {
+        let SwarmImageOutcome::Failed { error } = outcome else {
+            panic!("invalid shared image must fail visibly")
+        };
+        assert_eq!(error.code, code);
+        assert!(!error.message.is_empty());
+    }
+
+    let mut scenario = Scenario::new().await;
+    let swarm = scenario.launched(1).await;
+    scenario.pause(&swarm.id).await;
+    let caller = scenario
+        .fixture
+        .agent_control_caller(
+            swarm.members[0]
+                .agent_id
+                .as_ref()
+                .expect("live authenticated member"),
+        )
+        .await;
+    let mut uploads = Vec::new();
+    let mut images = Vec::new();
+    for (format, mime) in [
+        (image::ImageFormat::Png, "image/png"),
+        (image::ImageFormat::Jpeg, "image/jpeg"),
+        (image::ImageFormat::Gif, "image/gif"),
+        (image::ImageFormat::WebP, "image/webp"),
+    ] {
+        let pixels = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            12,
+            image::Rgb([13, 180, 245]),
+        ));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, format)
+            .expect("encode actual image fixture");
+        let item = SwarmImageUpload {
+            image_id: SwarmImageId(uuid::Uuid::new_v4().to_string()),
+            name: format!("shared.{format:?}"),
+            data: ImageData {
+                media_type: mime.to_owned(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
+            },
+        };
+        if format == image::ImageFormat::Png {
+            scenario.fixture.fail_next_swarm_directory_sync().await;
+        }
+        let SwarmImageOutcome::Ready { image, data: None } =
+            upload(&mut scenario, &swarm.id, &item).await
+        else {
+            panic!("valid image upload must succeed")
+        };
+        assert!(image.width == 16 && image.height == 12 && image.byte_len > 0);
+        assert_eq!(image.id, item.image_id);
+        if format == image::ImageFormat::Png {
+            scenario
+                .error(SwarmErrorCode::CommittedDurabilityUncertain)
+                .await;
+            assert_eq!(
+                scenario.snapshot(&swarm.id).await.recovery_requirement,
+                protocol::SwarmRecoveryRequirement::ExplicitResume
+            );
+        }
+
+        assert!(
+            matches!(
+                upload(&mut scenario, &swarm.id, &item).await,
+                SwarmImageOutcome::Ready { data: None, .. }
+            ),
+            "same upload is idempotent"
+        );
+        assert!(
+            matches!(read(&mut scenario, &swarm.id, &item.image_id).await, SwarmImageOutcome::Ready { image: loaded, data: Some(data) } if loaded == image && data == item.data)
+        );
+        swarm_tool_error(
+            &call_tool(
+                &caller,
+                "tyde_swarm_read_image",
+                json!({"image_id": item.image_id}),
+            )
+            .await,
+            SwarmErrorCode::Unauthorized,
+        );
+        images.push(image);
+        uploads.push(item);
+    }
+    let mut invalid = uploads[0].clone();
+    invalid.name = "changed.png".into();
+    rejected(
+        upload(&mut scenario, &swarm.id, &invalid).await,
+        SwarmErrorCode::Conflict,
+    );
+    for (id, mime, data) in [
+        (
+            "../escape".to_owned(),
+            "image/png",
+            uploads[0].data.data.clone(),
+        ),
+        (
+            uuid::Uuid::new_v4().to_string(),
+            "image/svg+xml",
+            uploads[0].data.data.clone(),
+        ),
+        (
+            uuid::Uuid::new_v4().to_string(),
+            "image/jpeg",
+            uploads[0].data.data.clone(),
+        ),
+        (
+            uuid::Uuid::new_v4().to_string(),
+            "image/png",
+            "not base64".to_owned(),
+        ),
+        (
+            uuid::Uuid::new_v4().to_string(),
+            "image/png",
+            base64::engine::general_purpose::STANDARD.encode(b"not image pixels"),
+        ),
+        (
+            uuid::Uuid::new_v4().to_string(),
+            "image/png",
+            "A".repeat(protocol::SWARM_MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4),
+        ),
+    ] {
+        rejected(
+            upload(
+                &mut scenario,
+                &swarm.id,
+                &SwarmImageUpload {
+                    image_id: SwarmImageId(id),
+                    name: "invalid.png".into(),
+                    data: ImageData {
+                        media_type: mime.into(),
+                        data,
+                    },
+                },
+            )
+            .await,
+            SwarmErrorCode::Invalid,
+        );
+    }
+    let mut root = publication(SwarmBoard::Briefing, "image-only", Vec::new());
+    root.images = images.iter().map(|image| image.id.clone()).collect();
+    let posted = scenario.post(&swarm.id, root.clone()).await;
+    assert!(posted.body.is_empty());
+    assert_eq!(posted.images, images);
+    let before = scenario.snapshot(&swarm.id).await.notifications.len();
+    assert_eq!(scenario.post(&swarm.id, root.clone()).await, posted);
+    assert_eq!(
+        scenario
+            .snapshot_after_commands(&swarm.id)
+            .await
+            .notifications
+            .len(),
+        before,
+        "image post retry must not duplicate notification intents"
+    );
+    let mut conflict = root;
+    conflict.images.reverse();
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: swarm.id.clone(),
+            publication: conflict,
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Conflict).await;
+    let mut reply = publication(
+        SwarmBoard::Briefing,
+        "image-reply",
+        vec![text("More pictures")],
+    );
+    reply.thread_id = Some(posted.thread_id.clone());
+    reply.images = vec![images[1].id.clone()];
+    let replied = scenario.post(&swarm.id, reply).await;
+    let thread = scenario
+        .thread(
+            &swarm.id,
+            SwarmThreadRead {
+                thread_id: posted.thread_id.clone(),
+                after_cursor: None,
+                limit: Some(50),
+            },
+        )
+        .await;
+    assert_eq!(thread.root, posted);
+    assert!(thread.posts.contains(&replied));
+    let mut coordination = publication(SwarmBoard::Coordination, "coordination-image", Vec::new());
+    coordination.images = vec![images[2].id.clone()];
+    let coord = scenario.post(&swarm.id, coordination).await;
+    assert!(
+        scenario
+            .board(&swarm.id, read_board(SwarmBoard::Coordination))
+            .await
+            .posts
+            .contains(&coord)
+    );
+    for (item, metadata) in uploads.iter().zip(&images) {
+        let result = call_tool(
+            &caller,
+            "tyde_swarm_read_image",
+            json!({"image_id": item.image_id}),
+        )
+        .await;
+        assert_eq!(tool_value::<SwarmImage>(&result), *metadata);
+        assert_eq!(
+            result.content.len(),
+            2,
+            "MCP returns metadata and actual pixels, not just a filename"
+        );
+        let RawContent::Image(content) = &result.content[1].raw else {
+            panic!("image tool must contain image content")
+        };
+        assert!(content.mime_type == item.data.media_type && content.data == item.data.data);
+    }
+    let other = scenario.launched(1).await;
+    scenario.pause(&other.id).await;
+    rejected(
+        read(&mut scenario, &other.id, &images[0].id).await,
+        SwarmErrorCode::NotFound,
+    );
+    rejected(
+        upload(&mut scenario, &other.id, &uploads[0]).await,
+        SwarmErrorCode::Conflict,
+    );
+    let mut foreign = publication(SwarmBoard::Briefing, "foreign-image", Vec::new());
+    foreign.images = vec![images[0].id.clone()];
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: other.id.clone(),
+            publication: foreign,
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Unauthorized).await;
+    let other_caller = scenario
+        .fixture
+        .agent_control_caller(other.members[0].agent_id.as_ref().expect("other member"))
+        .await;
+    swarm_tool_error(
+        &call_tool(
+            &other_caller,
+            "tyde_swarm_read_image",
+            json!({"image_id": images[0].id}),
+        )
+        .await,
+        SwarmErrorCode::Unauthorized,
+    );
+    let image_path = scenario
+        .fixture
+        .swarm_store_path()
+        .with_extension("images")
+        .join(&images[0].id.0);
+    let bytes = std::fs::read(&image_path).expect("host-owned image exists");
+    std::fs::write(&image_path, vec![0u8; bytes.len()]).expect("simulate corrupt media");
+    rejected(
+        read(&mut scenario, &swarm.id, &images[0].id).await,
+        SwarmErrorCode::Storage,
+    );
+    std::fs::write(&image_path, bytes).expect("restore actual bytes");
+    scenario.fixture.restart_host().await;
+    scenario.pending.clear();
+    let restored = scenario
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
+        .await;
+    assert!(restored.posts.contains(&posted) && restored.posts.contains(&replied));
+    for item in &uploads {
+        assert!(
+            matches!(read(&mut scenario, &swarm.id, &item.image_id).await, SwarmImageOutcome::Ready { data: Some(data), .. } if data == item.data),
+            "pixels must survive host restart"
+        );
+    }
+    assert!(
+        !std::path::Path::new(&scenario.project.root_paths()[0].0)
+            .join("shared.Png")
+            .exists(),
+        "read-only project is never the upload store"
     );
 }
