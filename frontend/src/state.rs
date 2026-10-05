@@ -3313,6 +3313,7 @@ pub struct TeamMemberShuffleSuggestionEntry {
 /// board or thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmPageMeta {
+    pub head_cursor: Option<u64>,
     /// Opaque continuation cursor; submitted back unchanged.
     pub next_cursor: SwarmReadCursor,
     pub high_water: u64,
@@ -3340,6 +3341,7 @@ impl SwarmPostsState {
 
     pub fn apply_board_page(&mut self, page: SwarmBoardPage) {
         let meta = SwarmPageMeta {
+            head_cursor: None,
             next_cursor: page.next_cursor,
             high_water: page.high_water,
             has_more: page.has_more,
@@ -3357,6 +3359,7 @@ impl SwarmPostsState {
         self.threads.insert(
             page.thread_id,
             SwarmPageMeta {
+                head_cursor: Some(page.head_cursor),
                 next_cursor: page.next_cursor,
                 high_water: page.high_water,
                 has_more: page.has_more,

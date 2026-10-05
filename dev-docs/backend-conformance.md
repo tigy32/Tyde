@@ -680,7 +680,8 @@ router, not synthetic provider events. It uploads a real PNG before the first
 member wake, publishes its metadata on Briefing, requires a real board read
 and `tyde_swarm_read_image` completion carrying the exact metadata and pixels,
 and requires the member to publish the pixel-derived color answer through
-`tyde_swarm_post`. Setup and assertions are identical for every eligible
+`tyde_swarm_update_thread` after reading the human thread summary, using its
+exact sequence and advancing it once. Setup and assertions are identical for every eligible
 provider; only the prompt wording differs to require the same actual reads.
 The case requires image input, enforced read-only access and delegation
 exclusion; Claude and Codex are the currently eligible providers.
@@ -747,3 +748,49 @@ reply and pixels, and preserved independent reply and new-request drafts.
 At 390px it had no horizontal overflow; single-line request rows measured
 67.75px. The native instance, browser and ephemeral stores were stopped.
 This is scoped UI/host validation, not a complete backend certification.
+
+
+## Stateful swarm interaction tools
+
+`real_swarm_board_coordination` drives the production host and native MCP
+interfaces under enforced read-only project access. A peer atomically creates
+Coordination under the exact human request; another peer lists the directory,
+reads the current summary and attributed deltas, and publishes a conditional
+reply. Native tool results must preserve authenticated authors, causal rounds,
+parent ownership, and the summary/delta sequence. All five new tools need actual
+correlated completions, not private prose or inferred results.
+
+The existing busy/Pending, sequential audit, follow-up cardinality, restart, and
+resume oracles remain intact. Four distinct page limits (50, 60, 70, 80) make
+the requested eight audit reads unambiguously separate work; the case also
+checks those exact limits without relaxing any prior assertion. Tool descriptions
+spell out the different `type` body-segment and `kind` summary discriminators.
+Invalid model arguments are still rejected rather than translated or guessed.
+
+The deterministic server regression races two authenticated creators, rejects a
+stale human-thread update without mutation, verifies catch-up and idempotent
+stale retries, and exercises UTF-8 limits, pinned pagination and persistence.
+It was run against the unchanged server and failed at the missing native tool;
+with the implementation, it passes within the canonical server suite.
+
+Scoped stateful-thread validation on 2026-10-04 used Claude Code Haiku
+(Claude Haiku 4.5 through the existing OpenRouter credential after the direct
+account reached its weekly quota) and Codex `gpt-5.6-luna` with low reasoning.
+Both providers passed `real_swarm_board_coordination` and
+`real_swarm_shared_images`, including the same assertions and capability gates.
+The final coordination runs took 138s and 104s respectively; image runs took
+19s and 18s respectively. These are feature-path results, not full backend certification.
+
+Live desktop QA used a branch-built debug MCP launcher because the resident
+launcher used protocol 69 and could not handshake with protocol 72. Its typed
+UI-debug Evaluate transport drove the actual rendered app with attested
+ephemeral project/session stores and one read-only Codex `gpt-5.6-luna` peer.
+The human composer created sequence 1; the peer replaced its summary and
+published one reply in that exact human thread at sequence 2. The current
+state changed reactively. An explicit Coordination child linked back to that
+human request; a second creation displayed a conflict, froze the uncertain
+payload, and committed no losing delta. Edit unlocked the proposal. Durable
+state contained exactly two threads and three deltas, and the instance was
+stopped. Desktop/mobile DOM suites additionally cover conditional composers,
+reactive state, compact layouts, and identical frozen retries. Unsupported
+screenshot/second-client capabilities were not used or claimed.

@@ -465,7 +465,24 @@ impl Scenario {
             .await
     }
 
-    async fn post(&mut self, id: &SwarmId, publication: SwarmPublication) -> SwarmPost {
+    async fn post(&mut self, id: &SwarmId, mut publication: SwarmPublication) -> SwarmPost {
+        if publication.thread_change.is_none()
+            && let Some(thread_id) = &publication.thread_id
+        {
+            let snapshot = self.snapshot(id).await;
+            if let Some(thread) = snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.thread_id == *thread_id)
+            {
+                publication.thread_change = Some(protocol::SwarmThreadChange::Update {
+                    expected_seq: thread.seq,
+                    summary: protocol::SwarmSummaryChange::Append {
+                        text: "Human scenario contribution".into(),
+                    },
+                });
+            }
+        }
         let key = publication.publication_id.clone();
         self.send(SwarmCommandPayload::Post {
             swarm_id: id.clone(),
@@ -715,6 +732,7 @@ fn ready(swarm: &Swarm) -> bool {
 
 fn publication(board: SwarmBoard, key: &str, body: Vec<SwarmBodySegment>) -> SwarmPublication {
     SwarmPublication {
+        thread_change: None,
         images: Vec::new(),
         board,
         publication_id: SwarmPublicationId(key.to_owned()),
@@ -833,7 +851,115 @@ async fn client_event_without_swarm(
     .unwrap_or_else(|_| panic!("ordinary activity barrier timed out during {phase}"))
 }
 
+// Older flow fixtures describe publications rather than thread state. Supply
+// the new wire contract through real authenticated reads without changing their
+// original body, author, notification, permission, or causal assertions.
 async fn call_tool(
+    caller: &server::AgentControlMcpCaller,
+    name: &str,
+    arguments: Value,
+) -> CallToolResult {
+    if name != "tyde_swarm_post"
+        || arguments
+            .get("thread_change")
+            .is_some_and(|value| !value.is_null())
+    {
+        return call_tool_raw(caller, name, arguments).await;
+    }
+    let described = call_tool_raw(caller, "tyde_swarm_describe", json!({})).await;
+    if described.is_error == Some(true) {
+        return call_tool_raw(caller, name, arguments).await;
+    }
+    let described: protocol::SwarmDescribe = tool_value(&described);
+    let mut publication: SwarmPublication =
+        serde_json::from_value(arguments).expect("typed fixture publication");
+    let page: SwarmBoardPage = tool_value(
+        &call_tool_raw(
+            caller,
+            "tyde_swarm_read_board",
+            json!({"board": publication.board, "limit":100}),
+        )
+        .await,
+    );
+    let existing = page.posts.iter().find(|post| {
+        post.publication_id == publication.publication_id
+            && post.author
+                == (SwarmAuthor::Member {
+                    member_id: described.member_id.clone(),
+                })
+    });
+    if let Some(existing) = existing {
+        publication.thread_change = existing.thread_change.clone();
+        publication.thread_id = match existing.thread_change {
+            Some(protocol::SwarmThreadChange::Create { .. }) => None,
+            _ => Some(existing.thread_id.clone()),
+        };
+    } else {
+        if publication.thread_id.is_none()
+            && publication.board == SwarmBoard::Coordination
+            && let Some(child) = described
+                .swarm
+                .threads
+                .iter()
+                .find(|thread| thread.board == SwarmBoard::Coordination)
+        {
+            publication.thread_id = Some(child.thread_id.clone());
+        }
+        publication.thread_change = Some(match &publication.thread_id {
+            Some(id) => match described
+                .swarm
+                .threads
+                .iter()
+                .find(|thread| thread.thread_id == *id)
+            {
+                Some(thread) => protocol::SwarmThreadChange::Update {
+                    expected_seq: thread.seq,
+                    summary: protocol::SwarmSummaryChange::Append {
+                        text: "Protocol scenario contribution".into(),
+                    },
+                },
+                None => {
+                    let thread: SwarmThreadPage = tool_value(
+                        &call_tool_raw(
+                            caller,
+                            "tyde_swarm_read_thread",
+                            json!({"thread_id":id,"limit":100}),
+                        )
+                        .await,
+                    );
+                    protocol::SwarmThreadChange::Initialize {
+                        expected_cursor: thread.high_water,
+                        title: "Protocol scenario".into(),
+                        description: "Authenticated feature flow".into(),
+                        summary: "Protocol scenario contribution".into(),
+                    }
+                }
+            },
+            None => protocol::SwarmThreadChange::Create {
+                title: "Protocol scenario".into(),
+                description: "Authenticated feature flow".into(),
+                summary: "Protocol scenario contribution".into(),
+                parent_thread_id: if publication.board == SwarmBoard::Coordination {
+                    described
+                        .swarm
+                        .opening_post_id
+                        .as_ref()
+                        .map(|post| protocol::SwarmThreadId(post.0.clone()))
+                } else {
+                    None
+                },
+            },
+        });
+    }
+    call_tool_raw(
+        caller,
+        name,
+        serde_json::to_value(publication).expect("stateful fixture publication"),
+    )
+    .await
+}
+
+async fn call_tool_raw(
     caller: &server::AgentControlMcpCaller,
     name: &str,
     arguments: Value,
@@ -1826,6 +1952,11 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             "tyde_swarm_read_thread",
             "tyde_swarm_read_image",
             "tyde_swarm_post",
+            "tyde_swarm_list_threads",
+            "tyde_swarm_read_summary",
+            "tyde_swarm_read_deltas",
+            "tyde_swarm_create_thread",
+            "tyde_swarm_update_thread",
         ];
         if broad {
             expected.extend([
@@ -4535,8 +4666,8 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .expect("list authenticated swarm tools over HTTP");
     assert_eq!(
         tools.len(),
-        5,
-        "a swarm caller sees the five shared-board tools, never ordinary orchestration tools"
+        10,
+        "a swarm caller sees thread and shared-board tools, never ordinary orchestration tools"
     );
     for (name, read_only) in [
         ("tyde_swarm_describe", true),
@@ -4544,6 +4675,11 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         ("tyde_swarm_read_thread", true),
         ("tyde_swarm_read_image", true),
         ("tyde_swarm_post", false),
+        ("tyde_swarm_list_threads", true),
+        ("tyde_swarm_read_summary", true),
+        ("tyde_swarm_read_deltas", true),
+        ("tyde_swarm_create_thread", false),
+        ("tyde_swarm_update_thread", false),
     ] {
         let tool = tools
             .iter()
@@ -5839,8 +5975,12 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             },
         )
         .await;
+    // Explicit initialization retains the legacy root's entire content and
+    // assigns its canonical first delta sequence; nothing else may change.
+    let mut initialized_pending = pending_post.clone();
+    initialized_pending.thread_seq = Some(1);
     assert!(
-        persisted_handoff.root == pending_post
+        persisted_handoff.root == initialized_pending
             && persisted_handoff.posts == vec![final_handoff.post],
         "retirement must retain the permitted final handoff exactly once and reject any post from the closed historical caller"
     );
@@ -10000,5 +10140,219 @@ async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members(
             .join("shared.Png")
             .exists(),
         "read-only project is never the upload store"
+    );
+}
+
+#[tokio::test]
+async fn stateful_threads_race_create_and_reconcile_updates_without_losing_history() {
+    let mut scenario = Scenario::new().await;
+    let swarm = scenario.launched(2).await;
+    scenario.pause(&swarm.id).await;
+    let first = scenario
+        .fixture
+        .agent_control_caller(swarm.members[0].agent_id.as_ref().expect("first peer"))
+        .await;
+    let second = scenario
+        .fixture
+        .agent_control_caller(swarm.members[1].agent_id.as_ref().expect("second peer"))
+        .await;
+    let human = scenario.post(&swarm.id, serde_json::from_value(json!({
+        "board":"briefing", "publication_id":"stateful-human-root", "thread_id":null,
+        "body":[{"type":"text","text":"Investigate the reported issue"}],
+        "thread_change":{"kind":"create","title":"Investigate issue","description":"Human request","summary":"Investigation requested","parent_thread_id":null}
+    })).expect("canonical human creation")).await;
+    let create = |key: &str| json!({"parent_thread_id":human.thread_id,"title":"Issue coordination","description":"Peer investigation","summary":"Investigation beginning","publication_id":key,"body":[{"type":"text","text":"Coordinate evidence here"}]});
+    let (a, b) = tokio::join!(
+        call_tool(&first, "tyde_swarm_create_thread", create("race-a")),
+        call_tool(&second, "tyde_swarm_create_thread", create("race-b"))
+    );
+    let a: Value = tool_value(&a);
+    let b: Value = tool_value(&b);
+    assert!(
+        (a["kind"] == "created" && b["kind"] == "already_exists")
+            || (b["kind"] == "created" && a["kind"] == "already_exists"),
+        "exactly one peer creates the shared child"
+    );
+    assert!(a["thread"]["thread_id"] == b["thread"]["thread_id"]);
+    let child = a["thread"]["thread_id"].clone();
+    let directory: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_list_threads",
+            json!({"board":"coordination","parent_thread_id":human.thread_id,"limit":1}),
+        )
+        .await,
+    );
+    assert!(
+        directory["threads"].as_array().expect("directory").len() == 1
+            && directory["threads"][0]["thread_id"] == child
+    );
+    assert!(
+        directory["threads"][0].get("summary").is_none(),
+        "directory omits summary bodies"
+    );
+    let deltas: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_deltas",
+            json!({"thread_id":child,"after_seq":0,"limit":1}),
+        )
+        .await,
+    );
+    assert!(
+        deltas["deltas"].as_array().expect("deltas").len() == 1
+            && deltas["high_water"] == 1
+            && deltas["has_more"] == false,
+        "losing creator contributes no delta"
+    );
+    let summary: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_summary",
+            json!({"thread_id":human.thread_id}),
+        )
+        .await,
+    );
+    assert!(summary["seq"] == 1);
+    let update = |key: &str, seq: u64, kind: &str, state: &str| json!({"thread_id":human.thread_id,"expected_seq":seq,"summary_change":{"kind":kind,"text":state},"publication_id":key,"body":[{"type":"text","text":"Published contribution"}]});
+    let first_update = update("first-answer", 1, "append", "Evidence collected");
+    let published: Value =
+        tool_value(&call_tool(&first, "tyde_swarm_update_thread", first_update.clone()).await);
+    swarm_tool_error(
+        &call_tool(
+            &second,
+            "tyde_swarm_update_thread",
+            update("stale-answer", 1, "append", "Concurrent contribution"),
+        )
+        .await,
+        SwarmErrorCode::Conflict,
+    );
+    let duplicate: Value =
+        tool_value(&call_tool(&first, "tyde_swarm_update_thread", first_update).await);
+    assert!(
+        duplicate["duplicate"] == true && duplicate["post"]["id"] == published["post"]["id"],
+        "identical stale retry returns the original publication"
+    );
+    let latest: Value = tool_value(
+        &call_tool(
+            &second,
+            "tyde_swarm_read_summary",
+            json!({"thread_id":human.thread_id}),
+        )
+        .await,
+    );
+    assert!(
+        latest["seq"] == 2 && latest["summary"] == "Investigation requested\nEvidence collected"
+    );
+    let catchup: Value = tool_value(
+        &call_tool(
+            &second,
+            "tyde_swarm_read_deltas",
+            json!({"thread_id":human.thread_id,"after_seq":1,"through_seq":2}),
+        )
+        .await,
+    );
+    assert!(
+        catchup["deltas"].as_array().expect("catchup").len() == 1
+            && catchup["deltas"][0]["id"] == published["post"]["id"]
+    );
+    let compacted: Value = tool_value(
+        &call_tool(
+            &second,
+            "tyde_swarm_update_thread",
+            update(
+                "reconciled-answer",
+                2,
+                "replace",
+                "Evidence verified; deployment remains pending",
+            ),
+        )
+        .await,
+    );
+    assert!(compacted["post"]["thread_seq"] == 3);
+    let boundary = "é".repeat(2048);
+    let full: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_update_thread",
+            update("full-summary", 3, "replace", &boundary),
+        )
+        .await,
+    );
+    assert!(full["post"]["thread_seq"] == 4);
+    swarm_tool_error(
+        &call_tool(
+            &second,
+            "tyde_swarm_update_thread",
+            update("overflow", 4, "append", "x"),
+        )
+        .await,
+        SwarmErrorCode::Invalid,
+    );
+    let unchanged: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_summary",
+            json!({"thread_id":human.thread_id}),
+        )
+        .await,
+    );
+    assert!(
+        unchanged["seq"] == 4 && unchanged["summary"].as_str().expect("summary").len() == 4096,
+        "oversized append changes neither summary nor sequence"
+    );
+    let bounded: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_deltas",
+            json!({"thread_id":human.thread_id,"after_seq":1,"through_seq":3,"limit":1}),
+        )
+        .await,
+    );
+    assert!(bounded["has_more"] == true && bounded["next_seq"] == 2 && bounded["high_water"] == 3);
+    let next: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_deltas",
+            json!({"thread_id":human.thread_id,"after_seq":2,"through_seq":3,"limit":1}),
+        )
+        .await,
+    );
+    assert!(
+        next["has_more"] == false
+            && next["next_seq"] == 3
+            && next["deltas"].as_array().expect("snapshot").len() == 1
+    );
+    let child_state: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_summary",
+            json!({"thread_id":child}),
+        )
+        .await,
+    );
+    assert!(
+        child_state["seq"] == 1,
+        "parent updates cannot rewrite the child"
+    );
+    let mut nested = create("nested-child");
+    nested["parent_thread_id"] = child;
+    swarm_tool_error(
+        &call_tool(&first, "tyde_swarm_create_thread", nested).await,
+        SwarmErrorCode::Invalid,
+    );
+    swarm_tool_error(&call_tool_raw(&first,"tyde_swarm_post",json!({"board":"briefing","thread_id":human.thread_id,"publication_id":"raw-bypass","body":[{"type":"text","text":"Unversioned reply"}]})).await,SwarmErrorCode::Invalid);
+    let restarted = scenario.fixture.restart_host().await;
+    let restored = restarted
+        .swarms
+        .iter()
+        .find(|state| state.id == swarm.id)
+        .expect("persisted swarm");
+    let value = serde_json::to_value(restored).expect("restored canonical state");
+    assert!(
+        value["threads"].as_array().expect("threads").len() == 2
+            && value["threads"][0]["seq"] == 4
+            && value["threads"][1]["seq"] == 1,
+        "restart preserves current summaries and unique child identity"
     );
 }

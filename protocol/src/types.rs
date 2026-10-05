@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 71;
+pub const PROTOCOL_VERSION: u32 = 72;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9107,6 +9107,8 @@ pub struct SwarmChangePreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Swarm {
     #[serde(default)]
+    pub threads: Vec<SwarmThread>,
+    #[serde(default)]
     pub recovery_requirement: SwarmRecoveryRequirement,
     #[serde(default)]
     pub source_draft_id: Option<SwarmDraftId>,
@@ -9187,8 +9189,127 @@ pub enum SwarmAuthor {
     Human,
     Member { member_id: SwarmMemberId },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmSummaryChange {
+    Append { text: String },
+    Replace { text: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmThreadChange {
+    Create {
+        title: String,
+        description: String,
+        summary: String,
+        parent_thread_id: Option<SwarmThreadId>,
+    },
+    Update {
+        expected_seq: u64,
+        summary: SwarmSummaryChange,
+    },
+    Initialize {
+        expected_cursor: u64,
+        title: String,
+        description: String,
+        summary: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThread {
+    pub swarm_id: SwarmId,
+    pub thread_id: SwarmThreadId,
+    pub board: SwarmBoard,
+    pub parent_thread_id: Option<SwarmThreadId>,
+    pub title: String,
+    pub description: String,
+    pub summary: String,
+    pub seq: u64,
+    pub creation_cursor: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThreadList {
+    pub board: Option<SwarmBoard>,
+    pub parent_thread_id: Option<SwarmThreadId>,
+    pub after_cursor: Option<SwarmReadCursor>,
+    pub limit: Option<u32>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmThreadEntry {
+    pub thread_id: SwarmThreadId,
+    pub board: SwarmBoard,
+    pub parent_thread_id: Option<SwarmThreadId>,
+    pub title: String,
+    pub description: String,
+    pub seq: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmThreadDirectory {
+    pub threads: Vec<SwarmThreadEntry>,
+    pub next_cursor: SwarmReadCursor,
+    pub has_more: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThreadIdentity {
+    pub thread_id: SwarmThreadId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmDeltaRead {
+    pub thread_id: SwarmThreadId,
+    pub after_seq: u64,
+    pub through_seq: Option<u64>,
+    pub limit: Option<u32>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmDeltaPage {
+    pub thread_id: SwarmThreadId,
+    pub deltas: Vec<SwarmPost>,
+    pub next_seq: u64,
+    pub high_water: u64,
+    pub has_more: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThreadCreate {
+    pub parent_thread_id: SwarmThreadId,
+    pub title: String,
+    pub description: String,
+    pub summary: String,
+    pub publication_id: SwarmPublicationId,
+    pub body: Vec<SwarmBodySegment>,
+    #[serde(default)]
+    pub attachments: Vec<SwarmAttachment>,
+    #[serde(default)]
+    pub images: Vec<SwarmImageId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmThreadUpdate {
+    pub thread_id: SwarmThreadId,
+    pub expected_seq: u64,
+    pub summary_change: SwarmSummaryChange,
+    pub publication_id: SwarmPublicationId,
+    pub body: Vec<SwarmBodySegment>,
+    #[serde(default)]
+    pub attachments: Vec<SwarmAttachment>,
+    #[serde(default)]
+    pub images: Vec<SwarmImageId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmThreadCreation {
+    Created {
+        publication: Box<SwarmPublicationOutcome>,
+        thread: SwarmThread,
+    },
+    AlreadyExists {
+        thread: SwarmThread,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmPublication {
+    #[serde(default)]
+    pub thread_change: Option<SwarmThreadChange>,
     pub board: SwarmBoard,
     pub publication_id: SwarmPublicationId,
     pub body: Vec<SwarmBodySegment>,
@@ -9201,6 +9322,10 @@ pub struct SwarmPublication {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmPost {
+    #[serde(default)]
+    pub thread_change: Option<SwarmThreadChange>,
+    #[serde(default)]
+    pub thread_seq: Option<u64>,
     pub id: SwarmPostId,
     pub swarm_id: SwarmId,
     pub thread_id: SwarmThreadId,
@@ -9218,9 +9343,19 @@ pub struct SwarmPost {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwarmCursorTarget {
-    Board { board: SwarmBoard },
-    BoardThreads { board: SwarmBoard },
-    Thread { thread_id: SwarmThreadId },
+    Board {
+        board: SwarmBoard,
+    },
+    BoardThreads {
+        board: SwarmBoard,
+    },
+    ThreadDirectory {
+        board: Option<SwarmBoard>,
+        parent_thread_id: Option<SwarmThreadId>,
+    },
+    Thread {
+        thread_id: SwarmThreadId,
+    },
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -9267,6 +9402,7 @@ pub struct SwarmBoardPage {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmThreadPage {
+    pub head_cursor: u64,
     pub swarm_id: SwarmId,
     pub thread_id: SwarmThreadId,
     pub root: SwarmPost,
@@ -9284,6 +9420,8 @@ pub struct SwarmDescribe {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmPublicationOutcome {
+    #[serde(default)]
+    pub already_exists: bool,
     #[serde(default)]
     pub commit_status: SwarmCommitStatus,
     pub post: SwarmPost,

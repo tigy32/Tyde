@@ -353,6 +353,7 @@ fn SwarmThreadCard(
                 let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(root.created_at_ms as f64));
                 format!("{:02}/{:02} {:02}:{:02}", date.get_month() + 1, date.get_date(), date.get_hours(), date.get_minutes())
             })}</time></span>
+            {move || root.get().and_then(|root| swarm.get().and_then(|swarm| swarm.threads.into_iter().find(|thread| thread.thread_id == root.thread_id))).map(|thread| view! { <span class="mobile-swarm-thread-state"><strong>{thread.title}</strong><span>{thread.description}</span></span> })}
             <span class="mobile-swarm-thread-content"><span class="mobile-swarm-thread-title">{move || root.get().map(|root| {
                 if root.body.is_empty() { return format!("{} shared images", root.images.len()); }
                 root.body.into_iter().map(|segment| match segment {
@@ -385,6 +386,7 @@ fn SwarmPostCard(
     });
     view! {
         <article class="mobile-swarm-post" data-mobile-test="swarm-post">
+            {move || post.get().filter(|post| post.id.0 == post.thread_id.0).and_then(|post| swarm.get().and_then(|swarm| swarm.threads.into_iter().find(|thread| thread.thread_id == post.thread_id))).map(|thread| view! { <h3>{thread.title}</h3><details open><summary>{format!("Current state · sequence {}", thread.seq)}</summary><div style="white-space: pre-wrap">{thread.summary}</div></details> })}
             <header><strong>{move || post.get().map(|p| author_name(&p.author, swarm.get().as_ref()))}</strong><span class="mobile-swarm-muted">{move || post.get().map(|p| if p.id.0 != p.thread_id.0 { "Thread reply" } else { "New post" })}</span></header>
             <div class="mobile-swarm-post-body">{move || post.get().map(|p| p.body.into_iter().map(|segment| match segment {
                 SwarmBodySegment::Text { text } => view! { <span>{text}</span> }.into_any(),
@@ -472,6 +474,10 @@ fn SwarmComposer(
     swarm: Memo<Option<Swarm>>,
     on_published: Callback<protocol::SwarmPost>,
 ) -> impl IntoView {
+    let title = RwSignal::new("Human request".to_owned());
+    let description = RwSignal::new("Human-authored request".to_owned());
+    let replacement = RwSignal::new(String::new());
+    let parent_id = RwSignal::new(String::new());
     let state = use_context::<AppState>().unwrap();
     let submitted = RwSignal::new(None::<SwarmPublicationId>);
     Effect::new(move |_| {
@@ -512,6 +518,7 @@ fn SwarmComposer(
         if draft_index.get().is_none() {
             state.swarm_composer_drafts.update(|drafts| {
                 drafts.push(SwarmComposerDraft {
+                    publication: None,
                     host,
                     swarm_id,
                     board,
@@ -551,6 +558,7 @@ fn SwarmComposer(
                         }
                     }
                     d.publication_id = None;
+                    d.publication = None;
                     d.error = None;
                 });
             }
@@ -617,16 +625,99 @@ fn SwarmComposer(
         let was_pending = d.pending;
         let publication_id = d
             .publication_id
+            .clone()
             .unwrap_or_else(|| SwarmPublicationId(uuid::Uuid::new_v4().to_string()));
-        let publication = SwarmPublication {
-            images: Vec::new(),
-            board: d.board,
-            publication_id: publication_id.clone(),
-            body: body.get_untracked(),
-            thread_id: d.thread_id,
-            attachments: Vec::new(),
+        let publication = if retry || d.publication_id.is_some() {
+            match d.publication.clone() {
+                Some(publication) => publication,
+                None => {
+                    state.swarm_composer_drafts.update(|drafts| {
+                        drafts[index].error =
+                            Some("No frozen publication is available to retry.".into())
+                    });
+                    return;
+                }
+            }
+        } else {
+            let summary = if replacement.with_untracked(|text| text.is_empty()) {
+                d.text.clone()
+            } else {
+                replacement.get_untracked()
+            };
+            let change = match &d.thread_id {
+                Some(id) => {
+                    match swarm.get_untracked().and_then(|swarm| {
+                        swarm
+                            .threads
+                            .into_iter()
+                            .find(|state| state.thread_id == *id)
+                    }) {
+                        Some(current) => protocol::SwarmThreadChange::Update {
+                            expected_seq: current.seq,
+                            summary: if replacement.with_untracked(|text| text.is_empty()) {
+                                protocol::SwarmSummaryChange::Append { text: summary }
+                            } else {
+                                protocol::SwarmSummaryChange::Replace { text: summary }
+                            },
+                        },
+                        None => {
+                            let cursor = state.swarm_thread_pages.with_untracked(|pages| {
+                                let (host, swarm_id) = target.get_value();
+                                pages
+                                    .get(&(host, swarm_id, id.clone()))
+                                    .filter(|page| !page.has_more)
+                                    .map(|page| page.head_cursor)
+                            });
+                            let Some(cursor) = cursor else {
+                                state.swarm_composer_drafts.update(|drafts| {
+                            drafts[index].error =
+                                Some("Read all pages of the legacy thread before initializing it.".into())
+                        });
+                                return;
+                            };
+                            protocol::SwarmThreadChange::Initialize {
+                                expected_cursor: cursor,
+                                title: title.get_untracked(),
+                                description: description.get_untracked(),
+                                summary,
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let parent = if d.board == SwarmBoard::Coordination {
+                        if parent_id.with_untracked(|id| id.is_empty()) {
+                            state.swarm_composer_drafts.update(|drafts| {
+                                drafts[index].error = Some(
+                                    "Choose the human request this coordination belongs to.".into(),
+                                )
+                            });
+                            return;
+                        }
+                        Some(SwarmThreadId(parent_id.get_untracked()))
+                    } else {
+                        None
+                    };
+                    protocol::SwarmThreadChange::Create {
+                        title: title.get_untracked(),
+                        description: description.get_untracked(),
+                        summary,
+                        parent_thread_id: parent,
+                    }
+                }
+            };
+            SwarmPublication {
+                thread_change: Some(change),
+                images: Vec::new(),
+                board: d.board,
+                publication_id: publication_id.clone(),
+                body: body.get_untracked(),
+                thread_id: d.thread_id,
+                attachments: Vec::new(),
+            }
         };
         state.swarm_composer_drafts.update(|drafts| {
+            drafts[index].publication = Some(publication.clone());
             drafts[index].publication_id = Some(publication_id.clone());
             drafts[index].pending = true;
             drafts[index].error = None;
@@ -660,6 +751,17 @@ fn SwarmComposer(
     view! {
         <form class="mobile-swarm-composer" on:submit=move |event| { event.prevent_default(); submit.run(false); }>
             <label for="mobile-swarm-message">{move || if thread.get().is_some() { "Reply to thread" } else { "Message the swarm" }}</label>
+            <details><summary>"Thread state"</summary>
+                <label>"Title"<input aria-label="Thread title" prop:value=move || title.get() disabled=move || draft.get().is_some_and(|d| d.pending) on:input=move |event| { title.set(event_target_value(&event)); edit.run((None, None)); } /></label>
+                <label>"Description"<input aria-label="Thread description" prop:value=move || description.get() disabled=move || draft.get().is_some_and(|d| d.pending) on:input=move |event| { description.set(event_target_value(&event)); edit.run((None, None)); } /></label>
+                <Show when=move || board.get() == SwarmBoard::Coordination && thread.get().is_none()>
+                    <label>"Human request"<select aria-label="Coordination parent" prop:value=move || parent_id.get() disabled=move || draft.get().is_some_and(|d| d.pending) on:change=move |event| { parent_id.set(event_target_value(&event)); edit.run((None, None)); }>
+                        <option value="">"Choose a human request"</option>
+                        {move || state.swarm_posts.with(|map| map.get(&target.get_value()).map(|posts| posts.values().filter(|post| post.board == SwarmBoard::Briefing && post.author == SwarmAuthor::Human && post.id.0 == post.thread_id.0).map(|post| view! { <option value=post.thread_id.0.clone()>{post.body.iter().filter_map(|segment| if let SwarmBodySegment::Text { text } = segment { Some(text.as_str()) } else { None }).collect::<String>()}</option> }).collect_view()))}
+                    </select></label>
+                </Show>
+                <label>"Replacement summary (optional)"<textarea aria-label="Replacement summary" prop:value=move || replacement.get() disabled=move || draft.get().is_some_and(|d| d.pending) on:input=move |event| { replacement.set(event_target_value(&event)); edit.run((None, None)); } /></label>
+            </details>
             <textarea id="mobile-swarm-message" data-mobile-test="swarm-message" rows="3" placeholder="What’s on your mind?" prop:value=move || draft.get().map(|d| d.text).unwrap_or_default() disabled=move || draft.get().is_none_or(|d| d.pending) on:input=move |event| edit.run((Some(event_target_value(&event)), None))></textarea>
             <details class="mobile-swarm-mention-picker"><summary>"@ Mention an agent"</summary><div>{move || swarm.get().map(|s| s.members.into_iter().filter(|m| !matches!(m.state, SwarmMemberState::Retired | SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved)).map(|m| {
                 let id = StoredValue::new(m.spec.id);
@@ -767,6 +869,14 @@ mod wasm_tests {
     fn acknowledged(swarm: &Swarm, publication: SwarmPublication, cursor: u64) -> SwarmPost {
         let id = SwarmPostId(format!("mobile-post-{cursor}"));
         SwarmPost {
+            thread_seq: match &publication.thread_change {
+                Some(protocol::SwarmThreadChange::Create { .. }) => Some(1),
+                Some(protocol::SwarmThreadChange::Update { expected_seq, .. }) => {
+                    Some(expected_seq + 1)
+                }
+                _ => None,
+            },
+            thread_change: publication.thread_change,
             images: Vec::new(),
             thread_id: publication
                 .thread_id
@@ -801,6 +911,7 @@ mod wasm_tests {
     fn fixture_swarm() -> Swarm {
         let project_id = protocol::ProjectId("project".into());
         Swarm {
+            threads: Vec::new(),
             id: SwarmId("mobile-swarm".into()),
             host_id: protocol::HostFilterId("local".into()),
             name: "Project companions".into(),
@@ -959,6 +1070,35 @@ mod wasm_tests {
             "explicit retry preserves the unconfirmed publication identity"
         );
         let first = acknowledged(&swarm, posts()[0].clone(), 1);
+        let Some(protocol::SwarmThreadChange::Create {
+            title,
+            description,
+            summary,
+            ..
+        }) = &first.thread_change
+        else {
+            panic!("human composer creates canonical state")
+        };
+        swarm.threads.push(protocol::SwarmThread {
+            swarm_id: swarm.id.clone(),
+            thread_id: first.thread_id.clone(),
+            board: SwarmBoard::Briefing,
+            parent_thread_id: None,
+            title: title.clone(),
+            description: description.clone(),
+            summary: summary.clone(),
+            seq: 1,
+            creation_cursor: 1,
+        });
+        emit(
+            &state,
+            &host,
+            &mut seq,
+            FrameKind::SwarmNotify,
+            &SwarmNotifyPayload {
+                swarm: swarm.clone(),
+            },
+        );
         let shared_image = protocol::SwarmImage {
             id: protocol::SwarmImageId("5e8c5c8e-3aab-43d0-b285-1966331e6f9d".into()),
             name: "Reference.png".into(),
@@ -1047,6 +1187,16 @@ mod wasm_tests {
             .click();
         tick().await;
         assert!(container.text_content().unwrap().contains("Notifies Nova"));
+        let parent = container
+            .query_selector("select[aria-label='Coordination parent']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        parent.set_value(&first.thread_id.0);
+        parent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
         element(&container, "swarm-send").click();
         tick().await;
         let publication = posts()[2].clone();
@@ -1118,6 +1268,7 @@ mod wasm_tests {
             acknowledged(
                 &swarm,
                 SwarmPublication {
+                    thread_change: None,
                     images: Vec::new(),
                     board: SwarmBoard::Briefing,
                     publication_id: SwarmPublicationId(format!("past-{cursor}")),
@@ -1210,6 +1361,7 @@ mod wasm_tests {
         let mut reply = acknowledged(
             &swarm,
             SwarmPublication {
+                thread_change: None,
                 images: Vec::new(),
                 board: SwarmBoard::Briefing,
                 publication_id: SwarmPublicationId("agent-reply".into()),
@@ -1322,6 +1474,48 @@ mod wasm_tests {
                 .value(),
             "Thread draft stays separate"
         );
+        swarm.threads[0].summary = "Agent reply verified".into();
+        swarm.threads[0].seq = 2;
+        emit(
+            &state,
+            &host,
+            &mut seq,
+            FrameKind::SwarmNotify,
+            &SwarmNotifyPayload {
+                swarm: swarm.clone(),
+            },
+        );
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Agent reply verified"),
+            "mobile current state updates from the server without replay inference"
+        );
+        element(&container, "swarm-send").click();
+        tick().await;
+        let conditional = posts().last().unwrap().clone();
+        assert!(
+            matches!(
+                conditional.thread_change,
+                Some(protocol::SwarmThreadChange::Update {
+                    expected_seq: 2,
+                    summary: protocol::SwarmSummaryChange::Append { .. }
+                })
+            ),
+            "mobile replies use the server's current sequence"
+        );
+        emit(
+            &state,
+            &host,
+            &mut seq,
+            FrameKind::SwarmPostNotify,
+            &SwarmPostNotifyPayload {
+                post: acknowledged(&swarm, conditional, 63),
+            },
+        );
+        tick().await;
         element(&container, "swarm-back-to-board").click();
         tick().await;
         input(&container, "Lost confirmation, recovered by fetching").await;
@@ -1377,6 +1571,7 @@ mod wasm_tests {
         let linked_root = acknowledged(
             &swarm,
             SwarmPublication {
+                thread_change: None,
                 images: Vec::new(),
                 board: SwarmBoard::Coordination,
                 publication_id: SwarmPublicationId("older-thread".into()),
@@ -1393,6 +1588,7 @@ mod wasm_tests {
                 acknowledged(
                     &swarm,
                     SwarmPublication {
+                        thread_change: None,
                         images: Vec::new(),
                         board: SwarmBoard::Coordination,
                         publication_id: SwarmPublicationId(format!("older-reply-{cursor}")),
@@ -1410,6 +1606,7 @@ mod wasm_tests {
         let mut link_source = acknowledged(
             &swarm,
             SwarmPublication {
+                thread_change: None,
                 images: vec![shared_image.id.clone()],
                 board: SwarmBoard::Briefing,
                 publication_id: SwarmPublicationId("link-source".into()),
@@ -1474,6 +1671,7 @@ mod wasm_tests {
         tick().await;
         assert!(commands().iter().any(|c| matches!(c, SwarmCommandPayload::ReadPost { post_id, .. } if post_id == &late_reply.id)));
         let mut thread_page = protocol::SwarmThreadPage {
+            head_cursor: 1060,
             swarm_id: swarm.id.clone(),
             thread_id: linked_root.thread_id.clone(),
             root: linked_root.clone(),

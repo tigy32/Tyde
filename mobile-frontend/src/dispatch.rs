@@ -1344,6 +1344,7 @@ fn apply_swarm_post(state: &AppState, host: &LocalHostId, post: protocol::SwarmP
                 draft.mentions.clear();
                 draft.pending = false;
                 draft.publication_id = None;
+                draft.publication = None;
                 draft.error = None;
             }
         });

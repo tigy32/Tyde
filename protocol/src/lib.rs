@@ -223,3 +223,11 @@ pub use types::{
 };
 
 pub use types::{SwarmCursorTarget, SwarmMembership, SwarmReadCursor, SwarmRecoveryRequirement};
+
+pub use types::{
+    SwarmDeltaPage, SwarmDeltaRead, SwarmSummaryChange, SwarmThread, SwarmThreadChange,
+    SwarmThreadCreation, SwarmThreadDirectory, SwarmThreadEntry, SwarmThreadIdentity,
+    SwarmThreadList,
+};
+
+pub use types::{SwarmThreadCreate, SwarmThreadUpdate};

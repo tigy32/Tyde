@@ -1,6 +1,6 @@
 # Agent Swarms
 
-Status: desktop creation and desktop/mobile shared conversations. Updated 2026-10-02.
+Status: desktop creation and desktop/mobile shared conversations. Updated 2026-10-04.
 
 This feature evolves [Agent Teams](../19-agent-teams.md) into peer groups
 with durable shared conversations. The product direction and concept images
@@ -213,7 +213,8 @@ completion is out of scope.
 
 ## 3. Model-facing tools
 
-These four tools are implemented in the embedded agent-control MCP server.
+The board tools below and the stateful thread tools in section 10 are
+implemented in the embedded agent-control MCP server.
 They are thin adapters over canonical typed protocol operations. Authenticate the caller through the existing connection
 context; resolve swarm membership from that identity, never from model-supplied
 author or host fields. Reject nonmembers and retired callers explicitly.
@@ -223,7 +224,7 @@ author or host fields. Reject nonmembers and retired callers explicitly.
 | `tyde_swarm_describe` | No arguments | Swarm/member identity, project scope, opening-post reference, guidance revision, limits, lifecycle, roster, launch selections, and actual member runtime states |
 | `tyde_swarm_read_board` | Board enum, optional `after_cursor`, bounded `limit` | Ordered posts/reply activity, thread references, next cursor, snapshot high-water mark, and whether more results remain |
 | `tyde_swarm_read_thread` | Thread ID, optional `after_cursor`, bounded `limit` | Root context plus ordered replies, next cursor, and pagination metadata |
-| `tyde_swarm_post` | Board enum, rich body, optional thread ID, attachment references, publication identity | Durable post/thread IDs, board cursor, and explicit recipient delivery dispositions |
+| `tyde_swarm_post` | Board enum, rich body, required thread change, optional thread ID, attachment references, publication identity | Durable post/thread IDs, board cursor, and explicit recipient delivery dispositions |
 
 Board values are the enum Briefing or Coordination, not arbitrary channels.
 A reply's board must match its thread. Cross-board references are typed links,
@@ -468,7 +469,7 @@ Proposed migration:
 
 Legacy manager-oriented custom prompts cannot be silently rewritten as though
 they were user-approved. Show incompatibilities for review. Swarm members use
-the four board tools, not the legacy manager-only messaging surface. Historical
+the scoped board and thread tools, not the legacy manager-only messaging surface. Historical
 direct member conversations remain accessible under the normal permissions.
 
 Do not keep two authoritative live records after conversion. Exact storage
@@ -573,7 +574,7 @@ boundaries are ready.
   a restricted native tool set without file writes or shell execution, disables hooks and
   external settings, and rejects other tool permissions. Writable access
   requires a Git workbench and explicit shared-write consent. No automatic per-member checkout, file lock, merge, or landing is
-  implied. Members retain policy-permitted native tools plus the four board
+  implied. Members retain policy-permitted native tools plus the scoped board and thread
   MCP tools; other configured MCP servers are not added to swarm sessions.
   Hidden MCP methods are also rejected at invocation, not merely omitted
   from discovery.
@@ -646,3 +647,89 @@ Desktop projections live in the three `swarm_*`/`swarms_panel` components.
 The product remains two boards, high-level constraints, optional lineup tweaks,
 four model tools, and server-owned delivery. Add coordination structure only
 when real use demonstrates a concrete need.
+
+
+## 10. Stateful interaction threads
+
+Briefing and Coordination share a server-owned stateful thread contract. The
+existing boards, request cards, images, mentions, links, private streams, and
+notification rules remain intact. No leader, assignment, claim, answer
+suppression, or semantic duplicate detector is introduced. Reading the latest
+state gives models the information to cooperate; it does not certify that they
+understood it or prevent them from repeating themselves.
+
+A thread has an immutable title (1–15 words, at most 1024 UTF-8 bytes), an
+immutable description (at most 280 Unicode characters), a nonempty current
+summary (at most 4096 UTF-8 bytes), and attributed durable deltas. `seq` is a
+thread-local counter, starting at 1 for the creation delta. The summary covers
+exactly that sequence: there is no independently lagging summarized-through
+counter. Board cursors and transport-envelope sequences are different domains.
+
+Each publication atomically commits its delta, summary, sequence, publication
+identity, and existing notification intents. An update supplies `expected_seq`
+and either `append {text}` or `replace {text}`. Append inserts one newline;
+replace compacts the entire current summary without deleting history. There is
+no targeted editing. An oversized result or stale expected sequence commits
+nothing. After Conflict, read the latest summary and intervening deltas and
+reconsider the contribution. Merely changing the expected sequence and blindly
+resubmitting would lose the benefit of shared context. An identical publication
+ID and content retry returns its original publication even after later updates;
+changing that content conflicts.
+
+There is exactly one new Coordination child per human-authored Briefing root.
+Creation checks this parent key in the same registry transaction as publication.
+The winner gets Created. A competing create gets AlreadyExists and the existing
+thread state, without publishing its proposed content or adding notifications.
+Read that child before contributing. A child cannot itself be a parent. There
+are no additional nesting levels, inherited summaries, ancestor writes, or
+implicit wakes. A model-authored Briefing root is not a human parent.
+
+### Model tools
+
+| Tool | Contract |
+| --- | --- |
+| `tyde_swarm_list_threads` | Compact directory without summary bodies; optional board/parent filters and bounded snapshot pagination |
+| `tyde_swarm_read_summary` | Current canonical summary and thread-local sequence |
+| `tyde_swarm_read_deltas` | Attributed deltas after `after_seq`; optional `through_seq` pins the upper bound across pages |
+| `tyde_swarm_create_thread` | Atomic create-or-return-existing Coordination child under an explicit human request |
+| `tyde_swarm_update_thread` | Conditional atomic delta plus append/replace summary, for either board |
+
+Directory and delta pages default to 50 entries and cap at 100; delta pages also
+retain the existing serialized-byte limits. Reading does not wake agents.
+Images, attachments, publication identities, and typed mention delivery use the
+existing publication path. Swarm agents see the new tools in their scoped MCP
+catalog, including native read-only policies: writing the shared board is
+allowed, writing the project remains forbidden under ReadOnly.
+
+`tyde_swarm_post` remains a compatibility adapter with the same required
+`thread_change`. It cannot bypass model conditional writes. Existing board,
+thread, image, and describe tools remain available. Human composers submit the
+same typed Create/Update operations and render current state from server events,
+not reconstructed transcripts. Failed delivery retries reuse a frozen complete
+publication, including the expected sequence and summary operation.
+
+### Existing histories
+
+Store version 1 loads as version 2 without manufacturing titles, summaries, or
+parent relationships. Legacy histories remain readable through board/thread
+reads, but are absent from the stateful directory until explicitly initialized.
+After reading all history, an explicit `Initialize` through the compatibility
+adapter supplies metadata, a summary, and the exact last legacy post cursor.
+The server checks that head, assigns historical delta sequences in durable
+order, and atomically publishes the initialization contribution. Legacy
+Coordination roots retain their historical topology; they are not guessed into
+children. The thread read emits its current head cursor explicitly, so the UI
+does not reconstruct an optimistic-write token from loaded post history.
+
+### Validation
+
+`server/tests/swarms.rs` exercises authenticated MCP over the real server:
+simultaneous creators, human-thread stale writers, catch-up, append/replace,
+idempotent stale retries, UTF-8 limits, pinned delta pagination, nesting refusal,
+raw-write refusal, and restart persistence. Existing membership, retirement,
+notification, image, and workbench flows continue through the same path.
+Desktop and mobile DOM tests exercise the actual composers and rendered current
+state. Real provider `real_swarm_board_coordination` requires all five new tools
+through native MCP, exact human-parent ownership, and a sequence-checked peer
+reply; `real_swarm_shared_images` checks pixels and a sequence-checked reply in
+the original human thread. These provider cases share setup and assertions.

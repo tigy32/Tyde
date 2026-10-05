@@ -1151,7 +1151,7 @@ pub fn SwarmDraftDialog(
 fn SwarmToolPolicyNote() -> impl IntoView {
     view! {
         <p class="swarm-field-help swarm-tool-policy" data-field="tool-policy">
-            "Tools: members get the four swarm board tools plus their backend's built-in tools. Writable host and project scopes also get scoped workbench listing, creation, and removal. Your other configured MCP servers are not attached; file writes follow the workspace access above."
+            "Tools: members get the ten swarm board tools (including atomic thread state and delta tools) plus their backend's built-in tools. Writable host and project scopes also get scoped workbench listing, creation, and removal. Your other configured MCP servers are not attached; file writes follow the workspace access above."
         </p>
     }
 }
@@ -2670,7 +2670,10 @@ mod wasm_tests {
             text_of(&dialog).contains("Bo · Status unavailable"),
             "retiring members show server status only"
         );
-        assert!(text_of(&field(&dialog, "tool-policy")).contains("swarm board tools"));
+        assert!(
+            text_of(&field(&dialog, "tool-policy"))
+                .contains("ten swarm board tools (including atomic thread state and delta tools)")
+        );
         assert_eq!(
             text_of(&button(&container, "Manage • preview pending")),
             "Manage • preview pending"

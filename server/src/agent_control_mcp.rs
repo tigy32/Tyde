@@ -806,6 +806,11 @@ fn swarm_tool_allowed_for_policy(policy: protocol::SwarmWorkspacePolicy, tool_na
     matches!(
         tool_name,
         "tyde_swarm_describe"
+            | "tyde_swarm_list_threads"
+            | "tyde_swarm_read_summary"
+            | "tyde_swarm_read_deltas"
+            | "tyde_swarm_create_thread"
+            | "tyde_swarm_update_thread"
             | "tyde_swarm_read_board"
             | "tyde_swarm_read_thread"
             | "tyde_swarm_read_image"
@@ -1442,7 +1447,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. images accepts shared image IDs already uploaded to this swarm; an image-only post may have an empty body. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
+        description = "Compatibility adapter: every model publication MUST provide thread_change: create with title/description/summary/parent_thread_id for a root (omit thread_id or set it to null; the server generates the ID, never mint a thread_id), or update with expected_seq and summary append/replace for a reply. Read the summary before updating. Coordination creation requires a human Briefing parent. Legacy threads can be explicitly initialized with expected_cursor after reading their complete history. Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. images accepts shared image IDs already uploaded to this swarm; an image-only post may have an empty body. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1470,6 +1475,210 @@ impl TydeAgentControlMcpServer {
         }
     }
 
+    #[tool(
+        description = "List a compact, paginated directory of stateful threads, optionally by board or human parent. Results contain titles, descriptions and sequences, not full summaries. Preserve next_cursor while paging; reads never wake peers.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_list_threads(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmThreadList>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_list_threads").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        match self.host.list_swarm_threads_for_agent(caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+    #[tool(
+        description = "Read a thread's current summary and its sequence atomically. Read before contributing to either Briefing or Coordination. Legacy threads have no invented summary: read their history and explicitly initialize them. Reads do not schedule execution.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_read_summary(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmThreadIdentity>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_read_summary").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        match self
+            .host
+            .read_swarm_summary_for_agent(caller, input.thread_id)
+            .await
+        {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+    #[tool(
+        description = "Read immutable, attributed deltas after a thread-local sequence. Use next_seq and preserve returned high_water as through_seq for bounded snapshot paging. This sequence is not a board cursor. Read intervening deltas after an update conflict; reads never wake peers.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_read_deltas(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmDeltaRead>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_read_deltas").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        match self.host.read_swarm_deltas_for_agent(caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
+    #[tool(
+        description = "Atomically create the one Coordination child of a human Briefing thread. Supply immutable title (1–15 words), description (<=280 characters), initial summary (<=4096 UTF-8 bytes), and first delta body. body segments are {type:text,text:...}, {type:member_mention,member_id:...}, or {type:post_link,post_id:...}; use type, not kind. Only typed member_id mentions wake peers, never an @name text segment. Obtain exact IDs from describe/read tools. Concurrent callers get AlreadyExists with the existing thread; their proposed delta is NOT published. Preserve publication_id on uncertain retries. No parent summary or wake budget is changed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_create_thread(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmThreadCreate>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_create_thread").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        let publication = protocol::SwarmPublication {
+            board: protocol::SwarmBoard::Coordination,
+            thread_id: None,
+            publication_id: input.publication_id,
+            body: input.body,
+            attachments: input.attachments,
+            images: input.images,
+            thread_change: Some(protocol::SwarmThreadChange::Create {
+                title: input.title,
+                description: input.description,
+                summary: input.summary,
+                parent_thread_id: Some(input.parent_thread_id),
+            }),
+        };
+        match self
+            .host
+            .post_swarm_for_agent(caller.clone(), publication)
+            .await
+        {
+            Ok(result) => {
+                let thread = match self
+                    .host
+                    .read_swarm_summary_for_agent(caller, result.post.thread_id.clone())
+                    .await
+                {
+                    Ok(thread) => thread,
+                    Err(error) => return err_json(error),
+                };
+                if result.already_exists {
+                    ok_json(protocol::SwarmThreadCreation::AlreadyExists { thread })
+                } else {
+                    ok_json(protocol::SwarmThreadCreation::Created {
+                        publication: Box::new(result),
+                        thread,
+                    })
+                }
+            }
+            Err(error) => err_json(error),
+        }
+    }
+    #[tool(
+        description = "Atomically publish a delta and append or replace the current summary on either board. expected_seq must match the latest summary read; stale writes commit nothing. On conflict read the new summary and intervening deltas and reconsider, rather than blindly retrying. The resulting summary must be nonempty and <=4096 UTF-8 bytes; compact with replace when append is too large. body segments are {type:text,text:...}, {type:member_mention,member_id:...}, or {type:post_link,post_id:...}; use type, not kind. A member_mention must contain member_id, never text or an @name. Only typed mentions wake peers. No targeted edits or automatic merging. Preserve publication_id and identical content on uncertain retries.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_swarm_update_thread(
+        &self,
+        Parameters(input): Parameters<protocol::SwarmThreadUpdate>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_swarm_update_thread").await {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return err_json(protocol::SwarmFailure {
+                        code: protocol::SwarmErrorCode::Unauthorized,
+                        message: error,
+                    });
+                }
+            };
+        let thread = match self
+            .host
+            .read_swarm_summary_for_agent(caller.clone(), input.thread_id.clone())
+            .await
+        {
+            Ok(thread) => thread,
+            Err(error) => return err_json(error),
+        };
+        let publication = protocol::SwarmPublication {
+            board: thread.board,
+            thread_id: Some(input.thread_id),
+            publication_id: input.publication_id,
+            body: input.body,
+            attachments: input.attachments,
+            images: input.images,
+            thread_change: Some(protocol::SwarmThreadChange::Update {
+                expected_seq: input.expected_seq,
+                summary: input.summary_change,
+            }),
+        };
+        match self.host.post_swarm_for_agent(caller, publication).await {
+            Ok(result) => ok_json(result),
+            Err(error) => err_json(error),
+        }
+    }
     #[tool(
         description = "Describe the calling team member's team, roster, optional custom-agent summaries, and live bindings."
     )]

@@ -27,6 +27,7 @@ use settings_model::HostSettings;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SwarmComposerDraft {
+    pub publication: Option<protocol::SwarmPublication>,
     pub host: LocalHostId,
     pub swarm_id: protocol::SwarmId,
     pub board: protocol::SwarmBoard,

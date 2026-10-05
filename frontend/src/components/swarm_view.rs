@@ -1216,6 +1216,11 @@ fn SwarmThread(
         // A thread's board comes from immutable posts, not the active tab;
         // keeping its keyed component mounted preserves local reply drafts.
         <section class="swarm-thread" data-thread-id=thread.get_value().0 hidden=move || selected_board.get() != Some(board)>
+            {move || swarm.get().and_then(|swarm| swarm.threads.into_iter().find(|state| state.thread_id == thread.get_value())).map(|state| view! {
+                <header><h3>{state.title}</h3><p>{state.description}</p></header>
+                <details open><summary>{format!("Current state · sequence {}", state.seq)}</summary><div style="white-space: pre-wrap">{state.summary}</div></details>
+                {state.parent_thread_id.map(|parent| view! { <button class="swarm-link-btn" on:click=move |_| on_link.run(SwarmPostId(parent.0.clone()))>"Open human request"</button> })}
+            })}
             {move || match thread_posts.with(|(root, _)| root.clone()) {
                 Some(root) => view! {
                     <SwarmPostCard host=host post=root swarm=swarm on_link=on_link />
@@ -1748,6 +1753,10 @@ fn SwarmComposer(
     let is_reply = thread.with_value(|thread| thread.is_some());
 
     let text = RwSignal::new(String::new());
+    let title = RwSignal::new("Human request".to_owned());
+    let description = RwSignal::new("Human-authored request".to_owned());
+    let replacement = RwSignal::new(String::new());
+    let parent_id = RwSignal::new(String::new());
     let references: RwSignal<Vec<ComposerReference>> = RwSignal::new(Vec::new());
     let input_range: StoredValue<Option<(usize, usize)>> = StoredValue::new(None);
     let attachments: RwSignal<Vec<SwarmAttachment>> = RwSignal::new(Vec::new());
@@ -2184,9 +2193,82 @@ fn SwarmComposer(
         if body_text.trim().is_empty() && images.with_untracked(Vec::is_empty) {
             return;
         }
+        let initial_summary = if replacement.with_untracked(|text| text.is_empty()) {
+            if body_text.trim().is_empty() {
+                "Shared images attached".to_owned()
+            } else {
+                body_text.clone()
+            }
+        } else {
+            replacement.get_untracked()
+        };
+        let thread_change = match thread.get_value() {
+            Some(id) => {
+                let current = swarm.get_untracked().and_then(|swarm| {
+                    swarm
+                        .threads
+                        .into_iter()
+                        .find(|state| state.thread_id == id)
+                });
+                match current {
+                    Some(current) => protocol::SwarmThreadChange::Update {
+                        expected_seq: current.seq,
+                        summary: if replacement.with_untracked(|text| text.is_empty()) {
+                            protocol::SwarmSummaryChange::Append {
+                                text: initial_summary,
+                            }
+                        } else {
+                            protocol::SwarmSummaryChange::Replace {
+                                text: initial_summary,
+                            }
+                        },
+                    },
+                    None => {
+                        let cursor = posts_signal.with_untracked(|map| {
+                            map.get(&(host.get_value(), sid.get_value()))
+                                .and_then(|posts| posts.threads.get(&id))
+                                .filter(|page| !page.has_more)
+                                .and_then(|page| page.head_cursor)
+                        });
+                        let Some(cursor) = cursor else {
+                            send_error.set(Some(
+                                "Read all pages of the legacy thread before initializing its state.".into(),
+                            ));
+                            return;
+                        };
+                        protocol::SwarmThreadChange::Initialize {
+                            expected_cursor: cursor,
+                            title: title.get_untracked(),
+                            description: description.get_untracked(),
+                            summary: initial_summary,
+                        }
+                    }
+                }
+            }
+            None => {
+                let parent = if board.get_untracked() == SwarmBoard::Coordination {
+                    if parent_id.with_untracked(|id| id.is_empty()) {
+                        send_error.set(Some(
+                            "Choose the human request this coordination belongs to.".into(),
+                        ));
+                        return;
+                    }
+                    Some(SwarmThreadId(parent_id.get_untracked()))
+                } else {
+                    None
+                };
+                protocol::SwarmThreadChange::Create {
+                    title: title.get_untracked(),
+                    description: description.get_untracked(),
+                    summary: initial_summary,
+                    parent_thread_id: parent,
+                }
+            }
+        };
         let waiting = PendingPublication {
             swarm_id: sid.get_value(),
             publication: SwarmPublication {
+                thread_change: Some(thread_change),
                 images: images.with_untracked(|images| {
                     images
                         .iter()
@@ -2503,6 +2585,7 @@ fn SwarmComposer(
             </Show>
             <Show when=move || reading_images.get()><span class="swarm-image-status" role="status">"Reading images…"</span></Show>
             {move || image_error.get().map(|message| view! { <span class="swarm-composer-error" role="alert">{message}</span> })}
+
             <textarea
                 class="swarm-composer-input"
                 node_ref=textarea_ref
@@ -2558,6 +2641,20 @@ fn SwarmComposer(
                 </div>
             <div class="swarm-composer-footer">
                 <div class="swarm-composer-tools">
+            <details><summary>"Thread state"</summary>
+                <Show when=move || !is_reply>
+                    <label>"Title (up to 15 words)"<input aria-label="Thread title" prop:value=move || title.get() readonly=move || pending.get().is_some() on:input=move |event| title.set(event_target_value(&event)) /></label>
+                    <label>"Description (up to 280 characters)"<input aria-label="Thread description" prop:value=move || description.get() readonly=move || pending.get().is_some() on:input=move |event| description.set(event_target_value(&event)) /></label>
+                    <Show when=move || board.get() == SwarmBoard::Coordination>
+                        <label>"Human request"<select aria-label="Coordination parent" prop:value=move || parent_id.get() disabled=move || pending.get().is_some() on:change=move |event| parent_id.set(event_target_value(&event))>
+                            <option value="">"Choose a human request"</option>
+                            {move || posts_signal.with(|map| map.get(&(host.get_value(), sid.get_value())).map(|posts| { let mut roots = posts.posts.values().filter(|post| post.board == SwarmBoard::Briefing && post.author == SwarmAuthor::Human && post.id.0 == post.thread_id.0).collect::<Vec<_>>(); roots.sort_by_key(|post| post.cursor); roots.into_iter().map(|post| view! { <option value=post.thread_id.0.clone()>{post_excerpt(post, swarm.get().as_ref())}</option> }).collect_view() }).unwrap_or_default())}
+                        </select></label>
+                    </Show>
+                </Show>
+                <label>"Replacement summary (optional, up to 4096 bytes)"<input aria-label="Replacement summary" prop:value=move || replacement.get() readonly=move || pending.get().is_some() on:input=move |event| replacement.set(event_target_value(&event)) /></label>
+                <p>"Without a replacement, your message is appended to the current state. Replace to compact or correct it."</p>
+            </details>
                     <input type="file" node_ref=image_input_ref accept="image/png,image/jpeg,image/gif,image/webp" multiple=true hidden=true aria-label="Choose images" on:change=move |_| {
                         if let Some(input) = image_input_ref.get_untracked() {
                             let files = input.files().map(|files| (0..files.length()).filter_map(|index| files.get(index)).collect::<Vec<_>>()).unwrap_or_default();
@@ -2959,6 +3056,7 @@ pub(crate) mod wasm_tests {
 
     pub(crate) fn make_swarm(id: &str, name: &str, members: Vec<SwarmMember>) -> Swarm {
         Swarm {
+            threads: Vec::new(),
             recovery_requirement: protocol::SwarmRecoveryRequirement::None,
             change_preview_revision: 0,
             source_draft_id: None,
@@ -3021,6 +3119,8 @@ pub(crate) mod wasm_tests {
         body: Vec<SwarmBodySegment>,
     ) -> SwarmPost {
         SwarmPost {
+            thread_change: None,
+            thread_seq: None,
             images: Vec::new(),
             id: SwarmPostId(id.to_owned()),
             swarm_id: SwarmId(swarm_id.to_owned()),
@@ -3586,6 +3686,26 @@ pub(crate) mod wasm_tests {
                 },
             );
         });
+        let mut current = harness
+            .state
+            .swarms
+            .get_untracked()
+            .get(&harness.host)
+            .and_then(|swarms| swarms.get(&SwarmId(sid.into())))
+            .cloned()
+            .expect("current swarm");
+        current.threads.push(protocol::SwarmThread {
+            swarm_id: current.id.clone(),
+            thread_id: SwarmThreadId("r1".into()),
+            board: SwarmBoard::Briefing,
+            parent_thread_id: None,
+            title: "Review documentation".into(),
+            description: "Human review request".into(),
+            summary: "Documentation review in progress".into(),
+            seq: 2,
+            creation_cursor: 1,
+        });
+        harness.swarm(&current);
         let editing_thread = one(&container, "[data-thread-id='r1']");
         container.style().set_property("width", "1600px").unwrap();
         settle().await;
@@ -3859,6 +3979,7 @@ pub(crate) mod wasm_tests {
         assert_eq!(thread_reads[0]["query"]["after_cursor"], Value::Null);
         let continuation = thread_cursor(sid, "r1", 3, 3);
         harness.thread_page(SwarmThreadPage {
+            head_cursor: 1,
             swarm_id: SwarmId(sid.into()),
             thread_id: SwarmThreadId("r1".into()),
             root: root.clone(),
@@ -4065,6 +4186,7 @@ pub(crate) mod wasm_tests {
             vec![text("Earlier discussion")],
         );
         harness.thread_page(SwarmThreadPage {
+            head_cursor: 1,
             swarm_id: SwarmId(sid.into()),
             thread_id: SwarmThreadId("orphan-root".into()),
             root: orphan_root,
@@ -4601,6 +4723,16 @@ pub(crate) mod wasm_tests {
                 .starts_with("Notification recipients: Quasar (ready to resume)."),
             "canonical Dormant members are distinct from never-started members in the routing preview"
         );
+        let parent = one(
+            &coordination_composer,
+            "select[aria-label='Coordination parent']",
+        )
+        .dyn_into::<web_sys::HtmlSelectElement>()
+        .unwrap();
+        parent.set_value("m1");
+        parent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
         button(&coordination_composer, "Post").click();
         settle().await;
         let coordination_publication =
@@ -4930,9 +5062,38 @@ pub(crate) mod wasm_tests {
             SwarmAuthor::Human,
             Vec::new(),
         );
-        posted.publication_id = publication.publication_id;
+        posted.publication_id = publication.publication_id.clone();
         posted.images = vec![metadata(&selected[0]), metadata(&selected[2])];
         harness.post(&posted);
+        let mut current = harness
+            .state
+            .swarms
+            .get_untracked()
+            .get(&harness.host)
+            .and_then(|swarms| swarms.get(&SwarmId(sid.into())))
+            .cloned()
+            .expect("current swarm");
+        let Some(protocol::SwarmThreadChange::Create {
+            title,
+            description,
+            summary,
+            parent_thread_id,
+        }) = publication.thread_change.clone()
+        else {
+            panic!("stateful image creation")
+        };
+        current.threads.push(protocol::SwarmThread {
+            swarm_id: current.id.clone(),
+            thread_id: posted.thread_id.clone(),
+            board: posted.board,
+            parent_thread_id,
+            title,
+            description,
+            summary,
+            seq: 1,
+            creation_cursor: posted.cursor,
+        });
+        harness.swarm(&current);
         harness.board_page(page(
             sid,
             SwarmBoard::Briefing,
@@ -5023,6 +5184,13 @@ pub(crate) mod wasm_tests {
             1,
             "Briefing publication does not discard Coordination images"
         );
+        let parent = one(&coordination, "select[aria-label='Coordination parent']")
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        parent.set_value("pictures");
+        parent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
         button(&coordination, "Post").click();
         settle().await;
         assert!(
@@ -5329,6 +5497,7 @@ pub(crate) mod wasm_tests {
             vec![text("Old answer")],
         );
         harness.thread_page(SwarmThreadPage {
+            head_cursor: 1,
             swarm_id: SwarmId(sid.into()),
             thread_id: SwarmThreadId("dl-root".into()),
             root,
@@ -5427,6 +5596,13 @@ pub(crate) mod wasm_tests {
             ),
             "post link insertion returns focus to the editor"
         );
+        let parent = one(&composer, "select[aria-label='Coordination parent']")
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        parent.set_value("dl-root");
+        parent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
         button(&composer, "Post").click();
         settle().await;
         let commands = harness.commands_of("post");
@@ -5608,6 +5784,78 @@ pub(crate) mod wasm_tests {
         assert!(
             visible.contains("Forged 0 marker"),
             "a literal marker is plain text, not a segment: {visible}"
+        );
+    }
+    #[wasm_bindgen_test]
+    async fn current_state_updates_reactively_and_replies_use_its_sequence() {
+        let harness = Harness::new("host-stateful-thread");
+        let sid = "stateful-thread";
+        let mut swarm = make_swarm(sid, "Stateful", vec![idle("ada", "Ada")]);
+        swarm.threads.push(protocol::SwarmThread {
+            swarm_id: SwarmId(sid.into()),
+            thread_id: SwarmThreadId("human-root".into()),
+            board: SwarmBoard::Briefing,
+            parent_thread_id: None,
+            title: "Investigate rendering".into(),
+            description: "A human request".into(),
+            summary: "Audit in progress".into(),
+            seq: 2,
+            creation_cursor: 1,
+        });
+        harness.swarm(&swarm);
+        harness.board_page(page(
+            sid,
+            SwarmBoard::Briefing,
+            vec![make_post(
+                sid,
+                "human-root",
+                "human-root",
+                SwarmBoard::Briefing,
+                1,
+                SwarmAuthor::Human,
+                vec![text("Check the rendering")],
+            )],
+            1,
+            false,
+        ));
+        settle().await;
+        let (container, _handle) = mount_view(&harness, sid);
+        settle().await;
+        assert!(
+            text_of(&container).contains("Investigate rendering")
+                && text_of(&container).contains("Audit in progress")
+        );
+        swarm.threads[0].summary = "Correction deployed".into();
+        swarm.threads[0].seq = 3;
+        harness.swarm(&swarm);
+        settle().await;
+        assert!(
+            text_of(&container).contains("Correction deployed")
+                && !text_of(&container).contains("Audit in progress"),
+            "the current state changes from server events without reconstructing deltas"
+        );
+        let thread = one(&container, ".swarm-thread");
+        button(&thread, "Reply").click();
+        settle().await;
+        let composer = one(&thread, ".swarm-composer-reply");
+        let input = one(&composer, ".swarm-composer-input");
+        input
+            .dyn_ref::<web_sys::HtmlTextAreaElement>()
+            .unwrap()
+            .set_value("Verified in the running instance");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        settle().await;
+        button(&composer, "Reply").click();
+        settle().await;
+        let commands = harness.commands_of("post");
+        let change = &commands.last().expect("conditional reply")["publication"]["thread_change"];
+        assert!(
+            change["kind"] == "update"
+                && change["expected_seq"] == 3
+                && change["summary"]["kind"] == "append",
+            "the human composer uses the same atomic update contract"
         );
     }
 }
