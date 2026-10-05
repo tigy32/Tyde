@@ -189,7 +189,7 @@ impl Scenario {
                 count,
             }],
             shared_guidance: "Coordinate using shared board posts".to_owned(),
-            agent_wake_budget: 16,
+            agent_wake_budget: Some(16),
         }
     }
 
@@ -804,7 +804,7 @@ fn request_count(requests: &[MockRequest]) -> usize {
         .count()
 }
 
-fn last_dispatch_context(requests: &[MockRequest]) -> (Vec<protocol::SwarmPostId>, Vec<SwarmPost>) {
+fn last_dispatch_context(requests: &[MockRequest]) -> (Vec<protocol::SwarmPostId>, String) {
     let message = requests
         .iter()
         .rev()
@@ -814,24 +814,37 @@ fn last_dispatch_context(requests: &[MockRequest]) -> (Vec<protocol::SwarmPostId
             _ => None,
         })
         .expect("accepted dispatch must reach the actual mock input boundary");
-    let (prefix, inline) = message
-        .rsplit_once("\nBoard activity:\n")
-        .expect("native input must include its complete serialized board-context array");
-    let (_, references) = prefix.rsplit_once("Required notification post references: ")
-        .expect("native input must retain required notification references independently of inline bodies");
     assert!(
-        inline.len() <= protocol::SWARM_MAX_INLINE_CONTEXT_BYTES,
-        "actual serialized native inline context must respect the canonical byte bound"
+        message.len() <= 8192,
+        "a wake is a short ping that never grows with board history"
     );
-    assert!(
-        message.len() <= protocol::SWARM_MAX_INLINE_CONTEXT_BYTES + 8192,
-        "wake input with this bounded guidance and focus must not grow with durable history"
-    );
-    (
-        serde_json::from_str(references)
-            .expect("parse canonical required notification post IDs from actual native input"),
-        serde_json::from_str(inline).expect("parse full canonical posts from actual native input"),
-    )
+    let references = message
+        .lines()
+        .filter_map(|line| {
+            let (_, post) = line.strip_prefix("Swarm: ")?.rsplit_once(", post ")?;
+            Some(protocol::SwarmPostId(post.strip_suffix('.')?.to_owned()))
+        })
+        .collect();
+    (references, message.to_owned())
+}
+
+/// The mock thread namer titles a thread with the first six words of its
+/// root body, and naming runs concurrently with the first wake, so a wake
+/// line may legitimately carry either no title or exactly that title.
+fn is_wake_line(line: &str, author: &str, post: &SwarmPost, root_body: &str) -> bool {
+    let title = root_body
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    line == format!(
+        "Swarm: {author} posted in thread {}, post {}.",
+        post.thread_id.0, post.id.0
+    ) || line
+        == format!(
+            "Swarm: {author} posted in thread {} \"{title}\", post {}.",
+            post.thread_id.0, post.id.0
+        )
 }
 
 async fn controls(scenario: &Scenario, swarm: &Swarm) -> Vec<MockControl> {
@@ -1215,12 +1228,11 @@ async fn empty_swarm_waits_for_conversation_and_new_members_wait_for_real_posts(
     let active = scenario.swarm(&swarm.id, ready).await;
     for control in controls(&scenario, &active).await {
         let requests = control.requests().await;
-        let (references, context) = last_dispatch_context(&requests);
+        let (references, ping) = last_dispatch_context(&requests);
         assert!(references.contains(&first.id));
         assert!(
-            context
-                .iter()
-                .any(|post| post.id == first.id && post.author == SwarmAuthor::Human)
+            is_wake_line(&ping, "Human", &first, "Let's look at the project together"),
+            "a wake is exactly one line naming the human author, thread, and post"
         );
     }
     let page = scenario
@@ -2406,7 +2418,7 @@ async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() 
     mismatched_backend.allocations[0].backend_kind = protocol::BackendKind::Codex;
     invalid_constraints.push(mismatched_backend);
     let mut unbounded_wake = valid.clone();
-    unbounded_wake.agent_wake_budget = 129;
+    unbounded_wake.agent_wake_budget = Some(129);
     invalid_constraints.push(unbounded_wake);
     let mut unsafe_workspace = valid.clone();
     unsafe_workspace.workspace_policy = SwarmWorkspacePolicy::SharedWorkbench {
@@ -3756,36 +3768,26 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .await;
     let inline_requests = inline_control.requests().await;
     assert_eq!(request_count(&inline_requests), 1);
-    let (references, inline_posts) = last_dispatch_context(&inline_requests);
+    let (references, ping) = last_dispatch_context(&inline_requests);
     assert!(
         references == vec![wake.id.clone()],
-        "every required notification reference must survive even when its body is outside the inline prefix"
+        "the wake must reference exactly the notified post"
     );
     assert!(
-        !inline_posts.is_empty()
-            && inline_posts.len() < large_posts.len()
-            && inline_posts
-                .iter()
-                .eq(large_posts[..inline_posts.len()].iter()),
-        "native delivery must contain only a whole chronological prefix, never split or skip an oversized next post"
+        is_wake_line(
+            &ping,
+            "Human",
+            &wake,
+            "Read the referenced notification and any omitted shared history through the board tools",
+        ) && !large_posts
+            .iter()
+            .any(|post| ping.contains(&post.publication_id.0)),
+        "a wake behind large history is a short ping that inlines no board content"
     );
-    let mut over_budget = inline_posts.clone();
-    over_budget.push(large_posts[inline_posts.len()].clone());
-    assert!(
-        serde_json::to_vec(&over_budget)
-            .expect("measure first omitted complete post")
-            .len()
-            > protocol::SWARM_MAX_INLINE_CONTEXT_BYTES,
-        "the first omitted full post must exceed the remaining inline byte budget"
-    );
-    let accepted_cursor = inline_posts
-        .last()
-        .expect("accepted full inline prefix")
-        .cursor;
-    assert_eq!(inline_accepted.members[0].context_cursor, accepted_cursor);
-    assert!(
-        accepted_cursor < high_water && accepted_cursor < wake.cursor,
-        "accepting a notification reference cannot falsely mark its omitted body or later history delivered"
+    let accepted_cursor = inline_accepted.members[0].context_cursor;
+    assert_eq!(
+        accepted_cursor, wake.cursor,
+        "accepting a wake records the notified post, not unrelated history"
     );
     assert!(
         inline_accepted.members[0].session_id == before_inline.members[0].session_id,
@@ -3800,27 +3802,38 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
                 .expect("authenticated bounded-wake caller"),
         )
         .await;
-    let omitted_history: SwarmThreadPage = tool_value(
-        &call_tool(
-            &caller,
-            "tyde_swarm_read_thread",
-            serde_json::to_value(SwarmThreadRead {
-                thread_id: large_root.thread_id.clone(),
-                after_cursor: None,
-                limit: Some(protocol::SWARM_MAX_PAGE_LIMIT),
-            })
-            .expect("serialize omitted-history tool query"),
-        )
-        .await,
-    );
+    let mut history = Vec::new();
+    let mut after_cursor = None;
+    for _ in 0..protocol::SWARM_MAX_PAGE_LIMIT {
+        let page: SwarmThreadPage = tool_value(
+            &call_tool(
+                &caller,
+                "tyde_swarm_read_thread",
+                serde_json::to_value(SwarmThreadRead {
+                    thread_id: large_root.thread_id.clone(),
+                    after_cursor: after_cursor.clone(),
+                    limit: Some(protocol::SWARM_MAX_PAGE_LIMIT),
+                })
+                .expect("serialize omitted-history tool query"),
+            )
+            .await,
+        );
+        assert!(
+            page.root == large_root && !page.posts.is_empty(),
+            "every byte-bounded history page names the thread root and makes progress"
+        );
+        history.extend(page.posts);
+        if !page.has_more {
+            break;
+        }
+        after_cursor = Some(page.next_cursor);
+    }
     assert!(
-        omitted_history.root == large_root
-            && omitted_history
-                .posts
+        history.iter().all(|post| large_posts.contains(post))
+            && large_posts[1..]
                 .iter()
-                .any(|post| post.cursor > accepted_cursor
-                    && large_posts.iter().any(|stored| stored == post)),
-        "authenticated paginated tools must retain full bodies omitted from native inline context"
+                .all(|stored| history.contains(stored)),
+        "authenticated paginated tools must return the full history a wake never inlines"
     );
     let omitted_notification: SwarmThreadPage = tool_value(
         &call_tool(
@@ -3837,13 +3850,13 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     );
     assert!(
         omitted_notification.root == wake && omitted_notification.posts.is_empty(),
-        "the required notification body absent from inline input must remain readable by its authenticated tool reference"
+        "the notified post body absent from the wake must remain readable by its authenticated tool reference"
     );
     let after_tools = scenario.snapshot(&foreign.id).await;
     assert_eq!(after_tools.members[0].context_cursor, accepted_cursor);
     assert!(
         after_tools.notifications == inline_accepted.notifications,
-        "tool reads cannot pretend omitted bodies were accepted by native delivery"
+        "tool reads cannot create or acknowledge delivery intents"
     );
     assert_eq!(request_count(&inline_control.requests().await), 1);
     inline_gate.release_one();
@@ -3854,7 +3867,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
 
     let oversized_swarm = scenario.launched(1).await;
     let oversized_control = controls(&scenario, &oversized_swarm).await.remove(0);
-    let before_oversized = scenario.pause(&oversized_swarm.id).await;
+    scenario.pause(&oversized_swarm.id).await;
     let mut relative_file = std::path::PathBuf::new();
     // Escape-heavy real paths amplify serialized attachment bytes without
     // exceeding native filename or path-length limits.
@@ -3901,9 +3914,8 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .expect("measure committed attachment-heavy full post")
         .len();
     assert!(
-        oversized_bytes > protocol::SWARM_MAX_INLINE_CONTEXT_BYTES
-            && oversized_bytes <= protocol::SWARM_MAX_POST_BYTES,
-        "a valid readable full post must exceed the inline budget without exceeding the durable or page bounds"
+        oversized_bytes > 128 * 1024 && oversized_bytes <= protocol::SWARM_MAX_POST_BYTES,
+        "a valid readable full post must be far larger than any wake without exceeding the durable or page bounds"
     );
     let oversized_wake = scenario.post(&oversized_swarm.id, publication(SwarmBoard::Briefing, "wake-behind-oversized-post", vec![
         text("Read the required notification through tools despite the preceding oversized shared post"),
@@ -3938,14 +3950,14 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         request_count(&oversized_requests),
         before_oversized_count + 1
     );
-    let (references, inline_posts) = last_dispatch_context(&oversized_requests);
+    let (references, ping) = last_dispatch_context(&oversized_requests);
     assert!(
-        references == vec![oversized_wake.id.clone()] && inline_posts.is_empty(),
-        "an oversized first unread post must yield an empty inline prefix, never a first-post exception or skipped-middle delivery"
+        references == vec![oversized_wake.id.clone()] && ping.len() < 1024,
+        "a wake behind an oversized post stays a short ping referencing only the notified post"
     );
     assert_eq!(
-        oversized_accepted.members[0].context_cursor, before_oversized.members[0].context_cursor,
-        "accepted references with no full inline bodies cannot advance the delivery cursor"
+        oversized_accepted.members[0].context_cursor, oversized_wake.cursor,
+        "an accepted wake records the notified post"
     );
     let caller = scenario
         .fixture
@@ -3983,8 +3995,8 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     }
     assert_eq!(
         scenario.snapshot(&oversized_swarm.id).await.members[0].context_cursor,
-        before_oversized.members[0].context_cursor,
-        "reading an oversized post through tools must not imply native inline acceptance"
+        oversized_wake.cursor,
+        "reading posts through tools leaves the accepted wake cursor unchanged"
     );
     assert_eq!(
         request_count(&oversized_control.requests().await),
@@ -4303,24 +4315,16 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
             "paused recovery must not invent a live member binding"
         );
     }
-    let first_round_gates = [MockGateHandle::new(), MockGateHandle::new()];
-    let second_round_gates = [MockGateHandle::new(), MockGateHandle::new()];
+    let round_gates = [MockGateHandle::new(), MockGateHandle::new()];
     let scripts = recovered
         .members
         .iter()
-        .zip(&first_round_gates)
-        .zip(&second_round_gates)
-        .map(|((member, first_gate), second_gate)| {
+        .zip(&round_gates)
+        .map(|(member, gate)| {
             (
                 member.spec.name.clone(),
-                MockScript::one(MockTurn::gated_text(
-                    "First resumed causal round",
-                    first_gate,
-                ))
-                .then(MockTurn::gated_text(
-                    "Second resumed causal round",
-                    second_gate,
-                )),
+                MockScript::one(MockTurn::gated_text("Resumed causal rounds", gate))
+                    .with_mid_turn_steering(),
             )
         })
         .collect();
@@ -4330,63 +4334,30 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
             swarm_id: busy.id.clone(),
         })
         .await;
-    for gate in &first_round_gates {
+    for gate in &round_gates {
         scenario
-            .wait_mock_turn(gate, "restart-first-human-round")
+            .wait_mock_turn(gate, "restart-resumed-human-rounds")
             .await;
     }
-    let first_accepted = scenario
+    let accepted = scenario
         .swarm(&busy.id, |state| {
             state.lifecycle == SwarmLifecycle::Running
                 && state
                     .notifications
                     .iter()
-                    .filter(|notification| notification.post_ids.contains(&first.id))
+                    .filter(|notification| {
+                        notification.post_ids.contains(&first.id)
+                            || notification.post_ids.contains(&second.id)
+                    })
                     .all(|notification| notification.state == SwarmDeliveryState::Accepted)
-                && state
-                    .notifications
-                    .iter()
-                    .filter(|notification| notification.post_ids.contains(&second.id))
-                    .all(|notification| notification.state == SwarmDeliveryState::Pending)
                 && state.members.iter().all(|member| {
                     member.state == SwarmMemberState::Live
                         && member.runtime_status == Some(AgentControlStatus::Thinking)
-                        && member.current_round_id.as_ref() == Some(&first.round_id)
-                })
-        })
-        .await;
-    let resumed_controls = controls(&scenario, &first_accepted).await;
-    for control in &resumed_controls {
-        assert_eq!(
-            request_count(&control.requests().await),
-            1,
-            "first resumed turn cannot silently absorb another human round's notification"
-        );
-    }
-    for gate in &first_round_gates {
-        gate.release_one();
-    }
-    for gate in &second_round_gates {
-        scenario
-            .wait_mock_turn(gate, "restart-second-human-round")
-            .await;
-    }
-    let accepted = scenario
-        .swarm(&busy.id, |state| {
-            state
-                .notifications
-                .iter()
-                .filter(|notification| {
-                    notification.post_ids.contains(&first.id)
-                        || notification.post_ids.contains(&second.id)
-                })
-                .all(|notification| notification.state == SwarmDeliveryState::Accepted)
-                && state.members.iter().all(|member| {
-                    member.runtime_status == Some(AgentControlStatus::Thinking)
                         && member.current_round_id.as_ref() == Some(&second.round_id)
                 })
         })
         .await;
+    let resumed_controls = controls(&scenario, &accepted).await;
     for original_intent in persisted.notifications.iter().filter(|notification| {
         notification.post_ids.contains(&first.id) || notification.post_ids.contains(&second.id)
     }) {
@@ -4413,29 +4384,33 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
             member.agent_id != prior.agent_id,
             "restarted activations must expose new runtime bindings"
         );
-        let requests = control.requests().await;
-        assert_eq!(
-            request_count(&requests),
-            2,
-            "different human causal rounds must be delivered in separate turns with a singular round identity"
+        let deliveries = control
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| match request {
+                MockRequest::Launch { message } => Some((false, message)),
+                MockRequest::Input(input) => Some((false, input.message)),
+                MockRequest::Steer(input) => Some((true, input.message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            deliveries.len() == 2
+                && !deliveries[0].0
+                && deliveries[0].1.contains(&first.id.0)
+                && !deliveries[0].1.contains(&second.id.0)
+                && deliveries[1].0
+                && deliveries[1].1.contains(&second.id.0)
+                && !deliveries[1].1.contains(&first.id.0),
+            "each resumed human round is its own delivery, the later one steered into the running turn"
         );
-        for post_id in [&first.id, &second.id] {
-            assert!(
-                requests.iter().any(|request| match request {
-                    MockRequest::Input(input) | MockRequest::Steer(input) =>
-                        input.message.contains(&post_id.0),
-                    MockRequest::Launch { message } => message.contains(&post_id.0),
-                    _ => false,
-                }),
-                "resumed deliveries must retain every underlying post reference"
-            );
-        }
         assert!(
             member.context_cursor >= second.cursor,
             "accepted context must advance the server-owned delivery cursor"
         );
     }
-    for gate in &second_round_gates {
+    for gate in &round_gates {
         gate.release_one();
     }
     let idle = scenario
@@ -5679,6 +5654,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
                     "Turn that must finish before retirement",
                     &finish_gate,
                 ))
+                .with_mid_turn_steering()
                 .with_shutdown_gate(&retirement_teardown_gate),
             ),
         ])
@@ -5734,20 +5710,31 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             ),
         )
         .await;
-    let pending_state = scenario.snapshot(&busy.id).await;
+    let steered_state = scenario
+        .swarm(&busy.id, |state| {
+            state.notifications.iter().any(|intent| {
+                intent.member_id == retiring.spec.id
+                    && intent.post_ids.contains(&pending_post.id)
+                    && intent.state == SwarmDeliveryState::Accepted
+            })
+        })
+        .await;
+    let steered_requests = retiring_control.requests().await;
     assert!(
-        pending_state
-            .notifications
-            .iter()
-            .any(|intent| intent.member_id == retiring.spec.id
-                && intent.post_ids.contains(&pending_post.id)
-                && intent.state == SwarmDeliveryState::Pending)
+        request_count(&steered_requests) == 2
+            && matches!(steered_requests.last(), Some(MockRequest::Steer(_)))
+            && !steered_requests
+                .iter()
+                .any(|request| matches!(request, MockRequest::Interrupt))
+            && steered_state
+                .members
+                .iter()
+                .any(|member| member.spec.id == retiring.spec.id
+                    && member.runtime_status == Some(AgentControlStatus::Thinking)),
+        "busy member delivery is steered into the current turn rather than interrupting it"
     );
-    assert_eq!(
-        request_count(&retiring_control.requests().await),
-        1,
-        "busy member delivery must stay pending rather than interrupting the current turn"
-    );
+    let busy = steered_state;
+    let retiring = busy.members[1].clone();
     scenario
         .send(SwarmCommandPayload::PreviewChange {
             swarm_id: busy.id.clone(),
@@ -5852,9 +5839,8 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             .notifications
             .iter()
             .any(|intent| intent.post_ids.contains(&pending_post.id)
-                && intent.state == SwarmDeliveryState::Undeliverable
-                && intent.error.is_some()),
-        "pending notification for a retiring recipient must remain inspectably undeliverable"
+                && intent.state == SwarmDeliveryState::Accepted),
+        "a wake already steered into the retiring member's turn stays delivered"
     );
     assert!(
         !retiring_control
@@ -5967,8 +5953,8 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
     );
     assert_eq!(
         request_count(&retiring_control.requests().await),
-        1,
-        "describe/read/final publication and refused private input cannot admit a second retiring backend turn"
+        2,
+        "describe/read/final publication and refused private input cannot admit another retiring backend turn beyond the steered wake"
     );
     assert!(
         !retiring_control
@@ -6224,7 +6210,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             scenario.fixture.agent_ids().await == occupied_before_teardown,
             "rejected retry cannot release the occupied retirement slot or admit the reviewed replacement before teardown completes"
         );
-        assert_eq!(request_count(&retiring_control.requests().await), 1);
+        assert_eq!(request_count(&retiring_control.requests().await), 2);
         eprintln!("Swarm sim capacity retry boundary rejected without mutation: {phase}");
     }
     drop(retry_client);
@@ -6776,6 +6762,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
                 })
         })
         .await;
+    let requests_before_retirement = private_control.requests().await.len();
     assert_eq!(retiring_reserved.lifecycle, SwarmLifecycle::Transitioning);
     assert!(
         retiring_reserved
@@ -6874,10 +6861,11 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         scenario.fixture.agent_ids().await == before_private_retirement,
         "receipt resolution changes RetiringReserved to Retiring, not Retired before actual native turn completion"
     );
+    // This mock cannot steer, so the earlier board wake may interrupt the
+    // private self-started turn it raced; only FinishTurn's own cancellation
+    // is forbidden here.
     assert!(
-        !private_control
-            .requests()
-            .await
+        !private_control.requests().await[requests_before_retirement..]
             .iter()
             .any(|request| matches!(request, MockRequest::Interrupt)),
         "FinishTurn must wait for the accepted private turn's natural completion, not cancel it"
@@ -9391,11 +9379,200 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
 }
 
 #[tokio::test]
+async fn wakes_are_short_pings_steered_into_running_turns_beside_standing_swarm_steering() {
+    let mut scenario = Scenario::new().await;
+    let mut constraints = scenario.constraints(2);
+    constraints.agent_wake_budget = None;
+    let draft = scenario.generate(constraints).await;
+    let scripts = draft
+        .members
+        .iter()
+        .map(|member| {
+            (
+                member.name.clone(),
+                MockScript::one(MockTurn::text("Opening reply")).with_mid_turn_steering(),
+            )
+        })
+        .collect();
+    let launch_reservation = scenario.fixture.reserve_mock_launches(scripts).await;
+    let starting = scenario.launch(&draft).await;
+    let (opening, live) = scenario
+        .open_request(&starting.id, "Opening request body text")
+        .await;
+    let mocks = controls(&scenario, &live).await;
+    for (member, control) in live.members.iter().zip(&mocks) {
+        let steering = server::backend::mock::session_builtin_steering(
+            member.session_id.as_ref().expect("live member session"),
+        )
+        .expect("mock session records its resolved steering");
+        assert!(
+            steering.contains(&format!(
+                "You are {}, member {} of the Tyde swarm \"Protocol swarm\"",
+                member.spec.name, member.spec.id.0
+            )) && steering.contains("Coordinate using shared board posts"),
+            "identity and shared guidance are standing session steering"
+        );
+        let (references, ping) = last_dispatch_context(&control.requests().await);
+        assert!(
+            references == vec![opening.id.clone()]
+                && is_wake_line(&ping, "Human", &opening, "Opening request body text"),
+            "the opening wake is a ping that repeats neither the post nor the steering"
+        );
+    }
+    assert_eq!(live.rounds[0].agent_activations_remaining, None);
+
+    let (first, second) = (&live.members[0], &live.members[1]);
+    let busy_gate = MockGateHandle::new();
+    mocks[0]
+        .enqueue(MockTurn::gated_text("Long running work", &busy_gate))
+        .await;
+    let busy_cause = scenario
+        .post(
+            &live.id,
+            publication(
+                SwarmBoard::Briefing,
+                "start-long-work",
+                vec![
+                    text("Start the long task"),
+                    SwarmBodySegment::MemberMention {
+                        member_id: first.spec.id.clone(),
+                    },
+                ],
+            ),
+        )
+        .await;
+    scenario
+        .wait_mock_turn(&busy_gate, "first member's running turn")
+        .await;
+    let second_caller = scenario
+        .fixture
+        .agent_control_caller(second.agent_id.as_ref().expect("second peer runtime"))
+        .await;
+    let mut peer_publication = publication(
+        SwarmBoard::Briefing,
+        "peer-ping-while-busy",
+        vec![
+            text("Peer note body that stays on the board"),
+            SwarmBodySegment::MemberMention {
+                member_id: first.spec.id.clone(),
+            },
+        ],
+    );
+    peer_publication.thread_id = Some(opening.thread_id.clone());
+    let peer_post = agent_published(&second_caller, &peer_publication).await;
+    let steered = scenario
+        .swarm(&live.id, |state| {
+            state.notifications.iter().any(|intent| {
+                intent.post_ids.contains(&peer_post.id)
+                    && intent.state == SwarmDeliveryState::Accepted
+            })
+        })
+        .await;
+    let first_requests = mocks[0].requests().await;
+    assert!(
+        matches!(first_requests.last(), Some(MockRequest::Steer(_)))
+            && steered.members[0].runtime_status == Some(AgentControlStatus::Thinking)
+            && steered.members[0].context_cursor == peer_post.cursor,
+        "an agent wake reaches a busy member as steering into its running turn"
+    );
+    let (references, ping) = last_dispatch_context(&first_requests);
+    let second_name = &second.spec.name;
+    assert!(
+        references == vec![peer_post.id.clone()]
+            && is_wake_line(&ping, second_name, &peer_post, "Opening request body text"),
+        "a peer wake names the author and post without its body"
+    );
+    assert_eq!(
+        steered
+            .rounds
+            .iter()
+            .find(|round| round.id == busy_cause.round_id)
+            .map(|round| round.agent_activations_remaining),
+        Some(None),
+        "without a turn limit agent wakes spend no allowance"
+    );
+    busy_gate.release_one();
+    let settled = scenario.swarm(&live.id, ready).await;
+
+    let mut edited = settled.constraints.clone();
+    edited.shared_guidance = "Report only verified findings".to_owned();
+    scenario
+        .send(SwarmCommandPayload::PreviewChange {
+            swarm_id: live.id.clone(),
+            expected_revision: settled.revision,
+            constraints: edited.clone(),
+        })
+        .await;
+    let previewed = scenario
+        .swarm(&live.id, |state| {
+            state
+                .change_preview
+                .as_ref()
+                .is_some_and(|preview| preview.base_revision == settled.revision)
+        })
+        .await;
+    scenario
+        .send(SwarmCommandPayload::ApplyChange {
+            swarm_id: live.id.clone(),
+            preview_revision: previewed
+                .change_preview
+                .as_ref()
+                .expect("guidance-only preview")
+                .revision,
+            retirement: SwarmRetirementPolicy::FinishTurn,
+        })
+        .await;
+    scenario
+        .swarm(&live.id, |state| {
+            state.constraints == edited && ready(state)
+        })
+        .await;
+    for _ in 0..2 {
+        for control in &mocks {
+            control.enqueue(MockTurn::text("Follow-up reply")).await;
+        }
+    }
+    let after_edit = scenario
+        .open_request(&live.id, "First request after the edit")
+        .await
+        .0;
+    for control in &mocks {
+        let (references, ping) = last_dispatch_context(&control.requests().await);
+        assert!(
+            references == vec![after_edit.id.clone()]
+                && ping.lines().next().is_some_and(|line| is_wake_line(
+                    line,
+                    "Human",
+                    &after_edit,
+                    "First request after the edit"
+                ))
+                && ping.contains("shared guidance changed")
+                && ping.contains("Report only verified findings"),
+            "the next wake after a guidance edit carries the new guidance"
+        );
+    }
+    let later = scenario
+        .open_request(&live.id, "Second request after the edit")
+        .await
+        .0;
+    for control in &mocks {
+        let (references, ping) = last_dispatch_context(&control.requests().await);
+        assert!(
+            references == vec![later.id.clone()]
+                && is_wake_line(&ping, "Human", &later, "Second request after the edit"),
+            "updated guidance is delivered once, not on every wake"
+        );
+        assert!(control.violations().await.is_empty());
+    }
+    drop(launch_reservation);
+}
+
+#[tokio::test]
 async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts_or_resetting_on_board_changes()
  {
     let mut scenario = Scenario::new().await;
     let mut constraints = scenario.constraints(2);
-    constraints.agent_wake_budget = 2;
+    constraints.agent_wake_budget = Some(2);
     let draft = scenario.generate(constraints).await;
     let starting = scenario.launch(&draft).await;
     let live = scenario
@@ -9422,7 +9599,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     let cause = opening.posts[0].round_id.clone();
     assert_eq!(live.rounds.len(), 1);
     assert_eq!(
-        live.rounds[0].agent_activations_remaining, 2,
+        live.rounds[0].agent_activations_remaining,
+        Some(2),
         "human-authorized initial member starts do not spend the agent-only wake allowance"
     );
     scenario.pause(&live.id).await;
@@ -9479,7 +9657,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     let pending = scenario.snapshot(&live.id).await;
     assert_eq!(pending.rounds.len(), 1);
     assert_eq!(
-        pending.rounds[0].agent_activations_remaining, 2,
+        pending.rounds[0].agent_activations_remaining,
+        Some(2),
         "publication alone must not spend activation allowance"
     );
     let same_cause_intents = pending
@@ -9530,7 +9709,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         .await;
     assert_eq!(first_wake.rounds.len(), 1);
     assert_eq!(
-        first_wake.rounds[0].agent_activations_remaining, 1,
+        first_wake.rounds[0].agent_activations_remaining,
+        Some(1),
         "same-round coalescing charges one activation, not one per post and not zero"
     );
     for original_intent in &same_cause_intents {
@@ -9611,7 +9791,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         })
         .await;
     assert_eq!(second_wake.rounds.len(), 1);
-    assert_eq!(second_wake.rounds[0].agent_activations_remaining, 0);
+    assert_eq!(second_wake.rounds[0].agent_activations_remaining, Some(0));
     assert!(second_wake.members[0].current_round_id.as_ref() == Some(&cause));
     assert_eq!(request_count(&mock_controls[0].requests().await), 2);
     second_wake_gate.release_one();
@@ -9653,7 +9833,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         exhausted.error.is_some(),
         "automatic loop exhaustion must explain why dispatch stopped"
     );
-    assert_eq!(exhausted.rounds[0].agent_activations_remaining, 0);
+    assert_eq!(exhausted.rounds[0].agent_activations_remaining, Some(0));
     let cross_board_overflow: SwarmPublicationOutcome = tool_value(
         &agent_post(
             &second_caller,
@@ -9717,7 +9897,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             .find(|round| round.id == cause)
             .expect("original cause")
             .agent_activations_remaining,
-        0
+        Some(0)
     );
     assert_eq!(
         stopped
@@ -9726,7 +9906,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             .find(|round| round.id == human.round_id)
             .expect("human cause")
             .agent_activations_remaining,
-        2
+        Some(2)
     );
     for control in &mock_controls {
         assert_eq!(
@@ -9784,7 +9964,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
                     "Human-reauthorized bounded activation",
                     gate,
                 ))
-                .then(MockTurn::text("Human request acknowledged")),
+                .with_mid_turn_steering(),
             )
         })
         .collect();
@@ -9807,9 +9987,16 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
                         || intent.post_ids.contains(&cross_board_overflow.post.id)
                 })
                 .all(|intent| intent.state == SwarmDeliveryState::Accepted)
+                && state
+                    .notifications
+                    .iter()
+                    .filter(|intent| intent.round_id == human.round_id)
+                    .all(|intent| intent.state == SwarmDeliveryState::Accepted)
                 && state.members.iter().all(|member| {
                     member.state == SwarmMemberState::Live
                         && member.runtime_status == Some(AgentControlStatus::Thinking)
+                        && member.current_round_id.as_ref() == Some(&human.round_id)
+                        && member.context_cursor >= human.cursor
                 })
         })
         .await;
@@ -9820,7 +10007,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             .find(|round| round.id == cause)
             .expect("reauthorized original cause")
             .agent_activations_remaining,
-        0,
+        Some(0),
         "explicit Resume restores only a finite allowance and both pending peer wakes consume it"
     );
     for original_intent in stopped.notifications.iter().filter(|intent| {
@@ -9883,15 +10070,28 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
                     .expect("reauthorized runtime binding"),
             )
             .await;
-        assert_eq!(request_count(&control.requests().await), 1);
+        let requests = control.requests().await;
+        let human_steers = requests
+            .iter()
+            .filter(|request| {
+                matches!(request, MockRequest::Steer(input) if input.message.contains(&human.id.0))
+            })
+            .count();
+        assert!(
+            request_count(&requests) == 2
+                && human_steers == 1
+                && matches!(requests.last(), Some(MockRequest::Steer(_)))
+                && !requests
+                    .iter()
+                    .any(|request| matches!(request, MockRequest::Interrupt)),
+            "one reauthorized peer wake, then the human request steered into that running turn"
+        );
         assert!(control.violations().await.is_empty());
         resumed_controls.push(control);
     }
     for gate in &gates {
         gate.release_one();
     }
-    // The human request is its own cause and wakes every member once the
-    // reauthorized peer wakes finish.
     let human_delivered = scenario
         .swarm(&live.id, |state| {
             ready(state)

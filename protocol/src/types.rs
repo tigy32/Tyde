@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 73;
+pub const PROTOCOL_VERSION: u32 = 74;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9029,7 +9029,10 @@ pub struct SwarmConstraints {
     pub max_live_agents: u32,
     pub allocations: Vec<SwarmBackendAllocation>,
     pub shared_guidance: String,
-    pub agent_wake_budget: u32,
+    /// Optional cap on agent-triggered wakes per human request. `None` lets
+    /// members wake each other without limit.
+    #[serde(default)]
+    pub agent_wake_budget: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmMemberSpec {
@@ -9065,11 +9068,14 @@ pub struct SwarmMember {
     pub agent_id: Option<AgentId>,
     pub session_id: Option<SessionId>,
     pub runtime_status: Option<AgentControlStatus>,
-    /// Highest contiguous post cursor accepted as complete inline wake context;
-    /// references and bodies read separately through tools do not advance it.
+    /// Highest post cursor the member has accepted a wake for.
     pub context_cursor: u64,
     pub current_round_id: Option<SwarmRoundId>,
     pub error: Option<String>,
+    /// Shared guidance changed after this member's session took its steering;
+    /// the next wake carries the new guidance.
+    #[serde(default)]
+    pub guidance_changed: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmBoardPosition {
@@ -9090,7 +9096,9 @@ pub struct SwarmNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmRound {
     pub id: SwarmRoundId,
-    pub agent_activations_remaining: u32,
+    /// `None` when the swarm has no agent wake budget.
+    #[serde(default)]
+    pub agent_activations_remaining: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmChangePreview {
@@ -9602,7 +9610,10 @@ pub struct SwarmDispatch {
     pub member: SwarmMember,
     pub constraints: SwarmConstraints,
     pub notification_ids: Vec<SwarmNotificationId>,
-    pub posts: Vec<SwarmPost>,
+    /// The short wake text: who posted, where, and the post ids.
+    pub message: String,
+    /// Highest board cursor among the notified posts.
+    pub notified_cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9624,7 +9635,6 @@ pub const SWARM_DEFAULT_PAGE_LIMIT: u32 = 50;
 pub const SWARM_MAX_PAGE_LIMIT: u32 = 100;
 pub const SWARM_MAX_BODY_BYTES: usize = 65536;
 pub const SWARM_MAX_SUMMARY_BYTES: usize = 4096;
-pub const SWARM_MAX_INLINE_CONTEXT_BYTES: usize = 128 * 1024;
 pub const SWARM_MAX_ATTACHMENTS: usize = 16;
 pub const SWARM_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const SWARM_MAX_IMAGE_DIMENSION: u32 = 8192;

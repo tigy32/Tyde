@@ -122,7 +122,7 @@ impl SwarmRegistryHandle {
                                 swarm.rounds.push(SwarmRound { id: round_id.clone(), agent_activations_remaining: swarm.constraints.agent_wake_budget });
                                 member.current_round_id = Some(round_id);
                                 member.state = SwarmMemberState::Reserved;
-                                batch = Some(SwarmDispatch { previous_round_id, agent_activation_charged: false, notification_post_ids: Vec::new(), swarm_id: swarm.id.clone(), member: member.clone(), constraints: swarm.constraints.clone(), notification_ids: Vec::new(), posts: Vec::new() });
+                                batch = Some(SwarmDispatch { previous_round_id, agent_activation_charged: false, notification_post_ids: Vec::new(), swarm_id: swarm.id.clone(), member: member.clone(), constraints: swarm.constraints.clone(), notification_ids: Vec::new(), message: String::new(), notified_cursor: member.context_cursor });
                             }
                             Ok((batch, vec![swarm_event(swarm)]))
                         });
@@ -226,8 +226,9 @@ impl SwarmRegistryHandle {
                                 && let Some(round_id) = &batch.member.current_round_id
                                 && let Some(round) =
                                     swarm.rounds.iter_mut().find(|round| round.id == *round_id)
+                                && let Some(remaining) = &mut round.agent_activations_remaining
                             {
-                                round.agent_activations_remaining += 1;
+                                *remaining += 1;
                             }
                             for notification in &mut swarm.notifications {
                                 if batch.notification_ids.contains(&notification.id)
@@ -1120,7 +1121,10 @@ fn validate_constraints(constraints: &SwarmConstraints) -> Result<(), SwarmFailu
             "live-agent limit must be 1–16",
         ));
     }
-    if !(1..=SWARM_MAX_AGENT_WAKE_BUDGET).contains(&constraints.agent_wake_budget) {
+    if constraints
+        .agent_wake_budget
+        .is_some_and(|budget| !(1..=SWARM_MAX_AGENT_WAKE_BUDGET).contains(&budget))
+    {
         return Err(failure(
             SwarmErrorCode::Invalid,
             "agent wake budget must be 1–128",
@@ -1381,6 +1385,7 @@ fn apply(
                         context_cursor: 0,
                         current_round_id: None,
                         error: None,
+                        guidance_changed: false,
                         spec,
                     })
                     .collect(),
@@ -1540,7 +1545,7 @@ fn apply(
                 ));
             }
             for round in &mut swarm.rounds {
-                if round.agent_activations_remaining == 0 {
+                if round.agent_activations_remaining == Some(0) {
                     round.agent_activations_remaining = swarm.constraints.agent_wake_budget;
                 }
             }
@@ -1596,7 +1601,7 @@ fn apply(
                 && swarm
                     .rounds
                     .iter()
-                    .all(|round| round.agent_activations_remaining > 0)
+                    .all(|round| round.agent_activations_remaining != Some(0))
             {
                 swarm.lifecycle = SwarmLifecycle::Running;
                 swarm.error = None;
@@ -1724,7 +1729,16 @@ fn apply(
                     context_cursor: 0,
                     current_round_id: None,
                     error: None,
+                    guidance_changed: false,
                 });
+            }
+            if preview.constraints.shared_guidance != swarm.constraints.shared_guidance {
+                // A reserved startup may already have rendered the old
+                // guidance into its standing steering.
+                for member in &mut swarm.members {
+                    member.guidance_changed =
+                        member.agent_id.is_some() || member.state == SwarmMemberState::Reserved;
+                }
             }
             swarm.constraints = preview.constraints;
             swarm.revision += 1;
@@ -3078,10 +3092,14 @@ fn reserve(
             if !matches!(
                 member.state,
                 SwarmMemberState::Proposed | SwarmMemberState::Dormant | SwarmMemberState::Live
-            ) || member
-                .runtime_status
-                .is_some_and(|status| status != AgentControlStatus::Idle)
-            {
+            ) || member.runtime_status.is_some_and(|status| {
+                // A running turn takes the wake as steering; a question or
+                // failure waits for the human.
+                !matches!(
+                    status,
+                    AgentControlStatus::Idle | AgentControlStatus::Thinking
+                )
+            }) {
                 continue;
             }
             let starting = member.agent_id.is_none();
@@ -3153,7 +3171,7 @@ fn reserve(
                     .rounds
                     .iter()
                     .find(|round| round.id == *id)
-                    .is_none_or(|round| round.agent_activations_remaining == 0)
+                    .is_none_or(|round| round.agent_activations_remaining == Some(0))
             }) {
                 changed = true;
                 swarm.lifecycle = SwarmLifecycle::AttentionRequired;
@@ -3161,8 +3179,10 @@ fn reserve(
                 break;
             }
             for round in &mut swarm.rounds {
-                if rounds.contains(&round.id) {
-                    round.agent_activations_remaining -= 1;
+                if rounds.contains(&round.id)
+                    && let Some(remaining) = &mut round.agent_activations_remaining
+                {
+                    *remaining -= 1;
                 }
             }
             let notification_ids = notifications
@@ -3174,6 +3194,28 @@ fn reserve(
                     notification.state = SwarmDeliveryState::Dispatching;
                 }
             }
+            let notified = notifications
+                .iter()
+                .flat_map(|notification| &notification.post_ids)
+                .filter_map(|id| file.posts.iter().find(|post| post.id == *id))
+                .collect::<Vec<_>>();
+            let notified_cursor = notified
+                .iter()
+                .map(|post| post.cursor)
+                .max()
+                .unwrap_or(swarm.members[index].context_cursor);
+            let mut message = notified
+                .iter()
+                .map(|post| wake_line(swarm, post))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if swarm.members[index].guidance_changed {
+                message.push_str(&format!(
+                    "\nThe swarm's shared guidance changed and replaces the earlier version:\n{}",
+                    swarm.constraints.shared_guidance
+                ));
+            }
+            let notification_post_ids = notified.iter().map(|post| post.id.clone()).collect();
             changed = true;
             let member = &mut swarm.members[index];
             member.state = SwarmMemberState::Reserved;
@@ -3181,33 +3223,6 @@ fn reserve(
                 occupancy += 1;
             }
             let previous_round_id = member.current_round_id.replace(round_id);
-            let mut context_bytes = 2usize;
-            let mut posts = Vec::new();
-            for post in file
-                .posts
-                .iter()
-                .filter(|post| post.swarm_id == swarm.id && post.cursor > member.context_cursor)
-                .take(SWARM_MAX_PAGE_LIMIT as usize)
-            {
-                let size = serde_json::to_vec(post)
-                    .map_err(|error| {
-                        failure(
-                            SwarmErrorCode::Storage,
-                            format!("Cannot encode inline swarm post: {error}"),
-                        )
-                    })?
-                    .len()
-                    + usize::from(!posts.is_empty());
-                if size > SWARM_MAX_INLINE_CONTEXT_BYTES - context_bytes {
-                    break;
-                }
-                context_bytes += size;
-                posts.push(post.clone());
-            }
-            let notification_post_ids = notifications
-                .iter()
-                .flat_map(|notification| notification.post_ids.clone())
-                .collect();
             batches.push(SwarmDispatch {
                 previous_round_id,
                 agent_activation_charged: !rounds.is_empty(),
@@ -3216,7 +3231,8 @@ fn reserve(
                 member: member.clone(),
                 constraints: swarm.constraints.clone(),
                 notification_ids,
-                posts,
+                message,
+                notified_cursor,
             });
         }
         if changed {
@@ -3225,12 +3241,36 @@ fn reserve(
     }
     Ok((batches, events))
 }
+/// One line per notified post; standing steering explains the board and tools.
+fn wake_line(swarm: &Swarm, post: &SwarmPost) -> String {
+    let author = match &post.author {
+        SwarmAuthor::Human => "Human".to_owned(),
+        SwarmAuthor::Member { member_id } => swarm
+            .members
+            .iter()
+            .find(|member| member.spec.id == *member_id)
+            .map_or_else(|| member_id.0.clone(), |member| member.spec.name.clone()),
+    };
+    let title = swarm
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == post.thread_id)
+        .and_then(|thread| thread.title.as_deref())
+        .map(|title| format!(" \"{title}\""))
+        .unwrap_or_default();
+    format!(
+        "Swarm: {author} posted in thread {}{title}, post {}.",
+        post.thread_id.0, post.id.0
+    )
+}
 fn complete(
     file: &mut SwarmStoreSnapshot,
     batch: SwarmDispatch,
     result: Result<(AgentId, SessionId), SwarmFailure>,
 ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
     let swarm = swarm_mut(file, &batch.swarm_id)?;
+    let delivered_current_guidance =
+        batch.constraints.shared_guidance == swarm.constraints.shared_guidance;
     let member = member_mut(swarm, &batch.member.spec.id)?;
     #[cfg(feature = "test-support")]
     tracing::warn!(
@@ -3252,11 +3292,13 @@ fn complete(
                 member.state = SwarmMemberState::Live;
                 member.error = None;
             }
-            member.context_cursor = batch
-                .posts
-                .last()
-                .map(|post| post.cursor)
-                .unwrap_or(member.context_cursor);
+            member.context_cursor = member.context_cursor.max(batch.notified_cursor);
+            if batch.member.guidance_changed
+                && !batch.message.is_empty()
+                && delivered_current_guidance
+            {
+                member.guidance_changed = false;
+            }
             None
         }
         Err(error) => {

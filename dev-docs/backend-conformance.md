@@ -760,11 +760,11 @@ reply. Native tool results must preserve authenticated authors, causal rounds,
 parent ownership, and the summary/delta sequence. All five new tools need actual
 correlated completions, not private prose or inferred results.
 
-The existing busy/Pending, sequential audit, follow-up cardinality, restart, and
+The busy-delivery, sequential audit, follow-up cardinality, restart, and
 resume oracles remain intact. Four distinct page limits (50, 60, 70, 80) make
-the requested eight audit reads unambiguously separate work; the case also
-checks those exact limits without relaxing any prior assertion. Body segments
-and summary changes both use the `kind` discriminator.
+the requested audit reads unambiguously separate work; see "Steered swarm
+wakes" for how the busy phase now proves steering. Body segments and summary
+changes both use the `kind` discriminator.
 Invalid model arguments are still rejected rather than translated or guessed.
 
 The deterministic server regression races two authenticated creators, rejects a
@@ -837,3 +837,37 @@ request led Peer 1 to open a Coordination child: the request showed
 title>" with no root composer and no sequence label. The agreed answer came
 back in the request thread. The instance was stopped. Unsupported screenshot
 and second-client capabilities were not used or claimed.
+
+## Steered swarm wakes
+
+Every swarm wake, from a human post or an agent mention, now reaches a busy
+member as steering into its running turn. When a backend cannot steer, Tyde
+interrupts the turn and keeps the notification pending until the member is
+idle; a wake never waits in the member's private queue. Swarm instructions are
+standing builtin steering, and a wake is one line per post naming the author,
+thread, title and post ID. The agent wake budget is optional and off by
+default.
+
+The busy phase of `real_swarm_board_coordination` posts BUSY_FOLLOWUP once
+the initiator's audit-thread read is in flight. It requires the follow-up
+intent Accepted while the member is still Thinking, with the member moved to
+the follow-up round. It also requires AUDIT_DONE attributed to that round
+and at least one audit read after the acceptance. Together these prove the
+wake joined the running turn. The audit oracle requires all four passes in
+order, each reading the board and then the thread with the pass's limit. All
+audit reads must complete sequentially. A pass may repeat: one real Codex run
+restarted the audit from limit 50 once the follow-up was steered in, making
+nine audit reads. Per-tool busy traces print with indexed round and thread
+IDs.
+
+Scoped validation on 2026-10-05 used Claude Code Haiku with low effort and
+Codex `gpt-5.6-luna` with low reasoning. Both received the follow-up as
+steering between the limit-50 and limit-60 passes. Both passed
+`real_swarm_board_coordination`, Codex in 260s and Claude in 133s. Both
+passed `real_swarm_shared_images`, in 25s and 21s. One earlier Claude run
+read the audit thread once and ended its turn without auditing, which
+exceeded the busy deadline; the rerun passed unchanged. Another earlier
+Claude run answered the follow-up with a summary read instead of the
+required thread read. The shared guidance now names the
+`tyde_swarm_read_thread` call explicitly. These are feature-path results,
+not full backend certification.

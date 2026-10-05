@@ -914,7 +914,7 @@ mod wasm_tests {
                 max_live_agents: 1,
                 allocations: Vec::new(),
                 shared_guidance: String::new(),
-                agent_wake_budget: 16,
+                agent_wake_budget: Some(16),
             },
             lifecycle: SwarmLifecycle::Running,
             members: vec![protocol::SwarmMember {
@@ -935,6 +935,7 @@ mod wasm_tests {
                 context_cursor: 0,
                 current_round_id: None,
                 error: None,
+                guidance_changed: false,
             }],
             pending_replies: Vec::new(),
             board_positions: [SwarmBoard::Briefing, SwarmBoard::Coordination]

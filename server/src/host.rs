@@ -728,6 +728,10 @@ pub(crate) struct HostState {
     pub swarm_registry: SwarmRegistryHandle,
     swarm_dispatch_tx: mpsc::Sender<()>,
     swarm_helper_jobs: HashSet<swarms::SwarmHelperJobKey>,
+    /// Members whose running turn refused a wake. They are retried once the
+    /// turn ends; each refusal is itself an activity edge, so retrying while
+    /// still busy would spin.
+    swarm_wakes_awaiting_idle: HashSet<AgentId>,
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
     pub team_registry: TeamRegistryHandle,
@@ -4785,7 +4789,7 @@ impl HostHandle {
             .and_then(|depth| depth.checked_add(1))
             .unwrap_or(1);
 
-        let swarm_workspace = if let Some((swarm_id, _, policy)) = &swarm_binding {
+        let swarm_workspace = if let Some((swarm_id, member_id, policy)) = &swarm_binding {
             let registry = self.state.lock().await.swarm_registry.clone();
             let swarm = registry
                 .snapshot()
@@ -4813,7 +4817,9 @@ impl HostHandle {
                 root_count = roots.len(),
                 "Resolved swarm workspace scope"
             );
-            Some((projects, roots))
+            let steering = swarms::swarm_member_steering(&swarm, member_id)
+                .map_err(|error| AppError::invalid("swarm_activate", error.message))?;
+            Some((projects, roots, steering))
         } else {
             None
         };
@@ -4831,7 +4837,7 @@ impl HostHandle {
                 session_settings,
             } => {
                 let workspace_roots = match &swarm_workspace {
-                    Some((_, roots)) => roots.clone(),
+                    Some((_, roots, _)) => roots.clone(),
                     None => workspace_roots,
                 };
                 let (session_settings, session_settings_source) = self
@@ -5129,7 +5135,7 @@ impl HostHandle {
                         record.custom_agent_id
                     );
                 }
-                if let Some((_, roots)) = &swarm_workspace {
+                if let Some((_, roots, _)) = &swarm_workspace {
                     record.workspace_roots = roots.clone();
                 }
                 let requested_project_id = payload.project_id.or(record.project_id.clone());
@@ -5668,12 +5674,16 @@ impl HostHandle {
 
         let mut request = self.apply_complexity_tier_settings(request).await;
         if let Some((swarm_id, member_id, policy)) = &swarm_binding {
-            let (projects, roots) = swarm_workspace.as_ref().ok_or_else(|| {
+            let (projects, roots, swarm_steering) = swarm_workspace.as_ref().ok_or_else(|| {
                 AppError::invalid("swarm_activate", "Swarm workspace was not resolved")
             })?;
             request.workspace_roots = roots.clone();
             let scope = serde_json::to_string(projects)
                 .map_err(|error| AppError::invalid("swarm_activate", error.to_string()))?;
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str(swarm_steering);
             request.resolved_spawn_config.builtin_steering.push_str(&format!(
                 "\n\nYour server-authorized workspace policy is {policy:?}. Current projects and roots in scope: {scope}. Use tyde_swarm_describe to obtain the current workspace_projects before accessing another project or workbench; the server resolves this list dynamically. Project scope includes newly created workbenches of the selected parent project. Host scope includes all current and newly added projects on this host. Workbench scope covers only the selected workbench. Writable host/project members can use tyde_list_workbenches, tyde_create_workbench, and tyde_remove_workbench within their scope. Do not edit outside the authorized scope. Repository-specific workbench, validation, and landing instructions still apply."
             ));
@@ -15551,6 +15561,7 @@ fn spawn_host_inner(
             swarm_registry,
             swarm_dispatch_tx,
             swarm_helper_jobs: HashSet::new(),
+            swarm_wakes_awaiting_idle: HashSet::new(),
             registry: AgentRegistry::new(),
             supervisor_compaction_tx,
             review_registry,

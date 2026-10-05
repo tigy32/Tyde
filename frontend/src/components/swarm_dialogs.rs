@@ -12,10 +12,9 @@ use wasm_bindgen::JsCast;
 
 use protocol::{
     BackendKind, LaunchProfile, LaunchProfileEntry, LaunchProfileId, ProjectId,
-    SWARM_DEFAULT_AGENT_WAKE_BUDGET, SWARM_MAX_AGENT_WAKE_BUDGET, SWARM_MAX_LIVE_AGENTS,
-    SessionSchemaEntry, SessionSettingsValues, SwarmBackendAllocation, SwarmCommandPayload,
-    SwarmConstraints, SwarmDraft, SwarmDraftId, SwarmId, SwarmMemberId, SwarmMemberSpec,
-    SwarmRetirementPolicy, SwarmWorkspacePolicy,
+    SWARM_MAX_AGENT_WAKE_BUDGET, SWARM_MAX_LIVE_AGENTS, SessionSchemaEntry, SessionSettingsValues,
+    SwarmBackendAllocation, SwarmCommandPayload, SwarmConstraints, SwarmDraft, SwarmDraftId,
+    SwarmId, SwarmMemberId, SwarmMemberSpec, SwarmRetirementPolicy, SwarmWorkspacePolicy,
 };
 
 use crate::components::session_settings::SessionSettingsControls;
@@ -160,7 +159,7 @@ impl ConstraintsForm {
             max_live: RwSignal::new("4".to_owned()),
             allocations: RwSignal::new(Vec::new()),
             guidance: RwSignal::new(String::new()),
-            wake_budget: RwSignal::new(SWARM_DEFAULT_AGENT_WAKE_BUDGET.to_string()),
+            wake_budget: RwSignal::new(String::new()),
             next_key: RwSignal::new(0),
         }
     }
@@ -170,8 +169,12 @@ impl ConstraintsForm {
         self.policy.set(constraints.workspace_policy);
         self.max_live.set(constraints.max_live_agents.to_string());
         self.guidance.set(constraints.shared_guidance.clone());
-        self.wake_budget
-            .set(constraints.agent_wake_budget.to_string());
+        self.wake_budget.set(
+            constraints
+                .agent_wake_budget
+                .map(|budget| budget.to_string())
+                .unwrap_or_default(),
+        );
         let rows = constraints
             .allocations
             .iter()
@@ -238,11 +241,7 @@ impl ConstraintsForm {
             )?,
             allocations,
             shared_guidance: self.guidance.get_untracked(),
-            agent_wake_budget: parse_number(
-                &self.wake_budget.get_untracked(),
-                SWARM_MAX_AGENT_WAKE_BUDGET,
-                "Agent-to-agent turn limit",
-            )?,
+            agent_wake_budget: parse_wake_budget(&self.wake_budget.get_untracked())?,
         })
     }
 
@@ -252,14 +251,7 @@ impl ConstraintsForm {
         let allocations = self.allocations.get();
         parse_number(&max_live, SWARM_MAX_LIVE_AGENTS, "Live agents")
             .err()
-            .or_else(|| {
-                parse_number(
-                    &wake_budget,
-                    SWARM_MAX_AGENT_WAKE_BUDGET,
-                    "Agent-to-agent turn limit",
-                )
-                .err()
-            })
+            .or_else(|| parse_wake_budget(&wake_budget).err())
             .or_else(|| {
                 allocations.iter().find_map(|row| {
                     parse_number(
@@ -364,6 +356,19 @@ fn SettingsOverrides(
         .into_any(),
     }
     }
+}
+
+/// An empty limit means agents may wake each other without limit.
+fn parse_wake_budget(value: &str) -> Result<Option<u32>, String> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_number(
+        value,
+        SWARM_MAX_AGENT_WAKE_BUDGET,
+        "Agent-to-agent turn limit",
+    )
+    .map(Some)
 }
 
 fn parse_number(value: &str, max: u32, label: &str) -> Result<u32, String> {
@@ -678,7 +683,7 @@ fn ConstraintsFields(
                 ></textarea>
             </label>
             <label class="swarm-field">
-                <span class="swarm-field-label">"Agent-to-agent turn limit"</span>
+                <span class="swarm-field-label">"Agent-to-agent turn limit (optional)"</span>
                 <span class="swarm-field-row">
                     <input
                         class="swarm-input swarm-stepper-input"
@@ -686,12 +691,13 @@ fn ConstraintsFields(
                         min="1"
                         max=SWARM_MAX_AGENT_WAKE_BUDGET.to_string()
                         data-field="wake-budget"
-                        aria-invalid=move || parse_number(&form.wake_budget.get(), SWARM_MAX_AGENT_WAKE_BUDGET, "Agent-to-agent turn limit").is_err().to_string()
+                        placeholder="No limit"
+                        aria-invalid=move || parse_wake_budget(&form.wake_budget.get()).is_err().to_string()
                         prop:value=move || form.wake_budget.get()
                         on:input=move |ev| form.wake_budget.set(event_target_value(&ev))
                         on:change=move |ev| form.wake_budget.set(event_target_value(&ev))
                     />
-                    <span class="swarm-field-help">"Limits agent-to-agent turns in each conversation you start. At the limit, new turns stop until you choose Resume."</span>
+                    <span class="swarm-field-help">"Off by default. When set, limits agent-to-agent turns in each request you start; at the limit, new turns stop until you choose Resume."</span>
                 </span>
             </label>
                     </div>
@@ -2077,8 +2083,8 @@ mod wasm_tests {
         assert_eq!(constraints.workspace_policy, SwarmWorkspacePolicy::ReadOnly);
         assert_eq!(constraints.max_live_agents, 4);
         assert_eq!(
-            constraints.agent_wake_budget,
-            SWARM_DEFAULT_AGENT_WAKE_BUDGET
+            constraints.agent_wake_budget, None,
+            "agents wake each other without limit unless a limit is set"
         );
         assert_eq!(constraints.allocations.len(), 1);
         assert_eq!(
@@ -2673,7 +2679,10 @@ mod wasm_tests {
             ),
             (
                 field(&dialog, "wake-budget"),
-                approved.agent_wake_budget.to_string(),
+                approved
+                    .agent_wake_budget
+                    .expect("fixture sets a limit")
+                    .to_string(),
                 SWARM_MAX_AGENT_WAKE_BUDGET,
                 "Agent-to-agent turn limit",
             ),
@@ -2690,6 +2699,10 @@ mod wasm_tests {
                 (max + 1).to_string(),
                 "1.5".to_owned(),
             ] {
+                // An empty turn limit is valid: it means no limit.
+                if invalid.is_empty() && label == "Agent-to-agent turn limit" {
+                    continue;
+                }
                 if invalid.is_empty() {
                     type_into(&control, &invalid);
                 } else {
@@ -2740,8 +2753,19 @@ mod wasm_tests {
             ),
             (
                 "wake-budget",
-                (approved.agent_wake_budget + 1).to_string(),
-                approved.agent_wake_budget.to_string(),
+                (approved.agent_wake_budget.expect("fixture sets a limit") + 1).to_string(),
+                approved
+                    .agent_wake_budget
+                    .expect("fixture sets a limit")
+                    .to_string(),
+            ),
+            (
+                "wake-budget",
+                String::new(),
+                approved
+                    .agent_wake_budget
+                    .expect("fixture sets a limit")
+                    .to_string(),
             ),
         ] {
             change_control(&field(&dialog, field_name), &next);

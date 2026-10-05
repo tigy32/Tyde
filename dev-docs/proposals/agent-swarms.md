@@ -335,10 +335,14 @@ Thread participation alone does not subscribe an agent to endless automatic
 reply turns. Reading historical posts cannot create new notification intents.
 
 For an eligible idle member, schedule a turn when permitted by lifecycle and
-capacity. For a busy member, persist pending notifications and deliver at the
-next turn boundary without automatic interruption. Coalesce pending
-notifications only within the same causal round, in bounded batches retaining
-every underlying post reference. Separate human rounds remain separate turns.
+capacity. A member in a running turn receives the wake as steering into that
+turn. When its backend cannot steer, Tyde interrupts the turn and the wake
+stays a pending swarm intent, sent once the member is idle; a wake never waits
+in the member's private queue, which Pause could not withdraw. A member
+awaiting a human answer or in failure keeps the notification pending. Coalesce
+pending notifications only within the same causal round, in bounded batches
+retaining every underlying post reference. Separate human rounds remain
+separate wakes.
 All board activity since the context cursor remains discoverable, even if it
 did not qualify to wake that member.
 
@@ -375,8 +379,9 @@ Tyde workbench scope. Members coordinate edits; Tyde does not automatically land
 
 ### 4.3 Prevent wake storms
 
-Each externally initiated round has durable causal identity and a finite
-allowance for agent-triggered activations. Subsequent agent posts inherit the
+Each externally initiated round has durable causal identity and an optional
+allowance for agent-triggered activations. The allowance is off by default;
+the human can set one under Advanced settings. Subsequent agent posts inherit the
 causal round; changing thread or board cannot reset it. Coalescing notifications
 must not mint new allowances. Authors cannot spoof human provenance.
 
@@ -608,7 +613,8 @@ boundaries are ready.
   lineup change. Pause and checked mailbox admission are serialized, but the
   host does not hold its command lock while awaiting native acknowledgement.
   Work admitted before Pause may finish its handoff and is then interrupted;
-  work refused as busy stays in the durable swarm intent, not a private queue.
+  work the runtime refuses stays in the durable swarm intent, not a private
+  queue.
 - **Retention:** persisted posts, publication identities and delivery/causal
   history are retained; there is no automatic archival or ledger pruning in
   this version. Page and wake bounds do not bound total stored history.
@@ -621,10 +627,13 @@ boundaries are ready.
   Serialized pages are additionally byte-bounded (1 MiB, including a reserved
   container allowance), so a page can contain fewer than its requested limit.
   The returned cursor and `has_more`, not the requested count, govern paging.
-  Wake input inlines at most 128 KiB of complete chronological posts, never
-  truncates a body, and retains every required notification reference. Agents
-  read omitted bodies through the board tools; omitted content does not
-  advance the member’s inline-context cursor.
+  Wake input is a short ping, one line per notified post naming its author,
+  thread and post id, with no board content. Members read posts through the
+  board tools. Accepting a wake advances the member's context cursor to the
+  notified post. Identity, focus, shared guidance and how to use the board
+  are standing builtin steering for the member's session, not wake text. When
+  shared guidance changes, each running member's next wake carries the new
+  guidance once.
 - **Human unread:** one host-owner read position, shared across connected UI
   clients. The host protocol does not currently represent multiple independent
   human principals. Reading from a model never changes that position.

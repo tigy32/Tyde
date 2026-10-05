@@ -283,6 +283,11 @@ impl AgentActorRuntimeResources {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunningTurnRedirect {
     IdleOnly,
+    /// Join the turn natively; when the backend cannot take it mid-turn,
+    /// interrupt the turn and refuse so the swarm redelivers once idle. A
+    /// swarm wake never waits in the ordinary queue, which Pause cannot
+    /// withdraw.
+    SwarmWake,
     /// Join the turn natively; interrupt it and send next when the backend
     /// cannot take the message mid-turn. The chat input's Steer action.
     SteerElseInterrupt,
@@ -1316,6 +1321,16 @@ impl AgentHandle {
         self.enqueue_delivery(
             AgentInput::SendMessage(payload),
             RunningTurnRedirect::IdleOnly,
+        )
+    }
+
+    pub(crate) fn enqueue_swarm_wake(
+        &self,
+        payload: SendMessagePayload,
+    ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
+        self.enqueue_delivery(
+            AgentInput::SteerMessage(payload),
+            RunningTurnRedirect::SwarmWake,
         )
     }
 
@@ -3442,7 +3457,10 @@ pub(crate) fn spawn_agent_actor(
                             }
                         }
                         AgentCommand::DeliverMessage { input, redirect, reply } => {
-                            if redirect == RunningTurnRedirect::IdleOnly {
+                            if matches!(
+                                redirect,
+                                RunningTurnRedirect::IdleOnly | RunningTurnRedirect::SwarmWake
+                            ) {
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
@@ -6358,9 +6376,12 @@ pub(crate) fn spawn_agent_actor(
                             redirect: delivery_redirect,
                             reply,
                         } => {
-                            if delivery_redirect == RunningTurnRedirect::IdleOnly
-                                && (in_turn || resume_replay_gate_pending || usage_paused || !queue.is_empty())
-                            {
+                            let refused = match delivery_redirect {
+                                RunningTurnRedirect::IdleOnly => in_turn || resume_replay_gate_pending || usage_paused || !queue.is_empty(),
+                                RunningTurnRedirect::SwarmWake => resume_replay_gate_pending || usage_paused || !queue.is_empty(),
+                                _ => false,
+                            };
+                            if refused {
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
@@ -6715,7 +6736,11 @@ pub(crate) fn spawn_agent_actor(
                                         continue;
                                     }
                                     if admission != Some(registry::DispatchAdmission::Admitted) {
-                                        if redirect == RunningTurnRedirect::IdleOnly {
+                                        if matches!(
+                                            redirect,
+                                            RunningTurnRedirect::IdleOnly
+                                                | RunningTurnRedirect::SwarmWake
+                                        ) {
                                             if let Some(reply) = delivery_ack.take() {
                                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                             }
@@ -6809,7 +6834,11 @@ pub(crate) fn spawn_agent_actor(
                                             .send_with_outcome(AgentInput::SendMessage(msg))
                                             .await;
                                         if let SendOutcome::Busy(input) = outcome {
-                                            if redirect == RunningTurnRedirect::IdleOnly {
+                                            if matches!(
+                                                redirect,
+                                                RunningTurnRedirect::IdleOnly
+                                                    | RunningTurnRedirect::SwarmWake
+                                            ) {
                                                 tracing::info!("Swarm native admission deferred: backend is busy; no ordinary message queued");
                                                 mark_agent_turn_active(&status_handle).await;
                                                 if let Some(reply) = delivery_ack.take() {
@@ -7070,6 +7099,12 @@ pub(crate) fn spawn_agent_actor(
                                         .await
                                         != registry::DispatchAdmission::Admitted
                                     {
+                                        if redirect == RunningTurnRedirect::SwarmWake {
+                                            if let Some(reply) = delivery_ack.take() {
+                                                let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                            }
+                                            continue;
+                                        }
                                         let sequence = next_queue_sequence;
                                         next_queue_sequence = next_queue_sequence.saturating_add(1);
                                         queue.push_back(SequencedQueuedMessage {
@@ -7136,31 +7171,46 @@ pub(crate) fn spawn_agent_actor(
                                         ),
                                         }
                                     };
-                                    let sequence = next_queue_sequence;
-                                    next_queue_sequence = next_queue_sequence.saturating_add(1);
-                                    let queued = SequencedQueuedMessage {
-                                        sequence,
-                                        entry: queued_entry_from_send_payload(payload),
-                                    };
-                                    // A message that declined to interrupt
-                                    // waits its turn behind earlier sends.
-                                    if redirect == RunningTurnRedirect::SteerElseQueue {
-                                        queue.push_back(queued);
+                                    let (payload, interrupt_turn) = if redirect
+                                        == RunningTurnRedirect::SwarmWake
+                                    {
+                                        if let Some(reply) = delivery_ack.take() {
+                                            let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                        }
+                                        if !interrupt_turn {
+                                            continue;
+                                        }
+                                        (None, true)
                                     } else {
-                                        queue.push_front(queued);
-                                    }
-                                    update_queued_messages_snapshot(
-                                        &canonical_stream,
-                                        &mut event_log,
-                                        &mut subscribers,
-                                        &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
-                                    .await;
-                                    if let Some(reply) = delivery_ack.take() {
-                                        mark_agent_turn_active(&status_handle).await;
-                                        let _ = reply.send(Ok(()));
+                                        (Some(payload), interrupt_turn)
+                                    };
+                                    if let Some(payload) = payload {
+                                        let sequence = next_queue_sequence;
+                                        next_queue_sequence = next_queue_sequence.saturating_add(1);
+                                        let queued = SequencedQueuedMessage {
+                                            sequence,
+                                            entry: queued_entry_from_send_payload(payload),
+                                        };
+                                        // A message that declined to interrupt
+                                        // waits its turn behind earlier sends.
+                                        if redirect == RunningTurnRedirect::SteerElseQueue {
+                                            queue.push_back(queued);
+                                        } else {
+                                            queue.push_front(queued);
+                                        }
+                                        update_queued_messages_snapshot(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &queue,
+                                            &session_store,
+                                            &status_handle,
+                                        )
+                                        .await;
+                                        if let Some(reply) = delivery_ack.take() {
+                                            mark_agent_turn_active(&status_handle).await;
+                                            let _ = reply.send(Ok(()));
+                                        }
                                     }
                                     if interrupt_turn
                                         && !backend

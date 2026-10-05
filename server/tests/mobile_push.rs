@@ -739,7 +739,7 @@ async fn only_agents_the_user_started_notify() {
                     count: 1,
                 }],
                 shared_guidance: "Publish board-facing results".to_owned(),
-                agent_wake_budget: protocol::SWARM_DEFAULT_AGENT_WAKE_BUDGET,
+                agent_wake_budget: None,
             },
         })
         .await

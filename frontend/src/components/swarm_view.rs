@@ -3024,6 +3024,7 @@ pub(crate) mod wasm_tests {
             context_cursor: 0,
             current_round_id: None,
             error: None,
+            guidance_changed: false,
         }
     }
 
@@ -3058,7 +3059,7 @@ pub(crate) mod wasm_tests {
                     count: 2,
                 }],
                 shared_guidance: String::new(),
-                agent_wake_budget: SWARM_DEFAULT_AGENT_WAKE_BUDGET,
+                agent_wake_budget: Some(SWARM_DEFAULT_AGENT_WAKE_BUDGET),
             },
             lifecycle: SwarmLifecycle::Running,
             members,
