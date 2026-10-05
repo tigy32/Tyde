@@ -11179,7 +11179,7 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("turn")
                     .to_string();
-                let provider_initiated = {
+                {
                     let mut state = self.state.lock().await;
                     if state
                         .terminated_turns
@@ -11213,7 +11213,6 @@ impl CodexInner {
                         return;
                     }
                     state.terminated_turn_awaiting_replacement = None;
-                    let provider_initiated = !state.awaiting_root_turn_start;
                     state.awaiting_root_turn_start = false;
                     state.background_wake_request_in_flight = false;
                     state.active_turn_id = Some(turn_id.clone());
@@ -11227,11 +11226,10 @@ impl CodexInner {
                     state.tool_container_images.clear();
                     state.close_active_stream_when_tools_idle = false;
                     state.pending_message_metadata = None;
-                    provider_initiated
-                };
-                if provider_initiated {
-                    self.emitter.typing_status_changed(true);
                 }
+                // The previous completion can consume the send-path typing edge.
+                // Reassert the real start; the emitter deduplicates an active turn.
+                self.emitter.typing_status_changed(true);
             }
             "item/agentMessage/delta" => {
                 let delta = params

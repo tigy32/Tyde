@@ -54,6 +54,27 @@ pub async fn real_resume_start_race_child<B: Backend>(host: &Harness<B>) -> bool
     false
 }
 
+pub async fn real_answer_completion_race_child<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_ANSWER_COMPLETION_PROOF").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("completion_proxy.py");
+    std::fs::write(&script, include_str!("completion_proxy.py"))
+        .expect("write real provider completion-race fixture");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .status()
+        .await
+        .expect("run isolated real-provider completion race");
+    assert!(
+        status.success(),
+        "real-provider completion race failed; see retained fixture diagnostics"
+    );
+    false
+}
+
 pub async fn real_stream_disconnect_child<B: Backend>(host: &Harness<B>) -> bool {
     if std::env::var_os("TYDE_REAL_STREAM_FAULT_MARKER").is_some() {
         return true;
@@ -1422,18 +1443,17 @@ pub async fn wait_for_unanswered_question_idle<B: Backend>(
     );
 }
 
-pub async fn answer_question<B: Backend>(
-    host: &mut Harness<B>,
-    _agent: &Agent,
-    question: &Question,
+pub async fn send_question_response<B: Backend>(
+    host: &Harness<B>,
+    tool_call_id: &str,
     answer: &str,
-) -> Turn {
+) {
     let payload = SendMessagePayload {
         message: answer.to_owned(),
         images: None,
         origin: None,
         tool_response: Some(SendMessageToolResponse::AskUserQuestion {
-            tool_call_id: question.tool_call_id().to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
             answer: answer.to_owned(),
         }),
     };
@@ -1448,6 +1468,15 @@ pub async fn answer_question<B: Backend>(
         ),
         "backend refused the question's answer"
     );
+}
+
+pub async fn answer_question<B: Backend>(
+    host: &mut Harness<B>,
+    _agent: &Agent,
+    question: &Question,
+    answer: &str,
+) -> Turn {
+    send_question_response(host, question.tool_call_id(), answer).await;
     let mut turn = host.turn(&format!("answer {answer:?}"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {

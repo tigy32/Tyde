@@ -138,6 +138,8 @@ macro_rules! conformance2_scenario {
                 server::backend::codex::CodexBackend,
                 if stringify!($scenario) == "real_nested_subagent_ownership" {
                     Profile::new(&["gpt-5.6-sol"], &[("model", "gpt-5.6-sol"), ("reasoning_effort", "low")])
+                } else if stringify!($scenario) == "real_async_answer_completion_overlap" {
+                    Profile::new(&["gpt-6-luna"], &[("model", "gpt-6-luna"), ("reasoning_effort", "low")])
                 } else if stringify!($scenario) == "real_generated_image_preserves_tool_ownership" {
                     // Luna missed the race; Astra reproduced the captured empty-reasoning interleaving.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
@@ -4531,6 +4533,187 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     assert_universal_contract(&[launched, recovered]);
     assert_clean_close(host, &agent).await;
 }
+
+async fn real_async_answer_completion_overlap<B: Backend>(host: &mut Harness<B>) {
+    use server::backend::SendOutcome;
+
+    if !real_answer_completion_race_child(host).await {
+        return;
+    }
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let prompt = "Use request_user_input_async to ask one nonblocking question with options \
+                  ALPHA and BETA. Then end your turn with a short final sentence. Do not use \
+                  the blocking request_user_input tool or any other tool. When I later answer, \
+                  run the foreground command sleep 8 without detaching it, then repeat my answer.";
+    send_prompt(host, &agent, prompt).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut question = None;
+    let mut running = false;
+    loop {
+        let event = host
+            .next_chat(deadline)
+            .await
+            .expect("question turn must finish its response");
+        match event {
+            ChatEvent::TypingStatusChanged(active) => {
+                assert!(
+                    active && !running,
+                    "question turn must start once and remain active while completion is held"
+                );
+                running = active;
+            }
+            ChatEvent::ToolRequest(request) => {
+                if let ToolRequestType::AskUserQuestion { mode, questions } = &request.tool_type {
+                    assert_eq!(*mode, protocol::UserQuestionMode::NonBlocking);
+                    let answer = questions
+                        .first()
+                        .and_then(|question| question.options.first())
+                        .expect("real question must offer an answer")
+                        .label
+                        .clone();
+                    assert!(
+                        question.replace((request.tool_call_id, answer)).is_none(),
+                        "request exactly one question"
+                    );
+                }
+            }
+            ChatEvent::StreamEnd(end)
+                if question.is_some()
+                    && !end.message.content.trim().is_empty()
+                    && end.message.tool_calls.is_empty() =>
+            {
+                break;
+            }
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
+                panic!("question turn emitted a backend error");
+            }
+            _ => {}
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let proof_path =
+        std::env::var_os("TYDE_ANSWER_COMPLETION_PROOF").expect("transport proof path");
+    let proof: Value = serde_json::from_slice(
+        &std::fs::read(&proof_path).expect("genuine completion must be held"),
+    )
+    .expect("parse content-free completion proof");
+    assert_eq!(proof["completion_held"], true);
+    assert_eq!(proof["completion_released"], false);
+    let (tool_call_id, answer) = question.expect("observed real async question");
+    send_question_response(host, &tool_call_id, &answer).await;
+
+    let followup = "Reply with one short acknowledgment. Do not use tools.";
+    let mut old_idle = false;
+    let mut answer_started = false;
+    let mut answer_completed = false;
+    let mut command_seen = false;
+    let mut final_seen = false;
+    let mut held_followup = None;
+    loop {
+        let event = host
+            .next_chat(deadline)
+            .await
+            .expect("answer must produce its own start and completion edges");
+        match &event {
+            ChatEvent::TypingStatusChanged(active) => {
+                assert_ne!(
+                    *active, running,
+                    "duplicate thinking event must not reach the client"
+                );
+                running = *active;
+                eprintln!(
+                    "Completion overlap activity: running={running}, old_idle={old_idle}, answer_started={answer_started}"
+                );
+                if !active && !old_idle {
+                    old_idle = true;
+                    match try_send_prompt(host, &agent, followup).await {
+                        SendOutcome::Busy(protocol::AgentInput::SendMessage(payload)) => {
+                            assert!(
+                                payload.message == followup,
+                                "Busy must preserve the held follow-up"
+                            );
+                            held_followup = Some(payload);
+                        }
+                        _ => panic!("answer turn must own admission after the old idle edge"),
+                    }
+                } else if *active && old_idle {
+                    assert!(!answer_started, "answer turn must start exactly once");
+                    answer_started = true;
+                } else if !active && old_idle {
+                    assert!(
+                        answer_started && command_seen && final_seen && answer_completed,
+                        "answer turn must finish its real work and answered question before becoming idle"
+                    );
+                    break;
+                }
+            }
+            ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::StreamEnd(_)
+            | ChatEvent::ToolRequest(_) => {
+                assert!(
+                    running,
+                    "answer turn emitted live work while the client was idle"
+                );
+                command_seen |= matches!(&event, ChatEvent::ToolRequest(request)
+                    if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains("sleep 8")));
+                final_seen |= matches!(&event, ChatEvent::StreamEnd(end)
+                    if end.message.tool_calls.is_empty() && end.message.content.contains(&answer));
+            }
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == tool_call_id =>
+            {
+                assert!(
+                    matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
+                    "answer must complete the pending question"
+                );
+                assert!(
+                    !answer_completed,
+                    "question answer must complete exactly once"
+                );
+                answer_completed = true;
+            }
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
+                panic!("answer turn emitted a backend error");
+            }
+            ChatEvent::OperationCancelled(_) => {
+                panic!("answer turn was cancelled without a request")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        matches!(
+            try_deliver_message(
+                host,
+                &agent,
+                held_followup.expect("old idle must retain the Busy follow-up"),
+                false,
+            )
+            .await,
+            SendOutcome::Accepted
+        ),
+        "answer completion must release admission for the held follow-up"
+    );
+    let delivered = collect_turn(host, &agent, followup).await;
+    assert_universal_contract(&[launched, delivered]);
+    assert!(
+        host.protocol_violations().is_empty(),
+        "overlap must not violate the turn-emitter contract"
+    );
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_async_answer_completion_overlap,
+    [
+        BackendCapability::AsyncUserQuestionRequests,
+        BackendCapability::MidTurnSteering
+    ]
+);
 
 fn assert_async_answer_has_no_user_echo(turn: &Turn) {
     let echoes = turn

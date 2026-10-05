@@ -130,6 +130,48 @@ fix, `real_async_user_question` failed on the `Blocking` mapping. With only
 the `NonBlocking` mapping in place, it failed because an answer given
 mid-turn produced no turn.
 
+## Async answer and previous completion overlap
+
+`real_async_answer_completion_overlap` requires asynchronous user questions
+and native mid-turn steering. It exercises an answer whose steering is
+declined because the provider already finished the asking turn, while Tyde
+has not yet consumed that turn's completion. Codex is currently the only
+backend declaring both required capabilities. Async-only question backends
+retain the existing `real_async_user_question` flow and oracle.
+
+The transparent real-CLI fixture holds the genuine asking-turn completion
+for five seconds, preserving FIFO notification ordering while RPC replies
+continue independently. Its content-free proof requires a native steering
+decline and an accepted answer-turn start before releasing the completion;
+it fabricates no responses, notifications, or command results. Missing
+trigger evidence fails the case. Private diagnostics and transport proof
+remain in the reported `tyde-real-completion-race-*` directory.
+
+The unfixed Codex adapter failed the controlled case on 2026-10-05: the
+answer turn emitted live work while the client's typing state was inactive.
+The case checks distinct start/completion edges, rejects duplicate typing
+events, verifies the answered question and real foreground command, and
+retains a follow-up returned as Busy until the answer's completion permits
+delivery. The server-level queue reproduction uses the same real provider
+interleaving, through the real framed host protocol.
+
+The Codex adapter now reasserts activity on every valid provider turn start,
+including user-requested starts. Existing emitter deduplication still
+suppresses redundant true calls. Duplicate and terminated provider starts,
+question semantics, native steering, server queue policy, and UI rendering
+remain unchanged.
+
+Validation on 2026-10-05: the controlled unfixed case failed in 12.26
+seconds; the fixed case passed in 21.70 seconds with the same proven
+interleaving. The real-server reproduction queued the follow-up at 16.35
+seconds, drained it at 24.54 seconds, and completed its reply at 27.75
+seconds. The existing async-question flow passed on Codex in 118.08
+seconds and Antigravity in 108.77 seconds. An initial Antigravity run
+failed the existing independent-work assertion with no pending command;
+an unchanged-code control passed in 111.48 seconds before the explicit
+fixed-build recheck passed. Neither its oracle nor Antigravity production
+code was changed.
+
 ## Resumed native-goal running state
 
 `real_resumed_native_goal_reports_running` requires `NativeGoals` and
