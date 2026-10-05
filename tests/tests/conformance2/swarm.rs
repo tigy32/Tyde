@@ -34,7 +34,6 @@ enum BoardTool {
     ReadBoard,
     ReadThread,
     ReadImage,
-    Post,
     ListThreads,
     ReadSummary,
     ReadDeltas,
@@ -49,7 +48,6 @@ impl BoardTool {
             ("tyde_swarm_read_board", Self::ReadBoard),
             ("tyde_swarm_read_thread", Self::ReadThread),
             ("tyde_swarm_read_image", Self::ReadImage),
-            ("tyde_swarm_post", Self::Post),
             ("tyde_swarm_list_threads", Self::ListThreads),
             ("tyde_swarm_read_summary", Self::ReadSummary),
             ("tyde_swarm_read_deltas", Self::ReadDeltas),
@@ -68,7 +66,7 @@ enum BoardResult {
     Post(Box<SwarmPublicationOutcome>),
     Image(Box<SwarmImage>, ImageData),
     Directory(Box<SwarmThreadDirectory>),
-    Summary(Box<SwarmThread>),
+    Summary(Box<SwarmThreadState>),
     Deltas(Box<SwarmDeltaPage>),
 }
 
@@ -116,14 +114,23 @@ impl ToolEvidence {
             } => {
                 let code = details
                     .as_deref()
-                    .and_then(|details| serde_json::from_str::<SwarmFailure>(details).ok())
-                    .or_else(|| {
-                        serde_json::from_str::<SwarmFailure>(
-                            message.strip_prefix("Error: ").unwrap_or(&message),
-                        )
-                        .ok()
-                    })
+                    .and_then(mcp_swarm_failure)
                     .map(|failure| failure.code);
+                if code == Some(SwarmErrorCode::Conflict)
+                    && matches!(
+                        self.tool,
+                        Some(BoardTool::CreateThread | BoardTool::UpdateThread)
+                    )
+                {
+                    // A peer advanced the thread first; nothing committed and
+                    // the member is instructed to re-read and retry.
+                    eprintln!(
+                        "real swarm conditional write conflict; phase={:?}; tool={:?}",
+                        self.phase, self.tool
+                    );
+                    self.completion_seq = Some(seq);
+                    return;
+                }
                 let input = match &self.request.tool_type {
                     ToolRequestType::Other { args } => Some(args),
                     _ => None,
@@ -296,11 +303,14 @@ impl ToolEvidence {
             }
             BoardTool::ReadSummary => {
                 let query: SwarmThreadIdentity = self.input();
-                let result: SwarmThread = decode(&value, "thread summary completion");
+                let result: SwarmThreadState = decode(&value, "thread summary completion");
                 assert!(
-                    result.swarm_id == self.membership.swarm_id
-                        && result.thread_id == query.thread_id
-                        && result.summary.len() <= 4096
+                    result.thread.swarm_id == self.membership.swarm_id
+                        && result.thread.thread_id == query.thread_id
+                        && result.thread.summary.len() <= 4096
+                        && result.root.thread_id == query.thread_id
+                        && result.root.id.0 == query.thread_id.0,
+                    "summary read must return the requested thread with its root post"
                 );
                 BoardResult::Summary(Box::new(result))
             }
@@ -318,25 +328,19 @@ impl ToolEvidence {
                 );
                 BoardResult::Deltas(Box::new(result))
             }
-            BoardTool::Post | BoardTool::CreateThread | BoardTool::UpdateThread => {
+            BoardTool::CreateThread | BoardTool::UpdateThread => {
                 let (publication, result) = match tool {
-                    BoardTool::Post => (
-                        self.input::<SwarmPublication>(),
-                        decode::<SwarmPublicationOutcome>(&value, "swarm publication completion"),
-                    ),
                     BoardTool::CreateThread => {
                         let input: SwarmThreadCreate = self.input();
                         let result: SwarmThreadCreation =
                             decode(&value, "thread creation completion");
-                        let SwarmThreadCreation::Created {
+                        let SwarmThreadCreation {
                             publication,
                             thread,
-                        } = result
-                        else {
-                            panic!("first exchange creator must create its child")
-                        };
+                        } = result;
                         assert!(
                             thread.parent_thread_id.as_ref() == Some(&input.parent_thread_id)
+                                && thread.board == SwarmBoard::Coordination
                                 && thread.seq == 1
                                 && publication.post.thread_seq == Some(1)
                         );
@@ -352,10 +356,11 @@ impl ToolEvidence {
                                     title: input.title,
                                     description: input.description,
                                     summary: input.summary,
-                                    parent_thread_id: Some(input.parent_thread_id),
+                                    parent_thread_id: input.parent_thread_id,
+                                    expected_sibling_seq: input.expected_sibling_seq,
                                 }),
                             },
-                            *publication,
+                            publication,
                         )
                     }
                     BoardTool::UpdateThread => {
@@ -892,19 +897,12 @@ impl BoardClient {
         });
         self.send(SwarmCommandPayload::Post {
             swarm_id: id.clone(),
-            publication: SwarmPublication {
-                thread_change: Some(SwarmThreadChange::Create {
-                    title: "Conformance request".into(),
-                    description: "Human provider test".into(),
-                    summary: "Provider behavior requested".into(),
-                    parent_thread_id: None,
-                }),
-                images: Vec::new(),
-                board: SwarmBoard::Briefing,
+            post: SwarmHumanPost {
                 publication_id: publication_id.clone(),
-                body: body.clone(),
                 thread_id: None,
+                body: body.clone(),
                 attachments: Vec::new(),
+                images: Vec::new(),
             },
         })
         .await;
@@ -1160,12 +1158,10 @@ async fn require_publication(
     phase: Phase,
     post: &SwarmPost,
 ) {
-    let tool = match (&post.thread_change, post.board) {
-        (Some(SwarmThreadChange::Create { .. }), SwarmBoard::Coordination) => {
-            BoardTool::CreateThread
-        }
-        (Some(SwarmThreadChange::Update { .. }), _) => BoardTool::UpdateThread,
-        _ => BoardTool::Post,
+    let tool = match &post.thread_change {
+        Some(SwarmThreadChange::Create { .. }) => BoardTool::CreateThread,
+        Some(SwarmThreadChange::Update { .. }) => BoardTool::UpdateThread,
+        None => panic!("members publish only through stateful thread writes"),
     };
     client.require_tool(member, phase, tool, |result| matches!(result, BoardResult::Post(outcome) if outcome.post == *post && !outcome.duplicate && outcome.commit_status == SwarmCommitStatus::Durable)).await;
 }
@@ -1194,16 +1190,16 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         let event: ProjectNotifyPayload = client.wait(FrameKind::ProjectNotify, "project registration", |event| matches!(event, ProjectNotifyPayload::Upsert { .. })).await;
         let ProjectNotifyPayload::Upsert { project } = event else { unreachable!() };
         let draft_id = SwarmDraftId(uuid::Uuid::new_v4().to_string());
-        let guidance = "Use only the named tyde_swarm tools directly, never another agent tool. Every result must be a durable board post, not a private final answer. Discover your identity and peers using tyde_swarm_describe, then read Briefing using tyde_swarm_read_board. Read the exact opening thread using tyde_swarm_read_thread. For every root publication, omit thread_id or set it to null; supply thread_id only for the explicitly designated peer reply, using the peer request's exact thread ID. Initially publish one Briefing root SWARM_READY and finish your turn. Later, Initiator receiving BEGIN_EXCHANGE must call tyde_swarm_create_thread with parent_thread_id set to that exact human BEGIN_EXCHANGE thread, title Peer exchange, description Provider coordination, summary Exchange requested, and a root body containing PEER_REQUEST and a typed member_mention for Responder. Responder receiving PEER_REQUEST must perform exactly these FIVE actual reads in order, awaiting each successful result: (1) tyde_swarm_read_board for Coordination; (2) tyde_swarm_read_thread for that exact peer request thread; (3) tyde_swarm_list_threads filtered by board coordination and the BEGIN_EXCHANGE parent_thread_id; (4) tyde_swarm_read_summary for that peer request thread; (5) tyde_swarm_read_deltas for that thread with after_seq 0. All five calls are mandatory even if other tool results already show the IDs or history: inline context and earlier reads cannot substitute for an actual call. Then reply with tyde_swarm_update_thread in the SAME thread using expected_seq from the actual summary read and summary_change append PEER_REPLY, with body PEER_REPLY and a typed member_mention for Initiator. Initiator receiving PEER_REPLY must read Coordination using tyde_swarm_read_board and then read that exact thread including the reply and publish a Briefing root PEER_DONE without mentions. Do not respond to any other agent's Briefing posts. Only Initiator handles BUSY_AUDIT: perform exactly four distinct audit passes with limits 50, 60, 70, and 80 in that order. For EACH limit, call tyde_swarm_read_board for Briefing with that explicit limit THEN tyde_swarm_read_thread for the exact human BUSY_AUDIT root with the same limit. All four distinct limits must be read. Execute all eight reads sequentially, awaiting each result before issuing the next; do not batch or parallelize them. Then publish a Briefing root AUDIT_DONE without mentions and finish that turn. If BUSY_FOLLOWUP appears in a read result during the audit, do not act on it in the audit round: handle it only when separately delivered in your next notification context. Only Initiator receiving that delivered BUSY_FOLLOWUP reads Briefing and its exact human trigger thread, publishes a Briefing root BUSY_CONFIRMED without mentions, and finishes. Responder does nothing on BUSY_AUDIT or BUSY_FOLLOWUP and finishes immediately. If a human asks RESUME_CHECK, both peers read Briefing and that exact human trigger thread, then each publishes one Briefing root RESUME_CONFIRMED without mentions. Do not create or edit files. Every publication must have a fresh publication_id; obtain exact swarm/member/thread/post IDs from describe/read tools or delivered notification context. body segments use type, not kind: a text segment is {type:text,text:...}; a mention is {type:member_mention,member_id:the actual member ID}. NEVER put text inside a member_mention or invent a member_id. Never type an @name instead of a member_mention segment. Handle only the explicitly delivered trigger, not an older matching marker in board history.";
+        let guidance = "Use only the named tyde_swarm tools directly, never another agent tool. Every result must be a durable board post, not a private final answer. Agents never start Briefing threads: every result is a reply in the exact human request thread that delivered it, posted with tyde_swarm_update_thread using that thread_id, expected_seq equal to the thread's current seq from tyde_swarm_read_summary, summary_change append containing the marker, and a body text containing the marker. If update_thread or create_thread fails with a conflict, nothing was committed: call tyde_swarm_read_summary again and retry with the new seq, reusing the same publication_id. On the OPENING request, discover your identity and peers using tyde_swarm_describe, read Briefing using tyde_swarm_read_board, read the exact opening thread using tyde_swarm_read_thread, read its summary with tyde_swarm_read_summary, then reply SWARM_READY without mentions and finish your turn. Later, Initiator receiving BEGIN_EXCHANGE must call tyde_swarm_create_thread with parent_thread_id set to that exact human BEGIN_EXCHANGE thread, expected_sibling_seq 0, title Peer exchange, description Provider coordination, summary Exchange requested, and a root body containing PEER_REQUEST and a typed member_mention for Responder. Responder receiving PEER_REQUEST must perform exactly these FIVE actual reads in order, awaiting each successful result: (1) tyde_swarm_read_board for Coordination; (2) tyde_swarm_read_thread for that exact peer request thread; (3) tyde_swarm_list_threads filtered by board coordination and the BEGIN_EXCHANGE parent_thread_id; (4) tyde_swarm_read_summary for that peer request thread; (5) tyde_swarm_read_deltas for that thread with after_seq 0. All five calls are mandatory even if other tool results already show the IDs or history: inline context and earlier reads cannot substitute for an actual call. Then reply with tyde_swarm_update_thread in the SAME peer thread using expected_seq from the actual summary read and summary_change append PEER_REPLY, with body PEER_REPLY and a typed member_mention for Initiator. Initiator receiving PEER_REPLY must read Coordination using tyde_swarm_read_board and then read that exact peer thread including the reply, then reply PEER_DONE without mentions in the BEGIN_EXCHANGE human thread. A human message containing NO_ACTION needs nothing: finish immediately without any tool call. Do not respond to any other agent's posts. Only Initiator handles BUSY_AUDIT: perform exactly four distinct audit passes with limits 50, 60, 70, and 80 in that order. For EACH limit, call tyde_swarm_read_board for Briefing with that explicit limit THEN tyde_swarm_read_thread for the exact human BUSY_AUDIT thread with the same limit. All four distinct limits must be read. Execute all eight reads sequentially, awaiting each result before issuing the next; do not batch or parallelize them. Then reply AUDIT_DONE without mentions in the BUSY_AUDIT thread and finish that turn. If BUSY_FOLLOWUP appears in a read result during the audit, do not act on it in the audit round: handle it only when separately delivered in your next notification context. Only Initiator receiving that delivered BUSY_FOLLOWUP reads Briefing and its exact human trigger thread, replies BUSY_CONFIRMED without mentions in that BUSY_FOLLOWUP thread, and finishes. Responder does nothing on BUSY_AUDIT or BUSY_FOLLOWUP and finishes immediately. If a human asks RESUME_CHECK, both peers read Briefing and that exact human trigger thread, then each replies RESUME_CONFIRMED without mentions in that RESUME_CHECK thread. Do not create or edit files. Every publication must have a fresh publication_id; obtain exact swarm/member/thread/post IDs from describe/read tools or delivered notification context. body segments use kind: a text segment is {kind:text,text:...}; a mention is {kind:member_mention,member_id:the actual member ID}. NEVER put text inside a member_mention or invent a member_id. Never type an @name instead of a member_mention segment. Handle only the explicitly delivered trigger, not an older matching marker in board history.";
         let provider_instructions = match backend {
             // Retained native evidence: exec discovery returned code-mode-disabled
             // refusals, not results from any of the four actual board tools.
             BackendKind::Codex => "Invoke the named MCP tools DIRECTLY from the tyde-agent-control server using their advertised native tool-call interfaces. Do not use functions.exec, exec, JavaScript, ALL_TOOLS, tool-discovery code, or any code-mode wrapper: code mode is disabled by the read-only policy. The discovery and opening board/thread primer below applies only to the initial opening notification: start by directly calling tyde_swarm_describe, then perform those opening reads and publication. On later notifications, do not repeat the opening primer; execute only the current phase's prescribed reads and publication. A private response is not a substitute for publishing.",
-            BackendKind::Claude => "Invoke the named MCP tools directly from the tyde-agent-control server. For the initial Opening notification only, perform exactly this four-tool sequence, awaiting each successful result: (1) tyde_swarm_describe; (2) tyde_swarm_read_board for Briefing; (3) tyde_swarm_read_thread for the exact opening thread identified by those results; (4) tyde_swarm_post one SWARM_READY Briefing root, omitting thread_id or setting it to null. Calls 2 and 3 must be actual MCP tool invocations even when the inline notification, visible context, or Describe result already contains the opening text and IDs: none substitutes for the two real read results. Do not publish or finish the opening turn before both reads succeed. On later notifications, follow only the corresponding phase instructions below, without repeating this opening primer.",
+            BackendKind::Claude => "Invoke the named MCP tools directly from the tyde-agent-control server. For the initial OPENING notification only, perform exactly this five-tool sequence, awaiting each successful result: (1) tyde_swarm_describe; (2) tyde_swarm_read_board for Briefing; (3) tyde_swarm_read_thread for the exact opening thread identified by those results; (4) tyde_swarm_read_summary for that thread; (5) tyde_swarm_update_thread one SWARM_READY reply in that thread. Calls 2 and 3 must be actual MCP tool invocations even when the inline notification, visible context, or Describe result already contains the opening text and IDs: none substitutes for the two real read results. Do not publish or finish the opening turn before both reads succeed. On later notifications, follow only the corresponding phase instructions below, without repeating this opening primer.",
             _ => "Invoke the named MCP tools directly from the tyde-agent-control server. Start by calling tyde_swarm_describe, then perform the required real board/thread reads and publication.",
         };
-        let guidance = format!("{provider_instructions}\n\n{guidance}\nFor every Briefing root, thread_id MUST be null or omitted: the server mints the new thread ID. Mint only publication_id. Every Briefing root posted with tyde_swarm_post must include thread_change kind create, title Provider result, description Conformance result, summary matching its marker, and parent_thread_id null. The peer exchange uses create_thread and update_thread exactly as instructed, not raw post. Obtain the human parent ID from real board reads or the delivered notification. Never publish without a summary operation.");
-        client.send(SwarmCommandPayload::GenerateDraft { draft_id: draft_id.clone(), expected_revision: None, name: "Real peer coordination".to_owned(), opening_brief: guidance.to_owned(), constraints: SwarmConstraints {
+        let guidance = format!("{provider_instructions}\n\n{guidance}\nMint only publication_id; thread IDs come from the human request or create_thread. Obtain the human parent ID from real board reads or the delivered notification. Never publish without a summary operation.");
+        client.send(SwarmCommandPayload::GenerateDraft { draft_id: draft_id.clone(), expected_revision: None, name: "Real peer coordination".to_owned(), constraints: SwarmConstraints {
             project_id: project.id, workspace_policy: SwarmWorkspacePolicy::ReadOnly, max_live_agents: 2,
             allocations: vec![SwarmBackendAllocation { backend_kind: backend, launch_profile_id: profile.id, session_settings: settings, count: 2 }], shared_guidance: guidance.to_owned(), agent_wake_budget: 16,
         }}).await;
@@ -1225,12 +1221,14 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         client.send(SwarmCommandPayload::Launch { draft_id: draft.id.clone(), expected_revision: draft.revision }).await;
         let event: SwarmNotifyPayload = client.wait(FrameKind::SwarmNotify, "real swarm launch", |event: &SwarmNotifyPayload| event.swarm.source_draft_id.as_ref() == Some(&draft.id)).await;
         let swarm_id = event.swarm.id;
-        let opening_id = event.swarm.opening_post_id.expect("launch publishes its canonical opening root");
-        let opening: SwarmPostNotifyPayload = client.wait(FrameKind::SwarmPostNotify, "canonical opening post", |event: &SwarmPostNotifyPayload| event.post.swarm_id == swarm_id && event.post.id == opening_id).await;
-        let opening = opening.post;
-        assert!(opening.author == SwarmAuthor::Human && opening.board == SwarmBoard::Briefing && opening.thread_id.0 == opening.id.0, "opening must be the intended human Briefing root");
-        let ready_first = client.member_post(&initiator, SwarmBoard::Briefing, "SWARM_READY", &opening, opening.cursor, None).await;
-        let ready_second = client.member_post(&responder, SwarmBoard::Briefing, "SWARM_READY", &opening, opening.cursor, None).await;
+        assert!(event.swarm.members.iter().all(|member| member.state == SwarmMemberState::Proposed) && client.post_count == 0, "members stay idle until the first human request");
+        let opening = client.post(&swarm_id, &[], "OPENING. Both peers: follow the opening steps in your guidance.").await;
+        let ready_first = client.member_post(&initiator, SwarmBoard::Briefing, "SWARM_READY", &opening, opening.cursor, Some(&opening.thread_id)).await;
+        let ready_second = client.member_post(&responder, SwarmBoard::Briefing, "SWARM_READY", &opening, opening.cursor, Some(&opening.thread_id)).await;
+        let named = client.swarm(&swarm_id, |swarm| swarm.threads.iter().any(|thread| thread.thread_id == opening.thread_id && thread.title.as_deref().is_some_and(|title| !title.trim().is_empty()))).await;
+        let opening_thread = named.threads.iter().find(|thread| thread.thread_id == opening.thread_id).unwrap();
+        assert!(opening_thread.naming_error.is_none() && opening_thread.description.is_some(), "the real helper names the human request");
+        assert!(ready_first.thread_change.is_some() && ready_second.thread_change.is_some() && ready_first.thread_seq != ready_second.thread_seq, "concurrent peer replies serialize through the thread sequence");
         for (member, ready) in [(&initiator, &ready_first), (&responder, &ready_second)] {
             client.require_tool(member, Phase::Opening, BoardTool::Describe, |result| matches!(result, BoardResult::Describe(describe) if describe.swarm.id == swarm_id && describe.member_id == *member)).await;
             require_reads(&mut client, member, Phase::Opening, &opening, None).await;
@@ -1243,27 +1241,35 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         assert!(begin.cursor > ready_first.cursor.max(ready_second.cursor) && begin.round_id != opening.round_id, "human exchange must start a new round after both opening turns");
         let request = client.member_post(&initiator, SwarmBoard::Coordination, "PEER_REQUEST", &begin, begin.cursor, None).await;
         assert!(request.body.contains(&SwarmBodySegment::MemberMention { member_id: responder.clone() }), "peer request must route by typed member identity");
-        assert!(matches!(&request.thread_change, Some(SwarmThreadChange::Create {parent_thread_id:Some(parent),..}) if *parent == begin.thread_id) && request.thread_seq == Some(1), "peer discussion must be the exact human request's stateful child");
+        assert!(matches!(&request.thread_change, Some(SwarmThreadChange::Create {parent_thread_id,..}) if *parent_thread_id == begin.thread_id) && request.thread_seq == Some(1), "peer discussion must be the exact human request's stateful child");
         let reply = client.member_post(&responder, SwarmBoard::Coordination, "PEER_REPLY", &begin, request.cursor, Some(&request.thread_id)).await;
         client.require_tool(&responder, Phase::Exchange, BoardTool::ListThreads, |result| matches!(result, BoardResult::Directory(directory) if directory.threads.iter().any(|thread| thread.thread_id == request.thread_id && thread.parent_thread_id.as_ref() == Some(&begin.thread_id)))).await;
-        client.require_tool(&responder, Phase::Exchange, BoardTool::ReadSummary, |result| matches!(result, BoardResult::Summary(thread) if thread.thread_id == request.thread_id && thread.seq == 1)).await;
+        client.require_tool(&responder, Phase::Exchange, BoardTool::ReadSummary, |result| matches!(result, BoardResult::Summary(state) if state.thread.thread_id == request.thread_id && state.thread.seq == 1 && state.root == request)).await;
         client.require_tool(&responder, Phase::Exchange, BoardTool::ReadDeltas, |result| matches!(result, BoardResult::Deltas(page) if page.thread_id == request.thread_id && page.high_water == 1 && page.deltas.contains(&request))).await;
         assert!(reply.thread_seq == Some(2), "peer contribution atomically advances summary and delta sequence");
         assert!(reply.thread_id == request.thread_id && reply.id != request.id, "peer response must be an actual reply, not a similarly marked root");
         assert!(reply.body.contains(&SwarmBodySegment::MemberMention { member_id: initiator.clone() }), "peer reply must route to the exact original peer");
-        let done = client.member_post(&initiator, SwarmBoard::Briefing, "PEER_DONE", &begin, reply.cursor, None).await;
+        let done = client.member_post(&initiator, SwarmBoard::Briefing, "PEER_DONE", &begin, reply.cursor, Some(&begin.thread_id)).await;
         require_reads(&mut client, &responder, Phase::Exchange, &request, None).await;
         require_reads(&mut client, &initiator, Phase::Exchange, &request, Some(&reply)).await;
         require_publication(&mut client, &initiator, Phase::Exchange, &request).await;
         require_publication(&mut client, &responder, Phase::Exchange, &reply).await;
         require_publication(&mut client, &initiator, Phase::Exchange, &done).await;
         client.quiescent(&swarm_id).await;
+        let before_reply = client.swarms[&swarm_id].threads.iter().find(|thread| thread.thread_id == begin.thread_id).expect("human request thread").seq;
+        let human_reply = SwarmPublicationId(uuid::Uuid::new_v4().to_string());
+        client.send(SwarmCommandPayload::Post { swarm_id: swarm_id.clone(), post: SwarmHumanPost { publication_id: human_reply.clone(), thread_id: Some(begin.thread_id.clone()), body: vec![SwarmBodySegment::Text { text: "NO_ACTION. Thanks, the peer exchange answered my question.".into() }], attachments: Vec::new(), images: Vec::new() } }).await;
+        let committed: SwarmPostNotifyPayload = client.wait(FrameKind::SwarmPostNotify, "human reply committed by the real summary helper", |event: &SwarmPostNotifyPayload| event.post.publication_id == human_reply).await;
+        assert!(committed.post.author == SwarmAuthor::Human && committed.post.thread_id == begin.thread_id && committed.post.thread_seq == Some(before_reply + 1) && matches!(&committed.post.thread_change, Some(SwarmThreadChange::Update { expected_seq, summary: SwarmSummaryChange::Replace { text } }) if *expected_seq == before_reply && !text.trim().is_empty() && text.len() <= 4096), "the real helper folds the human reply into a conditional summary update");
+        let settled = client.swarm(&swarm_id, |swarm| swarm.pending_replies.is_empty()).await;
+        assert!(settled.threads.iter().any(|thread| thread.thread_id == begin.thread_id && thread.seq == before_reply + 1), "the committed human reply advances the request thread");
+        client.quiescent(&swarm_id).await;
 
         client.phase = Phase::Busy;
         tokio::time::timeout(EVENT_TIMEOUT, async {
             let audit_prompt = match backend {
-                BackendKind::Codex => "BUSY_AUDIT. Initiator: this phase requires exactly eight read-tool calls, not eight total tool calls. Do not repeat discovery or any opening/primer reads. Perform this numbered sequence exactly once, awaiting each result before the next call: (1) tyde_swarm_read_board for Briefing with limit 50; (2) tyde_swarm_read_thread for this exact human trigger thread with limit 50; (3) tyde_swarm_read_board for Briefing with limit 60; (4) tyde_swarm_read_thread for this same human trigger thread with limit 60; (5) tyde_swarm_read_board for Briefing with limit 70; (6) tyde_swarm_read_thread for this same human trigger thread with limit 70; (7) tyde_swarm_read_board for Briefing with limit 80; (8) tyde_swarm_read_thread for this same human trigger thread with limit 80. All four distinct limits must have both successful real reads before publication. These are the four audit passes: do not add, skip, or repeat a read. Only after call8 succeeds, publish one AUDIT_DONE Briefing root without mentions, omitting thread_id or setting it to null, and finish. Responder: finish without acting.",
-                _ => "BUSY_AUDIT. Initiator: perform FOUR distinct sequential audit passes, first with limit 50, second with limit 60, third with limit 70, fourth with limit 80. Each pass must actually call tyde_swarm_read_board on Briefing with that explicit limit THEN tyde_swarm_read_thread on this exact human thread with the same limit, awaiting each result. All eight actual calls are mandatory, including both calls with limit 80; do not reuse inline context or earlier results. Only after all four distinct limits have both real successful reads, post AUDIT_DONE and finish. Responder: finish without acting.",
+                BackendKind::Codex => "BUSY_AUDIT. Initiator: this phase requires exactly eight read-tool calls, not eight total tool calls. Do not repeat discovery or any opening/primer reads. Perform this numbered sequence exactly once, awaiting each result before the next call: (1) tyde_swarm_read_board for Briefing with limit 50; (2) tyde_swarm_read_thread for this exact human trigger thread with limit 50; (3) tyde_swarm_read_board for Briefing with limit 60; (4) tyde_swarm_read_thread for this same human trigger thread with limit 60; (5) tyde_swarm_read_board for Briefing with limit 70; (6) tyde_swarm_read_thread for this same human trigger thread with limit 70; (7) tyde_swarm_read_board for Briefing with limit 80; (8) tyde_swarm_read_thread for this same human trigger thread with limit 80. All four distinct limits must have both successful real reads before publication. These are the four audit passes: do not add, skip, or repeat a read. Only after call8 succeeds, reply AUDIT_DONE without mentions in this exact thread with tyde_swarm_update_thread, and finish. Responder: finish without acting.",
+                _ => "BUSY_AUDIT. Initiator: perform FOUR distinct sequential audit passes, first with limit 50, second with limit 60, third with limit 70, fourth with limit 80. Each pass must actually call tyde_swarm_read_board on Briefing with that explicit limit THEN tyde_swarm_read_thread on this exact human thread with the same limit, awaiting each result. All eight actual calls are mandatory, including both calls with limit 80; do not reuse inline context or earlier results. Only after all four distinct limits have both real successful reads, reply AUDIT_DONE in this thread and finish. Responder: finish without acting.",
             };
             let audit = client.post(&swarm_id, &[&initiator], audit_prompt).await;
             assert!(audit.cursor > done.cursor && audit.round_id != begin.round_id, "busy audit must be a fresh causal phase");
@@ -1273,10 +1279,10 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
                 let event = client.next(deadline, "real provider starting the audit thread read").await;
                 client.buffer(event);
             }
-            let queued = client.post(&swarm_id, &[&initiator], "BUSY_FOLLOWUP. Initiator: only when this post is delivered as a new notification, read Briefing and this exact human thread, publish BUSY_CONFIRMED, and finish. Do not handle it in the audit round. Responder: finish without acting.").await;
+            let queued = client.post(&swarm_id, &[&initiator], "BUSY_FOLLOWUP. Initiator: only when this post is delivered as a new notification, read Briefing and this exact human thread, reply BUSY_CONFIRMED in this thread, and finish. Do not handle it in the audit round. Responder: finish without acting.").await;
             assert!(queued.cursor > audit.cursor && queued.round_id != audit.round_id, "busy follow-up must have its own human-triggered round");
             let (pending_id, pending_observation) = client.busy_pending(&initiator, &audit, &queued).await;
-            let audited = client.member_post(&initiator, SwarmBoard::Briefing, "AUDIT_DONE", &audit, queued.cursor, None).await;
+            let audited = client.member_post(&initiator, SwarmBoard::Briefing, "AUDIT_DONE", &audit, queued.cursor, Some(&audit.thread_id)).await;
             require_publication(&mut client, &initiator, Phase::Busy, &audited).await;
             let mut reads = client.tools.values().filter(|tool| tool.phase == Phase::Busy && tool.membership.member_id == initiator && tool.round_id.as_ref() == Some(&audit.round_id) && matches!(tool.tool, Some(BoardTool::ReadBoard | BoardTool::ReadThread))).collect::<Vec<_>>();
             reads.sort_by_key(|tool| tool.request_seq);
@@ -1285,7 +1291,7 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
             assert!(reads.as_chunks::<2>().0.iter().all(|pair| matches!(&pair[0].result, Some(BoardResult::Board(page)) if page.board == SwarmBoard::Briefing && page.posts.contains(&audit)) && matches!(&pair[1].result, Some(BoardResult::Thread(page)) if page.root == audit)), "each real audit pass must successfully read the exact board and human thread");
             assert!(reads.windows(2).all(|pair| pair[0].completion_seq.is_some_and(|completed| completed < pair[1].request_seq)), "the real provider must finish each audit read before starting the next, not fake a long-running parallel batch");
             assert!(reads.iter().any(|tool| tool.request_observation > pending_observation), "real sequential audit work must continue AFTER the canonical busy/Pending snapshot, not merely precede the queued trigger");
-            let confirmed = client.member_post(&initiator, SwarmBoard::Briefing, "BUSY_CONFIRMED", &queued, audited.cursor, None).await;
+            let confirmed = client.member_post(&initiator, SwarmBoard::Briefing, "BUSY_CONFIRMED", &queued, audited.cursor, Some(&queued.thread_id)).await;
             require_reads(&mut client, &initiator, Phase::Busy, &queued, None).await;
             require_publication(&mut client, &initiator, Phase::Busy, &confirmed).await;
             let accepted = client.swarm(&swarm_id, |swarm| swarm.notifications.iter().any(|intent| intent.id == pending_id && intent.state == SwarmDeliveryState::Accepted)).await;
@@ -1303,7 +1309,7 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         let sessions: HashMap<_, _> = paused.members.iter().map(|member| (member.spec.id.clone(), member.session_id.clone().expect("real member owns a session"))).collect();
         // Explicit mentions restrict human Briefing recipients; prose asking
         // both peers does not notify an unmentioned retained session.
-        let queued = client.post(&swarm_id, &[&initiator, &responder], "RESUME_CHECK. Both peers: after this notification is delivered, read Briefing and this exact human thread, then each publish one RESUME_CONFIRMED root without mentions.").await;
+        let queued = client.post(&swarm_id, &[&initiator, &responder], "RESUME_CHECK. Both peers: after this notification is delivered, read Briefing and this exact human thread, then each reply RESUME_CONFIRMED without mentions in this thread.").await;
         let pending = client.swarm(&swarm_id, |swarm| swarm.lifecycle == SwarmLifecycle::Paused && [&initiator, &responder].into_iter().all(|member| swarm.notifications.iter().any(|intent| intent.member_id == *member && intent.post_ids == vec![queued.id.clone()] && intent.round_id == queued.round_id && intent.state == SwarmDeliveryState::Pending))).await;
         assert_eq!(pending.notifications.iter().filter(|intent| intent.post_ids.contains(&queued.id)).count(), 2, "the one explicit human resume trigger must create exactly one Pending intent for EACH peer");
         assert!(pending.members.iter().all(|member| member.context_cursor < queued.cursor), "paused trigger must not be accepted into either private session");
@@ -1323,7 +1329,7 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         client.send(SwarmCommandPayload::Resume { swarm_id: swarm_id.clone() }).await;
         let mut confirmations = Vec::new();
         for member in [&initiator, &responder] {
-            let confirmed = client.member_post(member, SwarmBoard::Briefing, "RESUME_CONFIRMED", &queued, queued.cursor, None).await;
+            let confirmed = client.member_post(member, SwarmBoard::Briefing, "RESUME_CONFIRMED", &queued, queued.cursor, Some(&queued.thread_id)).await;
             require_reads(&mut client, member, Phase::Resumed, &queued, None).await;
             require_publication(&mut client, member, Phase::Resumed, &confirmed).await;
             confirmations.push(confirmed);
@@ -1400,7 +1406,7 @@ pub async fn run_images(
             _ => "Use the named tyde-agent-control MCP tools directly. ",
         }.to_owned() + "Read the shared Briefing board with tyde_swarm_read_board. Find the human post with an image attachment. Call tyde_swarm_read_image with its exact image_id to view the actual pixels; metadata and filenames do not contain the answer. The image contains three equal vertical solid-color bands. Publish exactly one concise human-facing reply using tyde_swarm_update_thread in the original human image request thread, with its exact thread_id, expected_seq from tyde_swarm_read_summary, summary_change append with the image result, and one text segment containing IMAGE_RESULT followed by a space and the three lowercase CSS color names from left to right separated by colons. Use a fresh publication_id. Do not guess before reading the image. Do not create files or use any agent tools. A private final answer is not a board publication. Finish after posting.";
         let draft_id = SwarmDraftId(uuid::Uuid::new_v4().to_string());
-        client.send(SwarmCommandPayload::GenerateDraft { draft_id:draft_id.clone(), expected_revision:None, name:"Shared pixels".into(), opening_brief:String::new(), constraints:SwarmConstraints {
+        client.send(SwarmCommandPayload::GenerateDraft { draft_id:draft_id.clone(), expected_revision:None, name:"Shared pixels".into(), constraints:SwarmConstraints {
             project_id:project.id, workspace_policy:SwarmWorkspacePolicy::ReadOnly, max_live_agents:1,
             allocations:vec![SwarmBackendAllocation {backend_kind:backend,launch_profile_id:profile.id,session_settings:settings,count:1}],shared_guidance:String::new(),agent_wake_budget:2,
         }}).await;
@@ -1411,21 +1417,20 @@ pub async fn run_images(
         client.send(SwarmCommandPayload::Launch {draft_id:draft.id.clone(),expected_revision:draft.revision}).await;
         let event: SwarmNotifyPayload = client.wait(FrameKind::SwarmNotify, "image swarm launch", |event: &SwarmNotifyPayload| event.swarm.source_draft_id.as_ref() == Some(&draft.id)).await;
         let swarm_id = event.swarm.id;
-        assert!(event.swarm.opening_post_id.is_none(), "upload precedes the first provider wake");
+        assert!(event.swarm.members.iter().all(|member| member.state == SwarmMemberState::Proposed), "upload precedes the first provider wake");
         let image_id = SwarmImageId(uuid::Uuid::new_v4().to_string());
         client.send(SwarmCommandPayload::UploadImage {swarm_id:swarm_id.clone(),image:SwarmImageUpload {image_id:image_id.clone(),name:"shared-reference.png".into(),data:pixels.clone()}}).await;
         let uploaded: SwarmImageNotifyPayload = client.wait(FrameKind::SwarmImageNotify, "actual image upload", |event: &SwarmImageNotifyPayload| event.swarm_id == swarm_id && event.image_id == image_id).await;
         let SwarmImageOutcome::Ready {image, data:None} = uploaded.outcome else {panic!("valid real image must be durably stored")};
         let publication_id = SwarmPublicationId(uuid::Uuid::new_v4().to_string());
-        client.send(SwarmCommandPayload::Post {swarm_id:swarm_id.clone(),publication:SwarmPublication {
-thread_change: Some(SwarmThreadChange::Create {title:"Inspect shared pixels".into(),description:"Image provider test".into(),summary:"Shared pixels awaiting inspection".into(),parent_thread_id:None}),publication_id:publication_id.clone(),board:SwarmBoard::Briefing,thread_id:None,body:vec![SwarmBodySegment::Text {text:prompt}],attachments:Vec::new(),images:vec![image_id.clone()]}}).await;
+        client.send(SwarmCommandPayload::Post {swarm_id:swarm_id.clone(),post:SwarmHumanPost {publication_id:publication_id.clone(),thread_id:None,body:vec![SwarmBodySegment::Text {text:prompt}],attachments:Vec::new(),images:vec![image_id.clone()]}}).await;
         let trigger: SwarmPostNotifyPayload = client.wait(FrameKind::SwarmPostNotify, "shared image trigger", |event: &SwarmPostNotifyPayload| event.post.publication_id == publication_id && event.post.author == SwarmAuthor::Human).await;
         let posted = client.member_post(&member, SwarmBoard::Briefing, "IMAGE_RESULT", &trigger.post, trigger.post.cursor, Some(&trigger.post.thread_id)).await;
         let text = posted.body.iter().map(|segment| match segment {SwarmBodySegment::Text {text} => text.as_str(), _ => panic!("image result must be ordinary text")}).collect::<String>().trim().to_ascii_lowercase().replace("fuchsia", "magenta");
         assert!(text == format!("image_result {answer}"), "real member must identify the actual shared pixels correctly; backend={backend:?}");
         client.require_tool(&member, Phase::Opening, BoardTool::ReadImage, |result| matches!(result, BoardResult::Image(metadata, data) if **metadata == image && *data == pixels)).await;
         client.require_tool(&member, Phase::Opening, BoardTool::ReadBoard, |result| matches!(result, BoardResult::Board(page) if page.posts.contains(&trigger.post))).await;
-        client.require_tool(&member, Phase::Opening, BoardTool::ReadSummary, |result| matches!(result, BoardResult::Summary(thread) if thread.thread_id == trigger.post.thread_id && thread.seq == 1)).await;
+        client.require_tool(&member, Phase::Opening, BoardTool::ReadSummary, |result| matches!(result, BoardResult::Summary(state) if state.thread.thread_id == trigger.post.thread_id && state.thread.seq == 1 && state.root.id == trigger.post.id)).await;
         assert!(posted.thread_seq == Some(2));
         require_publication(&mut client, &member, Phase::Opening, &posted).await;
         client.quiescent(&swarm_id).await;
@@ -1439,4 +1444,20 @@ thread_change: Some(SwarmThreadChange::Create {title:"Inspect shared pixels".int
         std::panic::resume_unwind(panic);
     }
     cleanup.expect("bounded image host shutdown");
+}
+
+/// Decodes the board error a failed MCP call returned. Failure details carry
+/// the canonical `CallToolResult`, either directly or as the
+/// `detailed_message` of a normalized error result.
+fn mcp_swarm_failure(details: &str) -> Option<SwarmFailure> {
+    let value = serde_json::from_str::<Value>(details).ok()?;
+    if let Some(inner) = value.get("detailed_message").and_then(Value::as_str) {
+        return mcp_swarm_failure(inner);
+    }
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .find_map(|text| serde_json::from_str::<SwarmFailure>(text).ok())
 }

@@ -728,7 +728,6 @@ async fn only_agents_the_user_started_notify() {
             draft_id: draft_id.clone(),
             expected_revision: None,
             name: "Push-suppressed swarm".to_owned(),
-            opening_brief: "A swarm peer completes one board activation".to_owned(),
             constraints: protocol::SwarmConstraints {
                 project_id: project.id.clone(),
                 workspace_policy: protocol::SwarmWorkspacePolicy::ReadOnly,
@@ -774,6 +773,36 @@ async fn only_agents_the_user_started_notify() {
         })
         .await
         .expect("launch exactly the reviewed swarm peer");
+    let launched_event = swarm_push_frame(&mut fixture, "launched swarm", |event| {
+        event.kind == FrameKind::SwarmNotify
+            && event
+                .parse_payload::<protocol::SwarmNotifyPayload>()
+                .expect("launched swarm state")
+                .swarm
+                .source_draft_id
+                .as_ref()
+                == Some(&draft.id)
+    })
+    .await;
+    let launched: protocol::SwarmNotifyPayload = launched_event
+        .parse_payload()
+        .expect("launched swarm state");
+    fixture
+        .client
+        .swarm_command(protocol::SwarmCommandPayload::Post {
+            swarm_id: launched.swarm.id.clone(),
+            post: protocol::SwarmHumanPost {
+                publication_id: protocol::SwarmPublicationId("push-request".to_owned()),
+                thread_id: None,
+                body: vec![protocol::SwarmBodySegment::Text {
+                    text: "A swarm peer completes one board activation".to_owned(),
+                }],
+                attachments: Vec::new(),
+                images: Vec::new(),
+            },
+        })
+        .await
+        .expect("open the human request that wakes the peer");
     let member_event = swarm_push_frame(&mut fixture, "swarm member native activation", |event| {
         event.kind == FrameKind::NewAgent
             && event
@@ -824,7 +853,7 @@ async fn only_agents_the_user_started_notify() {
     let idle: protocol::SwarmNotifyPayload = idle_event
         .parse_payload()
         .expect("completed real swarm lifecycle");
-    assert!(idle.swarm.opening_post_id.is_some());
+    assert!(idle.swarm.threads.len() == 1);
     assert_eq!(
         swarm_control
             .requests()

@@ -13512,7 +13512,7 @@ impl CodexInner {
                     == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
                 let (tool_result, success, error_message) = if item_type == "mcpToolCall" {
-                    let normalized = normalize_mcp_call_tool_result(item);
+                    let normalized = codex_mcp_call_tool_result(item, provider_success);
                     let success = normalized.success && provider_success;
                     let error = normalized
                         .error
@@ -15746,8 +15746,8 @@ impl CodexInner {
                 let provider_success = item.get("status").and_then(Value::as_str)
                     == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
-                let normalized_mcp =
-                    (item_type == "mcpToolCall").then(|| normalize_mcp_call_tool_result(item));
+                let normalized_mcp = (item_type == "mcpToolCall")
+                    .then(|| codex_mcp_call_tool_result(item, provider_success));
                 let result = if let Some(normalized) = normalized_mcp.as_ref() {
                     normalized.tool_result.clone()
                 } else {
@@ -22967,6 +22967,22 @@ fn codex_public_generic_tool_result(tool_name: &str, item: &Value, success: bool
                 .unwrap_or_else(|_| item.to_string()),
         })
     }
+}
+
+/// Codex reports an MCP `isError` result as a failed item whose `result`
+/// omits the flag, so the failed status restores it on the canonical result.
+fn codex_mcp_call_tool_result(
+    item: &Value,
+    provider_success: bool,
+) -> super::NormalizedMcpToolResult {
+    if provider_success {
+        return normalize_mcp_call_tool_result(item);
+    }
+    let mut item = item.clone();
+    if let Some(result) = item.get_mut("result").and_then(Value::as_object_mut) {
+        result.insert("isError".to_owned(), Value::Bool(true));
+    }
+    normalize_mcp_call_tool_result(&item)
 }
 
 fn normalize_codex_tool_result(

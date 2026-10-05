@@ -313,7 +313,6 @@ impl Scenario {
             draft_id: id.clone(),
             expected_revision: None,
             name: "Protocol swarm".to_owned(),
-            opening_brief: "Review the project and publish useful findings".to_owned(),
             constraints,
         })
         .await;
@@ -453,7 +452,34 @@ impl Scenario {
     async fn launched(&mut self, count: u32) -> Swarm {
         let draft = self.generate(self.constraints(count)).await;
         let swarm = self.launch(&draft).await;
-        self.swarm(&swarm.id, ready).await
+        self.open_request(&swarm.id, "Review the project and publish useful findings")
+            .await
+            .1
+    }
+
+    /// Opens a human Briefing request and waits until every member has
+    /// accepted it and returned to idle.
+    async fn open_request(&mut self, id: &SwarmId, body: &str) -> (SwarmPost, Swarm) {
+        let post = self
+            .post(
+                id,
+                publication(
+                    SwarmBoard::Briefing,
+                    &format!("request-{}", uuid::Uuid::new_v4()),
+                    vec![text(body)],
+                ),
+            )
+            .await;
+        let swarm = self
+            .swarm(id, |swarm| {
+                ready(swarm)
+                    && swarm
+                        .members
+                        .iter()
+                        .all(|member| member.context_cursor >= post.cursor)
+            })
+            .await;
+        (post, swarm)
     }
 
     async fn pause(&mut self, id: &SwarmId) -> Swarm {
@@ -465,28 +491,11 @@ impl Scenario {
             .await
     }
 
-    async fn post(&mut self, id: &SwarmId, mut publication: SwarmPublication) -> SwarmPost {
-        if publication.thread_change.is_none()
-            && let Some(thread_id) = &publication.thread_id
-        {
-            let snapshot = self.snapshot(id).await;
-            if let Some(thread) = snapshot
-                .threads
-                .iter()
-                .find(|thread| thread.thread_id == *thread_id)
-            {
-                publication.thread_change = Some(protocol::SwarmThreadChange::Update {
-                    expected_seq: thread.seq,
-                    summary: protocol::SwarmSummaryChange::Append {
-                        text: "Human scenario contribution".into(),
-                    },
-                });
-            }
-        }
+    async fn post(&mut self, id: &SwarmId, publication: SwarmPublication) -> SwarmPost {
         let key = publication.publication_id.clone();
         self.send(SwarmCommandPayload::Post {
             swarm_id: id.clone(),
-            publication,
+            post: human_post(publication),
         })
         .await;
         let event: SwarmPostNotifyPayload = self
@@ -712,7 +721,6 @@ impl Scenario {
             draft_id: refreshed.id.clone(),
             expected_revision: Some(refreshed.revision),
             name: previous.name.clone(),
-            opening_brief: previous.opening_brief.clone(),
             constraints: refreshed.constraints.clone(),
         })
         .await;
@@ -740,6 +748,33 @@ fn publication(board: SwarmBoard, key: &str, body: Vec<SwarmBodySegment>) -> Swa
         thread_id: None,
         attachments: Vec::new(),
     }
+}
+
+/// Humans address an existing thread or open a Briefing request; the board
+/// of a new request is implied.
+fn human_post(publication: SwarmPublication) -> protocol::SwarmHumanPost {
+    assert!(
+        publication.thread_id.is_some() || publication.board == SwarmBoard::Briefing,
+        "humans open Briefing requests; Coordination threads are agent-created"
+    );
+    protocol::SwarmHumanPost {
+        publication_id: publication.publication_id,
+        thread_id: publication.thread_id,
+        body: publication.body,
+        attachments: publication.attachments,
+        images: publication.images,
+    }
+}
+
+/// Root post of the human's first Briefing request.
+fn first_request(swarm: &Swarm) -> protocol::SwarmPostId {
+    swarm
+        .threads
+        .iter()
+        .filter(|thread| thread.board == SwarmBoard::Briefing && thread.parent_thread_id.is_none())
+        .min_by_key(|thread| thread.creation_cursor)
+        .map(|thread| protocol::SwarmPostId(thread.thread_id.0.clone()))
+        .expect("the swarm has a human Briefing request")
 }
 
 fn text(value: &str) -> SwarmBodySegment {
@@ -851,112 +886,171 @@ async fn client_event_without_swarm(
     .unwrap_or_else(|_| panic!("ordinary activity barrier timed out during {phase}"))
 }
 
-// Older flow fixtures describe publications rather than thread state. Supply
-// the new wire contract through real authenticated reads without changing their
-// original body, author, notification, permission, or causal assertions.
 async fn call_tool(
     caller: &server::AgentControlMcpCaller,
     name: &str,
     arguments: Value,
 ) -> CallToolResult {
-    if name != "tyde_swarm_post"
-        || arguments
-            .get("thread_change")
-            .is_some_and(|value| !value.is_null())
-    {
-        return call_tool_raw(caller, name, arguments).await;
-    }
+    call_tool_raw(caller, name, arguments).await
+}
+
+// Older flow fixtures describe agent posts as one publication shape. Route each
+// through the real thread tools without changing the flows' body, author,
+// notification, permission, or causal assertions: a reply (or an agent post to
+// Briefing) updates its thread, and a new Coordination post opens a child
+// thread under the swarm's first human request. Retries resend the committed
+// thread change so idempotency is exercised exactly.
+async fn agent_post(caller: &server::AgentControlMcpCaller, arguments: Value) -> CallToolResult {
+    let publication: SwarmPublication =
+        serde_json::from_value(arguments).expect("typed fixture publication");
     let described = call_tool_raw(caller, "tyde_swarm_describe", json!({})).await;
     if described.is_error == Some(true) {
-        return call_tool_raw(caller, name, arguments).await;
+        return call_tool_raw(
+            caller,
+            "tyde_swarm_update_thread",
+            json!({
+                "thread_id": publication.thread_id.clone().unwrap_or(protocol::SwarmThreadId("unknown".into())),
+                "expected_seq": 1,
+                "summary_change": {"kind": "append", "text": "Unauthorized contribution"},
+                "publication_id": publication.publication_id,
+                "body": publication.body,
+                "attachments": publication.attachments,
+                "images": publication.images,
+            }),
+        )
+        .await;
     }
     let described: protocol::SwarmDescribe = tool_value(&described);
-    let mut publication: SwarmPublication =
-        serde_json::from_value(arguments).expect("typed fixture publication");
-    let page: SwarmBoardPage = tool_value(
-        &call_tool_raw(
-            caller,
-            "tyde_swarm_read_board",
-            json!({"board": publication.board, "limit":100}),
-        )
-        .await,
-    );
-    let existing = page.posts.iter().find(|post| {
-        post.publication_id == publication.publication_id
-            && post.author
-                == (SwarmAuthor::Member {
-                    member_id: described.member_id.clone(),
-                })
-    });
-    if let Some(existing) = existing {
-        publication.thread_change = existing.thread_change.clone();
-        publication.thread_id = match existing.thread_change {
-            Some(protocol::SwarmThreadChange::Create { .. }) => None,
-            _ => Some(existing.thread_id.clone()),
-        };
-    } else {
-        if publication.thread_id.is_none()
-            && publication.board == SwarmBoard::Coordination
-            && let Some(child) = described
-                .swarm
-                .threads
-                .iter()
-                .find(|thread| thread.board == SwarmBoard::Coordination)
-        {
-            publication.thread_id = Some(child.thread_id.clone());
-        }
-        publication.thread_change = Some(match &publication.thread_id {
-            Some(id) => match described
-                .swarm
-                .threads
-                .iter()
-                .find(|thread| thread.thread_id == *id)
-            {
-                Some(thread) => protocol::SwarmThreadChange::Update {
-                    expected_seq: thread.seq,
-                    summary: protocol::SwarmSummaryChange::Append {
-                        text: "Protocol scenario contribution".into(),
+    let author = SwarmAuthor::Member {
+        member_id: described.member_id.clone(),
+    };
+    let mut existing = None;
+    for board in [SwarmBoard::Briefing, SwarmBoard::Coordination] {
+        let page: SwarmBoardPage = tool_value(
+            &call_tool_raw(
+                caller,
+                "tyde_swarm_read_board",
+                json!({"board": board, "limit": 100}),
+            )
+            .await,
+        );
+        existing = existing.or_else(|| {
+            page.posts.into_iter().find(|post| {
+                post.publication_id == publication.publication_id && post.author == author
+            })
+        });
+    }
+    let human_request = described
+        .swarm
+        .threads
+        .iter()
+        .filter(|thread| thread.board == SwarmBoard::Briefing && thread.parent_thread_id.is_none())
+        .min_by_key(|thread| thread.creation_cursor)
+        .cloned();
+    let change = match existing {
+        Some(existing) => existing
+            .thread_change
+            .map(|change| (existing.thread_id, change)),
+        None => match (&publication.thread_id, publication.board) {
+            (Some(thread_id), _) => {
+                let state: protocol::SwarmThreadState = tool_value(
+                    &call_tool_raw(
+                        caller,
+                        "tyde_swarm_read_summary",
+                        json!({"thread_id": thread_id}),
+                    )
+                    .await,
+                );
+                Some((
+                    thread_id.clone(),
+                    protocol::SwarmThreadChange::Update {
+                        expected_seq: state.thread.seq,
+                        summary: protocol::SwarmSummaryChange::Append {
+                            text: "Protocol scenario contribution".into(),
+                        },
                     },
-                },
-                None => {
-                    let thread: SwarmThreadPage = tool_value(
-                        &call_tool_raw(
-                            caller,
-                            "tyde_swarm_read_thread",
-                            json!({"thread_id":id,"limit":100}),
-                        )
-                        .await,
-                    );
-                    protocol::SwarmThreadChange::Initialize {
-                        expected_cursor: thread.high_water,
+                ))
+            }
+            (None, SwarmBoard::Briefing) => human_request.map(|thread| {
+                (
+                    thread.thread_id,
+                    protocol::SwarmThreadChange::Update {
+                        expected_seq: thread.seq,
+                        summary: protocol::SwarmSummaryChange::Append {
+                            text: "Protocol scenario contribution".into(),
+                        },
+                    },
+                )
+            }),
+            (None, SwarmBoard::Coordination) => human_request.map(|parent| {
+                (
+                    parent.thread_id.clone(),
+                    protocol::SwarmThreadChange::Create {
                         title: "Protocol scenario".into(),
                         description: "Authenticated feature flow".into(),
                         summary: "Protocol scenario contribution".into(),
-                    }
-                }
-            },
-            None => protocol::SwarmThreadChange::Create {
-                title: "Protocol scenario".into(),
-                description: "Authenticated feature flow".into(),
-                summary: "Protocol scenario contribution".into(),
-                parent_thread_id: if publication.board == SwarmBoard::Coordination {
-                    described
-                        .swarm
-                        .opening_post_id
-                        .as_ref()
-                        .map(|post| protocol::SwarmThreadId(post.0.clone()))
-                } else {
-                    None
-                },
-            },
-        });
+                        parent_thread_id: parent.thread_id,
+                        expected_sibling_seq: parent.child_seq,
+                    },
+                )
+            }),
+        },
+    };
+    let Some((thread_id, change)) = change else {
+        panic!("agent fixture publication needs a human request to attach to");
+    };
+    match change {
+        protocol::SwarmThreadChange::Update {
+            expected_seq,
+            summary,
+        } => {
+            call_tool_raw(
+                caller,
+                "tyde_swarm_update_thread",
+                json!({
+                    "thread_id": thread_id,
+                    "expected_seq": expected_seq,
+                    "summary_change": summary,
+                    "publication_id": publication.publication_id,
+                    "body": publication.body,
+                    "attachments": publication.attachments,
+                    "images": publication.images,
+                }),
+            )
+            .await
+        }
+        protocol::SwarmThreadChange::Create {
+            title,
+            description,
+            summary,
+            parent_thread_id,
+            expected_sibling_seq,
+        } => {
+            let mut result = call_tool_raw(
+                caller,
+                "tyde_swarm_create_thread",
+                json!({
+                    "parent_thread_id": parent_thread_id,
+                    "expected_sibling_seq": expected_sibling_seq,
+                    "title": title,
+                    "description": description,
+                    "summary": summary,
+                    "publication_id": publication.publication_id,
+                    "body": publication.body,
+                    "attachments": publication.attachments,
+                    "images": publication.images,
+                }),
+            )
+            .await;
+            if result.is_error == Some(false) {
+                let created: protocol::SwarmThreadCreation = tool_value(&result);
+                result.content = vec![rmcp::model::Content::text(
+                    serde_json::to_string(&created.publication).expect("publication outcome"),
+                )];
+            }
+            result
+        }
     }
-    call_tool_raw(
-        caller,
-        name,
-        serde_json::to_value(publication).expect("stateful fixture publication"),
-    )
-    .await
 }
 
 async fn call_tool_raw(
@@ -984,6 +1078,20 @@ async fn call_tool_raw(
         .expect("call MCP tool over HTTP");
     service.cancel().await.expect("close MCP client");
     result
+}
+
+async fn agent_published(
+    caller: &server::AgentControlMcpCaller,
+    publication: &SwarmPublication,
+) -> SwarmPost {
+    let outcome: SwarmPublicationOutcome = tool_value(
+        &agent_post(
+            caller,
+            serde_json::to_value(publication).expect("serialize agent publication"),
+        )
+        .await,
+    );
+    outcome.post
 }
 
 fn tool_value<T: DeserializeOwned>(result: &CallToolResult) -> T {
@@ -1039,14 +1147,12 @@ async fn empty_swarm_waits_for_conversation_and_new_members_wait_for_real_posts(
             draft_id: id.clone(),
             expected_revision: None,
             name: "Interactive peers".into(),
-            opening_brief: String::new(),
             constraints: scenario.constraints(1),
         })
         .await;
     let draft = scenario.draft(&id, 0).await;
     let swarm = scenario.launch(&draft).await;
     assert_eq!(swarm.lifecycle, SwarmLifecycle::Running);
-    assert!(swarm.opening_post_id.is_none());
     assert!(swarm.notifications.is_empty() && swarm.rounds.is_empty());
     assert!(
         swarm
@@ -1126,6 +1232,51 @@ async fn empty_swarm_waits_for_conversation_and_new_members_wait_for_real_posts(
         "creation and constraint edits invent no messages"
     );
     assert!(page.posts[0].id == first.id);
+
+    // Pre-thread stores cannot be read; they are kept beside a fresh store.
+    let store_path = scenario.fixture.swarm_store_path();
+    let backup_path = store_path.with_file_name("agent_swarms.json.bak");
+    let legacy = br#"{"version":2,"swarms":[{"opening_brief":"legacy"}],"drafts":[]}"#;
+    std::fs::write(&store_path, legacy).expect("write legacy swarm store");
+    let bootstrap = scenario.fixture.restart_host().await;
+    scenario.pending.clear();
+    assert!(
+        bootstrap.swarms.is_empty(),
+        "an unreadable pre-thread store starts the host with no swarms"
+    );
+    assert_eq!(
+        std::fs::read(&backup_path).expect("legacy store is set aside"),
+        legacy,
+        "the set-aside store keeps the original bytes for manual recovery"
+    );
+    let fresh = scenario.generate(scenario.constraints(1)).await;
+    assert!(
+        fresh.members.len() == 1,
+        "the replacement store accepts new work"
+    );
+
+    // A damaged current store is a storage failure, never a silent reset.
+    let damaged = br#"{"version":3,"swarms":"#;
+    std::fs::write(&store_path, damaged).expect("write damaged swarm store");
+    scenario.fixture.restart_host().await;
+    scenario.pending.clear();
+    scenario
+        .send(SwarmCommandPayload::GenerateDraft {
+            draft_id: SwarmDraftId(uuid::Uuid::new_v4().to_string()),
+            expected_revision: None,
+            name: "After damage".into(),
+            constraints: scenario.constraints(1),
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Storage).await;
+    assert_eq!(
+        std::fs::read(&store_path).expect("damaged store stays in place"),
+        damaged
+    );
+    assert_eq!(
+        std::fs::read(&backup_path).expect("earlier backup is untouched"),
+        legacy
+    );
 }
 
 #[tokio::test]
@@ -1176,7 +1327,6 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
             draft_id: draft.id.clone(),
             expected_revision: Some(draft.revision),
             name: draft.name.clone(),
-            opening_brief: draft.opening_brief.clone(),
             constraints: scenario.constraints(1),
         })
         .await;
@@ -1210,7 +1360,6 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
             draft_id: draft.id.clone(),
             expected_revision: Some(draft.revision),
             name: draft.name.clone(),
-            opening_brief: draft.opening_brief.clone(),
             constraints: scenario.constraints(2),
         })
         .await;
@@ -1262,6 +1411,16 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
         ])
         .await;
     let starting = scenario.launch(&draft).await;
+    let opening_post = scenario
+        .post(
+            &starting.id,
+            publication(
+                SwarmBoard::Briefing,
+                "partial-opening-request",
+                vec![text("Review the project and publish useful findings")],
+            ),
+        )
+        .await;
     let partial = scenario
         .swarm(&starting.id, |swarm| {
             swarm
@@ -1325,13 +1484,13 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     assert_eq!(
         opening.posts.len(),
         1,
-        "opening brief is persisted once even on partial launch"
+        "the opening request is persisted once even on partial activation"
     );
-    assert!(Some(&opening.posts[0].id) == partial.opening_post_id.as_ref());
+    assert!(opening.posts[0].id == opening_post.id);
     assert!(opening.posts[0].author == SwarmAuthor::Human);
     assert!(
-        opening.posts[0].body == vec![text(&draft.opening_brief)],
-        "opening brief must match the approved preview"
+        opening.posts[0].body == vec![text("Review the project and publish useful findings")],
+        "the opening request must keep the human's message"
     );
     let (_, after_launch) = scenario.fixture.connect_with_bootstrap().await;
     let replayed_activation = after_launch
@@ -1391,7 +1550,7 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     assert_eq!(
         request_count(&successful_control.requests().await),
         successful_request_count,
-        "retry must not redeliver the opening brief to successful members"
+        "retry must not redeliver the opening request to successful members"
     );
     let board = scenario
         .board(&partial.id, read_board(SwarmBoard::Briefing))
@@ -1399,7 +1558,7 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     assert_eq!(
         board.posts.len(),
         1,
-        "activation retry must not republish the opening brief"
+        "activation retry must not republish the opening request"
     );
     assert!(board.posts[0].id == opening.posts[0].id);
     let stored = scenario.snapshot(&partial.id).await;
@@ -1460,14 +1619,39 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     );
     let _: SwarmDraftNotifyPayload = scenario.wait(FrameKind::SwarmDraftNotify, "committed uncertain launch draft deletion", |event|
         matches!(event, SwarmDraftNotifyPayload::Delete { draft_id } if *draft_id == uncertain_draft.id)).await;
+    assert!(
+        scenario
+            .board(&committed_launch.id, read_board(SwarmBoard::Briefing))
+            .await
+            .posts
+            .is_empty(),
+        "launch publishes nothing on the human's behalf"
+    );
+    let uncertain_request = scenario
+        .post(
+            &committed_launch.id,
+            publication(
+                SwarmBoard::Briefing,
+                "uncertain-launch-request",
+                vec![text("Review the project and publish useful findings")],
+            ),
+        )
+        .await;
+    let launch_attention = scenario.snapshot(&committed_launch.id).await;
+    assert!(
+        launch_attention.lifecycle == SwarmLifecycle::AttentionRequired
+            && launch_attention
+                .members
+                .iter()
+                .all(|member| member.agent_id.is_none() && member.session_id.is_none()),
+        "a human request cannot authorize native execution of an uncertain launch"
+    );
     let committed_brief = scenario
         .board(&committed_launch.id, read_board(SwarmBoard::Briefing))
         .await;
-    assert_eq!(committed_brief.posts.len(), 1);
     assert!(
-        committed_brief.posts[0].body == vec![text(&uncertain_draft.opening_brief)]
-            && launch_attention.opening_post_id.as_ref() == Some(&committed_brief.posts[0].id),
-        "the committed opening post must be observable despite an uncertain directory sync"
+        committed_brief.posts.len() == 1 && committed_brief.posts[0].id == uncertain_request.id,
+        "the committed request must be observable despite an uncertain directory sync"
     );
     scenario
         .send(SwarmCommandPayload::MarkRead {
@@ -1531,7 +1715,15 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
             swarm_id: committed_launch.id.clone(),
         })
         .await;
-    let committed_live = scenario.swarm(&committed_launch.id, ready).await;
+    let committed_live = scenario
+        .swarm(&committed_launch.id, |state| {
+            ready(state)
+                && state
+                    .members
+                    .iter()
+                    .all(|member| member.context_cursor >= uncertain_request.cursor)
+        })
+        .await;
     assert_eq!(
         committed_live.recovery_requirement,
         protocol::SwarmRecoveryRequirement::None
@@ -1586,9 +1778,8 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
     );
     scenario.fixture.fail_next_swarm_directory_sync().await;
     let uncertain_outcome: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(&uncertain_publication)
                 .expect("serialize committed-warning publication"),
         )
@@ -1674,9 +1865,8 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
         "committed uncertain peer publication cannot cross native admission before human Resume"
     );
     let duplicate: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(&uncertain_publication)
                 .expect("serialize committed publication retry"),
         )
@@ -1725,9 +1915,8 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
         protocol::SwarmRecoveryRequirement::ExplicitResume
     );
     let durable_retry: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(&uncertain_publication)
                 .expect("serialize retry after subsequent durable write"),
         )
@@ -1891,7 +2080,13 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
         }
         let draft = scenario.generate(constraints).await;
         let launched = scenario.launch(&draft).await;
-        let swarm = scenario.swarm(&launched.id, ready).await;
+        let swarm = scenario
+            .open_request(
+                &launched.id,
+                "Review the project and publish useful findings",
+            )
+            .await
+            .1;
         scenario.pause(&swarm.id).await;
         let agent = swarm.members[0]
             .agent_id
@@ -1951,7 +2146,6 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             "tyde_swarm_read_board",
             "tyde_swarm_read_thread",
             "tyde_swarm_read_image",
-            "tyde_swarm_post",
             "tyde_swarm_list_threads",
             "tyde_swarm_read_summary",
             "tyde_swarm_read_deltas",
@@ -1998,9 +2192,8 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
                 },
             });
             swarm_tool_error(
-                &call_tool(
+                &agent_post(
                     &caller,
-                    "tyde_swarm_post",
                     serde_json::to_value(outside).expect("attachment publication"),
                 )
                 .await,
@@ -2046,9 +2239,8 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             },
         });
         let published: SwarmPublicationOutcome = tool_value(
-            &call_tool(
+            &agent_post(
                 &caller,
-                "tyde_swarm_post",
                 serde_json::to_value(attached).expect("attachment publication"),
             )
             .await,
@@ -2084,9 +2276,8 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
                 },
             });
             swarm_tool_error(
-                &call_tool(
+                &agent_post(
                     &caller,
-                    "tyde_swarm_post",
                     serde_json::to_value(outside).expect("outside publication"),
                 )
                 .await,
@@ -2246,7 +2437,6 @@ async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() 
                 draft_id: draft.id.clone(),
                 expected_revision: Some(draft.revision),
                 name: draft.name.clone(),
-                opening_brief: draft.opening_brief.clone(),
                 constraints,
             })
             .await;
@@ -2261,7 +2451,6 @@ async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() 
             draft_id: draft.id.clone(),
             expected_revision: Some(draft.revision),
             name: draft.name.clone(),
-            opening_brief: draft.opening_brief.clone(),
             constraints: unavailable,
         })
         .await;
@@ -2304,19 +2493,28 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             .iter()
             .any(|state| state.id == swarm.id)
     );
-    let literal = scenario
-        .post(
-            &swarm.id,
-            publication(
-                SwarmBoard::Coordination,
-                "literal-reference",
-                vec![text(&format!(
-                    "@{} is a literal display name, not an authenticated mention",
-                    swarm.members[0].spec.name
-                ))],
-            ),
+    // Coordination threads are agent-created; the human replies to them.
+    let second_caller = scenario
+        .fixture
+        .agent_control_caller(
+            swarm.members[1]
+                .agent_id
+                .as_ref()
+                .expect("authenticated second member"),
         )
         .await;
+    let literal = agent_published(
+        &second_caller,
+        &publication(
+            SwarmBoard::Coordination,
+            "literal-reference",
+            vec![text(&format!(
+                "@{} is a literal display name, not an authenticated mention",
+                swarm.members[0].spec.name
+            ))],
+        ),
+    )
+    .await;
     let shared_only = scenario.snapshot(&swarm.id).await;
     assert!(
         !shared_only
@@ -2437,7 +2635,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     .await
     .expect("peer must receive its own requested page");
     assert_eq!(peer_board.posts.len(), 1);
-    assert!(Some(&peer_board.posts[0].id) == swarm.opening_post_id.as_ref());
+    assert!(peer_board.posts[0].id == first_request(&swarm));
     let reverse_barrier = scenario
         .board(&swarm.id, read_board(SwarmBoard::Coordination))
         .await;
@@ -2471,11 +2669,11 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
                 member_id: first_member.clone(),
             },
             SwarmBodySegment::PostLink {
-                post_id: swarm.opening_post_id.clone().expect("opening reference"),
+                post_id: first_request(&swarm),
             },
         ],
     );
-    let typed = scenario.post(&swarm.id, typed_publication.clone()).await;
+    let typed = agent_published(&second_caller, &typed_publication).await;
     let after_typed = scenario.snapshot(&swarm.id).await;
     let notifications = after_typed
         .notifications
@@ -2489,7 +2687,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     );
     assert!(notifications[0].member_id == first_member);
     assert_eq!(notifications[0].state, SwarmDeliveryState::Pending);
-    let repeated = scenario.post(&swarm.id, typed_publication.clone()).await;
+    let repeated = agent_published(&second_caller, &typed_publication).await;
     assert!(
         repeated == typed,
         "retry must return the existing durable publication"
@@ -2512,17 +2710,13 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     typed_publication
         .body
         .push(text("A different body under the same key"));
-    scenario
-        .send(SwarmCommandPayload::Post {
-            swarm_id: swarm.id.clone(),
-            publication: typed_publication,
-        })
-        .await;
-    let conflict = scenario.error(SwarmErrorCode::Conflict).await;
-    assert!(conflict.swarm_id.as_ref() == Some(&swarm.id));
-    assert!(
-        conflict.publication_id.as_ref() == Some(&typed.publication_id),
-        "publication errors must bind to the rejected submission"
+    swarm_tool_error(
+        &agent_post(
+            &second_caller,
+            serde_json::to_value(&typed_publication).expect("serialize changed publication"),
+        )
+        .await,
+        SwarmErrorCode::Conflict,
     );
 
     let briefing_all = scenario
@@ -2589,15 +2783,6 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     );
     second_reply_publication.thread_id = Some(literal.thread_id.clone());
     let second_reply = scenario.post(&swarm.id, second_reply_publication).await;
-    reply_publication.board = SwarmBoard::Briefing;
-    reply_publication.publication_id = SwarmPublicationId("wrong-board-reply".to_owned());
-    scenario
-        .send(SwarmCommandPayload::Post {
-            swarm_id: swarm.id.clone(),
-            publication: reply_publication,
-        })
-        .await;
-    scenario.error(SwarmErrorCode::Invalid).await;
 
     let first_two = scenario
         .board(
@@ -2655,18 +2840,17 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     assert!(first_page.has_more);
     assert_eq!(first_page.next_cursor.position, literal.cursor);
     assert_eq!(first_page.high_water, second_reply.cursor);
-    let late_root = scenario
-        .post(
-            &swarm.id,
-            publication(
-                SwarmBoard::Coordination,
-                "live-root-during-pagination",
-                vec![text(
-                    "New live activity must not extend an existing historical snapshot",
-                )],
-            ),
-        )
-        .await;
+    let late_root = agent_published(
+        &second_caller,
+        &publication(
+            SwarmBoard::Coordination,
+            "live-root-during-pagination",
+            vec![text(
+                "New live activity must not extend an existing historical snapshot",
+            )],
+        ),
+    )
+    .await;
     assert!(late_root.cursor > first_page.high_water);
     let older_threads = scenario
         .board(
@@ -3008,18 +3192,9 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         &late_root.id,
         &late_reply.id,
     ]));
-    let retried_after_restart = scenario
-        .post(
-            &swarm.id,
-            publication(
-                SwarmBoard::Coordination,
-                "typed-reference",
-                typed.body.clone(),
-            ),
-        )
-        .await;
+    let retried_after_restart = scenario.post(&swarm.id, reply_publication).await;
     assert!(
-        retried_after_restart == typed,
+        retried_after_restart == reply,
         "publication identity must remain durable across restart"
     );
     let reread = scenario.snapshot(&swarm.id).await;
@@ -3029,10 +3204,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     );
 
     let foreign = scenario.launched(1).await;
-    let foreign_opening = foreign
-        .opening_post_id
-        .as_ref()
-        .expect("foreign swarm opening post");
+    let foreign_opening = &first_request(&foreign);
     scenario
         .send(SwarmCommandPayload::ReadBoard {
             swarm_id: foreign.id.clone(),
@@ -3066,7 +3238,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: foreign_reply,
+            post: human_post(foreign_reply),
         })
         .await;
     scenario.error(SwarmErrorCode::NotFound).await;
@@ -3081,11 +3253,11 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         scenario
             .send(SwarmCommandPayload::Post {
                 swarm_id: swarm.id.clone(),
-                publication: publication(
-                    SwarmBoard::Coordination,
+                post: human_post(publication(
+                    SwarmBoard::Briefing,
                     "foreign-reference",
                     vec![segment],
-                ),
+                )),
             })
             .await;
         scenario.error(SwarmErrorCode::Unauthorized).await;
@@ -3098,7 +3270,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         },
     };
     let mut attached_publication = publication(
-        SwarmBoard::Coordination,
+        SwarmBoard::Briefing,
         "project-reference",
         vec![text("Authorized project file reference")],
     );
@@ -3115,7 +3287,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: attached_publication.clone(),
+            post: human_post(attached_publication.clone()),
         })
         .await;
     scenario.error(SwarmErrorCode::Unauthorized).await;
@@ -3125,7 +3297,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: attached_publication.clone(),
+            post: human_post(attached_publication.clone()),
         })
         .await;
     scenario.error(SwarmErrorCode::Unauthorized).await;
@@ -3134,16 +3306,16 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: attached_publication,
+            post: human_post(attached_publication),
         })
         .await;
     scenario.error(SwarmErrorCode::NotFound).await;
     let scoped = scenario
-        .board(&swarm.id, read_board(SwarmBoard::Coordination))
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
         .await;
     assert_eq!(
         scoped.posts.len(),
-        7,
+        4,
         "scope errors cannot leave partially persisted posts"
     );
     assert!(
@@ -3153,6 +3325,64 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             .is_some_and(|post| post.id == attached.id)
     );
 
+    let empty_body_bytes = serde_json::to_vec(&vec![text("")])
+        .expect("measure canonical body envelope")
+        .len();
+    let text_budget = protocol::SWARM_MAX_BODY_BYTES - empty_body_bytes;
+    let mut escaped_text = "\\".repeat(text_budget / 2);
+    if !text_budget.is_multiple_of(2) {
+        escaped_text.push('x');
+    }
+    let large_body = vec![text(&escaped_text)];
+    assert_eq!(
+        serde_json::to_vec(&large_body)
+            .expect("measure maximum valid escaped body")
+            .len(),
+        protocol::SWARM_MAX_BODY_BYTES
+    );
+    // The live member authors the shared history before the pause so only
+    // the later wake notifies.
+    let foreign_caller = scenario
+        .fixture
+        .agent_control_caller(
+            foreign.members[0]
+                .agent_id
+                .as_ref()
+                .expect("authenticated foreign member"),
+        )
+        .await;
+    let large_root = agent_published(
+        &foreign_caller,
+        &publication(
+            SwarmBoard::Coordination,
+            "large-page-root",
+            large_body.clone(),
+        ),
+    )
+    .await;
+    let mut large_posts = vec![large_root.clone()];
+    for index in 1..protocol::SWARM_MAX_PAGE_LIMIT {
+        let previous = large_posts.last().expect("large thread has a root");
+        let outcome: SwarmPublicationOutcome = tool_value(
+            &call_tool(
+                &foreign_caller,
+                "tyde_swarm_update_thread",
+                json!({
+                    "thread_id": large_root.thread_id,
+                    "expected_seq": previous.thread_seq.expect("committed thread sequence"),
+                    "summary_change": {"kind": "append", "text": "Large reply"},
+                    "publication_id": format!("large-page-reply-{index}"),
+                    "body": large_body,
+                }),
+            )
+            .await,
+        );
+        large_posts.push(outcome.post);
+    }
+    let high_water = large_posts
+        .last()
+        .expect("maximum page has committed activity")
+        .cursor;
     scenario.pause(&foreign.id).await;
     let before_failure = scenario.snapshot(&swarm.id).await;
     let store_path = scenario.fixture.swarm_store_path();
@@ -3165,7 +3395,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     std::fs::create_dir(&store_path)
         .expect("block swarm store publication with a real filesystem object");
     let failed_publication = publication(
-        SwarmBoard::Coordination,
+        SwarmBoard::Briefing,
         "recoverable-store-failure",
         vec![
             text("Publish this only after durable storage recovers"),
@@ -3177,7 +3407,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: failed_publication.clone(),
+            post: human_post(failed_publication.clone()),
         })
         .await;
     let storage_error = scenario.error(SwarmErrorCode::Storage).await;
@@ -3187,7 +3417,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         "storage rejection must identify the failed publication for the client"
     );
     let failed_page = scenario
-        .board(&swarm.id, read_board(SwarmBoard::Coordination))
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
         .await;
     assert!(
         failed_page.posts == scoped.posts && failed_page.high_water == scoped.high_water,
@@ -3266,11 +3496,11 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         "recovered posts and their exact intent/cause identities must survive host restart"
     );
     let recovered_page = scenario
-        .board(&swarm.id, read_board(SwarmBoard::Coordination))
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
         .await;
-    assert_eq!(recovered_page.posts.len(), 8);
+    assert_eq!(recovered_page.posts.len(), 5);
     assert!(
-        recovered_page.posts[..7] == scoped.posts && recovered_page.posts[7] == recovered_post,
+        recovered_page.posts[..4] == scoped.posts && recovered_page.posts[4] == recovered_post,
         "filesystem recovery must retain all earlier board activity and persist the retried post once"
     );
     let restart_retry = scenario.post(&swarm.id, failed_publication).await;
@@ -3280,45 +3510,6 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     );
     assert!(scenario.snapshot(&swarm.id).await.notifications == recovered.notifications);
 
-    let empty_body_bytes = serde_json::to_vec(&vec![text("")])
-        .expect("measure canonical body envelope")
-        .len();
-    let text_budget = protocol::SWARM_MAX_BODY_BYTES - empty_body_bytes;
-    let mut escaped_text = "\\".repeat(text_budget / 2);
-    if !text_budget.is_multiple_of(2) {
-        escaped_text.push('x');
-    }
-    let large_body = vec![text(&escaped_text)];
-    assert_eq!(
-        serde_json::to_vec(&large_body)
-            .expect("measure maximum valid escaped body")
-            .len(),
-        protocol::SWARM_MAX_BODY_BYTES
-    );
-    let large_root = scenario
-        .post(
-            &foreign.id,
-            publication(
-                SwarmBoard::Coordination,
-                "large-page-root",
-                large_body.clone(),
-            ),
-        )
-        .await;
-    let mut large_posts = vec![large_root.clone()];
-    for index in 1..protocol::SWARM_MAX_PAGE_LIMIT {
-        let mut reply = publication(
-            SwarmBoard::Coordination,
-            &format!("large-page-reply-{index}"),
-            large_body.clone(),
-        );
-        reply.thread_id = Some(large_root.thread_id.clone());
-        large_posts.push(scenario.post(&foreign.id, reply).await);
-    }
-    let high_water = large_posts
-        .last()
-        .expect("maximum page has committed activity")
-        .cursor;
     let mut board_queries = Vec::new();
     let mut board_pages = Vec::new();
     let mut board_cursor = None;
@@ -3524,7 +3715,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
 
     let before_inline = scenario.snapshot(&foreign.id).await;
     assert!(before_inline.members[0].context_cursor < large_root.cursor);
-    let wake = scenario.post(&foreign.id, publication(SwarmBoard::Coordination, "large-history-wake", vec![
+    let wake = scenario.post(&foreign.id, publication(SwarmBoard::Briefing, "large-history-wake", vec![
         text("Read the referenced notification and any omitted shared history through the board tools"),
         SwarmBodySegment::MemberMention { member_id: foreign.members[0].spec.id.clone() },
     ])).await;
@@ -3696,9 +3887,16 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         };
         protocol::SWARM_MAX_ATTACHMENTS
     ];
-    let oversized_post = scenario
-        .post(&oversized_swarm.id, oversized_publication)
+    let oversized_member = scenario
+        .fixture
+        .agent_control_caller(
+            oversized_swarm.members[0]
+                .agent_id
+                .as_ref()
+                .expect("authenticated oversized-post author"),
+        )
         .await;
+    let oversized_post = agent_published(&oversized_member, &oversized_publication).await;
     let oversized_bytes = serde_json::to_vec(&oversized_post)
         .expect("measure committed attachment-heavy full post")
         .len();
@@ -3707,7 +3905,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             && oversized_bytes <= protocol::SWARM_MAX_POST_BYTES,
         "a valid readable full post must exceed the inline budget without exceeding the durable or page bounds"
     );
-    let oversized_wake = scenario.post(&oversized_swarm.id, publication(SwarmBoard::Coordination, "wake-behind-oversized-post", vec![
+    let oversized_wake = scenario.post(&oversized_swarm.id, publication(SwarmBoard::Briefing, "wake-behind-oversized-post", vec![
         text("Read the required notification through tools despite the preceding oversized shared post"),
         SwarmBodySegment::MemberMention { member_id: oversized_swarm.members[0].spec.id.clone() },
     ])).await;
@@ -3797,10 +3995,30 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     assert!(oversized_control.violations().await.is_empty());
     scenario.pause(&oversized_swarm.id).await;
     let mut boundary_posts: Vec<SwarmPost> = Vec::new();
+    // A human request roots the thread and the member replies: human replies
+    // reserve room for the helper's summary, so cannot reach the exact maximum.
     for key in ["exact-max-root", "exact-max-reply"] {
         let mut measured = oversized_post.clone();
         measured.cursor = oversized_wake.cursor + boundary_posts.len() as u64 + 1;
         measured.publication_id = SwarmPublicationId(key.to_owned());
+        measured.board = SwarmBoard::Briefing;
+        match boundary_posts.first() {
+            None => {
+                measured.author = SwarmAuthor::Human;
+                measured.thread_change = None;
+                measured.thread_seq = Some(1);
+            }
+            Some(root) => {
+                measured.thread_id = root.thread_id.clone();
+                measured.thread_change = Some(protocol::SwarmThreadChange::Update {
+                    expected_seq: 1,
+                    summary: protocol::SwarmSummaryChange::Append {
+                        text: "Boundary reply".into(),
+                    },
+                });
+                measured.thread_seq = Some(2);
+            }
+        }
         measured.body = vec![text("Authorized boundary post")];
         measured.attachments = vec![protocol::SwarmAttachment {
             project_id: scenario.project.id.clone(),
@@ -3837,10 +4055,31 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
                 .len()
                 <= protocol::SWARM_MAX_BODY_BYTES
         );
-        let mut request = publication(SwarmBoard::Coordination, key, measured.body.clone());
-        request.attachments = measured.attachments.clone();
-        request.thread_id = boundary_posts.first().map(|root| root.thread_id.clone());
-        let accepted = scenario.post(&oversized_swarm.id, request).await;
+        let accepted = match boundary_posts.first() {
+            None => {
+                let mut request = publication(SwarmBoard::Briefing, key, measured.body.clone());
+                request.attachments = measured.attachments.clone();
+                scenario.post(&oversized_swarm.id, request).await
+            }
+            Some(root) => {
+                let outcome: SwarmPublicationOutcome = tool_value(
+                    &call_tool(
+                        &oversized_member,
+                        "tyde_swarm_update_thread",
+                        json!({
+                            "thread_id": root.thread_id,
+                            "expected_seq": 1,
+                            "summary_change": {"kind": "append", "text": "Boundary reply"},
+                            "publication_id": key,
+                            "body": measured.body,
+                            "attachments": measured.attachments,
+                        }),
+                    )
+                    .await,
+                );
+                outcome.post
+            }
+        };
         assert_eq!(
             serde_json::to_vec(&accepted)
                 .expect("measure actual accepted boundary post")
@@ -3852,6 +4091,28 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         boundary_posts.push(accepted);
     }
     let root = &boundary_posts[0];
+    let mut unsummarizable = publication(
+        SwarmBoard::Briefing,
+        "exact-max-human-reply",
+        boundary_posts[1].body.clone(),
+    );
+    unsummarizable.attachments = boundary_posts[1].attachments.clone();
+    unsummarizable.thread_id = Some(root.thread_id.clone());
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: oversized_swarm.id.clone(),
+            post: human_post(unsummarizable),
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Invalid).await;
+    assert!(
+        scenario
+            .snapshot(&oversized_swarm.id)
+            .await
+            .pending_replies
+            .is_empty(),
+        "a reply with no room for its summary must be rejected, never held uncommittable"
+    );
     let mut cursor = None;
     let mut read_replies = Vec::new();
     loop {
@@ -3909,6 +4170,16 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
         .collect();
     let launch_reservation = scenario.fixture.reserve_mock_launches(scripts).await;
     let starting = scenario.launch(&draft).await;
+    scenario
+        .post(
+            &starting.id,
+            publication(
+                SwarmBoard::Briefing,
+                "opening-request",
+                vec![text("Review the project and publish useful findings")],
+            ),
+        )
+        .await;
     let busy = scenario
         .swarm(&starting.id, |swarm| {
             swarm.members.iter().all(|member| {
@@ -4189,7 +4460,7 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
         "resume must not republish the brief or turn private output into shared posts"
     );
     assert!(board.posts.iter().map(|post| &post.id).eq([
-        busy.opening_post_id.as_ref().expect("original brief"),
+        &first_request(&busy),
         &first.id,
         &second.id,
     ]));
@@ -4205,7 +4476,7 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
         .post(
             &busy.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "pause-before-final-handoff",
                 vec![
                     text("Pause must win over this prepared but unadmitted turn"),
@@ -4342,7 +4613,7 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
         .post(
             &restart_race.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "pause-before-resumed-runtime",
                 vec![
                     text("Do not create a resumed runtime after Pause commits"),
@@ -4475,14 +4746,20 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
             )
             .await;
         let starting_replay = scenario.launch(&replay_draft).await;
-        let original_replay = scenario.swarm(&starting_replay.id, ready).await;
+        let original_replay = scenario
+            .open_request(
+                &starting_replay.id,
+                "Review the project and publish useful findings",
+            )
+            .await
+            .1;
         drop(initial_replay_reservation);
         let replay_paused = scenario.pause(&original_replay.id).await;
         let replay_post = scenario
             .post(
                 &original_replay.id,
                 publication(
-                    SwarmBoard::Coordination,
+                    SwarmBoard::Briefing,
                     "pause-during-native-replay",
                     vec![
                         text("A deferred prompt must be revocable until native replay is ready"),
@@ -4552,7 +4829,7 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
                 .post(
                     &original_replay.id,
                     publication(
-                        SwarmBoard::Coordination,
+                        SwarmBoard::Briefing,
                         "durability-during-native-replay",
                         vec![text("Durability review must revoke the held native prompt")],
                     ),
@@ -4666,7 +4943,7 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .expect("list authenticated swarm tools over HTTP");
     assert_eq!(
         tools.len(),
-        10,
+        9,
         "a swarm caller sees thread and shared-board tools, never ordinary orchestration tools"
     );
     for (name, read_only) in [
@@ -4674,7 +4951,6 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         ("tyde_swarm_read_board", true),
         ("tyde_swarm_read_thread", true),
         ("tyde_swarm_read_image", true),
-        ("tyde_swarm_post", false),
         ("tyde_swarm_list_threads", true),
         ("tyde_swarm_read_summary", true),
         ("tyde_swarm_read_deltas", true),
@@ -4767,9 +5043,8 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         ],
     );
     let member_post: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(&member_publication).expect("serialize typed member publication"),
         )
         .await,
@@ -4794,7 +5069,7 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .post(
             &swarm.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "caller-scoped-key",
                 vec![text("A human publication uses its own key scope")],
             ),
@@ -4805,9 +5080,16 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         "publication identities are caller-scoped, not globally reserved"
     );
     assert!(human_post.author == SwarmAuthor::Human);
-    let caller_scoped_page = scenario
-        .board(&swarm.id, read_board(SwarmBoard::Coordination))
+    // Humans open requests on Briefing; the member's thread is on Coordination.
+    let mut caller_scoped_page = scenario
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
         .await;
+    caller_scoped_page.posts.extend(
+        scenario
+            .board(&swarm.id, read_board(SwarmBoard::Coordination))
+            .await
+            .posts,
+    );
     assert_eq!(
         caller_scoped_page
             .posts
@@ -4829,9 +5111,8 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         "the protocol and MCP notifications must describe the actual two committed posts"
     );
     let duplicate: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(&member_publication).expect("serialize retry"),
         )
         .await,
@@ -4841,9 +5122,8 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
     let mut changed = member_publication;
     changed.body.push(text("Changed publication content"));
     swarm_tool_error(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(changed).expect("serialize changed publication"),
         )
         .await,
@@ -4903,9 +5183,8 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         ],
     );
     let update: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &caller,
-            "tyde_swarm_post",
             serde_json::to_value(agent_update).expect("serialize cross-board post"),
         )
         .await,
@@ -4992,13 +5271,26 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
             .expect("thread query"),
         ),
         (
-            "tyde_swarm_post",
-            serde_json::to_value(publication(
-                SwarmBoard::Briefing,
-                "nonmember-post",
-                vec![text("Unauthorized publication")],
-            ))
-            .expect("publication"),
+            "tyde_swarm_update_thread",
+            json!({
+                "thread_id": opening.thread_id,
+                "expected_seq": 0,
+                "summary_change": {"kind": "append", "text": "Unauthorized"},
+                "publication_id": "nonmember-update",
+                "body": [{"kind": "text", "text": "Unauthorized publication"}],
+            }),
+        ),
+        (
+            "tyde_swarm_create_thread",
+            json!({
+                "parent_thread_id": opening.thread_id,
+                "expected_sibling_seq": 0,
+                "title": "Unauthorized",
+                "description": "Unauthorized",
+                "summary": "Unauthorized",
+                "publication_id": "nonmember-create",
+                "body": [{"kind": "text", "text": "Unauthorized publication"}],
+            }),
         ),
     ] {
         swarm_tool_error(
@@ -5212,7 +5504,7 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .post(
             &swarm.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "fatal-member-authority",
                 vec![
                     text("A terminated caller cannot inherit ordinary orchestration authority"),
@@ -5393,6 +5685,16 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .await;
     let starting = scenario.launch(&draft).await;
     scenario
+        .post(
+            &starting.id,
+            publication(
+                SwarmBoard::Briefing,
+                "opening-request",
+                vec![text("Review the project and publish useful findings")],
+            ),
+        )
+        .await;
+    scenario
         .wait_mock_turn(&finish_gate, "capacity-current-turn-before-retirement")
         .await;
     let busy = scenario
@@ -5421,7 +5723,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .post(
             &busy.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "pending-before-retire",
                 vec![
                     text("Pending context for a member still working"),
@@ -5583,7 +5885,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         &call_tool(
             &retiring_caller,
             "tyde_swarm_read_board",
-            serde_json::to_value(read_board(SwarmBoard::Coordination))
+            serde_json::to_value(read_board(SwarmBoard::Briefing))
                 .expect("serialize retiring current-turn read"),
         )
         .await,
@@ -5636,7 +5938,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
     );
     drop(private_client);
     let mut final_handoff_publication = publication(
-        SwarmBoard::Coordination,
+        SwarmBoard::Briefing,
         "retiring-current-turn-handoff",
         vec![text(
             "Final durable handoff from the already-admitted retiring turn",
@@ -5644,9 +5946,8 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
     );
     final_handoff_publication.thread_id = Some(pending_post.thread_id.clone());
     let final_handoff: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &retiring_caller,
-            "tyde_swarm_post",
             serde_json::to_value(&final_handoff_publication)
                 .expect("serialize retiring current-turn handoff"),
         )
@@ -5740,11 +6041,37 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         2,
         "replacement cannot launch into a reserved retiring slot"
     );
+    let activation = scenario
+        .post(
+            &busy.id,
+            publication(
+                SwarmBoard::Briefing,
+                "activate-replacement",
+                vec![
+                    text("Replacement, join once a slot frees"),
+                    SwarmBodySegment::MemberMention {
+                        member_id: addition.id.clone(),
+                    },
+                ],
+            ),
+        )
+        .await;
+    let waiting = scenario.snapshot(&busy.id).await;
+    assert!(
+        waiting
+            .notifications
+            .iter()
+            .any(|intent| intent.member_id == addition.id
+                && intent.post_ids.contains(&activation.id)
+                && intent.state == SwarmDeliveryState::Pending)
+            && scenario.fixture.agent_ids().await.len() == 2,
+        "a notified replacement waits for the retiring slot instead of launching"
+    );
     let undelivered = scenario
         .post(
             &busy.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "mention-retiring-peer",
                 vec![
                     text("This explicitly names the historical peer, not its replacement"),
@@ -5953,9 +6280,8 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
     retired_publication.publication_id =
         SwarmPublicationId("closed-retired-caller-post".to_owned());
     tool_error(
-        &call_tool(
+        &agent_post(
             &retiring_caller,
-            "tyde_swarm_post",
             serde_json::to_value(retired_publication)
                 .expect("serialize valid closed-retired-caller post attempt"),
         )
@@ -5995,7 +6321,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .post(
             &busy.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "mention-retired-peer",
                 vec![
                     text("Historical author remains referenceable"),
@@ -6043,7 +6369,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .post(
             &busy.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "retire-before-final-handoff",
                 vec![
                     text("This prepared follow-up cannot outrun explicit FinishTurn retirement"),
@@ -6245,7 +6571,13 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         ])
         .await;
     let private_launch = scenario.launch(&private_draft).await;
-    let private_live = scenario.swarm(&private_launch.id, ready).await;
+    let private_live = scenario
+        .open_request(
+            &private_launch.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
     let private_member = private_live.members[1].clone();
     let private_agent = private_member
         .agent_id
@@ -6291,7 +6623,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         })
         .await;
     assert_eq!(request_count(&private_control.requests().await), 1);
-    let behind_private = scenario.post(&private_live.id, publication(SwarmBoard::Coordination, "board-behind-private-receipt", vec![
+    let behind_private = scenario.post(&private_live.id, publication(SwarmBoard::Briefing, "board-behind-private-receipt", vec![
         text("This original board intent waits behind the private receipt, then wakes without another human command"),
         SwarmBodySegment::MemberMention { member_id: private_member.spec.id.clone() },
     ])).await;
@@ -6996,6 +7328,23 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             retirement: SwarmRetirementPolicy::FinishTurn,
         })
         .await;
+    // Additions stay Proposed until a post notifies them; the mention wakes
+    // only C, never the dormant peers.
+    scenario
+        .post(
+            &idle_pair.id,
+            publication(
+                SwarmBoard::Briefing,
+                "wake-new-peer",
+                vec![
+                    text("New peer, start on this"),
+                    SwarmBodySegment::MemberMention {
+                        member_id: new_peer.id.clone(),
+                    },
+                ],
+            ),
+        )
+        .await;
     scenario
         .wait_mock_turn(
             &new_peer_gate,
@@ -7249,14 +7598,13 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
             draft_id: draft.id.clone(),
             expected_revision: Some(draft.revision),
             name: draft.name.clone(),
-            opening_brief: "Human-reviewed opening brief for the converted peer group".to_owned(),
             constraints: draft.constraints.clone(),
         })
         .await;
     let mut reviewed = scenario.draft(&draft.id, draft.revision + 1).await;
     assert!(
         reviewed.members == draft.members,
-        "reviewing the brief must preserve pinned migrated identities"
+        "regenerating must preserve pinned migrated identities"
     );
     let mut changed_retained_selection = reviewed
         .members
@@ -7627,7 +7975,13 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
             |event: &SwarmNotifyPayload| event.swarm.source_draft_id.as_ref() == Some(&reviewed.id),
         )
         .await;
-    let converted = scenario.swarm(&launched_event.swarm.id, ready).await;
+    let converted = scenario
+        .open_request(
+            &launched_event.swarm.id,
+            "Human-reviewed opening request for the converted peer group",
+        )
+        .await
+        .1;
     assert!(
         converted.legacy_team_id.as_ref() == Some(&team.id),
         "conversion must encode legacy ownership explicitly"
@@ -7662,7 +8016,12 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
         1,
         "legacy private transcript must never be reconstructed as shared posts"
     );
-    assert!(briefing.posts[0].body == vec![text(&reviewed.opening_brief)]);
+    assert!(
+        briefing.posts[0].body
+            == vec![text(
+                "Human-reviewed opening request for the converted peer group"
+            )]
+    );
     assert!(briefing.posts[0].author == SwarmAuthor::Human);
     let coordination = scenario
         .board(&converted.id, read_board(SwarmBoard::Coordination))
@@ -7923,7 +8282,13 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
         )
         .await;
     let starting = scenario.launch(&draft).await;
-    let live = scenario.swarm(&starting.id, ready).await;
+    let live = scenario
+        .open_request(
+            &starting.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
     drop(reservation);
     let member = &live.members[0];
     let original_session = member.session_id.clone().expect("existing durable session");
@@ -8117,7 +8482,13 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
         )
         .await;
     let acknowledgment_launch = scenario.launch(&acknowledgment_draft).await;
-    let acknowledgment_live = scenario.swarm(&acknowledgment_launch.id, ready).await;
+    let acknowledgment_live = scenario
+        .open_request(
+            &acknowledgment_launch.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
     let acknowledgment_control = controls(&scenario, &acknowledgment_live).await.remove(0);
     let (mut lifecycle_peer, lifecycle_bootstrap) = scenario.fixture.connect_with_bootstrap().await;
     let acknowledgment_stream = lifecycle_bootstrap
@@ -8299,7 +8670,13 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
         )
         .await;
     let busy_launch = scenario.launch(&busy_draft).await;
-    let busy_live = scenario.swarm(&busy_launch.id, ready).await;
+    let busy_live = scenario
+        .open_request(
+            &busy_launch.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
     let busy_control = controls(&scenario, &busy_live).await.remove(0);
     let busy_post = scenario
         .post(
@@ -8785,6 +9162,17 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
             )
             .await;
         let boundary_launch = scenario.launch(&boundary_draft).await;
+        let opening_id = &scenario
+            .post(
+                &boundary_launch.id,
+                publication(
+                    SwarmBoard::Briefing,
+                    &format!("{phase}-request"),
+                    vec![text("Review the project and publish useful findings")],
+                ),
+            )
+            .await
+            .id;
         eprintln!("Swarm sim startup phase begin: {phase}");
         tokio::time::timeout(Duration::from_secs(5), startup_gate.wait_until_entered())
             .await
@@ -8795,10 +9183,6 @@ async fn interrupted_transport_acceptance_requires_explicit_notification_retry_a
                     && state.members[0].agent_id.is_some()
             })
             .await;
-        let opening_id = reserved
-            .opening_post_id
-            .as_ref()
-            .expect("durable original opening cause");
         let original_intent = reserved
             .notifications
             .iter()
@@ -9014,7 +9398,13 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     constraints.agent_wake_budget = 2;
     let draft = scenario.generate(constraints).await;
     let starting = scenario.launch(&draft).await;
-    let live = scenario.swarm(&starting.id, ready).await;
+    let live = scenario
+        .open_request(
+            &starting.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
     let mock_controls = controls(&scenario, &live).await;
     let first = &live.members[0];
     let second = &live.members[1];
@@ -9047,17 +9437,15 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         ],
     );
     let coordination: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &first_caller,
-            "tyde_swarm_post",
             serde_json::to_value(&coordination_publication).expect("serialize Coordination wake"),
         )
         .await,
     );
     let briefing: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &first_caller,
-            "tyde_swarm_post",
             serde_json::to_value(publication(
                 SwarmBoard::Briefing,
                 "same-round-briefing",
@@ -9080,9 +9468,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         "board and thread changes cannot mint new agent causal rounds"
     );
     let duplicate: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &first_caller,
-            "tyde_swarm_post",
             serde_json::to_value(coordination_publication)
                 .expect("serialize idempotent wake retry"),
         )
@@ -9204,9 +9591,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     );
     return_publication.thread_id = Some(briefing.post.thread_id.clone());
     let return_post: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &second_caller,
-            "tyde_swarm_post",
             serde_json::to_value(return_publication).expect("serialize return wake"),
         )
         .await,
@@ -9247,9 +9633,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     );
     overflow_publication.thread_id = Some(coordination.post.thread_id.clone());
     let overflow: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &first_caller,
-            "tyde_swarm_post",
             serde_json::to_value(overflow_publication).expect("serialize exhausted wake"),
         )
         .await,
@@ -9270,9 +9655,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     );
     assert_eq!(exhausted.rounds[0].agent_activations_remaining, 0);
     let cross_board_overflow: SwarmPublicationOutcome = tool_value(
-        &call_tool(
+        &agent_post(
             &second_caller,
-            "tyde_swarm_post",
             serde_json::to_value(publication(
                 SwarmBoard::Briefing,
                 "exhausted-new-root",
@@ -9292,7 +9676,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         .post(
             &live.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "fresh-human-context",
                 vec![text(
                     "A new human cause does not silently resume attention-required execution",
@@ -9399,7 +9783,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
                 MockScript::one(MockTurn::gated_text(
                     "Human-reauthorized bounded activation",
                     gate,
-                )),
+                ))
+                .then(MockTurn::text("Human request acknowledged")),
             )
         })
         .collect();
@@ -9462,6 +9847,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         current_bootstrap.agents.len(),
         current_swarm.lifecycle
     );
+    let mut resumed_controls = Vec::new();
     for (index, member) in resumed.members.iter().enumerate() {
         let original = live
             .members
@@ -9499,19 +9885,40 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             .await;
         assert_eq!(request_count(&control.requests().await), 1);
         assert!(control.violations().await.is_empty());
+        resumed_controls.push(control);
     }
     for gate in &gates {
         gate.release_one();
     }
-    scenario
+    // The human request is its own cause and wakes every member once the
+    // reauthorized peer wakes finish.
+    let human_delivered = scenario
         .swarm(&live.id, |state| {
             ready(state)
+                && state
+                    .notifications
+                    .iter()
+                    .filter(|intent| intent.round_id == human.round_id)
+                    .all(|intent| intent.state == SwarmDeliveryState::Accepted)
                 && state
                     .members
                     .iter()
                     .all(|member| member.context_cursor >= human.cursor)
         })
         .await;
+    assert_eq!(
+        human_delivered
+            .notifications
+            .iter()
+            .filter(|intent| intent.round_id == human.round_id)
+            .count(),
+        2,
+        "the human request wakes every member exactly once"
+    );
+    for control in &resumed_controls {
+        assert_eq!(request_count(&control.requests().await), 2);
+        assert!(control.violations().await.is_empty());
+    }
     drop(resumed_reservation);
 
     scenario.pause(&live.id).await;
@@ -9600,19 +10007,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     let ordinary_control = scenario.fixture.mock_by_id(&ordinary.agent_id).await;
     ordinary_start_gate.release_one();
     drop(ordinary_reservation);
-    let mut supervision_draft = scenario.generate(scenario.constraints(1)).await;
-    scenario
-        .send(SwarmCommandPayload::GenerateDraft {
-            draft_id: supervision_draft.id.clone(),
-            expected_revision: Some(supervision_draft.revision),
-            name: supervision_draft.name.clone(),
-            opening_brief: continue_marker.to_owned(),
-            constraints: supervision_draft.constraints.clone(),
-        })
-        .await;
-    supervision_draft = scenario
-        .draft(&supervision_draft.id, supervision_draft.revision + 1)
-        .await;
+    let supervision_draft = scenario.generate(scenario.constraints(1)).await;
     let supervision_reservation = scenario
         .fixture
         .reserve_next_mock_launch(
@@ -9625,7 +10020,10 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         )
         .await;
     let supervision_start = scenario.launch(&supervision_draft).await;
-    let unsupervised = scenario.swarm(&supervision_start.id, ready).await;
+    let unsupervised = scenario
+        .open_request(&supervision_start.id, continue_marker)
+        .await
+        .1;
     let member_control = controls(&scenario, &unsupervised).await.remove(0);
     drop(supervision_reservation);
     scenario
@@ -9673,7 +10071,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         .post(
             &unsupervised.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "supervision-cannot-unpause",
                 vec![
                     text(continue_marker),
@@ -9749,7 +10147,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         .post(
             &unsupervised.id,
             publication(
-                SwarmBoard::Coordination,
+                SwarmBoard::Briefing,
                 "supervision-cannot-clear-attention",
                 vec![
                     text(continue_marker),
@@ -9763,9 +10161,12 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     scenario
         .error(SwarmErrorCode::CommittedDurabilityUncertain)
         .await;
+    // Naming the new request is server work independent of attention; let it
+    // settle so the comparison below isolates supervision.
     let before_attention_supervision = scenario
         .swarm(&unsupervised.id, |state| {
             state.lifecycle == SwarmLifecycle::AttentionRequired
+                && state.threads.iter().all(|thread| thread.title.is_some())
         })
         .await;
     scenario
@@ -9782,7 +10183,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     let after_attention_supervision = scenario.snapshot(&unsupervised.id).await;
     if after_attention_supervision != before_attention_supervision {
         eprintln!(
-            "Swarm attention snapshot comparison: lifecycle_equal={} members_equal={} notifications_equal={} rounds_equal={} boards_equal={} revision_equal={} error_equal={} recovery_equal={}",
+            "Swarm attention snapshot comparison: lifecycle_equal={} members_equal={} notifications_equal={} rounds_equal={} boards_equal={} revision_equal={} error_equal={} recovery_equal={} threads_equal={} pending_replies_equal={}",
             after_attention_supervision.lifecycle == before_attention_supervision.lifecycle,
             after_attention_supervision.members == before_attention_supervision.members,
             after_attention_supervision.notifications == before_attention_supervision.notifications,
@@ -9792,7 +10193,10 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             after_attention_supervision.revision == before_attention_supervision.revision,
             after_attention_supervision.error == before_attention_supervision.error,
             after_attention_supervision.recovery_requirement
-                == before_attention_supervision.recovery_requirement
+                == before_attention_supervision.recovery_requirement,
+            after_attention_supervision.threads == before_attention_supervision.threads,
+            after_attention_supervision.pending_replies
+                == before_attention_supervision.pending_replies
         );
     }
     assert!(
@@ -10027,7 +10431,7 @@ async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members(
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: swarm.id.clone(),
-            publication: conflict,
+            post: human_post(conflict),
         })
         .await;
     scenario.error(SwarmErrorCode::Conflict).await;
@@ -10051,15 +10455,21 @@ async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members(
         .await;
     assert_eq!(thread.root, posted);
     assert!(thread.posts.contains(&replied));
-    let mut coordination = publication(SwarmBoard::Coordination, "coordination-image", Vec::new());
-    coordination.images = vec![images[2].id.clone()];
-    let coord = scenario.post(&swarm.id, coordination).await;
+    let image_named = scenario
+        .swarm(&swarm.id, |state| {
+            state
+                .threads
+                .iter()
+                .any(|thread| thread.thread_id == posted.thread_id && thread.title.is_some())
+        })
+        .await;
     assert!(
-        scenario
-            .board(&swarm.id, read_board(SwarmBoard::Coordination))
-            .await
-            .posts
-            .contains(&coord)
+        image_named
+            .threads
+            .iter()
+            .any(|thread| thread.thread_id == posted.thread_id
+                && thread.title.as_deref() == Some("Image request")),
+        "an image-only request still gets a title"
     );
     for (item, metadata) in uploads.iter().zip(&images) {
         let result = call_tool(
@@ -10094,7 +10504,7 @@ async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members(
     scenario
         .send(SwarmCommandPayload::Post {
             swarm_id: other.id.clone(),
-            publication: foreign,
+            post: human_post(foreign),
         })
         .await;
     scenario.error(SwarmErrorCode::Unauthorized).await;
@@ -10144,7 +10554,7 @@ async fn shared_images_are_durable_scoped_and_readable_by_authenticated_members(
 }
 
 #[tokio::test]
-async fn stateful_threads_race_create_and_reconcile_updates_without_losing_history() {
+async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
     let mut scenario = Scenario::new().await;
     let swarm = scenario.launched(2).await;
     scenario.pause(&swarm.id).await;
@@ -10156,65 +10566,143 @@ async fn stateful_threads_race_create_and_reconcile_updates_without_losing_histo
         .fixture
         .agent_control_caller(swarm.members[1].agent_id.as_ref().expect("second peer"))
         .await;
-    let human = scenario.post(&swarm.id, serde_json::from_value(json!({
-        "board":"briefing", "publication_id":"stateful-human-root", "thread_id":null,
-        "body":[{"type":"text","text":"Investigate the reported issue"}],
-        "thread_change":{"kind":"create","title":"Investigate issue","description":"Human request","summary":"Investigation requested","parent_thread_id":null}
-    })).expect("canonical human creation")).await;
-    let create = |key: &str| json!({"parent_thread_id":human.thread_id,"title":"Issue coordination","description":"Peer investigation","summary":"Investigation beginning","publication_id":key,"body":[{"type":"text","text":"Coordinate evidence here"}]});
-    let (a, b) = tokio::join!(
-        call_tool(&first, "tyde_swarm_create_thread", create("race-a")),
-        call_tool(&second, "tyde_swarm_create_thread", create("race-b"))
-    );
-    let a: Value = tool_value(&a);
-    let b: Value = tool_value(&b);
+    let request = "Investigate the reported issue in the deploy pipeline";
+    let human = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "stateful-human-root",
+                vec![text(request)],
+            ),
+        )
+        .await;
     assert!(
-        (a["kind"] == "created" && b["kind"] == "already_exists")
-            || (b["kind"] == "created" && a["kind"] == "already_exists"),
-        "exactly one peer creates the shared child"
+        human.thread_change.is_none() && human.thread_seq == Some(1),
+        "a human request commits immediately as an unversioned root"
     );
-    assert!(a["thread"]["thread_id"] == b["thread"]["thread_id"]);
-    let child = a["thread"]["thread_id"].clone();
+    let named = scenario
+        .swarm(&swarm.id, |state| {
+            state
+                .threads
+                .iter()
+                .any(|thread| thread.thread_id == human.thread_id && thread.title.is_some())
+        })
+        .await;
+    let root_thread = named
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == human.thread_id)
+        .expect("human request thread");
+    assert!(
+        root_thread.title.as_deref() == Some("Investigate the reported issue in the")
+            && root_thread.description.as_deref() == Some(request)
+            && root_thread.naming_error.is_none()
+            && root_thread.summary.is_empty()
+            && root_thread.seq == 1
+            && root_thread.parent_thread_id.is_none(),
+        "the server names the request and leaves its summary for the swarm"
+    );
+    let opened: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_summary",
+            json!({"thread_id": human.thread_id}),
+        )
+        .await,
+    );
+    assert!(
+        opened["thread"]["seq"] == 1
+            && opened["thread"]["summary"] == ""
+            && opened["root"]["id"] == json!(human.id)
+            && opened["root"]["body"] == json!([{"kind": "text", "text": request}]),
+        "agents always receive the human's message with the thread state"
+    );
+
+    let create = |key: &str, sibling: u64, title: &str| {
+        json!({
+            "parent_thread_id": human.thread_id,
+            "expected_sibling_seq": sibling,
+            "title": title,
+            "description": "Peer investigation",
+            "summary": "Investigation beginning",
+            "publication_id": key,
+            "body": [{"kind": "text", "text": "Coordinate evidence here"}],
+        })
+    };
+    let (a, b) = tokio::join!(
+        call_tool(
+            &first,
+            "tyde_swarm_create_thread",
+            create("race-a", 0, "Build logs")
+        ),
+        call_tool(
+            &second,
+            "tyde_swarm_create_thread",
+            create("race-b", 0, "Rollback plan")
+        )
+    );
+    let (winner, loser) = match (a.is_error == Some(true), b.is_error == Some(true)) {
+        (false, true) => (a, b),
+        (true, false) => (b, a),
+        _ => panic!("exactly one concurrent creation may claim the sibling sequence"),
+    };
+    swarm_tool_error(&loser, SwarmErrorCode::Conflict);
+    let winner: Value = tool_value(&winner);
+    let won_title = winner["thread"]["title"].clone();
+    let retry_title = if won_title == "Build logs" {
+        "Rollback plan"
+    } else {
+        "Build logs"
+    };
+    let retry_caller = if won_title == "Build logs" {
+        &second
+    } else {
+        &first
+    };
+    let retried: Value = tool_value(
+        &call_tool(
+            retry_caller,
+            "tyde_swarm_create_thread",
+            create("race-retry", 1, retry_title),
+        )
+        .await,
+    );
+    let child = winner["thread"]["thread_id"].clone();
+    assert!(
+        retried["thread"]["thread_id"] != child
+            && retried["thread"]["parent_thread_id"] == json!(human.thread_id),
+        "after seeing its sibling, the loser opens a second Coordination thread"
+    );
     let directory: Value = tool_value(
         &call_tool(
             &first,
             "tyde_swarm_list_threads",
-            json!({"board":"coordination","parent_thread_id":human.thread_id,"limit":1}),
+            json!({"board": "coordination", "parent_thread_id": human.thread_id}),
         )
         .await,
     );
+    let listed = directory["threads"].as_array().expect("directory");
     assert!(
-        directory["threads"].as_array().expect("directory").len() == 1
-            && directory["threads"][0]["thread_id"] == child
+        listed.len() == 2 && listed.iter().all(|thread| thread.get("summary").is_none()),
+        "both children are listed, without summary bodies"
     );
-    assert!(
-        directory["threads"][0].get("summary").is_none(),
-        "directory omits summary bodies"
+    let mut nested = create("nested-child", 0, "Nested");
+    nested["parent_thread_id"] = child.clone();
+    swarm_tool_error(
+        &call_tool(&first, "tyde_swarm_create_thread", nested).await,
+        SwarmErrorCode::Invalid,
     );
-    let deltas: Value = tool_value(
-        &call_tool(
-            &first,
-            "tyde_swarm_read_deltas",
-            json!({"thread_id":child,"after_seq":0,"limit":1}),
-        )
-        .await,
-    );
-    assert!(
-        deltas["deltas"].as_array().expect("deltas").len() == 1
-            && deltas["high_water"] == 1
-            && deltas["has_more"] == false,
-        "losing creator contributes no delta"
-    );
-    let summary: Value = tool_value(
-        &call_tool(
-            &first,
-            "tyde_swarm_read_summary",
-            json!({"thread_id":human.thread_id}),
-        )
-        .await,
-    );
-    assert!(summary["seq"] == 1);
-    let update = |key: &str, seq: u64, kind: &str, state: &str| json!({"thread_id":human.thread_id,"expected_seq":seq,"summary_change":{"kind":kind,"text":state},"publication_id":key,"body":[{"type":"text","text":"Published contribution"}]});
+
+    let update = |key: &str, seq: u64, kind: &str, state: &str| {
+        json!({
+            "thread_id": human.thread_id,
+            "expected_seq": seq,
+            "summary_change": {"kind": kind, "text": state},
+            "publication_id": key,
+            "body": [{"kind": "text", "text": "Published contribution"}],
+        })
+    };
     let first_update = update("first-answer", 1, "append", "Evidence collected");
     let published: Value =
         tool_value(&call_tool(&first, "tyde_swarm_update_thread", first_update.clone()).await);
@@ -10237,35 +10725,16 @@ async fn stateful_threads_race_create_and_reconcile_updates_without_losing_histo
         &call_tool(
             &second,
             "tyde_swarm_read_summary",
-            json!({"thread_id":human.thread_id}),
+            json!({"thread_id": human.thread_id}),
         )
         .await,
     );
-    assert!(
-        latest["seq"] == 2 && latest["summary"] == "Investigation requested\nEvidence collected"
-    );
-    let catchup: Value = tool_value(
-        &call_tool(
-            &second,
-            "tyde_swarm_read_deltas",
-            json!({"thread_id":human.thread_id,"after_seq":1,"through_seq":2}),
-        )
-        .await,
-    );
-    assert!(
-        catchup["deltas"].as_array().expect("catchup").len() == 1
-            && catchup["deltas"][0]["id"] == published["post"]["id"]
-    );
+    assert!(latest["thread"]["seq"] == 2 && latest["thread"]["summary"] == "Evidence collected");
     let compacted: Value = tool_value(
         &call_tool(
             &second,
             "tyde_swarm_update_thread",
-            update(
-                "reconciled-answer",
-                2,
-                "replace",
-                "Evidence verified; deployment remains pending",
-            ),
+            update("reconciled-answer", 2, "replace", "Evidence verified"),
         )
         .await,
     );
@@ -10293,66 +10762,344 @@ async fn stateful_threads_race_create_and_reconcile_updates_without_losing_histo
         &call_tool(
             &first,
             "tyde_swarm_read_summary",
-            json!({"thread_id":human.thread_id}),
+            json!({"thread_id": human.thread_id}),
         )
         .await,
     );
     assert!(
-        unchanged["seq"] == 4 && unchanged["summary"].as_str().expect("summary").len() == 4096,
+        unchanged["thread"]["seq"] == 4
+            && unchanged["thread"]["summary"]
+                .as_str()
+                .expect("summary")
+                .len()
+                == 4096,
         "oversized append changes neither summary nor sequence"
     );
     let bounded: Value = tool_value(
         &call_tool(
             &first,
             "tyde_swarm_read_deltas",
-            json!({"thread_id":human.thread_id,"after_seq":1,"through_seq":3,"limit":1}),
+            json!({"thread_id": human.thread_id, "after_seq": 1, "through_seq": 3, "limit": 1}),
         )
         .await,
     );
-    assert!(bounded["has_more"] == true && bounded["next_seq"] == 2 && bounded["high_water"] == 3);
+    assert!(
+        bounded["has_more"] == true
+            && bounded["next_seq"] == 2
+            && bounded["high_water"] == 3
+            && bounded["deltas"][0]["id"] == published["post"]["id"]
+    );
     let next: Value = tool_value(
         &call_tool(
             &first,
             "tyde_swarm_read_deltas",
-            json!({"thread_id":human.thread_id,"after_seq":2,"through_seq":3,"limit":1}),
+            json!({"thread_id": human.thread_id, "after_seq": 2, "through_seq": 3, "limit": 1}),
         )
         .await,
     );
     assert!(
         next["has_more"] == false
             && next["next_seq"] == 3
-            && next["deltas"].as_array().expect("snapshot").len() == 1
+            && next["deltas"].as_array().expect("snapshot").len() == 1,
+        "a pinned delta snapshot excludes later updates"
     );
-    let child_state: Value = tool_value(
+    let compact: Value = tool_value(
         &call_tool(
             &first,
-            "tyde_swarm_read_summary",
-            json!({"thread_id":child}),
+            "tyde_swarm_update_thread",
+            update(
+                "compact-summary",
+                4,
+                "replace",
+                "Evidence verified; deploy pending",
+            ),
         )
         .await,
     );
+    assert!(compact["post"]["thread_seq"] == 5);
+
+    let reply_body = "Please also check the rollback";
+    let mut reply = publication(
+        SwarmBoard::Briefing,
+        "human-summary-reply",
+        vec![text(reply_body)],
+    );
+    reply.thread_id = Some(human.thread_id.clone());
+    let replied = scenario.post(&swarm.id, reply).await;
     assert!(
-        child_state["seq"] == 1,
-        "parent updates cannot rewrite the child"
+        replied.author == SwarmAuthor::Human
+            && replied.thread_seq == Some(6)
+            && matches!(
+                &replied.thread_change,
+                Some(protocol::SwarmThreadChange::Update {
+                    expected_seq: 5,
+                    ..
+                })
+            ),
+        "the server turns a human reply into an ordinary versioned update"
     );
-    let mut nested = create("nested-child");
-    nested["parent_thread_id"] = child;
-    swarm_tool_error(
-        &call_tool(&first, "tyde_swarm_create_thread", nested).await,
-        SwarmErrorCode::Invalid,
+    let after_reply = scenario.snapshot(&swarm.id).await;
+    let reply_thread = after_reply
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == human.thread_id)
+        .expect("updated request");
+    assert!(
+        reply_thread.summary == format!("Evidence verified; deploy pending\nHuman: {reply_body}")
+            && after_reply.pending_replies.is_empty(),
+        "the helper rewrites the summary to include the human's reply"
     );
-    swarm_tool_error(&call_tool_raw(&first,"tyde_swarm_post",json!({"board":"briefing","thread_id":human.thread_id,"publication_id":"raw-bypass","body":[{"type":"text","text":"Unversioned reply"}]})).await,SwarmErrorCode::Invalid);
+    let mut woken = after_reply
+        .notifications
+        .iter()
+        .filter(|intent| intent.post_ids.contains(&replied.id))
+        .map(|intent| intent.member_id.clone())
+        .collect::<Vec<_>>();
+    woken.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut everyone = swarm
+        .members
+        .iter()
+        .map(|member| member.spec.id.clone())
+        .collect::<Vec<_>>();
+    everyone.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(
+        woken == everyone,
+        "a human Briefing reply wakes every member"
+    );
+
+    let mut failing = publication(
+        SwarmBoard::Briefing,
+        "human-reply-retried",
+        vec![text("__mock_fail_swarm_helper_once__ and confirm the fix")],
+    );
+    failing.thread_id = Some(human.thread_id.clone());
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: swarm.id.clone(),
+            post: human_post(failing.clone()),
+        })
+        .await;
+    let failed_attempt = scenario
+        .swarm(&swarm.id, |state| {
+            state.pending_replies.iter().any(|pending| {
+                pending.publication_id == failing.publication_id
+                    && pending.attempts == 1
+                    && pending.error.is_some()
+            })
+        })
+        .await;
+    assert!(
+        failed_attempt
+            .threads
+            .iter()
+            .any(|thread| thread.thread_id == human.thread_id && thread.seq == 6),
+        "a failed summary rewrite commits nothing"
+    );
+    let recovered: SwarmPostNotifyPayload = scenario
+        .wait(
+            FrameKind::SwarmPostNotify,
+            "reply committed after helper retry",
+            |event: &SwarmPostNotifyPayload| event.post.publication_id == failing.publication_id,
+        )
+        .await;
+    assert!(
+        recovered.post.thread_seq == Some(7),
+        "the server retries a failed rewrite without the human"
+    );
+
+    let unnamed = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "naming-retried",
+                vec![text(
+                    "__mock_fail_swarm_naming_once__ audit the release notes",
+                )],
+            ),
+        )
+        .await;
+    let naming_failed = scenario
+        .swarm(&swarm.id, |state| {
+            state.threads.iter().any(|thread| {
+                thread.thread_id == unnamed.thread_id
+                    && thread.title.is_none()
+                    && thread.naming_error.is_some()
+            })
+        })
+        .await;
+    assert!(naming_failed.lifecycle == SwarmLifecycle::Paused);
+    scenario
+        .swarm(&swarm.id, |state| {
+            state.threads.iter().any(|thread| {
+                thread.thread_id == unnamed.thread_id
+                    && thread.title.is_some()
+                    && thread.naming_error.is_none()
+            })
+        })
+        .await;
+
+    let gate = scenario
+        .fixture
+        .install_swarm_reply_commit_test_gate()
+        .await;
+    let mut raced = publication(
+        SwarmBoard::Briefing,
+        "human-reply-raced",
+        vec![text("Ship only after the rollback test")],
+    );
+    raced.thread_id = Some(human.thread_id.clone());
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: swarm.id.clone(),
+            post: human_post(raced.clone()),
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+        .await
+        .expect("helper prepared the reply against the current sequence");
+    let pending = scenario
+        .swarm(&swarm.id, |state| {
+            state
+                .pending_replies
+                .iter()
+                .any(|pending| pending.publication_id == raced.publication_id)
+        })
+        .await;
+    assert!(
+        pending
+            .threads
+            .iter()
+            .any(|thread| thread.thread_id == human.thread_id && thread.seq == 7),
+        "a held reply stays pending and changes nothing"
+    );
+    let agent_won: Value = tool_value(
+        &call_tool(
+            &second,
+            "tyde_swarm_update_thread",
+            update("agent-beats-human", 7, "replace", "Rollback test scheduled"),
+        )
+        .await,
+    );
+    assert!(agent_won["post"]["thread_seq"] == 8);
+    gate.release_one();
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+        .await
+        .expect("a stale helper commit retries against the new sequence");
+    gate.release_one();
+    let reconciled: SwarmPostNotifyPayload = scenario
+        .wait(
+            FrameKind::SwarmPostNotify,
+            "raced reply committed",
+            |event: &SwarmPostNotifyPayload| event.post.publication_id == raced.publication_id,
+        )
+        .await;
+    assert!(
+        reconciled.post.thread_seq == Some(9)
+            && matches!(
+                &reconciled.post.thread_change,
+                Some(protocol::SwarmThreadChange::Update {
+                    expected_seq: 8,
+                    ..
+                })
+            ),
+        "the reply lands after the agent's update instead of overwriting it"
+    );
+    let raced_state = scenario.snapshot(&swarm.id).await;
+    assert!(
+        raced_state
+            .threads
+            .iter()
+            .any(|thread| thread.thread_id == human.thread_id
+                && thread.summary
+                    == "Rollback test scheduled\nHuman: Ship only after the rollback test"),
+        "the agent's state survives the human reply"
+    );
+
+    // Replies still queued when the host stops commit after restart, in order.
+    let held_gate = scenario
+        .fixture
+        .install_swarm_reply_commit_test_gate()
+        .await;
+    let queued = ["human-reply-queued-one", "human-reply-queued-two"].map(|key| {
+        let mut reply = publication(SwarmBoard::Briefing, key, vec![text(key)]);
+        reply.thread_id = Some(human.thread_id.clone());
+        reply
+    });
+    for reply in &queued {
+        scenario
+            .send(SwarmCommandPayload::Post {
+                swarm_id: swarm.id.clone(),
+                post: human_post(reply.clone()),
+            })
+            .await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), held_gate.wait_until_entered())
+        .await
+        .expect("the first queued reply reaches its commit");
+    let held = scenario
+        .swarm(&swarm.id, |state| state.pending_replies.len() == 2)
+        .await;
+    assert!(
+        held.pending_replies
+            .iter()
+            .map(|pending| &pending.publication_id)
+            .eq(queued.iter().map(|reply| &reply.publication_id))
+            && held
+                .threads
+                .iter()
+                .any(|thread| thread.thread_id == human.thread_id && thread.seq == 9),
+        "queued replies wait in submission order without committing"
+    );
+
     let restarted = scenario.fixture.restart_host().await;
+    scenario.pending.clear();
     let restored = restarted
         .swarms
         .iter()
         .find(|state| state.id == swarm.id)
-        .expect("persisted swarm");
-    let value = serde_json::to_value(restored).expect("restored canonical state");
+        .expect("persisted swarm")
+        .clone();
+    let restored = if restored.pending_replies.is_empty() {
+        restored
+    } else {
+        scenario
+            .swarm(&swarm.id, |state| state.pending_replies.is_empty())
+            .await
+    };
+    let restored_request = restored
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == human.thread_id)
+        .expect("restored request");
     assert!(
-        value["threads"].as_array().expect("threads").len() == 2
-            && value["threads"][0]["seq"] == 4
-            && value["threads"][1]["seq"] == 1,
-        "restart preserves current summaries and unique child identity"
+        restored.threads.len() == 5
+            && restored_request.seq == 11
+            && restored_request.child_seq == 2
+            && restored_request.title == root_thread.title
+            && restored_request
+                .summary
+                .ends_with("Human: human-reply-queued-one\nHuman: human-reply-queued-two"),
+        "restart preserves summaries, names and every child thread, then commits queued replies in order"
+    );
+    let committed = scenario
+        .thread(
+            &swarm.id,
+            SwarmThreadRead {
+                thread_id: human.thread_id.clone(),
+                after_cursor: None,
+                limit: Some(100),
+            },
+        )
+        .await;
+    assert!(
+        committed.posts[committed.posts.len() - 2..]
+            .iter()
+            .map(|post| (&post.publication_id, post.thread_seq))
+            .eq(queued
+                .iter()
+                .map(|reply| &reply.publication_id)
+                .zip([Some(10), Some(11)])),
+        "each queued reply commits exactly once after restart"
     );
 }

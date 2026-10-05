@@ -651,6 +651,14 @@ impl Fixture {
 
     // Shared fixture is compiled separately for every integration binary.
     #[allow(dead_code)]
+    pub async fn install_swarm_reply_commit_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_swarm_reply_commit_test_gate().await
+    }
+
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
     pub async fn install_swarm_conversion_test_gate(
         &self,
     ) -> server::InstalledSpawnOperationTestGate {

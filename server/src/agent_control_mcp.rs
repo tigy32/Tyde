@@ -814,7 +814,6 @@ fn swarm_tool_allowed_for_policy(policy: protocol::SwarmWorkspacePolicy, tool_na
             | "tyde_swarm_read_board"
             | "tyde_swarm_read_thread"
             | "tyde_swarm_read_image"
-            | "tyde_swarm_post"
     ) || (matches!(
         policy,
         protocol::SwarmWorkspacePolicy::SharedHost {
@@ -1347,7 +1346,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read Briefing or Coordination in your authenticated swarm. Default view posts returns ordered post/reply activity; view threads returns only roots, newest root creation first, never reordered by replies. Default limit 50, maximum 100. Return next_cursor, snapshot high_water, and has_more; cursors are bound to their board and view. Reading never creates wake notifications.",
+        description = "Read Briefing or Coordination activity. view posts lists posts and replies in order; view threads lists roots newest first. Default limit 50, max 100. Reads never wake peers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1377,7 +1376,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read a shared thread root and bounded ordered replies. thread_id must come from your swarm's board. Default limit 50, maximum 100. Reading never schedules execution.",
+        description = "Read a thread's root post and replies in order. Default limit 50, max 100. Reads never wake peers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1447,36 +1446,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Compatibility adapter: every model publication MUST provide thread_change: create with title/description/summary/parent_thread_id for a root (omit thread_id or set it to null; the server generates the ID, never mint a thread_id), or update with expected_seq and summary append/replace for a reply. Read the summary before updating. Coordination creation requires a human Briefing parent. Legacy threads can be explicitly initialized with expected_cursor after reading their complete history. Publish a durable root post or threaded reply. body segments are text, member_mention, and post_link; only typed member_mention wakes another peer, never the author. Obtain IDs with describe/read tools. Preserve publication_id on uncertain retries: same content returns existing post without another notification; different content conflicts. Attachments are existing authorized project files, not permission grants. images accepts shared image IDs already uploaded to this swarm; an image-only post may have an empty body. Acceptance is transport, not read/understood/completed. Posts do not assign tasks or infer completion.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn tyde_swarm_post(
-        &self,
-        Parameters(input): Parameters<protocol::SwarmPublication>,
-        Extension(parts): Extension<axum::http::request::Parts>,
-    ) -> Result<CallToolResult, McpError> {
-        let caller = match require_authenticated_caller(self, &parts, "tyde_swarm_post").await {
-            Ok(caller) => caller,
-            Err(error) => {
-                return err_json(protocol::SwarmFailure {
-                    code: protocol::SwarmErrorCode::Unauthorized,
-                    message: error,
-                });
-            }
-        };
-        match self.host.post_swarm_for_agent(caller, input).await {
-            Ok(result) => ok_json(result),
-            Err(error) => err_json(error),
-        }
-    }
-
-    #[tool(
-        description = "List a compact, paginated directory of stateful threads, optionally by board or human parent. Results contain titles, descriptions and sequences, not full summaries. Preserve next_cursor while paging; reads never wake peers.",
+        description = "List threads (title, description, seq, child_seq) by board or by human parent_thread_id; filtering by parent also returns its sibling_seq for create_thread. Untitled human threads are still being named. Page with next_cursor. Reads never wake peers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1505,7 +1475,7 @@ impl TydeAgentControlMcpServer {
         }
     }
     #[tool(
-        description = "Read a thread's current summary and its sequence atomically. Read before contributing to either Briefing or Coordination. Legacy threads have no invented summary: read their history and explicitly initialize them. Reads do not schedule execution.",
+        description = "Read a thread's state: its summary, seq and child_seq plus the root post (for a human thread, the human's original request). Read before updating; use the returned seq as expected_seq. Reads never wake peers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1538,7 +1508,7 @@ impl TydeAgentControlMcpServer {
         }
     }
     #[tool(
-        description = "Read immutable, attributed deltas after a thread-local sequence. Use next_seq and preserve returned high_water as through_seq for bounded snapshot paging. This sequence is not a board cursor. Read intervening deltas after an update conflict; reads never wake peers.",
+        description = "Read the attributed posts after a thread-local seq (after_seq). Use it after an update conflict to see what changed. Page with next_seq; keep high_water as through_seq. Reads never wake peers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1567,7 +1537,7 @@ impl TydeAgentControlMcpServer {
         }
     }
     #[tool(
-        description = "Atomically create the one Coordination child of a human Briefing thread. Supply immutable title (1–15 words), description (<=280 characters), initial summary (<=4096 UTF-8 bytes), and first delta body. body segments are {type:text,text:...}, {type:member_mention,member_id:...}, or {type:post_link,post_id:...}; use type, not kind. Only typed member_id mentions wake peers, never an @name text segment. Obtain exact IDs from describe/read tools. Concurrent callers get AlreadyExists with the existing thread; their proposed delta is NOT published. Preserve publication_id on uncertain retries. No parent summary or wake budget is changed.",
+        description = "Open a Coordination thread under a human Briefing thread. expected_sibling_seq must equal the parent's current child_seq (from list_threads with parent_thread_id or read_summary); if another thread was opened first you get a conflict: list the parent's threads and use an existing one or create again. title 1-15 words, description <=280 chars, summary <=4096 bytes, body is the first post. body segments: {kind:text,text}, {kind:member_mention,member_id}, {kind:post_link,post_id}; only member_mention wakes a peer. Reuse publication_id when retrying.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1601,7 +1571,8 @@ impl TydeAgentControlMcpServer {
                 title: input.title,
                 description: input.description,
                 summary: input.summary,
-                parent_thread_id: Some(input.parent_thread_id),
+                parent_thread_id: input.parent_thread_id,
+                expected_sibling_seq: input.expected_sibling_seq,
             }),
         };
         match self
@@ -1615,23 +1586,19 @@ impl TydeAgentControlMcpServer {
                     .read_swarm_summary_for_agent(caller, result.post.thread_id.clone())
                     .await
                 {
-                    Ok(thread) => thread,
+                    Ok(state) => state.thread,
                     Err(error) => return err_json(error),
                 };
-                if result.already_exists {
-                    ok_json(protocol::SwarmThreadCreation::AlreadyExists { thread })
-                } else {
-                    ok_json(protocol::SwarmThreadCreation::Created {
-                        publication: Box::new(result),
-                        thread,
-                    })
-                }
+                ok_json(protocol::SwarmThreadCreation {
+                    publication: result,
+                    thread,
+                })
             }
             Err(error) => err_json(error),
         }
     }
     #[tool(
-        description = "Atomically publish a delta and append or replace the current summary on either board. expected_seq must match the latest summary read; stale writes commit nothing. On conflict read the new summary and intervening deltas and reconsider, rather than blindly retrying. The resulting summary must be nonempty and <=4096 UTF-8 bytes; compact with replace when append is too large. body segments are {type:text,text:...}, {type:member_mention,member_id:...}, or {type:post_link,post_id:...}; use type, not kind. A member_mention must contain member_id, never text or an @name. Only typed mentions wake peers. No targeted edits or automatic merging. Preserve publication_id and identical content on uncertain retries.",
+        description = "Post to a thread and change its summary in one step. expected_seq must equal the thread's current seq; on conflict nothing is committed, so read_deltas, reconsider and retry. summary_change is append or replace; the result must be nonempty and <=4096 bytes. body segments: {kind:text,text}, {kind:member_mention,member_id}, {kind:post_link,post_id}; only member_mention wakes a peer. Reuse publication_id when retrying.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1663,7 +1630,7 @@ impl TydeAgentControlMcpServer {
             Err(error) => return err_json(error),
         };
         let publication = protocol::SwarmPublication {
-            board: thread.board,
+            board: thread.thread.board,
             thread_id: Some(input.thread_id),
             publication_id: input.publication_id,
             body: input.body,

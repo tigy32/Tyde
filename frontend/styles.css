@@ -16174,9 +16174,22 @@ pre.tool-error-pre {
     padding: var(--space-3) 0;
 }
 .swarm-thread[hidden] { display: none; }
-.swarm-thread > .swarm-post { grid-column: 1; grid-row: 1; }
-.swarm-thread-orphan { grid-column: 1; font-size: 0.769rem; color: var(--text-tertiary); font-style: italic; }
-.swarm-replies { grid-column: 1 / -1; grid-row: 2; }
+.swarm-thread-head { grid-column: 1 / -1; grid-row: 1; display: flex; flex-direction: column; gap: 2px; margin-bottom: var(--space-2); min-width: 0; }
+.swarm-thread-parent { align-self: flex-start; font-size: 0.769rem; }
+.swarm-thread-title { margin: 0; font-size: 0.923rem; font-weight: 600; color: var(--text-primary); }
+.swarm-thread-naming { color: var(--text-tertiary); font-style: italic; font-weight: 500; }
+.swarm-thread-description { margin: 0; font-size: 0.846rem; color: var(--text-secondary); }
+.swarm-thread-error { margin: 0; font-size: 0.769rem; color: var(--warning); }
+.swarm-thread-state { font-size: 0.846rem; color: var(--text-secondary); }
+.swarm-thread-state > summary { cursor: pointer; font-size: 0.769rem; color: var(--text-tertiary); }
+.swarm-thread-summary { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+.swarm-thread-children { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-3); font-size: 0.769rem; }
+.swarm-thread-children-label { color: var(--text-tertiary); }
+.swarm-thread > .swarm-post { grid-column: 1; grid-row: 2; }
+.swarm-thread-orphan { grid-column: 1; grid-row: 2; font-size: 0.769rem; color: var(--text-tertiary); font-style: italic; }
+.swarm-replies { grid-column: 1 / -1; grid-row: 3; }
+.swarm-pending-reply { display: flex; flex-direction: column; gap: 2px; padding-left: 36px; opacity: 0.75; }
+.swarm-pending-status { font-size: 0.769rem; color: var(--text-tertiary); font-style: italic; }
 .swarm-replies:not(:empty) {
     display: flex;
     flex-direction: column;
@@ -16185,14 +16198,14 @@ pre.tool-error-pre {
     padding-left: var(--space-3);
     border-left: 1px solid var(--border-secondary);
 }
-.swarm-thread-actions { display: flex; flex-wrap: wrap; align-items: baseline; align-self: start; gap: var(--space-3); grid-column: 2; grid-row: 1; padding: 2px 0; }
-.swarm-reply-composer { grid-column: 1 / -1; grid-row: 3; margin-top: var(--space-2); padding-left: 36px; min-width: 0; }
+.swarm-thread-actions { display: flex; flex-wrap: wrap; align-items: baseline; align-self: start; gap: var(--space-3); grid-column: 2; grid-row: 2; padding: 2px 0; }
+.swarm-reply-composer { grid-column: 1 / -1; grid-row: 4; margin-top: var(--space-2); padding-left: 36px; min-width: 0; }
 .swarm-post { display: flex; gap: var(--space-2); border-radius: 4px; scroll-margin: var(--space-4); min-width: 0; }
 .swarm-post .swarm-avatar { width: 28px; height: 28px; }
 @container (max-width: 600px) {
     .swarm-thread { grid-template-columns: minmax(0, 1fr); }
-    .swarm-thread-actions { grid-column: 1; grid-row: 3; padding-left: 36px; margin-top: 6px; }
-    .swarm-reply-composer { grid-row: 4; padding-left: 0; }
+    .swarm-thread-actions { grid-column: 1; grid-row: 4; padding-left: 36px; margin-top: 6px; }
+    .swarm-reply-composer { grid-row: 5; padding-left: 0; }
 }
 .swarm-post:focus { outline: none; }
 .swarm-post:focus-visible,

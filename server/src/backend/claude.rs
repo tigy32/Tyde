@@ -1427,8 +1427,7 @@ fn claude_native_tool_kind(name: &str) -> NativeToolKind {
         | "mcp__tyde-agent-control__tyde_swarm_update_thread"
         | "mcp__tyde-agent-control__tyde_swarm_read_board"
         | "mcp__tyde-agent-control__tyde_swarm_read_thread"
-        | "mcp__tyde-agent-control__tyde_swarm_read_image"
-        | "mcp__tyde-agent-control__tyde_swarm_post" => NativeToolKind::SessionControl,
+        | "mcp__tyde-agent-control__tyde_swarm_read_image" => NativeToolKind::SessionControl,
         _ => NativeToolKind::Unknown,
     }
 }
@@ -4006,7 +4005,6 @@ impl ClaudeInner {
                         | "mcp__tyde-agent-control__tyde_swarm_read_board"
                         | "mcp__tyde-agent-control__tyde_swarm_read_thread"
                         | "mcp__tyde-agent-control__tyde_swarm_read_image"
-                        | "mcp__tyde-agent-control__tyde_swarm_post"
                 )
             {
                 return Err(
@@ -7579,10 +7577,14 @@ fn control_response_payload_for_request(
             && !matches!(
                 tool_name,
                 "mcp__tyde-agent-control__tyde_swarm_describe"
+                    | "mcp__tyde-agent-control__tyde_swarm_list_threads"
+                    | "mcp__tyde-agent-control__tyde_swarm_read_summary"
+                    | "mcp__tyde-agent-control__tyde_swarm_read_deltas"
+                    | "mcp__tyde-agent-control__tyde_swarm_create_thread"
+                    | "mcp__tyde-agent-control__tyde_swarm_update_thread"
                     | "mcp__tyde-agent-control__tyde_swarm_read_board"
                     | "mcp__tyde-agent-control__tyde_swarm_read_thread"
                     | "mcp__tyde-agent-control__tyde_swarm_read_image"
-                    | "mcp__tyde-agent-control__tyde_swarm_post"
             )
         {
             return Some(tool_permission_control_response_payload(

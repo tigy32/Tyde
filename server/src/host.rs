@@ -727,6 +727,7 @@ type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 pub(crate) struct HostState {
     pub swarm_registry: SwarmRegistryHandle,
     swarm_dispatch_tx: mpsc::Sender<()>,
+    swarm_helper_jobs: HashSet<swarms::SwarmHelperJobKey>,
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
     pub team_registry: TeamRegistryHandle,
@@ -828,6 +829,8 @@ pub(crate) struct HostState {
     swarm_admission_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     swarm_conversion_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    swarm_reply_commit_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     swarm_startup_test_gates: crate::agent::SwarmStartupTestGates,
     #[cfg(feature = "test-support")]
@@ -5794,9 +5797,7 @@ impl HostHandle {
                                 == protocol::SwarmRecoveryRequirement::None
                             && matches!(
                                 swarm.lifecycle,
-                                SwarmLifecycle::Running
-                                    | SwarmLifecycle::Launching
-                                    | SwarmLifecycle::Transitioning
+                                SwarmLifecycle::Running | SwarmLifecycle::Transitioning
                             )
                             && swarm.constraints.workspace_policy == *policy
                             && request.project_id.as_ref() == Some(&swarm.constraints.project_id)
@@ -5923,9 +5924,7 @@ impl HostHandle {
                                 == protocol::SwarmRecoveryRequirement::None
                             && matches!(
                                 swarm.lifecycle,
-                                SwarmLifecycle::Running
-                                    | SwarmLifecycle::Launching
-                                    | SwarmLifecycle::Transitioning
+                                SwarmLifecycle::Running | SwarmLifecycle::Transitioning
                             )
                             && swarm.members.iter().any(|member| {
                                 member.spec.id == *member_id
@@ -15551,6 +15550,7 @@ fn spawn_host_inner(
         state: Arc::new(Mutex::new(HostState {
             swarm_registry,
             swarm_dispatch_tx,
+            swarm_helper_jobs: HashSet::new(),
             registry: AgentRegistry::new(),
             supervisor_compaction_tx,
             review_registry,
@@ -15651,6 +15651,8 @@ fn spawn_host_inner(
             swarm_admission_test_gate: None,
             #[cfg(feature = "test-support")]
             swarm_conversion_test_gate: None,
+            #[cfg(feature = "test-support")]
+            swarm_reply_commit_test_gate: None,
             #[cfg(feature = "test-support")]
             swarm_startup_test_gates: Default::default(),
             #[cfg(feature = "test-support")]

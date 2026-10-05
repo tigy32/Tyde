@@ -142,7 +142,6 @@ struct AllocationRow {
 #[derive(Clone, Copy)]
 struct ConstraintsForm {
     name: RwSignal<String>,
-    brief: RwSignal<String>,
     project_id: RwSignal<Option<ProjectId>>,
     policy: RwSignal<SwarmWorkspacePolicy>,
     max_live: RwSignal<String>,
@@ -156,7 +155,6 @@ impl ConstraintsForm {
     fn new() -> Self {
         Self {
             name: RwSignal::new(String::new()),
-            brief: RwSignal::new(String::new()),
             project_id: RwSignal::new(None),
             policy: RwSignal::new(SwarmWorkspacePolicy::ReadOnly),
             max_live: RwSignal::new("4".to_owned()),
@@ -591,16 +589,6 @@ fn ConstraintsFields(
                     </label>
                 </Show>
             </fieldset>
-            <Show when=move || show_identity && !form.brief.get().is_empty()>
-                <label class="swarm-field">
-                    <span class="swarm-field-label">"Saved opening message"</span>
-                    <span class="swarm-field-help">"This older draft includes a first message. Clear it to start with an empty conversation."</span>
-                    <textarea class="swarm-input swarm-textarea" rows="3" data-field="brief"
-                        prop:value=move || form.brief.get()
-                        on:input=move |ev| form.brief.set(event_target_value(&ev))
-                    ></textarea>
-                </label>
-            </Show>
             <div class="swarm-field">
                 <span class="swarm-field-label" id="swarm-live-label">"Live agents"</span>
                 <div class="swarm-stepper">
@@ -930,7 +918,6 @@ pub fn SwarmDraftDialog(
         if !is_new {
             if let Some(current) = draft.get() {
                 form.name.set(current.name.clone());
-                form.brief.set(current.opening_brief.clone());
                 form.load(&current.constraints);
                 seeded.set(true);
             }
@@ -998,7 +985,6 @@ pub fn SwarmDraftDialog(
             draft_id: id,
             expected_revision: revision,
             name,
-            opening_brief: form.brief.get_untracked(),
             constraints,
         });
     };
@@ -1017,10 +1003,8 @@ pub fn SwarmDraftDialog(
             return true;
         };
         form.name.track();
-        form.brief.track();
         form.track_constraints();
         current.name != form.name.get_untracked()
-            || current.opening_brief != form.brief.get_untracked()
             || form.constraints().ok().as_ref() != Some(&current.constraints)
     });
 
@@ -1685,8 +1669,8 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         FrameKind, LaunchProfileCatalog, LaunchProfileKind, Project, ProjectSource,
-        SwarmChangePreview, SwarmDraftGeneration, SwarmDraftNotifyPayload, SwarmLifecycle,
-        SwarmMemberId, SwarmMemberState,
+        SwarmChangePreview, SwarmDraftGeneration, SwarmDraftNotifyPayload, SwarmMemberId,
+        SwarmMemberState,
     };
     use serde_json::json;
     use wasm_bindgen_test::*;
@@ -2083,7 +2067,8 @@ mod wasm_tests {
         assert_eq!(command["expected_revision"], serde_json::Value::Null);
         assert_eq!(command["name"], "Checkout reliability");
         assert_eq!(
-            command["opening_brief"], "",
+            command.get("opening_brief"),
+            None,
             "the first message belongs in the conversation, not setup"
         );
         let constraints: SwarmConstraints =
@@ -2116,7 +2101,6 @@ mod wasm_tests {
             id: draft_id.clone(),
             revision: 1,
             name: "Checkout reliability".to_owned(),
-            opening_brief: String::new(),
             constraints: constraints.clone(),
             members,
             conflicts: Vec::new(),
@@ -2427,7 +2411,6 @@ mod wasm_tests {
             vec![idle("m1", "Generalist 1")],
         );
         launched.source_draft_id = Some(draft_id);
-        launched.lifecycle = SwarmLifecycle::Launching;
         harness.swarm(&launched);
         settle().await;
         assert_eq!(

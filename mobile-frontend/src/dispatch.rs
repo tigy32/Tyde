@@ -1014,11 +1014,14 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             }
         }
         FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
-            Ok(payload) => state.swarms_by_host.update(|m| {
-                m.entry(host.clone())
-                    .or_default()
-                    .insert(payload.swarm.id.clone(), payload.swarm);
-            }),
+            Ok(payload) => {
+                accept_pending_replies(state, host, &payload.swarm);
+                state.swarms_by_host.update(|m| {
+                    m.entry(host.clone())
+                        .or_default()
+                        .insert(payload.swarm.id.clone(), payload.swarm);
+                });
+            }
             Err(_) => invalid_swarm_payload(state, host),
         },
         FrameKind::SwarmDraftNotify => {
@@ -1334,34 +1337,65 @@ fn unix_time_ms() -> u64 {
 /// recoverable — a silently wedged stream is not.
 fn apply_swarm_post(state: &AppState, host: &LocalHostId, post: protocol::SwarmPost) {
     if post.author == protocol::SwarmAuthor::Human {
-        state.swarm_composer_drafts.update(|drafts| {
-            for draft in drafts.iter_mut().filter(|draft| {
-                draft.host == *host
-                    && draft.swarm_id == post.swarm_id
-                    && draft.publication_id.as_ref() == Some(&post.publication_id)
-            }) {
-                draft.text.clear();
-                draft.mentions.clear();
-                draft.pending = false;
-                draft.publication_id = None;
-                draft.publication = None;
-                draft.error = None;
-            }
-        });
-        state.swarm_errors_by_host.update(|m| {
-            if let Some(errors) = m.get_mut(host) {
-                errors.retain(|e| {
-                    e.code == protocol::SwarmErrorCode::CommittedDurabilityUncertain
-                        || e.swarm_id.as_ref() != Some(&post.swarm_id)
-                        || e.publication_id.as_ref() != Some(&post.publication_id)
-                });
-            }
-        });
+        accept_swarm_publication(state, host, &post.swarm_id, &post.publication_id);
     }
     state.swarm_posts.update(|m| {
         m.entry((host.clone(), post.swarm_id.clone()))
             .or_default()
             .insert(post.id.clone(), post);
+    });
+}
+
+/// The host recorded this human publication (as a post or a pending reply),
+/// so its draft is done and earlier failures for it are stale.
+/// A reply the host holds as pending was accepted, so its draft is done.
+fn accept_pending_replies(state: &AppState, host: &LocalHostId, swarm: &protocol::Swarm) {
+    let accepted = state.swarm_composer_drafts.with_untracked(|drafts| {
+        drafts
+            .iter()
+            .filter(|draft| draft.host == *host && draft.swarm_id == swarm.id)
+            .filter_map(|draft| draft.publication_id.clone())
+            .filter(|id| {
+                swarm
+                    .pending_replies
+                    .iter()
+                    .any(|reply| &reply.publication_id == id)
+            })
+            .collect::<Vec<_>>()
+    });
+    for publication_id in accepted {
+        accept_swarm_publication(state, host, &swarm.id, &publication_id);
+    }
+}
+
+fn accept_swarm_publication(
+    state: &AppState,
+    host: &LocalHostId,
+    swarm_id: &protocol::SwarmId,
+    publication_id: &protocol::SwarmPublicationId,
+) {
+    state.swarm_composer_drafts.update(|drafts| {
+        for draft in drafts.iter_mut().filter(|draft| {
+            draft.host == *host
+                && draft.swarm_id == *swarm_id
+                && draft.publication_id.as_ref() == Some(publication_id)
+        }) {
+            draft.text.clear();
+            draft.mentions.clear();
+            draft.pending = false;
+            draft.publication_id = None;
+            draft.publication = None;
+            draft.error = None;
+        }
+    });
+    state.swarm_errors_by_host.update(|m| {
+        if let Some(errors) = m.get_mut(host) {
+            errors.retain(|e| {
+                e.code == protocol::SwarmErrorCode::CommittedDurabilityUncertain
+                    || e.swarm_id.as_ref() != Some(swarm_id)
+                    || e.publication_id.as_ref() != Some(publication_id)
+            });
+        }
     });
 }
 
@@ -3019,6 +3053,9 @@ fn apply_host_bootstrap(
         wasm_bindgen_futures::spawn_local(async move {
             crate::actions::deliver_push_subscription(&state, host).await;
         });
+    }
+    for swarm in &payload.swarms {
+        accept_pending_replies(state, host, swarm);
     }
     state.swarms_by_host.update(|map| {
         map.insert(

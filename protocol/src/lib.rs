@@ -219,7 +219,7 @@ pub use types::{SwarmDispatch, SwarmEventPayload};
 pub use types::{
     SWARM_DEFAULT_AGENT_WAKE_BUDGET, SWARM_DEFAULT_PAGE_LIMIT, SWARM_MAX_AGENT_WAKE_BUDGET,
     SWARM_MAX_ATTACHMENTS, SWARM_MAX_BODY_BYTES, SWARM_MAX_IMAGE_BYTES, SWARM_MAX_IMAGE_DIMENSION,
-    SWARM_MAX_IMAGE_PIXELS, SWARM_MAX_LIVE_AGENTS, SWARM_MAX_PAGE_LIMIT,
+    SWARM_MAX_IMAGE_PIXELS, SWARM_MAX_LIVE_AGENTS, SWARM_MAX_PAGE_LIMIT, SWARM_MAX_SUMMARY_BYTES,
 };
 
 pub use types::{SwarmCursorTarget, SwarmMembership, SwarmReadCursor, SwarmRecoveryRequirement};
@@ -229,5 +229,7 @@ pub use types::{
     SwarmThreadCreation, SwarmThreadDirectory, SwarmThreadEntry, SwarmThreadIdentity,
     SwarmThreadList,
 };
+
+pub use types::{SwarmHumanPost, SwarmPendingReply, SwarmThreadState};
 
 pub use types::{SwarmThreadCreate, SwarmThreadUpdate};

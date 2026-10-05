@@ -2127,56 +2127,73 @@ pub(crate) async fn generate_agent_name(
     }
 
     let name_prompt = build_name_generation_prompt(prompt);
-    let logged_name_prompt = name_prompt.clone();
-    let mut spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
-    let isolated_workspace = tempfile::tempdir()
-        .map_err(|err| format!("failed to create isolated agent naming workspace: {err}"))?;
-    let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
-    let initial_input = SendMessagePayload {
-        message: name_prompt,
-        images: None,
-        origin: None,
-        tool_response: None,
-    };
-    let name_agent_id = AgentId(Uuid::new_v4().to_string());
-    let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
-    spawn_config.subagent_emitter = Some(Arc::new(
-        HostSubAgentEmitterContext {
-            host_sub_agent_spawn_tx,
-            capacity_tx: request.capacity_tx.clone(),
-        }
-        .emitter(name_agent_id, workspace_roots.clone()),
-    ));
-    let (_backend, mut events, _session_id) = match spawn_backend(
-        false,
-        request.backend_kind,
-        workspace_roots,
-        spawn_config,
-        initial_input,
-    )
+    let result = run_helper_text_turn(HelperTextTurn {
+        label: "agent name generator",
+        backend_kind: request.backend_kind,
+        session_settings: request.session_settings,
+        capacity_tx: request.capacity_tx,
+        prompt: name_prompt.clone(),
+    })
     .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            return Err(format!(
-                "agent name generator failed to start for backend {:?}: {}",
-                request.backend_kind, err
-            ));
-        }
-    };
-
-    let result = collect_agent_name_events(&mut events).await;
+    .and_then(|text| sanitize_generated_agent_name(&text));
     if let Err(err) = &result {
         tracing::warn!(
             backend_kind = ?request.backend_kind,
             cost_hint = ?SpawnCostHint::Low,
             prompt = %prompt,
-            name_prompt = %logged_name_prompt,
+            name_prompt = %name_prompt,
             error = %err,
             "agent name generator failed"
         );
     }
     result
+}
+
+pub(crate) struct HelperTextTurn {
+    pub label: &'static str,
+    pub backend_kind: BackendKind,
+    pub session_settings: Option<SessionSettingsValues>,
+    pub capacity_tx: HostCapacityTx,
+    pub prompt: String,
+}
+
+/// Runs one low-cost, tool-less inference turn in an isolated workspace and
+/// returns the assistant's raw final text.
+pub(crate) async fn run_helper_text_turn(turn: HelperTextTurn) -> Result<String, String> {
+    let mut spawn_config = agent_name_generation_spawn_config(turn.session_settings);
+    let isolated_workspace = tempfile::tempdir()
+        .map_err(|err| format!("failed to create isolated {} workspace: {err}", turn.label))?;
+    let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
+    let initial_input = SendMessagePayload {
+        message: turn.prompt,
+        images: None,
+        origin: None,
+        tool_response: None,
+    };
+    let helper_agent_id = AgentId(Uuid::new_v4().to_string());
+    let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+    spawn_config.subagent_emitter = Some(Arc::new(
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: turn.capacity_tx,
+        }
+        .emitter(helper_agent_id, workspace_roots.clone()),
+    ));
+    let (_backend, mut events, _session_id) = spawn_backend(
+        false,
+        turn.backend_kind,
+        workspace_roots,
+        spawn_config,
+        initial_input,
+    )
+    .await
+    .map_err(|err| {
+        format!(
+            "{} failed to start for backend {:?}: {}",
+            turn.label, turn.backend_kind, err
+        )
+    })?;
+    collect_helper_text_events(&mut events, turn.label).await
 }
 
 pub(crate) fn agent_name_generation_spawn_config(
@@ -2294,16 +2311,19 @@ pub fn usage_wakeup_spawn_config(
     config
 }
 
-async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, String> {
+async fn collect_helper_text_events(
+    events: &mut EventStream,
+    label: &str,
+) -> Result<String, String> {
     let mut streamed_text = String::new();
-    // Some backends run session-setup commands before the naming turn, and
+    // Some backends run session-setup commands before the helper turn, and
     // each command completion emits its own typing false (captured live on
     // the Tycode wire: SetRootAgent produces typing true → RootAgentChanged →
     // typing false before the prompt turn starts). Typing false only means
     // "turn completed without a response" once the turn itself has produced a
     // message or stream frame; earlier ones are setup noise. A backend that
-    // never produces either is bounded by await_agent_name_generation's
-    // timeout rather than misread here.
+    // never produces either is bounded by the caller's timeout rather than
+    // misread here.
     let mut turn_started = false;
     while let Some(event) = events.recv().await {
         match event {
@@ -2328,19 +2348,18 @@ async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, S
                 if candidate.trim().is_empty() {
                     continue;
                 }
-                return sanitize_generated_agent_name(&candidate);
+                return Ok(candidate);
             }
             ChatEvent::TypingStatusChanged(false) if turn_started => {
-                return Err(
-                    "agent name generator turn completed before producing a final response"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "{label} turn completed before producing a final response"
+                ));
             }
             _ => {}
         }
     }
 
-    Err("agent name generator ended before producing a final response".to_string())
+    Err(format!("{label} ended before producing a final response"))
 }
 
 pub(crate) async fn generate_agent_activity_summary(

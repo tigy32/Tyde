@@ -763,8 +763,8 @@ correlated completions, not private prose or inferred results.
 The existing busy/Pending, sequential audit, follow-up cardinality, restart, and
 resume oracles remain intact. Four distinct page limits (50, 60, 70, 80) make
 the requested eight audit reads unambiguously separate work; the case also
-checks those exact limits without relaxing any prior assertion. Tool descriptions
-spell out the different `type` body-segment and `kind` summary discriminators.
+checks those exact limits without relaxing any prior assertion. Body segments
+and summary changes both use the `kind` discriminator.
 Invalid model arguments are still rejected rather than translated or guessed.
 
 The deterministic server regression races two authenticated creators, rejects a
@@ -794,3 +794,46 @@ state contained exactly two threads and three deltas, and the instance was
 stopped. Desktop/mobile DOM suites additionally cover conditional composers,
 reactive state, compact layouts, and identical frozen retries. Unsupported
 screenshot/second-client capabilities were not used or claimed.
+
+## Human request threads
+
+Swarms no longer open with a brief. Members stay Proposed until a human
+request reaches them. Every human root is a Briefing request; without member
+mentions it wakes all active members, and with mentions only those members.
+Agents reply in that request with `update_thread`, or open
+Coordination children beneath it; they never create Briefing roots. The real
+case keeps its setup, oracle and per-provider prompt-only differences: the
+opening request is now an ordinary human thread, and two peers append
+SWARM_READY to it concurrently.
+
+That concurrency exposed a Codex normalization defect. Codex reports an MCP
+`isError` result as a failed `mcpToolCall` whose `result` omits the flag, so
+its completion surfaced as an opaque `Other` result with `isError: false`
+while Claude surfaced the canonical MCP error. The Codex adapter now restores
+the flag from the failed status, so both providers deliver the same canonical
+error and board code. The harness decodes that code from the canonical
+`CallToolResult` for every provider and tolerates only a conflict on a
+conditional write, which commits nothing and is retried by the member.
+Without the fix, a genuine Codex conflict failed the case as unclassified.
+
+Validation on 2026-10-05 used Claude Haiku 4.5 and Codex `gpt-5.6-luna` at
+low effort. `real_swarm_board_coordination` passed on Claude (114s) and on
+Codex (139s); each run hit and recovered from a real update conflict.
+`real_swarm_shared_images` passed on Claude (22s) and Codex (16s). One
+earlier Codex coordination attempt exceeded the five-minute limit during the
+busy audit while still making progress; the next run passed. These are
+feature-path results, not full backend certification.
+
+Live desktop QA on 2026-10-05 drove the branch build through the branch's own
+`tyde-dev-driver debug` launcher, because the resident launcher speaks
+protocol 69 and this host speaks 73. With ephemeral stores and two read-only
+Claude Haiku members, creation took only a name, scope and members; members
+showed as ready to chat until the first request. That request committed
+instantly as "Naming…", woke both members, and gained a generated title,
+description and summary; both members replied in that thread. A human reply
+rendered "posting…", then committed with a rewritten summary. A second
+request led Peer 1 to open a Coordination child: the request showed
+"Coordination · 1", and the flat Coordination tab showed it as "Re: <request
+title>" with no root composer and no sequence label. The agreed answer came
+back in the request thread. The instance was stopped. Unsupported screenshot
+and second-client capabilities were not used or claimed.

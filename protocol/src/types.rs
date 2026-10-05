@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 72;
+pub const PROTOCOL_VERSION: u32 = 73;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -8919,7 +8919,6 @@ pub enum SwarmBoard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmLifecycle {
-    Launching,
     Running,
     Pausing,
     Paused,
@@ -9053,7 +9052,6 @@ pub struct SwarmDraft {
     pub id: SwarmDraftId,
     pub revision: u64,
     pub name: String,
-    pub opening_brief: String,
     pub constraints: SwarmConstraints,
     pub members: Vec<SwarmMemberSpec>,
     pub conflicts: Vec<String>,
@@ -9108,6 +9106,9 @@ pub struct SwarmChangePreview {
 pub struct Swarm {
     #[serde(default)]
     pub threads: Vec<SwarmThread>,
+    /// Human replies accepted but not yet folded into their thread summary.
+    #[serde(default)]
+    pub pending_replies: Vec<SwarmPendingReply>,
     #[serde(default)]
     pub recovery_requirement: SwarmRecoveryRequirement,
     #[serde(default)]
@@ -9119,7 +9120,6 @@ pub struct Swarm {
     pub constraints: SwarmConstraints,
     pub lifecycle: SwarmLifecycle,
     pub members: Vec<SwarmMember>,
-    pub opening_post_id: Option<SwarmPostId>,
     pub board_positions: Vec<SwarmBoardPosition>,
     pub notifications: Vec<SwarmNotification>,
     pub rounds: Vec<SwarmRound>,
@@ -9130,7 +9130,7 @@ pub struct Swarm {
     pub legacy_team_id: Option<TeamId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwarmBodySegment {
     Text { text: String },
     MemberMention { member_id: SwarmMemberId },
@@ -9203,17 +9203,12 @@ pub enum SwarmThreadChange {
         title: String,
         description: String,
         summary: String,
-        parent_thread_id: Option<SwarmThreadId>,
+        parent_thread_id: SwarmThreadId,
+        expected_sibling_seq: u64,
     },
     Update {
         expected_seq: u64,
         summary: SwarmSummaryChange,
-    },
-    Initialize {
-        expected_cursor: u64,
-        title: String,
-        description: String,
-        summary: String,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -9222,11 +9217,47 @@ pub struct SwarmThread {
     pub thread_id: SwarmThreadId,
     pub board: SwarmBoard,
     pub parent_thread_id: Option<SwarmThreadId>,
-    pub title: String,
-    pub description: String,
+    /// `None` while the server is still generating a human thread's title.
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Latest title-generation failure; generation keeps retrying.
+    #[serde(default)]
+    pub naming_error: Option<String>,
     pub summary: String,
     pub seq: u64,
+    /// Coordination children created under this thread; creation is
+    /// conditional on it so agents see their siblings first.
+    #[serde(default)]
+    pub child_seq: u64,
     pub creation_cursor: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmPendingReply {
+    pub publication_id: SwarmPublicationId,
+    pub thread_id: SwarmThreadId,
+    pub body: Vec<SwarmBodySegment>,
+    pub attachments: Vec<SwarmAttachment>,
+    pub images: Vec<SwarmImage>,
+    pub created_at_ms: u64,
+    pub attempts: u32,
+    /// Latest summary-helper failure; the server keeps retrying.
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmHumanPost {
+    pub publication_id: SwarmPublicationId,
+    /// `None` starts a new Briefing thread; otherwise a reply to that thread.
+    pub thread_id: Option<SwarmThreadId>,
+    pub body: Vec<SwarmBodySegment>,
+    #[serde(default)]
+    pub attachments: Vec<SwarmAttachment>,
+    #[serde(default)]
+    pub images: Vec<SwarmImageId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmThreadState {
+    pub thread: SwarmThread,
+    pub root: SwarmPost,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmThreadList {
@@ -9240,12 +9271,15 @@ pub struct SwarmThreadEntry {
     pub thread_id: SwarmThreadId,
     pub board: SwarmBoard,
     pub parent_thread_id: Option<SwarmThreadId>,
-    pub title: String,
-    pub description: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
     pub seq: u64,
+    pub child_seq: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmThreadDirectory {
+    /// The parent's `child_seq` when listing one parent's children.
+    pub sibling_seq: Option<u64>,
     pub threads: Vec<SwarmThreadEntry>,
     pub next_cursor: SwarmReadCursor,
     pub has_more: bool,
@@ -9272,6 +9306,7 @@ pub struct SwarmDeltaPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmThreadCreate {
     pub parent_thread_id: SwarmThreadId,
+    pub expected_sibling_seq: u64,
     pub title: String,
     pub description: String,
     pub summary: String,
@@ -9295,15 +9330,9 @@ pub struct SwarmThreadUpdate {
     pub images: Vec<SwarmImageId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SwarmThreadCreation {
-    Created {
-        publication: Box<SwarmPublicationOutcome>,
-        thread: SwarmThread,
-    },
-    AlreadyExists {
-        thread: SwarmThread,
-    },
+pub struct SwarmThreadCreation {
+    pub publication: SwarmPublicationOutcome,
+    pub thread: SwarmThread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -9402,7 +9431,6 @@ pub struct SwarmBoardPage {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmThreadPage {
-    pub head_cursor: u64,
     pub swarm_id: SwarmId,
     pub thread_id: SwarmThreadId,
     pub root: SwarmPost,
@@ -9421,8 +9449,6 @@ pub struct SwarmDescribe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmPublicationOutcome {
     #[serde(default)]
-    pub already_exists: bool,
-    #[serde(default)]
     pub commit_status: SwarmCommitStatus,
     pub post: SwarmPost,
     pub duplicate: bool,
@@ -9435,7 +9461,6 @@ pub enum SwarmCommandPayload {
         draft_id: SwarmDraftId,
         expected_revision: Option<u64>,
         name: String,
-        opening_brief: String,
         constraints: SwarmConstraints,
     },
     DiscardDraft {
@@ -9479,7 +9504,7 @@ pub enum SwarmCommandPayload {
     },
     Post {
         swarm_id: SwarmId,
-        publication: SwarmPublication,
+        post: SwarmHumanPost,
     },
     MarkRead {
         swarm_id: SwarmId,
@@ -9598,6 +9623,7 @@ pub const SWARM_DEFAULT_AGENT_WAKE_BUDGET: u32 = 16;
 pub const SWARM_DEFAULT_PAGE_LIMIT: u32 = 50;
 pub const SWARM_MAX_PAGE_LIMIT: u32 = 100;
 pub const SWARM_MAX_BODY_BYTES: usize = 65536;
+pub const SWARM_MAX_SUMMARY_BYTES: usize = 4096;
 pub const SWARM_MAX_INLINE_CONTEXT_BYTES: usize = 128 * 1024;
 pub const SWARM_MAX_ATTACHMENTS: usize = 16;
 pub const SWARM_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -9626,20 +9652,24 @@ pub fn swarm_publication_recipients(
     match author {
         SwarmAuthor::Human => match root_author {
             Some(SwarmAuthor::Member { member_id }) => recipients.push(member_id.clone()),
-            None if board == SwarmBoard::Briefing && recipients.is_empty() => recipients.extend(
-                swarm
-                    .members
-                    .iter()
-                    .filter(|member| {
-                        !matches!(
-                            member.state,
-                            SwarmMemberState::Retiring
-                                | SwarmMemberState::RetiringReserved
-                                | SwarmMemberState::Retired
-                        )
-                    })
-                    .map(|member| member.spec.id.clone()),
-            ),
+            None | Some(SwarmAuthor::Human)
+                if board == SwarmBoard::Briefing && recipients.is_empty() =>
+            {
+                recipients.extend(
+                    swarm
+                        .members
+                        .iter()
+                        .filter(|member| {
+                            !matches!(
+                                member.state,
+                                SwarmMemberState::Retiring
+                                    | SwarmMemberState::RetiringReserved
+                                    | SwarmMemberState::Retired
+                            )
+                        })
+                        .map(|member| member.spec.id.clone()),
+                )
+            }
             _ => {}
         },
         SwarmAuthor::Member { member_id } => recipients.retain(|id| id != member_id),
