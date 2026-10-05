@@ -601,6 +601,67 @@ fn set_aside_store(path: &std::path::Path) -> Result<(), SwarmFailure> {
     Ok(())
 }
 
+/// Earlier versions held human replies in `pending_replies` until a summary
+/// helper rewrote the thread; they now commit when the store loads.
+fn take_legacy_pending_replies(
+    bytes: &[u8],
+) -> Result<(serde_json::Value, Vec<(SwarmId, SwarmHumanPost)>), SwarmFailure> {
+    #[derive(serde::Deserialize)]
+    struct LegacyPendingReply {
+        publication_id: SwarmPublicationId,
+        thread_id: SwarmThreadId,
+        body: Vec<SwarmBodySegment>,
+        attachments: Vec<SwarmAttachment>,
+        images: Vec<SwarmImage>,
+    }
+    let invalid = |error: serde_json::Error| {
+        failure(
+            SwarmErrorCode::Storage,
+            format!("invalid swarm store: {error}"),
+        )
+    };
+    let mut value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(invalid)?;
+    let mut replies = Vec::new();
+    if let Some(swarms) = value
+        .get_mut("swarms")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for swarm in swarms {
+            let Some(object) = swarm.as_object_mut() else {
+                continue;
+            };
+            let Some(pending) = object.remove("pending_replies") else {
+                continue;
+            };
+            let swarm_id = object
+                .get("id")
+                .cloned()
+                .map(serde_json::from_value::<SwarmId>)
+                .transpose()
+                .map_err(invalid)?
+                .ok_or(failure(
+                    SwarmErrorCode::Storage,
+                    "invalid swarm store: swarm without id",
+                ))?;
+            for reply in
+                serde_json::from_value::<Vec<LegacyPendingReply>>(pending).map_err(invalid)?
+            {
+                replies.push((
+                    swarm_id.clone(),
+                    SwarmHumanPost {
+                        publication_id: reply.publication_id,
+                        thread_id: Some(reply.thread_id),
+                        body: reply.body,
+                        attachments: reply.attachments,
+                        images: reply.images.into_iter().map(|image| image.id).collect(),
+                    },
+                ));
+            }
+        }
+    }
+    Ok((value, replies))
+}
+
 struct Actor {
     path: PathBuf,
     file: Result<SwarmStoreSnapshot, SwarmFailure>,
@@ -612,9 +673,13 @@ impl Actor {
         let file = match std::fs::read(&path) {
             Ok(bytes) if legacy_store_version(&bytes) => set_aside_store(&path)
                 .map(|()| SwarmStoreSnapshot { version: SWARM_STORE_VERSION, ..Default::default() }),
-            Ok(bytes) => serde_json::from_slice::<SwarmStoreSnapshot>(&bytes)
-                .map_err(|error| failure(SwarmErrorCode::Storage, format!("invalid swarm store: {error}")))
-                .and_then(|mut file| {
+            Ok(bytes) => take_legacy_pending_replies(&bytes)
+                .and_then(|(value, legacy_replies)| {
+                    serde_json::from_value::<SwarmStoreSnapshot>(value)
+                        .map(|file| (file, legacy_replies))
+                        .map_err(|error| failure(SwarmErrorCode::Storage, format!("invalid swarm store: {error}")))
+                })
+                .and_then(|(mut file, legacy_replies)| {
                     if file.version != SWARM_STORE_VERSION {
                         return Err(failure(SwarmErrorCode::Storage, "unsupported swarm store version"));
                     }
@@ -667,6 +732,16 @@ impl Actor {
                             swarm.recovery_requirement = SwarmRecoveryRequirement::ExplicitResume;
                             swarm.error = Some("Host restarted; review deliveries and Resume or explicitly retry uncertain work".into());
                         }
+                    }
+                    // A held reply that cannot commit fails the load instead of
+                    // being dropped: the store on disk still holds it.
+                    for (swarm_id, reply) in legacy_replies {
+                        human_post(&mut file, &swarm_id, reply).map_err(|error| {
+                            failure(
+                                SwarmErrorCode::Storage,
+                                format!("cannot commit a human reply held by an earlier version: {}", error.message),
+                            )
+                        })?;
                     }
                     Ok(file)
                 }),
@@ -1388,7 +1463,6 @@ fn apply(
             }
             let swarm = Swarm {
                 threads: Vec::new(),
-                pending_replies: Vec::new(),
                 recovery_requirement: SwarmRecoveryRequirement::None,
                 source_draft_id: Some(draft.id.clone()),
                 id: SwarmId(draft.id.0.clone()),
@@ -1896,7 +1970,11 @@ fn publish(
             Some(thread) => post.thread_id == *thread,
             None => post.thread_id.0 == post.id.0,
         };
-        if post.thread_change != publication.thread_change
+        // A human never supplies a thread change; replies committed by earlier
+        // versions carry the helper's summary rewrite, which a retry of the
+        // same publication cannot reproduce.
+        if (author != SwarmAuthor::Human && post.thread_change != publication.thread_change)
+            || post.result != publication.result
             || post.board != publication.board
             || post.body != publication.body
             || post.attachments != publication.attachments
@@ -1952,6 +2030,16 @@ fn publish(
             "reply board does not match thread",
         ));
     }
+    if publication.result
+        && (matches!(author, SwarmAuthor::Human)
+            || publication.board != SwarmBoard::Briefing
+            || root.is_none())
+    {
+        return Err(failure(
+            SwarmErrorCode::Invalid,
+            "Only a member's reply in a Briefing thread can be a result",
+        ));
+    }
     let recipients = swarm_publication_recipients(
         swarm,
         &author,
@@ -1988,6 +2076,7 @@ fn publish(
     let threads = prepare_thread(file, id, &thread_id, cursor, &author, &publication)?;
     let post = SwarmPost {
         thread_change: publication.thread_change.clone(),
+        result: publication.result,
         thread_seq: Some(threads.thread.seq),
         images,
         id: post_id.clone(),
@@ -2181,213 +2270,52 @@ fn validate_content(
     Ok(images)
 }
 
-/// Human messages commit verbatim. A new thread commits immediately; a reply
-/// waits as server state until the summary helper folds it into the thread.
+/// Human messages commit verbatim and immediately; a reply leaves the
+/// agent-owned thread summary unchanged.
 fn human_post(
     file: &mut SwarmStoreSnapshot,
     id: &SwarmId,
     post: SwarmHumanPost,
 ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
-    let Some(thread_id) = post.thread_id else {
-        // Pending replies own their identity before they commit; a new request
-        // reusing it would leave the reply uncommittable.
-        if file
+    let board = match &post.thread_id {
+        None => SwarmBoard::Briefing,
+        Some(thread_id) => file
             .swarms
             .iter()
-            .filter(|swarm| swarm.id == *id)
-            .flat_map(|swarm| &swarm.pending_replies)
-            .any(|pending| pending.publication_id == post.publication_id)
-        {
-            return Err(failure(
-                SwarmErrorCode::Conflict,
-                "publication identity reused with different content",
-            ));
-        }
-        let outcome = publish(
-            file,
-            id,
-            SwarmAuthor::Human,
-            SwarmPublication {
-                thread_change: None,
-                board: SwarmBoard::Briefing,
-                publication_id: post.publication_id,
-                body: post.body,
-                thread_id: None,
-                attachments: post.attachments,
-                images: post.images,
-            },
-        )?;
-        return Ok(vec![
-            SwarmEventPayload::Post(SwarmPostNotifyPayload { post: outcome.post }),
-            swarm_event(swarm_mut(file, id)?),
-        ]);
-    };
-    validate_publication_id(&post.publication_id)?;
-    let swarm = file
-        .swarms
-        .iter()
-        .find(|swarm| swarm.id == *id)
-        .ok_or(failure(SwarmErrorCode::NotFound, "swarm does not exist"))?;
-    let committed = file.posts.iter().find(|existing| {
-        existing.swarm_id == *id
-            && existing.author == SwarmAuthor::Human
-            && existing.publication_id == post.publication_id
-    });
-    let pending = swarm
-        .pending_replies
-        .iter()
-        .find(|pending| pending.publication_id == post.publication_id);
-    let image_ids = |images: &[SwarmImage]| {
-        images
+            .find(|swarm| swarm.id == *id)
+            .ok_or(failure(SwarmErrorCode::NotFound, "swarm does not exist"))?
+            .threads
             .iter()
-            .map(|image| image.id.clone())
-            .collect::<Vec<_>>()
+            .find(|thread| thread.thread_id == *thread_id)
+            .map(|thread| thread.board)
+            .ok_or(failure(
+                SwarmErrorCode::NotFound,
+                "thread does not belong to swarm",
+            ))?,
     };
-    let previous = committed
-        .map(|existing| {
-            (
-                &existing.thread_id,
-                &existing.body,
-                &existing.attachments,
-                image_ids(&existing.images),
-            )
-        })
-        .or(pending.map(|pending| {
-            (
-                &pending.thread_id,
-                &pending.body,
-                &pending.attachments,
-                image_ids(&pending.images),
-            )
-        }));
-    if let Some((previous_thread, previous_body, previous_attachments, previous_images)) = previous
-    {
-        if *previous_thread != thread_id
-            || *previous_body != post.body
-            || *previous_attachments != post.attachments
-            || previous_images != post.images
-        {
-            return Err(failure(
-                SwarmErrorCode::Conflict,
-                "publication identity reused with different content",
-            ));
-        }
-        let mut events = committed
-            .map(|existing| {
-                SwarmEventPayload::Post(SwarmPostNotifyPayload {
-                    post: existing.clone(),
-                })
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        events.push(swarm_event(swarm));
-        return Ok(events);
-    }
-    if !swarm
-        .threads
-        .iter()
-        .any(|thread| thread.thread_id == thread_id)
-    {
-        return Err(failure(
-            SwarmErrorCode::NotFound,
-            "thread does not belong to swarm",
-        ));
-    }
-    let images = validate_content(file, id, &post.body, &post.attachments, &post.images)?;
-    validate_reply_size(
+    let outcome = publish(
+        file,
         id,
-        swarm,
-        &thread_id,
-        &post.publication_id,
-        &post.body,
-        &post.attachments,
-        &images,
+        SwarmAuthor::Human,
+        SwarmPublication {
+            thread_change: None,
+            result: false,
+            board,
+            publication_id: post.publication_id,
+            body: post.body,
+            thread_id: post.thread_id,
+            attachments: post.attachments,
+            images: post.images,
+        },
     )?;
-    let swarm = swarm_mut(file, id)?;
-    swarm.pending_replies.push(SwarmPendingReply {
-        publication_id: post.publication_id,
-        thread_id,
-        body: post.body,
-        attachments: post.attachments,
-        images,
-        created_at_ms: now_ms(),
-        attempts: 0,
-        error: None,
-    });
-    Ok(vec![swarm_event(swarm)])
-}
-
-/// The helper commits a reply together with its rewritten summary, so a
-/// pending reply must leave room for the largest encodable summary or it
-/// could never commit.
-fn validate_reply_size(
-    id: &SwarmId,
-    swarm: &Swarm,
-    thread_id: &SwarmThreadId,
-    publication_id: &SwarmPublicationId,
-    body: &[SwarmBodySegment],
-    attachments: &[SwarmAttachment],
-    images: &[SwarmImage],
-) -> Result<(), SwarmFailure> {
-    let board = swarm
-        .threads
-        .iter()
-        .find(|thread| thread.thread_id == *thread_id)
-        .map(|thread| thread.board)
-        .ok_or(failure(
-            SwarmErrorCode::NotFound,
-            "thread does not belong to swarm",
-        ))?;
-    let largest = SwarmPost {
-        thread_change: Some(SwarmThreadChange::Update {
-            expected_seq: u64::MAX,
-            summary: SwarmSummaryChange::Replace {
-                // Control characters have the longest JSON escape.
-                text: "\u{1}".repeat(SWARM_MAX_SUMMARY_BYTES),
-            },
-        }),
-        thread_seq: Some(u64::MAX),
-        images: images.to_vec(),
-        id: SwarmPostId(fresh()),
-        swarm_id: id.clone(),
-        thread_id: thread_id.clone(),
-        board,
-        cursor: u64::MAX,
-        author: SwarmAuthor::Human,
-        publication_id: publication_id.clone(),
-        body: body.to_vec(),
-        attachments: attachments.to_vec(),
-        round_id: SwarmRoundId(fresh()),
-        created_at_ms: u64::MAX,
-    };
-    let bytes = serde_json::to_vec(&largest)
-        .map_err(|error| {
-            failure(
-                SwarmErrorCode::Invalid,
-                format!("Cannot encode post: {error}"),
-            )
-        })?
-        .len();
-    if bytes > SWARM_MAX_POST_BYTES {
-        return Err(failure(
-            SwarmErrorCode::Invalid,
-            "Reply leaves no room for its thread summary; shorten it",
-        ));
-    }
-    Ok(())
+    Ok(vec![
+        SwarmEventPayload::Post(SwarmPostNotifyPayload { post: outcome.post }),
+        swarm_event(swarm_mut(file, id)?),
+    ])
 }
 
 /// Server-side helper results for human threads.
 pub(crate) enum SwarmHelperChange {
-    CommitReply {
-        publication_id: SwarmPublicationId,
-        expected_seq: u64,
-        summary: String,
-    },
-    ReplyFailed {
-        publication_id: SwarmPublicationId,
-        message: String,
-    },
     NameThread {
         thread_id: SwarmThreadId,
         title: String,
@@ -2405,82 +2333,6 @@ fn apply_helper_change(
     change: SwarmHelperChange,
 ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
     match change {
-        SwarmHelperChange::CommitReply {
-            publication_id,
-            expected_seq,
-            summary,
-        } => {
-            let swarm = swarm_mut(file, id)?;
-            let pending = swarm
-                .pending_replies
-                .iter()
-                .find(|pending| pending.publication_id == publication_id)
-                .cloned()
-                .ok_or(failure(
-                    SwarmErrorCode::NotFound,
-                    "Pending reply is no longer pending",
-                ))?;
-            let thread = swarm
-                .threads
-                .iter()
-                .find(|thread| thread.thread_id == pending.thread_id)
-                .ok_or(failure(SwarmErrorCode::NotFound, "Thread disappeared"))?;
-            if thread.seq != expected_seq {
-                return Err(failure(
-                    SwarmErrorCode::Conflict,
-                    "Thread advanced while the summary was rewritten",
-                ));
-            }
-            let board = thread.board;
-            let outcome = publish(
-                file,
-                id,
-                SwarmAuthor::Human,
-                SwarmPublication {
-                    thread_change: Some(SwarmThreadChange::Update {
-                        expected_seq,
-                        summary: SwarmSummaryChange::Replace { text: summary },
-                    }),
-                    board,
-                    publication_id: pending.publication_id,
-                    body: pending.body,
-                    thread_id: Some(pending.thread_id),
-                    attachments: pending.attachments,
-                    images: pending.images.into_iter().map(|image| image.id).collect(),
-                },
-            )
-            // The sequence was current, so a conflict here is a permanent
-            // identity clash; retrying at once would loop forever.
-            .map_err(|error| match error.code {
-                SwarmErrorCode::Conflict => failure(SwarmErrorCode::Invalid, error.message),
-                _ => error,
-            })?;
-            let swarm = swarm_mut(file, id)?;
-            swarm
-                .pending_replies
-                .retain(|pending| pending.publication_id != publication_id);
-            Ok(vec![
-                SwarmEventPayload::Post(SwarmPostNotifyPayload { post: outcome.post }),
-                swarm_event(swarm),
-            ])
-        }
-        SwarmHelperChange::ReplyFailed {
-            publication_id,
-            message,
-        } => {
-            let swarm = swarm_mut(file, id)?;
-            let pending = swarm
-                .pending_replies
-                .iter_mut()
-                .find(|pending| pending.publication_id == publication_id)
-                .ok_or(failure(
-                    SwarmErrorCode::NotFound,
-                    "Pending reply is no longer pending",
-                ))?;
-            pending.attempts += 1;
-            pending.error = Some(message);
-            Ok(vec![swarm_event(swarm)])
-        }
         SwarmHelperChange::NameThread {
             thread_id,
             title,
@@ -2583,11 +2435,27 @@ fn prepare_thread(
         .find(|swarm| swarm.id == *id)
         .ok_or(failure(SwarmErrorCode::NotFound, "Swarm does not exist"))?;
     match &publication.thread_change {
+        None if *author == SwarmAuthor::Human && publication.thread_id.is_some() => {
+            let mut next = swarm
+                .threads
+                .iter()
+                .find(|thread| thread.thread_id == *thread_id)
+                .cloned()
+                .ok_or(failure(
+                    SwarmErrorCode::NotFound,
+                    "Thread does not belong to this swarm",
+                ))?;
+            next.seq = next.seq.checked_add(1).ok_or(failure(
+                SwarmErrorCode::Conflict,
+                "Thread sequence exhausted",
+            ))?;
+            Ok(PreparedThread {
+                thread: next,
+                parent: None,
+            })
+        }
         None => {
-            if *author != SwarmAuthor::Human
-                || publication.thread_id.is_some()
-                || publication.board != SwarmBoard::Briefing
-            {
+            if *author != SwarmAuthor::Human || publication.board != SwarmBoard::Briefing {
                 return Err(failure(
                     SwarmErrorCode::Invalid,
                     "Publications require a Coordination thread creation or a conditional summary update",

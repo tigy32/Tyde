@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 75;
+pub const PROTOCOL_VERSION: u32 = 76;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9139,9 +9139,6 @@ pub struct SwarmChangePreview {
 pub struct Swarm {
     #[serde(default)]
     pub threads: Vec<SwarmThread>,
-    /// Human replies accepted but not yet folded into their thread summary.
-    #[serde(default)]
-    pub pending_replies: Vec<SwarmPendingReply>,
     #[serde(default)]
     pub recovery_requirement: SwarmRecoveryRequirement,
     #[serde(default)]
@@ -9264,18 +9261,6 @@ pub struct SwarmThread {
     pub child_seq: u64,
     pub creation_cursor: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SwarmPendingReply {
-    pub publication_id: SwarmPublicationId,
-    pub thread_id: SwarmThreadId,
-    pub body: Vec<SwarmBodySegment>,
-    pub attachments: Vec<SwarmAttachment>,
-    pub images: Vec<SwarmImage>,
-    pub created_at_ms: u64,
-    pub attempts: u32,
-    /// Latest summary-helper failure; the server keeps retrying.
-    pub error: Option<String>,
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmHumanPost {
     pub publication_id: SwarmPublicationId,
@@ -9355,6 +9340,10 @@ pub struct SwarmThreadUpdate {
     pub thread_id: SwarmThreadId,
     pub expected_seq: u64,
     pub summary_change: SwarmSummaryChange,
+    /// Marks this post as the answer to the human's latest request in a
+    /// Briefing thread.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result: bool,
     pub publication_id: SwarmPublicationId,
     pub body: Vec<SwarmBodySegment>,
     #[serde(default)]
@@ -9372,6 +9361,8 @@ pub struct SwarmThreadCreation {
 pub struct SwarmPublication {
     #[serde(default)]
     pub thread_change: Option<SwarmThreadChange>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result: bool,
     pub board: SwarmBoard,
     pub publication_id: SwarmPublicationId,
     pub body: Vec<SwarmBodySegment>,
@@ -9386,6 +9377,11 @@ pub struct SwarmPublication {
 pub struct SwarmPost {
     #[serde(default)]
     pub thread_change: Option<SwarmThreadChange>,
+    /// A member's answer to the human's latest request in a Briefing thread.
+    /// Omitted when false so posts stored before the flag keep their size
+    /// against the read page byte budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result: bool,
     #[serde(default)]
     pub thread_seq: Option<u64>,
     pub id: SwarmPostId,

@@ -2663,9 +2663,13 @@ mod wasm_tests {
             text_of(&field(&dialog, "tool-policy"))
                 .contains("ten swarm board tools (including atomic thread state and delta tools)")
         );
+        // Manage is a gear icon; the pending preview is carried by its
+        // announced name and tooltip rather than visible button text.
         assert_eq!(
-            text_of(&button(&container, "Manage • preview pending")),
-            "Manage • preview pending"
+            button(&container, "Manage • preview pending")
+                .get_attribute("title")
+                .as_deref(),
+            Some("Manage swarm — change preview pending")
         );
 
         assert!(!is_disabled(&action(&dialog, "apply")));

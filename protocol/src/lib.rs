@@ -229,6 +229,6 @@ pub use types::{
     SwarmThreadList,
 };
 
-pub use types::{SwarmHumanPost, SwarmPendingReply, SwarmThreadState};
+pub use types::{SwarmHumanPost, SwarmThreadState};
 
 pub use types::{SwarmThreadCreate, SwarmThreadUpdate};

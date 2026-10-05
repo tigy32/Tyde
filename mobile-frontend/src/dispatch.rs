@@ -1015,7 +1015,6 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         }
         FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
             Ok(payload) => {
-                accept_pending_replies(state, host, &payload.swarm);
                 state.swarms_by_host.update(|m| {
                     m.entry(host.clone())
                         .or_default()
@@ -1346,28 +1345,8 @@ fn apply_swarm_post(state: &AppState, host: &LocalHostId, post: protocol::SwarmP
     });
 }
 
-/// The host recorded this human publication (as a post or a pending reply),
-/// so its draft is done and earlier failures for it are stale.
-/// A reply the host holds as pending was accepted, so its draft is done.
-fn accept_pending_replies(state: &AppState, host: &LocalHostId, swarm: &protocol::Swarm) {
-    let accepted = state.swarm_composer_drafts.with_untracked(|drafts| {
-        drafts
-            .iter()
-            .filter(|draft| draft.host == *host && draft.swarm_id == swarm.id)
-            .filter_map(|draft| draft.publication_id.clone())
-            .filter(|id| {
-                swarm
-                    .pending_replies
-                    .iter()
-                    .any(|reply| &reply.publication_id == id)
-            })
-            .collect::<Vec<_>>()
-    });
-    for publication_id in accepted {
-        accept_swarm_publication(state, host, &swarm.id, &publication_id);
-    }
-}
-
+/// The host recorded this human publication as a post, so its draft is done
+/// and earlier failures for it are stale.
 fn accept_swarm_publication(
     state: &AppState,
     host: &LocalHostId,
@@ -3053,9 +3032,6 @@ fn apply_host_bootstrap(
         wasm_bindgen_futures::spawn_local(async move {
             crate::actions::deliver_push_subscription(&state, host).await;
         });
-    }
-    for swarm in &payload.swarms {
-        accept_pending_replies(state, host, swarm);
     }
     state.swarms_by_host.update(|map| {
         map.insert(

@@ -834,8 +834,6 @@ pub(crate) struct HostState {
     #[cfg(feature = "test-support")]
     swarm_conversion_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
-    swarm_reply_commit_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
-    #[cfg(feature = "test-support")]
     swarm_startup_test_gates: crate::agent::SwarmStartupTestGates,
     #[cfg(feature = "test-support")]
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
@@ -15671,8 +15669,6 @@ fn spawn_host_inner(
             swarm_admission_test_gate: None,
             #[cfg(feature = "test-support")]
             swarm_conversion_test_gate: None,
-            #[cfg(feature = "test-support")]
-            swarm_reply_commit_test_gate: None,
             #[cfg(feature = "test-support")]
             swarm_startup_test_gates: Default::default(),
             #[cfg(feature = "test-support")]

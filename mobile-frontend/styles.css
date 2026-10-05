@@ -5249,6 +5249,8 @@ input, textarea, select {
 .mobile-swarm-posts { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .mobile-swarm-post { padding: 16px; background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: 14px; min-width: 0; }
 .mobile-swarm-post header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 14px; margin-bottom: 12px; }
+.mobile-swarm-result { border-color: var(--accent-success); background: color-mix(in srgb, var(--accent-success) 8%, var(--bg-surface)); }
+.mobile-swarm-result header > span { color: var(--accent-success); font-weight: 600; }
 .mobile-swarm-post-body { font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .mobile-swarm-mention { color: var(--accent-primary); margin-right: 4px; }
 .mobile-swarm-attachment { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }

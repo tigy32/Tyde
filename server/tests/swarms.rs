@@ -741,6 +741,7 @@ fn ready(swarm: &Swarm) -> bool {
 fn publication(board: SwarmBoard, key: &str, body: Vec<SwarmBodySegment>) -> SwarmPublication {
     SwarmPublication {
         thread_change: None,
+        result: false,
         images: Vec::new(),
         board,
         publication_id: SwarmPublicationId(key.to_owned()),
@@ -4102,29 +4103,22 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         assert!(accepted.attachments == measured.attachments && accepted.body == measured.body);
         boundary_posts.push(accepted);
     }
-    let root = &boundary_posts[0];
-    let mut unsummarizable = publication(
+    let root = boundary_posts[0].clone();
+    let mut human_reply = publication(
         SwarmBoard::Briefing,
         "exact-max-human-reply",
         boundary_posts[1].body.clone(),
     );
-    unsummarizable.attachments = boundary_posts[1].attachments.clone();
-    unsummarizable.thread_id = Some(root.thread_id.clone());
-    scenario
-        .send(SwarmCommandPayload::Post {
-            swarm_id: oversized_swarm.id.clone(),
-            post: human_post(unsummarizable),
-        })
-        .await;
-    scenario.error(SwarmErrorCode::Invalid).await;
+    human_reply.attachments = boundary_posts[1].attachments.clone();
+    human_reply.thread_id = Some(root.thread_id.clone());
+    let human_reply = scenario.post(&oversized_swarm.id, human_reply).await;
     assert!(
-        scenario
-            .snapshot(&oversized_swarm.id)
-            .await
-            .pending_replies
-            .is_empty(),
-        "a reply with no room for its summary must be rejected, never held uncommittable"
+        human_reply.thread_id == root.thread_id
+            && human_reply.body == boundary_posts[1].body
+            && human_reply.attachments == boundary_posts[1].attachments,
+        "a maximum-sized human reply commits verbatim and immediately, with no summary rewrite to make room for"
     );
+    boundary_posts.push(human_reply);
     let mut cursor = None;
     let mut read_replies = Vec::new();
     loop {
@@ -4139,7 +4133,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             )
             .await;
         assert!(
-            page.root == *root,
+            page.root == root,
             "every maximum-sized thread page must preserve the complete actual root"
         );
         assert!(
@@ -4162,7 +4156,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     }
     assert!(
         read_replies == boundary_posts[1..],
-        "an accepted exact-maximum root and reply must be exhaustively readable, without separator-budget failure or loss"
+        "an accepted exact-maximum root and replies must be exhaustively readable, without separator-budget failure or loss"
     );
 }
 
@@ -10383,7 +10377,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     let after_attention_supervision = scenario.snapshot(&unsupervised.id).await;
     if after_attention_supervision != before_attention_supervision {
         eprintln!(
-            "Swarm attention snapshot comparison: lifecycle_equal={} members_equal={} notifications_equal={} rounds_equal={} boards_equal={} revision_equal={} error_equal={} recovery_equal={} threads_equal={} pending_replies_equal={}",
+            "Swarm attention snapshot comparison: lifecycle_equal={} members_equal={} notifications_equal={} rounds_equal={} boards_equal={} revision_equal={} error_equal={} recovery_equal={} threads_equal={}",
             after_attention_supervision.lifecycle == before_attention_supervision.lifecycle,
             after_attention_supervision.members == before_attention_supervision.members,
             after_attention_supervision.notifications == before_attention_supervision.notifications,
@@ -10394,9 +10388,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             after_attention_supervision.error == before_attention_supervision.error,
             after_attention_supervision.recovery_requirement
                 == before_attention_supervision.recovery_requirement,
-            after_attention_supervision.threads == before_attention_supervision.threads,
-            after_attention_supervision.pending_replies
-                == before_attention_supervision.pending_replies
+            after_attention_supervision.threads == before_attention_supervision.threads
         );
     }
     assert!(
@@ -11029,14 +11021,9 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
     assert!(
         replied.author == SwarmAuthor::Human
             && replied.thread_seq == Some(6)
-            && matches!(
-                &replied.thread_change,
-                Some(protocol::SwarmThreadChange::Update {
-                    expected_seq: 5,
-                    ..
-                })
-            ),
-        "the server turns a human reply into an ordinary versioned update"
+            && replied.thread_change.is_none()
+            && !replied.result,
+        "a human reply commits immediately as an ordinary sequenced post"
     );
     let after_reply = scenario.snapshot(&swarm.id).await;
     let reply_thread = after_reply
@@ -11045,9 +11032,8 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         .find(|thread| thread.thread_id == human.thread_id)
         .expect("updated request");
     assert!(
-        reply_thread.summary == format!("Evidence verified; deploy pending\nHuman: {reply_body}")
-            && after_reply.pending_replies.is_empty(),
-        "the helper rewrites the summary to include the human's reply"
+        reply_thread.seq == 6 && reply_thread.summary == "Evidence verified; deploy pending",
+        "a human reply leaves the members' shared notes untouched"
     );
     let mut woken = after_reply
         .notifications
@@ -11066,45 +11052,60 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         woken == everyone,
         "a human Briefing reply wakes every member"
     );
-
-    let mut failing = publication(
-        SwarmBoard::Briefing,
-        "human-reply-retried",
-        vec![text("__mock_fail_swarm_helper_once__ and confirm the fix")],
+    swarm_tool_error(
+        &call_tool(
+            &second,
+            "tyde_swarm_update_thread",
+            update("missed-follow-up", 5, "replace", "Deploying now"),
+        )
+        .await,
+        SwarmErrorCode::Conflict,
     );
-    failing.thread_id = Some(human.thread_id.clone());
-    scenario
-        .send(SwarmCommandPayload::Post {
-            swarm_id: swarm.id.clone(),
-            post: human_post(failing.clone()),
-        })
-        .await;
-    let failed_attempt = scenario
-        .swarm(&swarm.id, |state| {
-            state.pending_replies.iter().any(|pending| {
-                pending.publication_id == failing.publication_id
-                    && pending.attempts == 1
-                    && pending.error.is_some()
-            })
-        })
-        .await;
+    let follow_up_delta: Value = tool_value(
+        &call_tool(
+            &second,
+            "tyde_swarm_read_deltas",
+            json!({"thread_id": human.thread_id, "after_seq": 5}),
+        )
+        .await,
+    );
     assert!(
-        failed_attempt
-            .threads
-            .iter()
-            .any(|thread| thread.thread_id == human.thread_id && thread.seq == 6),
-        "a failed summary rewrite commits nothing"
+        follow_up_delta["deltas"][0]["id"] == json!(replied.id),
+        "a member that missed the follow-up must read it before replacing the notes"
     );
-    let recovered: SwarmPostNotifyPayload = scenario
+
+    let mut answer = update("rollback-result", 6, "append", "Rollback verified");
+    answer["result"] = json!(true);
+    let answered: Value = tool_value(&call_tool(&second, "tyde_swarm_update_thread", answer).await);
+    assert!(
+        answered["post"]["result"] == true && answered["post"]["thread_seq"] == 7,
+        "a member marks the post that answers the human's follow-up as its result"
+    );
+    let result_post: SwarmPostNotifyPayload = scenario
         .wait(
             FrameKind::SwarmPostNotify,
-            "reply committed after helper retry",
-            |event: &SwarmPostNotifyPayload| event.post.publication_id == failing.publication_id,
+            "result reaches the client",
+            |event: &SwarmPostNotifyPayload| {
+                event.post.publication_id.0 == "rollback-result" && event.post.result
+            },
         )
         .await;
-    assert!(
-        recovered.post.thread_seq == Some(7),
-        "the server retries a failed rewrite without the human"
+    assert!(result_post.post.thread_id == human.thread_id);
+    swarm_tool_error(
+        &call_tool(
+            &first,
+            "tyde_swarm_update_thread",
+            json!({
+                "thread_id": child,
+                "expected_seq": 1,
+                "summary_change": {"kind": "append", "text": "Logs read"},
+                "publication_id": "coordination-result",
+                "body": [{"kind": "text", "text": "Logs are clean"}],
+                "result": true,
+            }),
+        )
+        .await,
+        SwarmErrorCode::Invalid,
     );
 
     let unnamed = scenario
@@ -11139,118 +11140,64 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         })
         .await;
 
-    let gate = scenario
-        .fixture
-        .install_swarm_reply_commit_test_gate()
-        .await;
-    let mut raced = publication(
-        SwarmBoard::Briefing,
-        "human-reply-raced",
-        vec![text("Ship only after the rollback test")],
-    );
-    raced.thread_id = Some(human.thread_id.clone());
-    scenario
-        .send(SwarmCommandPayload::Post {
-            swarm_id: swarm.id.clone(),
-            post: human_post(raced.clone()),
-        })
-        .await;
-    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
-        .await
-        .expect("helper prepared the reply against the current sequence");
-    let pending = scenario
-        .swarm(&swarm.id, |state| {
-            state
-                .pending_replies
-                .iter()
-                .any(|pending| pending.publication_id == raced.publication_id)
-        })
-        .await;
-    assert!(
-        pending
-            .threads
-            .iter()
-            .any(|thread| thread.thread_id == human.thread_id && thread.seq == 7),
-        "a held reply stays pending and changes nothing"
-    );
-    let agent_won: Value = tool_value(
-        &call_tool(
-            &second,
-            "tyde_swarm_update_thread",
-            update("agent-beats-human", 7, "replace", "Rollback test scheduled"),
-        )
-        .await,
-    );
-    assert!(agent_won["post"]["thread_seq"] == 8);
-    gate.release_one();
-    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
-        .await
-        .expect("a stale helper commit retries against the new sequence");
-    gate.release_one();
-    let reconciled: SwarmPostNotifyPayload = scenario
-        .wait(
-            FrameKind::SwarmPostNotify,
-            "raced reply committed",
-            |event: &SwarmPostNotifyPayload| event.post.publication_id == raced.publication_id,
-        )
-        .await;
-    assert!(
-        reconciled.post.thread_seq == Some(9)
-            && matches!(
-                &reconciled.post.thread_change,
-                Some(protocol::SwarmThreadChange::Update {
-                    expected_seq: 8,
-                    ..
-                })
-            ),
-        "the reply lands after the agent's update instead of overwriting it"
-    );
-    let raced_state = scenario.snapshot(&swarm.id).await;
-    assert!(
-        raced_state
-            .threads
-            .iter()
-            .any(|thread| thread.thread_id == human.thread_id
-                && thread.summary
-                    == "Rollback test scheduled\nHuman: Ship only after the rollback test"),
-        "the agent's state survives the human reply"
-    );
-
-    // Replies still queued when the host stops commit after restart, in order.
-    let held_gate = scenario
-        .fixture
-        .install_swarm_reply_commit_test_gate()
-        .await;
+    // Human replies are durable the moment they are acknowledged.
     let queued = ["human-reply-queued-one", "human-reply-queued-two"].map(|key| {
         let mut reply = publication(SwarmBoard::Briefing, key, vec![text(key)]);
         reply.thread_id = Some(human.thread_id.clone());
         reply
     });
     for reply in &queued {
-        scenario
-            .send(SwarmCommandPayload::Post {
-                swarm_id: swarm.id.clone(),
-                post: human_post(reply.clone()),
-            })
-            .await;
+        scenario.post(&swarm.id, reply.clone()).await;
     }
-    tokio::time::timeout(Duration::from_secs(5), held_gate.wait_until_entered())
-        .await
-        .expect("the first queued reply reaches its commit");
-    let held = scenario
-        .swarm(&swarm.id, |state| state.pending_replies.len() == 2)
-        .await;
-    assert!(
-        held.pending_replies
-            .iter()
-            .map(|pending| &pending.publication_id)
-            .eq(queued.iter().map(|reply| &reply.publication_id))
-            && held
-                .threads
-                .iter()
-                .any(|thread| thread.thread_id == human.thread_id && thread.seq == 9),
-        "queued replies wait in submission order without committing"
-    );
+
+    // Earlier versions held replies for a summary rewrite; a store that still
+    // holds one commits it verbatim on load.
+    let store_path = scenario.fixture.swarm_store_path();
+    let mut stored: Value =
+        serde_json::from_slice(&std::fs::read(&store_path).expect("read swarm store"))
+            .expect("parse swarm store");
+    let stored_swarm = stored["swarms"]
+        .as_array_mut()
+        .expect("stored swarms")
+        .iter_mut()
+        .find(|stored| stored["id"] == json!(swarm.id))
+        .expect("stored swarm");
+    let legacy_change = serde_json::to_value(protocol::SwarmThreadChange::Update {
+        expected_seq: 8,
+        summary: protocol::SwarmSummaryChange::Append {
+            text: "Human: queued two".to_owned(),
+        },
+    })
+    .expect("encode legacy summary rewrite");
+    stored_swarm["pending_replies"] = json!([{
+        "publication_id": "legacy-held-reply",
+        "thread_id": human.thread_id,
+        "body": [{"kind": "text", "text": "Held before the upgrade"}],
+        "attachments": [],
+        "images": [],
+        "attempts": 1,
+        "error": "Helper offline",
+    }]);
+    std::fs::write(
+        &store_path,
+        serde_json::to_vec(&stored).expect("encode swarm store"),
+    )
+    .expect("write swarm store with a legacy held reply");
+    // Replies committed before the upgrade carry the helper's rewrite.
+    let mut stored: Value =
+        serde_json::from_slice(&std::fs::read(&store_path).expect("read swarm store"))
+            .expect("parse swarm store");
+    stored["posts"]
+        .as_array_mut()
+        .expect("stored posts")
+        .iter_mut()
+        .find(|post| post["publication_id"] == json!(queued[1].publication_id))
+        .expect("stored queued reply")["thread_change"] = legacy_change;
+    std::fs::write(
+        &store_path,
+        serde_json::to_vec(&stored).expect("encode swarm store"),
+    )
+    .expect("write swarm store with a pre-upgrade reply");
 
     let restarted = scenario.fixture.restart_host().await;
     scenario.pending.clear();
@@ -11260,13 +11207,6 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         .find(|state| state.id == swarm.id)
         .expect("persisted swarm")
         .clone();
-    let restored = if restored.pending_replies.is_empty() {
-        restored
-    } else {
-        scenario
-            .swarm(&swarm.id, |state| state.pending_replies.is_empty())
-            .await
-    };
     let restored_request = restored
         .threads
         .iter()
@@ -11274,13 +11214,11 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         .expect("restored request");
     assert!(
         restored.threads.len() == 5
-            && restored_request.seq == 11
+            && restored_request.seq == 10
             && restored_request.child_seq == 2
             && restored_request.title == root_thread.title
-            && restored_request
-                .summary
-                .ends_with("Human: human-reply-queued-one\nHuman: human-reply-queued-two"),
-        "restart preserves summaries, names and every child thread, then commits queued replies in order"
+            && restored_request.summary == "Evidence verified; deploy pending\nRollback verified",
+        "restart preserves summaries, names and every child thread"
     );
     let committed = scenario
         .thread(
@@ -11292,15 +11230,62 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
             },
         )
         .await;
+    let legacy_id = SwarmPublicationId("legacy-held-reply".into());
     assert!(
-        committed.posts[committed.posts.len() - 2..]
+        committed.posts[committed.posts.len() - 3..]
             .iter()
             .map(|post| (&post.publication_id, post.thread_seq))
             .eq(queued
                 .iter()
                 .map(|reply| &reply.publication_id)
-                .zip([Some(10), Some(11)])),
-        "each queued reply commits exactly once after restart"
+                .chain([&legacy_id])
+                .zip([Some(8), Some(9), Some(10)])),
+        "each human reply survives restart exactly once, in order, and a legacy held reply commits after them"
+    );
+    assert!(
+        committed
+            .posts
+            .last()
+            .is_some_and(|post| post.author == SwarmAuthor::Human
+                && post.body == vec![text("Held before the upgrade")]),
+        "the legacy reply commits verbatim as the human's post"
+    );
+    let retried = scenario.post(&swarm.id, queued[1].clone()).await;
+    assert!(
+        retried.id == committed.posts[committed.posts.len() - 2].id
+            && retried.thread_seq == Some(9),
+        "retrying a reply committed before the upgrade returns the original post"
+    );
+
+    // A held reply that can no longer commit is never silently erased.
+    let mut stored: Value =
+        serde_json::from_slice(&std::fs::read(&store_path).expect("read swarm store"))
+            .expect("parse swarm store");
+    stored["swarms"]
+        .as_array_mut()
+        .expect("stored swarms")
+        .iter_mut()
+        .find(|stored| stored["id"] == json!(swarm.id))
+        .expect("stored swarm")["pending_replies"] = json!([{
+        "publication_id": "legacy-orphan-reply",
+        "thread_id": "thread-removed-before-upgrade",
+        "body": [{"kind": "text", "text": "Held for a missing thread"}],
+        "attachments": [],
+        "images": [],
+        "attempts": 3,
+        "error": "Helper offline",
+    }]);
+    let unrecoverable = serde_json::to_vec(&stored).expect("encode swarm store");
+    std::fs::write(&store_path, &unrecoverable).expect("write unrecoverable legacy reply");
+    let failed = scenario.fixture.restart_host().await;
+    assert!(
+        failed.swarms.is_empty(),
+        "an uncommittable held reply fails the store load"
+    );
+    assert_eq!(
+        std::fs::read(&store_path).expect("read swarm store"),
+        unrecoverable,
+        "the store keeps the held reply for recovery"
     );
 }
 

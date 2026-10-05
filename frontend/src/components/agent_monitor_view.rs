@@ -2710,8 +2710,8 @@ mod wasm_tests {
         AgentId, AgentManualTagAssignment, AgentManualTagDescriptor, AgentPinsSnapshot,
         AgentSortMode, AgentStatusFilter, AgentSystemTagAssignment, AgentSystemTagDescriptor,
         AgentSystemTagId, AgentsSmartViewsSnapshot, AgentsViewPreferences,
-        AgentsViewPreferencesSnapshot, BuiltInSmartViewId, ProjectPath, ProjectRootPath, SmartView,
-        SmartViewId, StreamPath, UserSmartViewId,
+        AgentsViewPreferencesSnapshot, BuiltInSmartViewId, SmartView, SmartViewId, StreamPath,
+        UserSmartViewId,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;

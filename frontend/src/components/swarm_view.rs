@@ -665,6 +665,10 @@ pub fn SwarmView(
             else {
                 return;
             };
+            // A linked agent reply may sit in a collapsed discussion group.
+            if let Ok(Some(group)) = element.closest("details") {
+                let _ = group.set_attribute("open", "");
+            }
             element.scroll_into_view();
             if let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() {
                 let _ = html.focus();
@@ -701,24 +705,27 @@ pub fn SwarmView(
             return ().into_any();
         };
         let lifecycle = current.lifecycle;
-        let members = current
+        let faces = current
             .members
             .iter()
             .filter(|member| member.state != SwarmMemberState::Retired)
-            .count();
-        let working = current
-            .members
-            .iter()
-            .filter(|member| member_is_working(member))
-            .count();
-        let idle = current
-            .members
-            .iter()
-            .filter(|member| {
-                member.state == SwarmMemberState::Live
-                    && member.runtime_status == Some(AgentControlStatus::Idle)
+            .map(|member| {
+                let label = format!("{} — {}", member.spec.name, member_status_label(member));
+                view! {
+                    <span
+                        class="swarm-avatar swarm-face"
+                        class:swarm-face-working=member_is_working(member)
+                        data-tone=member_status_tone(member)
+                        style=avatar_style(&member.spec.id.0)
+                        title=label.clone()
+                        aria-label=label
+                        role="img"
+                    >
+                        {initials(&member.spec.name)}
+                    </span>
+                }
             })
-            .count();
+            .collect_view();
         let project = projects_signal.with(|projects| {
             project_name(projects, &host.get_value(), &current.constraints.project_id)
         });
@@ -731,62 +738,67 @@ pub fn SwarmView(
             lifecycle,
             SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired
         );
-        let pausing = lifecycle == SwarmLifecycle::Pausing;
+        let preview_pending = current.change_preview.is_some();
         view! {
             <header class="swarm-header">
-                <div class="swarm-header-text">
-                    <h1 class="swarm-title">{current.name.clone()}</h1>
-                    <div class="swarm-subtitle">
-                        <span>{project}</span>
-                        <span class="swarm-dot-sep">"·"</span>
-                        <span
-                            class="swarm-scope-label"
-                            data-policy=match policy {
-                                SwarmWorkspacePolicy::ReadOnly => "read_only",
-                                SwarmWorkspacePolicy::SharedWorkbench { .. } => "shared_workbench",
-                                SwarmWorkspacePolicy::SharedProject { .. } => "shared_project",
-                                SwarmWorkspacePolicy::SharedHost { .. } => "shared_host",
-                            }
-                        >
-                            {workspace_policy_label(policy)}
-                        </span>
-                        <span class="swarm-dot-sep">"·"</span>
-                        <span>{format!("{members} agent{} · {working} working · {idle} idle", if members == 1 { "" } else { "s" })}</span>
-                    </div>
-                </div>
-                <div class="swarm-header-actions">
-                    <span class="swarm-lifecycle-pill" data-tone=lifecycle_tone(lifecycle)>
-                        {lifecycle_label(lifecycle)}
+                <h1 class="swarm-title">{current.name.clone()}</h1>
+                <span class="swarm-header-project">{project}</span>
+                {(policy != SwarmWorkspacePolicy::default()).then(|| view! {
+                    <span
+                        class="swarm-scope-label"
+                        data-policy=match policy {
+                            SwarmWorkspacePolicy::ReadOnly => "read_only",
+                            SwarmWorkspacePolicy::SharedWorkbench { .. } => "shared_workbench",
+                            SwarmWorkspacePolicy::SharedProject { .. } => "shared_project",
+                            SwarmWorkspacePolicy::SharedHost { .. } => "shared_host",
+                        }
+                    >
+                        {workspace_policy_label(policy)}
                     </span>
+                })}
+                <span class="swarm-faces" aria-label="Swarm agents">{faces}</span>
+                <span class="swarm-header-spacer"></span>
+                <span class="swarm-run-control" data-tone=lifecycle_tone(lifecycle)>
+                    {if lifecycle == SwarmLifecycle::Pausing {
+                        view! {
+                            <button
+                                class="swarm-lifecycle-pill"
+                                data-tone=lifecycle_tone(lifecycle)
+                                disabled=true
+                                title="Waiting for running turns to stop"
+                            >
+                                {lifecycle_label(lifecycle)}
+                            </button>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <span class="swarm-lifecycle-pill" data-tone=lifecycle_tone(lifecycle)>
+                                {lifecycle_label(lifecycle)}
+                            </span>
+                        }
+                        .into_any()
+                    }}
                     {can_pause.then(|| view! {
-                        <button
-                            class="swarm-btn"
-                            on:click=move |_| send(SwarmCommandPayload::Pause { swarm_id: sid.get_value() })
-                        >
+                        <button on:click=move |_| send(SwarmCommandPayload::Pause { swarm_id: sid.get_value() })>
                             "Pause"
                         </button>
                     })}
-                    {pausing.then(|| view! {
-                        <button class="swarm-btn" disabled=true title="Waiting for running turns to stop">
-                            "Pausing…"
-                        </button>
-                    })}
                     {can_resume.then(|| view! {
-                        <button
-                            class="swarm-btn swarm-btn-primary"
-                            on:click=move |_| send(SwarmCommandPayload::Resume { swarm_id: sid.get_value() })
-                        >
+                        <button on:click=move |_| send(SwarmCommandPayload::Resume { swarm_id: sid.get_value() })>
                             "Resume"
                         </button>
                     })}
-                    <button class="swarm-btn" on:click=move |_| manage_open.set(true)>
-                        {move || if swarm.with(|s| s.as_ref().is_some_and(|s| s.change_preview.is_some())) {
-                            "Manage • preview pending"
-                        } else {
-                            "Manage"
-                        }}
-                    </button>
-                </div>
+                </span>
+                <button
+                    class="swarm-icon-btn swarm-manage-btn"
+                    class:swarm-manage-pending=preview_pending
+                    aria-label=if preview_pending { "Manage • preview pending" } else { "Manage" }
+                    title=if preview_pending { "Manage swarm — change preview pending" } else { "Manage swarm" }
+                    on:click=move |_| manage_open.set(true)
+                >
+                    <span aria-hidden="true">"⚙"</span>
+                </button>
             </header>
         }
         .into_any()
@@ -1038,6 +1050,7 @@ pub fn SwarmView(
                 aria-selected=move || (tab.get() == target).to_string()
                 class:active=move || tab.get() == target
                 data-board=target.label()
+                aria-label=target.label()
                 on:click=move |_| tab.set(target)
                 on:keydown=on_keydown
             >
@@ -1045,15 +1058,11 @@ pub fn SwarmView(
                 {move || (unread() > 0).then(|| view! {
                     <span class="swarm-unread-badge" aria-label=format!("{} unread", unread())>{unread()}</span>
                 })}
+                {move || (target == SwarmTab::Agents).then(|| {
+                    let total = swarm.with(|s| s.as_ref().map(|s| s.members.iter().filter(|member| member.state != SwarmMemberState::Retired).count()).unwrap_or(0));
+                    view! { <span class="swarm-tab-count" aria-label=format!("{total} agents")>{total}</span> }
+                })}
             </button>
-        }
-    };
-
-    let board_hint = move || match tab.get() {
-        SwarmTab::Board(SwarmBoard::Briefing) => "Requests, questions, and results for the swarm.",
-        SwarmTab::Board(SwarmBoard::Coordination) => "Peer coordination and working discussion.",
-        SwarmTab::Agents => {
-            "Host-reported status. Open a conversation for tasks and tool activity."
         }
     };
 
@@ -1076,7 +1085,6 @@ pub fn SwarmView(
                     {view_tab(SwarmTab::Board(SwarmBoard::Briefing))}
                     {view_tab(SwarmTab::Board(SwarmBoard::Coordination))}
                     {view_tab(SwarmTab::Agents)}
-                    <span class="swarm-board-hint">{board_hint}</span>
                 </nav>
                 <div class="swarm-content" role="tabpanel" id=panel_id.get_value() aria-labelledby=move || tab_id(tab.get()) tabindex="0">
                 <div class="swarm-board-scroll" node_ref=scroll_ref hidden=move || board.get().is_none()>
@@ -1138,10 +1146,41 @@ pub fn SwarmView(
 struct ThreadHeader {
     parent: Option<(SwarmThreadId, String)>,
     title: Option<String>,
-    description: Option<String>,
     naming_error: Option<String>,
     summary: String,
     children: Vec<(SwarmThreadId, String)>,
+}
+
+/// A Briefing thread reads as the human's posts and the members' results,
+/// with the member discussion between them folded into one group.
+#[derive(Clone, Debug, PartialEq)]
+enum ThreadItem {
+    Post(Box<SwarmPost>),
+    AgentReplies(Vec<SwarmPost>),
+}
+
+impl ThreadItem {
+    fn key(&self) -> String {
+        match self {
+            Self::Post(post) => post.id.0.clone(),
+            Self::AgentReplies(posts) => format!("agent-replies-{}", posts[0].id.0),
+        }
+    }
+}
+
+fn thread_items(board: SwarmBoard, replies: &[SwarmPost]) -> Vec<ThreadItem> {
+    let mut items = Vec::new();
+    for post in replies {
+        let discussion = board == SwarmBoard::Briefing
+            && !post.result
+            && matches!(post.author, SwarmAuthor::Member { .. });
+        match items.last_mut() {
+            Some(ThreadItem::AgentReplies(group)) if discussion => group.push(post.clone()),
+            _ if discussion => items.push(ThreadItem::AgentReplies(vec![post.clone()])),
+            _ => items.push(ThreadItem::Post(Box::new(post.clone()))),
+        }
+    }
+    items
 }
 
 #[component]
@@ -1214,7 +1253,6 @@ fn SwarmThread(
             Some(ThreadHeader {
                 parent,
                 title: state.title.clone(),
-                description: state.description.clone(),
                 naming_error: state.naming_error.clone(),
                 summary: state.summary.clone(),
                 children: children
@@ -1224,20 +1262,12 @@ fn SwarmThread(
             })
         })
     });
-    let pending_replies = Memo::new(move |_| {
-        swarm.with(|swarm| {
-            swarm
-                .as_ref()
-                .map(|swarm| {
-                    swarm
-                        .pending_replies
-                        .iter()
-                        .filter(|reply| reply.thread_id == thread.get_value())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
+    let items = Memo::new(move |_| thread_posts.with(|(_, replies)| thread_items(board, replies)));
+    let quote: RwSignal<Option<SwarmPost>> = RwSignal::new(None);
+    let on_reply = Callback::new(move |()| reply_open.set(true));
+    let on_quote = Callback::new(move |post: SwarmPost| {
+        quote.set(Some(post));
+        reply_open.set(true);
     });
     let load_replies = move |_| {
         let after_cursor = thread_meta.get_untracked().map(|meta| meta.next_cursor);
@@ -1277,27 +1307,25 @@ fn SwarmThread(
                         Some(title) => view! { <h3 class="swarm-thread-title">{title}</h3> }.into_any(),
                         None => view! { <h3 class="swarm-thread-title swarm-thread-naming" role="status">"Naming…"</h3> }.into_any(),
                     }}
-                    {header.description.map(|description| view! { <p class="swarm-thread-description">{description}</p> })}
-                    {header.naming_error.map(|message| view! { <p class="swarm-thread-error" role="status">{format!("Naming failed, retrying: {message}")}</p> })}
-                    {(!header.summary.is_empty()).then(|| view! {
-                        <details class="swarm-thread-state" open>
-                            <summary>"Current state"</summary>
-                            <div class="swarm-thread-summary">{header.summary}</div>
-                        </details>
-                    })}
                     {(!header.children.is_empty()).then(|| view! {
                         <nav class="swarm-thread-children" aria-label="Coordination threads">
-                            <span class="swarm-thread-children-label">{format!("Coordination · {}", header.children.len())}</span>
                             {header.children.into_iter().map(|(child_id, child_title)| view! {
-                                <button class="swarm-link-btn" on:click=move |_| on_link.run(SwarmPostId(child_id.0.clone()))>{child_title}</button>
+                                <button class="swarm-thread-chip" on:click=move |_| on_link.run(SwarmPostId(child_id.0.clone()))>{format!("↳ Coordination: {child_title}")}</button>
                             }).collect_view()}
                         </nav>
                     })}
+                    {(!header.summary.is_empty()).then(|| view! {
+                        <details class="swarm-thread-state">
+                            <summary>"Agent notes"</summary>
+                            <div class="swarm-thread-summary">{header.summary}</div>
+                        </details>
+                    })}
+                    {header.naming_error.map(|message| view! { <p class="swarm-thread-error" role="status">{format!("Naming failed, retrying: {message}")}</p> })}
                 </div>
             })}
             {move || match thread_posts.with(|(root, _)| root.clone()) {
                 Some(root) => view! {
-                    <SwarmPostCard host=host post=root swarm=swarm on_link=on_link />
+                    <SwarmPostCard host=host post=root swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
                 }.into_any(),
                 None => view! {
                     <div class="swarm-thread-orphan">"Reply to an earlier post"</div>
@@ -1305,41 +1333,58 @@ fn SwarmThread(
             }}
             <div class="swarm-replies">
                 <For
-                    each=move || thread_posts.with(|(_, replies)| replies.clone())
-                    key=|post| post.id.clone()
-                    let:post
+                    each=move || items.get()
+                    key=|item| item.key()
+                    let:item
                 >
-                    <SwarmPostCard host=host post=post swarm=swarm on_link=on_link />
+                    {match item {
+                        ThreadItem::Post(post) => view! {
+                            <SwarmPostCard host=host post=*post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
+                        }.into_any(),
+                        ThreadItem::AgentReplies(posts) => {
+                            let key = ThreadItem::AgentReplies(posts).key();
+                            let group = Memo::new(move |_| items.with(|items| items.iter().find_map(|item| match item {
+                                ThreadItem::AgentReplies(posts) if item.key() == key => Some(posts.clone()),
+                                _ => None,
+                            }).unwrap_or_default()));
+                            view! {
+                                <details class="swarm-agent-replies">
+                                    <summary>
+                                        <span class="swarm-faces swarm-faces-sm" aria-hidden="true">
+                                            {move || swarm.with(|swarm| {
+                                                let mut authors: Vec<SwarmMemberId> = Vec::new();
+                                                for post in group.get() {
+                                                    if let SwarmAuthor::Member { member_id } = post.author
+                                                        && !authors.contains(&member_id)
+                                                    {
+                                                        authors.push(member_id);
+                                                    }
+                                                }
+                                                authors.into_iter().map(|member_id| {
+                                                    let name = member_name(swarm.as_ref(), &member_id);
+                                                    view! { <span class="swarm-avatar swarm-face" style=avatar_style(&member_id.0)>{initials(&name)}</span> }
+                                                }).collect_view()
+                                            })}
+                                        </span>
+                                        <span>{move || {
+                                            let count = group.with(Vec::len);
+                                            format!("{count} agent repl{}", if count == 1 { "y" } else { "ies" })
+                                        }}</span>
+                                    </summary>
+                                    <For each=move || group.get() key=|post| post.id.clone() let:post>
+                                        <SwarmPostCard host=host post=post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
+                                    </For>
+                                </details>
+                            }.into_any()
+                        }
+                    }}
                 </For>
-                {move || pending_replies.get().into_iter().map(|reply| {
-                    let body = swarm.with(|swarm| posts_signal.with(|map| {
-                        let empty = HashMap::new();
-                        let posts = map.get(&(host.get_value(), sid.get_value())).map(|posts| &posts.posts).unwrap_or(&empty);
-                        render_body(&reply.body, swarm.as_ref(), posts)
-                    }));
-                    view! {
-                        <div class="swarm-pending-reply" data-publication-id=reply.publication_id.0.clone()>
-                            <div class="swarm-post-body chat-card-body" inner_html=body></div>
-                            <SwarmAttachments host=host attachments=reply.attachments />
-                            <div class="swarm-image-gallery">
-                                {reply.images.into_iter().map(|image| view! {
-                                    <SwarmSharedImage host=host swarm_id=sid.get_value() image=image />
-                                }).collect_view()}
-                            </div>
-                            <span class="swarm-pending-status" role="status">"posting…"</span>
-                            {reply.error.map(|message| view! { <span class="swarm-composer-error" role="status">{format!("Summary update failed, retrying: {message}")}</span> })}
-                        </div>
-                    }
-                }).collect_view()}
             </div>
-            <div class="swarm-thread-actions">
-                <Show when=move || !reply_open.get()>
-                    <button class="swarm-link-btn" on:click=move |_| reply_open.set(true)>"Reply"</button>
-                </Show>
-                <Show when=show_load>
+            <Show when=show_load>
+                <div class="swarm-thread-actions">
                     <button class="swarm-link-btn" on:click=load_replies>{load_label}</button>
-                </Show>
-            </div>
+                </div>
+            </Show>
             <Show when=move || reply_open.get()>
                 <div class="swarm-reply-composer">
                     <SwarmComposer
@@ -1349,6 +1394,7 @@ fn SwarmThread(
                         board=Signal::derive(move || board)
                         thread_id=Some(thread.get_value())
                         on_cancel=Callback::new(move |_| reply_open.set(false))
+                        quote=quote
                     />
                 </div>
             </Show>
@@ -1362,6 +1408,8 @@ fn SwarmPostCard(
     post: SwarmPost,
     swarm: Memo<Option<Swarm>>,
     on_link: Callback<SwarmPostId>,
+    on_reply: Callback<()>,
+    on_quote: Callback<SwarmPost>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let posts_signal = state.swarm_posts;
@@ -1371,22 +1419,6 @@ fn SwarmPostCard(
 
     let author = move || {
         swarm.with(|swarm| post.with_value(|post| author_name(swarm.as_ref(), &post.author)))
-    };
-    let author_meta = move || {
-        swarm.with(|swarm| {
-            post.with_value(|post| match &post.author {
-                SwarmAuthor::Human => None,
-                SwarmAuthor::Member { member_id } => swarm
-                    .as_ref()
-                    .and_then(|swarm| {
-                        swarm
-                            .members
-                            .iter()
-                            .find(|member| &member.spec.id == member_id)
-                    })
-                    .map(|member| backend_name(member.spec.backend_kind)),
-            })
-        })
     };
     let avatar_key = post.with_value(|post| match &post.author {
         SwarmAuthor::Human => "human".to_owned(),
@@ -1469,11 +1501,12 @@ fn SwarmPostCard(
             return ().into_any();
         };
         let mut groups: Vec<DeliveryGroup> = Vec::new();
-        for notification in current
-            .notifications
-            .iter()
-            .filter(|notification| notification.post_ids.contains(&post_id))
-        {
+        // Accepted deliveries are the normal case; only outstanding or
+        // problem deliveries need the human's attention.
+        for notification in current.notifications.iter().filter(|notification| {
+            notification.post_ids.contains(&post_id)
+                && notification.state != SwarmDeliveryState::Accepted
+        }) {
             let name = member_name(Some(&current), &notification.member_id);
             let entry = (
                 notification.member_id.clone(),
@@ -1548,11 +1581,13 @@ fn SwarmPostCard(
         view! { <div class="swarm-delivery">{rows}</div> }.into_any()
     };
 
-    let (post_id, created_at_ms) = post.with_value(|post| (post.id.0.clone(), post.created_at_ms));
+    let (post_id, created_at_ms, is_result) =
+        post.with_value(|post| (post.id.0.clone(), post.created_at_ms, post.result));
     view! {
         <article
             class="swarm-post"
             class:swarm-post-human=is_human
+            class:swarm-post-result=is_result
             id=format!("swarm-post-{post_id}")
             data-post-id=post_id
             tabindex="-1"
@@ -1562,9 +1597,13 @@ fn SwarmPostCard(
             </span>
             <div class="swarm-post-main">
                 <header class="swarm-post-meta">
+                    {is_result.then(|| view! { <span class="swarm-result-label">"✓ Result"</span> })}
                     <span class="swarm-post-author">{author}</span>
-                    {move || author_meta().map(|meta| view! { <span class="swarm-post-backend">{meta}</span> })}
                     <time class="swarm-post-time">{format_time(created_at_ms)}</time>
+                    <span class="swarm-post-actions">
+                        <button class="swarm-post-action" on:click=move |_| on_reply.run(())>"Reply"</button>
+                        <button class="swarm-post-action" title="Link this post in a reply" on:click=move |_| on_quote.run(post.get_value())>"Link"</button>
+                    </span>
                 </header>
                 <div class="swarm-post-body chat-card-body" on:click=on_body_click on:keydown=on_body_keydown inner_html=body_html></div>
                 <SwarmAttachments host=host attachments=post.with_value(|post| post.attachments.clone()) />
@@ -1838,6 +1877,10 @@ fn SwarmComposer(
     board: Signal<SwarmBoard>,
     thread_id: Option<SwarmThreadId>,
     #[prop(optional)] on_cancel: Option<Callback<()>>,
+    /// A post the human asked to link from the thread; the composer inserts
+    /// the link and clears the request.
+    #[prop(optional)]
+    quote: Option<RwSignal<Option<SwarmPost>>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let posts_signal = state.swarm_posts;
@@ -2128,13 +2171,6 @@ fn SwarmComposer(
         let published = posts_signal.with(|map| {
             map.get(&(host.get_value(), waiting.swarm_id.clone()))
                 .is_some_and(|posts| posts.posts.values().any(|post| &post.publication_id == id))
-        }) || swarm.with(|swarm| {
-            swarm.as_ref().is_some_and(|swarm| {
-                swarm
-                    .pending_replies
-                    .iter()
-                    .any(|reply| &reply.publication_id == id)
-            })
         });
         if published {
             clear_publication_errors(&waiting.post.publication_id);
@@ -2411,9 +2447,15 @@ fn SwarmComposer(
         link_open.set(false);
     };
 
-    let routing_preview = move || {
+    // Who a post will notify. The full list is the Post button's tooltip;
+    // the composer only spells it out when something needs the human's eye.
+    let routing = Memo::new(move |_| {
         let Some(current) = swarm.get() else {
-            return view! { <p class="swarm-routing-preview" role="status">"Notification preview unavailable: swarm state is missing."</p> }.into_any();
+            return (
+                "Notification preview unavailable: swarm state is missing.".to_owned(),
+                None,
+                true,
+            );
         };
         let waiting = pending.get();
         let target_board = waiting
@@ -2426,7 +2468,11 @@ fn SwarmComposer(
             .unwrap_or_else(|| compose_segments(&text.get(), &references.get()));
         let root_author = reply_root_author.get();
         if is_reply && root_author.is_none() {
-            return view! { <p class="swarm-routing-preview" role="status">"Notification preview unavailable until the thread root is loaded."</p> }.into_any();
+            return (
+                "Notification preview unavailable until the thread root is loaded.".to_owned(),
+                None,
+                true,
+            );
         }
         let recipients = protocol::swarm_publication_recipients(
             &current,
@@ -2436,8 +2482,13 @@ fn SwarmComposer(
             &body,
         );
         if recipients.is_empty() {
-            return view! { <p class="swarm-routing-preview" role="status">"Shared context only — no members notified."</p> }.into_any();
+            return (
+                "Shared context only — no members notified.".to_owned(),
+                None,
+                true,
+            );
         }
+        let mut problem = false;
         let labels = recipients
             .into_iter()
             .map(|member_id| {
@@ -2450,11 +2501,14 @@ fn SwarmComposer(
                     Some((index, member)) => match member.state {
                         SwarmMemberState::Retired
                         | SwarmMemberState::Retiring
-                        | SwarmMemberState::RetiringReserved => format!(
-                            "{} — undeliverable ({})",
-                            recipient_name(&current, member, index + 1),
-                            member_status_label(member).to_lowercase()
-                        ),
+                        | SwarmMemberState::RetiringReserved => {
+                            problem = true;
+                            format!(
+                                "{} — undeliverable ({})",
+                                recipient_name(&current, member, index + 1),
+                                member_status_label(member).to_lowercase()
+                            )
+                        }
                         SwarmMemberState::Proposed
                         | SwarmMemberState::Dormant
                         | SwarmMemberState::Reserved
@@ -2465,7 +2519,10 @@ fn SwarmComposer(
                             member_status_label(member).to_lowercase()
                         ),
                     },
-                    None => "Unknown recipient — delivery preview unavailable".to_owned(),
+                    None => {
+                        problem = true;
+                        "Unknown recipient — delivery preview unavailable".to_owned()
+                    }
                 }
             })
             .collect::<Vec<_>>()
@@ -2478,18 +2535,35 @@ fn SwarmComposer(
             }
             SwarmLifecycle::Running | SwarmLifecycle::Transitioning => None,
         };
-        view! {
+        (
+            format!("Notification recipients: {labels}."),
+            lifecycle_note,
+            problem || lifecycle_note.is_some(),
+        )
+    });
+    let routing_preview =
+        move || {
+            let (summary, note, problem) = routing.get();
+            problem.then(|| view! {
             <div class="swarm-routing-preview" role="status">
-                <span>{format!("Notification recipients: {labels}.")}</span>
-                <details class="swarm-routing-about">
-                    <summary aria-label="About notifications" title="About notifications"><span aria-hidden="true">"ⓘ"</span></summary>
-                    <span class="swarm-routing-note">"Notification is not confirmation of delivery or execution."</span>
-                </details>
-                {lifecycle_note.map(|note| view! { <span class="swarm-routing-warning">{note}</span> })}
+                <span>{summary}</span>
+                {note.map(|note| view! { <span class="swarm-routing-warning">{note}</span> })}
             </div>
-        }
-        .into_any()
-    };
+        })
+        };
+
+    if let Some(quote) = quote {
+        Effect::new(move |_| {
+            let Some(post) = quote.get() else {
+                return;
+            };
+            if textarea_ref.get().is_none() || pending.get().is_some() {
+                return;
+            }
+            quote.set(None);
+            insert_post_link(post);
+        });
+    }
 
     let attachable = Memo::new(move |_| {
         let host_id = host.get_value();
@@ -2510,9 +2584,9 @@ fn SwarmComposer(
 
     let placeholder = move || {
         if is_reply {
-            "Reply in thread…".to_owned()
+            "Reply… (@ to mention)"
         } else {
-            format!("Post to {}…", board_label(board.get()))
+            "Message the swarm… (@ to mention)"
         }
     };
 
@@ -2662,17 +2736,19 @@ fn SwarmComposer(
                         }
                     } />
                     <Show when=move || pending.get().is_none()>
-                        <button class="swarm-btn swarm-btn-quiet" title="Add images, paste screenshots, or drop multiple images here" disabled={move || reading_images.get() || images.with(Vec::len) + attachments.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS} on:click=move |_| { if let Some(input) = image_input_ref.get_untracked() { input.click(); } }>"Add images"</button>
+                        <button class="swarm-icon-btn" aria-label="Add images" title="Add images, paste screenshots, or drop multiple images here" disabled={move || reading_images.get() || images.with(Vec::len) + attachments.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS} on:click=move |_| { if let Some(input) = image_input_ref.get_untracked() { input.click(); } }><span aria-hidden="true">"🖼"</span></button>
                     </Show>
                     <Show when=move || pending.get().is_none()>
                         <div class="swarm-attach-wrap">
                             <button
-                                class="swarm-btn swarm-btn-quiet"
+                                class="swarm-icon-btn"
+                                aria-label="Link a post"
+                                title="Link a post"
                                 aria-haspopup="true"
                                 aria-expanded=move || link_open.get().to_string()
                                 on:click=move |_| link_open.update(|open| *open = !*open)
                             >
-                                "Link a post"
+                                <span aria-hidden="true">"🔗"</span>
                             </button>
                             <Show when=move || link_open.get()>
                                 <ul class="swarm-attach-menu swarm-link-menu" aria-label="Choose a post to link">
@@ -2694,15 +2770,19 @@ fn SwarmComposer(
                     <Show when=move || pending.get().is_none() && !attachable.with(|files| files.is_empty())>
                         <div class="swarm-attach-wrap">
                             <button
-                                class="swarm-btn swarm-btn-quiet"
+                                class="swarm-icon-btn"
+                                aria-label="Attach open file"
                                 aria-haspopup="listbox"
                                 aria-expanded=move || attach_open.get().to_string()
                                 disabled={move || attachments.with(Vec::len) + images.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS}
-                                title=move || (attachments.with(Vec::len) + images.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS)
-                                    .then(|| format!("A post can carry at most {} attachments", protocol::SWARM_MAX_ATTACHMENTS))
+                                title=move || { if attachments.with(Vec::len) + images.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS {
+                                    format!("A post can carry at most {} attachments", protocol::SWARM_MAX_ATTACHMENTS)
+                                } else {
+                                    "Attach open file".to_owned()
+                                } }
                                 on:click=move |_| attach_open.update(|open| *open = !*open)
                             >
-                                "Attach open file"
+                                <span aria-hidden="true">"📄"</span>
                             </button>
                             <Show when=move || attach_open.get()>
                                 <ul class="swarm-attach-menu" role="listbox">
@@ -2730,12 +2810,6 @@ fn SwarmComposer(
                     </Show>
                 </div>
                 <div class="swarm-composer-buttons">
-                    <span class="swarm-composer-help">
-                        <span><kbd>"Enter"</kbd>" to post"</span>
-                        <span><kbd>"Shift+Enter"</kbd>" newline"</span>
-                        <span><kbd>"@"</kbd>" mention"</span>
-                        {is_reply.then(|| view! { <span><kbd>"Esc"</kbd>" close"</span> })}
-                    </span>
                     {move || pending.get().map(|waiting| {
                         let retry = waiting.clone();
                         view! {
@@ -2762,6 +2836,7 @@ fn SwarmComposer(
                     })}
                     <button
                         class="swarm-btn swarm-btn-primary swarm-composer-send"
+                        title=move || routing.with(|(summary, _, _)| summary.clone())
                         disabled=move || pending.get().is_some() || !routing_available.get() || !images_ready.get() || (text.with(|t| t.trim().is_empty()) && images.with(Vec::is_empty))
                         on:click=move |_| submit()
                     >
@@ -3084,7 +3159,6 @@ pub(crate) mod wasm_tests {
             },
             lifecycle: SwarmLifecycle::Running,
             members,
-            pending_replies: Vec::new(),
             board_positions: [SwarmBoard::Briefing, SwarmBoard::Coordination]
                 .into_iter()
                 .map(|board| SwarmBoardPosition {
@@ -3126,6 +3200,7 @@ pub(crate) mod wasm_tests {
         SwarmPost {
             thread_change: None,
             thread_seq: None,
+            result: false,
             images: Vec::new(),
             id: SwarmPostId(id.to_owned()),
             swarm_id: SwarmId(swarm_id.to_owned()),
@@ -3228,17 +3303,44 @@ pub(crate) mod wasm_tests {
         element.text_content().unwrap_or_default()
     }
 
+    /// A button matches by its visible text or, for icon buttons, by the
+    /// aria-label a screen reader announces.
+    fn button_named(button: &HtmlElement, label: &str) -> bool {
+        text_of(button).trim() == label
+            || button.get_attribute("aria-label").as_deref() == Some(label)
+    }
+
     pub(crate) fn button(root: &web_sys::Element, label: &str) -> HtmlElement {
         all(root, "button")
             .into_iter()
-            .find(|button| text_of(button).trim() == label)
+            .find(|button| button_named(button, label))
             .unwrap_or_else(|| panic!("button {label:?} not rendered; text: {}", text_of(root)))
+    }
+
+    /// The header's member faces as (announced label, working ring shown).
+    pub(crate) fn header_faces(root: &web_sys::Element) -> Vec<(String, bool)> {
+        all(root, ".swarm-header .swarm-face")
+            .iter()
+            .map(|face| {
+                (
+                    face.get_attribute("aria-label").unwrap_or_default(),
+                    face.class_list().contains("swarm-face-working"),
+                )
+            })
+            .collect()
+    }
+
+    fn faces(expected: &[(&str, bool)]) -> Vec<(String, bool)> {
+        expected
+            .iter()
+            .map(|(label, working)| ((*label).to_owned(), *working))
+            .collect()
     }
 
     pub(crate) fn has_button(root: &web_sys::Element, label: &str) -> bool {
         all(root, "button")
             .iter()
-            .any(|button| text_of(button).trim() == label)
+            .any(|button| button_named(button, label))
     }
 
     /// Replace a text control's value with the caret at the end, as typing does.
@@ -3376,16 +3478,22 @@ pub(crate) mod wasm_tests {
         );
         let view = one(&container, ".swarm-view");
         assert_eq!(text_of(&one(&view, ".swarm-title")), "Release crew");
-        assert_eq!(
-            text_of(&one(&view, ".swarm-scope-label")),
-            "Read-only project access"
-        );
+        // The default read-only scope needs no badge; only a widened scope
+        // (which the user must notice) renders one.
+        assert!(all(&view, ".swarm-scope-label").is_empty());
         let reads = harness.commands_of("read_board");
         assert_eq!(reads.len(), 1, "first page requested once: {reads:?}");
         assert_eq!(reads[0]["query"]["board"], "briefing");
         assert_eq!(reads[0]["query"]["after_cursor"], Value::Null);
 
-        assert!(text_of(&one(&view, ".swarm-subtitle")).contains("3 agents · 0 working · 1 idle"));
+        assert_eq!(
+            header_faces(&view),
+            faces(&[
+                ("Ada — Idle", false),
+                ("Bo — Status unavailable", false),
+                ("Cy — Ready to chat", false),
+            ])
+        );
         assert!(
             all(&view, ".swarm-member-chip")
                 .iter()
@@ -3439,7 +3547,14 @@ pub(crate) mod wasm_tests {
         live_update.members[1].spec.focus = Some("Review layout and accessibility".to_owned());
         harness.swarm(&live_update);
         settle().await;
-        assert!(text_of(&one(&view, ".swarm-subtitle")).contains("3 agents · 1 working · 1 idle"));
+        assert_eq!(
+            header_faces(&view),
+            faces(&[
+                ("Ada — Idle", false),
+                ("Bo — Working", true),
+                ("Cy — Ready to chat", false),
+            ])
+        );
         let bo = all(&view, ".swarm-member-chip")
             .into_iter()
             .find(|row| text_of(&one(row, ".swarm-member-chip-name")) == "Bo")
@@ -3467,7 +3582,14 @@ pub(crate) mod wasm_tests {
             text_of(&one(&bo, ".swarm-member-chip-status")),
             "Needs your answer"
         );
-        assert!(text_of(&one(&view, ".swarm-subtitle")).contains("3 agents · 0 working · 1 idle"));
+        assert_eq!(
+            header_faces(&view),
+            faces(&[
+                ("Ada — Idle", false),
+                ("Bo — Needs your answer", false),
+                ("Cy — Ready to chat", false),
+            ])
+        );
         live_update.revision += 1;
         live_update.members[1].runtime_status = Some(AgentControlStatus::Failed);
         live_update.members[1].error = Some("Host could not start this turn".to_owned());
@@ -3601,8 +3723,13 @@ pub(crate) mod wasm_tests {
 
         one(&container, ".swarm-card-open").click();
         settle().await;
-        assert!(
-            text_of(&one(&container, ".swarm-subtitle")).contains("3 agents · 0 working · 1 idle")
+        assert_eq!(
+            header_faces(&container),
+            faces(&[
+                ("Ada — Idle", false),
+                ("Bo — Status unavailable", false),
+                ("Cy — Ready to chat", false),
+            ])
         );
         assert_eq!(
             text_of(&one(&container, ".swarm-card-meta")),
@@ -3657,9 +3784,7 @@ pub(crate) mod wasm_tests {
         settle().await;
         // The live one-member UI displayed "1 members"; canonical counts must
         // stay unchanged while all three visible labels react to singular wording.
-        assert!(
-            text_of(&one(&container, ".swarm-subtitle")).contains("1 agent · 0 working · 1 idle")
-        );
+        assert_eq!(header_faces(&container), faces(&[("Ada — Idle", false)]));
         assert_eq!(
             text_of(&one(&container, ".swarm-card-meta")),
             "1 member · 0 working"
@@ -3875,9 +4000,15 @@ pub(crate) mod wasm_tests {
         // protocol::swarm_publication_recipients wakes every active member
         // for an unmentioned human reply on a human Briefing request.
         assert!(
-            text_of(&one(&composer, ".swarm-routing-preview"))
+            one(&composer, ".swarm-composer-send")
+                .get_attribute("title")
+                .unwrap_or_default()
                 .starts_with("Notification recipients: Ada (idle), Bo (idle)."),
             "a reply to a human request previews the whole-swarm wake the host will send"
+        );
+        assert!(
+            all(&composer, ".swarm-routing-preview").is_empty(),
+            "deliverable routing stays out of the reply composer body"
         );
         draft_input.focus().unwrap();
         type_into(&draft_input, "Draft @B");
@@ -4275,9 +4406,15 @@ pub(crate) mod wasm_tests {
             "root arrival changes only the preview, not editor identity"
         );
         assert!(
-            text_of(&one(&orphan_composer, ".swarm-routing-preview"))
+            one(&orphan_composer, ".swarm-composer-send")
+                .get_attribute("title")
+                .unwrap_or_default()
                 .starts_with("Notification recipients: Ada (idle), Bo (idle)."),
             "reply preview combines the real root author with the selected member"
+        );
+        assert!(
+            all(&orphan_composer, ".swarm-routing-preview").is_empty(),
+            "the unavailable-preview warning clears once the root arrives"
         );
         assert!(
             !one(&orphan_composer, ".swarm-composer-send")
@@ -4316,34 +4453,33 @@ pub(crate) mod wasm_tests {
 
         let input = one(&container, ".swarm-root-composer:not([hidden]) textarea");
         let root_composer = one(&container, ".swarm-root-composer:not([hidden])");
-        let notification_preview = || text_of(&one(&root_composer, ".swarm-routing-preview"));
+        // Who a post notifies is always one hover away on Post; the composer
+        // only spells it out when routing needs attention.
+        let notification_preview = || {
+            one(&root_composer, ".swarm-composer-send")
+                .get_attribute("title")
+                .unwrap_or_default()
+        };
+        let routing_line = || {
+            all(&root_composer, ".swarm-routing-preview")
+                .first()
+                .map(|line| text_of(line))
+                .unwrap_or_default()
+        };
         assert!(
             notification_preview()
                 .starts_with("Notification recipients: Ada (idle), Alan (idle), Bo (idle)."),
             "Briefing without selected mentions previews the canonical broadcast recipients"
         );
         assert_eq!(
+            routing_line(),
+            "",
+            "healthy routing does not add a permanent line under the composer"
+        );
+        assert_eq!(
             input.get_attribute("placeholder").as_deref(),
-            Some("Post to Briefing…")
+            Some("Message the swarm… (@ to mention)")
         );
-        assert!(
-            text_of(&root_composer).contains("Shift+Enter"),
-            "keyboard help is available outside the placeholder"
-        );
-        let about = one(&root_composer, "summary[aria-label='About notifications']");
-        let details = about.parent_element().unwrap();
-        assert!(
-            !details.has_attribute("open"),
-            "the delivery disclaimer is disclosed on demand, not a permanent second line"
-        );
-        about.click();
-        settle().await;
-        let note = one(&root_composer, ".swarm-routing-note");
-        assert!(note.get_bounding_client_rect().height() > 0.0);
-        assert!(
-            text_of(&note).contains("Notification is not confirmation of delivery or execution.")
-        );
-        about.click();
         input.focus().unwrap();
         settle().await;
         let input_style = web_sys::window()
@@ -4520,7 +4656,8 @@ pub(crate) mod wasm_tests {
             "Needs attention"
         );
         assert!(
-            notification_preview().contains("Needs attention; posting does not resume delivery.")
+            routing_line().contains("Needs attention; posting does not resume delivery."),
+            "a stalled swarm surfaces its routing consequence in the composer"
         );
         assert!(
             has_button(&container, "Resume"),
@@ -4643,8 +4780,7 @@ pub(crate) mod wasm_tests {
         harness.swarm(&same_names);
         settle().await;
         assert!(
-            notification_preview()
-                .starts_with("Notification recipients: Nova — undeliverable (retiring)."),
+            routing_line().starts_with("Notification recipients: Nova — undeliverable (retiring)."),
             "selected retiring reference remains an undeliverable recipient, not a replacement"
         );
         same_names.members[1].state = SwarmMemberState::Retired;
@@ -4654,10 +4790,9 @@ pub(crate) mod wasm_tests {
         harness.swarm(&same_names);
         settle().await;
         assert!(
-            notification_preview()
-                .starts_with("Notification recipients: Nova — undeliverable (retired).")
+            routing_line().starts_with("Notification recipients: Nova — undeliverable (retired).")
         );
-        assert!(notification_preview().contains("Paused; posting does not resume delivery."));
+        assert!(routing_line().contains("Paused; posting does not resume delivery."));
         assert!(
             one(&root_composer, ".swarm-routing-warning")
                 .get_bounding_client_rect()
@@ -5425,7 +5560,9 @@ pub(crate) mod wasm_tests {
         input.focus().unwrap();
         type_into(&input, "See  for context");
         settle().await;
-        let routing = text_of(&one(&composer, ".swarm-routing-preview"));
+        let routing = one(&composer, ".swarm-composer-send")
+            .get_attribute("title")
+            .unwrap_or_default();
         assert!(
             routing.starts_with("Notification recipients: Ada"),
             "a human reply notifies the member who opened the thread: {routing}"
@@ -5459,7 +5596,9 @@ pub(crate) mod wasm_tests {
             "post link insertion returns focus to the editor"
         );
         assert_eq!(
-            text_of(&one(&composer, ".swarm-routing-preview")),
+            one(&composer, ".swarm-composer-send")
+                .get_attribute("title")
+                .unwrap_or_default(),
             routing,
             "post links do not become mentions or notify linked authors"
         );
@@ -5642,7 +5781,7 @@ pub(crate) mod wasm_tests {
         );
     }
     #[wasm_bindgen_test]
-    async fn human_threads_show_naming_links_and_pending_replies_from_server_state() {
+    async fn human_threads_show_naming_links_results_and_collapsed_agent_replies() {
         let harness = Harness::new("host-stateful-thread");
         let sid = "stateful-thread";
         let mut swarm = make_swarm(sid, "Stateful", vec![idle("ada", "Ada")]);
@@ -5722,9 +5861,20 @@ pub(crate) mod wasm_tests {
             text_of(&one(&head, ".swarm-thread-summary")),
             "Audit in progress"
         );
-        let children = one(&head, ".swarm-thread-children");
-        assert!(text_of(&children).contains("Coordination · 1"));
-        assert_eq!(text_of(&button(&children, "Build logs")), "Build logs");
+        let notes = one(&head, "details");
+        assert!(
+            text_of(&one(&notes, "summary")) == "Agent notes" && !notes.has_attribute("open"),
+            "the agents' working notes stay collapsed under the title"
+        );
+        assert!(
+            !text_of(&container).contains("A human request"),
+            "the generated thread description is not shown"
+        );
+        assert!(
+            has_button(&head, "↳ Coordination: Build logs"),
+            "the coordination thread is a chip beside the title: {}",
+            text_of(&head)
+        );
         assert!(
             !text_of(&container).contains("sequence"),
             "internal sequence numbers are not shown"
@@ -5744,7 +5894,6 @@ pub(crate) mod wasm_tests {
         settle().await;
         let composer = one(&thread_card, ".swarm-composer-reply");
         let input = one(&composer, ".swarm-composer-input");
-        let textarea = input.dyn_ref::<web_sys::HtmlTextAreaElement>().unwrap();
         type_into(&input, "Verified in the running instance");
         settle().await;
         button(&composer, "Reply").click();
@@ -5759,62 +5908,6 @@ pub(crate) mod wasm_tests {
         );
         let publication_id =
             SwarmPublicationId(command["publication_id"].as_str().unwrap().to_owned());
-        swarm.pending_replies.push(protocol::SwarmPendingReply {
-            publication_id: publication_id.clone(),
-            thread_id: SwarmThreadId("human-root".into()),
-            body: vec![text("Verified in the running instance")],
-            attachments: vec![protocol::SwarmAttachment {
-                project_id: protocol::ProjectId("project-1".into()),
-                path: protocol::ProjectPath {
-                    root: protocol::ProjectRootPath("/tmp/swarm-view".to_owned()),
-                    relative_path: "logs/render.txt".to_owned(),
-                },
-            }],
-            images: vec![protocol::SwarmImage {
-                id: protocol::SwarmImageId("pending-image".into()),
-                name: "render.png".into(),
-                media_type: "image/png".into(),
-                width: 16,
-                height: 12,
-                byte_len: 78,
-            }],
-            created_at_ms: 1,
-            attempts: 0,
-            error: None,
-        });
-        harness.swarm(&swarm);
-        settle().await;
-        let pending = one(&container, ".swarm-thread .swarm-pending-reply");
-        assert!(
-            text_of(&pending).contains("Verified in the running instance")
-                && text_of(&one(&pending, "[role='status']")) == "posting…",
-            "a held reply is visible as posting"
-        );
-        assert!(
-            text_of(&one(&pending, "button[title='logs/render.txt']")).contains("render.txt")
-                && text_of(&one(&pending, "figcaption")) == "render.png",
-            "a held reply shows the files and images it will post"
-        );
-        assert!(
-            textarea.value().is_empty(),
-            "the server accepted the reply, so the draft clears without a Retry"
-        );
-        swarm.pending_replies[0].attempts = 1;
-        swarm.pending_replies[0].error = Some("Helper offline".into());
-        harness.swarm(&swarm);
-        settle().await;
-        assert!(
-            text_of(&one(&container, ".swarm-pending-reply"))
-                .contains("Summary update failed, retrying: Helper offline")
-        );
-        assert!(
-            !has_button(&one(&container, ".swarm-pending-reply"), "Retry"),
-            "the human never retries a summary update"
-        );
-        swarm.pending_replies.clear();
-        swarm.threads[0].summary = "Correction deployed\nHuman: Verified".into();
-        swarm.threads[0].seq = 4;
-        harness.swarm(&swarm);
         let mut committed = make_post(
             sid,
             "reply-1",
@@ -5827,7 +5920,121 @@ pub(crate) mod wasm_tests {
         committed.publication_id = publication_id;
         harness.post(&committed);
         settle().await;
-        assert!(all(&container, ".swarm-pending-reply").is_empty());
+        assert!(
+            all(&thread_card, ".swarm-composer-reply").is_empty(),
+            "the host recorded the reply as posted, so the reply composer closes"
+        );
+
+        // Agent discussion after a human post collapses until its result; each
+        // result is shown inline where it happened, so a follow-up gets its own.
+        let agent_reply = |id: &str, cursor: u64, words: &str, result: bool| {
+            let mut post = make_post(
+                sid,
+                id,
+                "human-root",
+                SwarmBoard::Briefing,
+                cursor,
+                by("ada"),
+                vec![text(words)],
+            );
+            post.result = result;
+            post
+        };
+        for post in [
+            agent_reply("chat-1", 4, "Looking at the renderer", false),
+            agent_reply("chat-2", 5, "Found the double newline", false),
+            agent_reply("result-1", 6, "Fixed: rows render once", true),
+            make_post(
+                sid,
+                "follow-up",
+                "human-root",
+                SwarmBoard::Briefing,
+                7,
+                SwarmAuthor::Human,
+                vec![text("Also check wrapping")],
+            ),
+            agent_reply("chat-3", 8, "Checking wrapping", false),
+            agent_reply("result-2", 9, "Wrapping is correct", true),
+        ] {
+            harness.post(&post);
+        }
+        settle().await;
+        let replies = one(&container, ".swarm-replies");
+        let children = replies.children();
+        let shown: Vec<String> = (0..children.length())
+            .filter_map(|index| children.item(index))
+            .map(|item| match item.query_selector("summary").unwrap() {
+                Some(summary) => {
+                    format!("[{}]", text_of(&summary.last_element_child().unwrap()))
+                }
+                None => item.id(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "swarm-post-reply-1",
+                "[2 agent replies]",
+                "swarm-post-result-1",
+                "swarm-post-follow-up",
+                "[1 agent reply]",
+                "swarm-post-result-2",
+            ],
+            "results stay in time order and only the discussion before each collapses"
+        );
+        for group in all(&replies, "details") {
+            assert!(!group.has_attribute("open"));
+            let summary = group.query_selector("summary").unwrap().unwrap();
+            assert_eq!(
+                group.get_bounding_client_rect().height(),
+                summary.get_bounding_client_rect().height(),
+                "a collapsed group shows only its summary line"
+            );
+        }
+        for result in ["#swarm-post-result-1", "#swarm-post-result-2"] {
+            let card = one(&container, result);
+            assert!(
+                text_of(&card).contains("✓ Result")
+                    && card.get_bounding_client_rect().height() > 0.0,
+                "a result is labeled and visible without expanding anything"
+            );
+        }
+        assert!(
+            !text_of(&one(&container, "#swarm-post-follow-up")).contains("✓ Result"),
+            "a human follow-up is never labeled a result"
+        );
+        let first_group = all(&replies, "details").remove(0);
+        one(&first_group, "summary").click();
+        settle().await;
+        assert!(
+            one(&first_group, "#swarm-post-chat-2")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0,
+            "expanding the discussion reveals the agents' replies"
+        );
+        harness.post(&agent_reply("chat-4", 10, "One more note", false));
+        settle().await;
+        assert!(
+            text_of(&one(
+                &container,
+                ".swarm-replies > details:last-child summary"
+            ))
+            .contains("1 agent reply"),
+            "new discussion after the latest result starts a fresh collapsed group"
+        );
+
+        button(&one(&container, "#swarm-post-chat-1"), "Link").click();
+        settle().await;
+        let composer = one(&thread_card, ".swarm-composer-reply");
+        assert_eq!(
+            one(&composer, "textarea")
+                .dyn_ref::<web_sys::HtmlTextAreaElement>()
+                .unwrap()
+                .value(),
+            "↪ Ada: Looking at the renderer ",
+            "Link on a post inserts a link to it in the thread reply"
+        );
         assert!(
             container
                 .query_selector("#swarm-post-reply-1")

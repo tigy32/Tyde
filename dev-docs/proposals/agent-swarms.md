@@ -140,8 +140,7 @@ surfaces in this iteration; mobile displays existing attachment references.
 
 Mobile keeps message drafts separately by host, swarm, board, and thread.
 Transport acceptance is not durable publication: inputs clear only when a
-canonical human post or server-held pending reply matches the publication
-identity, including fetched
+canonical human post matches the publication identity, including fetched
 board/thread pages after reconnect. Explicit delivery retry uses that same
 immutable publication. Reconnection re-reads the open board or thread. The mobile board is a root-only thread inbox, newest-first by root creation
 time; replies do not reorder requests. Open a thread for its chronological
@@ -712,12 +711,19 @@ reconsider the contribution. An identical publication ID and content retry
 returns its original publication even after later updates; changing that
 content conflicts.
 
-The human never edits a summary or retries a conflict. A human reply is held
-by the server as a pending reply (shown "posting…") while the helper model
-rewrites the summary to include it, then commits as an ordinary conditional
-update. On Conflict the helper rereads and retries immediately; on helper
-failure it backs off (500 ms doubling to 60 s), shows the error on the pending
-reply, and keeps retrying. Pending replies survive restart.
+The human never edits a summary or retries a conflict. A human reply publishes
+immediately as an ordinary post that does not touch the summary; agents fold it
+into their working notes on their next update. An earlier design held human
+replies while a helper model rewrote the summary, which made posting slow.
+Stores that still carry held replies publish them once at load, deduplicated
+by publication ID.
+
+The summary is the agents' working notes, not the answer. A member's reply in
+a Briefing thread may set `result: true` on `tyde_swarm_update_thread` to mark
+it as the outcome of the human's latest request. The flag is typed on the
+post, so clients render it without inferring it from text. Human posts,
+Coordination posts, and new threads cannot be results. Each human follow-up
+expects its own result; results are not pinned and stay in time order.
 
 Agents open any number of Coordination threads under one human Briefing
 request. Creation supplies `expected_sibling_seq`, the parent's current
@@ -743,7 +749,10 @@ existing publication path. Swarm agents see the tools in their scoped MCP
 catalog, including native read-only policies: writing the shared board is
 allowed, writing the project remains forbidden under ReadOnly. The human UI
 renders server state only: a flat Coordination tab with "Re: <request>" links,
-"Coordination · N" child links on requests, and pending replies.
+Coordination chips beside each request's title, and collapsed agent notes.
+Within a Briefing thread, member replies between the human's posts and the
+next result collapse into one "N agent replies" group; results show inline in
+green.
 
 ### Existing histories
 
@@ -754,12 +763,12 @@ Stores from before this contract are not migrated: they are renamed to
 
 `server/tests/swarms.rs` exercises authenticated MCP over the real server:
 request naming and naming failure recovery, concurrent child creation,
-append/replace, stale writers, a human reply racing an agent update through the
-helper, helper failure backoff, UTF-8 limits, pinned delta pagination, nesting
+append/replace, stale writers, instant human replies, result flag validation,
+migration of held legacy replies at load, UTF-8 limits, pinned delta pagination, nesting
 refusal, and restart persistence. Desktop and mobile DOM tests exercise the
-actual composers, naming state, links, and pending replies. Real provider
-`real_swarm_board_coordination` drives all five tools through native MCP,
-concurrent replies in one human thread, a peer child thread, real helper naming
-and a helper-committed human reply; `real_swarm_shared_images` checks pixels
+actual composers, naming state, links, results, and collapsed agent replies.
+Real provider `real_swarm_board_coordination` drives all five tools through
+native MCP, concurrent replies in one human thread, a peer child thread, real
+helper naming, an instantly published human reply, and a flagged result; `real_swarm_shared_images` checks pixels
 and a sequence-checked reply in the original human thread. These provider
 cases share setup and assertions.

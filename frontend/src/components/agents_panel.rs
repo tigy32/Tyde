@@ -2834,9 +2834,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::center_zone::CenterWorkspaceWidth;
     use crate::dispatch::dispatch_envelope;
-    use crate::state::{
-        ChatMessageEntry, ChatRowHandle, FileResourceKey, OpenTarget, PaneId, TabId,
-    };
+    use crate::state::{ChatMessageEntry, ChatRowHandle, TabId};
     use leptos::mount::mount_to;
     use protocol::types::{
         AgentCompactNotifyPayload, AgentCompactStatus, TeamCompactNotifyPayload, TeamCompactStatus,
@@ -2845,7 +2843,7 @@ mod wasm_tests {
         AgentAnnotationTarget, AgentGroup, AgentGroupAssignment, AgentGroupId, AgentGroupsSnapshot,
         AgentOrigin, AgentsViewPreferences, AgentsViewPreferencesSnapshot, BackendKind,
         ChatMessage, Envelope, HostFilterId, MessageSender, NewAgentPayload, Project, ProjectId,
-        ProjectPath, ProjectRootPath, ProjectSource, StreamPath, TeamId, TeamMemberId,
+        ProjectRootPath, ProjectSource, StreamPath, TeamId, TeamMemberId,
     };
     use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;

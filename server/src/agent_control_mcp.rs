@@ -1561,6 +1561,7 @@ impl TydeAgentControlMcpServer {
                 }
             };
         let publication = protocol::SwarmPublication {
+            result: false,
             board: protocol::SwarmBoard::Coordination,
             thread_id: None,
             publication_id: input.publication_id,
@@ -1598,7 +1599,7 @@ impl TydeAgentControlMcpServer {
         }
     }
     #[tool(
-        description = "Post to a thread and change its summary in one step. expected_seq must equal the thread's current seq; on conflict nothing is committed, so read_deltas, reconsider and retry. summary_change is append or replace; the result must be nonempty and <=4096 bytes. body segments: {kind:text,text}, {kind:member_mention,member_id}, {kind:post_link,post_id}; only member_mention wakes a peer. Reuse publication_id when retrying.",
+        description = "Post to a thread and change its summary in one step. expected_seq must equal the thread's current seq; on conflict nothing is committed, so read_deltas, reconsider and retry. summary_change is append or replace; the new summary must be nonempty and <=4096 bytes. Set result=true only on the post that answers the human's latest request in a Briefing thread. body segments: {kind:text,text}, {kind:member_mention,member_id}, {kind:post_link,post_id}; only member_mention wakes a peer. Reuse publication_id when retrying.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1630,6 +1631,7 @@ impl TydeAgentControlMcpServer {
             Err(error) => return err_json(error),
         };
         let publication = protocol::SwarmPublication {
+            result: input.result,
             board: thread.thread.board,
             thread_id: Some(input.thread_id),
             publication_id: input.publication_id,
