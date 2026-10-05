@@ -525,7 +525,7 @@ fn ConstraintsFields(
                                     .and_then(|info| info.project.parent_project_id().cloned());
                                 form.project_id.set(parent);
                             }
-                            form.policy.set(SwarmWorkspacePolicy::SharedProject { writable_consent: false });
+                            form.policy.set(SwarmWorkspacePolicy::SharedProject { writable_consent: true });
                         }
                     />
                     <span>
@@ -553,7 +553,7 @@ fn ConstraintsFields(
                         data-policy="shared_workbench"
                         disabled=move || !selected_is_workbench.get()
                         prop:checked=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedWorkbench { .. })
-                        on:change=move |_| form.policy.set(SwarmWorkspacePolicy::SharedWorkbench { writable_consent: false })
+                        on:change=move |_| form.policy.set(SwarmWorkspacePolicy::SharedWorkbench { writable_consent: true })
                     />
                     <span>
                         <span class="swarm-radio-title">"Workbench scope — writable"</span>
@@ -566,7 +566,7 @@ fn ConstraintsFields(
                         </span>
                     </span>
                 </label>
-                <Show when=move || form.policy.get().writable_consent().is_some()>
+                <Show when=move || matches!(form.policy.get(), SwarmWorkspacePolicy::SharedHost { .. })>
                     <div class="swarm-banner" data-tone="warn" role="note">
                         <span class="swarm-banner-text">
                             "Members can edit files in this scope. Edits are not serialized: two members can change the same file at the same time. Repository rules still apply."
@@ -587,12 +587,7 @@ fn ConstraintsFields(
                                 });
                             }
                         />
-                        <span>{move || match form.policy.get() {
-                            SwarmWorkspacePolicy::ReadOnly => "",
-                            SwarmWorkspacePolicy::SharedWorkbench { .. } => "I allow members to write to this workbench.",
-                            SwarmWorkspacePolicy::SharedProject { .. } => "I allow members to write to this project and all its workbenches.",
-                            SwarmWorkspacePolicy::SharedHost { .. } => "I allow members to write to all projects and workbenches on this host.",
-                        }}</span>
+                        <span>"I allow members to write to all projects and workbenches on this host."</span>
                     </label>
                 </Show>
             </fieldset>
@@ -1826,7 +1821,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn writable_scope_choices_require_matching_consent_and_emit_typed_constraints() {
+    async fn writable_scope_choices_authorize_exact_scope_with_host_acknowledgement() {
         for (key, expected, scope_text, selected) in [
             (
                 "shared_host",
@@ -1841,7 +1836,9 @@ mod wasm_tests {
                 SwarmWorkspacePolicy::SharedProject {
                     writable_consent: true,
                 },
-                "this project and all its workbenches",
+                // The redundant acceptance label is gone; the scope help
+                // still states the complete project and future-workbench grant.
+                "Members can edit the selected project and all its workbenches, including newly created workbenches.",
                 PROJECT,
             ),
             (
@@ -1849,7 +1846,7 @@ mod wasm_tests {
                 SwarmWorkspacePolicy::SharedWorkbench {
                     writable_consent: true,
                 },
-                "this workbench",
+                "Members can edit this workbench. Nothing is landed on main automatically.",
                 "scope-workbench",
             ),
         ] {
@@ -1904,15 +1901,27 @@ mod wasm_tests {
             );
             assert!(text_of(&dialog).contains(scope_text));
             type_into(&field(&dialog, "name"), "Scoped swarm");
-            action(&dialog, "generate").click();
-            settle().await;
-            assert!(
-                harness.commands_of("generate_draft").is_empty(),
-                "unconsented scope cannot reach the server"
-            );
-            assert!(text_of(&dialog).contains("Confirm write access to the selected scope."));
-            field(&dialog, "writable-consent").click();
-            settle().await;
+            if key == "shared_host" {
+                action(&dialog, "generate").click();
+                settle().await;
+                assert!(
+                    harness.commands_of("generate_draft").is_empty(),
+                    "host-wide writes still need separate acknowledgement"
+                );
+                assert!(text_of(&dialog).contains("Confirm write access to the selected scope."));
+                field(&dialog, "writable-consent").click();
+                settle().await;
+            } else {
+                // Selecting the explicit project/workbench write scope is the
+                // authorization; a second checkbox is no longer required.
+                assert!(
+                    dialog
+                        .query_selector("[data-field='writable-consent']")
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!text_of(&dialog).contains("Edits are not serialized"));
+            }
             action(&dialog, "generate").click();
             settle().await;
             let commands = harness.commands_of("generate_draft");
