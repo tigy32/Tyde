@@ -6,11 +6,13 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentAnnotationTarget, AgentGroup, AgentGroupId, AgentGroupsSnapshot, AgentGroupsUpdate,
-    AgentId, AgentsSidebarPreferences, AgentsSidebarProjectVisibility, AgentsViewPreferencesUpdate,
-    FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
+    AgentId, AgentOrigin, AgentsSidebarPreferences, AgentsSidebarProjectVisibility,
+    AgentsViewPreferencesUpdate, FrameKind, HostFilterId, ProjectId, SetAgentNamePayload, Swarm,
+    SwarmId, SwarmLifecycle, SwarmMemberState,
 };
 
 use crate::components::card_menu::{CardContextMenu, CardMenuPosition, open_card_menu};
+use crate::components::swarm_view::{lifecycle_label, member_is_working, open_swarm_tab};
 use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
@@ -55,6 +57,149 @@ pub fn agent_passes_filters(
         return false;
     }
     true
+}
+
+fn swarm_passes_filters(
+    host_id: &str,
+    swarm: &Swarm,
+    filters: &AgentsPanelFilters,
+    active_project: Option<&ActiveProjectRef>,
+    lowercase_query: &str,
+) -> bool {
+    if filters.hide_inactive && swarm_working_count(swarm) == 0 {
+        return false;
+    }
+    if !filters.show_other_projects
+        && !active_project.is_some_and(|ap| {
+            ap.host_id == host_id && ap.project_id == swarm.constraints.project_id
+        })
+    {
+        return false;
+    }
+    lowercase_query.is_empty() || swarm.name.to_lowercase().contains(lowercase_query)
+}
+
+fn swarm_working_count(swarm: &Swarm) -> usize {
+    swarm
+        .members
+        .iter()
+        .filter(|member| member_is_working(member))
+        .count()
+}
+
+/// Aggregate status for a swarm's summary row: the lifecycle wins when it
+/// stops the swarm from working, otherwise any working member makes the
+/// whole swarm working.
+fn swarm_row_status(swarm: &Swarm) -> (&'static str, &'static str) {
+    match swarm.lifecycle {
+        SwarmLifecycle::Pausing | SwarmLifecycle::Paused => (
+            lifecycle_label(swarm.lifecycle),
+            "agent-card-status cancelled",
+        ),
+        SwarmLifecycle::AttentionRequired => ("Needs attention", "agent-card-status awaiting"),
+        SwarmLifecycle::Running | SwarmLifecycle::Transitioning => {
+            if swarm_working_count(swarm) > 0 {
+                ("Working", "agent-card-status running")
+            } else {
+                ("Idle", "agent-card-status")
+            }
+        }
+    }
+}
+
+fn swarm_row_counts(swarm: &Swarm) -> String {
+    let members = swarm
+        .members
+        .iter()
+        .filter(|member| member.state != SwarmMemberState::Retired)
+        .count();
+    format!(
+        "{members} agent{} · {} working",
+        if members == 1 { "" } else { "s" },
+        swarm_working_count(swarm)
+    )
+}
+
+fn render_swarm_row(state: AppState, swarm_ref: SidebarSwarmRef) -> AnyView {
+    let swarm_id_attr = swarm_ref.swarm_id.0.clone();
+    let swarm_state = state.clone();
+    let host_id = swarm_ref.host_id.clone();
+    let swarm_id = swarm_ref.swarm_id.clone();
+    let swarm = Memo::new(move |_| {
+        swarm_state.swarms.with(|by_host| {
+            by_host
+                .get(&host_id)
+                .and_then(|swarms| swarms.get(&swarm_id))
+                .cloned()
+        })
+    });
+    let open = move |_| {
+        if let Some(current) = swarm.get_untracked() {
+            open_swarm_tab(
+                &state,
+                swarm_ref.host_id.clone(),
+                swarm_ref.swarm_id.clone(),
+                current.name,
+            );
+        }
+    };
+    view! {
+        <button
+            class="agent-card agent-sidebar-swarm-row"
+            data-swarm-id=swarm_id_attr
+            title="Open the swarm"
+            on:click=open
+        >
+            <div class="agent-card-top">
+                <span class="agent-card-name">
+                    {move || swarm.with(|s| s.as_ref().map(|s| format!("Swarm: {}", s.name)))}
+                </span>
+                <span class=move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).1).unwrap_or("agent-card-status"))>
+                    {move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).0))}
+                </span>
+            </div>
+            <div class="agent-card-bottom">
+                <span class="agent-sidebar-swarm-counts">
+                    {move || swarm.with(|s| s.as_ref().map(swarm_row_counts))}
+                </span>
+            </div>
+        </button>
+    }
+    .into_any()
+}
+
+/// Swarm members and every agent they own belong to the Swarm view, which
+/// lists the members and opens their conversations; the Agents list would
+/// only duplicate them.
+fn swarm_owned_agents(agents: &[AgentInfo]) -> HashSet<SidebarAgentRef> {
+    let by_ref: HashMap<SidebarAgentRef, &AgentInfo> = agents
+        .iter()
+        .map(|agent| (agent_ref(agent), agent))
+        .collect();
+    agents
+        .iter()
+        .filter(|agent| {
+            let mut current = Some(*agent);
+            for _ in 0..=agents.len() {
+                let Some(agent) = current else {
+                    return false;
+                };
+                if agent.origin == AgentOrigin::SwarmMember {
+                    return true;
+                }
+                current = agent.parent_agent_id.as_ref().and_then(|parent_id| {
+                    by_ref
+                        .get(&SidebarAgentRef {
+                            host_id: agent.host_id.clone(),
+                            agent_id: parent_id.clone(),
+                        })
+                        .copied()
+                });
+            }
+            false
+        })
+        .map(agent_ref)
+        .collect()
 }
 
 /// Resolve the effective "show other projects" value from the server-owned
@@ -375,11 +520,32 @@ impl AgentTreeGroup {
     }
 }
 
+/// A swarm shown as one summary row in the project its members run in, in
+/// place of the member rows the Agents list hides.
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarSwarmRef {
+    host_id: String,
+    project_id: ProjectId,
+    swarm_id: SwarmId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AgentProjectSection {
     key: String,
     label: String,
+    swarms: Vec<SidebarSwarmRef>,
     groups: Vec<AgentTreeGroup>,
+}
+
+impl AgentProjectSection {
+    fn row_count(&self) -> usize {
+        self.swarms.len()
+            + self
+                .groups
+                .iter()
+                .map(AgentTreeGroup::member_count)
+                .sum::<usize>()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -493,6 +659,7 @@ fn build_parent_child_groups(agents: Vec<AgentInfo>) -> Vec<AgentTreeGroup> {
 
 fn build_sidebar_sections(
     groups: Vec<AgentTreeGroup>,
+    swarms: Vec<SidebarSwarmRef>,
     configured_hosts: Vec<crate::bridge::ConfiguredHost>,
     mut projects: Vec<ProjectInfo>,
 ) -> Vec<AgentHostSection> {
@@ -516,12 +683,11 @@ fn build_sidebar_sections(
         })
         .collect();
 
-    let mut leaf_agents: HashMap<(String, Option<ProjectId>), Vec<AgentTreeGroup>> = HashMap::new();
+    type Leaf = (Vec<SidebarSwarmRef>, Vec<AgentTreeGroup>);
+    let mut leaf_agents: HashMap<(String, Option<ProjectId>), Leaf> = HashMap::new();
     let mut first_seen_hosts: Vec<String> = Vec::new();
     let mut first_seen_projects: HashMap<String, Vec<Option<ProjectId>>> = HashMap::new();
-    for group in groups {
-        let host_id = group.parent.host_id.clone();
-        let project_id = group.parent.project_id.clone();
+    let mut leaf_for = |host_id: String, project_id: Option<ProjectId>| {
         if !known_host_order.contains(&host_id) && !first_seen_hosts.contains(&host_id) {
             first_seen_hosts.push(host_id.clone());
         }
@@ -529,10 +695,30 @@ fn build_sidebar_sections(
         if !project_order.contains(&project_id) {
             project_order.push(project_id.clone());
         }
-        leaf_agents
-            .entry((host_id, project_id))
-            .or_default()
-            .push(group);
+        (host_id, project_id)
+    };
+    let mut keyed_swarms = Vec::new();
+    for swarm in swarms {
+        keyed_swarms.push((
+            leaf_for(swarm.host_id.clone(), Some(swarm.project_id.clone())),
+            swarm,
+        ));
+    }
+    let mut keyed_groups = Vec::new();
+    for group in groups {
+        keyed_groups.push((
+            leaf_for(
+                group.parent.host_id.clone(),
+                group.parent.project_id.clone(),
+            ),
+            group,
+        ));
+    }
+    for (key, swarm) in keyed_swarms {
+        leaf_agents.entry(key).or_default().0.push(swarm);
+    }
+    for (key, group) in keyed_groups {
+        leaf_agents.entry(key).or_default().1.push(group);
     }
 
     let mut host_order: Vec<String> = known_host_order
@@ -571,7 +757,7 @@ fn build_sidebar_sections(
                 .into_iter()
                 .filter_map(|project_id| {
                     let key = (host_id.clone(), project_id.clone());
-                    let agents = leaf_agents.remove(&key)?;
+                    let (swarms, groups) = leaf_agents.remove(&key)?;
                     let label = project_label(&project_labels, &host_id, project_id.as_ref());
                     Some(AgentProjectSection {
                         key: project_id
@@ -579,7 +765,8 @@ fn build_sidebar_sections(
                             .map(|id| format!("{}:{}", host_id, id.0))
                             .unwrap_or_else(|| format!("{host_id}:no-project")),
                         label,
-                        groups: agents,
+                        swarms,
+                        groups,
                     })
                 })
                 .collect();
@@ -616,6 +803,7 @@ fn agent_ref(agent: &AgentInfo) -> SidebarAgentRef {
 
 fn build_sidebar_projection(
     agents: Vec<AgentInfo>,
+    swarms: Vec<SidebarSwarmRef>,
     configured_hosts: Vec<crate::bridge::ConfiguredHost>,
     projects: Vec<ProjectInfo>,
     groups_snapshot: AgentGroupsSnapshot,
@@ -657,7 +845,7 @@ fn build_sidebar_projection(
 
     AgentSidebarProjection {
         custom_groups,
-        default_hosts: build_sidebar_sections(ungrouped_agents, configured_hosts, projects),
+        default_hosts: build_sidebar_sections(ungrouped_agents, swarms, configured_hosts, projects),
     }
 }
 
@@ -983,6 +1171,7 @@ fn folder_toggle(
 
 fn folder_members(
     state: AppState,
+    swarms: Vec<SidebarSwarmRef>,
     groups: Vec<AgentTreeGroup>,
     interactions: AgentsPanelInteractions,
     collapsed: RwSignal<HashSet<String>>,
@@ -991,12 +1180,17 @@ fn folder_members(
     let expanded = Memo::new(move |_| !collapsed.with(|folders| folders.contains(&key)));
     move || {
         if expanded.get() {
-            groups
+            let swarm_rows = swarms
+                .clone()
+                .into_iter()
+                .map(|swarm| render_swarm_row(state.clone(), swarm))
+                .collect_view();
+            let agent_rows = groups
                 .clone()
                 .into_iter()
                 .map(|group| render_agent_tree_group(state.clone(), group, interactions.clone()))
-                .collect_view()
-                .into_any()
+                .collect_view();
+            view! { {swarm_rows} {agent_rows} }.into_any()
         } else {
             ().into_any()
         }
@@ -1145,18 +1339,20 @@ pub fn AgentsPanel() -> impl IntoView {
             filter_state.agent_turn_active.with(|turn_active_map| {
                 filter_state.agent_awaiting_user.with(|awaiting_user| {
                     filter_state.agents.with(|agents| {
+                        let swarm_owned = swarm_owned_agents(agents);
                         agents
                             .iter()
                             .filter(|a| {
-                                agent_passes_filters(
-                                    a,
-                                    &filters,
-                                    active_project.as_ref(),
-                                    streaming_map,
-                                    turn_active_map,
-                                    awaiting_user,
-                                    &query,
-                                )
+                                !swarm_owned.contains(&agent_ref(a))
+                                    && agent_passes_filters(
+                                        a,
+                                        &filters,
+                                        active_project.as_ref(),
+                                        streaming_map,
+                                        turn_active_map,
+                                        awaiting_user,
+                                        &query,
+                                    )
                             })
                             .cloned()
                             .collect::<Vec<_>>()
@@ -1166,10 +1362,42 @@ pub fn AgentsPanel() -> impl IntoView {
         })
     });
 
+    let swarm_filter_state = state.clone();
+    let filtered_swarms = Memo::new(move |_| {
+        let active_project = swarm_filter_state.active_project.get();
+        let query = search.get().to_lowercase();
+        let filters = current_filters.get();
+        swarm_filter_state.swarms.with(|by_host| {
+            let mut refs: Vec<(String, SidebarSwarmRef)> = by_host
+                .iter()
+                .flat_map(|(host_id, swarms)| swarms.values().map(move |swarm| (host_id, swarm)))
+                .filter(|(host_id, swarm)| {
+                    swarm_passes_filters(host_id, swarm, &filters, active_project.as_ref(), &query)
+                })
+                .map(|(host_id, swarm)| {
+                    (
+                        swarm.name.to_lowercase(),
+                        SidebarSwarmRef {
+                            host_id: host_id.clone(),
+                            project_id: swarm.constraints.project_id.clone(),
+                            swarm_id: swarm.id.clone(),
+                        },
+                    )
+                })
+                .collect();
+            refs.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.swarm_id.0.cmp(&b.1.swarm_id.0))
+            });
+            refs.into_iter().map(|(_, swarm)| swarm).collect::<Vec<_>>()
+        })
+    });
+
     let section_state = state.clone();
     let projection = Memo::new(move |_| {
         build_sidebar_projection(
             filtered_agents.get(),
+            filtered_swarms.get(),
             section_state.configured_hosts.get(),
             section_state.projects.get(),
             section_state.agents_view_preferences.get().groups,
@@ -1484,7 +1712,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                             </button>
                                                         </span>
                                                     </div>
-                                                    {folder_members(state.clone(), custom_group.groups, interactions.clone(), collapsed_folders, members_key)}
+                                                    {folder_members(state.clone(), Vec::new(), custom_group.groups, interactions.clone(), collapsed_folders, members_key)}
                                                 </section>
                                             }
                                         }).collect_view()}
@@ -1533,13 +1761,13 @@ pub fn AgentsPanel() -> impl IntoView {
                                             <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
                                             {host.projects.into_iter().map(|project| {
                                                 let folder_key = format!("project:{}", project.key);
-                                                let member_count = project.groups.iter().map(|group| group.member_count()).sum();
+                                                let member_count = project.row_count();
                                                 view! {
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">
                                                             {folder_toggle(collapsed_folders, folder_key.clone(), format!("Project: {}", project.label), member_count)}
                                                         </div>
-                                                        {folder_members(state.clone(), project.groups, interactions.clone(), collapsed_folders, folder_key)}
+                                                        {folder_members(state.clone(), project.swarms, project.groups, interactions.clone(), collapsed_folders, folder_key)}
                                                     </section>
                                                 }
                                             }).collect_view()}
@@ -3932,6 +4160,197 @@ mod wasm_tests {
                 && default_text.contains("Child Alpha Agent")
                 && !default_text.contains("Beta Agent"),
             "grouped agents must not be duplicated in Host/Project; got {default_text:?}"
+        );
+    }
+
+    /// Swarm members (and the agents they own) are replaced in the Agents list
+    /// by one summary row per swarm, filed under the project the members ran
+    /// in. The row's status follows member runtime status and the swarm
+    /// lifecycle, folder counts only count rendered rows, and clicking the
+    /// row opens the swarm.
+    #[wasm_bindgen_test]
+    async fn swarm_members_collapse_into_one_swarm_row() {
+        use crate::components::swarm_view::wasm_tests::{make_swarm, member};
+        use protocol::{AgentControlStatus, SwarmId, SwarmLifecycle, SwarmMemberState};
+
+        let container = make_container();
+        let state = make_app_state("local");
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        state.projects.set(vec![
+            project_info("local", "alpha", "Alpha Project", 0),
+            project_info("local", "bamboo", "Bamboo Project", 1),
+        ]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "normal",
+            "Normal Agent",
+            true,
+            Some("alpha"),
+            None,
+        );
+        push_agent_with_scope(
+            &state,
+            "local",
+            "fable",
+            "Fable",
+            true,
+            Some("bamboo"),
+            None,
+        );
+        push_agent_with_scope(&state, "local", "sol", "Sol", true, Some("bamboo"), None);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "fable-helper",
+            "Fable Helper",
+            true,
+            Some("bamboo"),
+            Some("fable"),
+        );
+        state.agents.update(|agents| {
+            for agent in agents.iter_mut() {
+                match agent.agent_id.0.as_str() {
+                    "fable" | "sol" => agent.origin = AgentOrigin::SwarmMember,
+                    "fable-helper" => agent.origin = AgentOrigin::AgentControl,
+                    _ => {}
+                }
+            }
+        });
+        let mut swarm = make_swarm(
+            "bamboo-swarm",
+            "Bamboo Crew",
+            vec![
+                member(
+                    "fable",
+                    "Fable",
+                    SwarmMemberState::Live,
+                    Some("fable"),
+                    Some(AgentControlStatus::Thinking),
+                ),
+                member(
+                    "sol",
+                    "Sol",
+                    SwarmMemberState::Live,
+                    Some("sol"),
+                    Some(AgentControlStatus::Idle),
+                ),
+            ],
+        );
+        swarm.constraints.project_id = ProjectId("bamboo".to_owned());
+        let swarm_id = swarm.id.clone();
+        state.swarms.set(HashMap::from([(
+            "local".to_owned(),
+            HashMap::from([(swarm_id.clone(), swarm)]),
+        )]));
+        let set_swarm = |update: &dyn Fn(&mut protocol::Swarm)| {
+            state.swarms.update(|by_host| {
+                update(
+                    by_host
+                        .get_mut("local")
+                        .and_then(|swarms| swarms.get_mut(&SwarmId("bamboo-swarm".to_owned())))
+                        .unwrap(),
+                )
+            });
+        };
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Normal Agent"),
+            "the normal agent stays listed; got {text:?}"
+        );
+        for hidden in ["Fable", "Sol", "Fable Helper"] {
+            assert!(
+                !text.contains(hidden),
+                "{hidden:?} belongs to a swarm and must not be in the Agents list; got {text:?}"
+            );
+        }
+        let bamboo: HtmlElement = container
+            .query_selector("[data-project-key='local:bamboo']")
+            .unwrap()
+            .expect("the swarm's project section renders")
+            .dyn_into()
+            .unwrap();
+        let rows = bamboo.query_selector_all("button").unwrap();
+        let row: HtmlElement = (0..rows.length())
+            .map(|index| rows.item(index).unwrap().dyn_into::<HtmlElement>().unwrap())
+            .find(|row| {
+                row.text_content()
+                    .unwrap_or_default()
+                    .contains("Bamboo Crew")
+            })
+            .expect("the swarm summary row renders under its project");
+        let row_text = || row.text_content().unwrap_or_default();
+        assert!(
+            row_text().contains("Working") && row_text().contains("2 agents · 1 working"),
+            "a working member makes the swarm working; got {:?}",
+            row_text()
+        );
+        let counts: Vec<String> = {
+            let nodes = container.query_selector_all(".agent-folder-count").unwrap();
+            (0..nodes.length())
+                .map(|index| {
+                    nodes
+                        .item(index)
+                        .unwrap()
+                        .text_content()
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        assert_eq!(
+            counts,
+            vec!["1".to_owned(), "1".to_owned()],
+            "Alpha counts its one agent and Bamboo its one swarm row, not the hidden members"
+        );
+
+        set_swarm(&|swarm| swarm.members[0].runtime_status = Some(AgentControlStatus::Idle));
+        next_tick().await;
+        assert!(
+            row_text().contains("Idle") && row_text().contains("2 agents · 0 working"),
+            "with no working member the swarm reads idle; got {:?}",
+            row_text()
+        );
+        set_swarm(&|swarm| swarm.members[1].runtime_status = Some(AgentControlStatus::Thinking));
+        next_tick().await;
+        assert!(
+            row_text().contains("Working") && row_text().contains("2 agents · 1 working"),
+            "the row flips back to working; got {:?}",
+            row_text()
+        );
+        set_swarm(&|swarm| swarm.lifecycle = SwarmLifecycle::Paused);
+        next_tick().await;
+        assert!(
+            row_text().contains("Paused") && !row_text().contains("Working"),
+            "a paused swarm reads paused; got {:?}",
+            row_text()
+        );
+        set_swarm(&|swarm| swarm.lifecycle = SwarmLifecycle::AttentionRequired);
+        next_tick().await;
+        assert!(
+            row_text().contains("Needs attention"),
+            "the swarm lifecycle surfaces needs-attention; got {:?}",
+            row_text()
+        );
+
+        row.click();
+        next_tick().await;
+        assert_eq!(
+            state
+                .center_zone
+                .with_untracked(|cz| cz.active_content().cloned()),
+            Some(TabContent::Swarm {
+                host_id: "local".to_owned(),
+                swarm_id,
+            }),
+            "clicking the swarm row opens the swarm"
         );
     }
 

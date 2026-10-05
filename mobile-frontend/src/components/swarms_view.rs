@@ -51,9 +51,8 @@ fn send(
 }
 
 #[component]
-pub fn SwarmsView() -> impl IntoView {
+pub fn SwarmsView(selected: RwSignal<Option<(LocalHostId, SwarmId)>>) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
-    let selected = RwSignal::new(None::<(LocalHostId, SwarmId)>);
     view! {
         <div class="mobile-swarms" data-mobile-test="swarms-view">
             {move || state.active_local_host_id.get().map(|host| view! { <SwarmErrors host=host swarm_id=None /> })}
@@ -130,6 +129,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
             .swarms_by_host
             .with(|m| m.get(&host).and_then(|s| s.get(&id)).cloned())
     });
+    let member_state = state.clone();
     let command_state = state.clone();
     let command = Callback::new(move |command| {
         let (host, _) = target.get_value();
@@ -264,7 +264,18 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
                 <button type="button" role="tab" aria-selected=move || (board.get() == SwarmBoard::Coordination).to_string() on:click=move |_| { board.set(SwarmBoard::Coordination); thread.set(None); compose_open.set(false); } data-mobile-test="swarm-coordination">"Coordination"</button>
             </nav>
             <details class="mobile-swarm-members"><summary>{move || swarm.get().map(|s| format!("{} agents", s.members.iter().filter(|m| m.state != SwarmMemberState::Retired).count()))}</summary>
-                {move || swarm.get().map(|s| s.members.into_iter().map(|member| view! { <div class="mobile-swarm-member"><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}</span></div> }).collect_view())}
+                {move || swarm.get().map(|s| s.members.into_iter().map(|member| match member.agent_id.clone() {
+                    Some(agent_id) => {
+                        let open_state = member_state.clone();
+                        let open = move |_| {
+                            let (host, _) = target.get_value();
+                            open_state.active_agent.set(Some(crate::state::ActiveAgentRef { local_host_id: host, agent_id: agent_id.clone() }));
+                            open_state.viewing_chat.set(true);
+                        };
+                        view! { <button type="button" class="mobile-swarm-member" data-mobile-test="swarm-member-open" on:click=open><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}" · Open →"</span></button> }.into_any()
+                    }
+                    None => view! { <div class="mobile-swarm-member"><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}</span></div> }.into_any(),
+                }).collect_view())}
             </details>
             </div>
             <p class="mobile-swarm-board-hint">{move || if board.get() == SwarmBoard::Briefing { "One request, one thread. Newest requests first." } else { "Threads agents opened to coordinate on your requests." }}</p>
@@ -773,7 +784,7 @@ fn SwarmComposer(
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
+pub(crate) mod wasm_tests {
     use super::*;
     use crate::components::AgentsView;
     use crate::dispatch::{dispatch_envelope, prime_host_with_bootstrap_for_tests};
@@ -899,7 +910,7 @@ mod wasm_tests {
             has_more: false,
         }
     }
-    fn fixture_swarm() -> Swarm {
+    pub(crate) fn fixture_swarm() -> Swarm {
         let project_id = protocol::ProjectId("project".into());
         Swarm {
             threads: Vec::new(),
@@ -955,6 +966,55 @@ mod wasm_tests {
             legacy_team_id: None,
             recovery_requirement: protocol::SwarmRecoveryRequirement::None,
         }
+    }
+
+    /// Swarm members are hidden from the Agents list, so the swarm's member
+    /// list is where a phone opens a member's conversation.
+    #[wasm_bindgen_test]
+    async fn mobile_swarm_member_opens_its_conversation() {
+        let state = AppState::new();
+        let host = LocalHostId("swarm-mobile-member-open".into());
+        let mut swarm = fixture_swarm();
+        swarm.members[0].state = SwarmMemberState::Live;
+        swarm.members[0].agent_id = Some(protocol::AgentId("nova-agent".into()));
+        swarm.members[0].runtime_status = Some(protocol::AgentControlStatus::Idle);
+        prime_host_with_bootstrap_for_tests(&state, &host, |bootstrap| {
+            bootstrap.swarms = vec![swarm.clone()]
+        });
+        state.active_local_host_id.set(Some(host.clone()));
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let mounted_state = state.clone();
+        let _handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <AgentsView /> }
+        });
+        tick().await;
+        element(&container, "agents-segment-swarms").click();
+        tick().await;
+        element(&container, "swarm-open").click();
+        tick().await;
+        let member = element(&container, "swarm-member-open");
+        assert!(
+            member.text_content().unwrap().contains("Nova"),
+            "the live member is listed as openable"
+        );
+        member.click();
+        tick().await;
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            Some(crate::state::ActiveAgentRef {
+                local_host_id: host.clone(),
+                agent_id: protocol::AgentId("nova-agent".into()),
+            }),
+            "tapping the member opens its agent"
+        );
+        assert!(state.viewing_chat.get_untracked(), "the chat is shown");
     }
 
     #[wasm_bindgen_test]

@@ -6,10 +6,13 @@ use crate::components::ui::{
     StatusTone,
 };
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AgentRef, AppState, ProjectInfo, sort_project_infos,
+    ActiveAgentRef, AgentInfo, AgentRef, AppState, LocalHostId, ProjectInfo, sort_project_infos,
 };
 use leptos::prelude::*;
-use protocol::{AgentId, ProjectId};
+use protocol::{
+    AgentControlStatus, AgentId, AgentOrigin, ProjectId, Swarm, SwarmId, SwarmLifecycle,
+    SwarmMemberState,
+};
 
 const STORAGE_HIDE_SUB_AGENTS: &str = "tyde-mobile-agents-hide-sub-agents";
 const BOOL_TRUE: &str = "true";
@@ -86,6 +89,11 @@ pub fn AgentsView() -> impl IntoView {
     let segment: RwSignal<AgentsSegment> = RwSignal::new(AgentsSegment::Agents);
     let hide_sub_agents = RwSignal::new(restore_hide_sub_agents());
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
+    let selected_swarm = RwSignal::new(None::<(LocalHostId, SwarmId)>);
+    let open_swarm = Callback::new(move |target: (LocalHostId, SwarmId)| {
+        selected_swarm.set(Some(target));
+        segment.set(AgentsSegment::Swarms);
+    });
 
     let on_new_chat = crate::components::new_chat_callback(&state);
 
@@ -139,11 +147,11 @@ pub fn AgentsView() -> impl IntoView {
                 <div class="shell-flow">
                 {move || {
                     if segment.get() == AgentsSegment::Swarms {
-                        return view! { <SwarmsView /> }.into_any();
+                        return view! { <SwarmsView selected=selected_swarm /> }.into_any();
                     }
                     view! {
                         <AgentRestorationNotice />
-                        {render_agents_body(&state, hide_sub_agents, collapsed_parents)}
+                        {render_agents_body(&state, hide_sub_agents, collapsed_parents, open_swarm)}
                     }
                     .into_any()
                 }}
@@ -218,6 +226,36 @@ fn AgentRestorationNotice() -> impl IntoView {
     }
 }
 
+/// Swarm members and every agent they own belong to the Swarms segment,
+/// which lists the members and opens their conversations. `agents` is one
+/// host's list.
+fn swarm_owned_agents(agents: &[AgentInfo]) -> HashSet<AgentId> {
+    let by_id: HashMap<&AgentId, &AgentInfo> = agents
+        .iter()
+        .map(|agent| (&agent.agent_id, agent))
+        .collect();
+    agents
+        .iter()
+        .filter(|agent| {
+            let mut current = Some(*agent);
+            for _ in 0..=agents.len() {
+                let Some(agent) = current else {
+                    return false;
+                };
+                if agent.origin == AgentOrigin::SwarmMember {
+                    return true;
+                }
+                current = agent
+                    .parent_agent_id
+                    .as_ref()
+                    .and_then(|parent_id| by_id.get(parent_id).copied());
+            }
+            false
+        })
+        .map(|agent| agent.agent_id.clone())
+        .collect()
+}
+
 fn group_agents(agents: Vec<AgentInfo>) -> Vec<(AgentInfo, Vec<AgentInfo>)> {
     let visible_ids: HashSet<AgentId> = agents.iter().map(|agent| agent.agent_id.clone()).collect();
     let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> = HashMap::new();
@@ -254,6 +292,7 @@ fn group_agents(agents: Vec<AgentInfo>) -> Vec<(AgentInfo, Vec<AgentInfo>)> {
 /// parent/child groups filed under it.
 struct ProjectSection {
     label: String,
+    swarms: Vec<Swarm>,
     groups: Vec<(AgentInfo, Vec<AgentInfo>)>,
 }
 
@@ -269,7 +308,11 @@ struct ProjectSection {
 /// A project id an agent carries that the project list does not know about
 /// still gets a section, keyed by the raw id: dropping those agents on the
 /// floor would hide running work.
-fn project_sections(agents: Vec<AgentInfo>, projects: &[ProjectInfo]) -> Vec<ProjectSection> {
+fn project_sections(
+    agents: Vec<AgentInfo>,
+    swarms: Vec<Swarm>,
+    projects: &[ProjectInfo],
+) -> Vec<ProjectSection> {
     let labels: HashMap<ProjectId, String> = projects
         .iter()
         .map(|info| (info.project.id.clone(), info.project.name.clone()))
@@ -279,8 +322,10 @@ fn project_sections(agents: Vec<AgentInfo>, projects: &[ProjectInfo]) -> Vec<Pro
         .iter()
         .map(|info| Some(info.project.id.clone()))
         .collect();
-    for agent in &agents {
-        let key = agent.project_id.clone();
+    let swarm_projects = swarms
+        .iter()
+        .map(|swarm| Some(swarm.constraints.project_id.clone()));
+    for key in swarm_projects.chain(agents.iter().map(|agent| agent.project_id.clone())) {
         if key.is_some() && !order.contains(&key) {
             order.push(key);
         }
@@ -295,17 +340,29 @@ fn project_sections(agents: Vec<AgentInfo>, projects: &[ProjectInfo]) -> Vec<Pro
             .or_default()
             .push(agent);
     }
+    let mut swarms_by_project: HashMap<Option<ProjectId>, Vec<Swarm>> = HashMap::new();
+    for swarm in swarms {
+        swarms_by_project
+            .entry(Some(swarm.constraints.project_id.clone()))
+            .or_default()
+            .push(swarm);
+    }
 
     order
         .into_iter()
         .filter_map(|project_id| {
-            let members = by_project.remove(&project_id)?;
+            let members = by_project.remove(&project_id).unwrap_or_default();
+            let swarms = swarms_by_project.remove(&project_id).unwrap_or_default();
+            if members.is_empty() && swarms.is_empty() {
+                return None;
+            }
             let label = match &project_id {
                 None => "No project".to_owned(),
                 Some(id) => labels.get(id).cloned().unwrap_or_else(|| id.0.clone()),
             };
             Some(ProjectSection {
                 label,
+                swarms,
                 groups: group_agents(members),
             })
         })
@@ -316,6 +373,7 @@ fn render_agents_body(
     state: &AppState,
     hide_sub_agents: RwSignal<bool>,
     collapsed_parents: RwSignal<HashSet<AgentId>>,
+    open_swarm: Callback<(LocalHostId, SwarmId)>,
 ) -> AnyView {
     let state = state.clone();
     view! {
@@ -332,8 +390,22 @@ fn render_agents_body(
                                 .is_some_and(|h| a.local_host_id == *h)
                         })
                         .collect();
+                    let swarm_owned = swarm_owned_agents(&agents);
+                    let agents: Vec<_> = agents
+                        .into_iter()
+                        .filter(|agent| !swarm_owned.contains(&agent.agent_id))
+                        .collect();
+                    let mut swarms: Vec<Swarm> = active_host
+                        .as_ref()
+                        .and_then(|host| {
+                            state
+                                .swarms_by_host
+                                .with(|by_host| by_host.get(host).map(|swarms| swarms.values().cloned().collect()))
+                        })
+                        .unwrap_or_default();
+                    swarms.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.0.cmp(&b.id.0)));
 
-                    if agents.is_empty() {
+                    if agents.is_empty() && swarms.is_empty() {
                         // The agent list arrives in the host snapshot. While the
                         // host is connecting and that snapshot hasn't landed,
                         // show a spinner rather than the "no agents" empty state
@@ -388,7 +460,7 @@ fn render_agents_body(
                             projects
                         })
                         .unwrap_or_default();
-                    let sections = project_sections(visible_agents, &projects);
+                    let sections = project_sections(visible_agents, swarms, &projects);
 
                     view! {
                         <div>
@@ -421,11 +493,15 @@ fn render_agents_body(
                             }}
                             <div class="agent-list" data-mobile-test="agents-list">
                                 {sections.into_iter().map(|section| {
-                                    let agent_count = section.groups.iter()
-                                        .map(|(_, children)| 1 + children.len())
-                                        .sum::<usize>();
+                                    let agent_count = section.swarms.len()
+                                        + section.groups.iter()
+                                            .map(|(_, children)| 1 + children.len())
+                                            .sum::<usize>();
                                     let label = section.label;
                                     let aria_label = format!("{label} agents");
+                                    let swarm_rows = section.swarms.into_iter().map(|swarm| {
+                                        swarm_row(active_host.clone(), swarm, open_swarm)
+                                    }).collect::<Vec<_>>();
                                     let rows = section.groups.into_iter().map(|(parent, children)| {
                                         let parent_id = parent.agent_id.clone();
                                         let child_count = children.len();
@@ -460,6 +536,7 @@ fn render_agents_body(
                                                 <span class="agent-project-name">{label}</span>
                                                 <span class="agent-project-count">{agent_count.to_string()}</span>
                                             </h2>
+                                            {swarm_rows}
                                             {rows}
                                         </section>
                                     }
@@ -470,6 +547,85 @@ fn render_agents_body(
                 }}
         </div>
     }.into_any()
+}
+
+fn swarm_working_count(swarm: &Swarm) -> usize {
+    swarm
+        .members
+        .iter()
+        .filter(|member| {
+            member.state == SwarmMemberState::Live
+                && member.runtime_status == Some(AgentControlStatus::Thinking)
+        })
+        .count()
+}
+
+/// One row standing in for a swarm's hidden members. The lifecycle wins when
+/// it stops the swarm from working; otherwise any working member makes the
+/// whole swarm working.
+fn swarm_row(
+    host: Option<LocalHostId>,
+    swarm: Swarm,
+    open_swarm: Callback<(LocalHostId, SwarmId)>,
+) -> AnyView {
+    let working = swarm_working_count(&swarm);
+    let members = swarm
+        .members
+        .iter()
+        .filter(|member| member.state != SwarmMemberState::Retired)
+        .count();
+    let (status, tone, pill) = match swarm.lifecycle {
+        SwarmLifecycle::Pausing => ("Pausing", StatusTone::Muted, PillTone::Neutral),
+        SwarmLifecycle::Paused => ("Paused", StatusTone::Muted, PillTone::Neutral),
+        SwarmLifecycle::AttentionRequired => {
+            ("Needs attention", StatusTone::Pending, PillTone::Warning)
+        }
+        SwarmLifecycle::Running | SwarmLifecycle::Transitioning if working > 0 => {
+            ("Working", StatusTone::Active, PillTone::Accent)
+        }
+        SwarmLifecycle::Running | SwarmLifecycle::Transitioning => {
+            ("Idle", StatusTone::Online, PillTone::Success)
+        }
+    };
+    let counts = format!(
+        "{members} agent{} · {working} working",
+        if members == 1 { "" } else { "s" }
+    );
+    let name = swarm.name.clone();
+    let swarm_id = swarm.id.clone();
+    let on_click = Callback::new(move |_: ()| {
+        if let Some(host) = host.clone() {
+            open_swarm.run((host, swarm_id.clone()));
+        }
+    });
+    view! {
+        <div class="agent-row-group" data-mobile-test="agent-swarm-row">
+            <Card
+                data_mobile_test="agent-swarm-open"
+                interactive=true
+                dense=true
+                on_click=on_click
+                aria_label=format!("Open swarm {name}")
+            >
+                <div class="list-row list-row-flush">
+                    <StatusDot label=status.to_string() tone=tone />
+                    <div class="list-row-primary">
+                        <div class="list-row-title">{format!("Swarm: {name}")}</div>
+                        <div class="list-row-subtitle">
+                            <Pill
+                                label=status.to_string()
+                                tone=pill
+                                data_mobile_test="agent-swarm-status"
+                            />
+                            <span style="margin-left: var(--space-2);">{counts}</span>
+                        </div>
+                    </div>
+                    <span class="list-row-chevron" aria-hidden="true">"\u{203A}"</span>
+                </div>
+            </Card>
+        </div>
+    }
+    .into_any()
 }
 
 fn agent_row(
@@ -1417,6 +1573,186 @@ mod wasm_tests {
             tyde_groups.length(),
             1,
             "the sub-agent stays nested under its parent inside the section"
+        );
+
+        clear_hide_sub_agents_pref();
+    }
+    /// Swarm members (and agents they own) are replaced in the Agents list by
+    /// one summary row per swarm, filed under the swarm's project. Project
+    /// counts and the sub-agent toggle only reflect rendered rows, the row's
+    /// status follows member runtime status and the swarm lifecycle, and
+    /// tapping it opens that swarm.
+    #[wasm_bindgen_test]
+    async fn agents_replace_swarm_members_with_a_swarm_row() {
+        set_hide_sub_agents_pref(false);
+        let _sends = crate::bridge::test_capture_sends();
+        let host = LocalHostId("host-swarm-row".to_owned());
+        let state = AppState::new();
+        let project = |id: &str, name: &str, sort_order| ProjectInfo {
+            local_host_id: host.clone(),
+            project: protocol::Project {
+                id: ProjectId(id.to_owned()),
+                name: name.to_owned(),
+                sort_order,
+                source: protocol::ProjectSource::Standalone { roots: Vec::new() },
+            },
+        };
+        let projects = vec![project("tyde", "Tyde", 0), project("bamboo", "Bamboo", 1)];
+
+        let mut normal = fixture(&host, "normal", "Normal agent", None);
+        normal.project_id = Some(ProjectId("tyde".to_owned()));
+        let mut fable = fixture(&host, "fable", "Fable", None);
+        fable.origin = AgentOrigin::SwarmMember;
+        fable.project_id = Some(ProjectId("bamboo".to_owned()));
+        let mut helper = child_fixture(&host, "helper", "Fable helper", "fable");
+        helper.origin = AgentOrigin::AgentControl;
+        helper.project_id = Some(ProjectId("bamboo".to_owned()));
+        let mut sol = fixture(&host, "sol", "Sol", None);
+        sol.origin = AgentOrigin::SwarmMember;
+        sol.project_id = Some(ProjectId("bamboo".to_owned()));
+        let agents = vec![normal, fable, helper, sol];
+
+        let mut swarm = crate::components::swarms_view::wasm_tests::fixture_swarm();
+        swarm.name = "Bamboo crew".to_owned();
+        swarm.constraints.project_id = ProjectId("bamboo".to_owned());
+        let template = swarm.members[0].clone();
+        swarm.members = [
+            ("fable", "Fable", AgentControlStatus::Thinking),
+            ("sol", "Sol", AgentControlStatus::Idle),
+        ]
+        .into_iter()
+        .map(|(id, name, status)| {
+            let mut member = template.clone();
+            member.spec.id = protocol::SwarmMemberId(id.to_owned());
+            member.spec.name = name.to_owned();
+            member.state = SwarmMemberState::Live;
+            member.agent_id = Some(AgentId(id.to_owned()));
+            member.runtime_status = Some(status);
+            member
+        })
+        .collect();
+        let swarm_id = swarm.id.clone();
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, &host, |bootstrap| {
+            bootstrap.swarms = vec![swarm.clone()]
+        });
+        state.active_local_host_id.set(Some(host.clone()));
+        state.projects.set(projects);
+        state.agents.set(agents);
+        let update_swarm = |update: &dyn Fn(&mut Swarm)| {
+            state.swarms_by_host.update(|by_host| {
+                update(
+                    by_host
+                        .get_mut(&host)
+                        .and_then(|swarms| swarms.get_mut(&swarm_id))
+                        .unwrap(),
+                )
+            });
+        };
+
+        let container = make_container();
+        let mount_state = state.clone();
+        let _mount = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Normal agent"),
+            "normal agent stays listed: {text}"
+        );
+        for hidden in ["Fable", "Sol", "sub-agent"] {
+            assert!(
+                !text.contains(hidden),
+                "{hidden:?} is swarm-owned and must not appear in the Agents list: {text}"
+            );
+        }
+        let headings = container
+            .query_selector_all("[data-mobile-test='agent-project-heading']")
+            .unwrap();
+        let headings: Vec<String> = (0..headings.length())
+            .map(|index| {
+                headings
+                    .item(index)
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            headings,
+            vec!["Tyde1".to_owned(), "Bamboo1".to_owned()],
+            "each project counts only its rendered rows: one agent, one swarm"
+        );
+        let row_text = || {
+            container
+                .query_selector("[data-mobile-test='agent-swarm-row']")
+                .unwrap()
+                .expect("the swarm row renders")
+                .text_content()
+                .unwrap_or_default()
+        };
+        let bamboo_section = container
+            .query_selector_all("[data-mobile-test='agent-project-section']")
+            .unwrap()
+            .item(1)
+            .unwrap()
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            bamboo_section.contains("Bamboo crew"),
+            "the swarm row sits in the members' project: {bamboo_section}"
+        );
+        assert!(
+            row_text().contains("Working") && row_text().contains("2 agents · 1 working"),
+            "a working member makes the swarm working: {}",
+            row_text()
+        );
+
+        update_swarm(&|swarm| swarm.members[0].runtime_status = Some(AgentControlStatus::Idle));
+        next_tick().await;
+        assert!(
+            row_text().contains("Idle") && row_text().contains("2 agents · 0 working"),
+            "with no working member the swarm reads idle: {}",
+            row_text()
+        );
+        update_swarm(&|swarm| swarm.members[1].runtime_status = Some(AgentControlStatus::Thinking));
+        next_tick().await;
+        assert!(
+            row_text().contains("Working") && row_text().contains("2 agents · 1 working"),
+            "the row flips back to working: {}",
+            row_text()
+        );
+        update_swarm(&|swarm| swarm.lifecycle = SwarmLifecycle::Paused);
+        next_tick().await;
+        assert!(
+            row_text().contains("Paused") && !row_text().contains("Working"),
+            "a paused swarm reads paused: {}",
+            row_text()
+        );
+
+        container
+            .query_selector("[data-mobile-test='agent-swarm-open']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='swarm-briefing']")
+                .unwrap()
+                .is_some(),
+            "tapping the swarm row opens that swarm's conversation"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Bamboo crew"),
+            "the opened swarm is the one tapped"
         );
 
         clear_hide_sub_agents_pref();

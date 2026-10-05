@@ -5259,6 +5259,7 @@ input, textarea, select {
 .mobile-swarm-members summary, .mobile-swarm-legacy summary, .mobile-swarm-mention-picker summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 .mobile-swarm-member { display: flex; gap: 12px; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--border-default); }
 .mobile-swarm-member strong { color: var(--text-primary); overflow-wrap: anywhere; }
+button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; border-right: 0; border-bottom: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .mobile-swarm-composer { display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--border-default); background: var(--bg-surface); border-radius: 16px; margin-top: 8px; min-width: 0; }
 .mobile-swarm-composer label { font-size: 13px; font-weight: 600; }
 .mobile-swarm-composer textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 88px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-base); color: var(--text-primary); font: inherit; font-size: 16px; line-height: 1.5; padding: 12px; }

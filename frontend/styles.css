@@ -6800,6 +6800,21 @@ math merror {
     font-size: 0.846rem;
 }
 
+.agent-sidebar-swarm-row {
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+}
+
+.agent-sidebar-swarm-row .agent-card-name {
+    flex: 1;
+}
+
+.agent-sidebar-swarm-counts {
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+}
+
 .agent-card-status.starting,
 .agent-card-status.running {
     color: var(--accent-primary);
