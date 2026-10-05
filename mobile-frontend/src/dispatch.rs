@@ -1043,6 +1043,17 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 Err(_) => invalid_swarm_payload(state, host),
             }
         }
+        FrameKind::SwarmImageNotify => {
+            match envelope.parse_payload::<protocol::SwarmImageNotifyPayload>() {
+                Ok(payload) => state.swarm_images.update(|images| {
+                    images.insert(
+                        (host.clone(), payload.swarm_id, payload.image_id),
+                        payload.outcome,
+                    );
+                }),
+                Err(_) => invalid_swarm_payload(state, host),
+            }
+        }
         FrameKind::SwarmBoardNotify => {
             match envelope.parse_payload::<protocol::SwarmBoardNotifyPayload>() {
                 Ok(payload) => {
@@ -1054,11 +1065,15 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         let pages = m.entry((host.clone(), page.swarm_id.clone())).or_default();
                         let retain_progress = pages.iter().any(|existing| {
                             existing.board == page.board
+                                && existing.next_cursor.target == page.next_cursor.target
                                 && (existing.next_cursor.position > page.next_cursor.position
                                     || (!existing.has_more && page.has_more))
                         });
                         if !retain_progress {
-                            pages.retain(|existing| existing.board != page.board);
+                            pages.retain(|existing| {
+                                existing.board != page.board
+                                    || existing.next_cursor.target != page.next_cursor.target
+                            });
                             pages.push(page);
                         }
                     });
@@ -3027,6 +3042,9 @@ fn apply_host_bootstrap(
     state
         .swarm_posts
         .update(|m| m.retain(|(h, _), _| h != host));
+    state
+        .swarm_images
+        .update(|m| m.retain(|(h, _, _), _| h != host));
     state
         .swarm_board_pages
         .update(|m| m.retain(|(h, _), _| h != host));

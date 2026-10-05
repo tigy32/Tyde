@@ -1342,7 +1342,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read ordered Briefing or Coordination post/reply activity in your authenticated swarm. Default limit 50, maximum 100. Return next_cursor, snapshot high_water, and has_more. Reading never creates wake notifications.",
+        description = "Read Briefing or Coordination in your authenticated swarm. Default view posts returns ordered post/reply activity; view threads returns only roots, newest root creation first, never reordered by replies. Default limit 50, maximum 100. Return next_cursor, snapshot high_water, and has_more; cursors are bound to their board and view. Reading never creates wake notifications.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

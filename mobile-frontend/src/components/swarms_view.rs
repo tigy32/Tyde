@@ -136,7 +136,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
         let (host, _) = target.get_value();
         send(command_state.clone(), host, command, error);
     });
-    let marked = RwSignal::new(Vec::<(SwarmBoard, u64)>::new());
+    let compose_open = RwSignal::new(false);
     let connection = Memo::new(move |_| {
         let (host, _) = target.get_value();
         let connected = state
@@ -171,6 +171,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
             None => command.run(SwarmCommandPayload::ReadBoard {
                 swarm_id: id,
                 query: SwarmBoardRead {
+                    view: protocol::SwarmBoardView::Threads,
                     board: current,
                     after_cursor: None,
                     limit: None,
@@ -192,44 +193,6 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
             linked_post.set(None);
         }
     });
-    Effect::new(move |_| {
-        connection.track();
-        marked.set(Vec::new());
-    });
-    Effect::new(move |_| {
-        if thread.get().is_some() || connection.get().is_none() {
-            return;
-        }
-        let current = board.get();
-        let Some(swarm) = swarm.get() else {
-            return;
-        };
-        let Some(position) = swarm.board_positions.iter().find(|p| p.board == current) else {
-            return;
-        };
-        let (host, id) = target.get_value();
-        let loaded = state.swarm_board_pages.with(|m| {
-            m.get(&(host.clone(), id.clone()))
-                .is_some_and(|pages| pages.iter().any(|p| p.board == current && !p.has_more))
-        }) && state.swarm_posts.with(|m| {
-            m.get(&(host, id)).is_some_and(|posts| {
-                posts
-                    .values()
-                    .any(|post| post.board == current && post.cursor == position.high_water)
-            })
-        });
-        if loaded
-            && position.unread_count > 0
-            && !marked.with_untracked(|m| m.contains(&(current, position.high_water)))
-        {
-            marked.update(|m| m.push((current, position.high_water)));
-            command.run(SwarmCommandPayload::MarkRead {
-                swarm_id: swarm.id,
-                board: current,
-                cursor: position.high_water,
-            });
-        }
-    });
     let posts = Memo::new(move |_| {
         let (host, id) = target.get_value();
         let current = board.get();
@@ -242,14 +205,18 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
                             post.board == current
                                 && selected_thread
                                     .as_ref()
-                                    .is_none_or(|t| &post.thread_id == t)
+                                    .map_or(post.id.0 == post.thread_id.0, |t| &post.thread_id == t)
                         })
                         .cloned()
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
         });
-        posts.sort_by_key(|post| post.cursor);
+        if selected_thread.is_some() {
+            posts.sort_by_key(|post| post.cursor);
+        } else {
+            posts.sort_by_key(|post| std::cmp::Reverse((post.created_at_ms, post.cursor)));
+        }
         posts
     });
     let page = Memo::new(move |_| {
@@ -261,7 +228,12 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
             }),
             None => state.swarm_board_pages.with(|m| {
                 m.get(&(host, id))
-                    .and_then(|pages| pages.iter().find(|p| p.board == board.get()))
+                    .and_then(|pages| {
+                        pages.iter().find(|p| {
+                            p.next_cursor.target
+                                == protocol::SwarmCursorTarget::BoardThreads { board: board.get() }
+                        })
+                    })
                     .map(|p| (p.next_cursor.clone(), p.has_more))
             }),
         }
@@ -275,42 +247,60 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
     });
     view! {
         <section class="mobile-swarm-conversation" data-mobile-test="swarm-conversation">
-            <button class="mobile-swarm-back" type="button" on:click=move |_| on_back.run(())>"← All swarms"</button>
-            <header class="mobile-swarm-header"><div><h2>{move || swarm.get().map(|s| s.name)}</h2><span class="mobile-swarm-muted">{move || swarm.get().map(|s| lifecycle_label(s.lifecycle))}</span></div>
+            <header class="mobile-swarm-header"><button class="mobile-swarm-back mobile-swarm-back-icon" type="button" aria-label="All swarms" title="All swarms" on:click=move |_| on_back.run(())>"←"</button><div><h2>{move || swarm.get().map(|s| s.name)}</h2><span class="mobile-swarm-muted">{move || swarm.get().map(|s| lifecycle_label(s.lifecycle))}</span></div>
                 <button type="button" class="mobile-swarm-control" data-mobile-test="swarm-pause-resume" disabled=move || swarm.get().is_none_or(|s| s.lifecycle == SwarmLifecycle::Pausing) on:click=move |_| {
                     if let Some(s) = swarm.get_untracked() {
                         command.run(if matches!(s.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired) { SwarmCommandPayload::Resume { swarm_id: s.id } } else { SwarmCommandPayload::Pause { swarm_id: s.id } });
                     }
                 }>{move || if swarm.get().is_some_and(|s| matches!(s.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired)) { "Resume" } else { "Pause" }}</button>
             </header>
-            <details class="mobile-swarm-members"><summary>{move || swarm.get().map(|s| format!("{} agents", s.members.iter().filter(|m| m.state != SwarmMemberState::Retired).count()))}</summary>
-                {move || swarm.get().map(|s| s.members.into_iter().map(|member| view! { <div class="mobile-swarm-member"><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}</span></div> }).collect_view())}
-            </details>
+
+
             {move || error.get().map(|message| view! { <div role="alert" class="mobile-swarm-error">{message}<button type="button" on:click=move |_| error.set(None)>"Dismiss"</button></div> })}
             {move || swarm.get().and_then(|s| s.error).map(|message| view! { <p role="alert" class="mobile-swarm-error">{message}</p> })}
             <SwarmErrors host=target.get_value().0 swarm_id=Some(target.get_value().1) />
+            <div class="mobile-swarm-navigation">
             <nav class="mobile-swarm-boards" role="tablist" aria-label="Swarm conversations">
-                <button type="button" role="tab" aria-selected=move || (board.get() == SwarmBoard::Briefing).to_string() on:click=move |_| { board.set(SwarmBoard::Briefing); thread.set(None); } data-mobile-test="swarm-briefing">"Briefing"</button>
-                <button type="button" role="tab" aria-selected=move || (board.get() == SwarmBoard::Coordination).to_string() on:click=move |_| { board.set(SwarmBoard::Coordination); thread.set(None); } data-mobile-test="swarm-coordination">"Coordination"</button>
+                <button type="button" role="tab" aria-selected=move || (board.get() == SwarmBoard::Briefing).to_string() on:click=move |_| { board.set(SwarmBoard::Briefing); thread.set(None); compose_open.set(false); } data-mobile-test="swarm-briefing">"Requests"</button>
+                <button type="button" role="tab" aria-selected=move || (board.get() == SwarmBoard::Coordination).to_string() on:click=move |_| { board.set(SwarmBoard::Coordination); thread.set(None); compose_open.set(false); } data-mobile-test="swarm-coordination">"Coordination"</button>
             </nav>
-            <p class="mobile-swarm-board-hint">{move || if board.get() == SwarmBoard::Briefing { "Talk to your swarm. Everyone shares the context." } else { "The agents’ shared message board. Follow along or @mention someone." }}</p>
-            <Show when=move || thread.get().is_some()><button class="mobile-swarm-back" type="button" on:click=move |_| thread.set(None)>"← Back to board"</button></Show>
+            <details class="mobile-swarm-members"><summary>{move || swarm.get().map(|s| format!("{} agents", s.members.iter().filter(|m| m.state != SwarmMemberState::Retired).count()))}</summary>
+                {move || swarm.get().map(|s| s.members.into_iter().map(|member| view! { <div class="mobile-swarm-member"><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}</span></div> }).collect_view())}
+            </details>
+            </div>
+            <p class="mobile-swarm-board-hint">{move || if board.get() == SwarmBoard::Briefing { "One request, one thread. Newest requests first." } else { "Peer planning and working conversation, kept separate from your requests." }}</p>
+            <Show when=move || thread.get().is_some()><button class="mobile-swarm-back" type="button" data-mobile-test="swarm-back-to-board" on:click=move |_| { thread.set(None); compose_open.set(false); }>"← Back to threads"</button></Show>
+            <Show when=move || thread.get().is_none()>
+                <div class="mobile-swarm-inbox-heading"><span class="mobile-swarm-muted">{move || if board.get() == SwarmBoard::Briefing { "Your requests" } else { "Coordination threads" }}</span><button type="button" class="mobile-swarm-control" data-mobile-test="swarm-new-thread" on:click=move |_| compose_open.set(true)>{move || if board.get() == SwarmBoard::Briefing { "+ New request" } else { "+ New thread" }}</button></div>
+            </Show>
             <div class="mobile-swarm-posts" role="tabpanel">
-                <Show when=move || posts.with(|p| p.is_empty())><div class="mobile-swarm-empty"><h3>{move || if page.get().is_none() { "Loading conversation…" } else if board.get() == SwarmBoard::Briefing { "What would you like to work on?" } else { "Room to coordinate" }}</h3><p>{move || if page.get().is_none() { "Waiting for the host." } else { "Send a message below to start the conversation." }}</p></div></Show>
+                <Show when=move || posts.with(|p| p.is_empty())><div class="mobile-swarm-empty"><h3>{move || if page.get().is_none() { "Loading conversation…" } else if board.get() == SwarmBoard::Briefing { "What would you like to work on?" } else { "Room to coordinate" }}</h3><p>{move || if page.get().is_none() { "Waiting for the host." } else { "Start a new thread when you are ready." }}</p></div></Show>
                 <For each={move || posts.get().into_iter().map(|p| p.id).collect::<Vec<_>>()} key={|id| id.clone()} let:post_id>
-                    <SwarmPostCard target=target post_id=post_id swarm=swarm on_reply=Callback::new(move |value| thread.set(Some(value))) on_link=open_link />
+                    {move || if thread.get().is_some() {
+                        view! { <SwarmPostCard target=target post_id=post_id.clone() swarm=swarm on_reply=Callback::new(move |value| thread.set(Some(value))) on_link=open_link /> }.into_any()
+                    } else {
+                        view! { <SwarmThreadCard target=target post_id=post_id.clone() swarm=swarm on_open=Callback::new(move |value| { compose_open.set(false); thread.set(Some(value)); }) /> }.into_any()
+                    }}
                 </For>
                 <Show when=move || page.get().is_some_and(|(_, more)| more)><button type="button" class="mobile-swarm-control" data-mobile-test="swarm-more" on:click=move |_| {
                     if let Some((cursor, _)) = page.get_untracked() {
                         let id = target.get_value().1;
                         command.run(match thread.get_untracked() {
                             Some(thread_id) => SwarmCommandPayload::ReadThread { swarm_id: id, query: SwarmThreadRead { thread_id, after_cursor: Some(cursor), limit: None } },
-                            None => SwarmCommandPayload::ReadBoard { swarm_id: id, query: SwarmBoardRead { board: board.get_untracked(), after_cursor: Some(cursor), limit: None } },
+                            None => SwarmCommandPayload::ReadBoard { swarm_id: id, query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Threads, board: board.get_untracked(), after_cursor: Some(cursor), limit: None } },
                         });
                     }
                 }>"Load more"</button></Show>
             </div>
-            <SwarmComposer target=target board=board thread=thread swarm=swarm />
+            <div class="mobile-swarm-compose" hidden=move || thread.get().is_none() && !compose_open.get()>
+                <Show when=move || thread.get().is_none()><button type="button" class="mobile-swarm-back" on:click=move |_| compose_open.set(false)>"Close composer · keep draft"</button></Show>
+                <SwarmComposer target=target board=board thread=thread swarm=swarm on_published=Callback::new(move |post: protocol::SwarmPost| {
+                    if thread.get_untracked().is_none() && board.get_untracked() == post.board && post.id.0 == post.thread_id.0
+                        && state.swarm_composer_drafts.with_untracked(|drafts| drafts.iter().any(|draft| (draft.host.clone(), draft.swarm_id.clone()) == target.get_value() && draft.board == post.board && draft.thread_id.is_none() && draft.text.is_empty() && draft.mentions.is_empty() && !draft.pending))
+                    { compose_open.set(false); }
+                }) />
+            </div>
         </section>
     }
 }
@@ -342,6 +332,41 @@ fn author_name(author: &SwarmAuthor, swarm: Option<&Swarm>) -> String {
 }
 
 #[component]
+fn SwarmThreadCard(
+    target: StoredValue<(LocalHostId, SwarmId)>,
+    post_id: SwarmPostId,
+    swarm: Memo<Option<Swarm>>,
+    on_open: Callback<SwarmThreadId>,
+) -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let post_id = StoredValue::new(post_id);
+    let root = Memo::new(move |_| {
+        state.swarm_posts.with(|map| {
+            map.get(&target.get_value())
+                .and_then(|posts| posts.get(&post_id.get_value()))
+                .cloned()
+        })
+    });
+    view! {
+        <button type="button" class="mobile-swarm-thread" data-mobile-test="swarm-thread" on:click=move |_| { if let Some(root) = root.get_untracked() { on_open.run(root.thread_id); } }>
+            <span class="mobile-swarm-thread-meta"><span>{move || root.get().map(|root| author_name(&root.author, swarm.get().as_ref()))}</span><time>{move || root.get().map(|root| {
+                let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(root.created_at_ms as f64));
+                format!("{:02}/{:02} {:02}:{:02}", date.get_month() + 1, date.get_date(), date.get_hours(), date.get_minutes())
+            })}</time></span>
+            <span class="mobile-swarm-thread-content"><span class="mobile-swarm-thread-title">{move || root.get().map(|root| {
+                if root.body.is_empty() { return format!("{} shared images", root.images.len()); }
+                root.body.into_iter().map(|segment| match segment {
+                    SwarmBodySegment::Text { text } => text,
+                    SwarmBodySegment::MemberMention { member_id } => format!("@{} ", author_name(&SwarmAuthor::Member { member_id }, swarm.get().as_ref())),
+                    SwarmBodySegment::PostLink { .. } => "Referenced post ↗".to_owned(),
+                }).collect::<String>()
+            })}</span>
+            <span class="mobile-swarm-thread-open">"Open →"</span></span>
+        </button>
+    }
+}
+
+#[component]
 fn SwarmPostCard(
     target: StoredValue<(LocalHostId, SwarmId)>,
     post_id: SwarmPostId,
@@ -367,8 +392,75 @@ fn SwarmPostCard(
                 SwarmBodySegment::PostLink { post_id } => view! { <button type="button" class="mobile-swarm-link" on:click=move |_| on_link.run(post_id.clone())>"Referenced post ↗"</button> }.into_any(),
             }).collect_view())}</div>
             {move || post.get().map(|p| p.attachments.into_iter().map(|a| view! { <p class="mobile-swarm-attachment">{format!("📄 {}", a.path.relative_path)}</p> }).collect_view())}
+            <div class="mobile-swarm-images">{move || post.get().map(|p| p.images.into_iter().map(|image| view! { <SwarmSharedImage target=target image=image /> }).collect_view())}</div>
             <button type="button" class="mobile-swarm-link" data-mobile-test="swarm-reply" on:click=move |_| { if let Some(p) = post.get_untracked() { on_reply.run(p.thread_id); } }>"Open thread / Reply"</button>
         </article>
+    }
+}
+
+#[component]
+fn SwarmSharedImage(
+    target: StoredValue<(LocalHostId, SwarmId)>,
+    image: protocol::SwarmImage,
+) -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let image = StoredValue::new(image);
+    let requested = RwSignal::new(None::<protocol::StreamPath>);
+    let error = RwSignal::new(None::<String>);
+    let outcome = Memo::new(move |_| {
+        let (host, swarm) = target.get_value();
+        state.swarm_images.with(|images| {
+            images
+                .get(&(host, swarm, image.with_value(|image| image.id.clone())))
+                .cloned()
+        })
+    });
+    let read_state = state.clone();
+    let read = Callback::new(move |_| {
+        let (host, swarm_id) = target.get_value();
+        error.set(None);
+        send(
+            read_state.clone(),
+            host,
+            SwarmCommandPayload::ReadImage {
+                swarm_id,
+                image_id: image.with_value(|image| image.id.clone()),
+            },
+            error,
+        );
+    });
+    Effect::new(move |_| {
+        let (host, _) = target.get_value();
+        let Some(stream) = state
+            .bootstrapped_host_streams
+            .with(|streams| streams.get(&host).cloned())
+        else {
+            return;
+        };
+        if state
+            .host_streams
+            .with(|streams| streams.get(&host).cloned())
+            != Some(stream.clone())
+            || requested.get_untracked().as_ref() == Some(&stream)
+        {
+            return;
+        }
+        requested.set(Some(stream));
+        read.run(());
+    });
+    view! {
+        <figure class="mobile-swarm-image" data-mobile-test="swarm-image">
+            {move || match outcome.get() {
+                Some(protocol::SwarmImageOutcome::Ready { data: Some(data), .. }) => {
+                    let src = format!("data:{};base64,{}", data.media_type, data.data);
+                    view! { <a href=src.clone() target="_blank" rel="noopener" aria-label="Open shared image full size"><img src=src.clone() alt=image.with_value(|image| image.name.clone()) loading="lazy" on:error=move |_| error.set(Some("This browser could not display the shared image.".into())) /></a> }.into_any()
+                },
+                Some(protocol::SwarmImageOutcome::Failed { error: failure }) => view! { <p role="alert" class="mobile-swarm-error">{failure.message}<button type="button" class="mobile-swarm-link" on:click=move |_| read.run(())>"Retry image"</button></p> }.into_any(),
+                _ => view! { <p class="mobile-swarm-muted">"Loading shared image…"</p> }.into_any(),
+            }}
+            <figcaption>{image.with_value(|image| image.name.clone())}</figcaption>
+            {move || error.get().map(|message| view! { <p role="alert" class="mobile-swarm-error">{message}<button type="button" class="mobile-swarm-link" on:click=move |_| read.run(())>"Retry image"</button></p> })}
+        </figure>
     }
 }
 
@@ -378,8 +470,28 @@ fn SwarmComposer(
     board: RwSignal<SwarmBoard>,
     thread: RwSignal<Option<SwarmThreadId>>,
     swarm: Memo<Option<Swarm>>,
+    on_published: Callback<protocol::SwarmPost>,
 ) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    let submitted = RwSignal::new(None::<SwarmPublicationId>);
+    Effect::new(move |_| {
+        let Some(publication_id) = submitted.get() else {
+            return;
+        };
+        let acknowledged = state.swarm_posts.with(|map| {
+            map.get(&target.get_value())
+                .and_then(|posts| {
+                    posts.values().find(|post| {
+                        post.author == SwarmAuthor::Human && post.publication_id == publication_id
+                    })
+                })
+                .cloned()
+        });
+        if let Some(post) = acknowledged {
+            submitted.set(None);
+            on_published.run(post);
+        }
+    });
     let draft_index = Memo::new(move |_| {
         let (host, swarm_id) = target.get_value();
         let board = board.get();
@@ -519,6 +631,7 @@ fn SwarmComposer(
             drafts[index].pending = true;
             drafts[index].error = None;
         });
+        submitted.set(Some(publication_id.clone()));
         let (host, swarm_id) = target.get_value();
         let state = submit_state.clone();
         spawn_local(async move {
@@ -629,7 +742,22 @@ mod wasm_tests {
             })
             .collect()
     }
-    fn input(container: &HtmlElement, text: &str) {
+    async fn input(container: &HtmlElement, text: &str) {
+        if element(container, "swarm-message")
+            .get_bounding_client_rect()
+            .height()
+            == 0.0
+        {
+            element(container, "swarm-new-thread").click();
+            tick().await;
+        }
+        assert!(
+            element(container, "swarm-message")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0,
+            "typing uses a visibly opened request or reply composer"
+        );
         let input: HtmlTextAreaElement = element(container, "swarm-message").dyn_into().unwrap();
         input.set_value(text);
         input
@@ -652,7 +780,7 @@ mod wasm_tests {
             author: SwarmAuthor::Human,
             cursor,
             round_id: protocol::SwarmRoundId("round".into()),
-            created_at_ms: 0,
+            created_at_ms: cursor * 1000,
         }
     }
     fn empty_page(swarm: &Swarm, board: SwarmBoard) -> SwarmBoardPage {
@@ -662,7 +790,7 @@ mod wasm_tests {
             posts: Vec::new(),
             next_cursor: SwarmReadCursor {
                 swarm_id: swarm.id.clone(),
-                target: SwarmCursorTarget::Board { board },
+                target: SwarmCursorTarget::BoardThreads { board },
                 position: 0,
                 snapshot_high_water: 0,
             },
@@ -810,7 +938,7 @@ mod wasm_tests {
                 .unwrap()
                 .contains("What would you like to work on?")
         );
-        input(&container, "Let's discuss this project.");
+        input(&container, "Let's discuss this project.").await;
         tick().await;
         element(&container, "swarm-send").click();
         tick().await;
@@ -831,6 +959,14 @@ mod wasm_tests {
             "explicit retry preserves the unconfirmed publication identity"
         );
         let first = acknowledged(&swarm, posts()[0].clone(), 1);
+        let shared_image = protocol::SwarmImage {
+            id: protocol::SwarmImageId("5e8c5c8e-3aab-43d0-b285-1966331e6f9d".into()),
+            name: "Reference.png".into(),
+            media_type: "image/png".into(),
+            width: 16,
+            height: 12,
+            byte_len: 78,
+        };
         emit(
             &state,
             &host,
@@ -849,12 +985,38 @@ mod wasm_tests {
             ""
         );
         assert!(
-            element(&container, "swarm-post")
+            element(&container, "swarm-thread")
                 .text_content()
                 .unwrap()
                 .contains("Let's discuss this project.")
         );
-        input(&container, "Keep this briefing draft");
+        assert_eq!(
+            container
+                .query_selector_all("[data-mobile-test='swarm-post']")
+                .unwrap()
+                .length(),
+            0
+        );
+        assert_eq!(
+            element(&container, "swarm-message")
+                .get_bounding_client_rect()
+                .height(),
+            0.0,
+            "root-only inbox does not reserve a composer when it is closed"
+        );
+        assert!(
+            !commands()
+                .iter()
+                .any(|command| matches!(command, SwarmCommandPayload::ReadImage { .. })),
+            "inbox does not download full-size media before opening its thread"
+        );
+        let conversation = element(&container, "swarm-conversation").get_bounding_client_rect();
+        let first_row = element(&container, "swarm-thread").get_bounding_client_rect();
+        assert!(
+            first_row.top() - conversation.top() <= 220.0,
+            "compact mobile controls leave the viewport for requests"
+        );
+        input(&container, "Keep this briefing draft").await;
         element(&container, "swarm-coordination").click();
         tick().await;
         emit(
@@ -867,7 +1029,7 @@ mod wasm_tests {
             },
         );
         tick().await;
-        input(&container, "Can you review this?");
+        input(&container, "Can you review this?").await;
         container
             .query_selector(".mobile-swarm-mention-picker summary")
             .unwrap()
@@ -969,10 +1131,10 @@ mod wasm_tests {
             )
         }));
         let mut first_page = empty_page(&swarm, SwarmBoard::Briefing);
-        first_page.posts = history.iter().take(50).cloned().collect();
+        first_page.posts = history.iter().rev().take(50).cloned().collect();
         first_page.has_more = true;
         first_page.high_water = 62;
-        first_page.next_cursor.position = 51;
+        first_page.next_cursor.position = 50;
         first_page.next_cursor.snapshot_high_water = 62;
         emit(
             &state,
@@ -988,9 +1150,9 @@ mod wasm_tests {
         tick().await;
         assert!(commands().iter().any(|c| matches!(c, SwarmCommandPayload::ReadBoard { query, .. } if query.after_cursor.as_ref() == Some(&first_page.next_cursor))));
         let mut complete_page = first_page.clone();
-        complete_page.posts = history.iter().skip(50).cloned().collect();
+        complete_page.posts = history.iter().rev().skip(50).cloned().collect();
         complete_page.has_more = false;
-        complete_page.next_cursor.position = 62;
+        complete_page.next_cursor.position = 61;
         emit(
             &state,
             &host,
@@ -1003,12 +1165,42 @@ mod wasm_tests {
         tick().await;
         assert_eq!(
             container
-                .query_selector_all("[data-mobile-test='swarm-post']")
+                .query_selector_all("[data-mobile-test='swarm-thread']")
                 .unwrap()
                 .length(),
             61
         );
-        element(&container, "swarm-reply").click();
+        assert_eq!(
+            container
+                .query_selector_all("[data-mobile-test='swarm-post']")
+                .unwrap()
+                .length(),
+            0,
+            "the inbox contains requests, not every reply"
+        );
+        let rows = container
+            .query_selector_all("[data-mobile-test='swarm-thread']")
+            .unwrap();
+        assert!(
+            rows.item(0)
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Earlier discussion 62")
+        );
+        let original = rows.item(60).unwrap().dyn_into::<HtmlElement>().unwrap();
+        assert!(
+            original
+                .text_content()
+                .unwrap()
+                .contains("Let's discuss this project.")
+        );
+        assert!(
+            original.get_bounding_client_rect().height() <= 120.0
+                && original.get_bounding_client_rect().height() >= 44.0,
+            "compact request cards remain touchable"
+        );
+        original.click();
         tick().await;
         assert!(
             commands()
@@ -1041,7 +1233,7 @@ mod wasm_tests {
                 post: reply.clone(),
             },
         );
-        input(&container, "Thread draft stays separate");
+        input(&container, "Thread draft stays separate").await;
         element(&container, "swarm-coordination").click();
         tick().await;
         assert_eq!(
@@ -1068,12 +1260,13 @@ mod wasm_tests {
                 .is_none(),
             "returning to a board preserves its completed pagination baseline"
         );
+        // The inbox now renders roots only. Marking the whole board read
+        // here would falsely consume replies in threads the user has not opened.
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("Agent answer is visible on the board"),
-            "reply activity is visible, not hidden beneath a root-only card"
+                .contains("Agent answer is visible on the board")
         );
         swarm.board_positions[0].high_water = 63;
         swarm.board_positions[0].unread_count = 1;
@@ -1088,7 +1281,7 @@ mod wasm_tests {
         );
         tick().await;
         assert!(
-            commands().iter().any(|c| matches!(
+            !commands().iter().any(|c| matches!(
                 c,
                 SwarmCommandPayload::MarkRead {
                     board: SwarmBoard::Briefing,
@@ -1096,9 +1289,42 @@ mod wasm_tests {
                     ..
                 }
             )),
-            "visible live replies are marked read after a complete initial page"
+            "root-only inbox cannot mark unseen reply activity read"
         );
-        input(&container, "Lost confirmation, recovered by fetching");
+        let rows = container
+            .query_selector_all("[data-mobile-test='swarm-thread']")
+            .unwrap();
+        assert!(
+            rows.item(0)
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Earlier discussion 62"),
+            "new replies do not reorder requests by agent activity"
+        );
+        rows.item(60)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Agent answer is visible on the board"),
+            "all reply activity remains reachable inside its request"
+        );
+        assert_eq!(
+            element(&container, "swarm-message")
+                .dyn_into::<HtmlTextAreaElement>()
+                .unwrap()
+                .value(),
+            "Thread draft stays separate"
+        );
+        element(&container, "swarm-back-to-board").click();
+        tick().await;
+        input(&container, "Lost confirmation, recovered by fetching").await;
         tick().await;
         element(&container, "swarm-send").click();
         tick().await;
@@ -1126,9 +1352,9 @@ mod wasm_tests {
             "reconnected open conversation reloads canonical board state"
         );
         let mut recovered_page = empty_page(&swarm, SwarmBoard::Briefing);
-        recovered_page.posts = vec![recovered, reply];
+        recovered_page.posts = vec![recovered];
         recovered_page.high_water = 64;
-        recovered_page.next_cursor.position = 64;
+        recovered_page.next_cursor.position = 1;
         recovered_page.next_cursor.snapshot_high_water = 64;
         emit(
             &state,
@@ -1181,10 +1407,10 @@ mod wasm_tests {
             })
             .collect::<Vec<_>>();
         let late_reply = replies.last().unwrap().clone();
-        let link_source = acknowledged(
+        let mut link_source = acknowledged(
             &swarm,
             SwarmPublication {
-                images: Vec::new(),
+                images: vec![shared_image.id.clone()],
                 board: SwarmBoard::Briefing,
                 publication_id: SwarmPublicationId("link-source".into()),
                 body: vec![SwarmBodySegment::PostLink {
@@ -1195,6 +1421,7 @@ mod wasm_tests {
             },
             1061,
         );
+        link_source.images.push(shared_image.clone());
         emit(
             &state,
             &host,
@@ -1203,6 +1430,36 @@ mod wasm_tests {
             &SwarmPostNotifyPayload { post: link_source },
         );
         tick().await;
+        element(&container, "swarm-thread").click();
+        tick().await;
+        assert!(commands().iter().any(|command| matches!(command, SwarmCommandPayload::ReadImage { swarm_id, image_id } if *swarm_id == swarm.id && *image_id == shared_image.id)));
+        emit(&state, &host, &mut seq, FrameKind::SwarmImageNotify, &protocol::SwarmImageNotifyPayload { swarm_id: swarm.id.clone(), image_id: shared_image.id.clone(), outcome: protocol::SwarmImageOutcome::Ready { image: shared_image, data: Some(protocol::ImageData { media_type: "image/png".into(), data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFUlEQVR4nGPg3fKVJMQwqmFUA3YEAK1USJCnamHcAAAAAElFTkSuQmCC".into() }) } });
+        tick().await;
+        let preview = container
+            .query_selector("[data-mobile-test='swarm-image'] img")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlImageElement>()
+            .unwrap();
+        preview.scroll_into_view();
+        tick().await;
+        web_sys::console::log_1(
+            &format!(
+                "Mobile shared image: complete={}, decoded_width={}, visible_height={}",
+                preview.complete(),
+                preview.natural_width(),
+                preview.get_bounding_client_rect().height(),
+            )
+            .into(),
+        );
+        wasm_bindgen_futures::JsFuture::from(preview.decode())
+            .await
+            .expect("visible shared pixels decode in the browser");
+        assert_eq!(
+            preview.natural_width(),
+            16,
+            "opened mobile threads display actual shared pixels"
+        );
         {
             let buttons = container.query_selector_all("button").unwrap();
             (0..buttons.length()).filter_map(move |index| {

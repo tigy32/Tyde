@@ -1140,7 +1140,8 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
             let accepted = client.swarm(&swarm_id, |swarm| swarm.notifications.iter().any(|intent| intent.id == pending_id && intent.state == SwarmDeliveryState::Accepted)).await;
             client.assert_accepted_once(&accepted, &initiator, &queued);
             client.quiescent(&swarm_id).await;
-            client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead { board: SwarmBoard::Briefing, after_cursor: None, limit: Some(100) } }).await;
+            client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts, board: SwarmBoard::Briefing, after_cursor: None, limit: Some(100) } }).await;
             let history: SwarmBoardNotifyPayload = client.wait(FrameKind::SwarmBoardNotify, "busy follow-up publication cardinality", |event: &SwarmBoardNotifyPayload| event.page.swarm_id == swarm_id && event.page.board == SwarmBoard::Briefing && event.page.posts.contains(&confirmed)).await;
             let confirmations = history.page.posts.iter().filter(|post| post.author == (SwarmAuthor::Member { member_id: initiator.clone() }) && post.round_id == queued.round_id && post.body.iter().any(|segment| matches!(segment, SwarmBodySegment::Text { text } if text.contains("BUSY_CONFIRMED")))).count();
             assert_eq!(confirmations, 1, "one busy notification must produce exactly one causal confirmation after native acceptance");
@@ -1180,13 +1181,15 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         for member in [&initiator, &responder] { client.assert_accepted_once(&resumed, member, &queued); }
         assert!(resumed.members.iter().all(|member| sessions.get(&member.spec.id) == member.session_id.as_ref()), "real restart must resume existing private sessions, not create replacements");
         client.quiescent(&swarm_id).await;
-        client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead { board: SwarmBoard::Briefing, after_cursor: None, limit: Some(100) } }).await;
+        client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts, board: SwarmBoard::Briefing, after_cursor: None, limit: Some(100) } }).await;
         let history: SwarmBoardNotifyPayload = client.wait(FrameKind::SwarmBoardNotify, "resumed confirmation cardinality", |event: &SwarmBoardNotifyPayload| event.page.swarm_id == swarm_id && event.page.board == SwarmBoard::Briefing && confirmations.iter().all(|post| event.page.posts.contains(post))).await;
         for member in [&initiator, &responder] {
             let count = history.page.posts.iter().filter(|post| post.author == (SwarmAuthor::Member { member_id: member.clone() }) && post.round_id == queued.round_id && post.body.iter().any(|segment| matches!(segment, SwarmBodySegment::Text { text } if text.contains("RESUME_CONFIRMED")))).count();
             assert_eq!(count, 1, "one restored notification must produce exactly one new causal confirmation per real member");
         }
-        client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead { board: SwarmBoard::Coordination, after_cursor: None, limit: Some(100) } }).await;
+        client.send(SwarmCommandPayload::ReadBoard { swarm_id: swarm_id.clone(), query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts, board: SwarmBoard::Coordination, after_cursor: None, limit: Some(100) } }).await;
         let history: SwarmBoardNotifyPayload = client.wait(FrameKind::SwarmBoardNotify, "durable coordination after resume", |event: &SwarmBoardNotifyPayload| event.page.swarm_id == swarm_id && event.page.board == SwarmBoard::Coordination && event.page.high_water >= reply.cursor).await;
         assert!(history.page.posts.contains(&request) && history.page.posts.contains(&reply), "exact real peer root and reply survive host restart");
     }).catch_unwind().await;
@@ -1244,11 +1247,11 @@ pub async fn run_images(
             BackendKind::Codex => "Use the named tyde-agent-control MCP tools DIRECTLY through their native interfaces. Do not use functions.exec, exec, code-mode wrappers or tool-discovery code: code mode is disabled. ",
             BackendKind::Claude => "Use the named tyde-agent-control MCP tools directly. Perform exactly these three actual tool calls in order, awaiting each successful result: (1) tyde_swarm_read_board for Briefing; (2) tyde_swarm_read_image for its shared attachment; (3) tyde_swarm_post the result. The board read is mandatory even when inline notification context already contains the human post and image ID; inline context is not a substitute for the actual read. Do not publish before both reads succeed. ",
             _ => "Use the named tyde-agent-control MCP tools directly. ",
-        }.to_owned() + "Read the shared Briefing board with tyde_swarm_read_board. Find the human post with an image attachment. Call tyde_swarm_read_image with its exact image_id to view the actual pixels; metadata and filenames do not contain the answer. The image contains three equal vertical solid-color bands. Publish exactly one Briefing root using tyde_swarm_post, omitting thread_id, with one text segment containing IMAGE_RESULT followed by a space and the three lowercase CSS color names from left to right separated by colons. Use a fresh publication_id. Do not guess before reading the image. Do not create files or use any agent tools. A private final answer is not a board publication. Finish after posting.";
+        }.to_owned() + "Read the shared Briefing board with tyde_swarm_read_board. Find the human post with an image attachment. Call tyde_swarm_read_image with its exact image_id to view the actual pixels; metadata and filenames do not contain the answer. The image contains three equal vertical solid-color bands. Publish exactly one concise human-facing reply using tyde_swarm_post in the original human image request thread, with its exact thread_id, with one text segment containing IMAGE_RESULT followed by a space and the three lowercase CSS color names from left to right separated by colons. Use a fresh publication_id. Do not guess before reading the image. Do not create files or use any agent tools. A private final answer is not a board publication. Finish after posting.";
         let draft_id = SwarmDraftId(uuid::Uuid::new_v4().to_string());
         client.send(SwarmCommandPayload::GenerateDraft { draft_id:draft_id.clone(), expected_revision:None, name:"Shared pixels".into(), opening_brief:String::new(), constraints:SwarmConstraints {
             project_id:project.id, workspace_policy:SwarmWorkspacePolicy::ReadOnly, max_live_agents:1,
-            allocations:vec![SwarmBackendAllocation {backend_kind:backend,launch_profile_id:profile.id,session_settings:settings,count:1}],shared_guidance:prompt.clone(),agent_wake_budget:2,
+            allocations:vec![SwarmBackendAllocation {backend_kind:backend,launch_profile_id:profile.id,session_settings:settings,count:1}],shared_guidance:String::new(),agent_wake_budget:2,
         }}).await;
         let event: SwarmDraftNotifyPayload = client.wait(FrameKind::SwarmDraftNotify, "image draft", |event| matches!(event, SwarmDraftNotifyPayload::Upsert {draft} if draft.id == draft_id)).await;
         let SwarmDraftNotifyPayload::Upsert {draft} = event else { unreachable!() };
@@ -1265,7 +1268,7 @@ pub async fn run_images(
         let publication_id = SwarmPublicationId(uuid::Uuid::new_v4().to_string());
         client.send(SwarmCommandPayload::Post {swarm_id:swarm_id.clone(),publication:SwarmPublication {publication_id:publication_id.clone(),board:SwarmBoard::Briefing,thread_id:None,body:vec![SwarmBodySegment::Text {text:prompt}],attachments:Vec::new(),images:vec![image_id.clone()]}}).await;
         let trigger: SwarmPostNotifyPayload = client.wait(FrameKind::SwarmPostNotify, "shared image trigger", |event: &SwarmPostNotifyPayload| event.post.publication_id == publication_id && event.post.author == SwarmAuthor::Human).await;
-        let posted = client.member_post(&member, SwarmBoard::Briefing, "IMAGE_RESULT", &trigger.post, trigger.post.cursor, None).await;
+        let posted = client.member_post(&member, SwarmBoard::Briefing, "IMAGE_RESULT", &trigger.post, trigger.post.cursor, Some(&trigger.post.thread_id)).await;
         let text = posted.body.iter().map(|segment| match segment {SwarmBodySegment::Text {text} => text.as_str(), _ => panic!("image result must be ordinary text")}).collect::<String>().trim().to_ascii_lowercase().replace("fuchsia", "magenta");
         assert!(text == format!("image_result {answer}"), "real member must identify the actual shared pixels correctly; backend={backend:?}");
         client.require_tool(&member, Phase::Opening, BoardTool::ReadImage, |result| matches!(result, BoardResult::Image(metadata, data) if **metadata == image && *data == pixels)).await;

@@ -513,6 +513,7 @@ pub fn SwarmView(
         send(SwarmCommandPayload::ReadBoard {
             swarm_id: sid.get_value(),
             query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: current,
                 after_cursor,
                 limit: None,

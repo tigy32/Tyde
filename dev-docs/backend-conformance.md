@@ -711,3 +711,39 @@ the available pane width and did not overflow a 420px pane. This check caught
 the client sending opaque history IDs where the image store requires UUIDs;
 image uploads now mint cryptographically random UUIDs, and the mounted-DOM
 flow checks the actual outbound identity shape before host acknowledgement.
+
+## Mobile swarm request threads
+
+Mobile now requests a typed, server-paged root-only board view. Roots sort by
+original creation time, not later reply activity; cursor coordinates are
+bound to that view and its snapshot. Opening a root reads its full thread.
+The inbox never marks unseen replies as read. Root composition is on demand,
+with separate root, board and reply drafts retained through navigation.
+Shared pixels are read from the owning host only after opening the thread.
+
+The default spawn and notification guidance now asks peers to keep concise,
+human-oriented progress, results and decision questions in the original
+Briefing request thread, and peer planning in Coordination. It does not
+classify or move old posts, impose task status, or rewrite custom guidance.
+The existing real image case now uses the default shared guidance and checks
+the concise pixel-derived answer in the original human request thread. It
+passed both eligible providers: Claude Haiku 4.5 (13.65s) and Codex
+gpt-5.6-luna at low effort (23.37s). Setup and the oracle remain identical.
+
+Protocol simulations cover root pagination, snapshot isolation, later
+replies, and rejection of cursors reused across read views. The mounted
+mobile flow covers sixty-one root rows, reachable reply history, older
+linked threads, retries, canonical publication acknowledgement, independent
+drafts, host isolation and actual decoded shared images. Its old flat-board
+assertions now require replies to remain reachable through their thread,
+not rendered in the inbox or falsely marked read there. Lazy images are
+scrolled into view and awaited through the browser's decode operation.
+
+The live direct-hosted PWA used an isolated native host and a fresh Chromium
+mobile viewport. Three actual human roots and one reply were confirmed in
+the host store, then read over the real paired connection. The inbox kept
+creation order, hid reply traffic and its closed composer, opened the exact
+reply and pixels, and preserved independent reply and new-request drafts.
+At 390px it had no horizontal overflow; single-line request rows measured
+67.75px. The native instance, browser and ephemeral stores were stopped.
+This is scoped UI/host validation, not a complete backend certification.

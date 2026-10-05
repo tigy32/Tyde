@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 70;
+pub const PROTOCOL_VERSION: u32 = 71;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9219,18 +9219,30 @@ pub struct SwarmPost {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwarmCursorTarget {
     Board { board: SwarmBoard },
+    BoardThreads { board: SwarmBoard },
     Thread { thread_id: SwarmThreadId },
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmBoardView {
+    #[default]
+    Posts,
+    Threads,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmReadCursor {
     pub swarm_id: SwarmId,
     pub target: SwarmCursorTarget,
+    /// Board/thread posts use the last post cursor; BoardThreads uses the
+    /// number of roots consumed from the creation-ordered snapshot.
     pub position: u64,
     pub snapshot_high_water: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmBoardRead {
     pub board: SwarmBoard,
+    #[serde(default)]
+    pub view: SwarmBoardView,
     #[serde(default)]
     pub after_cursor: Option<SwarmReadCursor>,
     #[serde(default)]

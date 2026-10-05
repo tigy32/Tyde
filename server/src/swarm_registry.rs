@@ -2180,26 +2180,51 @@ pub(crate) fn read_board(
         .high_water;
     let mut cursor = page_cursor(
         id,
-        SwarmCursorTarget::Board { board: query.board },
+        match query.view {
+            SwarmBoardView::Posts => SwarmCursorTarget::Board { board: query.board },
+            SwarmBoardView::Threads => SwarmCursorTarget::BoardThreads { board: query.board },
+        },
         query.after_cursor,
         actual,
     )?;
     let limit = page_limit(query.limit)?;
-    let activity = file
+    let mut activity = file
         .posts
         .iter()
         .filter(|post| {
             post.swarm_id == *id
                 && post.board == query.board
-                && post.cursor > cursor.position
                 && post.cursor <= cursor.snapshot_high_water
+                && match query.view {
+                    SwarmBoardView::Posts => post.cursor > cursor.position,
+                    SwarmBoardView::Threads => post.id.0 == post.thread_id.0,
+                }
         })
         .collect::<Vec<_>>();
+    if query.view == SwarmBoardView::Threads {
+        activity.sort_by_key(|post| std::cmp::Reverse((post.created_at_ms, post.cursor)));
+        let offset = usize::try_from(cursor.position).map_err(|_| {
+            failure(
+                SwarmErrorCode::Invalid,
+                "Thread-list cursor offset exceeds platform bounds",
+            )
+        })?;
+        if offset > activity.len() {
+            return Err(failure(
+                SwarmErrorCode::Invalid,
+                "Thread-list cursor exceeds the snapshot's root count",
+            ));
+        }
+        activity.drain(..offset);
+    }
     let (posts, has_more) = bounded_posts(&activity, limit, SWARM_READ_PAGE_CONTAINER_BYTES)?;
-    cursor.position = posts
-        .last()
-        .map(|post| post.cursor)
-        .unwrap_or(cursor.snapshot_high_water);
+    cursor.position = match query.view {
+        SwarmBoardView::Posts => posts
+            .last()
+            .map(|post| post.cursor)
+            .unwrap_or(cursor.snapshot_high_water),
+        SwarmBoardView::Threads => cursor.position + posts.len() as u64,
+    };
     Ok(SwarmBoardPage {
         swarm_id: id.clone(),
         board: query.board,

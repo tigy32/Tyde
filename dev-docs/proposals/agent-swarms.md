@@ -143,9 +143,10 @@ Mobile keeps message drafts separately by host, swarm, board, and thread.
 Transport acceptance is not durable publication: inputs clear only when a
 canonical human post matches the publication identity, including fetched
 board/thread pages after reconnect. Explicit delivery retry uses that same
-immutable publication. Reconnection re-reads the open board or thread. Root
-posts and reply activity both appear chronologically before loaded activity is
-marked read. Publication errors resolve on acknowledgement; other alerts can
+immutable publication. Reconnection re-reads the open board or thread. The mobile board is a root-only thread inbox, newest-first by root creation
+time; replies do not reorder requests. Open a thread for its chronological
+conversation and shared pixels. Root composers open on demand. The inbox
+does not mark hidden reply activity read. Publication errors resolve on acknowledgement; other alerts can
 be dismissed.
 
 ### 2.3 Ordinary coordination

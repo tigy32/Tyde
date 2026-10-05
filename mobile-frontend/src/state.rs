@@ -1066,6 +1066,12 @@ pub struct AppState {
     >,
     pub swarm_board_pages:
         RwSignal<HashMap<(LocalHostId, protocol::SwarmId), Vec<protocol::SwarmBoardPage>>>,
+    pub swarm_images: RwSignal<
+        HashMap<
+            (LocalHostId, protocol::SwarmId, protocol::SwarmImageId),
+            protocol::SwarmImageOutcome,
+        >,
+    >,
     pub swarm_thread_pages: RwSignal<
         HashMap<
             (LocalHostId, protocol::SwarmId, protocol::SwarmThreadId),
@@ -1199,6 +1205,7 @@ impl AppState {
             swarm_drafts_by_host: RwSignal::new(HashMap::new()),
             swarm_posts: RwSignal::new(HashMap::new()),
             swarm_board_pages: RwSignal::new(HashMap::new()),
+            swarm_images: RwSignal::new(HashMap::new()),
             swarm_thread_pages: RwSignal::new(HashMap::new()),
             swarm_errors_by_host: RwSignal::new(HashMap::new()),
             teams_by_host: RwSignal::new(HashMap::new()),
@@ -1962,6 +1969,8 @@ impl AppState {
             m.remove(host);
         });
         self.swarm_posts.update(|m| m.retain(|(h, _), _| h != host));
+        self.swarm_images
+            .update(|m| m.retain(|(h, _, _), _| h != host));
         self.swarm_board_pages
             .update(|m| m.retain(|(h, _), _| h != host));
         self.swarm_thread_pages

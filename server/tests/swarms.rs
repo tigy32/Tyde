@@ -732,6 +732,7 @@ fn text(value: &str) -> SwarmBodySegment {
 
 fn read_board(board: SwarmBoard) -> SwarmBoardRead {
     SwarmBoardRead {
+        view: protocol::SwarmBoardView::Posts,
         board,
         after_cursor: None,
         limit: None,
@@ -2255,6 +2256,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .send(SwarmCommandPayload::ReadBoard {
             swarm_id: swarm.id.clone(),
             query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: None,
                 limit: Some(0),
@@ -2270,6 +2272,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     peer.swarm_command(SwarmCommandPayload::ReadBoard {
         swarm_id: swarm.id.clone(),
         query: SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Briefing,
             after_cursor: None,
             limit: Some(1),
@@ -2469,6 +2472,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .board(
             &swarm.id,
             SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: None,
                 limit: Some(2),
@@ -2482,10 +2486,33 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
             .map(|post| &post.id)
             .eq([&literal.id, &typed.id])
     );
+    let thread_inbox = scenario
+        .board(
+            &swarm.id,
+            SwarmBoardRead {
+                view: protocol::SwarmBoardView::Threads,
+                board: SwarmBoard::Coordination,
+                after_cursor: None,
+                limit: Some(1),
+            },
+        )
+        .await;
+    assert!(
+        thread_inbox.posts == vec![typed.clone()] && thread_inbox.has_more,
+        "thread pages count roots, not the later reply traffic"
+    );
+    assert_eq!(thread_inbox.next_cursor.position, 1);
+    assert!(
+        thread_inbox.next_cursor.target
+            == protocol::SwarmCursorTarget::BoardThreads {
+                board: SwarmBoard::Coordination
+            }
+    );
     let first_page = scenario
         .board(
             &swarm.id,
             SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: None,
                 limit: Some(1),
@@ -2510,10 +2537,73 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         )
         .await;
     assert!(late_root.cursor > first_page.high_water);
+    let older_threads = scenario
+        .board(
+            &swarm.id,
+            SwarmBoardRead {
+                view: protocol::SwarmBoardView::Threads,
+                board: SwarmBoard::Coordination,
+                after_cursor: Some(thread_inbox.next_cursor.clone()),
+                limit: Some(1),
+            },
+        )
+        .await;
+    assert!(older_threads.posts == vec![literal.clone()] && !older_threads.has_more);
+    assert_eq!(
+        older_threads.high_water, thread_inbox.high_water,
+        "new requests and replies cannot shift a frozen inbox page"
+    );
+    let current_threads = scenario
+        .board(
+            &swarm.id,
+            SwarmBoardRead {
+                view: protocol::SwarmBoardView::Threads,
+                board: SwarmBoard::Coordination,
+                after_cursor: None,
+                limit: Some(100),
+            },
+        )
+        .await;
+    assert!(
+        current_threads.posts.iter().map(|post| &post.id).eq([
+            &late_root.id,
+            &typed.id,
+            &literal.id
+        ]),
+        "inbox is root creation order, never last agent activity"
+    );
+    scenario
+        .send(SwarmCommandPayload::ReadBoard {
+            swarm_id: swarm.id.clone(),
+            query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
+                board: SwarmBoard::Coordination,
+                after_cursor: Some(thread_inbox.next_cursor.clone()),
+                limit: Some(1),
+            },
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Unauthorized).await;
+    let mut invalid_offset = thread_inbox.next_cursor.clone();
+    invalid_offset.position = 3;
+    scenario
+        .send(SwarmCommandPayload::ReadBoard {
+            swarm_id: swarm.id.clone(),
+            query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Threads,
+                board: SwarmBoard::Coordination,
+                after_cursor: Some(invalid_offset),
+                limit: Some(1),
+            },
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Invalid).await;
+
     let remaining = scenario
         .board(
             &swarm.id,
             SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: Some(first_page.next_cursor.clone()),
                 limit: Some(100),
@@ -2539,6 +2629,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .board(
             &swarm.id,
             SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: Some(first_two.next_cursor),
                 limit: Some(100),
@@ -2656,21 +2747,25 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     future_snapshot.snapshot_high_water = late_reply.cursor + 1;
     for query in [
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: None,
             limit: Some(0),
         },
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: None,
             limit: Some(101),
         },
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: Some(invalid_position),
             limit: None,
         },
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: Some(future_snapshot),
             limit: None,
@@ -2686,11 +2781,13 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     }
     for query in [
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Briefing,
             after_cursor: Some(first_page.next_cursor.clone()),
             limit: None,
         },
         SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: Some(first_thread_page.next_cursor.clone()),
             limit: None,
@@ -2809,6 +2906,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .send(SwarmCommandPayload::ReadBoard {
             swarm_id: foreign.id.clone(),
             query: SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Coordination,
                 after_cursor: Some(first_page.next_cursor),
                 limit: None,
@@ -3095,6 +3193,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
     let mut board_cursor = None;
     loop {
         let query = SwarmBoardRead {
+            view: protocol::SwarmBoardView::Posts,
             board: SwarmBoard::Coordination,
             after_cursor: board_cursor,
             limit: Some(protocol::SWARM_MAX_PAGE_LIMIT),
@@ -3275,6 +3374,7 @@ async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity()
         .board(
             &foreign.id,
             SwarmBoardRead {
+                view: protocol::SwarmBoardView::Posts,
                 board: SwarmBoard::Briefing,
                 after_cursor: None,
                 limit: Some(1),
