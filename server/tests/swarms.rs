@@ -11303,3 +11303,259 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         "each queued reply commits exactly once after restart"
     );
 }
+
+async fn wait_replacement_turn(gate: &MockGateHandle, phase: &str) {
+    // Replacement backoff doubles up to 4s, beyond wait_mock_turn's window.
+    tokio::time::timeout(Duration::from_secs(15), gate.wait_until_entered())
+        .await
+        .unwrap_or_else(|_| panic!("replacement agent did not reach mock phase {phase}"));
+}
+
+#[tokio::test]
+async fn failed_members_are_replaced_by_fresh_agents_until_the_replacement_cap() {
+    let mut scenario = Scenario::new().await;
+    let draft = scenario.generate(scenario.constraints(1)).await;
+    let name = draft.members[0].name.clone();
+    let crash = (0..5).map(|_| MockGateHandle::new()).collect::<Vec<_>>();
+    let reservation = scenario
+        .fixture
+        .reserve_mock_launches(vec![
+            (
+                name.clone(),
+                MockScript::one(MockTurn::busy_then_close_stream(&crash[0])),
+            ),
+            (
+                name.clone(),
+                MockScript::one(MockTurn::text("Recovered the first request"))
+                    .then(MockTurn::busy_then_close_stream(&crash[1])),
+            ),
+            (
+                name.clone(),
+                MockScript::one(MockTurn::busy_then_close_stream(&crash[2])),
+            ),
+            (
+                name.clone(),
+                MockScript::one(MockTurn::busy_then_close_stream(&crash[3])),
+            ),
+            (
+                name.clone(),
+                MockScript::one(MockTurn::busy_then_close_stream(&crash[4])),
+            ),
+        ])
+        .await;
+    let swarm = scenario.launch(&draft).await;
+    let member_id = swarm.members[0].spec.id.clone();
+    let spec = swarm.members[0].spec.clone();
+    let first_post = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "replacement-first-request",
+                vec![text("Survey the project for broken builds")],
+            ),
+        )
+        .await;
+    scenario
+        .wait_mock_turn(&crash[0], "original-member-turn")
+        .await;
+    let original = scenario
+        .swarm(&swarm.id, |state| {
+            state.members[0].state == SwarmMemberState::Live
+                && state.members[0].session_id.is_some()
+        })
+        .await
+        .members[0]
+        .clone();
+    let original_agent = original.agent_id.clone().expect("original agent");
+    let original_session = original.session_id.clone().expect("original session");
+    crash[0].release_one();
+    let failed = scenario
+        .swarm(&swarm.id, |state| {
+            state.members[0].state == SwarmMemberState::Failed
+                && state.members[0].agent_id.is_none()
+        })
+        .await;
+    assert!(
+        failed.members[0].replacement_due_at_ms.is_some(),
+        "a failed member is scheduled for automatic replacement"
+    );
+    assert_ne!(
+        failed.lifecycle,
+        SwarmLifecycle::AttentionRequired,
+        "a scheduled replacement does not ask the human for help"
+    );
+    assert!(
+        failed.notifications.iter().any(|intent| {
+            intent.post_ids.contains(&first_post.id) && intent.state == SwarmDeliveryState::Failed
+        }),
+        "the wake the dead agent never finished is not counted as delivered"
+    );
+
+    let replaced = scenario
+        .swarm(&swarm.id, |state| {
+            let member = &state.members[0];
+            member.state == SwarmMemberState::Live
+                && member.agent_id.is_some()
+                && member.runtime_status == Some(AgentControlStatus::Idle)
+                && member.last_replacement.is_some()
+                && member.consecutive_replacements == 0
+        })
+        .await;
+    let replacement = replaced.members[0].clone();
+    let replacement_agent = replacement.agent_id.clone().expect("replacement agent");
+    let replacement_session = replacement.session_id.clone().expect("replacement session");
+    assert_eq!(replacement.spec.id, member_id, "the member keeps its id");
+    assert!(
+        replacement.spec == spec,
+        "the replacement keeps the member's name, backend, profile, settings and focus"
+    );
+    assert_ne!(replacement_agent, original_agent, "a brand-new agent");
+    assert!(
+        replacement_session != original_session,
+        "a brand-new session"
+    );
+    assert!(
+        replacement.replaced_session_ids == vec![original_session.clone()],
+        "the dead session is recorded as replaced, never re-adopted"
+    );
+    let last = replacement
+        .last_replacement
+        .clone()
+        .expect("typed replacement record");
+    assert_eq!(last.total, 1);
+    assert_eq!(last.reason, failed.members[0].error.clone().unwrap());
+    assert_eq!(
+        replacement.consecutive_replacements, 0,
+        "a finished turn resets the consecutive replacement count"
+    );
+    assert!(replacement.error.is_none() && replacement.replacement_due_at_ms.is_none());
+    assert!(
+        !scenario.fixture.agent_ids().await.contains(&original_agent),
+        "the dead agent is torn down, never resumed"
+    );
+    let replacement_control = scenario.fixture.mock_by_id(&replacement_agent).await;
+    let replacement_requests = replacement_control.requests().await;
+    assert!(
+        matches!(
+            replacement_requests.first(),
+            Some(MockRequest::Launch { .. })
+        ),
+        "the replacement starts a new conversation rather than resuming the old one"
+    );
+    let (references, _) = last_dispatch_context(&replacement_requests);
+    assert!(
+        references.contains(&first_post.id),
+        "the unfinished wake is redelivered to the replacement"
+    );
+    let sessions = scenario.fixture.read_persisted_sessions();
+    let record = |id: &protocol::SessionId| {
+        sessions
+            .iter()
+            .find(|record| record.id == *id)
+            .unwrap_or_else(|| panic!("session record missing"))
+    };
+    let (old, new) = (record(&original_session), record(&replacement_session));
+    assert_eq!(new.backend_kind, old.backend_kind);
+    assert_eq!(new.launch_profile_id, old.launch_profile_id);
+    assert_eq!(new.workspace_roots, old.workspace_roots);
+    assert_eq!(new.access_mode, old.access_mode);
+    assert_eq!(new.project_id, old.project_id);
+    assert_eq!(
+        serde_json::to_value(&new.session_settings).unwrap(),
+        serde_json::to_value(&old.session_settings).unwrap()
+    );
+
+    // Every later agent for this member dies; replacement stops at the cap.
+    let second_post = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "replacement-second-request",
+                vec![
+                    text("Check the release scripts too"),
+                    SwarmBodySegment::MemberMention {
+                        member_id: member_id.clone(),
+                    },
+                ],
+            ),
+        )
+        .await;
+    let mut agents = vec![original_agent, replacement_agent];
+    let mut last_failure = None;
+    for (index, gate) in crash.iter().enumerate().skip(1) {
+        wait_replacement_turn(gate, "crashing replacement turn").await;
+        let live = scenario
+            .swarm(&swarm.id, |state| {
+                state.members[0].state == SwarmMemberState::Live
+                    && state.members[0].runtime_status == Some(AgentControlStatus::Thinking)
+            })
+            .await;
+        let agent = live.members[0].agent_id.clone().expect("live agent");
+        if index > 1 {
+            assert!(!agents.contains(&agent), "each replacement is a new agent");
+            agents.push(agent.clone());
+            let (references, _) =
+                last_dispatch_context(&scenario.fixture.mock_by_id(&agent).await.requests().await);
+            assert!(
+                references.contains(&second_post.id),
+                "pending work follows every replacement"
+            );
+        }
+        gate.release_one();
+        last_failure = Some(
+            scenario
+                .swarm(&swarm.id, |state| {
+                    state.members[0].state == SwarmMemberState::Failed
+                        && state.members[0].agent_id.is_none()
+                })
+                .await,
+        );
+    }
+    let exhausted = last_failure.expect("final replacement failure");
+    assert_eq!(exhausted.lifecycle, SwarmLifecycle::AttentionRequired);
+    let member = &exhausted.members[0];
+    assert_eq!(member.state, SwarmMemberState::Failed);
+    assert!(member.agent_id.is_none());
+    assert!(
+        member.replacement_due_at_ms.is_none(),
+        "no replacement after the cap"
+    );
+    assert_eq!(member.consecutive_replacements, 3);
+    assert_eq!(
+        member.last_replacement.as_ref().map(|last| last.total),
+        Some(4)
+    );
+    let error = member.error.clone().expect("exhausted member error");
+    assert!(
+        error.contains("failed after 3 automatic replacements"),
+        "the exhausted member explains why it stopped: {error}"
+    );
+    assert_eq!(exhausted.error.as_deref(), Some(error.as_str()));
+    let agent_count = scenario.fixture.agent_ids().await.len();
+    scenario
+        .observe_for(Duration::from_millis(1500), "no replacement after the cap")
+        .await;
+    assert_eq!(scenario.fixture.agent_ids().await.len(), agent_count);
+    assert_eq!(
+        scenario.snapshot(&swarm.id).await.members[0].state,
+        SwarmMemberState::Failed
+    );
+    drop(reservation);
+
+    scenario
+        .send(SwarmCommandPayload::RetryMember {
+            swarm_id: swarm.id.clone(),
+            member_id: member_id.clone(),
+        })
+        .await;
+    let retried = scenario
+        .swarm(&swarm.id, |state| {
+            state.members[0].state != SwarmMemberState::Failed
+        })
+        .await;
+    assert_eq!(retried.members[0].consecutive_replacements, 0);
+    assert!(retried.members[0].error.is_none());
+    assert_ne!(retried.lifecycle, SwarmLifecycle::AttentionRequired);
+}

@@ -16067,6 +16067,7 @@ pre.tool-error-pre {
 .swarm-agent-state { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .swarm-member-chip-status { color: var(--swarm-tone, var(--text-tertiary)); }
 .swarm-agent-error { color: var(--error); font-size: 0.769rem; }
+.swarm-agent-replaced { color: var(--text-muted); font-size: 0.769rem; }
 .swarm-agent-backend,
 .swarm-agent-focus { color: var(--text-secondary); min-width: 0; }
 .swarm-agent-open { color: var(--accent-link); font-size: 0.769rem; }

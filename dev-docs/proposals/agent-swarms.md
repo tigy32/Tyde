@@ -204,6 +204,22 @@ visibility, not a hidden task queue. Its changes are examples, not defaults.
 
 - Draft: preview exists, no member sessions started.
 - Partially failed: show per-member outcomes and explicit retry.
+- Failed member: when a member agent terminates, or a wake or activation
+  cannot be delivered to it, the host closes that agent and starts a brand-new
+  agent for the same member id with the same spec (name, backend, launch
+  profile, session settings, focus, workspace policy) and no session. The old
+  agent is never retried or resumed; its session id is kept in
+  `replaced_session_ids` so restart never re-adopts it. Wakes the dead agent
+  accepted but had not finished (`unfinished_notification_ids`), plus Failed
+  and Uncertain wakes, return to Pending for the replacement. Replacement
+  waits `replacement_due_at_ms` (1 s, 2 s, 4 s) and stops after three
+  consecutive replacements: the member stays Failed with an explanatory error
+  and the swarm requires attention. The first Idle after a finished turn
+  resets the count; manual Retry also resets it. Retiring members are retired,
+  not replaced; Paused/Pausing swarms and restart recovery never replace (the
+  host clears pending replacements on load). A mid-turn backend error that
+  leaves the agent alive is not a member failure. `last_replacement` (reason,
+  time, total) is typed state the Agents tab renders.
 - Idle: nothing executing; not equivalent to objective completed.
 - Paused or attention required: pending posts visible, no automatic wake.
 - Unavailable backend, invalid attachment, or storage failure: explicit errors,

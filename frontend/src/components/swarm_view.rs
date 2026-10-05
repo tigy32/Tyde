@@ -108,6 +108,7 @@ pub(crate) fn member_status_label(member: &SwarmMember) -> &'static str {
         },
         SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved => "Retiring",
         SwarmMemberState::Retired => "Retired",
+        SwarmMemberState::Failed if member.replacement_due_at_ms.is_some() => "Replacing",
         SwarmMemberState::Failed => "Failed",
     }
 }
@@ -127,7 +128,16 @@ pub(crate) fn member_status_tone(member: &SwarmMember) -> &'static str {
         | SwarmMemberState::Retiring
         | SwarmMemberState::RetiringReserved
         | SwarmMemberState::Retired => "muted",
+        SwarmMemberState::Failed if member.replacement_due_at_ms.is_some() => "busy",
         SwarmMemberState::Failed => "error",
+    }
+}
+
+fn replacement_label(total: u32) -> String {
+    if total == 1 {
+        "Replaced after an error".to_owned()
+    } else {
+        format!("Replaced after errors ({total}×)")
     }
 }
 
@@ -802,6 +812,11 @@ pub fn SwarmView(
                 <span class="swarm-agent-state">
                     <span class="swarm-member-chip-status" data-tone=member_status_tone(member)>{member_status_label(member)}</span>
                     {member.error.clone().map(|error| view! { <span class="swarm-agent-error">{error}</span> })}
+                    {member.last_replacement.clone().map(|replacement| view! {
+                        <span class="swarm-agent-replaced" title=format!("Last error: {}", replacement.reason)>
+                            {replacement_label(replacement.total)}
+                        </span>
+                    })}
                 </span>
                 <span class="swarm-agent-backend">{backend_name(member.spec.backend_kind)}</span>
                 <span class="swarm-agent-focus">{member.spec.focus.clone().filter(|focus| !focus.is_empty()).unwrap_or_else(|| "No starting focus set".to_owned())}</span>
@@ -838,6 +853,7 @@ pub fn SwarmView(
             .members
             .iter()
             .filter(|member| member.state == SwarmMemberState::Failed || member.error.is_some())
+            .filter(|member| member.replacement_due_at_ms.is_none())
             .cloned()
             .collect();
         let attention = (current.lifecycle == SwarmLifecycle::AttentionRequired).then(|| {
@@ -3025,6 +3041,11 @@ pub(crate) mod wasm_tests {
             current_round_id: None,
             error: None,
             guidance_changed: false,
+            unfinished_notification_ids: Vec::new(),
+            replacement_due_at_ms: None,
+            consecutive_replacements: 0,
+            last_replacement: None,
+            replaced_session_ids: Vec::new(),
         }
     }
 
@@ -3460,6 +3481,77 @@ pub(crate) mod wasm_tests {
         assert_eq!(
             text_of(&one(&bo, ".swarm-agent-error")),
             "Host could not start this turn"
+        );
+        let bo_row = |view: &web_sys::Element| {
+            all(view, ".swarm-member-chip")
+                .into_iter()
+                .find(|row| text_of(&one(row, ".swarm-member-chip-name")) == "Bo")
+                .unwrap()
+        };
+        let bo_agent = live_update.members[1].agent_id.clone();
+        live_update.revision += 1;
+        live_update.members[1].state = SwarmMemberState::Failed;
+        live_update.members[1].agent_id = None;
+        live_update.members[1].runtime_status = None;
+        live_update.members[1].error = Some("Member agent terminated".to_owned());
+        live_update.members[1].replacement_due_at_ms = Some(1);
+        harness.swarm(&live_update);
+        settle().await;
+        let bo = bo_row(&view);
+        assert_eq!(text_of(&one(&bo, ".swarm-member-chip-status")), "Replacing");
+        assert_eq!(
+            text_of(&one(&bo, ".swarm-agent-error")),
+            "Member agent terminated"
+        );
+        assert!(
+            !text_of(&view).contains("A member needs attention"),
+            "a scheduled automatic replacement is not presented as needing attention"
+        );
+        live_update.revision += 1;
+        live_update.members[1].state = SwarmMemberState::Live;
+        live_update.members[1].agent_id = bo_agent.clone();
+        live_update.members[1].runtime_status = Some(AgentControlStatus::Thinking);
+        live_update.members[1].error = None;
+        live_update.members[1].replacement_due_at_ms = None;
+        live_update.members[1].last_replacement = Some(protocol::SwarmMemberReplacement {
+            reason: "Member agent terminated".to_owned(),
+            replaced_at_ms: 1,
+            total: 1,
+        });
+        harness.swarm(&live_update);
+        settle().await;
+        let bo = bo_row(&view);
+        assert_eq!(text_of(&one(&bo, ".swarm-member-chip-status")), "Working");
+        let replaced = one(&bo, ".swarm-agent-replaced");
+        assert_eq!(text_of(&replaced), "Replaced after an error");
+        assert!(replaced.get_bounding_client_rect().height() > 0.0);
+        assert_eq!(
+            replaced.get_attribute("title").as_deref(),
+            Some("Last error: Member agent terminated")
+        );
+        live_update.revision += 1;
+        live_update.members[1].state = SwarmMemberState::Failed;
+        live_update.members[1].agent_id = None;
+        live_update.members[1].runtime_status = None;
+        live_update.members[1].error = Some(
+            "Bo failed after 3 automatic replacements; Retry restarts it manually. Last error: Member agent terminated".to_owned(),
+        );
+        live_update.members[1]
+            .last_replacement
+            .as_mut()
+            .unwrap()
+            .total = 3;
+        harness.swarm(&live_update);
+        settle().await;
+        let bo = bo_row(&view);
+        assert_eq!(text_of(&one(&bo, ".swarm-member-chip-status")), "Failed");
+        assert_eq!(
+            text_of(&one(&bo, ".swarm-agent-replaced")),
+            "Replaced after errors (3×)"
+        );
+        assert!(
+            text_of(&view).contains("A member needs attention"),
+            "an exhausted member asks for a manual retry"
         );
         container.style().set_property("width", "420px").unwrap();
         settle().await;

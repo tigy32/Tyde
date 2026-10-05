@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 74;
+pub const PROTOCOL_VERSION: u32 = 75;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9076,6 +9076,31 @@ pub struct SwarmMember {
     /// the next wake carries the new guidance.
     #[serde(default)]
     pub guidance_changed: bool,
+    /// Wakes accepted by the current agent whose turn has not yet returned to
+    /// idle; a replacement redelivers them if that agent dies first.
+    #[serde(default)]
+    pub unfinished_notification_ids: Vec<SwarmNotificationId>,
+    /// Set while a Failed member awaits automatic replacement by a fresh
+    /// agent and session; absent when the failure needs a human.
+    #[serde(default)]
+    pub replacement_due_at_ms: Option<u64>,
+    /// Automatic replacements since the member last finished a turn.
+    #[serde(default)]
+    pub consecutive_replacements: u32,
+    #[serde(default)]
+    pub last_replacement: Option<SwarmMemberReplacement>,
+    /// Sessions abandoned by automatic replacement. They stay owned by the
+    /// member for history but are never resumed or re-adopted.
+    #[serde(default)]
+    pub replaced_session_ids: Vec<SessionId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmMemberReplacement {
+    /// The failure that caused the most recent replacement.
+    pub reason: String,
+    pub replaced_at_ms: u64,
+    /// Automatic replacements over the member's lifetime.
+    pub total: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmBoardPosition {

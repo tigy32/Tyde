@@ -1485,6 +1485,94 @@ impl HostHandle {
         Ok(())
     }
 
+    /// Replaces every Failed member whose backoff has elapsed and returns the
+    /// next pending replacement time. Paused swarms wait for Resume.
+    async fn replace_failed_swarm_members(&self, snapshot: &SwarmStoreSnapshot) -> Option<u64> {
+        let now = crate::agent::now_ms();
+        let mut next_due_at_ms: Option<u64> = None;
+        for swarm in &snapshot.swarms {
+            if swarm.recovery_requirement != protocol::SwarmRecoveryRequirement::None
+                || matches!(
+                    swarm.lifecycle,
+                    SwarmLifecycle::Paused | SwarmLifecycle::Pausing
+                )
+            {
+                continue;
+            }
+            for member in &swarm.members {
+                let (SwarmMemberState::Failed, Some(due_at_ms)) =
+                    (member.state, member.replacement_due_at_ms)
+                else {
+                    continue;
+                };
+                if due_at_ms > now {
+                    next_due_at_ms =
+                        Some(next_due_at_ms.map_or(due_at_ms, |next| next.min(due_at_ms)));
+                    continue;
+                }
+                if let Err(error) = self.replace_swarm_member(&swarm.id, member).await {
+                    if error.code == SwarmErrorCode::Conflict {
+                        // A human Retry, Pause or retirement won the race.
+                        tracing::info!("Swarm member replacement superseded");
+                        continue;
+                    }
+                    tracing::error!(code = ?error.code, "Failed swarm member could not be replaced");
+                    let swarm_id = swarm.id.clone();
+                    if let Err(error) = self
+                        .swarm_mutation(|registry| async move {
+                            let events = registry.error(swarm_id, error).await?;
+                            Ok(((), events))
+                        })
+                        .await
+                    {
+                        tracing::error!(code = ?error.code, "Swarm replacement failure could not be recorded");
+                    }
+                }
+            }
+        }
+        next_due_at_ms
+    }
+
+    async fn replace_swarm_member(
+        &self,
+        swarm_id: &SwarmId,
+        member: &protocol::SwarmMember,
+    ) -> Result<(), SwarmFailure> {
+        // A failed delivery can leave the old agent alive in a broken turn,
+        // and a terminated one stays registered under its session after the
+        // member binding clears; either is closed, never retried or resumed.
+        let terminated = match (&member.agent_id, &member.session_id) {
+            (None, Some(session)) => self.agent_bound_to_session(session).await,
+            _ => None,
+        };
+        for agent in member.agent_id.iter().chain(terminated.iter()) {
+            if self.agent_handle(agent).await.is_some() && !self.close_agent(agent).await {
+                return Err(fail(
+                    SwarmErrorCode::Lifecycle,
+                    format!(
+                        "{} could not be replaced: its failed agent did not close",
+                        member.spec.name
+                    ),
+                ));
+            }
+        }
+        if let Some(agent) = &member.agent_id {
+            self.record_swarm_status(agent.clone(), AgentControlStatus::Failed, None, true)
+                .await?;
+        }
+        tracing::info!(
+            replacements = member.consecutive_replacements + 1,
+            "Replacing failed swarm member with a fresh agent and session"
+        );
+        let swarm_id = swarm_id.clone();
+        let member_id = member.spec.id.clone();
+        self.swarm_mutation(|registry| async move {
+            let events = registry.replace(swarm_id, member_id).await?;
+            Ok(((), events))
+        })
+        .await
+    }
+
     async fn reserve_swarm_dispatches(&self) -> Result<Vec<SwarmDispatch>, SwarmFailure> {
         let mut state = self.state.lock().await;
         let registry = state.swarm_registry.clone();
@@ -1853,10 +1941,21 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
     let stopped = host.restart.stopped.clone();
     let worker = async move {
         host.schedule_swarm_helpers().await;
-        while rx.recv().await.is_some() {
-            if host.restart.stopped.is_cancelled() {
+        let mut replacement_due_at_ms: Option<u64> = None;
+        loop {
+            let signalled = match replacement_due_at_ms {
+                Some(due_at_ms) => tokio::select! {
+                    signal = rx.recv() => signal.is_some(),
+                    () = tokio::time::sleep(Duration::from_millis(
+                        due_at_ms.saturating_sub(crate::agent::now_ms()),
+                    )) => true,
+                },
+                None => rx.recv().await.is_some(),
+            };
+            if !signalled || host.restart.stopped.is_cancelled() {
                 return;
             }
+            replacement_due_at_ms = None;
             let registry = host.state.lock().await.swarm_registry.clone();
             let snapshot = match registry.snapshot().await {
                 Ok(snapshot) => snapshot,
@@ -1903,6 +2002,7 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
                     }
                 }
             }
+            replacement_due_at_ms = host.replace_failed_swarm_members(&snapshot).await;
             let batches = match host.reserve_swarm_dispatches().await {
                 Ok(batches) => batches,
                 Err(error) => {

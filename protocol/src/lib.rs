@@ -206,11 +206,11 @@ pub use types::{
     SwarmDeliveryState, SwarmDescribe, SwarmDraft, SwarmDraftGeneration, SwarmDraftId,
     SwarmDraftNotifyPayload, SwarmErrorCode, SwarmErrorNotifyPayload, SwarmId, SwarmImage,
     SwarmImageId, SwarmImageNotifyPayload, SwarmImageOutcome, SwarmImageRead, SwarmImageUpload,
-    SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberSpec, SwarmMemberState,
-    SwarmNotification, SwarmNotificationId, SwarmNotifyPayload, SwarmPost, SwarmPostId,
-    SwarmPostNotifyPayload, SwarmPublication, SwarmPublicationId, SwarmPublicationOutcome,
-    SwarmRetirementPolicy, SwarmRound, SwarmRoundId, SwarmStoreSnapshot, SwarmStoredImage,
-    SwarmThreadId, SwarmThreadNotifyPayload, SwarmThreadPage, SwarmThreadRead,
+    SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberReplacement, SwarmMemberSpec,
+    SwarmMemberState, SwarmNotification, SwarmNotificationId, SwarmNotifyPayload, SwarmPost,
+    SwarmPostId, SwarmPostNotifyPayload, SwarmPublication, SwarmPublicationId,
+    SwarmPublicationOutcome, SwarmRetirementPolicy, SwarmRound, SwarmRoundId, SwarmStoreSnapshot,
+    SwarmStoredImage, SwarmThreadId, SwarmThreadNotifyPayload, SwarmThreadPage, SwarmThreadRead,
     SwarmWorkspacePolicy,
 };
 pub use types::{SwarmDispatch, SwarmEventPayload};

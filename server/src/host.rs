@@ -10554,6 +10554,15 @@ impl HostHandle {
         self.state.lock().await.registry.agent_ids()
     }
 
+    pub(crate) async fn agent_bound_to_session(&self, session: &SessionId) -> Option<AgentId> {
+        let state = self.state.lock().await;
+        state
+            .registry
+            .agent_ids()
+            .into_iter()
+            .find(|agent_id| state.agent_sessions.get(agent_id) == Some(session))
+    }
+
     /// Session ids the live registry is currently bound to, including agents
     /// whose binding has not been published yet.
     pub async fn live_agent_session_ids(&self) -> Vec<SessionId> {

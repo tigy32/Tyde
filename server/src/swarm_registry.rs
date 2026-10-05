@@ -78,6 +78,11 @@ enum Command {
         SwarmFailure,
         SwarmCommitReply<Vec<SwarmEventPayload>>,
     ),
+    Replace(
+        SwarmId,
+        SwarmMemberId,
+        SwarmCommitReply<Vec<SwarmEventPayload>>,
+    ),
 }
 
 impl SwarmRegistryHandle {
@@ -312,6 +317,10 @@ impl SwarmRegistryHandle {
                             actor.transaction(|file| apply_helper_change(file, &id, change));
                         let _ = reply.send(result);
                     }
+                    Command::Replace(id, member_id, reply) => {
+                        let result = actor.transaction(|file| replace(file, &id, &member_id));
+                        let _ = reply.send(result);
+                    }
                     Command::Error(id, message, reply) => {
                         let result = actor.transaction(|file| {
                             let swarm = swarm_mut(file, &id)?;
@@ -521,6 +530,17 @@ impl SwarmRegistryHandle {
         )
         .await
     }
+    pub(crate) async fn replace(
+        &self,
+        id: SwarmId,
+        member: SwarmMemberId,
+    ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
+        self.committed_events(
+            self.request(|reply| Command::Replace(id, member, reply))
+                .await?,
+        )
+        .await
+    }
     pub(crate) async fn error(
         &self,
         id: SwarmId,
@@ -609,7 +629,7 @@ impl Actor {
                         }
                         for member in &mut swarm.members {
                             let membership = SwarmMembership { swarm_id: swarm.id.clone(), member_id: member.spec.id.clone() };
-                            let owned_sessions = sessions.iter().filter(|record| record.swarm_membership.as_ref() == Some(&membership)).collect::<Vec<_>>();
+                            let owned_sessions = sessions.iter().filter(|record| record.swarm_membership.as_ref() == Some(&membership) && !member.replaced_session_ids.contains(&record.id)).collect::<Vec<_>>();
                             if member.session_id.is_none() {
                                 match owned_sessions.as_slice() {
                                     [record] => member.session_id = Some(record.id.clone()),
@@ -636,6 +656,10 @@ impl Actor {
                             }
                             member.agent_id = None;
                             member.runtime_status = None;
+                            // Restart recovery stays explicit: a failure
+                            // awaiting replacement now awaits Retry.
+                            member.replacement_due_at_ms = None;
+                            member.unfinished_notification_ids.clear();
                         }
                         if swarm.lifecycle == SwarmLifecycle::Pausing { swarm.lifecycle = SwarmLifecycle::Paused; }
                         if uncertain || !matches!(swarm.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired) {
@@ -1386,6 +1410,11 @@ fn apply(
                         current_round_id: None,
                         error: None,
                         guidance_changed: false,
+                        unfinished_notification_ids: Vec::new(),
+                        replacement_due_at_ms: None,
+                        consecutive_replacements: 0,
+                        last_replacement: None,
+                        replaced_session_ids: Vec::new(),
                         spec,
                     })
                     .collect(),
@@ -1579,6 +1608,8 @@ fn apply(
                 } else {
                     SwarmMemberState::Proposed
                 };
+                member.replacement_due_at_ms = None;
+                member.consecutive_replacements = 0;
             }
             member.error = None;
             for notification in &mut swarm.notifications {
@@ -1592,20 +1623,7 @@ fn apply(
                     notification.error = None;
                 }
             }
-            if swarm.lifecycle == SwarmLifecycle::AttentionRequired
-                && swarm.recovery_requirement == SwarmRecoveryRequirement::None
-                && !swarm
-                    .notifications
-                    .iter()
-                    .any(|notification| notification.state == SwarmDeliveryState::Uncertain)
-                && swarm
-                    .rounds
-                    .iter()
-                    .all(|round| round.agent_activations_remaining != Some(0))
-            {
-                swarm.lifecycle = SwarmLifecycle::Running;
-                swarm.error = None;
-            }
+            clear_recoverable_attention(swarm);
             Ok(vec![swarm_event(swarm)])
         }
         SwarmCommandPayload::PreviewChange {
@@ -1710,6 +1728,7 @@ fn apply(
                 } else {
                     SwarmMemberState::Retired
                 };
+                member.replacement_due_at_ms = None;
                 for notification in &mut swarm.notifications {
                     if notification.member_id == *id
                         && notification.state == SwarmDeliveryState::Pending
@@ -1730,6 +1749,11 @@ fn apply(
                     current_round_id: None,
                     error: None,
                     guidance_changed: false,
+                    unfinished_notification_ids: Vec::new(),
+                    replacement_due_at_ms: None,
+                    consecutive_replacements: 0,
+                    last_replacement: None,
+                    replaced_session_ids: Vec::new(),
                 });
             }
             if preview.constraints.shared_guidance != swarm.constraints.shared_guidance {
@@ -1814,6 +1838,8 @@ fn apply(
                 } else {
                     SwarmMemberState::Proposed
                 };
+                member.replacement_due_at_ms = None;
+                member.consecutive_replacements = 0;
             }
             member.error = None;
             swarm.notifications[index].state = SwarmDeliveryState::Pending;
@@ -3292,6 +3318,11 @@ fn complete(
                 member.state = SwarmMemberState::Live;
                 member.error = None;
             }
+            if member.agent_id.as_ref() == Some(&agent) {
+                member
+                    .unfinished_notification_ids
+                    .extend(batch.notification_ids.iter().cloned());
+            }
             member.context_cursor = member.context_cursor.max(batch.notified_cursor);
             if batch.member.guidance_changed
                 && !batch.message.is_empty()
@@ -3302,16 +3333,19 @@ fn complete(
             None
         }
         Err(error) => {
-            if !matches!(
+            let retired = matches!(
                 member.state,
                 SwarmMemberState::Retiring
                     | SwarmMemberState::RetiringReserved
                     | SwarmMemberState::Retired
-            ) {
-                member.state = SwarmMemberState::Failed;
-            }
+            );
             member.error = Some(error.message.clone());
-            Some(error)
+            let swarm_error = if retired {
+                error.message.clone()
+            } else {
+                fail_member(member, error.message.clone()).unwrap_or(error.message.clone())
+            };
+            Some((error, swarm_error))
         }
     };
     for notification in &mut swarm.notifications {
@@ -3321,11 +3355,11 @@ fn complete(
             } else {
                 SwarmDeliveryState::Accepted
             };
-            notification.error = error.as_ref().map(|error| error.message.clone());
+            notification.error = error.as_ref().map(|(error, _)| error.message.clone());
         }
     }
-    if let Some(error) = error {
-        swarm.error = Some(error.message);
+    if let Some((_, swarm_error)) = error {
+        swarm.error = Some(swarm_error);
         if !matches!(
             swarm.lifecycle,
             SwarmLifecycle::Paused | SwarmLifecycle::Pausing
@@ -3369,8 +3403,14 @@ fn record_status(
         else {
             continue;
         };
+        let finished_turn = !terminated
+            && status == AgentControlStatus::Idle
+            && member.state == SwarmMemberState::Live
+            && (!member.unfinished_notification_ids.is_empty()
+                || member.consecutive_replacements > 0);
         if !terminated
             && !can_settle
+            && !finished_turn
             && member.runtime_status == Some(status)
             && session
                 .as_ref()
@@ -3382,6 +3422,12 @@ fn record_status(
         if let Some(session) = session {
             member.session_id = Some(session);
         }
+        if finished_turn {
+            member.unfinished_notification_ids.clear();
+            member.consecutive_replacements = 0;
+        }
+        let mut abandoned = Vec::new();
+        let mut attention = None;
         if terminated {
             #[cfg(feature = "test-support")]
             tracing::warn!(
@@ -3392,21 +3438,37 @@ fn record_status(
             );
             member.agent_id = None;
             member.runtime_status = None;
+            abandoned = std::mem::take(&mut member.unfinished_notification_ids);
             if matches!(
                 member.state,
                 SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved
             ) {
                 member.state = SwarmMemberState::Retired;
-            } else {
-                member.state = SwarmMemberState::Failed;
-                match failure {
-                    Some(failure) => member.error = Some(failure.message),
-                    None => {
-                        member.error.get_or_insert_with(|| {
-                            "Member agent terminated; explicit retry retains its session".into()
-                        });
-                    }
-                }
+                abandoned.clear();
+            } else if member.state != SwarmMemberState::Failed {
+                let message = failure
+                    .map(|failure| failure.message)
+                    .or_else(|| member.error.clone())
+                    .unwrap_or_else(|| "Member agent terminated".into());
+                attention = fail_member(member, message);
+            }
+        }
+        for notification in &mut swarm.notifications {
+            if abandoned.contains(&notification.id)
+                && notification.state == SwarmDeliveryState::Accepted
+            {
+                notification.state = SwarmDeliveryState::Failed;
+                notification.error =
+                    Some("Member agent terminated before finishing this wake".into());
+            }
+        }
+        if let Some(error) = attention {
+            swarm.error = Some(error);
+            if !matches!(
+                swarm.lifecycle,
+                SwarmLifecycle::Paused | SwarmLifecycle::Pausing
+            ) {
+                swarm.lifecycle = SwarmLifecycle::AttentionRequired;
             }
         }
         if swarm.lifecycle == SwarmLifecycle::Pausing
@@ -3432,6 +3494,115 @@ fn record_status(
     }
     Ok(events)
 }
+/// Consecutive automatic replacements before a failing member needs a human.
+const SWARM_MAX_CONSECUTIVE_REPLACEMENTS: u32 = 3;
+/// Doubles with each consecutive replacement: 1s, 2s, 4s.
+const SWARM_REPLACEMENT_BACKOFF_MS: u64 = 1_000;
+
+/// Marks a member Failed and schedules its automatic replacement. Returns the
+/// swarm error when replacement is exhausted and a human must intervene.
+fn fail_member(member: &mut SwarmMember, message: String) -> Option<String> {
+    member.state = SwarmMemberState::Failed;
+    if member.consecutive_replacements < SWARM_MAX_CONSECUTIVE_REPLACEMENTS {
+        member.replacement_due_at_ms =
+            Some(now_ms() + (SWARM_REPLACEMENT_BACKOFF_MS << member.consecutive_replacements));
+        member.error = Some(message);
+        return None;
+    }
+    member.replacement_due_at_ms = None;
+    let message = format!(
+        "{} failed after {} automatic replacements; Retry restarts it manually. Last error: {message}",
+        member.spec.name, member.consecutive_replacements
+    );
+    member.error = Some(message.clone());
+    Some(message)
+}
+
+/// Swaps a Failed member's dead agent for a fresh one: same spec, no session.
+/// Its undelivered and unfinished wakes go to the replacement.
+fn replace(
+    file: &mut SwarmStoreSnapshot,
+    swarm_id: &SwarmId,
+    member_id: &SwarmMemberId,
+) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
+    let now = now_ms();
+    let swarm = swarm_mut(file, swarm_id)?;
+    if swarm.recovery_requirement != SwarmRecoveryRequirement::None
+        || matches!(
+            swarm.lifecycle,
+            SwarmLifecycle::Paused | SwarmLifecycle::Pausing
+        )
+    {
+        return Err(failure(
+            SwarmErrorCode::Conflict,
+            "Swarm lifecycle no longer permits automatic replacement",
+        ));
+    }
+    let member = member_mut(swarm, member_id)?;
+    if member.state != SwarmMemberState::Failed
+        || member.agent_id.is_some()
+        || member
+            .replacement_due_at_ms
+            .is_none_or(|due_at_ms| due_at_ms > now)
+    {
+        return Err(failure(
+            SwarmErrorCode::Conflict,
+            "Member no longer awaits automatic replacement",
+        ));
+    }
+    let reason = member
+        .error
+        .take()
+        .unwrap_or_else(|| "Member agent failed".into());
+    member.replaced_session_ids.extend(member.session_id.take());
+    member.state = SwarmMemberState::Proposed;
+    member.runtime_status = None;
+    member.replacement_due_at_ms = None;
+    member.guidance_changed = false;
+    member.consecutive_replacements += 1;
+    member.last_replacement = Some(SwarmMemberReplacement {
+        reason,
+        replaced_at_ms: now,
+        total: member
+            .last_replacement
+            .as_ref()
+            .map_or(0, |replacement| replacement.total)
+            + 1,
+    });
+    let unfinished = std::mem::take(&mut member.unfinished_notification_ids);
+    for notification in &mut swarm.notifications {
+        if notification.member_id == *member_id
+            && (matches!(
+                notification.state,
+                SwarmDeliveryState::Uncertain | SwarmDeliveryState::Failed
+            ) || notification.state == SwarmDeliveryState::Accepted
+                && unfinished.contains(&notification.id))
+        {
+            notification.state = SwarmDeliveryState::Pending;
+            notification.error = None;
+        }
+    }
+    clear_recoverable_attention(swarm);
+    Ok(vec![swarm_event(swarm)])
+}
+
+fn clear_recoverable_attention(swarm: &mut Swarm) {
+    if swarm.lifecycle == SwarmLifecycle::AttentionRequired
+        && swarm.recovery_requirement == SwarmRecoveryRequirement::None
+        && !swarm
+            .notifications
+            .iter()
+            .any(|notification| notification.state == SwarmDeliveryState::Uncertain)
+        && swarm
+            .rounds
+            .iter()
+            .all(|round| round.agent_activations_remaining != Some(0))
+    {
+        swarm.lifecycle = SwarmLifecycle::Running;
+        swarm.error = None;
+    }
+}
+
 fn migration(
     file: &mut SwarmStoreSnapshot,
     mut draft: SwarmDraft,

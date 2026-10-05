@@ -947,6 +947,11 @@ pub(crate) mod wasm_tests {
                 current_round_id: None,
                 error: None,
                 guidance_changed: false,
+                unfinished_notification_ids: Vec::new(),
+                replacement_due_at_ms: None,
+                consecutive_replacements: 0,
+                last_replacement: None,
+                replaced_session_ids: Vec::new(),
             }],
             pending_replies: Vec::new(),
             board_positions: [SwarmBoard::Briefing, SwarmBoard::Coordination]
