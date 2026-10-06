@@ -450,6 +450,47 @@ impl SwarmTab {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SwarmIcon {
+    Settings,
+    Image,
+    Link,
+    File,
+    Check,
+}
+
+fn swarm_icon(icon: SwarmIcon) -> impl IntoView {
+    let paths = match icon {
+        SwarmIcon::Settings => view! {
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        }
+        .into_any(),
+        SwarmIcon::Image => view! {
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+            <circle cx="8.5" cy="8.5" r="1.5" />
+            <polyline points="21 15 16 10 5 21" />
+        }
+        .into_any(),
+        SwarmIcon::Link => view! {
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        }
+        .into_any(),
+        SwarmIcon::File => view! {
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+        }
+        .into_any(),
+        SwarmIcon::Check => view! { <polyline points="20 6 9 17 4 12" /> }.into_any(),
+    };
+    view! {
+        <svg class="swarm-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            {paths}
+        </svg>
+    }
+}
+
 #[component]
 pub fn SwarmView(
     host_id: String,
@@ -665,9 +706,14 @@ pub fn SwarmView(
             else {
                 return;
             };
-            // A linked agent reply may sit in a collapsed discussion group.
-            if let Ok(Some(group)) = element.closest("details") {
-                let _ = group.set_attribute("open", "");
+            // A linked post may sit in folded earlier replies and, inside
+            // them, a collapsed discussion group.
+            let mut ancestor = element.parent_element();
+            while let Some(node) = ancestor {
+                if node.tag_name().eq_ignore_ascii_case("details") {
+                    let _ = node.set_attribute("open", "");
+                }
+                ancestor = node.parent_element();
             }
             element.scroll_into_view();
             if let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() {
@@ -797,7 +843,7 @@ pub fn SwarmView(
                     title=if preview_pending { "Manage swarm — change preview pending" } else { "Manage swarm" }
                     on:click=move |_| manage_open.set(true)
                 >
-                    <span aria-hidden="true">"⚙"</span>
+                    {swarm_icon(SwarmIcon::Settings)}
                 </button>
             </header>
         }
@@ -1183,6 +1229,19 @@ fn thread_items(board: SwarmBoard, replies: &[SwarmPost]) -> Vec<ThreadItem> {
     items
 }
 
+/// Long threads keep the root and the most recent items in view; the middle
+/// folds behind one summary so the latest activity is always at the bottom.
+const THREAD_RECENT_ITEMS: usize = 4;
+const THREAD_FOLD_MIN_ITEMS: usize = 8;
+
+fn earlier_len(items: usize) -> usize {
+    if items > THREAD_FOLD_MIN_ITEMS {
+        items - THREAD_RECENT_ITEMS
+    } else {
+        0
+    }
+}
+
 #[component]
 fn SwarmThread(
     host: StoredValue<String>,
@@ -1197,7 +1256,7 @@ fn SwarmThread(
     let posts_signal = state.swarm_posts;
     let host_streams = state.host_streams;
     let thread = StoredValue::new(thread_id);
-    let reply_open = RwSignal::new(false);
+    let reply_focus = RwSignal::new(0u32);
 
     // Root first, then replies in board order; posts are immutable records.
     let thread_posts: Memo<(Option<SwarmPost>, Vec<SwarmPost>)> = Memo::new(move |_| {
@@ -1263,11 +1322,22 @@ fn SwarmThread(
         })
     });
     let items = Memo::new(move |_| thread_posts.with(|(_, replies)| thread_items(board, replies)));
+    let earlier_count = Memo::new(move |_| {
+        items.with(|items| {
+            items[..earlier_len(items.len())]
+                .iter()
+                .map(|item| match item {
+                    ThreadItem::Post(_) => 1,
+                    ThreadItem::AgentReplies(posts) => posts.len(),
+                })
+                .sum::<usize>()
+        })
+    });
     let quote: RwSignal<Option<SwarmPost>> = RwSignal::new(None);
-    let on_reply = Callback::new(move |()| reply_open.set(true));
+    let on_reply = Callback::new(move |()| reply_focus.update(|request| *request += 1));
     let on_quote = Callback::new(move |post: SwarmPost| {
         quote.set(Some(post));
-        reply_open.set(true);
+        reply_focus.update(|request| *request += 1);
     });
     let load_replies = move |_| {
         let after_cursor = thread_meta.get_untracked().map(|meta| meta.next_cursor);
@@ -1285,12 +1355,64 @@ fn SwarmThread(
             None,
         );
     };
-    let show_load = move || thread_meta.get().is_none_or(|meta| meta.has_more);
+    // A complete board page holds every post of each of its threads.
+    let board_complete = Memo::new(move |_| {
+        posts_signal.with(|map| {
+            map.get(&(host.get_value(), sid.get_value()))
+                .and_then(|posts| posts.page(board))
+                .is_some_and(|page| !page.has_more)
+        })
+    });
+    let show_load =
+        move || !board_complete.get() && thread_meta.get().is_none_or(|meta| meta.has_more);
     let load_label = move || {
         if thread_meta.get().is_some() {
             "Load more replies"
         } else {
             "Load full thread"
+        }
+    };
+    let render_item = move |item: ThreadItem| {
+        match item {
+            ThreadItem::Post(post) => view! {
+                <SwarmPostCard host=host post=*post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
+            }.into_any(),
+            ThreadItem::AgentReplies(posts) => {
+                let key = ThreadItem::AgentReplies(posts).key();
+                let group = Memo::new(move |_| items.with(|items| items.iter().find_map(|item| match item {
+                    ThreadItem::AgentReplies(posts) if item.key() == key => Some(posts.clone()),
+                    _ => None,
+                }).unwrap_or_default()));
+                view! {
+                    <details class="swarm-agent-replies">
+                        <summary>
+                            <span class="swarm-faces swarm-faces-sm" aria-hidden="true">
+                                {move || swarm.with(|swarm| {
+                                    let mut authors: Vec<SwarmMemberId> = Vec::new();
+                                    for post in group.get() {
+                                        if let SwarmAuthor::Member { member_id } = post.author
+                                            && !authors.contains(&member_id)
+                                        {
+                                            authors.push(member_id);
+                                        }
+                                    }
+                                    authors.into_iter().map(|member_id| {
+                                        let name = member_name(swarm.as_ref(), &member_id);
+                                        view! { <span class="swarm-avatar swarm-face" style=avatar_style(&member_id.0)>{initials(&name)}</span> }
+                                    }).collect_view()
+                                })}
+                            </span>
+                            <span>{move || {
+                                let count = group.with(Vec::len);
+                                format!("{count} agent repl{}", if count == 1 { "y" } else { "ies" })
+                            }}</span>
+                        </summary>
+                        <For each=move || group.get() key=|post| post.id.clone() let:post>
+                            <SwarmPostCard host=host post=post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
+                        </For>
+                    </details>
+                }.into_any()
+            }
         }
     };
 
@@ -1332,52 +1454,19 @@ fn SwarmThread(
                 }.into_any(),
             }}
             <div class="swarm-replies">
-                <For
-                    each=move || items.get()
-                    key=|item| item.key()
-                    let:item
-                >
-                    {match item {
-                        ThreadItem::Post(post) => view! {
-                            <SwarmPostCard host=host post=*post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
-                        }.into_any(),
-                        ThreadItem::AgentReplies(posts) => {
-                            let key = ThreadItem::AgentReplies(posts).key();
-                            let group = Memo::new(move |_| items.with(|items| items.iter().find_map(|item| match item {
-                                ThreadItem::AgentReplies(posts) if item.key() == key => Some(posts.clone()),
-                                _ => None,
-                            }).unwrap_or_default()));
-                            view! {
-                                <details class="swarm-agent-replies">
-                                    <summary>
-                                        <span class="swarm-faces swarm-faces-sm" aria-hidden="true">
-                                            {move || swarm.with(|swarm| {
-                                                let mut authors: Vec<SwarmMemberId> = Vec::new();
-                                                for post in group.get() {
-                                                    if let SwarmAuthor::Member { member_id } = post.author
-                                                        && !authors.contains(&member_id)
-                                                    {
-                                                        authors.push(member_id);
-                                                    }
-                                                }
-                                                authors.into_iter().map(|member_id| {
-                                                    let name = member_name(swarm.as_ref(), &member_id);
-                                                    view! { <span class="swarm-avatar swarm-face" style=avatar_style(&member_id.0)>{initials(&name)}</span> }
-                                                }).collect_view()
-                                            })}
-                                        </span>
-                                        <span>{move || {
-                                            let count = group.with(Vec::len);
-                                            format!("{count} agent repl{}", if count == 1 { "y" } else { "ies" })
-                                        }}</span>
-                                    </summary>
-                                    <For each=move || group.get() key=|post| post.id.clone() let:post>
-                                        <SwarmPostCard host=host post=post swarm=swarm on_link=on_link on_reply=on_reply on_quote=on_quote />
-                                    </For>
-                                </details>
-                            }.into_any()
-                        }
-                    }}
+                <Show when=move || earlier_count.get() != 0>
+                    <details class="swarm-earlier-replies">
+                        <summary>{move || {
+                            let count = earlier_count.get();
+                            format!("{count} earlier repl{}", if count == 1 { "y" } else { "ies" })
+                        }}</summary>
+                        <For each=move || items.with(|items| items[..earlier_len(items.len())].to_vec()) key=|item| item.key() let:item>
+                            {render_item(item)}
+                        </For>
+                    </details>
+                </Show>
+                <For each=move || items.with(|items| items[earlier_len(items.len())..].to_vec()) key=|item| item.key() let:item>
+                    {render_item(item)}
                 </For>
             </div>
             <Show when=show_load>
@@ -1385,19 +1474,17 @@ fn SwarmThread(
                     <button class="swarm-link-btn" on:click=load_replies>{load_label}</button>
                 </div>
             </Show>
-            <Show when=move || reply_open.get()>
-                <div class="swarm-reply-composer">
-                    <SwarmComposer
-                        host=host
-                        sid=sid
-                        swarm=swarm
-                        board=Signal::derive(move || board)
-                        thread_id=Some(thread.get_value())
-                        on_cancel=Callback::new(move |_| reply_open.set(false))
-                        quote=quote
-                    />
-                </div>
-            </Show>
+            <div class="swarm-reply-composer">
+                <SwarmComposer
+                    host=host
+                    sid=sid
+                    swarm=swarm
+                    board=Signal::derive(move || board)
+                    thread_id=Some(thread.get_value())
+                    quote=quote
+                    focus_request=reply_focus
+                />
+            </div>
         </section>
     }
 }
@@ -1597,7 +1684,7 @@ fn SwarmPostCard(
             </span>
             <div class="swarm-post-main">
                 <header class="swarm-post-meta">
-                    {is_result.then(|| view! { <span class="swarm-result-label">"✓ Result"</span> })}
+                    {is_result.then(|| view! { <span class="swarm-result-label">{swarm_icon(SwarmIcon::Check)}"Result"</span> })}
                     <span class="swarm-post-author">{author}</span>
                     <time class="swarm-post-time">{format_time(created_at_ms)}</time>
                     <span class="swarm-post-actions">
@@ -1643,7 +1730,7 @@ fn SwarmAttachments(host: StoredValue<String>, attachments: Vec<SwarmAttachment>
                         });
                     }
                 >
-                    <span class="swarm-attachment-icon" aria-hidden="true">"📄"</span>
+                    {swarm_icon(SwarmIcon::File)}
                     {label}
                 </button>
             }
@@ -1881,6 +1968,9 @@ fn SwarmComposer(
     /// the link and clears the request.
     #[prop(optional)]
     quote: Option<RwSignal<Option<SwarmPost>>>,
+    /// Each increment asks the composer to take keyboard focus.
+    #[prop(optional)]
+    focus_request: Option<RwSignal<u32>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let posts_signal = state.swarm_posts;
@@ -2565,6 +2655,18 @@ fn SwarmComposer(
         });
     }
 
+    if let Some(focus_request) = focus_request {
+        Effect::new(move |previous: Option<u32>| {
+            let request = focus_request.get();
+            if previous.is_some_and(|previous| previous != request)
+                && let Some(textarea) = textarea_ref.get_untracked()
+            {
+                let _ = textarea.focus();
+            }
+            request
+        });
+    }
+
     let attachable = Memo::new(move |_| {
         let host_id = host.get_value();
         let mut files: Vec<SwarmAttachment> = open_files.with(|files| {
@@ -2629,7 +2731,7 @@ fn SwarmComposer(
                             let remove = attachment.clone();
                             view! {
                                 <span class="swarm-attachment" title=attachment.path.relative_path.clone()>
-                                    <span class="swarm-attachment-icon" aria-hidden="true">"📄"</span>
+                                    {swarm_icon(SwarmIcon::File)}
                                     {label.clone()}
                                     <button
                                         class="swarm-attachment-remove"
@@ -2736,7 +2838,7 @@ fn SwarmComposer(
                         }
                     } />
                     <Show when=move || pending.get().is_none()>
-                        <button class="swarm-icon-btn" aria-label="Add images" title="Add images, paste screenshots, or drop multiple images here" disabled={move || reading_images.get() || images.with(Vec::len) + attachments.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS} on:click=move |_| { if let Some(input) = image_input_ref.get_untracked() { input.click(); } }><span aria-hidden="true">"🖼"</span></button>
+                        <button class="swarm-icon-btn" aria-label="Add images" title="Add images, paste screenshots, or drop multiple images here" disabled={move || reading_images.get() || images.with(Vec::len) + attachments.with(Vec::len) >= protocol::SWARM_MAX_ATTACHMENTS} on:click=move |_| { if let Some(input) = image_input_ref.get_untracked() { input.click(); } }>{swarm_icon(SwarmIcon::Image)}</button>
                     </Show>
                     <Show when=move || pending.get().is_none()>
                         <div class="swarm-attach-wrap">
@@ -2748,7 +2850,7 @@ fn SwarmComposer(
                                 aria-expanded=move || link_open.get().to_string()
                                 on:click=move |_| link_open.update(|open| *open = !*open)
                             >
-                                <span aria-hidden="true">"🔗"</span>
+                                {swarm_icon(SwarmIcon::Link)}
                             </button>
                             <Show when=move || link_open.get()>
                                 <ul class="swarm-attach-menu swarm-link-menu" aria-label="Choose a post to link">
@@ -2782,7 +2884,7 @@ fn SwarmComposer(
                                 } }
                                 on:click=move |_| attach_open.update(|open| *open = !*open)
                             >
-                                <span aria-hidden="true">"📄"</span>
+                                {swarm_icon(SwarmIcon::File)}
                             </button>
                             <Show when=move || attach_open.get()>
                                 <ul class="swarm-attach-menu" role="listbox">
@@ -3848,6 +3950,30 @@ pub(crate) mod wasm_tests {
             serde_json::to_value(&first_cursor).unwrap(),
             "continuation submits the page's cursor unchanged"
         );
+        let partial_thread = one(&container, "[data-thread-id='r1']");
+        button(&partial_thread, "Load full thread").click();
+        settle().await;
+        let thread_reads = harness.commands_of("read_thread");
+        assert_eq!(thread_reads[0]["query"]["thread_id"], "r1");
+        assert_eq!(thread_reads[0]["query"]["after_cursor"], Value::Null);
+        let continuation = thread_cursor(sid, "r1", 1, 2);
+        harness.thread_page(SwarmThreadPage {
+            swarm_id: SwarmId(sid.into()),
+            thread_id: SwarmThreadId("r1".into()),
+            root: root.clone(),
+            posts: Vec::new(),
+            next_cursor: continuation.clone(),
+            high_water: 2,
+            has_more: true,
+        });
+        settle().await;
+        button(&partial_thread, "Load more replies").click();
+        settle().await;
+        assert_eq!(
+            harness.commands_of("read_thread")[1]["query"]["after_cursor"],
+            serde_json::to_value(&continuation).unwrap(),
+            "a thread page with more replies continues from its cursor unchanged"
+        );
 
         let reply = make_post(
             sid,
@@ -3864,6 +3990,14 @@ pub(crate) mod wasm_tests {
             harness.commands_of("read_board").len(),
             2,
             "a complete board is not re-read"
+        );
+        // Replies share their root's board, so a complete board page already
+        // holds every post of each thread on it.
+        assert!(
+            all(&partial_thread, "button")
+                .iter()
+                .all(|button| !text_of(button).starts_with("Load")),
+            "a fully loaded thread offers no further loading"
         );
 
         let attachment_path = ProjectPath {
@@ -3982,7 +4116,12 @@ pub(crate) mod wasm_tests {
             );
         }
         let root_composer = one(&container, ".swarm-root-composer:not([hidden])");
-        button(&root_composer, "Attach open file").click();
+        let attach = button(&root_composer, "Attach open file");
+        assert!(
+            text_of(&attach).trim().is_empty() && attach.query_selector("svg").unwrap().is_some(),
+            "Attach open file draws a stroke icon instead of an emoji glyph"
+        );
+        attach.click();
         settle().await;
         let menu = one(&root_composer, ".swarm-attach-menu").get_bounding_client_rect();
         assert!(
@@ -4179,11 +4318,6 @@ pub(crate) mod wasm_tests {
             Some("r4")
         );
 
-        button(first_thread, "Load full thread").click();
-        settle().await;
-        let thread_reads = harness.commands_of("read_thread");
-        assert_eq!(thread_reads[0]["query"]["thread_id"], "r1");
-        assert_eq!(thread_reads[0]["query"]["after_cursor"], Value::Null);
         let continuation = thread_cursor(sid, "r1", 3, 3);
         harness.thread_page(SwarmThreadPage {
             swarm_id: SwarmId(sid.into()),
@@ -4230,11 +4364,11 @@ pub(crate) mod wasm_tests {
             "page update preserves full pending publication identity and content"
         );
         let first_thread = &all(&container, ".swarm-thread")[0];
-        button(first_thread, "Load more replies").click();
-        settle().await;
-        assert_eq!(
-            harness.commands_of("read_thread")[1]["query"]["after_cursor"],
-            serde_json::to_value(&continuation).unwrap()
+        assert!(
+            all(first_thread, "button")
+                .iter()
+                .all(|button| !text_of(button).starts_with("Load")),
+            "the bottom of a thread on a complete board never offers loading"
         );
 
         one(&container, "[data-board='Coordination']").click();
@@ -5890,10 +6024,43 @@ pub(crate) mod wasm_tests {
         );
 
         let thread_card = one(&container, ".swarm-thread");
-        button(&thread_card, "Reply").click();
-        settle().await;
         let composer = one(&thread_card, ".swarm-composer-reply");
         let input = one(&composer, ".swarm-composer-input");
+        assert!(
+            input.get_bounding_client_rect().height() > 0.0
+                && input.get_bounding_client_rect().top()
+                    >= one(&container, "#swarm-post-human-root")
+                        .get_bounding_client_rect()
+                        .bottom(),
+            "every thread ends in an open reply input without pressing Reply"
+        );
+        for label in ["Manage", "Add images", "Link a post"] {
+            let found = container
+                .query_selector(&format!("button[aria-label='{label}']"))
+                .unwrap();
+            assert!(
+                found.as_ref().is_some_and(|button| {
+                    text_of(button).trim().is_empty()
+                        && button.query_selector("svg").unwrap().is_some()
+                }),
+                "{label} draws a stroke icon instead of an emoji glyph (found: {:?})",
+                found.map(|button| button.outer_html())
+            );
+        }
+        button(&one(&container, "#swarm-post-human-root"), "Reply").click();
+        settle().await;
+        assert!(
+            input.is_same_node(
+                web_sys::window()
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .active_element()
+                    .as_ref()
+                    .map(|element| element.as_ref())
+            ),
+            "Reply on a post focuses the thread's reply input"
+        );
         type_into(&input, "Verified in the running instance");
         settle().await;
         button(&composer, "Reply").click();
@@ -5921,8 +6088,17 @@ pub(crate) mod wasm_tests {
         harness.post(&committed);
         settle().await;
         assert!(
-            all(&thread_card, ".swarm-composer-reply").is_empty(),
-            "the host recorded the reply as posted, so the reply composer closes"
+            input.is_same_node(Some(&one(&thread_card, ".swarm-composer-reply textarea")))
+                && input
+                    .dyn_ref::<web_sys::HtmlTextAreaElement>()
+                    .unwrap()
+                    .value()
+                    .is_empty()
+                && input.get_bounding_client_rect().top()
+                    >= one(&container, "#swarm-post-reply-1")
+                        .get_bounding_client_rect()
+                        .bottom(),
+            "the host recorded the reply as posted, so the open reply input clears below it"
         );
 
         // Agent discussion after a human post collapses until its result; each
@@ -5993,14 +6169,16 @@ pub(crate) mod wasm_tests {
         }
         for result in ["#swarm-post-result-1", "#swarm-post-result-2"] {
             let card = one(&container, result);
+            let label = one(&card, ".swarm-result-label");
             assert!(
-                text_of(&card).contains("✓ Result")
+                text_of(&label) == "Result"
+                    && label.query_selector("svg").unwrap().is_some()
                     && card.get_bounding_client_rect().height() > 0.0,
-                "a result is labeled and visible without expanding anything"
+                "a result is labeled with an icon and visible without expanding anything"
             );
         }
         assert!(
-            !text_of(&one(&container, "#swarm-post-follow-up")).contains("✓ Result"),
+            !text_of(&one(&container, "#swarm-post-follow-up")).contains("Result"),
             "a human follow-up is never labeled a result"
         );
         let first_group = all(&replies, "details").remove(0);
@@ -6040,6 +6218,85 @@ pub(crate) mod wasm_tests {
                 .query_selector("#swarm-post-reply-1")
                 .unwrap()
                 .is_some()
+        );
+
+        // A long thread keeps its root and latest activity in view and folds
+        // the middle; a link into the fold still reaches its post.
+        for (id, cursor, segments) in [
+            ("human-2", 11, vec![text("Ship it")]),
+            (
+                "human-3",
+                12,
+                vec![
+                    text("See "),
+                    SwarmBodySegment::PostLink {
+                        post_id: SwarmPostId("chat-1".into()),
+                    },
+                ],
+            ),
+        ] {
+            harness.post(&make_post(
+                sid,
+                id,
+                "human-root",
+                SwarmBoard::Briefing,
+                cursor,
+                SwarmAuthor::Human,
+                segments,
+            ));
+        }
+        settle().await;
+        let fold = one(&replies, ":scope > details");
+        assert_eq!(
+            text_of(&one(&fold, ":scope > summary")),
+            "6 earlier replies",
+            "reply-1, chat-1, chat-2, result-1, follow-up and chat-3 fold away"
+        );
+        assert!(!fold.has_attribute("open"));
+        assert_eq!(
+            fold.get_bounding_client_rect().height(),
+            one(&fold, ":scope > summary")
+                .get_bounding_client_rect()
+                .height(),
+            "the folded middle shows only its summary line"
+        );
+        for hidden in ["#swarm-post-reply-1", "#swarm-post-result-1"] {
+            assert!(
+                fold.contains(Some(&one(&container, hidden))),
+                "{hidden} is folded"
+            );
+        }
+        for shown in [
+            "#swarm-post-human-root",
+            "#swarm-post-result-2",
+            "#swarm-post-human-2",
+            "#swarm-post-human-3",
+        ] {
+            assert!(
+                one(&container, shown).get_bounding_client_rect().height() > 0.0,
+                "{shown} stays visible"
+            );
+        }
+        assert!(
+            one(&thread_card, ".swarm-composer-reply textarea")
+                .get_bounding_client_rect()
+                .top()
+                >= one(&container, "#swarm-post-human-3")
+                    .get_bounding_client_rect()
+                    .bottom(),
+            "the newest reply sits directly above the reply input"
+        );
+        one(&container, "#swarm-post-human-3 .swarm-post-link").click();
+        settle().await;
+        next_tick().await;
+        let target = one(&container, "#swarm-post-chat-1");
+        let group = target.closest("details").unwrap().unwrap();
+        assert!(
+            fold.has_attribute("open")
+                && group.has_attribute("open")
+                && !group.is_same_node(Some(&fold))
+                && target.get_bounding_client_rect().height() > 0.0,
+            "following a link opens the fold and the agent discussion around its post"
         );
 
         one(&container, "[data-board='Coordination']").click();

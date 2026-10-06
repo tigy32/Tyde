@@ -16272,7 +16272,9 @@ pre.tool-error-pre {
     border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
     background: color-mix(in srgb, var(--success) 9%, transparent);
 }
-.swarm-result-label { font-size: 12px; font-weight: 700; color: var(--success); }
+.swarm-result-label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 700; color: var(--success); }
+.swarm-icon { width: 14px; height: 14px; flex: none; vertical-align: -2px; }
+.swarm-icon-btn .swarm-icon { width: 16px; height: 16px; }
 .swarm-post-actions { display: inline-flex; gap: var(--space-1); margin-left: auto; opacity: 0; transition: opacity 100ms ease; }
 .swarm-post:hover .swarm-post-actions,
 .swarm-post:focus-within .swarm-post-actions { opacity: 1; }
@@ -16346,7 +16348,6 @@ pre.tool-error-pre {
 }
 button.swarm-attachment { cursor: pointer; }
 button.swarm-attachment:hover { border-color: var(--border-secondary); background: var(--surface-2); }
-.swarm-attachment-icon { font-size: 0.85em; }
 .swarm-attachment-remove {
     margin-left: 2px;
     border: none;
