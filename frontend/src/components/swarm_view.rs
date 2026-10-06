@@ -633,14 +633,16 @@ pub fn SwarmView(
             let Some(posts) = map.get(&(host.get_value(), sid.get_value())) else {
                 return Vec::new();
             };
-            let mut latest: HashMap<SwarmThreadId, (SwarmBoard, u64)> = HashMap::new();
+            // Threads stay in creation order: a thread's root is its earliest
+            // post, so new replies never move it.
+            let mut earliest: HashMap<SwarmThreadId, (SwarmBoard, u64)> = HashMap::new();
             for post in posts.posts.values() {
-                let entry = latest
+                let entry = earliest
                     .entry(post.thread_id.clone())
-                    .or_insert((post.board, 0));
-                entry.1 = entry.1.max(post.cursor);
+                    .or_insert((post.board, post.cursor));
+                entry.1 = entry.1.min(post.cursor);
             }
-            let mut threads: Vec<_> = latest.into_iter().collect();
+            let mut threads: Vec<_> = earliest.into_iter().collect();
             threads.sort_by_key(|(_, (_, cursor))| *cursor);
             threads
                 .into_iter()
@@ -4603,6 +4605,25 @@ pub(crate) mod wasm_tests {
                 .unwrap()
                 .disabled()
         );
+        harness.post(&make_post(
+            sid,
+            "p7",
+            "r1",
+            SwarmBoard::Briefing,
+            7,
+            by("ada"),
+            vec![text("A late reply to the first topic")],
+        ));
+        settle().await;
+        let order: Vec<String> = all(&container, ".swarm-thread")
+            .iter()
+            .map(|thread| thread.get_attribute("data-thread-id").unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            ["r1", "r4", "orphan-root"],
+            "threads stay in creation order when an older thread gets a reply"
+        );
         let (other_container, _other_handle) = mount_view(&harness, sid);
         settle().await;
         assert!(
@@ -6366,7 +6387,7 @@ pub(crate) mod wasm_tests {
             false,
         ));
         settle().await;
-        let coordination = one(&container, ".swarm-thread");
+        let coordination = one(&container, ".swarm-thread:not([hidden])");
         assert_eq!(text_of(&one(&coordination, "h3")), "Build logs");
         let parent_link = button(&coordination, "Re: Investigate rendering");
         parent_link.click();
