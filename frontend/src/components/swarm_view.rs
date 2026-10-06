@@ -358,6 +358,14 @@ fn render_body(
                     text: label,
                 }
             }
+            SwarmBodySegment::PostLink { post_id }
+                if swarm.is_some_and(|swarm| swarm.thread_deleted(&SwarmThreadId(post_id.0.clone()))) =>
+            {
+                InlineToken {
+                    html: "<span class=\"swarm-post-link swarm-post-link-deleted\">Deleted post</span>".to_owned(),
+                    text: "Deleted post".to_owned(),
+                }
+            }
             SwarmBodySegment::PostLink { post_id } => match posts.get(post_id) {
                 Some(linked) => {
                     let label = format!(
@@ -457,6 +465,7 @@ enum SwarmIcon {
     Link,
     File,
     Check,
+    Trash,
 }
 
 fn swarm_icon(icon: SwarmIcon) -> impl IntoView {
@@ -483,6 +492,14 @@ fn swarm_icon(icon: SwarmIcon) -> impl IntoView {
         }
         .into_any(),
         SwarmIcon::Check => view! { <polyline points="20 6 9 17 4 12" /> }.into_any(),
+        SwarmIcon::Trash => view! {
+            <polyline points="3 6 5 6 21 6" />
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+            <path d="M10 11v6" />
+            <path d="M14 11v6" />
+            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+        }
+        .into_any(),
     };
     view! {
         <svg class="swarm-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1306,7 +1323,7 @@ fn SwarmThread(
             let mut children = swarm
                 .threads
                 .iter()
-                .filter(|child| child.parent_thread_id.as_ref() == Some(&id))
+                .filter(|child| child.parent_thread_id.as_ref() == Some(&id) && !child.deleted)
                 .collect::<Vec<_>>();
             children.sort_by_key(|child| child.creation_cursor);
             Some(ThreadHeader {
@@ -1339,6 +1356,32 @@ fn SwarmThread(
         quote.set(Some(post));
         reply_focus.update(|request| *request += 1);
     });
+    let delete_thread = move |_| {
+        let has_children = thread_header.with_untracked(|header| {
+            header
+                .as_ref()
+                .is_some_and(|header| !header.children.is_empty())
+        });
+        let message = if has_children {
+            "Delete this thread and its coordination threads? Agents will no longer see them."
+        } else {
+            "Delete this thread? Agents will no longer see it."
+        };
+        spawn_local(async move {
+            if !crate::bridge::confirm_dialog("Delete thread", message).await {
+                return;
+            }
+            send_swarm_command(
+                host_streams,
+                &host.get_value(),
+                SwarmCommandPayload::DeleteThread {
+                    swarm_id: sid.get_value(),
+                    thread_id: thread.get_value(),
+                },
+                None,
+            );
+        });
+    };
     let load_replies = move |_| {
         let after_cursor = thread_meta.get_untracked().map(|meta| meta.next_cursor);
         send_swarm_command(
@@ -1425,10 +1468,13 @@ fn SwarmThread(
                     {header.parent.map(|(parent_id, parent_title)| view! {
                         <button class="swarm-link-btn swarm-thread-parent" on:click=move |_| on_link.run(SwarmPostId(parent_id.0.clone()))>{format!("Re: {parent_title}")}</button>
                     })}
-                    {match header.title {
-                        Some(title) => view! { <h3 class="swarm-thread-title">{title}</h3> }.into_any(),
-                        None => view! { <h3 class="swarm-thread-title swarm-thread-naming" role="status">"Naming…"</h3> }.into_any(),
-                    }}
+                    <div class="swarm-thread-title-row">
+                        {match header.title {
+                            Some(title) => view! { <h3 class="swarm-thread-title">{title}</h3> }.into_any(),
+                            None => view! { <h3 class="swarm-thread-title swarm-thread-naming" role="status">"Naming…"</h3> }.into_any(),
+                        }}
+                        <button class="swarm-icon-btn swarm-thread-delete" aria-label="Delete thread" title="Delete thread" on:click=delete_thread>{swarm_icon(SwarmIcon::Trash)}</button>
+                    </div>
                     {(!header.children.is_empty()).then(|| view! {
                         <nav class="swarm-thread-children" aria-label="Coordination threads">
                             {header.children.into_iter().map(|(child_id, child_title)| view! {
@@ -4040,6 +4086,7 @@ pub(crate) mod wasm_tests {
             seq: 2,
             child_seq: 0,
             creation_cursor: 1,
+            deleted: false,
         });
         harness.swarm(&current);
         let editing_thread = one(&container, "[data-thread-id='r1']");
@@ -5233,6 +5280,7 @@ pub(crate) mod wasm_tests {
             seq: 1,
             child_seq: 0,
             creation_cursor: posted.cursor,
+            deleted: false,
         });
         harness.swarm(&current);
         harness.board_page(page(
@@ -5932,6 +5980,7 @@ pub(crate) mod wasm_tests {
                 seq: 1,
                 child_seq: 0,
                 creation_cursor: 1,
+                deleted: false,
             };
         swarm
             .threads
@@ -6328,6 +6377,125 @@ pub(crate) mod wasm_tests {
                 .as_deref(),
             Some("true"),
             "Re: opens the parent request"
+        );
+
+        // Deleting a request asks first, then the server's tombstone removes
+        // it and its Coordination child; links to it read "Deleted post".
+        let mut other = thread(
+            "other-root",
+            SwarmBoard::Briefing,
+            None,
+            Some("Other request"),
+        );
+        other.creation_cursor = 13;
+        swarm.threads.push(other);
+        harness.swarm(&swarm);
+        harness.post(&make_post(
+            sid,
+            "other-root",
+            "other-root",
+            SwarmBoard::Briefing,
+            13,
+            SwarmAuthor::Human,
+            vec![
+                text("Follow-up to "),
+                SwarmBodySegment::PostLink {
+                    post_id: SwarmPostId("human-root".into()),
+                },
+            ],
+        ));
+        settle().await;
+        let _ = js_sys::eval(
+            r#"
+            window.__test_dialog_answer = 'Cancel';
+            (function(send) {
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    if (cmd === 'plugin:dialog|message') {
+                        window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                        return Promise.resolve(window.__test_dialog_answer);
+                    }
+                    return send(cmd, args);
+                };
+            })(window.__TAURI__.core.invoke);
+            "#,
+        );
+        let request = one(&container, "[data-thread-id='human-root']");
+        let delete = one(&request, "button[aria-label='Delete thread']");
+        assert!(
+            text_of(&delete).trim().is_empty() && delete.query_selector("svg").unwrap().is_some(),
+            "delete is a stroke icon button"
+        );
+        delete.click();
+        settle().await;
+        settle().await;
+        let dialogs = harness
+            .calls
+            .iter()
+            .filter(|entry| {
+                entry
+                    .dyn_ref::<js_sys::Array>()
+                    .unwrap()
+                    .get(0)
+                    .as_string()
+                    .as_deref()
+                    == Some("plugin:dialog|message")
+            })
+            .count();
+        assert_eq!(dialogs, 1, "delete asks for confirmation");
+        assert!(
+            harness.commands_of("delete_thread").is_empty(),
+            "a cancelled confirmation deletes nothing"
+        );
+        let _ = js_sys::eval("window.__test_dialog_answer = 'Ok';");
+        delete.click();
+        settle().await;
+        settle().await;
+        assert_eq!(
+            harness.commands_of("delete_thread"),
+            vec![json!({"kind": "delete_thread", "swarm_id": sid, "thread_id": "human-root"})]
+        );
+        assert!(
+            container
+                .query_selector("[data-thread-id='human-root']")
+                .unwrap()
+                .is_some(),
+            "the thread stays until the server reports it deleted"
+        );
+
+        swarm.revision += 1;
+        for state in &mut swarm.threads {
+            if state.thread_id.0 == "human-root" || state.thread_id.0 == "child-1" {
+                state.deleted = true;
+            }
+        }
+        harness.swarm(&swarm);
+        settle().await;
+        for gone in ["human-root", "child-1"] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-thread-id='{gone}']"))
+                    .unwrap()
+                    .is_none(),
+                "{gone} is removed once the server deletes it"
+            );
+        }
+        assert!(
+            container
+                .query_selector("#swarm-post-reply-1")
+                .unwrap()
+                .is_none(),
+            "replies of the deleted request are removed with it"
+        );
+        let remaining = one(&container, "#swarm-post-other-root");
+        assert!(remaining.get_bounding_client_rect().height() > 0.0);
+        assert!(
+            text_of(&remaining).contains("Follow-up to Deleted post")
+                && remaining
+                    .query_selector("button.swarm-post-link, a.swarm-post-link")
+                    .unwrap()
+                    .is_none(),
+            "a link to the deleted request reads Deleted post and cannot be opened: {}",
+            text_of(&remaining)
         );
     }
 }

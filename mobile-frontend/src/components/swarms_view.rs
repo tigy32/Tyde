@@ -357,7 +357,7 @@ fn thread_heading(swarm: &Swarm, thread_id: &SwarmThreadId) -> Option<ThreadHead
     let mut children = swarm
         .threads
         .iter()
-        .filter(|child| child.parent_thread_id.as_ref() == Some(thread_id))
+        .filter(|child| child.parent_thread_id.as_ref() == Some(thread_id) && !child.deleted)
         .collect::<Vec<_>>();
     children.sort_by_key(|child| child.creation_cursor);
     Some(ThreadHeading {
@@ -1123,6 +1123,7 @@ pub(crate) mod wasm_tests {
             seq: 1,
             child_seq: 0,
             creation_cursor: 1,
+            deleted: false,
         });
         emit(
             &state,
@@ -1224,6 +1225,7 @@ pub(crate) mod wasm_tests {
             seq: 1,
             child_seq: 0,
             creation_cursor: 2,
+            deleted: false,
         });
         emit(
             &state,

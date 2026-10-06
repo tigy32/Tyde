@@ -9159,6 +9159,13 @@ pub struct Swarm {
     pub error: Option<String>,
     pub legacy_team_id: Option<TeamId>,
 }
+impl Swarm {
+    pub fn thread_deleted(&self, thread_id: &SwarmThreadId) -> bool {
+        self.threads
+            .iter()
+            .any(|thread| thread.thread_id == *thread_id && thread.deleted)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwarmBodySegment {
@@ -9260,6 +9267,11 @@ pub struct SwarmThread {
     #[serde(default)]
     pub child_seq: u64,
     pub creation_cursor: u64,
+    /// The human deleted this thread or an ancestor. Its posts stay stored
+    /// but no board, thread, post, or agent read returns them; the entry
+    /// remains so sibling sequences keep counting it.
+    #[serde(default)]
+    pub deleted: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmHumanPost {
@@ -9539,6 +9551,12 @@ pub enum SwarmCommandPayload {
         swarm_id: SwarmId,
         board: SwarmBoard,
         cursor: u64,
+    },
+    /// Hides a thread and its Coordination descendants and cancels their
+    /// undelivered wakes.
+    DeleteThread {
+        swarm_id: SwarmId,
+        thread_id: SwarmThreadId,
     },
     Pause {
         swarm_id: SwarmId,

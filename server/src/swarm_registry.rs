@@ -1598,22 +1598,66 @@ fn apply(
                 ));
             }
             position.human_read_cursor = position.human_read_cursor.max(cursor);
-            let read_cursor = position.human_read_cursor;
-            let unread = file
+            recount_unread(file, &swarm_id)?;
+            Ok(vec![swarm_event(swarm_mut(file, &swarm_id)?)])
+        }
+        SwarmCommandPayload::DeleteThread {
+            swarm_id,
+            thread_id,
+        } => {
+            let swarm = swarm_mut(file, &swarm_id)?;
+            if !swarm
+                .threads
+                .iter()
+                .any(|thread| thread.thread_id == thread_id)
+            {
+                return Err(failure(
+                    SwarmErrorCode::NotFound,
+                    "Thread does not belong to this swarm",
+                ));
+            }
+            let mut deleted = vec![thread_id];
+            loop {
+                let children = swarm
+                    .threads
+                    .iter()
+                    .filter(|thread| {
+                        !deleted.contains(&thread.thread_id)
+                            && thread
+                                .parent_thread_id
+                                .as_ref()
+                                .is_some_and(|parent| deleted.contains(parent))
+                    })
+                    .map(|thread| thread.thread_id.clone())
+                    .collect::<Vec<_>>();
+                if children.is_empty() {
+                    break;
+                }
+                deleted.extend(children);
+            }
+            for thread in &mut swarm.threads {
+                if deleted.contains(&thread.thread_id) {
+                    thread.deleted = true;
+                }
+            }
+            let hidden = file
                 .posts
                 .iter()
-                .filter(|post| {
-                    post.swarm_id == swarm_id && post.board == board && post.cursor > read_cursor
-                })
-                .count() as u64;
+                .filter(|post| post.swarm_id == swarm_id && deleted.contains(&post.thread_id))
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>();
             let swarm = swarm_mut(file, &swarm_id)?;
-            let position = swarm
-                .board_positions
-                .iter_mut()
-                .find(|position| position.board == board)
-                .ok_or(failure(SwarmErrorCode::Invalid, "missing board position"))?;
-            position.unread_count = unread;
-            Ok(vec![swarm_event(swarm)])
+            for notification in &mut swarm.notifications {
+                if notification.state == SwarmDeliveryState::Pending {
+                    notification.post_ids.retain(|post| !hidden.contains(post));
+                }
+            }
+            swarm.notifications.retain(|notification| {
+                notification.state != SwarmDeliveryState::Pending
+                    || !notification.post_ids.is_empty()
+            });
+            recount_unread(file, &swarm_id)?;
+            Ok(vec![swarm_event(swarm_mut(file, &swarm_id)?)])
         }
         SwarmCommandPayload::Pause { swarm_id } => {
             let swarm = swarm_mut(file, &swarm_id)?;
@@ -2010,6 +2054,13 @@ fn publish(
         &publication.attachments,
         &publication.images,
     )?;
+    if publication
+        .thread_id
+        .as_ref()
+        .is_some_and(|thread| swarm.thread_deleted(thread))
+    {
+        return Err(failure(SwarmErrorCode::NotFound, "Thread was deleted"));
+    }
     let root = match publication.thread_id.as_ref() {
         Some(thread) => Some(
             file.posts
@@ -2389,6 +2440,17 @@ fn validate_coordination_parent(
             "Coordination must belong to a human Briefing thread",
         ));
     }
+    if file
+        .swarms
+        .iter()
+        .find(|swarm| swarm.id == *id)
+        .is_some_and(|swarm| swarm.thread_deleted(parent))
+    {
+        return Err(failure(
+            SwarmErrorCode::NotFound,
+            "Parent thread was deleted",
+        ));
+    }
     Ok(())
 }
 fn validate_heading(title: &str, description: &str) -> Result<(), SwarmFailure> {
@@ -2474,6 +2536,7 @@ fn prepare_thread(
                     seq: 1,
                     child_seq: 0,
                     creation_cursor: cursor,
+                    deleted: false,
                 },
                 parent: None,
             })
@@ -2526,6 +2589,7 @@ fn prepare_thread(
                     seq: 1,
                     child_seq: 0,
                     creation_cursor: cursor,
+                    deleted: false,
                 },
                 parent: Some(parent),
             })
@@ -2588,7 +2652,7 @@ pub(crate) fn thread_summary(
     swarm
         .threads
         .iter()
-        .find(|thread| thread.thread_id == *thread_id)
+        .find(|thread| thread.thread_id == *thread_id && !thread.deleted)
         .cloned()
         .ok_or(failure(
             SwarmErrorCode::NotFound,
@@ -2643,7 +2707,8 @@ pub(crate) fn list_threads(
         .threads
         .iter()
         .filter(|thread| {
-            query.board.is_none_or(|board| thread.board == board)
+            !thread.deleted
+                && query.board.is_none_or(|board| thread.board == board)
                 && query
                     .parent_thread_id
                     .as_ref()
@@ -2671,7 +2736,8 @@ pub(crate) fn list_threads(
         .take(limit)
         .next_back()
         .map_or(cursor.snapshot_high_water, |thread| thread.creation_cursor);
-    // Children are never removed, so the sibling sequence a page was read at is
+    // Children are never removed (deleted ones stay counted), so the sibling
+    // sequence a page was read at is
     // its count of children inside the pinned snapshot. A continuation page
     // must not hand out a newer sequence than the children it can show.
     let sibling_seq = query.parent_thread_id.as_ref().map(|parent| {
@@ -2844,6 +2910,7 @@ pub(crate) fn read_board(
             post.swarm_id == *id
                 && post.board == query.board
                 && post.cursor <= cursor.snapshot_high_water
+                && !swarm.thread_deleted(&post.thread_id)
                 && match query.view {
                     SwarmBoardView::Posts => post.cursor > cursor.position,
                     SwarmBoardView::Threads => post.id.0 == post.thread_id.0,
@@ -2888,6 +2955,14 @@ pub(crate) fn read_thread(
     id: &SwarmId,
     query: SwarmThreadRead,
 ) -> Result<SwarmThreadPage, SwarmFailure> {
+    if file
+        .swarms
+        .iter()
+        .find(|swarm| swarm.id == *id)
+        .is_some_and(|swarm| swarm.thread_deleted(&query.thread_id))
+    {
+        return Err(failure(SwarmErrorCode::NotFound, "Thread was deleted"));
+    }
     let root = file
         .posts
         .iter()
@@ -3481,6 +3556,35 @@ fn migration(
     file.drafts.retain(|previous| previous.id != draft.id);
     file.drafts.push(draft.clone());
     Ok(vec![draft_event(&draft)])
+}
+
+/// A human's unread count covers only posts a board read can still return.
+fn recount_unread(file: &mut SwarmStoreSnapshot, id: &SwarmId) -> Result<(), SwarmFailure> {
+    let swarm = file
+        .swarms
+        .iter()
+        .find(|swarm| swarm.id == *id)
+        .ok_or(failure(SwarmErrorCode::NotFound, "swarm does not exist"))?;
+    let counts = swarm
+        .board_positions
+        .iter()
+        .map(|position| {
+            file.posts
+                .iter()
+                .filter(|post| {
+                    post.swarm_id == *id
+                        && post.board == position.board
+                        && post.cursor > position.human_read_cursor
+                        && !swarm.thread_deleted(&post.thread_id)
+                })
+                .count() as u64
+        })
+        .collect::<Vec<_>>();
+    let swarm = swarm_mut(file, id)?;
+    for (position, unread) in swarm.board_positions.iter_mut().zip(counts) {
+        position.unread_count = unread;
+    }
+    Ok(())
 }
 
 fn failure(code: SwarmErrorCode, message: impl Into<String>) -> SwarmFailure {

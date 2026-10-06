@@ -11108,6 +11108,222 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         SwarmErrorCode::Invalid,
     );
 
+    // Deleting a human request hides it and its Coordination children from
+    // every reader, cancels their undelivered wakes, and refuses new posts.
+    let doomed = scenario
+        .post(
+            &swarm.id,
+            publication(
+                SwarmBoard::Briefing,
+                "doomed-request",
+                vec![text("Draft the migration plan")],
+            ),
+        )
+        .await;
+    let mut doomed_child = create("doomed-child", 0, "Migration steps");
+    doomed_child["parent_thread_id"] = json!(doomed.thread_id);
+    let doomed_child: Value =
+        tool_value(&call_tool(&first, "tyde_swarm_create_thread", doomed_child).await);
+    let child_id = protocol::SwarmThreadId(
+        doomed_child["thread"]["thread_id"]
+            .as_str()
+            .expect("child thread id")
+            .to_owned(),
+    );
+    let mut doomed_reply = publication(
+        SwarmBoard::Briefing,
+        "doomed-reply",
+        vec![text("Include the rollback")],
+    );
+    doomed_reply.thread_id = Some(doomed.thread_id.clone());
+    let doomed_reply = scenario.post(&swarm.id, doomed_reply).await;
+    let hidden_posts = [
+        doomed.id.clone(),
+        doomed_reply.id.clone(),
+        protocol::SwarmPostId(
+            doomed_child["publication"]["post"]["id"]
+                .as_str()
+                .expect("child root post")
+                .to_owned(),
+        ),
+    ];
+    let before_delete = scenario.snapshot(&swarm.id).await;
+    assert!(
+        before_delete.notifications.iter().any(|intent| {
+            intent.state == SwarmDeliveryState::Pending
+                && intent
+                    .post_ids
+                    .iter()
+                    .any(|post| hidden_posts.contains(post))
+        }),
+        "the paused swarm holds undelivered wakes for the request"
+    );
+    scenario
+        .send(SwarmCommandPayload::DeleteThread {
+            swarm_id: swarm.id.clone(),
+            thread_id: doomed.thread_id.clone(),
+        })
+        .await;
+    let deleted = scenario
+        .swarm(&swarm.id, |state| state.thread_deleted(&doomed.thread_id))
+        .await;
+    let removed = deleted
+        .threads
+        .iter()
+        .filter(|thread| thread.deleted)
+        .map(|thread| thread.thread_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        removed.len() == 2
+            && removed.contains(&child_id)
+            && !deleted.thread_deleted(&human.thread_id),
+        "the request and its Coordination child are deleted; other requests stay"
+    );
+    assert!(
+        deleted.notifications.iter().all(|intent| {
+            intent.state != SwarmDeliveryState::Pending
+                || intent
+                    .post_ids
+                    .iter()
+                    .all(|post| !hidden_posts.contains(post))
+        }),
+        "undelivered wakes for deleted posts are cancelled"
+    );
+    let briefing = scenario
+        .board(&swarm.id, read_board(SwarmBoard::Briefing))
+        .await;
+    assert!(
+        briefing
+            .posts
+            .iter()
+            .all(|post| post.thread_id != doomed.thread_id)
+            && briefing.posts.iter().any(|post| post.id == human.id),
+        "the Briefing board no longer returns the deleted request"
+    );
+    let coordination = scenario
+        .board(&swarm.id, read_board(SwarmBoard::Coordination))
+        .await;
+    assert!(
+        coordination
+            .posts
+            .iter()
+            .all(|post| !removed.contains(&post.thread_id)),
+        "the Coordination board no longer returns its children"
+    );
+    let unread = deleted
+        .board_positions
+        .iter()
+        .find(|position| position.board == SwarmBoard::Briefing)
+        .expect("briefing position");
+    assert_eq!(
+        unread.unread_count,
+        briefing
+            .posts
+            .iter()
+            .filter(|post| post.cursor > unread.human_read_cursor)
+            .count() as u64,
+        "unread counts only posts the board still returns"
+    );
+    scenario
+        .send(SwarmCommandPayload::ReadPost {
+            swarm_id: swarm.id.clone(),
+            post_id: hidden_posts[2].clone(),
+        })
+        .await;
+    scenario.error(SwarmErrorCode::NotFound).await;
+    scenario
+        .send(SwarmCommandPayload::ReadThread {
+            swarm_id: swarm.id.clone(),
+            query: SwarmThreadRead {
+                thread_id: doomed.thread_id.clone(),
+                after_cursor: None,
+                limit: None,
+            },
+        })
+        .await;
+    scenario.error(SwarmErrorCode::NotFound).await;
+    let mut late_reply = publication(
+        SwarmBoard::Briefing,
+        "doomed-late-reply",
+        vec![text("Still there?")],
+    );
+    late_reply.thread_id = Some(doomed.thread_id.clone());
+    scenario
+        .send(SwarmCommandPayload::Post {
+            swarm_id: swarm.id.clone(),
+            post: human_post(late_reply),
+        })
+        .await;
+    scenario.error(SwarmErrorCode::NotFound).await;
+    for (tool, arguments) in [
+        (
+            "tyde_swarm_read_summary",
+            json!({"thread_id": doomed.thread_id}),
+        ),
+        ("tyde_swarm_read_summary", json!({"thread_id": child_id})),
+        ("tyde_swarm_read_thread", json!({"thread_id": child_id})),
+        (
+            "tyde_swarm_read_deltas",
+            json!({"thread_id": doomed.thread_id, "after_seq": 0}),
+        ),
+        (
+            "tyde_swarm_list_threads",
+            json!({"board": "coordination", "parent_thread_id": doomed.thread_id}),
+        ),
+        (
+            "tyde_swarm_update_thread",
+            json!({
+                "thread_id": doomed.thread_id,
+                "expected_seq": 10,
+                "summary_change": {"kind": "append", "text": "late"},
+                "publication_id": "doomed-agent-update",
+                "body": [{"kind": "text", "text": "Late contribution"}],
+            }),
+        ),
+        ("tyde_swarm_create_thread", {
+            let mut late = create("doomed-late-child", 1, "Late child");
+            late["parent_thread_id"] = json!(doomed.thread_id);
+            late
+        }),
+    ] {
+        swarm_tool_error(
+            &call_tool(&first, tool, arguments).await,
+            SwarmErrorCode::NotFound,
+        );
+    }
+    let visible: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_list_threads",
+            json!({"board": "coordination"}),
+        )
+        .await,
+    );
+    assert!(
+        visible["threads"]
+            .as_array()
+            .expect("directory")
+            .iter()
+            .all(|thread| thread["thread_id"] != json!(child_id)),
+        "the agent thread directory omits deleted threads"
+    );
+    let agent_board: Value = tool_value(
+        &call_tool(
+            &first,
+            "tyde_swarm_read_board",
+            json!({"board": "briefing"}),
+        )
+        .await,
+    );
+    assert!(
+        agent_board["posts"]
+            .as_array()
+            .expect("agent board")
+            .iter()
+            .all(|post| post["thread_id"] != json!(doomed.thread_id)),
+        "agents no longer read the deleted request from the board"
+    );
+
     let unnamed = scenario
         .post(
             &swarm.id,
@@ -11213,12 +11429,14 @@ async fn human_requests_are_named_and_replies_serialize_with_agent_updates() {
         .find(|thread| thread.thread_id == human.thread_id)
         .expect("restored request");
     assert!(
-        restored.threads.len() == 5
+        restored.threads.len() == 7
+            && restored.thread_deleted(&doomed.thread_id)
+            && restored.thread_deleted(&child_id)
             && restored_request.seq == 10
             && restored_request.child_seq == 2
             && restored_request.title == root_thread.title
             && restored_request.summary == "Evidence verified; deploy pending\nRollback verified",
-        "restart preserves summaries, names and every child thread"
+        "restart preserves summaries, names, every child thread and deletions"
     );
     let committed = scenario
         .thread(

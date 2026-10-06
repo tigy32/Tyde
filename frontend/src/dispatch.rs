@@ -3074,6 +3074,23 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
             Ok(payload) => {
                 let swarm = payload.swarm;
+                let key = (host_id.to_string(), swarm.id.clone());
+                if swarm.threads.iter().any(|thread| thread.deleted)
+                    && state.swarm_posts.with_untracked(|map| {
+                        map.get(&key).is_some_and(|posts| {
+                            posts
+                                .posts
+                                .values()
+                                .any(|post| swarm.thread_deleted(&post.thread_id))
+                        })
+                    })
+                {
+                    state.swarm_posts.update(|map| {
+                        if let Some(posts) = map.get_mut(&key) {
+                            posts.drop_deleted_threads(&swarm);
+                        }
+                    });
+                }
                 state.swarms.update(|map| {
                     map.entry(host_id.to_string())
                         .or_default()

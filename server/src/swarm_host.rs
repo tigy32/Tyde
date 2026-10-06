@@ -487,6 +487,7 @@ impl HostHandle {
         let snapshot = registry.snapshot().await?;
         if !snapshot.posts.iter().any(|post| {
             post.swarm_id == describe.swarm.id
+                && !describe.swarm.thread_deleted(&post.thread_id)
                 && post.images.iter().any(|image| image.id == image_id)
         }) {
             return Err(fail(
@@ -1132,6 +1133,7 @@ impl HostHandle {
             | SwarmCommandPayload::ReadPost { .. }
             | SwarmCommandPayload::ReadThread { .. }
             | SwarmCommandPayload::MarkRead { .. }
+            | SwarmCommandPayload::DeleteThread { .. }
             | SwarmCommandPayload::Pause { .. }
             | SwarmCommandPayload::DiscardDraft { .. }
             | SwarmCommandPayload::DiscardChangePreview { .. } => {}
@@ -1923,6 +1925,7 @@ fn swarm_command_subject(
         | SwarmCommandPayload::ReadPost { swarm_id, .. }
         | SwarmCommandPayload::ReadThread { swarm_id, .. }
         | SwarmCommandPayload::MarkRead { swarm_id, .. }
+        | SwarmCommandPayload::DeleteThread { swarm_id, .. }
         | SwarmCommandPayload::Pause { swarm_id }
         | SwarmCommandPayload::Resume { swarm_id }
         | SwarmCommandPayload::PreviewChange { swarm_id, .. }
@@ -2172,7 +2175,7 @@ fn swarm_helper_work(snapshot: &SwarmStoreSnapshot) -> Vec<SwarmHelperJobKey> {
     let mut work = Vec::new();
     for swarm in &snapshot.swarms {
         for thread in &swarm.threads {
-            if thread.title.is_none() {
+            if thread.title.is_none() && !thread.deleted {
                 work.push((
                     swarm.id.clone(),
                     thread.thread_id.clone(),

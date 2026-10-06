@@ -1015,6 +1015,48 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         }
         FrameKind::SwarmNotify => match envelope.parse_payload::<protocol::SwarmNotifyPayload>() {
             Ok(payload) => {
+                let swarm = &payload.swarm;
+                if swarm.threads.iter().any(|thread| thread.deleted) {
+                    let key = (host.clone(), swarm.id.clone());
+                    let hidden = |post: &protocol::SwarmPost| swarm.thread_deleted(&post.thread_id);
+                    if state.swarm_posts.with_untracked(|m| {
+                        m.get(&key).is_some_and(|posts| posts.values().any(hidden))
+                    }) {
+                        state.swarm_posts.update(|m| {
+                            if let Some(posts) = m.get_mut(&key) {
+                                posts.retain(|_, post| !hidden(post));
+                            }
+                        });
+                    }
+                    if state.swarm_board_pages.with_untracked(|m| {
+                        m.get(&key).is_some_and(|pages| {
+                            pages.iter().any(|page| page.posts.iter().any(hidden))
+                        })
+                    }) {
+                        state.swarm_board_pages.update(|m| {
+                            if let Some(pages) = m.get_mut(&key) {
+                                for page in pages {
+                                    page.posts.retain(|post| !hidden(post));
+                                }
+                            }
+                        });
+                    }
+                    let stale = |(h, s, thread): &(
+                        LocalHostId,
+                        protocol::SwarmId,
+                        protocol::SwarmThreadId,
+                    )| {
+                        h == host && s == &swarm.id && swarm.thread_deleted(thread)
+                    };
+                    if state
+                        .swarm_thread_pages
+                        .with_untracked(|m| m.keys().any(stale))
+                    {
+                        state
+                            .swarm_thread_pages
+                            .update(|m| m.retain(|key, _| !stale(key)));
+                    }
+                }
                 state.swarms_by_host.update(|m| {
                     m.entry(host.clone())
                         .or_default()

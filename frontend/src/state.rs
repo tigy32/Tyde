@@ -3353,6 +3353,14 @@ impl SwarmPostsState {
         }
     }
 
+    /// Drops loaded records of threads the server reports deleted.
+    pub fn drop_deleted_threads(&mut self, swarm: &protocol::Swarm) {
+        self.posts
+            .retain(|_, post| !swarm.thread_deleted(&post.thread_id));
+        self.threads
+            .retain(|thread_id, _| !swarm.thread_deleted(thread_id));
+    }
+
     pub fn apply_thread_page(&mut self, page: SwarmThreadPage) {
         self.threads.insert(
             page.thread_id,

@@ -16227,6 +16227,12 @@ pre.tool-error-pre {
 .swarm-thread[hidden] { display: none; }
 .swarm-thread-head { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .swarm-thread-parent { align-self: flex-start; font-size: 12px; }
+.swarm-thread-title-row { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.swarm-thread-title-row .swarm-thread-title { flex: 1; min-width: 0; }
+.swarm-thread-delete { opacity: 0; transition: opacity 100ms ease; }
+.swarm-thread:hover .swarm-thread-delete,
+.swarm-thread-delete:focus-visible { opacity: 1; }
+.swarm-post-link-deleted { color: var(--text-muted); font-style: italic; }
 .swarm-thread-title { margin: 0; font-size: 16px; font-weight: 650; color: var(--text-bright); }
 .swarm-thread-naming { color: var(--text-tertiary); font-style: italic; font-weight: 500; }
 .swarm-thread-error { margin: 0; font-size: 12px; color: var(--warning); }
