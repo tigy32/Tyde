@@ -351,10 +351,7 @@ reply turns. Reading historical posts cannot create new notification intents.
 
 For an eligible idle member, schedule a turn when permitted by lifecycle and
 capacity. A member in a running turn receives the wake as steering into that
-turn. A model can end that turn without acting on the steer, so Tyde tracks
-the steered wake's threads until the member reads or posts in them; any still
-unopened when the turn ends make the wake pending again for a fresh turn.
-When its backend cannot steer, Tyde interrupts the turn and the wake
+turn. When its backend cannot steer, Tyde interrupts the turn and the wake
 stays a pending swarm intent, sent once the member is idle; a wake never waits
 in the member's private queue, which Pause could not withdraw. A member
 awaiting a human answer or in failure keeps the notification pending. Coalesce

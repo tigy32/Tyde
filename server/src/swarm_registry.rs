@@ -18,15 +18,6 @@ pub(crate) struct SwarmRegistryHandle {
 }
 
 type DispatchReservation = (Vec<SwarmDispatch>, Vec<SwarmEventPayload>);
-
-/// A member agent's acknowledgement of a dispatched wake.
-pub(crate) struct SwarmAdmission {
-    pub(crate) agent: AgentId,
-    pub(crate) session: SessionId,
-    /// The wake joined a turn that was already running, so the model may end
-    /// that turn without having acted on it.
-    pub(crate) steered: bool,
-}
 type PrivateAdmissionOutcome = (Option<SwarmDispatch>, Vec<SwarmEventPayload>);
 type SwarmCommitReply<T> = oneshot::Sender<Result<SwarmCommit<T>, SwarmFailure>>;
 
@@ -59,12 +50,7 @@ enum Command {
     Defer(SwarmDispatch, SwarmCommitReply<Vec<SwarmEventPayload>>),
     Complete(
         SwarmDispatch,
-        Result<SwarmAdmission, SwarmFailure>,
-        SwarmCommitReply<Vec<SwarmEventPayload>>,
-    ),
-    OpenedThread(
-        AgentId,
-        SwarmThreadId,
+        Result<(AgentId, SessionId), SwarmFailure>,
         SwarmCommitReply<Vec<SwarmEventPayload>>,
     ),
     Status(
@@ -288,10 +274,6 @@ impl SwarmRegistryHandle {
                         let result = actor.transaction(|file| complete(file, batch, result));
                         let _ = reply.send(result);
                     }
-                    Command::OpenedThread(id, thread_id, reply) => {
-                        let result = actor.transaction(|file| opened_thread(file, &id, &thread_id));
-                        let _ = reply.send(result);
-                    }
                     Command::Status(id, status, session, terminated, failure, reply) => {
                         let result = actor.transaction(|file| {
                             record_status(file, &id, status, session, terminated, failure)
@@ -493,22 +475,10 @@ impl SwarmRegistryHandle {
     pub(crate) async fn complete(
         &self,
         batch: SwarmDispatch,
-        result: Result<SwarmAdmission, SwarmFailure>,
+        result: Result<(AgentId, SessionId), SwarmFailure>,
     ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
         self.committed_events(
             self.request(|reply| Command::Complete(batch, result, reply))
-                .await?,
-        )
-        .await
-    }
-    /// Records that a member agent read or posted in a thread.
-    pub(crate) async fn opened_thread(
-        &self,
-        id: AgentId,
-        thread_id: SwarmThreadId,
-    ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
-        self.committed_events(
-            self.request(|reply| Command::OpenedThread(id, thread_id, reply))
                 .await?,
         )
         .await
@@ -2181,7 +2151,6 @@ fn publish(
                 SwarmDeliveryState::Pending
             },
             error: undeliverable.then(|| "Member retired; notification cannot be delivered".into()),
-            unopened_thread_ids: Vec::new(),
         });
     }
     let position = swarm
@@ -3191,23 +3160,8 @@ fn wake_line(swarm: &Swarm, post: &SwarmPost) -> String {
 fn complete(
     file: &mut SwarmStoreSnapshot,
     batch: SwarmDispatch,
-    result: Result<SwarmAdmission, SwarmFailure>,
+    result: Result<(AgentId, SessionId), SwarmFailure>,
 ) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
-    let steered_threads = match &result {
-        Ok(admission) if admission.steered => file
-            .posts
-            .iter()
-            .filter(|post| batch.notification_post_ids.contains(&post.id))
-            .map(|post| (post.id.clone(), post.thread_id.clone()))
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    #[cfg(feature = "test-support")]
-    tracing::warn!(
-        steered = result.as_ref().is_ok_and(|admission| admission.steered),
-        threads = ?steered_threads.iter().map(|(_, thread)| thread.0.clone()).collect::<Vec<_>>(),
-        "Swarm steer diagnostic: admission recorded"
-    );
     let swarm = swarm_mut(file, &batch.swarm_id)?;
     let delivered_current_guidance =
         batch.constraints.shared_guidance == swarm.constraints.shared_guidance;
@@ -3224,7 +3178,7 @@ fn complete(
         member.state = SwarmMemberState::Retiring;
     }
     let error = match result {
-        Ok(SwarmAdmission { agent, session, .. }) => {
+        Ok((agent, session)) => {
             member.session_id = Some(session);
             if member.agent_id.as_ref() == Some(&agent)
                 && member.state == SwarmMemberState::Reserved
@@ -3270,15 +3224,6 @@ fn complete(
                 SwarmDeliveryState::Accepted
             };
             notification.error = error.as_ref().map(|(error, _)| error.message.clone());
-            notification.unopened_thread_ids.clear();
-            for (post_id, thread_id) in &steered_threads {
-                if error.is_none()
-                    && notification.post_ids.contains(post_id)
-                    && !notification.unopened_thread_ids.contains(thread_id)
-                {
-                    notification.unopened_thread_ids.push(thread_id.clone());
-                }
-            }
         }
     }
     if let Some((_, swarm_error)) = error {
@@ -3295,42 +3240,6 @@ fn complete(
         swarm.lifecycle = SwarmLifecycle::Running;
     }
     Ok(vec![swarm_event(swarm)])
-}
-/// A steered wake counts as read once its member reads or posts in the thread.
-fn opened_thread(
-    file: &mut SwarmStoreSnapshot,
-    agent: &AgentId,
-    thread_id: &SwarmThreadId,
-) -> Result<Vec<SwarmEventPayload>, SwarmFailure> {
-    let mut events = Vec::new();
-    for swarm in &mut file.swarms {
-        let Some(member_id) = swarm
-            .members
-            .iter()
-            .find(|member| member.agent_id.as_ref() == Some(agent))
-            .map(|member| member.spec.id.clone())
-        else {
-            continue;
-        };
-        let mut changed = false;
-        for notification in &mut swarm.notifications {
-            if notification.member_id == member_id
-                && notification.unopened_thread_ids.contains(thread_id)
-            {
-                notification
-                    .unopened_thread_ids
-                    .retain(|id| id != thread_id);
-                changed = true;
-                #[cfg(feature = "test-support")]
-                tracing::warn!(thread = %thread_id.0, "Swarm steer diagnostic: steered thread opened");
-            }
-        }
-        if changed {
-            events.push(swarm_event(swarm));
-        }
-        break;
-    }
-    Ok(events)
 }
 fn record_status(
     file: &mut SwarmStoreSnapshot,
@@ -3382,23 +3291,8 @@ fn record_status(
             member.session_id = Some(session);
         }
         if finished_turn {
-            let finished = std::mem::take(&mut member.unfinished_notification_ids);
+            member.unfinished_notification_ids.clear();
             member.consecutive_replacements = 0;
-            for notification in &mut swarm.notifications {
-                if finished.contains(&notification.id)
-                    && notification.state == SwarmDeliveryState::Accepted
-                    && !notification.unopened_thread_ids.is_empty()
-                {
-                    #[cfg(feature = "test-support")]
-                    tracing::warn!(
-                        member = %member.spec.id.0,
-                        threads = ?notification.unopened_thread_ids.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-                        "Swarm steer diagnostic: redelivering unopened steered wake"
-                    );
-                    notification.state = SwarmDeliveryState::Pending;
-                    notification.unopened_thread_ids.clear();
-                }
-            }
         }
         let mut abandoned = Vec::new();
         let mut attention = None;
@@ -3554,7 +3448,6 @@ fn replace(
         {
             notification.state = SwarmDeliveryState::Pending;
             notification.error = None;
-            notification.unopened_thread_ids.clear();
         }
     }
     clear_recoverable_attention(swarm);

@@ -305,7 +305,7 @@ enum AgentCommand {
     DeliverMessage {
         input: AgentInput,
         redirect: RunningTurnRedirect,
-        reply: oneshot::Sender<Result<AgentDelivery, AgentDeliveryFailure>>,
+        reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
     },
     Compact {
         summary_prompt: String,
@@ -1402,11 +1402,7 @@ impl AgentHandle {
         let receipt = self
             .enqueue_delivery(input, redirect)
             .map_err(|error| error.to_string())?;
-        receipt
-            .wait()
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        receipt.wait().await.map_err(|error| error.to_string())
     }
 
     fn enqueue_delivery(
@@ -3488,7 +3484,7 @@ pub(crate) fn spawn_agent_actor(
                                     if let Some(input) = held {
                                         pending_inputs.push_back(input);
                                     }
-                                    let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                    let _ = reply.send(Ok(()));
                                 }
                                 Err(_) => {
                                     let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_UNRECORDED.to_owned())));
@@ -6372,7 +6368,7 @@ pub(crate) fn spawn_agent_actor(
                     // the `SendInput` arm below must resolve it on every exit.
                     // An unresolved acknowledgement drops with this iteration,
                     // which the caller reads as a failed delivery.
-                    let mut delivery_ack: Option<oneshot::Sender<Result<AgentDelivery, AgentDeliveryFailure>>> = None;
+                    let mut delivery_ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>> = None;
                     let mut redirect = RunningTurnRedirect::SteerElseInterrupt;
                     let command = match command {
                         AgentCommand::DeliverMessage {
@@ -6461,7 +6457,7 @@ pub(crate) fn spawn_agent_actor(
                                     .await;
                                 }
                                 if let Some(reply) = delivery_ack.take() {
-                                    let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                    let _ = reply.send(Ok(()));
                                 }
                                 continue;
                             }
@@ -6524,7 +6520,7 @@ pub(crate) fn spawn_agent_actor(
                             };
                             if usage_paused && matches!(&input, AgentInput::SendMessage(msg) if msg.tool_response.is_some()) {
                                 pending_inputs.push_back(input);
-                                if let Some(reply) = delivery_ack.take() { let _ = reply.send(Ok(AgentDelivery::Admitted)); }
+                                if let Some(reply) = delivery_ack.take() { let _ = reply.send(Ok(())); }
                                 continue;
                             }
                             match input {
@@ -6798,7 +6794,7 @@ pub(crate) fn spawn_agent_actor(
                                             // without this would leave the agent
                                             // Idle with a message it never ran.
                                             mark_agent_work_pending(&status_handle).await;
-                                            let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                            let _ = reply.send(Ok(()));
                                         }
                                         if supersedes_blocking_question {
                                             tracing::info!("Withdrawing a blocking question superseded by user input");
@@ -6885,7 +6881,7 @@ pub(crate) fn spawn_agent_actor(
                                                         // self-started turn ends.
                                                         mark_agent_turn_active(&status_handle)
                                                             .await;
-                                                        let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                                        let _ = reply.send(Ok(()));
                                                     }
                                                 }
                                                 _ => {
@@ -7068,7 +7064,7 @@ pub(crate) fn spawn_agent_actor(
                                                 // for whatever reaches here.
                                                 mark_agent_turn_active(&status_handle).await;
                                             }
-                                            let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                            let _ = reply.send(Ok(()));
                                         }
                                         if let Some(review_id) = review_origin {
                                             tracing::debug!(
@@ -7126,7 +7122,7 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
                                             mark_agent_work_pending(&status_handle).await;
-                                            let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                            let _ = reply.send(Ok(()));
                                         }
                                         continue;
                                     }
@@ -7144,7 +7140,7 @@ pub(crate) fn spawn_agent_actor(
                                         SteerOutcome::Accepted => {
                                             if let Some(reply) = delivery_ack.take() {
                                                 mark_agent_turn_active(&status_handle).await;
-                                                let _ = reply.send(Ok(AgentDelivery::Steered));
+                                                let _ = reply.send(Ok(()));
                                             }
                                             if let Some(review_id) = review_origin {
                                                 notify_review_bundle_consumed(
@@ -7213,7 +7209,7 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
                                             mark_agent_turn_active(&status_handle).await;
-                                            let _ = reply.send(Ok(AgentDelivery::Admitted));
+                                            let _ = reply.send(Ok(()));
                                         }
                                     }
                                     if interrupt_turn
@@ -10331,21 +10327,10 @@ impl std::fmt::Display for AgentDeliveryFailure {
     }
 }
 
-/// How an acknowledged delivery reached the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentDelivery {
-    /// Started, or is queued to start, a turn of its own.
-    Admitted,
-    /// Joined the turn that was already running.
-    Steered,
-}
-
-pub(crate) struct AgentDeliveryReceipt(
-    oneshot::Receiver<Result<AgentDelivery, AgentDeliveryFailure>>,
-);
+pub(crate) struct AgentDeliveryReceipt(oneshot::Receiver<Result<(), AgentDeliveryFailure>>);
 
 impl AgentDeliveryReceipt {
-    pub(crate) async fn wait(self) -> Result<AgentDelivery, AgentDeliveryFailure> {
+    pub(crate) async fn wait(self) -> Result<(), AgentDeliveryFailure> {
         self.0.await.unwrap_or_else(|_| {
             Err(AgentDeliveryFailure::Rejected(
                 DELIVERY_NOT_ACKNOWLEDGED.to_owned(),
@@ -10382,7 +10367,7 @@ const DELIVERY_NOT_ACKNOWLEDGED: &str = "agent actor did not acknowledge the mes
 /// rejection site can skip the transcript error it would otherwise append for
 /// fire-and-forget input.
 fn reject_agent_delivery(
-    ack: Option<oneshot::Sender<Result<AgentDelivery, AgentDeliveryFailure>>>,
+    ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>>,
     reason: &str,
 ) -> bool {
     let Some(reply) = ack else {

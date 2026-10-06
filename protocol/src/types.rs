@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 77;
+pub const PROTOCOL_VERSION: u32 = 76;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9117,10 +9117,6 @@ pub struct SwarmNotification {
     pub round_id: SwarmRoundId,
     pub state: SwarmDeliveryState,
     pub error: Option<String>,
-    /// Threads of a wake steered into a running turn that the member has not
-    /// yet read or posted in. Any left when that turn ends are redelivered.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unopened_thread_ids: Vec<SwarmThreadId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmRound {

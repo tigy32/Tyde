@@ -1,6 +1,4 @@
 use super::*;
-use crate::agent::AgentDelivery;
-use crate::swarm_registry::SwarmAdmission;
 use protocol::{
     SwarmAuthor, SwarmBackendAllocation, SwarmBoardPage, SwarmBoardRead, SwarmConstraints,
     SwarmDescribe, SwarmDispatch, SwarmFailure, SwarmLifecycle, SwarmMemberSpec, SwarmMemberState,
@@ -444,15 +442,8 @@ impl HostHandle {
         agent: AgentId,
         query: SwarmThreadRead,
     ) -> Result<SwarmThreadPage, SwarmFailure> {
-        let describe = self.describe_swarm_for_agent(agent.clone()).await?;
-        let thread_id = query.thread_id.clone();
-        let page = crate::swarm_registry::read_thread(
-            &self.swarm_snapshot().await?,
-            &describe.swarm.id,
-            query,
-        )?;
-        self.opened_swarm_thread(agent, thread_id).await?;
-        Ok(page)
+        let describe = self.describe_swarm_for_agent(agent).await?;
+        crate::swarm_registry::read_thread(&self.swarm_snapshot().await?, &describe.swarm.id, query)
     }
     pub(crate) async fn list_swarm_threads_for_agent(
         &self,
@@ -471,42 +462,20 @@ impl HostHandle {
         agent: AgentId,
         thread: protocol::SwarmThreadId,
     ) -> Result<protocol::SwarmThreadState, SwarmFailure> {
-        let describe = self.describe_swarm_for_agent(agent.clone()).await?;
-        let state = crate::swarm_registry::thread_state(
+        let describe = self.describe_swarm_for_agent(agent).await?;
+        crate::swarm_registry::thread_state(
             &self.swarm_snapshot().await?,
             &describe.swarm.id,
             &thread,
-        )?;
-        self.opened_swarm_thread(agent, thread).await?;
-        Ok(state)
+        )
     }
     pub(crate) async fn read_swarm_deltas_for_agent(
         &self,
         agent: AgentId,
         query: protocol::SwarmDeltaRead,
     ) -> Result<protocol::SwarmDeltaPage, SwarmFailure> {
-        let describe = self.describe_swarm_for_agent(agent.clone()).await?;
-        let thread_id = query.thread_id.clone();
-        let page = crate::swarm_registry::read_deltas(
-            &self.swarm_snapshot().await?,
-            &describe.swarm.id,
-            query,
-        )?;
-        self.opened_swarm_thread(agent, thread_id).await?;
-        Ok(page)
-    }
-    /// Marks a steered wake's thread as read so its turn ending is not a miss.
-    async fn opened_swarm_thread(
-        &self,
-        agent: AgentId,
-        thread_id: protocol::SwarmThreadId,
-    ) -> Result<(), SwarmFailure> {
-        #[cfg(feature = "test-support")]
-        tracing::warn!(thread = %thread_id.0, "Swarm steer diagnostic: member opened thread");
-        self.swarm_mutation(|registry| async move {
-            Ok(((), registry.opened_thread(agent, thread_id).await?))
-        })
-        .await
+        let describe = self.describe_swarm_for_agent(agent).await?;
+        crate::swarm_registry::read_deltas(&self.swarm_snapshot().await?, &describe.swarm.id, query)
     }
     pub(crate) async fn read_swarm_image_for_agent(
         &self,
@@ -532,13 +501,7 @@ impl HostHandle {
         agent: AgentId,
         publication: SwarmPublication,
     ) -> Result<SwarmPublicationOutcome, SwarmFailure> {
-        let describe = self.describe_swarm_for_agent(agent.clone()).await?;
-        let opened = match &publication.thread_change {
-            Some(protocol::SwarmThreadChange::Create {
-                parent_thread_id, ..
-            }) => Some(parent_thread_id.clone()),
-            _ => publication.thread_id.clone(),
-        };
+        let describe = self.describe_swarm_for_agent(agent).await?;
         if publication.thread_change.is_none() {
             return Err(fail(
                 SwarmErrorCode::Invalid,
@@ -594,9 +557,6 @@ impl HostHandle {
                 Ok((outcome, events))
             })
             .await?;
-        if let Some(thread_id) = opened {
-            self.opened_swarm_thread(agent, thread_id).await?;
-        }
         self.schedule_swarm_dispatch().await;
         Ok(outcome)
     }
@@ -712,16 +672,9 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         if let Some(batch) = batch {
             let events = match &delivered {
-                Ok(delivery) => {
+                Ok(()) => {
                     registry
-                        .complete(
-                            batch,
-                            Ok(SwarmAdmission {
-                                agent: agent.clone(),
-                                session: session.clone(),
-                                steered: *delivery == AgentDelivery::Steered,
-                            }),
-                        )
+                        .complete(batch, Ok((agent.clone(), session.clone())))
                         .await?
                 }
                 Err(_) => registry.defer(batch).await?,
@@ -1518,13 +1471,10 @@ impl HostHandle {
     async fn reconcile_swarm_dispatch(
         &self,
         batch: SwarmDispatch,
-        result: Result<SwarmAdmission, SwarmFailure>,
+        result: Result<(AgentId, SessionId), SwarmFailure>,
     ) -> Result<(), SwarmFailure> {
         let mut state = self.state.lock().await;
-        let agent = result
-            .as_ref()
-            .ok()
-            .map(|admission| admission.agent.clone());
+        let agent = result.as_ref().ok().map(|(agent, _)| agent.clone());
         let events = state.swarm_registry.complete(batch, result).await?;
         fan_out_swarm_events_locked(&mut state, events);
         if let Some(agent) = agent {
@@ -1663,7 +1613,7 @@ impl HostHandle {
     async fn dispatch_swarm_batch(
         &self,
         batch: &SwarmDispatch,
-    ) -> Result<SwarmAdmission, SwarmFailure> {
+    ) -> Result<(AgentId, SessionId), SwarmFailure> {
         self.validate_swarm_constraints(&batch.constraints).await?;
         self.validate_swarm_member(&batch.member.spec, &batch.constraints)
             .await?;
@@ -1772,11 +1722,7 @@ impl HostHandle {
                 .deliver_swarm_dispatch_to_live_agent(batch, &agent, prompt)
                 .await;
         }
-        Ok(SwarmAdmission {
-            agent,
-            session,
-            steered: false,
-        })
+        Ok((agent, session))
     }
 
     async fn deliver_swarm_dispatch_to_live_agent(
@@ -1784,7 +1730,7 @@ impl HostHandle {
         batch: &SwarmDispatch,
         agent: &AgentId,
         prompt: String,
-    ) -> Result<SwarmAdmission, SwarmFailure> {
+    ) -> Result<(AgentId, SessionId), SwarmFailure> {
         let state = self.state.lock().await;
         let snapshot = state.swarm_registry.snapshot().await?;
         let admitted = snapshot
@@ -1831,12 +1777,8 @@ impl HostHandle {
             })
             .map_err(delivery_failure)?;
         drop(state);
-        let delivery = receipt.wait().await.map_err(delivery_failure)?;
-        Ok(SwarmAdmission {
-            agent: agent.clone(),
-            session,
-            steered: delivery == AgentDelivery::Steered,
-        })
+        receipt.wait().await.map_err(delivery_failure)?;
+        Ok((agent.clone(), session))
     }
 }
 
