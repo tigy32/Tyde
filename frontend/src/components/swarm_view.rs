@@ -2585,15 +2585,12 @@ fn SwarmComposer(
         link_open.set(false);
     };
 
-    // Who a post will notify. The full list is the Post button's tooltip;
-    // the composer only spells it out when something needs the human's eye.
+    // Who a post will notify, as the Post button's tooltip, plus a warning
+    // under the composer only when someone it addresses can't be reached.
     let routing = Memo::new(move |_| {
         let Some(current) = swarm.get() else {
-            return (
-                "Notification preview unavailable: swarm state is missing.".to_owned(),
-                None,
-                true,
-            );
+            let loading = "Loading swarm…".to_owned();
+            return (loading.clone(), Some(loading));
         };
         let waiting = pending.get();
         let target_board = waiting
@@ -2606,11 +2603,8 @@ fn SwarmComposer(
             .unwrap_or_else(|| compose_segments(&text.get(), &references.get()));
         let root_author = reply_root_author.get();
         if is_reply && root_author.is_none() {
-            return (
-                "Notification preview unavailable until the thread root is loaded.".to_owned(),
-                None,
-                true,
-            );
+            let loading = "Loading thread…".to_owned();
+            return (loading.clone(), Some(loading));
         }
         let recipients = protocol::swarm_publication_recipients(
             &current,
@@ -2620,75 +2614,45 @@ fn SwarmComposer(
             &body,
         );
         if recipients.is_empty() {
-            return (
-                "Shared context only — no members notified.".to_owned(),
-                None,
-                true,
-            );
+            let nobody = "No one will be notified.".to_owned();
+            return (nobody.clone(), Some(nobody));
         }
-        let mut problem = false;
-        let labels = recipients
-            .into_iter()
-            .map(|member_id| {
-                match current
-                    .members
-                    .iter()
-                    .enumerate()
-                    .find(|(_, member)| member.spec.id == member_id)
-                {
-                    Some((index, member)) => match member.state {
+        let mut names = Vec::new();
+        let mut unreachable = Vec::new();
+        for member_id in recipients {
+            match current
+                .members
+                .iter()
+                .enumerate()
+                .find(|(_, member)| member.spec.id == member_id)
+            {
+                Some((index, member)) => {
+                    let name = recipient_name(&current, member, index + 1);
+                    if matches!(
+                        member.state,
                         SwarmMemberState::Retired
-                        | SwarmMemberState::Retiring
-                        | SwarmMemberState::RetiringReserved => {
-                            problem = true;
-                            format!(
-                                "{} — undeliverable ({})",
-                                recipient_name(&current, member, index + 1),
-                                member_status_label(member).to_lowercase()
-                            )
-                        }
-                        SwarmMemberState::Proposed
-                        | SwarmMemberState::Dormant
-                        | SwarmMemberState::Reserved
-                        | SwarmMemberState::Live
-                        | SwarmMemberState::Failed => format!(
-                            "{} ({})",
-                            recipient_name(&current, member, index + 1),
+                            | SwarmMemberState::Retiring
+                            | SwarmMemberState::RetiringReserved
+                    ) {
+                        unreachable.push(format!(
+                            "{name} ({})",
                             member_status_label(member).to_lowercase()
-                        ),
-                    },
-                    None => {
-                        problem = true;
-                        "Unknown recipient — delivery preview unavailable".to_owned()
+                        ));
                     }
+                    names.push(name);
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let lifecycle_note = match current.lifecycle {
-            SwarmLifecycle::Pausing => Some("Pausing; posting does not resume delivery."),
-            SwarmLifecycle::Paused => Some("Paused; posting does not resume delivery."),
-            SwarmLifecycle::AttentionRequired => {
-                Some("Needs attention; posting does not resume delivery.")
+                None => unreachable.push("an unknown member".to_owned()),
             }
-            SwarmLifecycle::Running | SwarmLifecycle::Transitioning => None,
-        };
-        (
-            format!("Notification recipients: {labels}."),
-            lifecycle_note,
-            problem || lifecycle_note.is_some(),
-        )
+        }
+        let warning = (!unreachable.is_empty())
+            .then(|| format!("Won't be notified: {}.", unreachable.join(", ")));
+        (format!("Notifies {}.", names.join(", ")), warning)
     });
-    let routing_preview =
-        move || {
-            let (summary, note, problem) = routing.get();
-            problem.then(|| view! {
-            <div class="swarm-routing-preview" role="status">
-                <span>{summary}</span>
-                {note.map(|note| view! { <span class="swarm-routing-warning">{note}</span> })}
-            </div>
+    let routing_preview = move || {
+        routing.get().1.map(|warning| {
+            view! { <div class="swarm-routing-preview" role="status">{warning}</div> }
         })
-        };
+    };
 
     if let Some(quote) = quote {
         Effect::new(move |_| {
@@ -2986,7 +2950,7 @@ fn SwarmComposer(
                     })}
                     <button
                         class="swarm-btn swarm-btn-primary swarm-composer-send"
-                        title=move || routing.with(|(summary, _, _)| summary.clone())
+                        title=move || routing.with(|(summary, _)| summary.clone())
                         disabled=move || pending.get().is_some() || !routing_available.get() || !images_ready.get() || (text.with(|t| t.trim().is_empty()) && images.with(Vec::is_empty))
                         on:click=move |_| submit()
                     >
@@ -4187,11 +4151,11 @@ pub(crate) mod wasm_tests {
         let draft_input = one(&composer, "textarea");
         // protocol::swarm_publication_recipients wakes every active member
         // for an unmentioned human reply on a human Briefing request.
-        assert!(
+        assert_eq!(
             one(&composer, ".swarm-composer-send")
                 .get_attribute("title")
-                .unwrap_or_default()
-                .starts_with("Notification recipients: Ada (idle), Bo (idle)."),
+                .unwrap_or_default(),
+            "Notifies Ada, Bo.",
             "a reply to a human request previews the whole-swarm wake the host will send"
         );
         assert!(
@@ -4542,7 +4506,7 @@ pub(crate) mod wasm_tests {
         let orphan_input = one(&orphan_composer, "textarea");
         assert_eq!(
             text_of(&one(&orphan_composer, ".swarm-routing-preview")),
-            "Notification preview unavailable until the thread root is loaded."
+            "Loading thread…"
         );
         orphan_input.focus().unwrap();
         type_into(&orphan_input, "For @B");
@@ -4551,7 +4515,7 @@ pub(crate) mod wasm_tests {
         settle().await;
         assert_eq!(
             text_of(&one(&orphan_composer, ".swarm-routing-preview")),
-            "Notification preview unavailable until the thread root is loaded.",
+            "Loading thread…",
             "a reply author is not inferred from a participant or missing root"
         );
         assert!(
@@ -4588,11 +4552,11 @@ pub(crate) mod wasm_tests {
             orphan_input.is_same_node(Some(&one(&orphan_composer, "textarea"))),
             "root arrival changes only the preview, not editor identity"
         );
-        assert!(
+        assert_eq!(
             one(&orphan_composer, ".swarm-composer-send")
                 .get_attribute("title")
-                .unwrap_or_default()
-                .starts_with("Notification recipients: Ada (idle), Bo (idle)."),
+                .unwrap_or_default(),
+            "Notifies Ada, Bo.",
             "reply preview combines the real root author with the selected member"
         );
         assert!(
@@ -4668,9 +4632,9 @@ pub(crate) mod wasm_tests {
                 .map(|line| text_of(line))
                 .unwrap_or_default()
         };
-        assert!(
-            notification_preview()
-                .starts_with("Notification recipients: Ada (idle), Alan (idle), Bo (idle)."),
+        assert_eq!(
+            notification_preview(),
+            "Notifies Ada, Alan, Bo.",
             "Briefing without selected mentions previews the canonical broadcast recipients"
         );
         assert_eq!(
@@ -4739,8 +4703,9 @@ pub(crate) mod wasm_tests {
         );
         let textarea = input.dyn_ref::<web_sys::HtmlTextAreaElement>().unwrap();
         assert_eq!(textarea.value(), "cc @Ada and @Alan ");
-        assert!(
-            notification_preview().starts_with("Notification recipients: Alan (idle)."),
+        assert_eq!(
+            notification_preview(),
+            "Notifies Alan.",
             "only the selected occurrence narrows the audience; literal Ada does not route"
         );
         assert!(
@@ -4857,9 +4822,10 @@ pub(crate) mod wasm_tests {
             text_of(&one(&container, ".swarm-lifecycle-pill")),
             "Needs attention"
         );
-        assert!(
-            routing_line().contains("Needs attention; posting does not resume delivery."),
-            "a stalled swarm surfaces its routing consequence in the composer"
+        assert_eq!(
+            routing_line(),
+            "",
+            "the header owns swarm attention; the composer does not repeat it"
         );
         assert!(
             has_button(&container, "Resume"),
@@ -4981,8 +4947,9 @@ pub(crate) mod wasm_tests {
         same_names.members[1].state = SwarmMemberState::Retiring;
         harness.swarm(&same_names);
         settle().await;
-        assert!(
-            routing_line().starts_with("Notification recipients: Nova — undeliverable (retiring)."),
+        assert_eq!(
+            routing_line(),
+            "Won't be notified: Nova (retiring).",
             "selected retiring reference remains an undeliverable recipient, not a replacement"
         );
         same_names.members[1].state = SwarmMemberState::Retired;
@@ -4991,12 +4958,9 @@ pub(crate) mod wasm_tests {
         same_names.lifecycle = SwarmLifecycle::Paused;
         harness.swarm(&same_names);
         settle().await;
+        assert_eq!(routing_line(), "Won't be notified: Nova (retired).");
         assert!(
-            routing_line().starts_with("Notification recipients: Nova — undeliverable (retired).")
-        );
-        assert!(routing_line().contains("Paused; posting does not resume delivery."));
-        assert!(
-            one(&root_composer, ".swarm-routing-warning")
+            one(&root_composer, ".swarm-routing-preview")
                 .get_bounding_client_rect()
                 .height()
                 > 0.0
@@ -5767,7 +5731,7 @@ pub(crate) mod wasm_tests {
             .get_attribute("title")
             .unwrap_or_default();
         assert!(
-            routing.starts_with("Notification recipients: Ada"),
+            routing.starts_with("Notifies Ada"),
             "a human reply notifies the member who opened the thread: {routing}"
         );
         input
