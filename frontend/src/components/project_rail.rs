@@ -39,8 +39,7 @@ struct ProjectDropTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 struct RailContextMenu {
-    host_id: String,
-    project_id: protocol::ProjectId,
+    project: Option<ActiveProjectRef>,
     x: f64,
     y: f64,
 }
@@ -70,6 +69,16 @@ pub fn ProjectRail() -> impl IntoView {
     let state_for_home = state.clone();
     let go_home = move |_| {
         state_for_home.switch_active_project(None);
+    };
+
+    let on_home_contextmenu = move |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        context_menu.set(Some(RailContextMenu {
+            project: None,
+            x: ev.client_x() as f64,
+            y: ev.client_y() as f64,
+        }));
     };
 
     let home_class = move || {
@@ -109,7 +118,7 @@ pub fn ProjectRail() -> impl IntoView {
                     </svg>
                 </button>
 
-                <button class=home_class on:click=go_home title="Home">
+                <button class=home_class on:click=go_home on:contextmenu=on_home_contextmenu title="Home">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
                         <polyline points="9 22 9 12 15 12 15 22"/>
@@ -507,8 +516,10 @@ fn ProjectRow(
         ev.prevent_default();
         ev.stop_propagation();
         context_menu.set(Some(RailContextMenu {
-            host_id: host_id_for_ctx.clone(),
-            project_id: project_id_for_ctx.clone(),
+            project: Some(ActiveProjectRef {
+                host_id: host_id_for_ctx.clone(),
+                project_id: project_id_for_ctx.clone(),
+            }),
             x: ev.client_x() as f64,
             y: ev.client_y() as f64,
         }));
@@ -649,9 +660,57 @@ fn RailContextMenuView(
     workbench_prompt: RwSignal<Option<WorkbenchCreatePrompt>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let project_for_new_agent = menu.project.clone();
+    let on_new_agent = move |_| {
+        context_menu.set(None);
+        state.switch_active_project(project_for_new_agent.clone());
+        begin_new_chat_default(&state);
+    };
 
-    let host_id_for_lookup = menu.host_id.clone();
-    let project_id_for_lookup = menu.project_id.clone();
+    let close_via_backdrop = move |_| context_menu.set(None);
+    let stop_in_menu = |ev: web_sys::MouseEvent| ev.stop_propagation();
+
+    view! {
+        <>
+            <div
+                class="rail-context-backdrop"
+                style="position: fixed; inset: 0; z-index: 1000;"
+                on:click=close_via_backdrop
+                on:contextmenu=move |ev: web_sys::MouseEvent| {
+                    ev.prevent_default();
+                    context_menu.set(None);
+                }
+            />
+            <div
+                class="context-menu rail-context-menu"
+                style=format!("left: {}px; top: {}px;", menu.x, menu.y)
+                on:click=stop_in_menu
+            >
+                <button class="context-menu-item" on:click=on_new_agent>"New Agent"</button>
+                {menu.project.map(|project| view! {
+                    <ProjectContextMenuItems
+                        project=project
+                        context_menu=context_menu
+                        editing_project=editing_project
+                        workbench_prompt=workbench_prompt
+                    />
+                })}
+            </div>
+        </>
+    }
+}
+
+#[component]
+fn ProjectContextMenuItems(
+    project: ActiveProjectRef,
+    context_menu: RwSignal<Option<RailContextMenu>>,
+    editing_project: RwSignal<Option<EditingKey>>,
+    workbench_prompt: RwSignal<Option<WorkbenchCreatePrompt>>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let host_id_for_lookup = project.host_id.clone();
+    let project_id_for_lookup = project.project_id.clone();
     let project_signal: Memo<Option<Project>> = {
         let state = state.clone();
         Memo::new(move |_| {
@@ -678,8 +737,8 @@ fn RailContextMenuView(
     // uses for nesting.
     let has_workbench_children: Memo<bool> = {
         let state = state.clone();
-        let host_id = menu.host_id.clone();
-        let project_id = menu.project_id.clone();
+        let host_id = project.host_id.clone();
+        let project_id = project.project_id.clone();
         Memo::new(move |_| {
             state.projects.get().iter().any(|info| {
                 info.host_id == host_id && info.project.parent_project_id() == Some(&project_id)
@@ -687,20 +746,8 @@ fn RailContextMenuView(
         })
     };
 
-    let state_for_new_agent = state.clone();
-    let host_id_for_new_agent = menu.host_id.clone();
-    let project_id_for_new_agent = menu.project_id.clone();
-    let on_new_agent = move |_| {
-        context_menu.set(None);
-        state_for_new_agent.switch_active_project(Some(ActiveProjectRef {
-            host_id: host_id_for_new_agent.clone(),
-            project_id: project_id_for_new_agent.clone(),
-        }));
-        begin_new_chat_default(&state_for_new_agent);
-    };
-
-    let host_id_for_rename = menu.host_id.clone();
-    let project_id_for_rename = menu.project_id.clone();
+    let host_id_for_rename = project.host_id.clone();
+    let project_id_for_rename = project.project_id.clone();
     let on_rename = move |_| {
         context_menu.set(None);
         editing_project.set(Some((
@@ -709,8 +756,8 @@ fn RailContextMenuView(
         )));
     };
 
-    let host_id_for_new = menu.host_id.clone();
-    let project_id_for_new = menu.project_id.clone();
+    let host_id_for_new = project.host_id.clone();
+    let project_id_for_new = project.project_id.clone();
     let on_new_workbench = move |_| {
         context_menu.set(None);
         let state = expect_context::<AppState>();
@@ -733,8 +780,8 @@ fn RailContextMenuView(
         }));
     };
 
-    let host_id_for_delete = menu.host_id.clone();
-    let project_id_for_delete = menu.project_id.clone();
+    let host_id_for_delete = project.host_id.clone();
+    let project_id_for_delete = project.project_id.clone();
     let on_delete = move |_| {
         let host_id = host_id_for_delete.clone();
         let project_id = project_id_for_delete.clone();
@@ -763,8 +810,8 @@ fn RailContextMenuView(
         });
     };
 
-    let host_id_for_remove_wb = menu.host_id.clone();
-    let project_id_for_remove_wb = menu.project_id.clone();
+    let host_id_for_remove_wb = project.host_id.clone();
+    let project_id_for_remove_wb = project.project_id.clone();
     let on_remove_workbench = move |_| {
         let host_id = host_id_for_remove_wb.clone();
         let workbench_id = project_id_for_remove_wb.clone();
@@ -793,53 +840,34 @@ fn RailContextMenuView(
         });
     };
 
-    let close_via_backdrop = move |_| context_menu.set(None);
-    let stop_in_menu = |ev: web_sys::MouseEvent| ev.stop_propagation();
-
     view! {
         <>
-            <div
-                class="rail-context-backdrop"
-                style="position: fixed; inset: 0; z-index: 1000;"
-                on:click=close_via_backdrop
-                on:contextmenu=move |ev: web_sys::MouseEvent| {
-                    ev.prevent_default();
-                    context_menu.set(None);
-                }
-            />
-            <div
-                class="context-menu rail-context-menu"
-                style=format!("left: {}px; top: {}px;", menu.x, menu.y)
-                on:click=stop_in_menu
-            >
-                <button class="context-menu-item" on:click=on_new_agent>"New Agent"</button>
-                <button class="context-menu-item" on:click=on_rename>"Rename"</button>
-                {move || (!is_workbench()).then(|| view! {
-                    <button class="context-menu-item" on:click=on_new_workbench.clone()>
-                        "New Workbench"
-                    </button>
-                    <button
-                        class="context-menu-item"
-                        on:click=on_delete.clone()
-                        disabled=move || has_workbench_children.get()
-                        title=move || if has_workbench_children.get() {
-                            "Remove its workbenches first"
-                        } else {
-                            ""
-                        }
-                    >
-                        "Delete Project"
-                    </button>
-                    {move || has_workbench_children.get().then(|| view! {
-                        <div class="context-menu-hint">"Remove its workbenches first"</div>
-                    })}
+            <button class="context-menu-item" on:click=on_rename>"Rename"</button>
+            {move || (!is_workbench()).then(|| view! {
+                <button class="context-menu-item" on:click=on_new_workbench.clone()>
+                    "New Workbench"
+                </button>
+                <button
+                    class="context-menu-item"
+                    on:click=on_delete.clone()
+                    disabled=move || has_workbench_children.get()
+                    title=move || if has_workbench_children.get() {
+                        "Remove its workbenches first"
+                    } else {
+                        ""
+                    }
+                >
+                    "Delete Project"
+                </button>
+                {move || has_workbench_children.get().then(|| view! {
+                    <div class="context-menu-hint">"Remove its workbenches first"</div>
                 })}
-                {move || is_workbench().then(|| view! {
-                    <button class="context-menu-item" on:click=on_remove_workbench.clone()>
-                        "Remove Workbench"
-                    </button>
-                })}
-            </div>
+            })}
+            {move || is_workbench().then(|| view! {
+                <button class="context-menu-item" on:click=on_remove_workbench.clone()>
+                    "Remove Workbench"
+                </button>
+            })}
         </>
     }
 }
@@ -1907,28 +1935,47 @@ mod wasm_tests {
         );
 
         for (name, project_id, expected_draft) in [
-            ("OrphanProj", "p-orphan", ""),
-            ("feature-login", "wb-feat", ""),
-            ("feature-login", "wb-feat", "Keep this existing draft"),
+            ("OrphanProj", Some("p-orphan"), ""),
+            ("feature-login", Some("wb-feat"), ""),
+            ("feature-login", Some("wb-feat"), "Keep this existing draft"),
+            ("Home", None, ""),
+            ("Home", None, "Keep this existing draft"),
         ] {
             let buttons = container
-                .query_selector_all(".rail-project-row button")
+                .query_selector_all(".project-rail button[title]")
                 .unwrap();
             let target = (0..buttons.length())
                 .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
                 .find(|button| button.get_attribute("title").as_deref() == Some(name))
                 .expect("target project button");
-            target
-                .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
-                .unwrap();
+            let selected_before_menu = state.active_project.get_untracked();
+            clear_send_calls();
+            let event_options = web_sys::MouseEventInit::new();
+            event_options.set_cancelable(true);
+            event_options.set_bubbles(true);
+            let event =
+                web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &event_options)
+                    .unwrap();
+            assert!(
+                !target.dispatch_event(&event).unwrap(),
+                "the rail must suppress the browser's context menu"
+            );
             next_tick().await;
+            assert_eq!(
+                state.active_project.get_untracked(),
+                selected_before_menu,
+                "opening the menu must not change the workspace"
+            );
             let items = container
                 .query_selector_all(".context-menu button")
                 .unwrap();
             let new_agent = (0..items.length())
                 .filter_map(|i| items.item(i)?.dyn_into::<HtmlElement>().ok())
                 .find(|button| button.text_content().as_deref().map(str::trim) == Some("New Agent"))
-                .expect("project menu must offer New Agent");
+                .expect("every workspace menu must offer New Agent");
+            if project_id.is_none() {
+                assert_eq!(items.length(), 1, "Home only offers New Agent");
+            }
             new_agent.click();
             next_tick().await;
             assert!(
@@ -1940,12 +1987,18 @@ mod wasm_tests {
             );
             assert_eq!(
                 state.active_project.get_untracked(),
-                Some(ActiveProjectRef {
+                project_id.map(|id| ActiveProjectRef {
                     host_id: "host-a".to_owned(),
-                    project_id: ProjectId(project_id.to_owned()),
+                    project_id: ProjectId(id.to_owned()),
                 }),
-                "launch targets the clicked project, not the previous selection"
+                "launch targets the clicked workspace, not the previous selection"
             );
+            if project_id.is_none() {
+                assert!(
+                    project_accessed_streams().is_empty(),
+                    "Home launch must not access the previously selected project"
+                );
+            }
             let composer = container
                 .query_selector(".chat-textarea")
                 .unwrap()
