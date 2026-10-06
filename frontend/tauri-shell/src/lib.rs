@@ -1187,6 +1187,53 @@ fn settings_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>
     Ok(menu)
 }
 
+/// WebKitGTK binds no undo/redo keys, and muda cannot create the Linux Edit
+/// menu's Undo/Redo items, so Ctrl+Z did nothing in text fields. WebKit
+/// re-dispatches key events the page left unhandled to the GTK window, so an
+/// after-handler there sees only chords no web content claimed (a terminal's
+/// Ctrl+Z is untouched) and runs WebKit's own editing command.
+#[cfg(target_os = "linux")]
+fn install_linux_edit_history_keys(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    window.with_webview(|webview| {
+        use gtk::gdk::{self, keys::constants as key};
+        use gtk::glib::prelude::*;
+        use gtk::prelude::WidgetExt;
+        use webkit2gtk::WebViewExt;
+
+        let view = webview.inner();
+        let Some(toplevel) = view.toplevel() else {
+            tracing::error!("webview has no GTK toplevel; Ctrl+Z undo is unavailable");
+            return;
+        };
+        toplevel.connect_local("key-press-event", true, move |values| {
+            let command = values
+                .get(1)
+                .and_then(|value| value.get::<gdk::Event>().ok())
+                .and_then(|event| {
+                    let event = event.downcast_ref::<gdk::EventKey>()?;
+                    let modifiers = event.state()
+                        & (gdk::ModifierType::CONTROL_MASK
+                            | gdk::ModifierType::SHIFT_MASK
+                            | gdk::ModifierType::MOD1_MASK
+                            | gdk::ModifierType::SUPER_MASK);
+                    let ctrl = gdk::ModifierType::CONTROL_MASK;
+                    let ctrl_shift = ctrl | gdk::ModifierType::SHIFT_MASK;
+                    match event.keyval().to_lower() {
+                        key::z if modifiers == ctrl => Some("Undo"),
+                        key::z if modifiers == ctrl_shift => Some("Redo"),
+                        key::y if modifiers == ctrl => Some("Redo"),
+                        _ => None,
+                    }
+                });
+            let Some(command) = command else {
+                return Some(false.to_value());
+            };
+            view.execute_editing_command(command);
+            Some(true.to_value())
+        });
+    })
+}
+
 pub fn run() {
     #[cfg(target_os = "macos")]
     macos_webview_defaults::apply();
@@ -1438,6 +1485,10 @@ pub fn run() {
             });
             #[cfg(desktop)]
             updates::init(app.handle())?;
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                install_linux_edit_history_keys(&window)?;
+            }
             Ok(())
         })
         .invoke_handler(production_invoke_handler::<tauri::Wry, _>(

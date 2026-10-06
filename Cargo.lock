@@ -8577,6 +8577,7 @@ dependencies = [
  "core-foundation-sys",
  "cpal",
  "devtools-protocol",
+ "gtk",
  "host-config",
  "libc",
  "opus",
@@ -8597,6 +8598,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "webkit2gtk",
  "webrtc-audio-processing",
 ]
 
