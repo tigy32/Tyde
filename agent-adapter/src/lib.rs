@@ -93,6 +93,17 @@ exhaustive_capabilities! {
     SessionSettings,
     SessionSpeed,
     StartupMcpServers,
+    // An image block in an MCP tool result reaches both the model, as an
+    // image, and the completion, intact. Grok moves it into a synthetic user
+    // message and Hermes into a cache file path, so neither stream carries
+    // the pixels. Kiro reports the block but gives its model base64 text: the
+    // model decoded the PNG with a shell command instead of seeing it.
+    McpImageResults,
+    // An MCP result with `isError: true` completes as a failure carrying the
+    // server's result. Antigravity and Hermes reach MCP servers through Tyde's
+    // bridge, which reports every call as a success so the provider keeps the
+    // embedded result, and both then flatten it to plain text.
+    McpErrorResults,
     AgentControlTools,
     TurnUsageReported,
     // Reports a session-cumulative total alongside the turn. Split out from

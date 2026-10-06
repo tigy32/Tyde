@@ -33,6 +33,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::Interrupt,
         BackendCapability::SessionSettings,
         BackendCapability::StartupMcpServers,
+        BackendCapability::McpErrorResults,
         BackendCapability::AgentControlTools,
         BackendCapability::Subagents,
         BackendCapability::TurnUsageReported,

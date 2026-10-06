@@ -28,6 +28,8 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::ImageInput,
         BackendCapability::SessionSettings,
         BackendCapability::StartupMcpServers,
+        BackendCapability::McpImageResults,
+        BackendCapability::McpErrorResults,
         BackendCapability::AgentControlTools,
         BackendCapability::Subagents,
         BackendCapability::TurnUsageReported,

@@ -372,10 +372,21 @@ impl AcpAgentAdapter for GrokAdapter {
             return mapped;
         }
         if completion.is_mcp_tool {
-            if let Some(text) = find_string(&completion.tool_result, &["OkayOutput"]) {
+            let output = completion.tool_result.get("output");
+            let reported = output
+                .and_then(|output| output.get("OkayOutput"))
+                .and_then(Value::as_str)
+                .map(|text| (text, false))
+                .or_else(|| {
+                    output
+                        .and_then(|output| output.get("Error"))
+                        .and_then(Value::as_str)
+                        .map(|text| (text, true))
+                });
+            if let Some((text, is_error)) = reported {
                 return crate::backend::normalize_mcp_call_tool_result(&json!({
                     "content": [{ "type": "text", "text": text }],
-                    "isError": false,
+                    "isError": is_error,
                 }))
                 .tool_result;
             }

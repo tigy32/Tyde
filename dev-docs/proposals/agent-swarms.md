@@ -770,8 +770,8 @@ append/replace, stale writers, instant human replies, result flag validation,
 migration of held legacy replies at load, UTF-8 limits, pinned delta pagination, nesting
 refusal, and restart persistence. Desktop and mobile DOM tests exercise the
 actual composers, naming state, links, results, and collapsed agent replies.
-Real provider `real_swarm_board_coordination` drives all five tools through
-native MCP, concurrent replies in one human thread, a peer child thread, real
-helper naming, an instantly published human reply, and a flagged result; `real_swarm_shared_images` checks pixels
-and a sequence-checked reply in the original human thread. These provider
-cases share setup and assertions.
+Swarm orchestration is server behavior and is tested only by these sims.
+What a swarm needs from a provider is ordinary backend contract, covered
+directly through the `Backend` trait: steering into a running turn, MCP tool
+calls and canonical results (including `isError` and image content),
+enforced read-only access, and delegation exclusion.

@@ -635,12 +635,24 @@ impl AcpAgentAdapter for OpenCodeAdapter {
                 .exported_tool(session_id, workspace_root, tool_call_id, false, false, true)
                 .await?;
             let state = part.get("state")?;
+            let mut content = state
+                .get("output")
+                .or_else(|| state.get("error"))
+                .and_then(Value::as_str)
+                .map(|text| vec![json!({ "type": "text", "text": text })])
+                .unwrap_or_default();
+            // OpenCode moves an MCP result's image blocks out of the tool output
+            // into data-URL file attachments on the same part.
+            content.extend(
+                state
+                    .get("attachments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(opencode_image_attachment_content),
+            );
             Some(json!({
-                "content": state
-                    .get("output")
-                    .or_else(|| state.get("error"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
+                "content": content,
                 "isError": state.get("status").and_then(Value::as_str) == Some("error"),
                 "_meta": state.get("metadata").cloned().unwrap_or(Value::Null),
             }))
@@ -667,6 +679,16 @@ impl AcpAgentAdapter for OpenCodeAdapter {
             info.get("id").and_then(Value::as_str).map(str::to_owned)
         })
     }
+}
+
+fn opencode_image_attachment_content(attachment: &Value) -> Option<Value> {
+    let mime = attachment.get("mime").and_then(Value::as_str)?;
+    let data = attachment
+        .get("url")
+        .and_then(Value::as_str)?
+        .strip_prefix(&format!("data:{mime};base64,"))?;
+    mime.starts_with("image/")
+        .then(|| json!({ "type": "image", "data": data, "mimeType": mime }))
 }
 
 fn opencode_token_usage(raw: &Value) -> Option<TokenUsage> {

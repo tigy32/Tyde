@@ -23543,6 +23543,8 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::SessionSpeed,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::McpImageResults,
+            tyde_agent_adapter::BackendCapability::McpErrorResults,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::CumulativeUsageReported,

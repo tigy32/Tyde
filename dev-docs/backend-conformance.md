@@ -913,3 +913,68 @@ Claude run answered the follow-up with a summary read instead of the
 required thread read. The shared guidance now names the
 `tyde_swarm_read_thread` call explicitly. These are feature-path results,
 not full backend certification.
+
+## Swarm cases removed from conformance
+
+`real_swarm_board_coordination` and `real_swarm_shared_images` started the
+full production host and drove members through its swarm layer. That broke
+the rule that conformance runs directly through the `Backend` trait: server
+code sat between the oracle and the provider, so a server-side change could
+make a provider bug pass. Both cases and `conformance2/swarm.rs` are deleted.
+
+Swarm orchestration (requests, threads, mentions, steered wakes, budgets,
+pause, restart and resume, images, naming, replacement) remains covered by
+the protocol sims in `server/tests/swarms.rs`. The provider contracts those
+cases had caught are now trait-level:
+
+- `real_mcp_image_result` (`StartupMcpServers`, `McpImageResults`): an MCP
+  server returns a text block and a PNG. The completion must be a canonical
+  `CallToolResult` with exactly those pixels as one typed image block, and
+  the model must name the colors. This covers the Claude projection of
+  native `image.source` blocks onto MCP image content.
+- `real_mcp_error_result` (`StartupMcpServers`, `McpErrorResults`): the MCP
+  server returns `isError: true`. The completion must be a failure carrying
+  the canonical result with `isError: true` and the server's text. This
+  covers the Codex restoration of the flag that its failed `mcpToolCall`
+  items omit. It was split out of `real_mcp_tool_call`, which keeps its
+  success phases and stays gated only on `StartupMcpServers`.
+
+### Capabilities
+
+`McpImageResults` is declared by Claude, Codex and OpenCode. Grok moves the
+image into a synthetic user message and Hermes into a cache file path, so
+neither stream carries the pixels. Kiro reports the canonical block, but its
+model receives the image as base64 text: asked for the colors, it decoded
+the PNG with a shell command, and once answered `red:green:blue` from the
+"pixel data".
+
+`McpErrorResults` is declared by Claude, Codex, Grok, Kiro and OpenCode.
+Antigravity and Hermes reach MCP servers through Tyde's bridge, which
+reports every call as a success so the provider keeps the embedded result,
+and both then flatten it to plain text.
+
+### Provider fixes found by these cases
+
+- Grok: ACP titles every MCP call `use_tool`, and startup-MCP detection
+  matched that raw title instead of the normalized tool name, so no Grok MCP
+  result was canonicalized. Detection now uses the normalized name, and the
+  Grok adapter maps `OkayOutput` / `Error` onto a canonical result.
+- OpenCode: MCP image blocks are moved out of the tool output into data-URL
+  file attachments on the same part. The adapter now restores them as image
+  blocks.
+- OpenCode's default model declares no image input, so the image cases
+  (`real_image_input`, `real_mcp_image_result`) select
+  `opencode/mimo-v2.6-flash-free`. That model answered `magenta:aqua`, so the
+  color answers canonicalize the CSS synonyms fuchsia/magenta and aqua/cyan.
+
+### Results (2026-10-05)
+
+- `real_mcp_tool_call`: pass on all seven backends.
+- `real_mcp_error_result`: pass on Claude, Codex, Grok, Kiro and OpenCode.
+- `real_mcp_image_result`: pass on Claude, Codex and OpenCode.
+- `real_image_input`: pass on Claude, Codex, Kiro and OpenCode.
+
+Negative controls: `real_mcp_image_result` fails on Claude without the
+image projection (`missing field data`), and `real_mcp_error_result` fails on
+Codex without the `isError` restoration. Grok and OpenCode failed both cases
+before their fixes.

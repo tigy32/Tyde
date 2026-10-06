@@ -3166,7 +3166,7 @@ impl KiroInner {
             let state = self.state.lock().await;
             (
                 state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&raw_tool_name, &state.startup_mcp_servers),
+                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
             )
         };
         let tool_type = self
@@ -3407,7 +3407,7 @@ impl KiroInner {
             let state = self.state.lock().await;
             (
                 state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&raw_tool_name, &state.startup_mcp_servers),
+                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
             )
         };
 
@@ -6771,6 +6771,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
+            tyde_agent_adapter::BackendCapability::McpErrorResults,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,
