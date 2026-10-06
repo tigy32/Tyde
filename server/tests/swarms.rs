@@ -1550,7 +1550,25 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
             swarm_id: partial.id.clone(),
         })
         .await;
-    let retried = scenario.swarm(&partial.id, ready).await;
+    // The retried member goes Live and Idle before its reset opening wake is
+    // delivered; compare against reconnect only once that delivery settles.
+    let retried = scenario
+        .swarm(&partial.id, |swarm| {
+            ready(swarm)
+                && swarm.notifications.iter().any(|intent| {
+                    intent.member_id == failed.spec.id
+                        && intent.state == SwarmDeliveryState::Accepted
+                })
+                && swarm
+                    .notifications
+                    .iter()
+                    .all(|intent| intent.state == SwarmDeliveryState::Accepted)
+                && swarm
+                    .members
+                    .iter()
+                    .all(|member| member.unfinished_notification_ids.is_empty())
+        })
+        .await;
     let retained = retried
         .members
         .iter()
