@@ -440,6 +440,24 @@ fn contains_code_mode_refusal(value: &Value) -> bool {
     }
 }
 
+struct DeliveryEdge {
+    state: SwarmDeliveryState,
+    unopened: bool,
+    accepted: usize,
+    redelivered: usize,
+}
+
+impl Default for DeliveryEdge {
+    fn default() -> Self {
+        Self {
+            state: SwarmDeliveryState::Pending,
+            unopened: false,
+            accepted: 0,
+            redelivered: 0,
+        }
+    }
+}
+
 struct BusyObservation {
     swarm: Swarm,
     audit_reads_started: HashSet<(SwarmMemberId, SwarmRoundId, SwarmThreadId)>,
@@ -454,7 +472,7 @@ struct BoardClient {
     activities: HashMap<StreamPath, AgentActivity>,
     tools: HashMap<(StreamPath, String), ToolEvidence>,
     swarms: HashMap<SwarmId, Swarm>,
-    delivery_edges: HashMap<SwarmNotificationId, (SwarmDeliveryState, usize)>,
+    delivery_edges: HashMap<SwarmNotificationId, DeliveryEdge>,
     busy_observations: Vec<BusyObservation>,
     post_count: usize,
     observation: u64,
@@ -697,16 +715,30 @@ impl BoardClient {
                     let edge = self
                         .delivery_edges
                         .entry(notification.id.clone())
-                        .or_insert((SwarmDeliveryState::Pending, 0));
+                        .or_default();
                     if notification.state == SwarmDeliveryState::Accepted
-                        && edge.0 != SwarmDeliveryState::Accepted
+                        && edge.state != SwarmDeliveryState::Accepted
                     {
-                        edge.1 += 1;
+                        edge.accepted += 1;
                     }
-                    edge.0 = notification.state;
+                    // A steered wake whose thread the member never opened is
+                    // redelivered as a fresh turn when that turn ends.
+                    if edge.state == SwarmDeliveryState::Accepted
+                        && edge.unopened
+                        && notification.state == SwarmDeliveryState::Pending
+                    {
+                        edge.redelivered += 1;
+                    }
+                    edge.state = notification.state;
+                    edge.unopened = !notification.unopened_thread_ids.is_empty();
                     assert!(
-                        edge.1 <= 1,
-                        "one durable notification was accepted more than once; phase={:?}",
+                        edge.unopened <= (notification.state == SwarmDeliveryState::Accepted),
+                        "only an accepted steered wake can await its thread being opened; phase={:?}",
+                        self.phase
+                    );
+                    assert!(
+                        edge.accepted <= 1 + edge.redelivered,
+                        "one durable notification was accepted more than once without an ignored steer; phase={:?}",
                         self.phase
                     );
                 }
@@ -954,7 +986,7 @@ impl BoardClient {
         assert!(
             self.delivery_edges
                 .get(&intent.id)
-                .is_some_and(|(_, accepted)| *accepted == 1),
+                .is_some_and(|edge| edge.accepted == 1 + edge.redelivered),
             "the real event stream must show one acceptance transition, not repeated snapshot counting"
         );
         assert!(
@@ -1349,6 +1381,12 @@ pub async fn run(backend: BackendKind, workspace: &Path, settings: SessionSettin
         assert!(committed.post.author == SwarmAuthor::Human && committed.post.thread_id == begin.thread_id && committed.post.thread_seq == Some(before_reply + 1) && committed.post.thread_change.is_none() && !committed.post.result, "a human reply commits verbatim as the next sequenced post");
         let settled = client.swarm(&swarm_id, |swarm| swarm.threads.iter().any(|thread| thread.thread_id == begin.thread_id && thread.seq == before_reply + 1)).await;
         assert!(settled.threads.iter().any(|thread| thread.thread_id == begin.thread_id && Some(&thread.summary) == before_notes.as_ref()), "the committed human reply advances the request thread without rewriting the members' notes");
+        // A new request posted while the reply's turn is still running is
+        // steered into that turn; it must still be answered, not lost when
+        // the turn ends on the reply it was reading.
+        client.swarm(&swarm_id, |swarm| swarm.members.iter().any(|member| member.spec.id == initiator && member.runtime_status == Some(AgentControlStatus::Thinking) && member.current_round_id.as_ref() == Some(&committed.post.round_id))).await;
+        let late = client.post(&swarm_id, &[&initiator], "LATE_CHECK. Initiator: read this exact human thread, reply LATE_DONE without mentions in this thread, and finish. Responder: finish without acting.").await;
+        client.member_post(&initiator, SwarmBoard::Briefing, "LATE_DONE", &late, late.cursor, Some(&late.thread_id)).await;
         client.quiescent(&swarm_id).await;
 
         client.phase = Phase::Busy;

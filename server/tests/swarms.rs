@@ -1094,6 +1094,27 @@ async fn call_tool_raw(
     result
 }
 
+/// A member opening a thread through its own board tool, as a model does when
+/// it acts on a wake.
+async fn agent_read_thread(
+    caller: &server::AgentControlMcpCaller,
+    thread_id: &protocol::SwarmThreadId,
+) -> SwarmThreadPage {
+    tool_value(
+        &call_tool(
+            caller,
+            "tyde_swarm_read_thread",
+            serde_json::to_value(SwarmThreadRead {
+                thread_id: thread_id.clone(),
+                after_cursor: None,
+                limit: None,
+            })
+            .expect("serialize thread read"),
+        )
+        .await,
+    )
+}
+
 async fn agent_published(
     caller: &server::AgentControlMcpCaller,
     publication: &SwarmPublication,
@@ -4403,7 +4424,20 @@ async fn pause_interrupts_active_turns_and_restart_resume_reuses_sessions_and_pe
             member.context_cursor >= second.cursor,
             "accepted context must advance the server-owned delivery cursor"
         );
+        let caller = scenario
+            .fixture
+            .agent_control_caller(member.agent_id.as_ref().expect("resumed runtime"))
+            .await;
+        agent_read_thread(&caller, &second.thread_id).await;
     }
+    scenario
+        .swarm(&busy.id, |state| {
+            state
+                .notifications
+                .iter()
+                .all(|notification| notification.unopened_thread_ids.is_empty())
+        })
+        .await;
     for gate in &round_gates {
         gate.release_one();
     }
@@ -9485,8 +9519,41 @@ async fn wakes_are_short_pings_steered_into_running_turns_beside_standing_swarm_
         Some(None),
         "without a turn limit agent wakes spend no allowance"
     );
+    let steered_intent = steered
+        .notifications
+        .iter()
+        .find(|intent| intent.post_ids.contains(&peer_post.id))
+        .expect("steered peer wake")
+        .clone();
+    assert_eq!(
+        steered_intent.unopened_thread_ids,
+        vec![opening.thread_id.clone()],
+        "a steered wake stays unopened until its member reads the thread"
+    );
+    // The running turn ends without the member opening the steered thread,
+    // so the same wake must come back as a turn of its own.
+    mocks[0]
+        .enqueue(MockTurn::text("Read the redelivered peer note"))
+        .await;
     busy_gate.release_one();
-    let settled = scenario.swarm(&live.id, ready).await;
+    let settled = scenario
+        .swarm(&live.id, |state| {
+            ready(state)
+                && state.notifications.iter().any(|intent| {
+                    intent.id == steered_intent.id
+                        && intent.state == SwarmDeliveryState::Accepted
+                        && intent.unopened_thread_ids.is_empty()
+                })
+        })
+        .await;
+    let first_requests = mocks[0].requests().await;
+    let (references, redelivered) = last_dispatch_context(&first_requests);
+    assert!(
+        matches!(first_requests.last(), Some(MockRequest::Input(_)))
+            && references == vec![peer_post.id.clone()]
+            && redelivered == ping,
+        "an unread steered wake is redelivered unchanged as a fresh turn once its turn ends"
+    );
 
     let mut edited = settled.constraints.clone();
     edited.shared_guidance = "Report only verified findings".to_owned();
@@ -10081,8 +10148,26 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
             "one reauthorized peer wake, then the human request steered into that running turn"
         );
         assert!(control.violations().await.is_empty());
+        let caller = scenario
+            .fixture
+            .agent_control_caller(
+                member
+                    .agent_id
+                    .as_ref()
+                    .expect("reauthorized runtime binding"),
+            )
+            .await;
+        agent_read_thread(&caller, &human.thread_id).await;
         resumed_controls.push(control);
     }
+    scenario
+        .swarm(&resumed.id, |state| {
+            state
+                .notifications
+                .iter()
+                .all(|intent| intent.unopened_thread_ids.is_empty())
+        })
+        .await;
     for gate in &gates {
         gate.release_one();
     }

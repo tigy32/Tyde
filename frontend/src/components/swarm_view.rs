@@ -5324,6 +5324,7 @@ pub(crate) mod wasm_tests {
             round_id: SwarmRoundId("round-1".into()),
             state: SwarmDeliveryState::Uncertain,
             error: Some("Backend did not confirm".to_owned()),
+            unopened_thread_ids: Vec::new(),
         }];
         let mut single_launch = swarm.clone();
         single_launch.members = vec![swarm.members[1].clone()];
