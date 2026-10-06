@@ -632,7 +632,7 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
                 <span class="capacity-state" data-capacity-state=slug>{headline}</span>
                 {refreshable.then(|| view! {
                     <button
-                        class="capacity-refresh"
+                        class="settings-btn capacity-refresh"
                         type="button"
                         title="Read this backend's account quota now"
                         on:click=move |_| request_capacity_refresh(kind)
@@ -735,12 +735,6 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
 
     view! {
         <div class="settings-field settings-capacity">
-            <h3 class="settings-section-title">"Subscription capacity"</h3>
-            <p class="settings-description">
-                "Quota reported by each backend for the account it is signed in to on the selected \
-                 host. This is advisory only \u{2014} Tyde never reroutes, downgrades, or switches \
-                 backends based on it, and no figure is ever inferred from Tyde's own token usage."
-            </p>
             {move || {
                 let snapshots = snapshots.get();
                 if snapshots.is_empty() {

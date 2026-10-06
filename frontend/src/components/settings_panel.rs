@@ -438,7 +438,7 @@ impl SettingsTab {
             Self::Display => "Code & Output Display",
             Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
-            Self::UsageManagement => "Usage management",
+            Self::UsageManagement => "Usage Limits",
             Self::Subagents => "Subagents",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
@@ -586,8 +586,8 @@ impl SettingsTab {
                 "Bedrock",
             ],
             Self::UsageManagement => &[
+                "Usage Limits",
                 "Usage management",
-                "Usage limits",
                 "Enable usage limit management",
                 "Pause at usage percentage",
                 "Compact before waiting for reset",
@@ -1087,9 +1087,11 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
 pub(crate) fn AgentRestorationSettings() -> impl IntoView {
     let state = expect_context::<AppState>();
     view! {
-        <h3 class="settings-section-title">"Agent restoration"</h3>
-        <div class="settings-scope-bar"><SettingsHostScope /></div>
-        {move || host_schema_section(&state, "updates")}
+        <section class="settings-subsection">
+            <h3 class="settings-section-title">"Agent restoration"</h3>
+            <div class="settings-scope-bar"><SettingsHostScope /></div>
+            {move || host_schema_section(&state, "updates")}
+        </section>
     }
 }
 
@@ -1428,10 +1430,13 @@ fn HostsTab() -> impl IntoView {
 
     view! {
         <h2 class="settings-panel-title">"Hosts"</h2>
+        <p class="settings-description settings-panel-intro">
+            "Machines Tyde runs agents on. The local host is always available; remote hosts connect over SSH."
+        </p>
 
         <div class="settings-field">
-            <label class="settings-label">"Selected Host"</label>
-            <p class="settings-description">"Which host the host-scoped settings pages — Backends, Custom Agents, MCP Servers, Skills and the rest — read and write. Shown at the top of every one of those pages."</p>
+            <label class="settings-label">"Selected host"</label>
+            <p class="settings-description">"The host whose settings the other pages edit."</p>
             <select
                 class="settings-select settings-select-full"
                 aria-label="Selected host"
@@ -1456,8 +1461,7 @@ fn HostsTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Configured Hosts"</label>
-            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install and launch the exact Tyde Server release matching this app at ~/.tyde/bin/<version>/tyde-server."</p>
+            <label class="settings-label">"Configured hosts"</label>
             <div class="settings-host-list">
                 {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
                     let host_id = host.id.clone();
@@ -1642,8 +1646,8 @@ fn HostsTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Add Remote Host"</label>
-            <p class="settings-description">"Configure a remote host over SSH. Tyde automatically installs and launches the same release as this app."</p>
+            <label class="settings-label">"Add remote host"</label>
+            <p class="settings-description">"Tyde installs and runs a matching server release on the host over SSH."</p>
             <div class="settings-form">
                 <div class="settings-form-row">
                     <label class="settings-form-label">
@@ -1858,14 +1862,14 @@ fn AppearanceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Appearance"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "How the Tyde window itself looks: colors, text size, card labels, and whether the center area is tabbed. These are stored in this installation's local storage, so they follow the app on this machine and are the same no matter which host you are connected to."
+            "How the Tyde window looks on this device, whichever host you connect to."
         </p>
 
         <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
-                    <p class="settings-description">"Show backend names alongside the matching colored edge on agent and history cards. Turn off for color-only rows; full names remain available in card details."</p>
+                    <p class="settings-description">"Show the backend name next to the colored edge on agent and history cards."</p>
                 </div>
                 <label class="settings-toggle">
                     <input id="sidebar-backend-labels" type="checkbox"
@@ -1886,7 +1890,7 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label" for="appearance-theme">"Appearance theme"</label>
-            <p class="settings-description">"Colors for the interface, without changing its layout or text size. Applies immediately and is remembered on this device. Syntax highlighting is selected separately in Code & Output Display."</p>
+            <p class="settings-description">"Interface colors. Code colors are set in Code & Output Display."</p>
             <select
                 id="appearance-theme"
                 aria-label="Appearance theme"
@@ -1901,8 +1905,8 @@ fn AppearanceTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Font Size"</label>
-            <p class="settings-description">"The base text size everything else scales from — chat, file contents, and panel labels all grow and shrink together. Raise it if you read Tyde from a distance; lower it to fit more of a long transcript on screen."</p>
+            <label class="settings-label">"Font size"</label>
+            <p class="settings-description">"Base size for all interface, chat, and code text."</p>
             <div class="settings-inline-control">
                 <input
                     type="range"
@@ -1917,8 +1921,8 @@ fn AppearanceTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Font Family"</label>
-            <p class="settings-description">"The typeface for interface text and chat prose. Code, diffs, and terminal output always use a monospace font regardless of this choice, so picking a proportional face here will not misalign a diff."</p>
+            <label class="settings-label">"Font family"</label>
+            <p class="settings-description">"Typeface for interface text and chat. Code always uses a monospace font."</p>
             <select
                 class="settings-select"
                 prop:value=move || state.font_family.get()
@@ -1933,8 +1937,8 @@ fn AppearanceTab() -> impl IntoView {
         <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
-                    <label class="settings-label">"Tab Bar"</label>
-                    <p class="settings-description">"Show a tab bar across the top of the center zone so several chats, files, and diffs can stay open at once and you can switch between them. When off, the center zone shows a single view and opening something new replaces what was there."</p>
+                    <label class="settings-label">"Tab bar"</label>
+                    <p class="settings-description">"Keep several chats, files, and diffs open in tabs. When off, opening something replaces the current view."</p>
                 </div>
                 <label class="settings-toggle">
                     <input
@@ -1982,12 +1986,12 @@ fn DisplayTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Code & Output Display"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Defaults for how Tyde renders the things agents produce: source files, diffs, and tool results. These are starting points, not locks — an individual diff or tool card can still be expanded in place. Like Appearance, they are stored on this device and apply to every host."
+            "Defaults for how files, diffs, and tool results are shown on this device. Individual diffs and tool cards can still be expanded in place."
         </p>
 
         <div class="settings-field">
-            <label class="settings-label">"Syntax Theme"</label>
-            <p class="settings-description">"The palette used to color code in the file viewer, the diff viewer, and code blocks inside chat. This is independent of the interface Color Theme, so you can run a light UI with a dark code palette or the reverse. Already-open files keep their old colors until you reopen them."</p>
+            <label class="settings-label">"Syntax theme"</label>
+            <p class="settings-description">"Code colors in files, diffs, and chat. Open files update when reopened."</p>
             <select
                 class="settings-select"
                 prop:value=move || state.syntax_theme.get()
@@ -2001,8 +2005,8 @@ fn DisplayTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Diff Layout"</label>
-            <p class="settings-description">"How a diff is arranged. Unified stacks removals and additions in one column, which reads well in a narrow panel and for small edits. Side by Side puts the old file and the new file in parallel columns, which makes it far easier to see what a line was rewritten into — at the cost of horizontal room."</p>
+            <label class="settings-label">"Diff layout"</label>
+            <p class="settings-description">"Unified fits narrow panels. Side by Side makes rewritten lines easier to compare."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.diff_view_mode.get() == DiffViewMode::Unified { "segment active" } else { "segment" }
@@ -2022,8 +2026,8 @@ fn DisplayTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Diff Context"</label>
-            <p class="settings-description">"How much of the file surrounds a change. Hunks shows only the edited regions plus a few lines on either side, so a one-line fix in a large file stays one screen. Full File renders the entire file with the changes highlighted in place, which is slower on big files but the only way to judge an edit against code that did not change."</p>
+            <label class="settings-label">"Diff context"</label>
+            <p class="settings-description">"Show only the changed regions, or the whole file with changes highlighted."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.diff_context_mode.get() == DiffContextMode::Hunks { "segment active" } else { "segment" }
@@ -2043,8 +2047,8 @@ fn DisplayTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Tool Output"</label>
-            <p class="settings-description">"How much of each tool call an agent makes is shown in the transcript. Summary and Compact both leave cards collapsed at their header line — what ran, and whether it worked — which keeps a long agent session readable; expanding a Compact card shows a short preview with a length cap, where Summary shows nothing. Full opens every card on the full output, which is what you want when debugging why an agent drew the wrong conclusion, and overwhelming otherwise. Expanding or collapsing a card yourself sticks until you change this setting."</p>
+            <label class="settings-label">"Tool output"</label>
+            <p class="settings-description">"Summary and Compact collapse tool cards to one line; an expanded Compact card shows a short preview. Full shows all output."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.tool_output_mode.get() == ToolOutputMode::Summary { "segment active" } else { "segment" }
@@ -2177,10 +2181,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
                 <div>
                     <label class="settings-label" for="code-intel-enabled">"Enable code intelligence"</label>
                     <p class="settings-description">
-                        "Applies to all projects on this host. Turning off stops language servers; file browsing still works."
-                    </p>
-                    <p class="settings-description">
-                        "Rust analysis runs Cargo checks and build scripts, which can compete with your builds."
+                        "Applies to all projects on this host. Rust analysis runs Cargo checks, which can compete with your builds."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2199,11 +2200,11 @@ fn CodeIntelSettingsSection() -> impl IntoView {
         <h3 class="settings-section-title">"Rust"</h3>
 
         <div class="settings-field">
-            <label class="settings-label">"rust-analyzer binary path"</label>
+            <label class="settings-label">"rust-analyzer path"</label>
             <p class="settings-description">
-                "Optional absolute path on the host. Leave blank to find rust-analyzer automatically."
+                "Absolute path on the host. Leave blank to find it automatically."
             </p>
-            <div class="settings-mobile-connection-row">
+            <div class="settings-input-row">
                 <input
                     class="settings-input settings-code-intel-path-input"
                     type="text"
@@ -2220,7 +2221,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
                 />
                 <button
                     type="button"
-                    class="filter-toggle settings-code-intel-path-clear"
+                    class="settings-btn"
                     disabled=disabled_for_button
                     title="Clear rust-analyzer binary path"
                     on:click=on_clear
@@ -2297,7 +2298,7 @@ fn AiSummariesTab() -> impl IntoView {
         <h2 class="settings-panel-title">"AI Summaries"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Short pieces of text Tyde writes about your agents so lists and cards are readable at a glance. Each one is produced by a background model call, so both settings here cost money — small amounts, but spent on your behalf without you asking. Turning them off never affects what an agent can do; you just get plainer labels."
+            "Short labels Tyde writes about your agents. Each is a background model call, so both settings cost money."
         </p>
 
         <div class="settings-field">
@@ -2305,7 +2306,7 @@ fn AiSummariesTab() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Auto-generate agent names"</label>
                     <p class="settings-description">
-                        "When an agent is started without a name, ask a cheap model to read its opening prompt and write a short title, so the agent list reads like \"Fix pairing timeout\" instead of a truncated prompt. Costs one small model call per unnamed agent, once, at creation. When off, Tyde derives a simple name from the prompt text and calls no model at all."
+                        "Title unnamed agents from their first prompt, such as \"Fix pairing timeout\". One small model call per agent. When off, the name is taken from the prompt text."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2325,7 +2326,7 @@ fn AiSummariesTab() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Agent activity summaries"</label>
                     <p class="settings-description">
-                        "Periodically summarize what each running agent is currently doing, so agent views can show a live \"what is this working on?\" line instead of only the last message. Useful when several agents run at once and you want to triage without opening each one. Unlike naming, this repeats on a schedule for as long as an agent stays active, so the cost scales with how many agents you run and for how long. Off by default."
+                        "Show a live line describing what each running agent is doing. Repeats while agents are active, so cost grows with how many you run."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2367,35 +2368,87 @@ fn ReviewSettingsTab() -> impl IntoView {
     let mode_state = state.clone();
     view! {
         <section class="review-settings">
-            <header class="review-settings-heading">
-                <div>
-                    <h2 class="settings-panel-title">"Review"</h2>
-                    <p class="settings-description">"Define what matters independently of who reviews it."</p>
+            <h2 class="settings-panel-title">"Review"</h2>
+            <p class="settings-description settings-panel-intro">"Choose what AI reviews look for and which agents run them."</p>
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Enable reviews"</label>
+                        <p class="settings-description">"Allow AI reviews on this host, from the review panel or requested by agents."</p>
+                    </div>
+                    <label class="settings-toggle">
+                        <input type="checkbox" role="switch" aria-label="Enable reviews"
+                            prop:checked=move || settings.get().is_some_and(|s| s.enabled)
+                            disabled=move || settings.get().is_none()
+                            on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
                 </div>
-                <label class="review-settings-enabled">
-                    <input type="checkbox" role="switch" aria-label="Enable reviews"
-                        prop:checked=move || settings.get().is_some_and(|s| s.enabled)
-                        disabled=move || settings.get().is_none()
-                        on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) />
-                    "Enabled"
-                </label>
-            </header>
-            <label class="settings-form-label"><span>"Default review depth"</span>
+            </div>
+            <div class="settings-field">
+                <label class="settings-label">"Default review depth"</label>
+                <p class="settings-description">"Lite gives each reviewer every enabled aspect. Heavy runs each reviewer once per aspect."</p>
                 <select class="settings-select" aria-label="Default review depth"
                     prop:value=move || if settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::Deep) { "deep" } else { "light" }
                     on:change=move |ev| send_host_replace(&mode_state, "/review/default_mode", event_target_value(&ev))>
                     <option value="light">"Lite · each reviewer covers all aspects"</option>
                     <option value="deep">"Heavy · each reviewer per aspect"</option>
                 </select>
-            </label>
-            <p class="settings-description">"Lite gives every reviewer all enabled aspects. Heavy launches each reviewer separately for every enabled aspect. Both modes inherit your default backend and its settings unless you configure explicit reviewers. Failures never count as a clean review."</p>
+            </div>
+            <div class="review-settings-list-heading">
+                <h3 class="settings-section-title">"Aspects"</h3>
+                <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.aspects.values().filter(|a| a.enabled).count()))}</span>
+                <button class="settings-btn settings-btn-primary" disabled=move || settings.get().is_none()
+                    on:click=move |_| {
+                        editor.set(Some((generate_id(), settings_model::ReviewAspectConfig {
+                            name: String::new(), description: String::new(), instructions: String::new(), enabled: true,
+                        })));
+                    }>"+ Add aspect"</button>
+            </div>
+            <div class="review-settings-list">
+                {move || {
+                    let state = list_state.clone();
+                    settings.get().map(|s| s.aspects.into_iter().map(|(id, reviewer)| {
+                        let edit_id = id.clone();
+                        let edit_reviewer = reviewer.clone();
+                        let delete_id = id.clone();
+                        let delete_name = reviewer.name.clone();
+                        let path = format!("/review/aspects/{}/enabled", settings_model::escape_pointer_token(&id));
+                        let state = state.clone();
+                        let label = format!("Enable {}", reviewer.name);
+                        view! {
+                            <div class="review-settings-row">
+                                <label class="settings-toggle">
+                                    <input type="checkbox" role="switch" aria-label=label prop:checked=reviewer.enabled
+                                        on:change=move |ev| send_host_replace(&state, path.clone(), event_target_checked(&ev)) />
+                                    <span class="settings-toggle-slider"></span>
+                                </label>
+                                <div class="review-settings-row-copy">
+                                    <strong>{reviewer.name}</strong>
+                                    <span>{reviewer.description}</span>
+                                </div>
+                                <button class="settings-btn" on:click=move |_| editor.set(Some((edit_id.clone(), edit_reviewer.clone())))>"Edit"</button>
+                                <button class="settings-btn" on:click=move |_| deleting.set(Some((delete_id.clone(), delete_name.clone())))>"Delete"</button>
+                            </div>
+                        }
+                    }).collect_view())
+                }}
+                <Show when=move || settings.get().is_some_and(|s| s.aspects.is_empty())>
+                    <div class="review-settings-empty">
+                        <strong>"What should your reviews look for?"</strong>
+                        <p>"Add an aspect for each focus area, such as test quality, comments, or scope."</p>
+                    </div>
+                </Show>
+            </div>
+            <h3 class="settings-section-title">"Reviewers"</h3>
+            <p class="settings-description">"Reviewers use the default backend and its settings unless configured. A failed review never counts as clean."</p>
             {[("lite", "Lite"), ("heavy", "Heavy")].into_iter().map(|(key, label)| {
                 let add_state = state.clone();
                 let rows_state = state.clone();
                 view! {
-                    <section>
+                    <section class="review-settings-group">
                         <div class="review-settings-list-heading">
-                            <h3>{format!("{label} reviewers")}</h3>
+                            <h4>{format!("{label} reviewers")}</h4>
                             <button class="settings-btn" disabled=move || settings.get().is_none() on:click=move |_| {
                                 let path = format!("/review/{key}");
                                 send_host_change(&add_state, move |doc| {
@@ -2408,6 +2461,7 @@ fn ReviewSettingsTab() -> impl IntoView {
                                 });
                             }>{format!("+ Add {label} reviewer")}</button>
                         </div>
+                        <div class="review-settings-list">
                         {move || {
                             let row_state = rows_state.clone();
                             settings.get().map(|s| {
@@ -2440,52 +2494,10 @@ fn ReviewSettingsTab() -> impl IntoView {
                                 }).collect_view()
                             })
                         }}
+                        </div>
                     </section>
                 }
             }).collect_view()}
-            <div class="review-settings-list-heading">
-                <h3>"Review aspects"</h3>
-                <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.aspects.values().filter(|a| a.enabled).count()))}</span>
-                <button class="settings-btn settings-btn-primary" disabled=move || settings.get().is_none()
-                    on:click=move |_| {
-                        editor.set(Some((generate_id(), settings_model::ReviewAspectConfig {
-                            name: String::new(), description: String::new(), instructions: String::new(), enabled: true,
-                        })));
-                    }>"+ Add aspect"</button>
-            </div>
-            <div class="review-settings-list">
-                {move || {
-                    let state = list_state.clone();
-                    settings.get().map(|s| s.aspects.into_iter().map(|(id, reviewer)| {
-                        let edit_id = id.clone();
-                        let edit_reviewer = reviewer.clone();
-                        let delete_id = id.clone();
-                        let delete_name = reviewer.name.clone();
-                        let path = format!("/review/aspects/{}/enabled", settings_model::escape_pointer_token(&id));
-                        let state = state.clone();
-                        let label = format!("Enable {}", reviewer.name);
-                        view! {
-                            <div class="review-settings-row">
-                                <input type="checkbox" role="switch" aria-label=label prop:checked=reviewer.enabled
-                                    on:change=move |ev| send_host_replace(&state, path.clone(), event_target_checked(&ev)) />
-                                <div class="review-settings-row-copy">
-                                    <strong>{reviewer.name}</strong>
-                                    <span>{reviewer.description}</span>
-                                </div>
-                                <button class="settings-btn" on:click=move |_| editor.set(Some((edit_id.clone(), edit_reviewer.clone())))>"Edit"</button>
-                                <button class="settings-btn" on:click=move |_| deleting.set(Some((delete_id.clone(), delete_name.clone())))>"Delete"</button>
-                            </div>
-                        }
-                    }).collect_view())
-                }}
-                <Show when=move || settings.get().is_some_and(|s| s.aspects.is_empty())>
-                    <div class="review-settings-empty">
-                        <strong>"What should your reviews look for?"</strong>
-                        <p>"Add an aspect for each focus area, such as test quality, comments, or scope."</p>
-                    </div>
-                </Show>
-            </div>
-            <p class="review-settings-note">"Agent-requested reviews are awaited and read through review tools."</p>
             {move || editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| editor.set(None)) /> })}
             {move || execution_editor.get().map(|execution| view! {
                 <ReviewAspectEditor id=String::new() reviewer=settings_model::ReviewAspectConfig {
@@ -2739,7 +2751,7 @@ fn SupervisorTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Supervisor"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "When an agent goes idle, the supervisor can run a hidden model call that reviews the request, task list, and final response, then either accept the result or send the agent a follow-up. It is off by default because both verdicts and follow-up turns cost money."
+            "When an agent stops, the supervisor checks whether the work is done and nudges it to continue if not. Each check is a paid model call."
         </p>
 
         <div class="settings-schema-fields">
@@ -2753,7 +2765,10 @@ fn UsageManagementTab() -> impl IntoView {
     let usage_state = expect_context::<AppState>();
 
     view! {
-        <h2 class="settings-panel-title">"Usage management"</h2>
+        <h2 class="settings-panel-title">"Usage Limits"</h2>
+        <p class="settings-description settings-panel-intro">
+            "Pause agents before they exhaust a shared subscription quota, and resume them when it resets."
+        </p>
         <div class="settings-schema-fields">
             {move || host_schema_section(&usage_state, "usage_limits")}
         </div>
@@ -2765,17 +2780,14 @@ fn BackendsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Backends"</h2>
-        </div>
-
+        <h2 class="settings-panel-title">"Backends"</h2>
         <p class="settings-description settings-panel-intro">
-            "A backend is the coding agent Tyde drives — Claude Code, Codex, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page decides which of them Tyde offers on this host. A backend's own configuration lives on its page in the sidebar, and what its account has spent lives on Usage."
+            "The coding agents Tyde can run on this host. Each backend has its own page in the sidebar for configuration."
         </p>
 
         <div class="settings-field">
-            <label class="settings-label">"Default Backend"</label>
-            <p class="settings-description">"Which backend a new agent uses when you do not pick one explicitly. Only backends you have enabled below can be chosen here."</p>
+            <label class="settings-label">"Default backend"</label>
+            <p class="settings-description">"Used for new agents when you don't pick one."</p>
             {move || match state.selected_host_settings() {
                 Some(settings) => {
                     let state_for_change = state.clone();
@@ -2830,7 +2842,7 @@ fn BackendsTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Enabled Backends"</label>
+            <label class="settings-label">"Enabled backends"</label>
             <div class="settings-backend-list">
                 {all_backends()
                     .into_iter()
@@ -2866,11 +2878,9 @@ fn usage_page_matches_query(query: &str) -> bool {
 #[component]
 fn UsagePage() -> impl IntoView {
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Usage"</h2>
-        </div>
+        <h2 class="settings-panel-title">"Usage"</h2>
         <p class="settings-description settings-panel-intro">
-            "What the backends on this host report about the accounts they are signed in to: the windows each vendor meters, how much of each is spent, and when they reset."
+            "Subscription capacity each backend reports for its signed-in account on this host. Advisory only: Tyde never switches backends because of it, and never estimates a figure from its own token counts."
         </p>
         <SubscriptionCapacitySection />
     }
@@ -2900,12 +2910,6 @@ fn launch_profiles_page_matches_query(query: &str) -> bool {
 #[component]
 fn LaunchProfilesPage() -> impl IntoView {
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Launch Profiles"</h2>
-        </div>
-        <p class="settings-description settings-panel-intro">
-            "A launch profile is a saved way to start an agent: a backend plus the settings it should run with, under a name you choose. Rather than picking a backend and re-selecting a model and reasoning effort every time, you pick \"Deep review\" or \"Quick fix\" and get the same configuration each time. Profiles are what the new-agent and spawn dialogs list, and what agents choose between when they start children of their own."
-        </p>
         <LaunchProfilesSection />
     }
 }
@@ -3067,19 +3071,20 @@ fn LaunchProfilesSection() -> impl IntoView {
     });
 
     view! {
+        <div class="settings-panel-header">
+            <h2 class="settings-panel-title">"Launch Profiles"</h2>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                on:click=move |_| form.set(Some(LaunchProfileForm::blank()))
+            >
+                "+ New launch profile"
+            </button>
+        </div>
+        <p class="settings-description settings-panel-intro">
+            "Named presets of a backend and its settings, such as \"Deep review\" or \"Quick fix\". They appear in the new-agent menu and agents can use them for children."
+        </p>
         <div class="settings-field">
-            <p class="settings-description">
-                "Profiles are saved on the selected host, so every device that connects to it sees the same list."
-            </p>
-            <div class="settings-form-footer">
-                <button
-                    class="settings-btn settings-btn-primary"
-                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                    on:click=move |_| form.set(Some(LaunchProfileForm::blank()))
-                >
-                    "+ New launch profile"
-                </button>
-            </div>
 
             {move || form.get().map(|f| view! { <LaunchProfileEditor form=f editor_signal=form /> })}
 
@@ -3468,19 +3473,20 @@ fn SubagentsTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Subagents"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "A sub-agent is an agent started by another agent. Agents can split broad work into parallel children, wait for their results, and use them to finish the parent task. More children can finish broad work faster, but each one adds model usage."
+            "Agents can split work across child agents running in parallel. Each child adds model usage."
         </p>
 
         <div class="settings-schema-fields">
             {move || host_schema_section(&fields_state, "subagents")}
         </div>
 
-        <DelegationPreference />
+        {move || complexity_tier_rows(&rows_state).map(|rows| view! {
+            <div class="settings-schema-nested">
+                <div class="settings-field">{rows}</div>
+            </div>
+        })}
 
-        <h3 class="settings-section-title">"How sub-agents are configured"</h3>
-        <div class="settings-field">
-            {move || complexity_tier_rows(&rows_state)}
-        </div>
+        <DelegationPreference />
     }
 }
 
@@ -3496,7 +3502,7 @@ fn DelegationPreference() -> impl IntoView {
                 "Delegation preference"
             </h3>
             <p class="settings-description">
-                "Agents use this order as advice when choosing how to launch a child. An explicit backend or launch profile always wins. Profiles that are temporarily unavailable stay in the list."
+                "Launch profiles agents should prefer for children, in order. An explicitly requested backend or profile always wins."
             </p>
             <ol class="delegation-preference-list">
                 {move || delegation_preference_rows(&rows_state)}
@@ -3593,7 +3599,7 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
                     </div>
                     <div class="delegation-preference-actions">
                         <button
-                            class="settings-btn"
+                            class="settings-btn settings-icon-btn"
                             aria-label=format!("Move {id_for_up} up")
                             disabled=index == 0
                             on:click=move |_| {
@@ -3605,9 +3611,9 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
                                     next,
                                 );
                             }
-                        >"↑"</button>
+                        >{chevron_icon(true)}</button>
                         <button
-                            class="settings-btn"
+                            class="settings-btn settings-icon-btn"
                             aria-label=format!("Move {id_for_down} down")
                             disabled=index + 1 == move_down_order.len()
                             on:click=move |_| {
@@ -3619,7 +3625,7 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
                                     next,
                                 );
                             }
-                        >"↓"</button>
+                        >{chevron_icon(false)}</button>
                         <button
                             class="settings-btn settings-btn-danger"
                             aria-label=format!("Remove {id_for_remove} from delegation preference")
@@ -3639,6 +3645,19 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
             .into_any()
         })
         .collect()
+}
+
+fn chevron_icon(up: bool) -> impl IntoView {
+    let points = if up {
+        "18 15 12 9 6 15"
+    } else {
+        "6 9 12 15 18 9"
+    };
+    view! {
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points=points />
+        </svg>
+    }
 }
 
 fn delegation_preference_add_options(state: &AppState) -> Vec<AnyView> {
@@ -4525,6 +4544,25 @@ fn host_schema_field_disabled(pointer: &str, settings: &Value) -> bool {
     }
 }
 
+/// How far a host setting is indented under the toggle that gates it, mirroring
+/// the dependencies in [`host_schema_field_disabled`].
+fn host_schema_field_depth(pointer: &str) -> u8 {
+    match pointer {
+        "/usage_limits/enabled"
+        | "/usage_limits/auto_start_short_windows"
+        | "/usage_limits/auto_start_weekly_windows"
+        | "/supervisor/enabled" => 0,
+        "/usage_limits/compact_context_percent"
+        | "/supervisor/stall_timeout_seconds"
+        | "/supervisor/auto_compact_inactivity_delay_seconds"
+        | "/supervisor/auto_compact_min_context_tokens" => 2,
+        pointer if pointer.starts_with("/usage_limits/") || pointer.starts_with("/supervisor/") => {
+            1
+        }
+        _ => 0,
+    }
+}
+
 fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&str>) -> AnyView {
     let Some(schema) = state.selected_host_settings_schema() else {
         return view! {
@@ -4564,7 +4602,7 @@ fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&s
         .map(|(_, pointer, property_schema)| {
             let current = settings_model::parse_json_pointer(&pointer)
                 .and_then(|tokens| settings_model::pointer_get(&settings, &tokens));
-            schema_settings_field(
+            let field = schema_settings_field(
                 SchemaEditTarget::Host {
                     state: state.clone(),
                     pointer: pointer.clone(),
@@ -4572,7 +4610,16 @@ fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&s
                 &property_schema,
                 current,
                 host_schema_field_disabled(&pointer, &settings),
-            )
+            );
+            match host_schema_field_depth(&pointer) {
+                0 => field,
+                depth => view! {
+                    <div class=format!("settings-schema-nested settings-schema-nested-{depth}")>
+                        {field}
+                    </div>
+                }
+                .into_any(),
+            }
         })
         .collect::<Vec<_>>()
         .into_view()
@@ -5634,6 +5681,7 @@ fn schema_field_unit(target: &SchemaEditTarget) -> Option<&'static str> {
         "/supervisor/stall_timeout_seconds"
         | "/supervisor/auto_compact_inactivity_delay_seconds" => Some("seconds"),
         "/supervisor/auto_compact_min_context_tokens" => Some("tokens"),
+        "/usage_limits/stop_used_percent" | "/usage_limits/compact_context_percent" => Some("%"),
         _ => None,
     }
 }
@@ -6139,7 +6187,7 @@ fn DebugTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Debug"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Tools for developing Tyde itself. These are aimed at people working on the app, not at people using it to write code — everything here is off by default and safe to leave alone."
+            "Diagnostics for developing Tyde itself. Everything here is off by default."
         </p>
 
         <div class="settings-schema-fields">
@@ -6161,14 +6209,14 @@ fn VoiceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Voice"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Choose conversational voice with Amazon Nova Sonic or direct dictation with Amazon Transcribe Streaming. Both run through the host's own AWS credentials. Tyde never sends AWS credentials to a desktop or mobile client and never falls back to another model or provider."
+            "Talk to agents with Amazon Nova Sonic, or dictate into the composer with Amazon Transcribe. Both use this host's AWS credentials, which never leave the host."
         </p>
 
         <Show
             when=move || state_for_support.native_voice_supported.get()
             fallback=|| view! {
                 <p class="settings-description">
-                    "This host reports that it cannot run native voice, so there is nothing to configure here. Voice needs a host build with native audio support."
+                    "This host was built without native audio support, so voice is unavailable."
                 </p>
             }
         >
@@ -6199,90 +6247,109 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
     let state_for_voice_disabled = state;
 
     view! {
-        <div class="settings-field" data-testid="native-voice-settings">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Conversation with Amazon Nova Sonic"</label>
-                    <p class="settings-description">"Turn on speech input and output for existing agent chats on desktop and mobile. Nova can invoke the focused Tyde agent and speaks its response."</p>
-                </div>
-                <label class="settings-toggle"><input type="checkbox"
-                    prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
-                    disabled=move || state_for_dictation_disabled.selected_host_settings().is_none()
-                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
-                /><span class="settings-toggle-slider"></span></label>
+        <div data-testid="native-voice-settings">
+            <div class="settings-field">
+                <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
+                <p class="settings-description">"Named profile from the host's AWS credentials file. Leave empty to use the default credential chain."</p>
+                <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
+                    prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
+                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
+                />
             </div>
-            <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
-            <p class="settings-description">"Which named profile from the host's AWS credentials file to use for Bedrock and Transcribe. Leave empty to use the AWS SDK's normal host credential chain. The profile is read only on the host."</p>
-            <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
-                prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
-                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
-            />
-            <label class="settings-label" for="voice-aws-region">"AWS region"</label>
-            <p class="settings-description">"The explicit AWS region to call Bedrock in. Nova Sonic is not offered in every region. Leaving this empty makes conversation mode unavailable; Tyde does not silently choose us-east-1."</p>
-            <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
-                prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
-                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
-            />
-            <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
-            <p class="settings-description">"Which Nova Sonic version handles speech. Nova 2 Sonic is the current model and the right choice unless your account or region only carries the older one. If the selected model is unavailable, voice fails with that error rather than switching models behind your back."</p>
-            <select id="voice-nova-model" class="settings-select"
-                prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
-                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_voice_model_commit,"/voice/nova_model",input.value()); }
-            ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
-            <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
-            <p class="settings-description">"How long Nova 2 Sonic waits through a pause before deciding that you finished speaking. Patient minimizes interruptions; Fast responds sooner. New and existing configurations default to Patient."</p>
-            <select id="voice-endpointing-sensitivity" class="settings-select"
-                prop:value=move || state_for_voice_endpointing.selected_host_settings().map(|settings|settings.voice.endpointing_sensitivity.nova_value()).unwrap_or("LOW")
-                on:change=move |ev| {
-                    let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
-                    let sensitivity=match input.value().as_str() {
-                        "HIGH" => settings_model::VoiceEndpointingSensitivity::High,
-                        "MEDIUM" => settings_model::VoiceEndpointingSensitivity::Medium,
-                        _ => settings_model::VoiceEndpointingSensitivity::Low,
-                    };
-                    send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
-                }
-            ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
-
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Dictation with Amazon Transcribe Streaming"</label>
-                    <p class="settings-description">"Turn on input-only dictation for new-chat and existing-agent composers. Final provider text is appended to the editable draft and is never sent automatically. Dictation does not invoke Nova, an LLM, or a Tyde agent, and it never produces spoken output."</p>
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Conversation with Amazon Nova Sonic"</label>
+                        <p class="settings-description">"Talk with the focused agent on desktop and mobile. Nova passes your request to the agent and speaks its reply."</p>
+                    </div>
+                    <label class="settings-toggle"><input type="checkbox"
+                        prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
+                        disabled=move || state_for_dictation_disabled.selected_host_settings().is_none()
+                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
+                    /><span class="settings-toggle-slider"></span></label>
                 </div>
-                <label class="settings-toggle"><input type="checkbox"
-                    prop:checked=move || state_for_dictation_enabled.selected_host_settings().is_some_and(|settings| settings.voice.dictation_enabled)
-                    disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
-                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_dictation_enabled_commit,"/voice/dictation_enabled",input.checked()); }
-                /><span class="settings-toggle-slider"></span></label>
             </div>
-            <label class="settings-label" for="voice-dictation-region">"Transcribe region"</label>
-            <p class="settings-description">"The explicit AWS region for Transcribe Streaming. Leaving it empty makes dictation unavailable; it does not inherit the Nova region or choose a default."</p>
-            <input id="voice-dictation-region" class="settings-input" type="text" placeholder="us-east-1"
-                prop:value=move || state_for_dictation_region.selected_host_settings().and_then(|settings|settings.voice.dictation_region).unwrap_or_default()
-                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_dictation_region_commit,"/voice/dictation_region",(!value.is_empty()).then_some(value)); }
-            />
-            <label class="settings-label" for="voice-dictation-language">"Dictation language"</label>
-            <p class="settings-description">"The fixed language code sent to Amazon Transcribe. Tyde inserts Transcribe's finalized text as returned: no LLM rewriting occurs, though ASR can mishear speech or normalize spelling, punctuation, and numbers."</p>
-            <select id="voice-dictation-language" class="settings-select"
-                prop:value=move || state_for_dictation_language.selected_host_settings().map(|settings|settings.voice.dictation_language_code).unwrap_or_else(||"en-US".into())
-                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_dictation_language_commit,"/voice/dictation_language_code",input.value()); }
-            >
-                <option value="en-US">"English (United States)"</option>
-                <option value="en-GB">"English (United Kingdom)"</option>
-                <option value="en-AU">"English (Australia)"</option>
-                <option value="es-US">"Spanish (United States)"</option>
-                <option value="es-ES">"Spanish (Spain)"</option>
-                <option value="fr-FR">"French (France)"</option>
-                <option value="fr-CA">"French (Canada)"</option>
-                <option value="de-DE">"German"</option>
-                <option value="it-IT">"Italian"</option>
-                <option value="pt-BR">"Portuguese (Brazil)"</option>
-                <option value="ja-JP">"Japanese"</option>
-                <option value="ko-KR">"Korean"</option>
-                <option value="zh-CN">"Chinese (Mainland)"</option>
-                <option value="hi-IN">"Hindi"</option>
-            </select>
-            <p class="settings-description">"The host AWS identity needs transcribe:StartStreamTranscription. Amazon Transcribe pricing and regional availability vary. Audio and transcript processing is subject to AWS Transcribe service terms and content-use policies; organizations that require an AWS Organizations AI-services opt-out should configure that policy before enabling dictation."</p>
+            <div class="settings-schema-nested">
+                <div class="settings-field">
+                    <label class="settings-label" for="voice-aws-region">"AWS region"</label>
+                    <p class="settings-description">"Bedrock region for Nova Sonic. Required; Tyde does not pick a default."</p>
+                    <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
+                        prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
+                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
+                    />
+                </div>
+                <div class="settings-field">
+                    <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
+                    <p class="settings-description">"Use Nova Sonic v1 only if your account or region lacks Nova 2 Sonic."</p>
+                    <select id="voice-nova-model" class="settings-select"
+                        prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
+                        on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_voice_model_commit,"/voice/nova_model",input.value()); }
+                    ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
+                </div>
+                <div class="settings-field">
+                    <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
+                    <p class="settings-description">"How long Nova waits through a pause before replying. Patient interrupts you least."</p>
+                    <select id="voice-endpointing-sensitivity" class="settings-select"
+                        prop:value=move || state_for_voice_endpointing.selected_host_settings().map(|settings|settings.voice.endpointing_sensitivity.nova_value()).unwrap_or("LOW")
+                        on:change=move |ev| {
+                            let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
+                            let sensitivity=match input.value().as_str() {
+                                "HIGH" => settings_model::VoiceEndpointingSensitivity::High,
+                                "MEDIUM" => settings_model::VoiceEndpointingSensitivity::Medium,
+                                _ => settings_model::VoiceEndpointingSensitivity::Low,
+                            };
+                            send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
+                        }
+                    ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
+                </div>
+            </div>
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Dictation with Amazon Transcribe Streaming"</label>
+                        <p class="settings-description">"Transcribe speech into the composer draft. Nothing is sent automatically and no model rewrites the text."</p>
+                    </div>
+                    <label class="settings-toggle"><input type="checkbox"
+                        prop:checked=move || state_for_dictation_enabled.selected_host_settings().is_some_and(|settings| settings.voice.dictation_enabled)
+                        disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_dictation_enabled_commit,"/voice/dictation_enabled",input.checked()); }
+                    /><span class="settings-toggle-slider"></span></label>
+                </div>
+            </div>
+            <div class="settings-schema-nested">
+                <div class="settings-field">
+                    <label class="settings-label" for="voice-dictation-region">"Transcribe region"</label>
+                    <p class="settings-description">"AWS region for Transcribe Streaming. Required; it does not inherit the Nova region."</p>
+                    <input id="voice-dictation-region" class="settings-input" type="text" placeholder="us-east-1"
+                        prop:value=move || state_for_dictation_region.selected_host_settings().and_then(|settings|settings.voice.dictation_region).unwrap_or_default()
+                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_dictation_region_commit,"/voice/dictation_region",(!value.is_empty()).then_some(value)); }
+                    />
+                </div>
+                <div class="settings-field">
+                    <label class="settings-label" for="voice-dictation-language">"Dictation language"</label>
+                    <p class="settings-description">"The language you dictate in."</p>
+                    <select id="voice-dictation-language" class="settings-select"
+                        prop:value=move || state_for_dictation_language.selected_host_settings().map(|settings|settings.voice.dictation_language_code).unwrap_or_else(||"en-US".into())
+                        on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_dictation_language_commit,"/voice/dictation_language_code",input.value()); }
+                    >
+                        <option value="en-US">"English (United States)"</option>
+                        <option value="en-GB">"English (United Kingdom)"</option>
+                        <option value="en-AU">"English (Australia)"</option>
+                        <option value="es-US">"Spanish (United States)"</option>
+                        <option value="es-ES">"Spanish (Spain)"</option>
+                        <option value="fr-FR">"French (France)"</option>
+                        <option value="fr-CA">"French (Canada)"</option>
+                        <option value="de-DE">"German"</option>
+                        <option value="it-IT">"Italian"</option>
+                        <option value="pt-BR">"Portuguese (Brazil)"</option>
+                        <option value="ja-JP">"Japanese"</option>
+                        <option value="ko-KR">"Korean"</option>
+                        <option value="zh-CN">"Chinese (Mainland)"</option>
+                        <option value="hi-IN">"Hindi"</option>
+                    </select>
+                </div>
+            </div>
+            <p class="settings-description settings-voice-footnote">"Dictation needs transcribe:StartStreamTranscription on the host's AWS identity. Audio is processed under AWS Transcribe service terms; configure any AWS Organizations AI-services opt-out before enabling it."</p>
         </div>
     }
 }
@@ -6433,7 +6500,7 @@ fn MobileTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Mobile"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Reach this host from the Tyde mobile app to follow your agents and reply away from your desk. Managed access connects your paired devices through an encrypted WebRTC connection using Cloudflare TURN. Sign in with your Tyggs Pass on your phone to pair. You can also host the mobile app on your own network using the settings below."
+            "Follow and reply to your agents from the Tyde mobile app. Pair through the managed relay, or host the mobile app on your own network."
         </p>
 
         <div class="settings-field">
@@ -6441,7 +6508,7 @@ fn MobileTab() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Enable mobile connections"</label>
                     <p class="settings-description">
-                        "Allow this host to accept pairing requests and mobile connections. This is the master switch: with it off, an already-paired phone cannot connect and no new pairing can be started, without you having to revoke devices one by one."
+                        "Master switch for pairing and mobile connections. When off, paired devices cannot connect."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -6459,7 +6526,7 @@ fn MobileTab() -> impl IntoView {
         <div class="settings-field settings-mobile-pairing">
             <label class="settings-label">"Pair a mobile device"</label>
             <p class="settings-description">
-                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR shares a one-time offer and a pairing key. Keep it private and scan it before the session expires."
+                "Scan the QR code with the Tyde mobile app, signed in with your Tyggs Pass. The code is a one-time key; keep it private."
             </p>
             // Connection status pill — surfaces connection_status from the
             // MobileAccessState snapshot. Keeps the user informed when
@@ -6535,7 +6602,7 @@ fn MobileTab() -> impl IntoView {
                             </details>
                             <button
                                 type="button"
-                                class="filter-toggle settings-mobile-pairing-cancel"
+                                class="settings-btn settings-mobile-pairing-cancel"
                                 on:click=on_cancel_pairing_click.clone()
                             >
                                 "Cancel pairing"
@@ -6563,7 +6630,7 @@ fn MobileTab() -> impl IntoView {
                 view! {
                     <button
                         type="button"
-                        class="filter-toggle settings-mobile-pairing-start"
+                        class="settings-btn settings-btn-primary settings-mobile-pairing-start"
                         disabled=!can
                         title=title
                         on:click=on_start_pairing_click.clone()
@@ -6581,7 +6648,7 @@ fn MobileTab() -> impl IntoView {
                     <div class="settings-mobile-pairing-devices">
                         <p class="settings-mobile-pairing-devices-heading">"Paired devices"</p>
                         <p class="settings-description settings-mobile-pairing-devices-description">
-                            "Remove stale test pairings here. Removed devices must scan a fresh QR before they can connect again."
+                            "Removed devices must pair again before they can connect."
                         </p>
                         <ul class="settings-mobile-pairing-devices-list">
                             {devices.into_iter().map(|device| {
@@ -6617,7 +6684,7 @@ fn MobileTab() -> impl IntoView {
                                         </div>
                                         <button
                                             type="button"
-                                            class="filter-toggle settings-mobile-pairing-device-remove"
+                                            class="settings-btn settings-btn-danger settings-mobile-pairing-device-remove"
                                             title="Remove this paired mobile device"
                                             on:click=move |_: web_sys::MouseEvent| {
                                                 let state = state_for_remove.clone();
@@ -6655,11 +6722,9 @@ fn MobileTab() -> impl IntoView {
         <MobileDirectSection />
 
         <div class="settings-mobile-warning" role="note">
-            <p class="settings-mobile-warning-heading">
-                "Managed access — encrypted contents, visible metadata"
-            </p>
+            <p class="settings-mobile-warning-heading">"Privacy"</p>
             <p class="settings-description">
-                "Tyde end-to-end encrypts messages between this host and your paired devices. Cloudflare relays encrypted traffic and can see connection metadata such as IP addresses, timing, and traffic volume. tycode.dev authorizes pairing and supplies temporary relay credentials; it cannot read your chats, files, or commands."
+                "Managed access is an end-to-end encrypted WebRTC connection relayed through Cloudflare TURN. Cloudflare sees only connection metadata such as IP addresses, timing and traffic volume. tycode.dev authorizes pairing but cannot read your chats, files or commands."
             </p>
         </div>
     }
@@ -6768,7 +6833,7 @@ fn MobileDirectSection() -> AnyView {
             <div>
                 <label class="settings-label">"Host the mobile app from this machine"</label>
                 <p class="settings-description">
-                    "Serve the mobile web app from this host over HTTP, so phones reach it like any other internal site and nothing tunnels out through the managed service. Put your own TLS-terminating proxy in front of it: on a plain-HTTP origin browsers switch off service workers, WebCrypto, the camera and notifications, and the app needs all four. Needs mobile connections enabled above."
+                    "Serve the mobile web app over HTTP on your own network, without the managed relay. Put a TLS-terminating proxy in front of it; browsers disable features the app needs on plain HTTP."
                 </p>
             </div>
             <label class="settings-toggle">
@@ -6816,7 +6881,7 @@ fn MobileDirectSection() -> AnyView {
 
         <MobileDirectField
             label="Address phones use"
-            description="The URL your proxy publishes this host under, e.g. https://tyde.corp.internal. Pairing needs it because the host cannot see the name it is reached by."
+            description="The HTTPS URL your proxy publishes this host under."
             placeholder="https://tyde.corp.internal"
             pointer="/mobile_direct_public_origin"
             slug="origin"
@@ -6824,7 +6889,7 @@ fn MobileDirectSection() -> AnyView {
         />
         <MobileDirectField
             label="Listen address"
-            description="Where the HTTP server binds. The default only accepts connections from a proxy on this machine; widen it only if something else terminates TLS."
+            description="Where the HTTP server binds. The default only accepts a proxy on this machine."
             placeholder="127.0.0.1:8730"
             pointer="/mobile_direct_bind_addr"
             slug="bind"
@@ -6845,7 +6910,7 @@ fn MobileDirectSection() -> AnyView {
             view! {
                 <button
                     type="button"
-                    class="filter-toggle settings-mobile-direct-pair"
+                    class="settings-btn settings-mobile-direct-pair"
                     disabled=!can
                     title=title
                     on:click=on_start_direct_pairing_click.clone()
@@ -7893,22 +7958,17 @@ fn CustomAgentsTab() -> impl IntoView {
     view! {
         <div class="settings-panel-header">
             <h2 class="settings-panel-title">"Custom Agents"</h2>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                on:click=move |_| form.set(Some(CustomAgentForm::blank()))
+            >
+                "+ New custom agent"
+            </button>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Define reusable agent presets: instructions, skills, MCP servers, and tool policy. Changes are saved on the selected host."
+            "Reusable agents with their own instructions, skills, MCP servers, and tool policy."
         </p>
-
-        <div class="settings-field">
-            <div class="settings-form-footer">
-                <button
-                    class="settings-btn settings-btn-primary"
-                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                    on:click=move |_| form.set(Some(CustomAgentForm::blank()))
-                >
-                    "+ New custom agent"
-                </button>
-            </div>
-        </div>
 
         {move || form.get().map(|f| view! { <CustomAgentEditor form=f editor_signal=form /> })}
 
@@ -7978,7 +8038,7 @@ fn CustomAgentRow(
                 <div class="host-card-title-row">
                     <span class="host-card-label">{agent.name.clone()}</span>
                 </div>
-                <p class="host-card-transport">{description}</p>
+                <p class="host-card-description">{description}</p>
             </div>
             <div class="host-card-actions">
                 <button class="settings-btn" on:click=on_edit>"Edit"</button>
@@ -8460,22 +8520,17 @@ fn McpServersTab() -> impl IntoView {
     view! {
         <div class="settings-panel-header">
             <h2 class="settings-panel-title">"MCP Servers"</h2>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                on:click=move |_| form.set(Some(McpForm::blank()))
+            >
+                "+ New MCP server"
+            </button>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Configure MCP servers (HTTP or Stdio). Names \"tyde-debug\", \"tyde-agent-control\", and \"tyde-review-feedback\" are reserved."
+            "Tool servers available to agents on this host, over HTTP or stdio."
         </p>
-
-        <div class="settings-field">
-            <div class="settings-form-footer">
-                <button
-                    class="settings-btn settings-btn-primary"
-                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                    on:click=move |_| form.set(Some(McpForm::blank()))
-                >
-                    "+ New MCP server"
-                </button>
-            </div>
-        </div>
 
         {move || form.get().map(|f| view! { <McpEditor form=f editor_signal=form /> })}
 
@@ -8846,22 +8901,17 @@ fn SteeringTab() -> impl IntoView {
     view! {
         <div class="settings-panel-header">
             <h2 class="settings-panel-title">"Steering"</h2>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                on:click=move |_| form.set(Some(SteeringForm::blank()))
+            >
+                "+ New steering"
+            </button>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Long-lived guidance injected into agent context. Scope to the host or a specific project."
+            "Standing guidance added to every agent's context, for the whole host or one project."
         </p>
-
-        <div class="settings-field">
-            <div class="settings-form-footer">
-                <button
-                    class="settings-btn settings-btn-primary"
-                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                    on:click=move |_| form.set(Some(SteeringForm::blank()))
-                >
-                    "+ New steering"
-                </button>
-            </div>
-        </div>
 
         {move || form.get().map(|f| view! { <SteeringEditor form=f editor_signal=form /> })}
 
@@ -8933,7 +8983,7 @@ fn SteeringRow(
                 <div class="host-card-title-row">
                     <span class="host-card-label">{title_display}</span>
                 </div>
-                <p class="host-card-transport">{scope_label}</p>
+                <p class="host-card-description">{scope_label}</p>
             </div>
             <div class="host-card-actions">
                 <button class="settings-btn" on:click=on_edit>"Edit"</button>
@@ -9120,20 +9170,15 @@ fn SkillsTab() -> impl IntoView {
     view! {
         <div class="settings-panel-header">
             <h2 class="settings-panel-title">"Skills"</h2>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || state_for_refresh_disabled.selected_host_stream_untracked().is_none()
+                on:click=on_refresh
+            >"Refresh"</button>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Skills are discovered from the filesystem. Edit SKILL.md under "<code>"~/.tyde/skills/<name>/"</code>" and click Refresh to re-scan."
+            "Skills are read from "<code>"~/.tyde/skills/<name>/SKILL.md"</code>" on the host. Refresh after editing them."
         </p>
-
-        <div class="settings-field">
-            <div class="settings-form-footer">
-                <button
-                    class="settings-btn settings-btn-primary"
-                    disabled=move || state_for_refresh_disabled.selected_host_stream_untracked().is_none()
-                    on:click=on_refresh
-                >"Refresh"</button>
-            </div>
-        </div>
 
         <div class="settings-field">
             <div class="settings-host-list">
@@ -9153,7 +9198,7 @@ fn SkillsTab() -> impl IntoView {
                                             <div class="host-card-title-row">
                                                 <span class="host-card-label">{title}</span>
                                             </div>
-                                            <p class="host-card-transport">{description}</p>
+                                            <p class="host-card-description">{description}</p>
                                         </div>
                                     </div>
                                 }
@@ -11743,7 +11788,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Usage management");
+        click_tab(&container, "Usage Limits");
         next_tick().await;
         let enabled = toggle_for_label(&container, "Enable usage limit management");
         let compact = toggle_for_label(&container, "Compact before waiting for reset");
@@ -12996,7 +13041,7 @@ mod wasm_tests {
         let text = container.text_content().unwrap_or_default();
         assert_eq!(panel_title(&container), "Backends");
         assert!(
-            text.contains("Default Backend"),
+            text.contains("Default backend"),
             "the overview keeps the global backend controls: {text:?}"
         );
         assert_eq!(
@@ -14319,7 +14364,7 @@ mod wasm_tests {
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Default Backend"),
+            text.contains("Default backend"),
             "the overview content must render after the deep link: {text:?}"
         );
     }

@@ -162,11 +162,8 @@ pub fn UpdatesSettings() -> impl IntoView {
     });
     view! {
         <h2 class="settings-panel-title">"Updates"</h2>
-
-        <crate::components::settings_panel::AgentRestorationSettings />
-
         <p class="settings-description settings-panel-intro">
-            "Tyde updates itself in place from its signed release repository. It only tells you when a newer version exists — nothing downloads or installs until you approve it."
+            "Tyde tells you when a signed update is available. Nothing is downloaded or installed until you approve it."
         </p>
 
         <div class="settings-field">
@@ -198,7 +195,7 @@ pub fn UpdatesSettings() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label" for="app-update-channel">"Update channel"</label>
-            <p class="settings-description">"Release offers stable versions only. Preview also offers betas and other prereleases — newer, but less tested. Switching channels never installs a version older than the one you have."</p>
+            <p class="settings-description">"Preview adds beta releases: newer, but less tested. Switching channels never downgrades."</p>
             <select id="app-update-channel" class="settings-select" disabled=move || disabled.get() || status.get().is_none()
                 prop:value=move || status.with(|value| match value.as_ref().map(|value| value.preferences.channel) {
                     Some(UpdateChannel::Preview) => "preview", _ => "release",
@@ -217,7 +214,7 @@ pub fn UpdatesSettings() -> impl IntoView {
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label" for="app-update-automatic">"Check for updates automatically"</label>
-                    <p class="settings-description">"Looks for a newer version at startup, every six hours, and whenever a connected server reports one. You are only notified; the download still waits for your approval."</p>
+                    <p class="settings-description">"Check at startup and every six hours. You are only notified; installing still waits for you."</p>
                 </div>
                 <label class="settings-toggle">
                     <input id="app-update-automatic" type="checkbox" disabled=move || disabled.get() || status.get().is_none()
@@ -231,6 +228,8 @@ pub fn UpdatesSettings() -> impl IntoView {
                 </label>
             </div>
         </div>
+
+        <crate::components::settings_panel::AgentRestorationSettings />
     }
 }
 

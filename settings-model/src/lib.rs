@@ -584,27 +584,27 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "resume_previous_agents",
             "Resume previous agents",
-            "Automatically reopen this host's previously open agents after an update or restart. Agents that were mid-turn continue where they stopped, with their queued messages preserved; approvals and questions still wait for you. Turning this off keeps saved sessions in History for manual resume, which never continues on its own. Changes take effect on the next host restart.",
+            "Reopen this host's open agents after an update or restart. Mid-turn agents continue with their queued messages; approvals and questions still wait for you. When off, sessions stay in History for manual resume. Applies on the next host restart.",
         ),
         (
             "tyde_debug_mcp_enabled",
             "Tyde Debug MCP",
-            "Start new chats with the Tyde debug MCP server attached, giving agents tools to inspect and drive Tyde's own frontend. Leave this off unless you are working on Tyde itself. Existing chats are unaffected until restarted.",
+            "Give new chats tools to inspect and drive Tyde's own frontend. Only useful when working on Tyde itself.",
         ),
         (
             "tyde_agent_control_mcp_enabled",
             "Tyde sub-agents",
-            "Allow agents to spawn, message, and await other agents through Tyde's cross-agent orchestration tools. This does not affect agents you create from the UI or a backend's own sub-agent feature.",
+            "Let agents spawn, message, and await other agents. Agents you create yourself and a backend's built-in sub-agents are unaffected.",
         ),
         (
             "tyde_agent_control_max_depth",
             "Maximum agent depth",
-            "Count the main task as level 1. Agents at the maximum level cannot create another level. The default of 3 allows the main task, its children, and their children.",
+            "The main task is level 1. Agents at the maximum level cannot spawn further.",
         ),
         (
             "complexity_tiers_enabled",
             "Task complexity tiers",
-            "Offer low and high cost configurations when agents are spawned instead of always using the backend default.",
+            "Let spawned agents use low or high cost configurations instead of the backend default.",
         ),
         (
             "enable_mobile_connections",
@@ -614,22 +614,22 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "mobile_direct_hosting_enabled",
             "Host the mobile app directly",
-            "Serve the mobile web app from this host over HTTP instead of tunnelling it through the managed service. Needs Mobile connections on as well. Put a TLS-terminating reverse proxy in front of it: over plain HTTP browsers disable service workers, WebCrypto, the camera and push notifications.",
+            "Serve the mobile web app from this host instead of the managed service. Requires Mobile connections and a TLS-terminating reverse proxy; plain HTTP disables service workers, WebCrypto, the camera, and push notifications.",
         ),
         (
             "mobile_direct_bind_addr",
             "Direct hosting address",
-            "Address the direct mobile web server listens on. Defaults to 127.0.0.1:8730, which only accepts connections from a proxy running on this machine.",
+            "Listen address for the direct web server. The default, 127.0.0.1:8730, only accepts a proxy on this machine.",
         ),
         (
             "mobile_direct_public_origin",
             "Direct hosting public URL",
-            "The URL phones use to reach this host, e.g. https://tyde.corp.internal. Required to generate a pairing code, because the host cannot see the name your proxy publishes it under.",
+            "The URL phones use to reach this host, such as https://tyde.corp.internal. Required for pairing.",
         ),
         (
             "mobile_direct_bundle_dir",
             "Mobile web bundle directory",
-            "Optional. A bundle directory to serve instead of the one built into this host, produced by ./dev.sh mobile-bundle. Release builds already carry a bundle; set this to serve one you built yourself.",
+            "Optional. Serve a bundle built with ./dev.sh mobile-bundle instead of the built-in one.",
         ),
     ] {
         set_property_text(schema, "HostSettings", field, title, description);
@@ -641,42 +641,42 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             10,
             "toggle",
             "Enable usage limit management",
-            "Pause agents sharing a reported quota at the configured usage percentage and resume when a fresh report confirms each blocking quota is below 50% (or below the pause percentage if lower). Off by default.",
+            "Pause agents when a shared quota reaches the limit below, and resume once a fresh report shows it under 50% (or the pause percentage, if lower).",
         ),
         (
             "stop_used_percent",
             20,
             "slider",
             "Pause at usage percentage",
-            "Percentage of reported quota used before pausing. Leave headroom for in-flight work and compaction; provider reports can lag.",
+            "Leave headroom for in-flight work and compaction; provider reports can lag.",
         ),
         (
             "compact_enabled",
             30,
             "toggle",
             "Compact before waiting for reset",
-            "Automatically compact paused agents whose context exceeds the threshold. Compaction can consume quota; exhausted quotas defer it until recovery. Quota-rejected compaction can retry once after a newer low-usage report. Off by default.",
+            "Compact paused agents whose context exceeds the threshold. Compaction uses quota, so it waits for recovery when the quota is exhausted.",
         ),
         (
             "compact_context_percent",
             40,
             "slider",
             "Compact at context percentage",
-            "Compact when the reported context reaches this percentage of its context window.",
+            "Share of the context window that triggers compaction.",
         ),
         (
             "auto_start_short_windows",
             50,
             "toggle",
             "Auto-start short usage windows",
-            "On the hourly usage refresh, send a hidden hi after a supported short usage window resets (including five-hour limits). Consumes quota. At most one wake-up attempt per hour across this host, with no retries for the same reset, even after restarting. Independent of pausing agents. Enable on only one host per account.",
+            "Send a hidden message after a short window (such as a five-hour limit) resets, so the next one starts early. Uses quota; at most one attempt per hour. Enable on only one host per account.",
         ),
         (
             "auto_start_weekly_windows",
             60,
             "toggle",
             "Auto-start weekly usage windows",
-            "On the hourly usage refresh, send a hidden hi after a supported weekly usage window resets. Weekly windows take priority; other targets wait for later hours. Shares the host-wide one-attempt-per-hour limit. May also start a short window. Consumes quota; off by default.",
+            "Send a hidden message after a weekly window resets. Takes priority over short windows and shares their one-attempt-per-hour limit. Uses quota.",
         ),
     ] {
         annotate_property(
@@ -718,52 +718,52 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "enabled",
             "Enable agent supervisor",
-            "When an agent goes idle, run a background verdict that can send a follow-up when the requested work is not finished. This adds a paid model call per idle transition.",
+            "Check idle agents and nudge them to continue when work is unfinished.",
         ),
         (
             "supervise_restored_agents",
             "Supervise restored agents",
-            "Judge a restored session as soon as its replayed transcript becomes idle instead of waiting for its first live turn.",
+            "Check restored sessions right away instead of waiting for their first new turn.",
         ),
         (
             "stall_timeout_enabled",
             "Interrupt stalled turns",
-            "Cancel a running turn that produces no observable progress for the configured timeout, then let the supervisor decide how to continue.",
+            "Cancel a turn that makes no progress for the timeout below, then let the supervisor decide how to continue.",
         ),
         (
             "stall_timeout_seconds",
             "Stall timeout",
-            "Whole seconds without observable turn progress before a stalled turn is interrupted.",
+            "Time without progress before a turn is interrupted.",
         ),
         (
             "auto_compact_on_success",
             "Auto-compact on success",
-            "After the supervisor confirms completion, compact the agent once the inactivity and context thresholds are met.",
+            "Compact finished agents once they have been idle and their context is large enough.",
         ),
         (
             "auto_compact_inactivity_delay_seconds",
             "Auto-compact inactivity delay",
-            "Whole seconds of uninterrupted inactivity required before automatic compaction may start.",
+            "Idle time before compaction starts.",
         ),
         (
             "auto_compact_min_context_tokens",
             "Auto-compact minimum context",
-            "Minimum reported current-context size in tokens required before automatic compaction.",
+            "Smallest context worth compacting.",
         ),
         (
             "max_kicks_per_task",
             "Kick limit",
-            "Maximum consecutive supervisor follow-ups without a new user message.",
+            "Most follow-ups the supervisor sends before you reply.",
         ),
         (
             "retry_attempts",
             "Extra delayed attempts",
-            "Extra paid attempts after a supervisor verdict call fails or returns an invalid verdict. Zero disables retries.",
+            "Retries when a supervisor check fails. Each retry is a paid call; 0 disables retries.",
         ),
         (
             "cost_tier",
             "Verdict model tier",
-            "Model tier used for supervision verdicts: low is cheapest, default uses the backend default, and high uses the most capable configuration.",
+            "Model used for supervisor checks.",
         ),
     ] {
         set_property_text(schema, "SupervisorSettings", field, title, description);

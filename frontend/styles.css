@@ -9131,7 +9131,7 @@ math merror {
 }
 
 .code-intel-squiggle-error {
-    text-decoration-color: var(--danger, #f85149);
+    text-decoration-color: var(--error);
 }
 
 .code-intel-squiggle-warning {
@@ -9165,7 +9165,7 @@ math merror {
 }
 
 .file-line.code-intel-gutter-error .file-line-num::after {
-    background: var(--danger, #f85149);
+    background: var(--error);
 }
 
 .file-line.code-intel-gutter-warning .file-line-num::after {
@@ -9438,6 +9438,7 @@ math merror {
     position: absolute;
     inset: 0;
     z-index: 50;
+    container: settings-overlay / inline-size;
     background: var(--surface-1);
     animation: overlay-fade-in 0.12s ease-out;
 }
@@ -9624,11 +9625,27 @@ math merror {
     max-width: 720px;
 }
 
+/* With both side panels open the centre zone can be under 600px wide; the
+   desktop gutters and a 240px nav would leave the page itself ~220px. */
+@container settings-overlay (max-width: 760px) {
+    .settings-root {
+        padding: 32px 48px 32px 24px;
+    }
+
+    .settings-layout {
+        gap: var(--space-5);
+    }
+
+    .settings-nav {
+        width: 168px;
+    }
+}
+
 .settings-panel-title {
     font-size: 1.538rem;
     font-weight: 600;
     color: var(--text-bright);
-    margin-bottom: var(--space-5);
+    margin-bottom: var(--space-2);
 }
 
 .settings-section-title {
@@ -9825,56 +9842,121 @@ math merror {
     cursor: not-allowed;
 }
 
-.settings-supervisor-number-input {
-    width: 6rem;
+.settings-schema-number-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-schema-number-row > .settings-input.settings-supervisor-number-input {
+    width: 10rem;
+    flex: 0 0 auto;
+}
+
+.settings-supervisor-number-unit {
+    color: var(--text-secondary);
+    font-size: 0.923rem;
+}
+
+/* Settings that only apply while a parent toggle is on sit under it. */
+.settings-schema-nested {
+    padding-left: var(--space-4);
+    border-left: 2px solid var(--border-primary);
+    margin-left: var(--space-1);
+}
+
+/* Depth two keeps its parent's guide line running alongside its own. */
+.settings-schema-nested-2 {
+    padding-left: calc(var(--space-4) * 2 + 2px);
+    background: linear-gradient(var(--border-primary), var(--border-primary))
+        var(--space-4) 0 / 2px 100% no-repeat;
+}
+
+.settings-schema-nested > .settings-field {
+    margin-bottom: 0;
+    padding-bottom: var(--space-5);
+}
+
+.settings-native-field > .settings-btn {
+    align-self: flex-start;
+}
+
+.settings-input-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-input-row > .settings-input {
+    flex: 1;
+    min-width: 0;
 }
 
 .settings-mobile-warning {
-    margin-top: var(--space-3);
-    padding: var(--space-3);
-    background: var(--surface-2);
+    margin-top: var(--space-5);
+    padding: var(--space-3) var(--space-4);
+    background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-left: 3px solid var(--warning, var(--accent-primary));
     border-radius: 6px;
 }
 
 .settings-mobile-warning-heading {
     font-weight: 600;
     color: var(--text-primary);
-    margin: 0 0 var(--space-2) 0;
+    margin: 0 0 var(--space-1) 0;
+}
+
+.settings-mobile-warning .settings-description {
+    margin: 0;
 }
 
 /* --- Direct hosting section --- */
 
-.settings-mobile-direct {
+.settings-mobile-direct,
+.settings-mobile-pairing {
     border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    padding: var(--space-3);
-    background: var(--surface-2);
+    border-radius: 6px;
+    padding: var(--space-4);
+    background: var(--surface-1);
 }
 
-.settings-mobile-direct-status {
-    display: inline-block;
+.settings-mobile-direct-status,
+.settings-mobile-pairing-connection {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
     margin: var(--space-2) 0;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 0.85rem;
-    font-weight: 600;
-    border: 1px solid var(--border-primary);
+    font-size: 0.923rem;
+    color: var(--text-secondary);
 }
 
-.settings-mobile-direct-status-online {
-    color: var(--success, var(--accent-primary));
-    border-color: var(--success, var(--accent-primary));
+.settings-mobile-direct-status::before,
+.settings-mobile-pairing-connection::before {
+    content: "";
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--mobile-status-color, var(--text-tertiary));
 }
 
-.settings-mobile-direct-status-error {
-    color: var(--error, var(--accent-primary));
-    border-color: var(--error, var(--accent-primary));
+.settings-mobile-direct-status-online,
+.settings-mobile-pairing-connection-online {
+    --mobile-status-color: var(--success);
+}
+
+.settings-mobile-pairing-connection-connecting {
+    --mobile-status-color: var(--warning);
+}
+
+.settings-mobile-direct-status-error,
+.settings-mobile-pairing-connection-error {
+    --mobile-status-color: var(--error);
+    color: var(--error);
 }
 
 .settings-mobile-direct-field {
-    margin-top: var(--space-3);
+    margin-top: var(--space-4);
 }
 
 .settings-mobile-direct-input {
@@ -9883,46 +9965,10 @@ math merror {
 }
 
 .settings-mobile-direct-pair {
-    margin-top: var(--space-3);
+    margin-top: var(--space-4);
 }
 
 /* --- Mobile pairing section --- */
-
-.settings-mobile-pairing {
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    padding: var(--space-3);
-    background: var(--surface-2);
-}
-
-.settings-mobile-pairing-connection {
-    display: inline-block;
-    margin: var(--space-2) 0;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 0.85rem;
-    font-weight: 600;
-    border: 1px solid var(--border-primary);
-}
-
-.settings-mobile-pairing-connection-online {
-    color: var(--success, var(--accent-primary));
-    border-color: var(--success, var(--accent-primary));
-}
-
-.settings-mobile-pairing-connection-connecting {
-    color: var(--text-secondary);
-}
-
-.settings-mobile-pairing-connection-disabled {
-    color: var(--text-tertiary);
-    font-style: italic;
-}
-
-.settings-mobile-pairing-connection-error {
-    color: var(--error, var(--accent-primary));
-    border-color: var(--error, var(--accent-primary));
-}
 
 .settings-mobile-pairing-status {
     margin-top: var(--space-2);
@@ -9995,7 +10041,7 @@ math merror {
 }
 
 .settings-mobile-pairing-start {
-    margin-top: var(--space-3);
+    margin-top: var(--space-2);
 }
 
 .settings-mobile-pairing-devices {
@@ -10026,9 +10072,9 @@ math merror {
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
-    padding: var(--space-1) var(--space-2);
-    border-radius: 4px;
-    background: var(--surface-1, var(--surface-base));
+    padding: var(--space-2) var(--space-3);
+    border-radius: 6px;
+    background: var(--surface-2);
 }
 
 .settings-mobile-pairing-device-main {
@@ -10047,9 +10093,7 @@ math merror {
 }
 
 .settings-mobile-pairing-device-state {
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-size: 0.846rem;
     color: var(--text-secondary);
 }
 
@@ -10062,8 +10106,6 @@ math merror {
 }
 
 .settings-mobile-pairing-device-remove {
-    color: var(--error, var(--accent-primary));
-    border-color: var(--error, var(--accent-primary));
     flex-shrink: 0;
 }
 
@@ -10077,9 +10119,9 @@ math merror {
 
 .settings-backend-card {
     padding: var(--space-2) var(--space-3);
-    background: var(--surface-2);
+    background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 /* One backend, one line: identity and state on the left, the enable toggle
@@ -10104,11 +10146,27 @@ math merror {
 }
 
 .settings-backend-row > .backend-badge {
-    min-width: 84px;
+    min-width: 110px;
+    padding: 0;
+    background: none;
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 600;
+    text-align: left;
 }
 
 .settings-backend-row > .settings-status-chip {
     min-width: 108px;
+}
+
+@container settings-overlay (max-width: 760px) {
+    .settings-backend-row > .backend-badge {
+        min-width: 84px;
+    }
+
+    .settings-backend-row > .settings-status-chip {
+        min-width: 0;
+    }
 }
 
 .settings-tier-list {
@@ -10119,21 +10177,29 @@ math merror {
 }
 
 .delegation-preference-list {
-    display: grid;
-    gap: 8px;
-    margin: 12px 0;
+    margin: var(--space-3) 0;
     padding: 0;
     list-style: none;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.delegation-preference-list:empty {
+    display: none;
 }
 
 .delegation-preference-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
-    padding: 10px 12px;
-    border: 1px solid var(--border-subtle);
-    border-radius: 8px;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-1);
+}
+
+.delegation-preference-row + .delegation-preference-row {
+    border-top: 1px solid var(--border-primary);
 }
 
 .delegation-preference-row-unavailable,
@@ -10153,8 +10219,9 @@ math merror {
 }
 
 .delegation-preference-id {
-    color: var(--text-secondary);
-    font-size: 12px;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
     overflow-wrap: anywhere;
 }
 
@@ -10165,18 +10232,26 @@ math merror {
     background: color-mix(in srgb, var(--error) 9%, transparent);
     border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
     border-radius: 999px;
-    font-size: 11px;
+    font-size: 0.846rem;
     font-weight: 600;
 }
 
 .delegation-preference-actions {
     display: flex;
     flex-shrink: 0;
-    gap: 6px;
+    gap: var(--space-1);
 }
 
 .delegation-preference-add {
     max-width: 520px;
+}
+
+.settings-btn.settings-icon-btn {
+    width: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
 
 @media (max-width: 640px) {
@@ -10188,9 +10263,9 @@ math merror {
 
 .settings-tier-backend {
     padding: var(--space-3);
-    background: var(--surface-2);
+    background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-radius: 8px;
+    border-radius: 6px;
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
@@ -10270,9 +10345,9 @@ math merror {
 }
 
 .settings-config-override-badge {
-    color: #f0b56b;
-    background: rgba(232, 160, 50, 0.14);
-    border: 1px solid rgba(232, 160, 50, 0.3);
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
     border-radius: 4px;
     padding: 0 var(--space-2);
     font-size: 0.72rem;
@@ -10306,8 +10381,8 @@ math merror {
     gap: var(--space-2) var(--space-3);
     padding: var(--space-3);
     margin-bottom: var(--space-4);
-    background: rgba(232, 160, 50, 0.08);
-    border: 1px solid rgba(232, 160, 50, 0.3);
+    background: color-mix(in srgb, var(--warning) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
     border-radius: 8px;
 }
 
@@ -10348,13 +10423,12 @@ math merror {
 .settings-native-tabs {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-1);
+    column-gap: var(--space-4);
     position: sticky;
     top: 0;
     z-index: 1;
-    padding-bottom: var(--space-2);
     border-bottom: 1px solid var(--border-primary);
-    background: var(--surface-0, var(--surface-1));
+    background: var(--surface-1);
 }
 
 /* Tycode settings profiles: one chip per settings file above the shared
@@ -10435,36 +10509,35 @@ math merror {
 }
 
 .settings-native-tab {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-1) var(--space-3);
-    font-size: 0.85rem;
+    padding: var(--space-2) 2px;
+    font-size: 0.95rem;
+    font-weight: 500;
     color: var(--text-secondary);
-    background: var(--surface-1);
-    border: 1px solid var(--border-primary);
-    border-radius: 999px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
     cursor: pointer;
-    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    transition: color 0.12s ease, border-color 0.12s ease;
 }
 
 .settings-native-tab:hover,
 .settings-native-tab:focus-visible {
     color: var(--text-primary);
-    border-color: var(--border-focus, var(--border-primary));
 }
 
 .settings-native-tab-active {
     color: var(--text-primary);
-    background: var(--surface-2);
-    border-color: var(--accent, var(--border-focus, var(--border-primary)));
-    font-weight: 600;
+    border-bottom-color: var(--accent-primary);
 }
 
 .settings-native-tab-badge {
-    font-size: 0.62rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-size: 0.769rem;
+    font-weight: 400;
     color: var(--text-tertiary);
 }
 
@@ -10557,7 +10630,7 @@ math merror {
 .settings-native-json-error {
     margin: 0;
     font-size: 0.8rem;
-    color: var(--danger, #e5534b);
+    color: var(--error);
 }
 
 .settings-native-json-note {
@@ -10585,10 +10658,10 @@ math merror {
 
 .settings-native-error {
     padding: var(--space-2) var(--space-3);
-    background: rgba(229, 83, 75, 0.1);
-    border: 1px solid rgba(229, 83, 75, 0.35);
+    background: color-mix(in srgb, var(--error) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error) 35%, transparent);
     border-radius: 6px;
-    color: var(--danger, #e5534b);
+    color: var(--error);
     font-size: 0.85rem;
 }
 
@@ -10596,8 +10669,8 @@ math merror {
    reason is shown verbatim so current values never appear as blank defaults. */
 .settings-native-unavailable {
     padding: var(--space-3);
-    background: rgba(232, 160, 50, 0.08);
-    border: 1px solid rgba(232, 160, 50, 0.3);
+    background: color-mix(in srgb, var(--warning) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
     border-radius: 8px;
 }
 
@@ -10639,12 +10712,10 @@ math merror {
 
 .settings-hermes-profilebar-label {
     flex-shrink: 0;
-    padding-top: 6px;
-    font-size: 0.68rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-tertiary);
+    padding-top: 5px;
+    font-size: 0.923rem;
+    font-weight: 500;
+    color: var(--text-primary);
 }
 
 .settings-hermes-profiles {
@@ -10657,7 +10728,7 @@ math merror {
 }
 
 .settings-hermes-profile-select {
-    min-width: 22rem;
+    min-width: min(22rem, 100%);
     max-width: 34rem;
 }
 
@@ -10730,6 +10801,7 @@ math merror {
 }
 
 .settings-hermes-panel {
+    container: hermes-panel / inline-size;
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
@@ -10915,34 +10987,61 @@ math merror {
 }
 
 .settings-hermes-badge {
+    --hermes-badge-color: var(--text-tertiary);
     justify-self: end;
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    border-radius: 999px;
-    padding: 1px var(--space-2);
-    border: 1px solid transparent;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.846rem;
+    color: var(--text-secondary);
     white-space: nowrap;
 }
 
+.settings-hermes-badge::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--hermes-badge-color);
+}
+
 .settings-hermes-badge-connected {
-    color: var(--success, #3fb950);
-    background: rgba(63, 185, 80, 0.12);
-    border-color: rgba(63, 185, 80, 0.35);
+    --hermes-badge-color: var(--success);
 }
 
 .settings-hermes-badge-muted {
-    color: var(--text-tertiary);
-    background: var(--surface-2);
-    border-color: var(--border-primary);
+    --hermes-badge-color: var(--text-tertiary);
 }
 
 /* A provider Tyde is hiding. Deliberately not the danger colour: the provider
    is connected and healthy, it is just switched off on Tyde's side. */
 .settings-hermes-badge-off {
-    color: var(--warning, #e8c56a);
-    background: rgba(232, 197, 106, 0.12);
-    border-color: rgba(232, 197, 106, 0.35);
+    --hermes-badge-color: var(--warning);
+}
+
+/* In a narrow settings column the fixed action column cannot sit beside the
+   provider name, so stack it underneath, left-aligned. */
+@container hermes-panel (max-width: 640px) {
+    .settings-hermes-provider-line {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .settings-hermes-provider-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2) var(--space-3);
+    }
+
+    .settings-hermes-provider-action-slot {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        width: auto;
+    }
+
+    .settings-hermes-provider-action-slot .settings-btn {
+        flex: 0 0 auto;
+    }
 }
 
 .settings-hermes-provider-note {
@@ -11092,7 +11191,7 @@ math merror {
 }
 
 .settings-hermes-chip-remove:hover {
-    color: var(--danger, #e5534b);
+    color: var(--error);
 }
 
 .settings-hermes-chip-add {
@@ -11325,41 +11424,38 @@ math merror {
 }
 
 .settings-status-chip {
-    font-size: 0.769rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-    padding: 4px 8px;
-    border-radius: 999px;
-    border: 1px solid var(--border-primary);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.923rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.settings-status-chip::before {
+    content: "";
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--status-chip-color, var(--text-tertiary));
 }
 
 .settings-status-chip.installed {
-    color: #84d69b;
-    background: rgba(52, 168, 83, 0.14);
-    border-color: rgba(52, 168, 83, 0.32);
+    --status-chip-color: var(--success);
 }
 
 .settings-status-chip.missing {
-    color: #f0b56b;
-    background: rgba(232, 160, 50, 0.14);
-    border-color: rgba(232, 160, 50, 0.3);
-}
-
-.settings-status-chip.unsupported {
-    color: var(--text-tertiary);
-    background: var(--surface-3);
+    --status-chip-color: var(--warning);
 }
 
 .settings-status-chip.unavailable {
-    color: var(--text-tertiary);
-    background: var(--surface-3);
-    border-color: var(--border-primary);
+    --status-chip-color: var(--error);
 }
 
+.settings-status-chip.unsupported,
 .settings-status-chip.loading {
-    color: var(--text-secondary);
-    background: var(--surface-3);
+    color: var(--text-tertiary);
 }
 
 /* Versions yield space to keep controls inside the card even for full paths. */
@@ -11393,7 +11489,7 @@ math merror {
 }
 
 .settings-backend-note-warning {
-    color: #f0b56b;
+    color: var(--warning);
 }
 
 /* --- Full-width select --- */
@@ -11420,13 +11516,13 @@ math merror {
 
 .host-card {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-4);
-    background: var(--surface-2);
+    background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-radius: 8px;
+    border-radius: 6px;
     transition: border-color 0.15s, background 0.15s;
 }
 
@@ -11437,7 +11533,7 @@ math merror {
 .host-card-main {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 2px;
     min-width: 0;
     flex: 1;
 }
@@ -11464,6 +11560,21 @@ math merror {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.host-card-description {
+    font-size: 0.923rem;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.settings-host-list > .panel-empty {
+    min-height: 0;
+    padding: var(--space-5);
+    border: 1px dashed var(--border-primary);
+    border-radius: 6px;
 }
 
 /* Lifecycle/status line for managed remote hosts. Unlike .host-card-transport
@@ -11502,12 +11613,12 @@ math merror {
 }
 
 .host-badge-local {
-    background: rgba(78, 201, 176, 0.18);
+    background: color-mix(in srgb, var(--success) 18%, transparent);
     color: var(--success);
 }
 
 .host-badge-ssh {
-    background: rgba(86, 156, 214, 0.2);
+    background: color-mix(in srgb, var(--info) 20%, transparent);
     color: var(--info);
 }
 
@@ -11552,7 +11663,7 @@ math merror {
 }
 
 .settings-btn-danger:hover:not(:disabled) {
-    background: rgba(244, 135, 113, 0.1);
+    background: color-mix(in srgb, var(--error) 10%, transparent);
     border-color: var(--error);
     color: var(--error);
 }
@@ -13675,7 +13786,7 @@ pre.tool-error-pre {
 }
 
 .review-composer-error {
-    color: var(--danger, #f85149);
+    color: var(--error);
     font-size: 0.769rem;
     line-height: 1.4;
     overflow-wrap: anywhere;
@@ -15019,14 +15130,13 @@ pre.tool-error-pre {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
-    margin-top: var(--space-2);
 }
 
 .capacity-card {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    padding: var(--space-3);
+    padding: var(--space-3) var(--space-4);
     background: var(--surface-1);
     border: 1px solid var(--border-primary);
     /* The edge names the backend, matching the sidebar rows, so a card is
@@ -15038,36 +15148,26 @@ pre.tool-error-pre {
 
 .capacity-card-head {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
+    align-items: center;
     gap: var(--space-2);
     flex-wrap: wrap;
+    min-height: 26px;
 }
 
 .capacity-backend {
+    font-size: 1rem;
     font-weight: 600;
     color: var(--text-primary);
 }
 
-.capacity-refresh {
+.settings-btn.capacity-refresh {
     margin-left: auto;
-    padding: 2px 10px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--surface-raised);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-}
-
-.capacity-refresh:hover {
-    color: var(--text-primary);
-    border-color: var(--border-strong);
+    height: 26px;
+    padding: 0 10px;
 }
 
 .capacity-state {
-    font-size: 0.78rem;
+    font-size: 0.923rem;
     color: var(--text-secondary);
 }
 
@@ -15084,14 +15184,20 @@ pre.tool-error-pre {
 .capacity-bucket-meta {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-1) var(--space-3);
-    font-size: 0.72rem;
+    gap: 2px var(--space-2);
+    font-size: 0.846rem;
     color: var(--text-tertiary);
+}
+
+.capacity-card-meta > .capacity-meta-item + .capacity-meta-item::before,
+.capacity-bucket-meta > .capacity-meta-item + .capacity-meta-item::before {
+    content: "\00b7";
+    margin-right: var(--space-2);
 }
 
 .capacity-explanation {
     margin: 0;
-    font-size: 0.78rem;
+    font-size: 0.923rem;
     line-height: 1.45;
     color: var(--text-secondary);
 }
@@ -15100,26 +15206,29 @@ pre.tool-error-pre {
    Without it, a one-bucket report and a complete one look identical. */
 .capacity-coverage {
     margin: 0;
-    padding: var(--space-2);
-    font-size: 0.75rem;
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.846rem;
     line-height: 1.45;
     color: var(--text-secondary);
-    background: var(--surface-hover);
+    background: var(--surface-2);
     border-radius: 4px;
 }
 
 .capacity-buckets {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
 }
 
 .capacity-bucket {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-    padding-top: var(--space-2);
+    padding: var(--space-3) 0;
     border-top: 1px solid var(--border-primary);
+}
+
+.capacity-bucket:last-child {
+    padding-bottom: 0;
 }
 
 .capacity-bucket-head {
@@ -15130,12 +15239,13 @@ pre.tool-error-pre {
 }
 
 .capacity-bucket-label {
-    font-size: 0.82rem;
+    font-size: 0.923rem;
+    font-weight: 500;
     color: var(--text-primary);
 }
 
 .capacity-bucket-status {
-    font-size: 0.72rem;
+    font-size: 0.846rem;
     color: var(--text-secondary);
 }
 
@@ -15150,7 +15260,7 @@ pre.tool-error-pre {
 .capacity-measure {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-3);
     flex-wrap: wrap;
 }
 
@@ -15158,7 +15268,7 @@ pre.tool-error-pre {
     flex: 1 1 140px;
     min-width: 100px;
     height: 6px;
-    background: var(--surface-hover);
+    background: var(--surface-3);
     border-radius: 3px;
     overflow: hidden;
 }
@@ -15172,7 +15282,7 @@ pre.tool-error-pre {
 .capacity-figures {
     display: flex;
     gap: var(--space-3);
-    font-size: 0.75rem;
+    font-size: 0.846rem;
     font-variant-numeric: tabular-nums;
 }
 
@@ -15186,10 +15296,15 @@ pre.tool-error-pre {
     color: var(--text-primary);
 }
 
+.capacity-credit-usage {
+    color: var(--text-secondary);
+}
+
 .capacity-no-magnitude,
 .capacity-credits {
-    font-size: 0.75rem;
+    font-size: 0.923rem;
     color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
 }
 
 .capacity-empty {
@@ -15284,7 +15399,11 @@ pre.tool-error-pre {
 
 .capacity-compact-textual .capacity-bucket {
     border-top: none;
-    padding-top: 0;
+    padding: 0;
+}
+
+.capacity-bucket-meta > .capacity-meta-vendor {
+    font-size: 0.769rem;
 }
 
 /* Narrow viewports (and the mobile web shell) stack the bucket rows rather
@@ -15828,33 +15947,27 @@ pre.tool-error-pre {
     .agent-move-footer { padding: 14px 16px 16px; }
 }
 
-.review-settings { max-width: 1000px; margin: 0 auto; padding: 16px 12px; }
-.review-settings-heading, .review-settings-list-heading, .review-agent-modal header, .review-agent-modal footer { display: flex; align-items: center; gap: 16px; }
-.review-settings-heading { justify-content: space-between; margin-bottom: 36px; }
-.review-settings-enabled { display: flex; align-items: center; gap: 10px; }
-.review-settings input[role="switch"] { appearance: none; width: 38px; height: 22px; border-radius: 20px; background: var(--surface-3); border: 1px solid var(--border-primary); flex-shrink: 0; cursor: pointer; position: relative; }
-.review-settings input[role="switch"]::after { content: ""; position: absolute; width: 16px; height: 16px; top: 2px; left: 2px; border-radius: 50%; background: var(--text-primary); transition: transform 120ms ease; }
-.review-settings input[role="switch"]:checked { background: var(--accent-primary); border-color: var(--accent-primary); }
-.review-settings input[role="switch"]:checked::after { transform: translateX(16px); }
-.review-settings input[role="switch"]:disabled { opacity: .5; cursor: default; }
-.review-settings-list-heading { margin-bottom: 16px; }
-.review-settings-list-heading h3 { margin: 0; font-size: 16px; }
+.review-settings-list-heading, .review-agent-modal header, .review-agent-modal footer { display: flex; align-items: center; gap: var(--space-3); }
+.review-settings-list-heading { margin: var(--space-5) 0 var(--space-3); }
+.review-settings-list-heading .settings-section-title { margin: 0; }
+.review-settings-list-heading h4 { margin: 0; font-size: 1rem; font-weight: 600; color: var(--text-primary); }
 .review-settings-list-heading > button { margin-left: auto; }
-.review-settings-count, .review-settings-backend { font-size: 12px; color: var(--text-secondary); background: var(--surface-2); padding: 4px 10px; border-radius: 6px; }
-.review-settings-list { border: 1px solid var(--border-primary); border-radius: 8px; overflow: hidden; }
-.review-settings-row { display: flex; align-items: center; gap: 16px; padding: 18px 22px; background: var(--surface-1); }
+.review-settings-group .review-settings-list-heading { margin-top: var(--space-4); }
+.review-settings-count { font-size: 0.846rem; color: var(--text-tertiary); }
+.review-settings-list { border: 1px solid var(--border-primary); border-radius: 6px; overflow: hidden; }
+.review-settings-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); padding: var(--space-3) var(--space-4); background: var(--surface-1); }
 .review-settings-row + .review-settings-row { border-top: 1px solid var(--border-primary); }
-.review-settings-row-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
-.review-settings-row-copy strong { font-weight: 550; }
-.review-settings-row-copy span, .review-settings-note { color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
-.review-settings-row > button { min-width: 68px; }
-.review-settings-note { margin-top: 20px; }
-.review-settings-empty { padding: 36px; text-align: center; }
-.review-settings-empty p { color: var(--text-secondary); }
-.review-agent-modal { width: min(600px, calc(100vw - 40px)); max-height: calc(100dvh - 48px); overflow-y: auto; background: var(--surface-1); border: 1px solid var(--border-primary); border-radius: 10px; box-shadow: 0 20px 70px #0006; padding: 28px; display: flex; flex-direction: column; gap: 20px; }
+.review-settings-row-copy { flex: 1 1 12rem; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.review-settings-row-copy strong { font-weight: 600; color: var(--text-primary); }
+.review-settings-row-copy span, .review-settings-note { color: var(--text-secondary); font-size: 0.923rem; line-height: 1.5; }
+.review-settings-row > button { flex-shrink: 0; }
+.review-settings-empty { padding: var(--space-5); text-align: center; }
+.review-settings-empty strong { color: var(--text-primary); }
+.review-settings-empty p { margin-top: var(--space-1); color: var(--text-secondary); }
+.review-agent-modal { width: min(560px, calc(100vw - 40px)); max-height: calc(100dvh - 48px); overflow-y: auto; background: var(--surface-1); border: 1px solid var(--border-primary); border-radius: 8px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); padding: var(--space-5); display: flex; flex-direction: column; gap: var(--space-4); }
 .review-agent-modal header { justify-content: space-between; }
-.review-agent-modal h3 { margin: 0; font-size: 20px; }
-.review-agent-modal .settings-form-label { display: flex; flex-direction: column; gap: 8px; }
+.review-agent-modal h3 { margin: 0; font-size: 1.154rem; font-weight: 600; color: var(--text-bright); }
+.review-agent-modal .settings-form-label { display: flex; flex-direction: column; gap: var(--space-1); }
 .review-agent-modal input, .review-agent-modal textarea, .review-agent-modal select { width: 100%; box-sizing: border-box; }
 .review-agent-modal textarea { resize: vertical; min-height: 120px; line-height: 1.6; }
 .review-agent-modal .session-settings, .review-agent-modal .session-setting-row { display: flex; flex-direction: column; align-items: stretch; gap: 12px; }
@@ -15862,11 +15975,8 @@ pre.tool-error-pre {
 .review-agent-modal footer { justify-content: flex-end; }
 .review-agent-modal .review-settings-note { margin: -8px 0 0; }
 @media (max-width: 700px) {
-    .review-settings { padding: 8px 0; }
-    .review-settings-row { flex-wrap: wrap; gap: 12px; padding: 16px; }
+    .review-settings-row { flex-wrap: wrap; }
     .review-settings-row-copy { flex-basis: calc(100% - 60px); }
-    .review-settings-backend { margin-left: 50px; margin-right: auto; }
-    .review-settings-heading { align-items: flex-start; }
 }
 .review-rounds { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
 .review-rounds summary { cursor: pointer; font-weight: 550; padding: 8px 0; }
@@ -16781,3 +16891,19 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .swarm-advanced { border-top: 1px solid var(--border-primary); padding-top: 14px; }
 .swarm-advanced summary { cursor: pointer; color: var(--text-secondary); font-weight: 600; padding: 8px 0; }
 .swarm-advanced-fields { display: flex; flex-direction: column; gap: 18px; padding-top: 12px; }
+
+.settings-voice-footnote {
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+}
+
+.settings-subsection {
+    margin-top: var(--space-5);
+    padding-top: var(--space-5);
+    border-top: 1px solid var(--border-primary);
+}
+
+.settings-subsection > .settings-scope-bar {
+    max-width: none;
+    margin: var(--space-3) 0 var(--space-5);
+}

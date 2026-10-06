@@ -3592,6 +3592,35 @@ mod wasm_tests {
                 button.client_width(),
             );
         }
+
+        // With both side panels open the settings page is only a few hundred
+        // pixels wide. Rows must still fit it, buttons unclipped, rather than
+        // overflow past the panel's right edge.
+        container.style().set_property("width", "340px").unwrap();
+        next_tick().await;
+        let panel_right = container
+            .query_selector(".settings-hermes-panel")
+            .unwrap()
+            .expect("providers panel")
+            .get_bounding_client_rect()
+            .right();
+        for button in elements(
+            &container,
+            ".settings-hermes-provider-action-slot .settings-btn",
+        ) {
+            let label = button.text_content().unwrap_or_default();
+            let right = button.get_bounding_client_rect().right();
+            assert!(
+                right <= panel_right + 0.5,
+                "action button {label:?} overflows the narrow panel (right {right}px, panel {panel_right}px)"
+            );
+            assert!(
+                button.scroll_width() <= button.client_width(),
+                "action button label {label:?} is clipped in a narrow panel ({}px of content in {}px of box)",
+                button.scroll_width(),
+                button.client_width(),
+            );
+        }
     }
 
     /// A host reporting dozens of providers must not bury the page: the tab
