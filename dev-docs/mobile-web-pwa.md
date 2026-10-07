@@ -101,7 +101,7 @@ in `./dev.sh check`.
 
 The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
 copy the viewport algorithm. The pinned revision is
-`3b3fa78d7e56fa5dc6d4aa4f5fdca4564edaaf5c`, published on the shell
+`b7e76f56111bfd557c25d8bb83f4f48cf7e4a88f`, published on the shell
 repository's upstream `main`. The unmodified archive was produced locally with
 `npm pack --ignore-scripts` from that clean committed checkout.
 `mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
@@ -115,6 +115,8 @@ Component cleanup disconnects the navigation observer and destroys the owner.
 Keyboard changes never remount the textarea. The shared textarea helper owns
 composer sizing; programmatic draft updates synchronize the native field before
 notifying it. Queued-message editing retains its separate existing behavior.
+The same helper hides the keyboard when the focused composer is dragged down
+(the usual phone chat gesture), shared with Tychat; Tyde adds no listeners.
 
 The shared shell owns viewport geometry, safe areas, covered tabs, and measured
 composer priority. Tyde supplies nested pane layout and glass appearance.

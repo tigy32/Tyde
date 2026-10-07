@@ -266,6 +266,53 @@ export function attachTextarea(element) {
         if (!stopped && frame === 0)
             frame = window.requestAnimationFrame(() => { frame = 0; resize(); });
     };
+    // A quick downward drag that starts on the focused composer dismisses the keyboard.
+    const surface = element.closest(".tws-composer") ?? element;
+    let drag = null;
+    const touchStart = (event) => {
+        drag = null;
+        const touch = event.touches[0];
+        if (event.touches.length !== 1 || !touch || element.ownerDocument.activeElement !== element)
+            return;
+        if (element.selectionStart !== element.selectionEnd)
+            return;
+        if (element.contains(event.target) && element.scrollTop > 0)
+            return;
+        drag = { id: touch.identifier, x: touch.clientX, y: touch.clientY, at: event.timeStamp, moving: false };
+    };
+    const touchMove = (event) => {
+        if (!drag)
+            return;
+        const touch = Array.from(event.touches).find(item => item.identifier === drag.id);
+        if (event.touches.length !== 1 || !touch) {
+            drag = null;
+            return;
+        }
+        const dx = touch.clientX - drag.x;
+        const dy = touch.clientY - drag.y;
+        if (!drag.moving) {
+            if (Math.hypot(dx, dy) < 10)
+                return;
+            // A held touch is a long-press caret or selection gesture, not a swipe.
+            if (event.timeStamp - drag.at > 350) {
+                drag = null;
+                return;
+            }
+            drag.moving = true;
+        }
+        if (dy < 0 || Math.abs(dx) > dy) {
+            drag = null;
+            return;
+        }
+        if (dy >= 32) {
+            drag = null;
+            element.blur();
+        }
+    };
+    const touchEnd = () => { drag = null; };
+    const touchListeners = [["touchstart", touchStart], ["touchmove", touchMove], ["touchend", touchEnd], ["touchcancel", touchEnd]];
+    for (const [name, callback] of touchListeners)
+        surface.addEventListener(name, callback, { passive: true });
     const observer = new ResizeObserver(queue);
     observer.observe(element);
     const container = element.closest(".tws-shell");
@@ -285,6 +332,8 @@ export function attachTextarea(element) {
         if (frame !== 0)
             window.cancelAnimationFrame(frame);
         element.removeEventListener("input", resize);
+        for (const [name, callback] of touchListeners)
+            surface.removeEventListener(name, callback);
         window.removeEventListener("resize", queue);
         window.visualViewport?.removeEventListener("resize", queue);
         element.ownerDocument.fonts.removeEventListener("loadingdone", queue);

@@ -97,6 +97,32 @@ test("return inserts a new line instead of sending", async ({ page }) => {
     .toBe(0);
 });
 
+test("dragging the composer down hides the keyboard", async ({ page, context }) => {
+  await openFixture(page, "chat");
+  const composer = page.locator("[data-mobile-test='chat-input']");
+  await composer.fill("kept draft");
+  await composer.focus();
+  const session = await context.newCDPSession(page);
+  const drag = async (dy) => {
+    const box = await composer.boundingBox();
+    const start = { x: box.x + box.width / 2, y: box.y + 12 };
+    await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [start] });
+    for (let step = 1; step <= 6; step++) {
+      await session.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: start.x, y: start.y + (dy * step) / 6 }],
+      });
+    }
+    await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  };
+
+  await drag(-80);
+  await expect(composer).toBeFocused();
+  await drag(80);
+  await expect(composer).not.toBeFocused();
+  await expect(composer).toHaveValue("kept draft");
+});
+
 test("new chat sends the selected backend and agent", async ({ page }) => {
   await openFixture(page, "new-chat");
 

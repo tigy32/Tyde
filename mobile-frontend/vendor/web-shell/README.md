@@ -21,11 +21,12 @@ See [verification](TESTING.md) and [continued device testing](design/devicefarm-
 - One owner of the visible viewport, including updates while an input stays focused.
 - Content scrolling **behind** the glass, with measured start/end clearances.
 - Safe-area spacing, changing chrome heights, optional follow-end scrolling.
-- An optional native textarea sizing helper and complete lifecycle cleanup.
+- An optional native textarea helper: sizing, drag-the-composer-down to hide
+  the keyboard, and complete lifecycle cleanup.
 
 No React dependency, router, app state, message handling, telemetry, network,
 storage, keyboard replacement, or separate Rust layout implementation.
-The maintained runtime source is `src/shell.ts` + `src/shell.css` (426 lines; 4,897 bytes gzip for the combined
+The maintained runtime source is `src/shell.ts` + `src/shell.css` (478 lines; 5,743 bytes gzip for the combined
 built JS and CSS in the current candidate).
 The demo and tests are deliberately separate from that runtime.
 
@@ -140,6 +141,9 @@ full, but every portion remains reachable by scrolling.
 real, border-box textarea without reading its value or intercepting composition.
 Use the supplied composer CSS. After **programmatic** draft updates, dispatch an
 `input` event so sizing catches up; ordinary typing already does this.
+A quick single-finger downward drag on the focused composer blurs the textarea so
+the keyboard hides; see `design/shell.md` for the guards that keep selection,
+long-press and internal textarea scrolling working.
 
 ### Styling
 

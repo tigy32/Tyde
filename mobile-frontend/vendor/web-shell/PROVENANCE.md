@@ -2,8 +2,8 @@
 
 Unmodified npm archive of the private upstream repository
 `https://github.com/tigy32/TyggsWebShell`, pinned to
-`3b3fa78d7e56fa5dc6d4aa4f5fdca4564edaaf5c`.
-Archive SHA-256: `052862b1f14847107119a9329260e95705183348dfe13a6c1e3f042237e312a3`.
+`b7e76f56111bfd557c25d8bb83f4f48cf7e4a88f`.
+Archive SHA-256: `92b406fe380c4aaa21ff2ec30d11712883e2b072fa9666404b5dfc862fa38692`.
 Produced locally with `npm pack --ignore-scripts` from that clean committed
 checkout after verifying the commit was pushed to upstream `main`.
 The adjacent runtime, README, license and package metadata are extracted
@@ -15,7 +15,9 @@ ships it inside each versioned bundle (including the integrity manifest),
 not at an unversioned origin-root URL. CSS is loaded before app styles.
 No npm install, registry access, or independent viewport implementation.
 
-This revision retains completed-tap focus and recovers only the legacy
+This revision adds the drag-the-composer-down gesture: a quick single-finger
+downward drag on the focused composer blurs the textarea so the keyboard hides
+and the draft stays. It also retains completed-tap focus and recovers only the legacy
 standalone status-bar shortfall. It grows the document paint surface with the
 shell, retains that validated surface during keyboard pan to keep paint and
 Send hit-testing aligned, preserves recovered shell height while focused without
