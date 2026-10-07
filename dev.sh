@@ -6,14 +6,16 @@ export PYTHONDONTWRITEBYTECODE=1
 cd "$(dirname "$0")"
 
 readonly DEV_CHECK_CACHE_SCHEMA="5"
-readonly DEV_CHECK_CACHE_DIR="target/dev-check-cache"
+readonly DEV_CHECK_OBSOLETE_CACHE_DIR="target/dev-check-cache"
 readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
 readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
 readonly DEV_CHECK_LOG_RETENTION=8
-readonly DEV_CHECK_CACHE_RETENTION=16
+readonly DEV_CHECK_CACHE_RETENTION=64
+readonly DEV_CHECK_CACHE_TEMP_MAX_AGE_MINUTES=1440
 readonly DEV_CHECK_SCCACHE_ROOT="${DEV_CHECK_SCCACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/tyde-dev-check-sccache}"
 readonly DEV_CHECK_SCCACHE_VERSION="0.16.0"
 
+DEV_CHECK_CACHE_DIR=""
 RUN_DIR=""
 RUN_METADATA=""
 RUN_SUMMARY=""
@@ -173,12 +175,19 @@ cleanup_check_artifacts() {
 
     remove_old_entries "$DEV_CHECK_LOG_DIR" 'run-*' "$((DEV_CHECK_LOG_RETENTION - 1))"
     remove_old_entries "$DEV_CHECK_CACHE_DIR" '*.success' "$DEV_CHECK_CACHE_RETENTION"
-    for entry in "$DEV_CHECK_CACHE_DIR"/.success.*; do
-        [[ -f "$entry" ]] || continue
+    # Other worktrees write records here concurrently, so only abandoned
+    # temporary records are old enough to remove.
+    while IFS= read -r entry; do
         bytes="$(directory_bytes "$entry")"
         rm -f "$entry"
         CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
-    done
+    done < <(find "$DEV_CHECK_CACHE_DIR" -mindepth 1 -maxdepth 1 -type f -name '.success.*' \
+        -mmin "+$DEV_CHECK_CACHE_TEMP_MAX_AGE_MINUTES" -print 2>/dev/null)
+    if [[ -d "$DEV_CHECK_OBSOLETE_CACHE_DIR" ]]; then
+        bytes="$(directory_bytes "$DEV_CHECK_OBSOLETE_CACHE_DIR")"
+        rm -rf "$DEV_CHECK_OBSOLETE_CACHE_DIR"
+        CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
+    fi
     if [[ "$(uname -s)" == "Darwin" ]]; then
         reclaimed="$(tools/run-nextest-binary.sh --cleanup-stale)"
         [[ "$reclaimed" =~ ^[0-9]+$ ]] ||
@@ -574,6 +583,16 @@ worktree_identity() {
     printf 'git.worktree_tree=%s\n' "$worktree_tree"
 }
 
+# Success records live in the Git common directory so every worktree of the
+# repository shares them: a commit validated in a workbench and fast-forwarded
+# onto main is a cache hit there, because the key is only HEAD plus content.
+resolve_check_cache_dir() {
+    local common_dir
+    common_dir="$(git rev-parse --path-format=absolute --git-common-dir)" ||
+        die "could not resolve the Git common directory for the dev check cache"
+    DEV_CHECK_CACHE_DIR="$common_dir/tyde-dev-check-cache"
+}
+
 cache_inputs() {
     printf 'cache.schema=%s\n' "$DEV_CHECK_CACHE_SCHEMA"
     worktree_identity
@@ -837,6 +856,7 @@ check() {
         [[ "$name" == TYDE_WASM_* ]] && unset "$name"
     done < <(compgen -e)
 
+    resolve_check_cache_dir
     if [[ "$mode" == "explain" ]]; then
         inputs="$(cache_inputs)"
         key="$(cache_key_for_inputs "$inputs")"

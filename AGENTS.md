@@ -39,6 +39,11 @@ committed work lands on `main`. The workflow for every change is:
    someone else's work. A change is not done until it is on `origin/main`.
 7. **Delete your workbench.**
 
+When a Project Manager coordinates several changes, one Lander agent performs
+steps 4–7 for every workbench, batching ready commits into one validated train
+at a time. Implementers stop after a committed workbench passes step 3 and
+report it ready; they never touch `main`. Every gate above still applies.
+
 The single exception is a change small and self-contained enough that the user
 explicitly tells you to skip the workbench; then edit and commit on `main`
 directly as instructed.
@@ -89,8 +94,11 @@ wall time, repetitions, and peak RSS. Complete stage output and metadata are
 retained in bounded `target/dev-check-logs/` runs; failures print the complete
 captured output for the failing run plus the complete stage-log path, without
 truncation. Validation keys the cache only by schema, `HEAD` commit, and current
-tracked plus unignored worktree content. There is no cache-bypass mode for
-local, release, or CI validation.
+tracked plus unignored worktree content. Success records live in the Git common
+directory and are shared by every worktree of the repository, so a commit
+validated in a workbench and fast-forwarded onto clean `main` satisfies the
+post-land `main` gate as a cache hit for that identical commit and content.
+There is no cache-bypass mode for local, release, or CI validation.
 
 Checks are single-instance per repository and fail immediately if the local
 check lock is held. The wrapper pins repository-local sccache configuration,

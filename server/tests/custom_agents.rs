@@ -49,9 +49,15 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
 }
 
 fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
-    ["tyde-default", "tyde-team-lead", "tyde-help"]
-        .into_iter()
-        .collect()
+    [
+        "tyde-default",
+        "tyde-team-lead",
+        "tyde-help",
+        "tyde-project-manager",
+        "tyde-lander",
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn collect_builtin_team_custom_agents_from_bootstrap(
@@ -165,6 +171,80 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
             && normalized
                 .contains("Compare their evidence and trade-offs and choose the approach yourself"),
         "Orchestrator must report progress, maximize useful concurrency, and adjudicate competing plans"
+    );
+}
+
+fn normalized_instructions(agent: &CustomAgent) -> String {
+    agent
+        .instructions
+        .as_deref()
+        .unwrap_or_else(|| panic!("{} should have instructions", agent.name))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn assert_project_manager_and_lander(builtins: &HashMap<CustomAgentId, CustomAgent>) {
+    let manager = builtins
+        .get(&CustomAgentId("tyde-project-manager".to_owned()))
+        .expect("built-in Project Manager should be seeded");
+    assert_eq!(manager.name, "Project Manager");
+    let lander = builtins
+        .get(&CustomAgentId("tyde-lander".to_owned()))
+        .expect("built-in Lander should be seeded");
+    assert_eq!(lander.name, "Lander");
+    let manager_text = normalized_instructions(manager);
+    let lander_text = normalized_instructions(lander);
+
+    for suffix in [
+        "tyde_list_launch_options",
+        "tyde_create_workbench",
+        "tyde_spawn_agent",
+        "tyde_await_agents",
+        "tyde_read_agent",
+        "tyde_send_agent_message",
+        "tyde_close_agent",
+        "tyde_remove_workbench",
+    ] {
+        assert!(
+            manager_text.contains(&format!("`{suffix}`")),
+            "Project Manager should name the Tyde tool suffix {suffix}"
+        );
+    }
+    assert!(
+        manager_text.contains(
+            "follow its launch-profile preference unless the user selected a backend or profile"
+        ) && !manager_text.contains("Use Claude and Codex as the primary"),
+        "Project Manager must follow live launch preferences, not hard-coded backends"
+    );
+    assert!(
+        manager_text.contains("never edit project files, implement, or land changes yourself")
+            && manager_text.contains("Run at most four Implementers at once")
+            && manager_text.contains("Spawn exactly one Lander"),
+        "Project Manager must delegate, cap concurrency, and serialize landing"
+    );
+    assert!(
+        manager_text.contains("`tyde_request_review` in its default mode")
+            && manager_text.contains("You do not land it on `main`; the Lander does")
+            && manager_text.contains("Stay available"),
+        "Project Manager must hand Implementers the review-then-ready workflow"
+    );
+    assert!(
+        manager_text.contains(&format!(
+            "<lander-workflow> {lander_text} </lander-workflow>"
+        )) && manager_text.contains("<implementer-workflow> You own this change")
+            && manager_text.contains("</implementer-workflow>"),
+        "Project Manager must fence the Implementer workflow and the verbatim Lander workflow"
+    );
+    assert!(
+        lander_text.contains("land everything queued as one train")
+            && lander_text
+                .contains("Run the repository validation gate once in the train workbench")
+            && lander_text.contains("split the train in halves")
+            && lander_text.contains("`git merge --ff-only`")
+            && lander_text.contains("Never force-push")
+            && lander_text.contains("Do not guess"),
+        "Lander must batch, validate once, bisect failures, fast-forward, and return semantic conflicts"
     );
 }
 
@@ -348,8 +428,8 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
     assert_eq!(
         builtins.len(),
-        3,
-        "expected Default, Orchestrator, and Help builtins: {builtins:?}"
+        5,
+        "expected Default, Orchestrator, Help, Project Manager, and Lander builtins: {builtins:?}"
     );
     let default = builtins
         .get(&CustomAgentId("tyde-default".to_owned()))
@@ -382,6 +462,13 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
             .is_some_and(|instructions| instructions.contains("tyde-config")),
         "Help should reference its config tools: {help:?}"
     );
+    assert!(
+        help.instructions.as_deref().is_some_and(|instructions| {
+            instructions.contains("**Project Manager**") && instructions.contains("**Lander**")
+        }),
+        "Help should introduce the Project Manager and Lander builtins: {help:?}"
+    );
+    assert_project_manager_and_lander(&builtins);
     for deprecated in [
         "tyde-code-reviewer",
         "tyde-frontend-engineer",
@@ -436,42 +523,42 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         "the built-in override must be notified verbatim"
     );
 
-    let mut previous_help = help.clone();
-    previous_help.instructions = Some(
-        help.instructions
-            .as_deref()
-            .expect("Help instructions")
-            .split_once("\n\n## Global agent control")
-            .expect("Help must document its global controls")
-            .0
-            .to_owned(),
-    );
-    fixture
-        .client
-        .custom_agent_upsert(CustomAgentUpsertPayload {
-            custom_agent: previous_help,
-        })
-        .await
-        .expect("install previously shipped Help");
-    fixture.next_frame_matching("previous Help upsert", |env| {
-        env.kind == FrameKind::CustomAgentNotify
-            && env.parse_payload::<CustomAgentNotifyPayload>().is_ok_and(|p| {
-                matches!(p, CustomAgentNotifyPayload::Upsert { custom_agent } if custom_agent.id == help.id)
+    let shipped_help_v2 = server::store::custom_agents::superseded_help_v2_instructions();
+    let shipped_help_v1 = shipped_help_v2
+        .split_once("\n\n## Global agent control")
+        .expect("Help v2 must document its global controls")
+        .0
+        .to_owned();
+    for instructions in [shipped_help_v1, shipped_help_v2] {
+        let mut previous_help = help.clone();
+        previous_help.instructions = Some(instructions);
+        fixture
+            .client
+            .custom_agent_upsert(CustomAgentUpsertPayload {
+                custom_agent: previous_help,
             })
-    }).await;
+            .await
+            .expect("install previously shipped Help");
+        fixture.next_frame_matching("previous Help upsert", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+                && env.parse_payload::<CustomAgentNotifyPayload>().is_ok_and(|p| {
+                    matches!(p, CustomAgentNotifyPayload::Upsert { custom_agent } if custom_agent.id == help.id)
+                })
+        }).await;
 
-    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
-    assert_eq!(
-        replayed.get(&help.id),
-        Some(help),
-        "Unedited Help must gain global-control instructions on restart"
-    );
-    assert_eq!(
-        replayed.get(&orchestrator_id),
-        Some(&edited),
-        "built-in seeding must not overwrite user edits"
-    );
+        let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+        let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
+        assert_eq!(
+            replayed.get(&help.id),
+            Some(help),
+            "Unedited shipped Help must upgrade to the active instructions on restart"
+        );
+        assert_eq!(
+            replayed.get(&orchestrator_id),
+            Some(&edited),
+            "built-in seeding must not overwrite user edits"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

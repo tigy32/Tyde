@@ -1674,6 +1674,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             )
         return result
 
+    def _cache_dir(self) -> pathlib.Path:
+        return self.root / ".git" / "tyde-dev-check-cache"
+
     def _log_lines(self) -> list[str]:
         if not self.log.exists():
             return []
@@ -1730,14 +1733,14 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 if line.startswith("cargo ")
             )
         )
-        records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
+        records = list(self._cache_dir().glob("*.success"))
         self.assertEqual(len(records), 1)
         record = records[0].read_text(encoding="utf-8")
         self.assertIn("schema=5", record)
         self.assertIn("complete=true", record)
         self.assertTrue(record.endswith("record.end=true\n"))
         self.assertEqual(
-            list((self.root / "target" / "dev-check-cache").glob(".success.*")), []
+            list(self._cache_dir().glob(".success.*")), []
         )
         run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
         metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
@@ -1895,7 +1898,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 (self.root / "failure.txt").write_text(command, encoding="utf-8")
                 failing_env = self.env.copy()
                 failing_env["DEV_CHECK_FAIL_COMMAND"] = command
-                records = set((self.root / "target/dev-check-cache").glob("*.success"))
+                records = set(self._cache_dir().glob("*.success"))
 
                 failed = self._run(env=failing_env, check=False)
 
@@ -1904,7 +1907,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 self.assertIn("Complete stage log:", failed.stderr)
                 self.assertIn(f"PASS  {other_label} (1/1", failed.stdout)
                 self.assertEqual(
-                    set((self.root / "target/dev-check-cache").glob("*.success")),
+                    set(self._cache_dir().glob("*.success")),
                     records,
                 )
                 run_dir = max((self.root / "target/dev-check-logs").glob("run-*"))
@@ -1923,7 +1926,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
     def test_environment_and_failures_obey_cache_contract(self) -> None:
         self._run()
-        initial_records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
+        initial_records = list(self._cache_dir().glob("*.success"))
         initial_log_count = len(self._log_lines())
 
         for removed_option in ("--force", "--no-cache"):
@@ -1931,7 +1934,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             self.assertEqual(rejected.returncode, 2)
         self.assertEqual(len(self._log_lines()), initial_log_count)
         self.assertEqual(
-            len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
+            len(list(self._cache_dir().glob("*.success"))),
             len(initial_records),
         )
 
@@ -1969,11 +1972,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         failure_metadata = (failure_run / "metadata.txt").read_text(encoding="utf-8")
         self.assertIn("failure_log=", failure_metadata)
         self.assertEqual(
-            len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
+            len(list(self._cache_dir().glob("*.success"))),
             len(initial_records),
         )
         self.assertEqual(
-            list((self.root / "target" / "dev-check-cache").glob(".success.*")),
+            list(self._cache_dir().glob(".success.*")),
             [],
         )
 
@@ -2738,7 +2741,7 @@ fi
         first = self._run()
         self.assertIn("CACHE MISS", first.stdout)
         record = next(
-            (self.root / "target" / "dev-check-cache").glob("*.success")
+            self._cache_dir().glob("*.success")
         )
         original = record.read_text(encoding="utf-8")
         record.write_text(original.removesuffix("record.end=true\n"), encoding="utf-8")
@@ -2750,7 +2753,7 @@ fi
         self.assertGreater(len(self._log_lines()), before)
         self.assertTrue(record.read_text(encoding="utf-8").endswith("record.end=true\n"))
         self.assertEqual(
-            list((self.root / "target" / "dev-check-cache").glob(".success.*")), []
+            list(self._cache_dir().glob(".success.*")), []
         )
 
     def test_wrong_sccache_version_fails_instead_of_falling_back(self) -> None:
@@ -2865,7 +2868,7 @@ fi
         logs.mkdir(parents=True)
         sentinel = logs / "run-sentinel"
         sentinel.mkdir()
-        orphan = self.root / "target" / "dev-check-cache" / ".success.orphan"
+        orphan = self._cache_dir() / ".success.orphan"
         orphan.parent.mkdir(parents=True)
         orphan.write_text("partial\n", encoding="utf-8")
 
@@ -2891,21 +2894,29 @@ fi
         self.assertEqual(self._log_lines().count("wasm-prepare"), 1)
         self.assertEqual(self._log_lines().count("wasm"), 1)
         self.assertEqual(
-            len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
+            len(list(self._cache_dir().glob("*.success"))),
             1,
         )
 
-    def test_success_retention_uses_mtime_and_removes_orphan_temp(self) -> None:
-        cache = self.root / "target" / "dev-check-cache"
+    def test_success_retention_uses_mtime_and_removes_only_abandoned_temp(
+        self,
+    ) -> None:
+        cache = self._cache_dir()
         cache.mkdir(parents=True)
         records = []
-        for index in range(18):
+        for index in range(66):
             record = cache / f"{index:02x}.success"
             record.write_text("old\n", encoding="utf-8")
             os.utime(record, (1000 + index, 1000 + index))
             records.append(record)
         orphan = cache / ".success.interrupted"
         orphan.write_text("partial\n", encoding="utf-8")
+        os.utime(orphan, (1000, 1000))
+        in_flight = cache / ".success.concurrent"
+        in_flight.write_text("another worktree is writing\n", encoding="utf-8")
+        obsolete = self.root / "target" / "dev-check-cache"
+        obsolete.mkdir(parents=True)
+        (obsolete / "old.success").write_text("old\n", encoding="utf-8")
 
         self._run()
 
@@ -2913,6 +2924,38 @@ fi
         self.assertFalse(records[1].exists())
         self.assertTrue(all(record.exists() for record in records[2:]))
         self.assertFalse(orphan.exists())
+        self.assertTrue(in_flight.exists())
+        self.assertFalse(obsolete.exists())
+
+    def test_success_in_a_worktree_is_a_hit_after_fast_forward(self) -> None:
+        worktree = pathlib.Path(self.temp.name) / "workbench"
+        self._git("worktree", "add", "-q", "-b", "workbench", str(worktree))
+        (worktree / "tracked.txt").write_text("landed\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "commit", "-qam", "Land change"],
+            cwd=worktree,
+            check=True,
+            capture_output=True,
+        )
+        workbench_run = subprocess.run(
+            [str(worktree / "dev.sh"), "check"],
+            cwd=worktree,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(workbench_run.returncode, 0, workbench_run.stderr)
+        self.assertIn("CACHE MISS", workbench_run.stdout)
+        stage_runs = sum(line.startswith("cargo ") for line in self._log_lines())
+
+        self._git("merge", "-q", "--ff-only", "workbench")
+        main_run = self._run()
+
+        self.assertIn("CACHE HIT", main_run.stdout)
+        self.assertEqual(
+            sum(line.startswith("cargo ") for line in self._log_lines()), stage_runs
+        )
 
     def test_empty_cleanup_directories_are_valid_under_nounset(self) -> None:
         target = self.root / "target"
