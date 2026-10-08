@@ -8028,6 +8028,132 @@ async fn user_interrupt_drops_the_owed_restart_continuation() {
     );
 }
 
+/// A provider resumed with an active native goal goes back to that goal on
+/// its own, so its work is the continuation: Tyde does not prompt it again,
+/// and the user's next message is not held behind an owed continuation. A
+/// paused goal is not pursued, so Tyde still continues the interrupted turn.
+#[tokio::test]
+async fn active_native_goal_is_the_restart_continuation() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    for status in [protocol::GoalStatus::Active, protocol::GoalStatus::Paused] {
+        let goal_active = status == protocol::GoalStatus::Active;
+        let mut fixture = Fixture::new().await;
+        let replay = server::backend::mock::MockResumeReplay::default();
+        let send_gate = server::backend::mock::MockGateHandle::new();
+        replay.gate_sends(&send_gate);
+        let (_agent, session) = spawn_restart_agent(
+            &mut fixture,
+            "goal continuation",
+            "unfinished prompt",
+            None,
+            MockScript::one(MockTurn::held_text("unfinished"))
+                .with_controlled_resume_replay(&replay),
+        )
+        .await;
+
+        let bootstrap = fixture.restart_host().await;
+        let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+        let stream = restored.instance_stream.clone();
+        replay.wait_until_started().await;
+        replay.goal_state(Some(protocol::NativeGoal {
+            objective: "Finish the unfinished work".to_owned(),
+            status,
+            token_budget: None,
+            tokens_used: None,
+            time_used_seconds: None,
+        }));
+        replay.complete();
+        let resumed = if goal_active {
+            let continuing = Observation::observe_until(
+                &mut fixture,
+                std::slice::from_ref(&stream),
+                |observation| {
+                    observation
+                        .stream(&stream)
+                        .phases()
+                        .contains(&Phase::Continuing)
+                },
+            )
+            .await;
+            assert_eq!(
+                stored_turn_recovery(&fixture, &session),
+                serde_json::Value::Null,
+                "no turn runs until the goal starts one, so none is recorded in flight"
+            );
+            replay.live_turn("pursuing the goal");
+            Observation::continue_until(
+                continuing,
+                &mut fixture,
+                std::slice::from_ref(&stream),
+                |observation| {
+                    observation
+                        .stream(&stream)
+                        .settled_after("pursuing the goal")
+                },
+            )
+            .await
+        } else {
+            send_gate.wait_until_entered().await;
+            send_gate.release_one();
+            Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+                observation.stream(&stream).continuation_finished()
+            })
+            .await
+        };
+        assert_eq!(
+            resumed.stream(&stream).phases(),
+            vec![
+                Phase::Interrupted {
+                    cause: Cause::HostRestart
+                },
+                Phase::Continuing
+            ],
+            "{status:?}: {:?}",
+            resumed.stream(&stream).items
+        );
+
+        fixture
+            .client
+            .send_message(&stream, "user follows up".to_owned())
+            .await
+            .expect("send after the restart");
+        send_gate.wait_until_entered().await;
+        send_gate.release_one();
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).settled_after("user follows up")
+        })
+        .await;
+        let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+        let expected = if goal_active {
+            vec![(false, "user follows up")]
+        } else {
+            vec![(true, "<continuation>"), (false, "user follows up")]
+        };
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| (
+                    input.origin == Some(MessageOrigin::HostRestart),
+                    if input.origin == Some(MessageOrigin::HostRestart) {
+                        "<continuation>"
+                    } else {
+                        input.message.as_str()
+                    }
+                ))
+                .collect::<Vec<_>>(),
+            expected,
+            "{status:?}: only a goal the provider pursues replaces Tyde's continuation"
+        );
+        assert_eq!(
+            stored_turn_recovery(&fixture, &session),
+            serde_json::Value::Null,
+            "{status:?}: a later restart has nothing to continue"
+        );
+    }
+}
+
 /// A turn that cannot be durably recorded as in flight is refused, not started
 /// unrecoverably.
 #[tokio::test]

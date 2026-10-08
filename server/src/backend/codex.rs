@@ -2307,40 +2307,7 @@ impl CodexSession {
 
         inner.emitter.slash_commands(codex_slash_commands());
         if config.execution_mode == BackendExecutionMode::Agent {
-            match inner
-                .rpc
-                .request("thread/goal/get", json!({"threadId": session_id.0}))
-                .await
-            {
-                Ok(response) => {
-                    let goal = response
-                        .get("goal")
-                        .ok_or_else(|| "Codex goal read omitted goal".to_owned())?;
-                    inner.emitter.goal_changed(if goal.is_null() {
-                        None
-                    } else {
-                        Some(parse_codex_goal(goal)?)
-                    });
-                    inner.emitter.goal_capabilities(protocol::GoalCapabilities {
-                        set: true,
-                        pause: true,
-                        resume: true,
-                        clear: true,
-                    });
-                }
-                Err(error) => {
-                    inner.emitter.goal_capabilities(protocol::GoalCapabilities {
-                        set: false,
-                        pause: false,
-                        resume: false,
-                        clear: false,
-                    });
-                    tracing::warn!(%error, "Codex native goal capability unavailable");
-                    inner
-                        .emitter
-                        .warning_message(&format!("Native goals unavailable: {error}"));
-                }
-            }
+            inner.emit_native_goal_snapshot(&session_id.0).await?;
         }
 
         if !skill_setup.exposed_names.is_empty() {
@@ -5043,6 +5010,43 @@ struct CodexInner {
     skill_projection: std::sync::Mutex<Option<CodexSkillProjection>>,
 }
 impl CodexInner {
+    async fn emit_native_goal_snapshot(&self, thread_id: &str) -> Result<(), String> {
+        match self
+            .rpc
+            .request("thread/goal/get", json!({"threadId": thread_id}))
+            .await
+        {
+            Ok(response) => {
+                let goal = response
+                    .get("goal")
+                    .ok_or_else(|| "Codex goal read omitted goal".to_owned())?;
+                self.emitter.goal_changed(if goal.is_null() {
+                    None
+                } else {
+                    Some(parse_codex_goal(goal)?)
+                });
+                self.emitter.goal_capabilities(protocol::GoalCapabilities {
+                    set: true,
+                    pause: true,
+                    resume: true,
+                    clear: true,
+                });
+            }
+            Err(error) => {
+                self.emitter.goal_capabilities(protocol::GoalCapabilities {
+                    set: false,
+                    pause: false,
+                    resume: false,
+                    clear: false,
+                });
+                tracing::warn!(%error, "Codex native goal capability unavailable");
+                self.emitter
+                    .warning_message(&format!("Native goals unavailable: {error}"));
+            }
+        }
+        Ok(())
+    }
+
     async fn begin_compaction(
         self: &Arc<Self>,
         request: BackendCompactionRequest,
@@ -8784,6 +8788,15 @@ impl CodexInner {
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
         self.emit_resumed_thread_history(&turns, &model).await;
+        // An active goal makes Codex start its own turn right after resume,
+        // so the goal must be known before the replay boundary settles.
+        let (thread_id, execution_mode) = {
+            let state = self.state.lock().await;
+            (state.thread_id.clone(), state.execution_mode)
+        };
+        if execution_mode == BackendExecutionMode::Agent {
+            self.emit_native_goal_snapshot(&thread_id).await?;
+        }
         self.emitter.resume_replay_complete();
         tracing::debug!(
             history_turns = turns.len(),

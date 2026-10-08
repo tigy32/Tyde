@@ -7023,9 +7023,10 @@ async fn real_native_goal_lifecycle<B: Backend>(host: &mut Harness<B>) {
             ChatEvent::GoalChanged(goal) => Some(goal),
             _ => None,
         });
-    if !matches!(replayed_goal, Some(Some(goal)) if goal.status == protocol::GoalStatus::Paused) {
-        wait_native_goal(host, &agent, Some(protocol::GoalStatus::Paused)).await;
-    }
+    assert!(
+        matches!(replayed_goal, Some(Some(goal)) if goal.status == protocol::GoalStatus::Paused),
+        "the paused goal must be reported before the resume boundary: {replayed_goal:?}"
+    );
     assert!(
         !agent
             .replayed_history
@@ -7133,6 +7134,20 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
     );
     std::fs::remove_file(&proof).expect("clear original command proof before resume");
     let resumed = resume_agent(host, &agent.session_id).await;
+    // The provider continues an active goal without a prompt, so the server
+    // must know the goal is active when the resume boundary settles.
+    let replayed_goal = resumed
+        .replayed_history
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ChatEvent::GoalChanged(goal) => Some(goal),
+            _ => None,
+        });
+    assert!(
+        matches!(replayed_goal, Some(Some(goal)) if goal.status == protocol::GoalStatus::Active),
+        "the active goal must be reported before the resume boundary: {replayed_goal:?}"
+    );
     // The harness stops at the in-band boundary, not at a temporarily empty
     // queue. Only a subsequent live typing edge can make this turn active.
     let mut running = false;

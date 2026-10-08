@@ -233,6 +233,16 @@ impl MockResumeReplay {
         }
     }
 
+    pub fn goal_state(&self, goal: Option<protocol::NativeGoal>) {
+        self.sender
+            .lock()
+            .expect("mock replay sender mutex")
+            .as_ref()
+            .expect("mock resume has not started")
+            .send(BackendEvent::Chat(protocol::ChatEvent::GoalChanged(goal)))
+            .expect("mock replay stream closed");
+    }
+
     pub fn complete(&self) {
         self.sender
             .lock()

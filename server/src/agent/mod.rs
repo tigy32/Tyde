@@ -5070,14 +5070,34 @@ pub(crate) fn spawn_agent_actor(
                                             &ChatEvent::RestartRecovery { phase: protocol::RestartRecoveryPhase::Interrupted { cause: recovery.cause() } },
                                         ).await;
                                     }
-                                    if resume_live_turn_seen && status_handle.pending_restart_continuation() {
+                                    // A provider pursuing an active native goal starts its
+                                    // own turn once resumed; prompting it again would
+                                    // collide with that turn and stay owed behind it.
+                                    let provider_continues_goal = status_handle
+                                        .snapshot()
+                                        .await
+                                        .goal
+                                        .is_some_and(|goal| goal.status == protocol::GoalStatus::Active);
+                                    if (resume_live_turn_seen || provider_continues_goal)
+                                        && status_handle.pending_restart_continuation()
+                                    {
                                         initial_follow_up = None;
-                                        tracing::info!("adopting the backend's resumed live turn as restart continuation");
+                                        tracing::info!(
+                                            resume_live_turn_seen,
+                                            provider_continues_goal,
+                                            "adopting the backend's own resumed work as restart continuation"
+                                        );
+                                        if resume_live_turn_seen {
+                                            status_handle
+                                                .admit_dispatch(registry::DispatchClass::RestartContinuation)
+                                                .await;
+                                        } else {
+                                            // No turn runs yet; the goal's own turn records
+                                            // itself in flight when it starts.
+                                            status_handle.persist_recovery(None).await;
+                                        }
                                         append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state,
                                             &ChatEvent::RestartRecovery { phase: protocol::RestartRecoveryPhase::Continuing }).await;
-                                        status_handle
-                                            .admit_dispatch(registry::DispatchClass::RestartContinuation)
-                                            .await;
                                         status_handle.restart_continuation_delivered();
                                     } else if resume_recovery.is_some()
                                         && !resume_live_turn_seen

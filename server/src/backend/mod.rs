@@ -1430,6 +1430,8 @@ pub trait Backend: Send + Sync + 'static {
     /// more history. The actor reduces that deferred live suffix after the
     /// marker, before settling resume. Prefer ordering live work after the
     /// marker in the adapter. Startup failures use the marker's Err form.
+    /// A native-goal backend reports its goal state before the marker; an
+    /// active goal means the provider resumes the work without a prompt.
     fn resume(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
