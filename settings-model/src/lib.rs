@@ -99,6 +99,11 @@ impl Default for ReviewSettings {
 pub struct HostSettings {
     #[serde(default = "default_resume_previous_agents")]
     pub resume_previous_agents: bool,
+    /// When true, swarms that were running at shutdown wait for an explicit
+    /// Resume after the host restarts. Off by default: running swarms
+    /// continue and redeliver work interrupted by the restart.
+    #[serde(default)]
+    pub pause_swarms_on_restart: bool,
     #[serde(default)]
     pub review: ReviewSettings,
     #[serde(default)]
@@ -185,6 +190,7 @@ impl Default for HostSettings {
     fn default() -> Self {
         Self {
             resume_previous_agents: default_resume_previous_agents(),
+            pause_swarms_on_restart: false,
             review: ReviewSettings::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
@@ -567,6 +573,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
 
     for (field, section, order, widget) in [
         ("resume_previous_agents", "updates", 10, "toggle"),
+        ("pause_swarms_on_restart", "updates", 20, "toggle"),
         ("tyde_debug_mcp_enabled", "general", 10, "toggle"),
         ("tyde_agent_control_mcp_enabled", "subagents", 10, "toggle"),
         ("tyde_agent_control_max_depth", "subagents", 20, "slider"),
@@ -585,6 +592,11 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             "resume_previous_agents",
             "Resume previous agents",
             "Reopen this host's open agents after an update or restart. Mid-turn agents continue with their queued messages; approvals and questions still wait for you. When off, sessions stay in History for manual resume. Applies on the next host restart.",
+        ),
+        (
+            "pause_swarms_on_restart",
+            "Pause swarms on update or restart",
+            "Hold running swarms after an update or restart until you choose Resume. When off, swarms continue automatically and work interrupted by the restart is delivered again. Applies on the next host restart.",
         ),
         (
             "tyde_debug_mcp_enabled",

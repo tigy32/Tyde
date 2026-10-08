@@ -145,6 +145,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
+            pause_swarms_on_restart: false,
             review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
@@ -7565,6 +7566,7 @@ pub(crate) mod restore_fixtures {
                 agents_with_background_work: Vec::new(),
                 settings: settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: Vec::new(),
                     default_backend: None,

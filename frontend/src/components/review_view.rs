@@ -3147,6 +3147,7 @@ mod wasm_tests {
                 "h1".to_owned(),
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Codex],
                     default_backend: Some(BackendKind::Codex),
@@ -3758,6 +3759,7 @@ mod wasm_tests {
                 "h1".to_owned(),
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: enabled,
                     default_backend: default,

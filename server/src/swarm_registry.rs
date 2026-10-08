@@ -90,6 +90,7 @@ impl SwarmRegistryHandle {
         path: PathBuf,
         stopped: CancellationToken,
         sessions: Vec<crate::store::session::SessionRecord>,
+        pause_on_restart: bool,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(64);
         let terminated = CancellationToken::new();
@@ -97,7 +98,7 @@ impl SwarmRegistryHandle {
         let actor_stopped = stopped.clone();
         let worker = async move {
             let completion = completion;
-            let mut actor = Actor::load(path, &sessions);
+            let mut actor = Actor::load(path, &sessions, pause_on_restart);
             loop {
                 let command = tokio::select! {
                     biased;
@@ -669,7 +670,11 @@ struct Actor {
     fail_directory_sync: bool,
 }
 impl Actor {
-    fn load(path: PathBuf, sessions: &[crate::store::session::SessionRecord]) -> Self {
+    fn load(
+        path: PathBuf,
+        sessions: &[crate::store::session::SessionRecord],
+        pause_on_restart: bool,
+    ) -> Self {
         let file = match std::fs::read(&path) {
             Ok(bytes) if legacy_store_version(&bytes) => set_aside_store(&path)
                 .map(|()| SwarmStoreSnapshot { version: SWARM_STORE_VERSION, ..Default::default() }),
@@ -684,12 +689,23 @@ impl Actor {
                         return Err(failure(SwarmErrorCode::Storage, "unsupported swarm store version"));
                     }
                     for swarm in &mut file.swarms {
+                        // Auto-resume continues only swarms that were
+                        // executing; paused or attention-held swarms keep
+                        // their explicit recovery.
+                        let auto_resume = !pause_on_restart
+                            && matches!(swarm.lifecycle, SwarmLifecycle::Running | SwarmLifecycle::Transitioning)
+                            && swarm.recovery_requirement == SwarmRecoveryRequirement::None;
                         let mut uncertain = false;
                         for notification in &mut swarm.notifications {
                             if notification.state == SwarmDeliveryState::Dispatching {
-                                notification.state = SwarmDeliveryState::Uncertain;
-                                notification.error = Some("Host restarted before backend acceptance was confirmed; explicit retry required".into());
-                                uncertain = true;
+                                if auto_resume {
+                                    notification.state = SwarmDeliveryState::Pending;
+                                    notification.error = None;
+                                } else {
+                                    notification.state = SwarmDeliveryState::Uncertain;
+                                    notification.error = Some("Host restarted before backend acceptance was confirmed; explicit retry required".into());
+                                    uncertain = true;
+                                }
                             }
                         }
                         for member in &mut swarm.members {
@@ -705,6 +721,8 @@ impl Actor {
                             if matches!(member.state, SwarmMemberState::Live | SwarmMemberState::Reserved | SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved) {
                                 if matches!(member.state, SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved) {
                                     member.state = SwarmMemberState::Retired;
+                                } else if member.state == SwarmMemberState::Reserved && member.session_id.is_none() && auto_resume {
+                                    member.state = SwarmMemberState::Proposed;
                                 } else if member.state == SwarmMemberState::Reserved && member.session_id.is_none() {
                                     member.state = SwarmMemberState::Failed;
                                     member.error = Some("Host restarted during member activation; explicit retry required".into());
@@ -721,13 +739,26 @@ impl Actor {
                             }
                             member.agent_id = None;
                             member.runtime_status = None;
-                            // Restart recovery stays explicit: a failure
-                            // awaiting replacement now awaits Retry.
-                            member.replacement_due_at_ms = None;
-                            member.unfinished_notification_ids.clear();
+                            let unfinished = std::mem::take(&mut member.unfinished_notification_ids);
+                            if auto_resume {
+                                // Turns cut off by the restart are delivered
+                                // again to the resumed session.
+                                for notification in &mut swarm.notifications {
+                                    if notification.member_id == member.spec.id
+                                        && notification.state == SwarmDeliveryState::Accepted
+                                        && unfinished.contains(&notification.id)
+                                    {
+                                        notification.state = SwarmDeliveryState::Pending;
+                                    }
+                                }
+                            } else {
+                                // Restart recovery stays explicit: a failure
+                                // awaiting replacement now awaits Retry.
+                                member.replacement_due_at_ms = None;
+                            }
                         }
                         if swarm.lifecycle == SwarmLifecycle::Pausing { swarm.lifecycle = SwarmLifecycle::Paused; }
-                        if uncertain || !matches!(swarm.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired) {
+                        if !auto_resume && (uncertain || !matches!(swarm.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired)) {
                             swarm.lifecycle = SwarmLifecycle::AttentionRequired;
                             swarm.recovery_requirement = SwarmRecoveryRequirement::ExplicitResume;
                             swarm.error = Some("Host restarted; review deliveries and Resume or explicitly retry uncertain work".into());

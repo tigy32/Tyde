@@ -15476,8 +15476,12 @@ fn spawn_host_inner(
     };
     let swarm_store_path = paths.agent_team.with_file_name("agent_swarms.json");
     let stopped = CancellationToken::new();
-    let swarm_registry =
-        SwarmRegistryHandle::spawn(swarm_store_path, stopped.clone(), session_store.list()?);
+    let swarm_registry = SwarmRegistryHandle::spawn(
+        swarm_store_path,
+        stopped.clone(),
+        session_store.list()?,
+        host_settings.pause_swarms_on_restart,
+    );
     let (swarm_dispatch_tx, swarm_dispatch_rx) = mpsc::channel(1);
     let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs);
     let project_store = Arc::new(Mutex::new(project_store));

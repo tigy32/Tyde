@@ -1849,6 +1849,7 @@ mod wasm_tests {
     fn empty_host_settings() -> settings_model::HostSettings {
         settings_model::HostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
+            pause_swarms_on_restart: false,
             review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,

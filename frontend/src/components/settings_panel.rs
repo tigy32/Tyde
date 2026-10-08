@@ -9596,6 +9596,7 @@ mod wasm_tests {
                 host_id,
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
@@ -11113,6 +11114,7 @@ mod wasm_tests {
                 host_id,
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
@@ -12001,6 +12003,7 @@ mod wasm_tests {
     ) -> settings_model::HostSettings {
         settings_model::HostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
+            pause_swarms_on_restart: false,
             review: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
@@ -14450,6 +14453,7 @@ mod wasm_tests {
                 host_id.clone(),
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),

@@ -1943,6 +1943,8 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
     let stopped = host.restart.stopped.clone();
     let worker = async move {
         host.schedule_swarm_helpers().await;
+        // Swarms that continued across a restart may already hold due work.
+        host.schedule_swarm_dispatch().await;
         let mut replacement_due_at_ms: Option<u64> = None;
         loop {
             let signalled = match replacement_due_at_ms {

@@ -343,6 +343,7 @@ mod wasm_tests {
                 host_id.to_owned(),
                 settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
+                    pause_swarms_on_restart: false,
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),

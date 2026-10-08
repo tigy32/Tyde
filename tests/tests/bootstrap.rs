@@ -222,6 +222,7 @@ fn write_host_settings_with_launch_profiles(
 ) {
     let settings = settings_model::HostSettings {
         resume_previous_agents: settings_model::default_resume_previous_agents(),
+        pause_swarms_on_restart: false,
         review: Default::default(),
         enabled_backends: backends.to_vec(),
         default_backend,

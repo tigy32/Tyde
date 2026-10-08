@@ -127,6 +127,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
+            pause_swarms_on_restart: false,
             review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
@@ -4422,6 +4423,7 @@ mod wasm_tests {
             agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
                 resume_previous_agents: settings_model::default_resume_previous_agents(),
+                pause_swarms_on_restart: false,
                 review: Default::default(),
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),

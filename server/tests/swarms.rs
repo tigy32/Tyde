@@ -120,6 +120,31 @@ impl Scenario {
         }
     }
 
+    /// Opts into explicit restart recovery, which is off by default.
+    async fn pause_swarms_on_restart(&mut self) {
+        let write_id = protocol::SettingsWriteId("pause-swarms-on-restart".to_owned());
+        self.fixture
+            .client
+            .settings_write(protocol::SettingsWritePayload {
+                write_id: write_id.clone(),
+                ops: vec![protocol::SettingOp::Replace {
+                    path: "/pause_swarms_on_restart".to_owned(),
+                    value: json!(true),
+                    expected: protocol::SettingExpectation::Value {
+                        value: json!(false),
+                    },
+                }],
+            })
+            .await
+            .expect("enable explicit swarm restart recovery");
+        fixture::expect_settings_write_applied(
+            &mut self.fixture.client,
+            &write_id,
+            "pause swarms on restart",
+        )
+        .await;
+    }
+
     async fn add_project(&mut self, name: &str) -> Project {
         let root = self.fixture.store_dir().join(name);
         std::fs::create_dir(&root).expect("create additional project root");
@@ -592,6 +617,46 @@ impl Scenario {
             !error.fatal && !error.message.is_empty(),
             "converted legacy mutation must explain its nonfatal rejection"
         );
+    }
+
+    /// Polls the durable store, which stays readable while a held backend
+    /// send blocks new bootstraps.
+    async fn persisted_until(&self, id: &SwarmId, predicate: impl Fn(&Swarm) -> bool) -> Swarm {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let persisted: protocol::SwarmStoreSnapshot = serde_json::from_slice(
+                    &std::fs::read(self.fixture.swarm_store_path())
+                        .expect("read persisted swarm store"),
+                )
+                .expect("decode persisted swarm store");
+                if let Some(state) = persisted
+                    .swarms
+                    .into_iter()
+                    .find(|state| state.id == *id && predicate(state))
+                {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("persisted swarm state must reach the requested condition")
+    }
+
+    /// Polls fresh bootstraps, so concurrent swarms cannot consume each
+    /// other's transitions from this scenario's event stream.
+    async fn snapshot_until(&self, id: &SwarmId, predicate: impl Fn(&Swarm) -> bool) -> Swarm {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state = self.snapshot(id).await;
+                if predicate(&state) {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("persisted swarm state must reach the requested condition")
     }
 
     async fn snapshot(&self, id: &SwarmId) -> Swarm {
@@ -7237,7 +7302,11 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .iter()
         .find(|state| state.id == idle_pair.id)
         .expect("retained idle swarm recovery");
-    assert_eq!(dormant.lifecycle, SwarmLifecycle::AttentionRequired);
+    assert_eq!(dormant.lifecycle, SwarmLifecycle::Running);
+    assert_eq!(
+        dormant.recovery_requirement,
+        protocol::SwarmRecoveryRequirement::None
+    );
     assert!(dormant.notifications == idle_pair.notifications && dormant.members.len() == 2);
     for previous in &idle_pair.members {
         let recovered = dormant
@@ -7254,16 +7323,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             "a previously Live idle peer is canonically Dormant, not a Proposed addition or a phantom bound actor"
         );
     }
-    scenario
-        .send(SwarmCommandPayload::Resume {
-            swarm_id: idle_pair.id.clone(),
-        })
-        .await;
-    let resumed_idle = scenario
-        .swarm(&idle_pair.id, |state| {
-            state.lifecycle == SwarmLifecycle::Running
-        })
-        .await;
+    let resumed_idle = scenario.snapshot(&idle_pair.id).await;
     assert!(
         resumed_idle
             .members
@@ -7275,7 +7335,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
     assert!(
         resumed_idle.notifications == idle_pair.notifications
             && scenario.fixture.agent_ids().await.is_empty(),
-        "Resume without intended notifications must not instantiate either retained session or replay its opening"
+        "Restart without intended notifications must not instantiate either retained session or replay its opening"
     );
     let mut expanded_constraints = resumed_idle.constraints.clone();
     expanded_constraints.max_live_agents = 3;
@@ -8268,8 +8328,149 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
 }
 
 #[tokio::test]
+async fn running_swarms_continue_after_restart_and_redeliver_interrupted_work() {
+    let mut scenario = Scenario::new().await;
+    let dispatching_draft = scenario.generate(scenario.constraints(1)).await;
+    let mid_turn_draft = scenario.generate(scenario.constraints(1)).await;
+    let send_gate = MockGateHandle::new();
+    let turn_gate = MockGateHandle::new();
+    let reservation = scenario
+        .fixture
+        .reserve_mock_launches(vec![
+            (
+                dispatching_draft.members[0].name.clone(),
+                MockScript::one(MockTurn::text("Initial activation completed"))
+                    .with_unbounded_echo()
+                    .with_send_gate(&send_gate),
+            ),
+            (
+                mid_turn_draft.members[0].name.clone(),
+                MockScript::one(MockTurn::text("Initial activation completed"))
+                    .then(MockTurn::gated_text("Turn cut off by restart", &turn_gate)),
+            ),
+        ])
+        .await;
+    let mut opened = Vec::new();
+    for draft in [&dispatching_draft, &mid_turn_draft] {
+        let starting = scenario.launch(draft).await;
+        opened.push(
+            scenario
+                .open_request(
+                    &starting.id,
+                    "Review the project and publish useful findings",
+                )
+                .await
+                .1,
+        );
+    }
+    drop(reservation);
+    // One host death strands both kinds of in-flight work: a delivery not
+    // yet accepted by the backend, and an accepted delivery mid-turn. The
+    // held send blocks the dispatch worker, so it is posted last.
+    let mut posts = Vec::new();
+    for (live, gate) in opened.iter().rev().zip([&turn_gate, &send_gate]) {
+        posts.push(
+            scenario
+                .post(
+                    &live.id,
+                    publication(
+                        SwarmBoard::Briefing,
+                        "interrupted-by-restart",
+                        vec![text("Work interrupted by a host update")],
+                    ),
+                )
+                .await,
+        );
+        gate.wait_until_entered().await;
+    }
+    posts.reverse();
+    let interrupted = opened.into_iter().zip(posts).collect::<Vec<_>>();
+    let mut notifications = Vec::new();
+    for ((live, post), expected) in interrupted.iter().zip([
+        SwarmDeliveryState::Dispatching,
+        SwarmDeliveryState::Accepted,
+    ]) {
+        let state = scenario
+            .persisted_until(&live.id, |state| {
+                state
+                    .notifications
+                    .iter()
+                    .any(|intent| intent.post_ids.contains(&post.id) && intent.state == expected)
+            })
+            .await;
+        notifications.push(
+            state
+                .notifications
+                .iter()
+                .find(|intent| intent.post_ids.contains(&post.id))
+                .expect("persisted dispatch intent")
+                .id
+                .clone(),
+        );
+    }
+
+    let restarted = scenario.fixture.relaunch_host_after_kill().await;
+    scenario.pending.clear();
+    for ((live, post), notification) in interrupted.iter().zip(&notifications) {
+        let recovered = restarted
+            .swarms
+            .iter()
+            .find(|state| state.id == live.id)
+            .expect("recovered running swarm");
+        assert_eq!(
+            recovered.lifecycle,
+            SwarmLifecycle::Running,
+            "a running swarm continues across a restart without a human Resume"
+        );
+        assert_eq!(
+            recovered.recovery_requirement,
+            protocol::SwarmRecoveryRequirement::None
+        );
+        assert!(recovered.error.is_none());
+        let redelivered = scenario
+            .snapshot_until(&live.id, |state| {
+                state.members[0].agent_id.is_some()
+                    && state.members[0].context_cursor >= post.cursor
+                    && ready(state)
+            })
+            .await;
+        assert!(
+            redelivered.members[0].session_id == live.members[0].session_id,
+            "automatic recovery must resume the member's existing session"
+        );
+        let intents = redelivered
+            .notifications
+            .iter()
+            .filter(|intent| intent.post_ids.contains(&post.id))
+            .collect::<Vec<_>>();
+        assert!(
+            intents.len() == 1
+                && intents[0].id == *notification
+                && intents[0].state == SwarmDeliveryState::Accepted,
+            "automatic recovery updates the durable intent rather than duplicating it"
+        );
+        let control = scenario
+            .fixture
+            .mock_by_id(
+                redelivered.members[0]
+                    .agent_id
+                    .as_ref()
+                    .expect("automatically resumed runtime"),
+            )
+            .await;
+        let (references, _) = last_dispatch_context(&control.requests().await);
+        assert!(
+            references.contains(&post.id),
+            "the interrupted delivery must reach the resumed session"
+        );
+        scenario.pause(&live.id).await;
+    }
+}
+
+#[tokio::test]
 async fn interrupted_transport_acceptance_requires_explicit_notification_retry_after_restart() {
     let mut scenario = Scenario::new().await;
+    scenario.pause_swarms_on_restart().await;
     let draft = scenario.generate(scenario.constraints(1)).await;
     let send_gate = MockGateHandle::new();
     let reservation = scenario
