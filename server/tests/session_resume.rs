@@ -7932,6 +7932,102 @@ async fn busy_provider_retains_the_restart_continuation() {
     }
 }
 
+/// When the provider runs a turn of its own after a restart, the owed
+/// continuation waits for it to end. A user who stops that turn and sends a
+/// message has taken over: their message runs, the stale continuation never
+/// does, and no later restart revives it.
+#[tokio::test]
+async fn user_interrupt_drops_the_owed_restart_continuation() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let replay = server::backend::mock::MockResumeReplay::default();
+    let send_gate = server::backend::mock::MockGateHandle::new();
+    replay.gate_sends(&send_gate);
+    let (_agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "interrupt owed continuation",
+        "unfinished prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished")).with_controlled_resume_replay(&replay),
+    )
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    replay.wait_until_started().await;
+    fixture
+        .mock_by_id(&restored.agent_id)
+        .await
+        .enqueue(MockTurn::held_text("provider resumed itself"))
+        .await;
+    replay.complete();
+    send_gate.wait_until_entered().await;
+    send_gate.release_one_busy();
+    let busy =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation
+                .stream(&stream)
+                .deltas()
+                .iter()
+                .any(|text| text.contains("provider resumed itself"))
+        })
+        .await;
+    assert_eq!(
+        busy.stream(&stream).phases(),
+        vec![Phase::Interrupted {
+            cause: Cause::HostRestart
+        }],
+        "the continuation is owed while the provider's own turn runs: {:?}",
+        busy.stream(&stream).items
+    );
+
+    fixture
+        .client
+        .interrupt(&stream)
+        .await
+        .expect("interrupt the provider's own turn");
+    fixture
+        .client
+        .send_message(&stream, "user takes over".to_owned())
+        .await
+        .expect("send after the interrupt");
+    send_gate.wait_until_entered().await;
+    send_gate.release_one();
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).settled_after("user takes over")
+        })
+        .await;
+    assert!(
+        !observation
+            .stream(&stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "an interrupted agent is not continued: {:?}",
+        observation.stream(&stream).items
+    );
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (
+                input.origin == Some(MessageOrigin::HostRestart),
+                input.message.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(false, "user takes over")],
+        "the user's message runs and the continuation never does"
+    );
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::Value::Null,
+        "a later restart has nothing to continue"
+    );
+}
+
 /// A turn that cannot be durably recorded as in flight is refused, not started
 /// unrecoverably.
 #[tokio::test]

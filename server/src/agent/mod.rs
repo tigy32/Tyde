@@ -8910,6 +8910,25 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
+                            // A user stop supersedes the host's offer to
+                            // continue the pre-restart turn; left owed, it
+                            // would fire at the next idle edge and hold the
+                            // user's own next message behind it.
+                            if initial_follow_up
+                                .as_ref()
+                                .is_some_and(|input| input.origin == Some(MessageOrigin::HostRestart))
+                            {
+                                tracing::info!(
+                                    agent_id = %current_start.agent_id,
+                                    in_turn,
+                                    "user interrupt dropped the owed restart continuation"
+                                );
+                                initial_follow_up = None;
+                                status_handle.abandon_restart_continuation();
+                                if !in_turn {
+                                    status_handle.persist_recovery(None).await;
+                                }
+                            }
                             if let Some(pause) = usage_pause.as_mut() {
                                 pause.resume_turn = false;
                                 let queue_len = queue.len();
