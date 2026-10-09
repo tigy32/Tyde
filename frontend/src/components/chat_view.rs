@@ -2086,6 +2086,7 @@ mod wasm_tests {
     fn mk_user_msg(text: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::User,
@@ -3404,6 +3405,7 @@ mod wasm_tests {
 
     fn tycode_terminal_message() -> ChatMessage {
         ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: 1,
             sender: MessageSender::Assistant {

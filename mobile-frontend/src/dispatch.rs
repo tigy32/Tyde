@@ -124,6 +124,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         release_version: None,
     };
     let mut bootstrap = BootstrapHostPayload {
+        tychat: Default::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -152,6 +153,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
+            tychat: Default::default(),
         },
         settings_etag: String::new(),
         settings_schema: serde_json::Value::Null,
@@ -1570,6 +1572,7 @@ fn apply_agent_error(state: &AppState, agent_ref: &AgentRef, payload: &AgentErro
     }
     let entry = ChatMessageEntry {
         message: protocol::ChatMessage {
+            origin: None,
             message_id: None,
             // `unix_time_ms`, not `js_sys::Date::now`: this reducer is now
             // reached by native tests, and a wasm-bindgen import aborts the
@@ -1943,6 +1946,7 @@ fn surface_load_agent_error(state: &AppState, host: &LocalHostId, payload: &Comm
     });
     let entry = ChatMessageEntry {
         message: protocol::ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: js_sys::Date::now() as u64,
             sender: protocol::MessageSender::Error,
@@ -4420,6 +4424,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Thinking,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
+            tychat: protocol::TychatStatePayload::default(),
             agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
                 resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -4448,6 +4453,7 @@ mod wasm_tests {
                 launch_profiles: Default::default(),
                 hermes_disabled_providers: Default::default(),
                 voice: Default::default(),
+                tychat: Default::default(),
             },
             settings_etag: String::new(),
             settings_schema: serde_json::Value::Null,
@@ -4657,6 +4663,7 @@ mod wasm_tests {
             created_at_ms: 1,
         };
         let chat_event = protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: 2,
             sender: protocol::MessageSender::User,
@@ -4953,6 +4960,7 @@ mod wasm_tests {
         let message_id = protocol::ChatMessageId("msg-meta-1".to_owned());
 
         let initial = protocol::ChatMessage {
+            origin: None,
             message_id: Some(message_id.clone()),
             timestamp: 1,
             sender: protocol::MessageSender::Assistant {
@@ -5110,6 +5118,7 @@ mod wasm_tests {
         );
 
         let chat_message = protocol::ChatMessage {
+            origin: None,
             message_id: Some(message_id.clone()),
             timestamp: 1,
             sender: protocol::MessageSender::Assistant {
@@ -5229,6 +5238,7 @@ mod wasm_tests {
             &agent_ref,
             ChatEvent::StreamEnd(protocol::StreamEndData {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: Some(protocol::ChatMessageId("end-id".to_owned())),
                     timestamp: 1,
                     sender: protocol::MessageSender::Assistant {
@@ -5274,6 +5284,7 @@ mod wasm_tests {
             agent_id: AgentId("agent".to_owned()),
         };
         let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
+            origin: None,
             message_id: Some(protocol::ChatMessageId(id.to_owned())),
             timestamp: 1,
             sender: protocol::MessageSender::Assistant {

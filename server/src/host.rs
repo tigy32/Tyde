@@ -1,3 +1,5 @@
+#[path = "tychat_host.rs"]
+mod tychat;
 use crate::swarm_registry::SwarmRegistryHandle;
 use protocol::{
     SwarmCommandPayload, SwarmErrorCode, SwarmErrorNotifyPayload, SwarmEventPayload, SwarmFailure,
@@ -368,6 +370,9 @@ struct SessionListSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct HostRuntimeConfig {
+    /// Server-boundary simulations do not run a transport. Real Tychat tests leave this false.
+    #[cfg(feature = "test-support")]
+    pub tychat_bridge_disabled: bool,
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -415,6 +420,8 @@ pub struct HostRuntimeConfig {
 impl Default for HostRuntimeConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "test-support")]
+            tychat_bridge_disabled: false,
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
@@ -725,6 +732,9 @@ enum SessionSchemaResolution {
 type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
+    tychat: crate::tychat::TychatService,
+    #[cfg(feature = "test-support")]
+    tychat_bridge_disabled: bool,
     pub swarm_registry: SwarmRegistryHandle,
     swarm_dispatch_tx: mpsc::Sender<()>,
     swarm_helper_jobs: HashSet<swarms::SwarmHelperJobKey>,
@@ -2059,6 +2069,9 @@ impl HostHandle {
     #[cfg(feature = "test-support")]
     pub async fn hard_stop_for_conformance(&self) {
         self.restart.stopped.cancel();
+        let tychat = self.state.lock().await.tychat.clone();
+        tychat.bridge.shutdown().await;
+        tychat.release_process_lock();
         if let Some(registry) = &self.restart.swarm_registry {
             registry.wait_stopped().await;
         }
@@ -3089,6 +3102,7 @@ impl HostHandle {
         }
         let settings_store_for_projection = Arc::clone(&state.settings_store);
         let agent_restoration_failures = state.agent_restoration_failures.clone();
+        let tychat_snapshot = state.tychat.state.lock().await.snapshot.clone();
         drop(state);
         let task_token_usages = task_token_usage_rollups_from_handles(
             usage_handles,
@@ -3103,6 +3117,7 @@ impl HostHandle {
             settings_wire_projection(&store, &settings)
         };
         let bootstrap = HostBootstrapPayload {
+            tychat: tychat_snapshot,
             agents_with_background_work,
             settings,
             settings_etag,
@@ -3539,7 +3554,9 @@ impl HostHandle {
                     .control
                     .get()
                     .expect("host MCP initialized before serving");
+                let tychat = host.state.lock().await.tychat.clone();
                 let graceful = async {
+                    tychat.bridge.shutdown().await;
                     futures_util::future::join_all(
                         handles.iter().map(|handle| handle.prepare_restart()),
                     )
@@ -3580,6 +3597,8 @@ impl HostHandle {
                     agents = handles.len(),
                     "host restart shutdown completed; owned process scopes sealed"
                 );
+                tychat.bridge.abort().await;
+                tychat.release_process_lock();
                 host.restart.complete.send_replace(true);
             });
         }
@@ -4181,7 +4200,10 @@ impl HostHandle {
             );
             return Ok(None);
         };
-        if start.origin == AgentOrigin::BackendNative {
+        if matches!(
+            start.origin,
+            AgentOrigin::BackendNative | AgentOrigin::Tychat
+        ) {
             send_agent_compact_notify(
                 &stream,
                 AgentCompactNotifyPayload {
@@ -4191,7 +4213,14 @@ impl HostHandle {
                     new_agent_id: None,
                     new_session_id: None,
                     summary_preview: None,
-                    message: Some("backend-native agents cannot be compacted".to_owned()),
+                    message: Some(
+                        if start.origin == AgentOrigin::Tychat {
+                            "Use Reset Tychat agent to start a fresh session"
+                        } else {
+                            "backend-native agents cannot be compacted"
+                        }
+                        .to_owned(),
+                    ),
                 },
             );
             return Ok(None);
@@ -4660,6 +4689,21 @@ impl HostHandle {
             } => Some(from_session_id),
             SpawnAgentParams::New { .. } => None,
         };
+        if origin != AgentOrigin::Tychat
+            && let Some(session) = source_session
+        {
+            let store = self.state.lock().await.session_store.clone();
+            if store
+                .get(session)
+                .await
+                .is_some_and(|record| record.origin == Some(AgentOrigin::Tychat))
+            {
+                return Err(AppError::conflict(
+                    "spawn_agent",
+                    "Tychat sessions are host-owned; use Reset Tychat agent",
+                ));
+            }
+        }
         if swarm_binding.is_none()
             && let Some(session) = source_session
             && self
@@ -5671,6 +5715,51 @@ impl HostHandle {
         };
 
         let mut request = self.apply_complexity_tier_settings(request).await;
+        if origin == AgentOrigin::Tychat {
+            request.origin = origin;
+            request.name = "Tychat agent".into();
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str("\n\n");
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str(crate::tychat::INSTRUCTIONS);
+            let forced = settings_model::HostSettings {
+                tyde_agent_control_mcp_enabled: true,
+                tyde_agent_control_max_depth: u8::MAX,
+                ..Default::default()
+            };
+            let servers = startup_mcp_servers_for_settings(
+                &forced,
+                &request.workspace_roots,
+                &debug_mcp,
+                &agent_control_mcp,
+                &config_mcp,
+                None,
+                1,
+            );
+            if servers.is_empty() {
+                return Err(AppError::invalid(
+                    "tychat",
+                    "Agent-control MCP is unavailable",
+                ));
+            }
+            for server in servers {
+                if !request
+                    .resolved_spawn_config
+                    .mcp_servers
+                    .iter()
+                    .any(|existing| existing.name == server.name)
+                {
+                    request.resolved_spawn_config.mcp_servers.push(
+                        crate::agent::customization::startup_mcp_server_to_protocol(&server),
+                    );
+                }
+            }
+        }
+
         if let Some((swarm_id, member_id, policy)) = &swarm_binding {
             let (projects, roots, swarm_steering) = swarm_workspace.as_ref().ok_or_else(|| {
                 AppError::invalid("swarm_activate", "Swarm workspace was not resolved")
@@ -5886,10 +5975,12 @@ impl HostHandle {
                 stopped: self.restart.stopped.clone(),
                 ..state.swarm_startup_test_gates.clone()
             };
+            let tychat = state.tychat.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    tychat,
                     #[cfg(feature = "test-support")]
                     swarm_startup_test_gates,
                     startup_admission: swarm_startup_rx.take(),
@@ -6444,10 +6535,12 @@ impl HostHandle {
                     "restored agent identity is already registered",
                 ));
             }
+            let tychat = state.tychat.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    tychat,
                     #[cfg(feature = "test-support")]
                     swarm_startup_test_gates: Default::default(),
                     startup_admission: None,
@@ -6742,6 +6835,9 @@ impl HostHandle {
             None => None,
         };
         let start = handle.snapshot();
+        if start.origin == AgentOrigin::Tychat {
+            return Err("The Tychat agent belongs to the host, not a project".into());
+        }
         if !crate::backend::capabilities_for_backend_kind(start.backend_kind)
             .contains(tyde_agent_adapter::BackendCapability::SetWorkspaceRoots)
         {
@@ -9106,6 +9202,26 @@ impl HostHandle {
             return Ok(());
         }
 
+        if candidate.tychat != current.tychat
+            || candidate.enabled_backends != current.enabled_backends
+            || candidate.launch_profiles != current.launch_profiles
+        {
+            if let Err(message) = tychat::validate_tychat_settings(&state, &candidate).await {
+                push_error(
+                    &mut field_errors,
+                    "/tychat",
+                    SettingsErrorCode::Invalid,
+                    message,
+                );
+            }
+            if !field_errors.is_empty() {
+                drop(store);
+                drop(state);
+                emit_result(false, current_etag, field_errors);
+                return Ok(());
+            }
+        }
+
         // Commit before external propagation so a downstream failure cannot
         // leave external state changed while the host store remains stale.
         let committed = match store.replace(candidate) {
@@ -9142,6 +9258,18 @@ impl HostHandle {
         self.finish_settings_apply(state, committed.clone(), effects)
             .await;
 
+        if current.tychat != committed.tychat
+            || current.enabled_backends != committed.enabled_backends
+            || current.launch_profiles != committed.launch_profiles
+        {
+            let service = self.state.lock().await.tychat.clone();
+            if let Err(reason) = self.reconcile_tychat(false).await {
+                service.fail(reason).await;
+            }
+            if service.state.lock().await.journal.pairing.is_some() {
+                service.notify();
+            }
+        }
         let new_etag = {
             let store = settings_store.lock().await;
             let (_doc, _configured_secrets, etag) = settings_wire_projection(&store, &committed);
@@ -10210,6 +10338,16 @@ impl HostHandle {
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
+        if self
+            .state
+            .lock()
+            .await
+            .registry
+            .agent_handle(agent_id)
+            .is_some_and(|handle| handle.snapshot().origin == AgentOrigin::Tychat)
+        {
+            return false;
+        }
         self.close_agent_with_host_visibility(agent_id, false).await
     }
 
@@ -11064,6 +11202,13 @@ impl HostHandle {
             return;
         };
         let activity = status.snapshot().await.activity();
+        if state
+            .registry
+            .agent_handle(agent_id)
+            .is_some_and(|agent| agent.snapshot().origin == AgentOrigin::Tychat)
+        {
+            state.tychat.activity(activity).await;
+        }
         fan_out_agent_turn_state(&mut state, agent_id, activity);
         fan_out_agent_background_work(&mut state, agent_id).await;
         if let Some(parent) = state.registry.parent_agent_id(agent_id) {
@@ -11087,6 +11232,13 @@ impl HostHandle {
                 continue;
             };
             let activity = status.snapshot().await.activity();
+            if state
+                .registry
+                .agent_handle(&agent_id)
+                .is_some_and(|agent| agent.snapshot().origin == AgentOrigin::Tychat)
+            {
+                state.tychat.activity(activity).await;
+            }
             fan_out_agent_turn_state(&mut state, &agent_id, activity);
             fan_out_agent_background_work(&mut state, &agent_id).await;
         }
@@ -12501,6 +12653,7 @@ impl HostHandle {
         if !request.description.trim().is_empty() {
             event_tx
                 .send(ChatEvent::MessageAdded(ChatMessage {
+                    origin: None,
                     message_id: None,
                     timestamp: crate::agent::now_ms(),
                     sender: MessageSender::User,
@@ -15412,6 +15565,8 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     crate::process_env::initialize_process_env()?;
+    let tychat =
+        crate::tychat::TychatService::load(paths.settings.with_file_name("tychat-secrets.json"))?;
     let usage_wakeup_store =
         crate::usage_wakeup::WakeupStore::new(paths.settings.with_file_name("usage_wakeups.json"));
     let transcript_root =
@@ -15569,6 +15724,9 @@ fn spawn_host_inner(
             ..Default::default()
         }),
         state: Arc::new(Mutex::new(HostState {
+            #[cfg(feature = "test-support")]
+            tychat_bridge_disabled: runtime_config.tychat_bridge_disabled,
+            tychat,
             swarm_registry,
             swarm_dispatch_tx,
             swarm_helper_jobs: HashSet::new(),
@@ -15958,6 +16116,7 @@ fn fan_out_agent_restoration_status(
 
 fn spawn_open_agent_restoration_task(host: HostHandle) {
     let worker = async move {
+        host.start_tychat().await;
         if let Err(error) = host.restore_open_agents().await {
             tracing::error!(error = %error, "failed to restore open agents after host restart");
         }
@@ -16035,7 +16194,12 @@ impl HostHandle {
             .await
             .map_err(|error| format!("failed to load open agent sessions: {error}"))?
             .into_iter()
-            .filter(|record| record.restore_state.is_some())
+            .filter(|record| {
+                record
+                    .restore_state
+                    .as_ref()
+                    .is_some_and(|restore| restore.origin != AgentOrigin::Tychat)
+            })
             .collect::<Vec<_>>();
 
         let swarm_registry = self.state.lock().await.swarm_registry.clone();
@@ -18480,6 +18644,10 @@ fn system_tag_descriptor(id: AgentSystemTagId, name: String) -> AgentSystemTagDe
 
 fn origin_system_tag(origin: AgentOrigin) -> (AgentSystemTagId, String) {
     match origin {
+        AgentOrigin::Tychat => (
+            AgentSystemTagId("system:origin:tychat".into()),
+            "Tychat".into(),
+        ),
         AgentOrigin::User => (
             AgentSystemTagId("system:origin:user".to_owned()),
             "User".to_owned(),

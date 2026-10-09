@@ -172,6 +172,7 @@ pub(super) fn mock_assistant_message(
     content: String,
 ) -> ChatMessage {
     ChatMessage {
+        origin: None,
         message_id,
         timestamp: now_ms(),
         sender: MessageSender::Assistant {
@@ -189,8 +190,9 @@ pub(super) fn mock_assistant_message(
     }
 }
 
-pub(super) fn user_bubble(message: &str) -> BackendEvent {
+pub(super) fn user_bubble(message: &str, origin: Option<protocol::MessageOrigin>) -> BackendEvent {
     message_added(ChatMessage {
+        origin,
         message_id: Some(ChatMessageId(Uuid::new_v4().to_string())),
         timestamp: now_ms(),
         sender: MessageSender::User,
@@ -214,6 +216,7 @@ pub(super) fn warning_card(message: &str) -> BackendEvent {
 
 fn card(sender: MessageSender, message: &str) -> BackendEvent {
     message_added(ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: now_ms(),
         sender,
@@ -263,7 +266,7 @@ pub(super) fn compact_turn_frames(
     let message_id = ChatMessageId(Uuid::new_v4().to_string());
     vec![
         typing(true),
-        user_bubble(prompt),
+        user_bubble(prompt, None),
         stream_start("mock", Some(MOCK_MODEL.to_owned())),
         compaction_observation(
             session_id,
@@ -272,6 +275,7 @@ pub(super) fn compact_turn_frames(
             CompactionMethod::NativeTextCommand,
         ),
         stream_end(ChatMessage {
+            origin: None,
             message_id: Some(message_id),
             timestamp: now_ms(),
             sender: MessageSender::Assistant {
@@ -672,6 +676,7 @@ pub(super) fn cancel_live_native_children(active_subagents: &[SubAgentHandle]) {
     for child in active_subagents {
         let _ = child.event_tx.send(ChatEvent::StreamEnd(StreamEndData {
             message: ChatMessage {
+                origin: None,
                 message_id: Some(ChatMessageId(live_native_child_message_id(child))),
                 timestamp: now_ms(),
                 sender: MessageSender::Assistant {
@@ -711,6 +716,7 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
     }));
     let _ = event_tx.send(ChatEvent::StreamEnd(StreamEndData {
         message: ChatMessage {
+            origin: None,
             message_id: message_id.map(ChatMessageId),
             timestamp: now_ms(),
             sender: MessageSender::Assistant {

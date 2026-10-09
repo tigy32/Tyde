@@ -3172,6 +3172,7 @@ mod wasm_tests {
                     launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
             );
         });
@@ -3784,6 +3785,7 @@ mod wasm_tests {
                     launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
             );
         });

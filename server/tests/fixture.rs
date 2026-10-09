@@ -152,6 +152,7 @@ impl tokio::io::AsyncWrite for PausedWriter {
 }
 
 pub struct Fixture {
+    tychat_bridge_disabled: bool,
     pub client: client::Connection,
     #[allow(dead_code)]
     pub bootstrap: HostBootstrapPayload,
@@ -163,6 +164,18 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    // Every integration binary compiles this fixture; only Tychat flows use these hooks.
+    #[allow(dead_code)]
+    pub fn tychat_host(&self) -> server::HostHandle {
+        self.host.clone()
+    }
+
+    // Shared fixture hook, unused in integration binaries outside the Tychat flows.
+    #[allow(dead_code)]
+    pub fn tychat_secret_path(&self) -> PathBuf {
+        self.session_store_dir.path().join("tychat-secrets.json")
+    }
+
     // Each integration binary compiles this shared fixture, but only project flows use scan hooks.
     #[allow(dead_code)]
     pub fn on_project_scan(
@@ -389,6 +402,7 @@ impl Fixture {
                 .replace(settings)
                 .expect("seed fixture enabled backends");
         }
+        let tychat_bridge_disabled = runtime_config.tychat_bridge_disabled;
         let host = if use_mock_backend {
             server::spawn_host_with_mock_backend_and_runtime_config(
                 session_path,
@@ -408,6 +422,7 @@ impl Fixture {
         let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
 
         Self {
+            tychat_bridge_disabled,
             client,
             bootstrap,
             host,
@@ -783,6 +798,7 @@ impl Fixture {
 
     fn fresh_host_runtime_config(&self) -> server::HostRuntimeConfig {
         server::HostRuntimeConfig {
+            tychat_bridge_disabled: self.tychat_bridge_disabled,
             backend_storage_roots: [(
                 BackendKind::Antigravity,
                 self.antigravity_conversations_dir.path().to_path_buf(),
@@ -1693,6 +1709,12 @@ async fn connect_client_with_bootstrap(
 ) -> (client::Connection, HostBootstrapPayload) {
     let mut client = connect_raw_client(host).await;
 
+    let bootstrap = read_initial_host_bootstrap(&mut client).await;
+    (client, bootstrap)
+}
+
+// Store actors run on real threads; paused Tokio time must not expire their I/O.
+async fn read_initial_host_bootstrap(client: &mut client::Connection) -> HostBootstrapPayload {
     let env = {
         let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
         let next_event = client.next_event();
@@ -1721,7 +1743,7 @@ async fn connect_client_with_bootstrap(
     );
     let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrapPayload");
 
-    (client, bootstrap)
+    bootstrap
 }
 
 /// Connect as a paired mobile device over the real mobile connection path,
@@ -1734,13 +1756,7 @@ pub async fn connect_mobile_client_with_bootstrap(
     device_id: &str,
 ) -> (client::Connection, HostBootstrapPayload) {
     let mut client = connect_raw_mobile_client(host, device_id).await;
-    let env = next_frame_matching_on(&mut client, "mobile HostBootstrap", |env| {
-        env.kind == FrameKind::HostBootstrap
-    })
-    .await;
-    let bootstrap: HostBootstrapPayload = env
-        .parse_payload()
-        .expect("parse mobile HostBootstrapPayload");
+    let bootstrap = read_initial_host_bootstrap(&mut client).await;
     (client, bootstrap)
 }
 

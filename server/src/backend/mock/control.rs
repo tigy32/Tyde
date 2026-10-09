@@ -73,6 +73,13 @@ pub enum MockRequest {
 }
 
 pub(super) enum MockControlCommand {
+    HoldUserBubbles {
+        hold: bool,
+        ack: oneshot::Sender<()>,
+    },
+    EndHeldTurnBeforeSteer {
+        ack: oneshot::Sender<()>,
+    },
     /// Append turns to the script queue and acknowledge once installed.
     Enqueue {
         turns: Vec<MockTurn>,
@@ -164,6 +171,15 @@ impl MockControl {
             .expect(TERMINAL_REPORT_MISSING)
     }
 
+    /// Delay complete typed user echoes while continuing to admit input and steering.
+    pub async fn hold_user_bubbles(&self, hold: bool) {
+        let (ack, applied) = oneshot::channel();
+        self.tx
+            .send(MockControlCommand::HoldUserBubbles { hold, ack })
+            .expect(CONTROL_CLOSED);
+        applied.await.expect(CONTROL_CLOSED);
+    }
+
     /// Install one more scripted turn and return once it is queued.
     pub async fn enqueue(&self, turn: MockTurn) {
         self.enqueue_all([turn]).await;
@@ -178,6 +194,15 @@ impl MockControl {
             })
             .expect(CONTROL_CLOSED);
         installed.await.expect(CONTROL_CLOSED);
+    }
+
+    /// Finish at provider admission, with idle still in transit to the server.
+    pub async fn end_held_turn_before_steer(&self) {
+        let (ack, ready) = oneshot::channel();
+        self.tx
+            .send(MockControlCommand::EndHeldTurnBeforeSteer { ack })
+            .expect(CONTROL_CLOSED);
+        ready.await.expect(CONTROL_CLOSED);
     }
 
     pub(super) async fn steer(&self, payload: SendMessagePayload) -> crate::backend::SteerOutcome {

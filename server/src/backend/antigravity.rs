@@ -1217,7 +1217,7 @@ impl Supervisor {
     /// involved: no turn starts there and no model request is made.
     async fn run_cli_command(&mut self, message: &str) -> bool {
         let emitter = Arc::clone(&self.inner.emitter);
-        emitter.user_message(message, None);
+        emitter.user_message(message, None, None);
         emitter.typing_status_changed(true);
         let model = self.launch.model.clone();
         let cwd = PathBuf::from(&self.launch.primary_root);
@@ -1403,7 +1403,7 @@ impl Supervisor {
             self.cumulative,
         ));
         if let Some(user_message) = echoed_user_message {
-            self.inner.emitter.user_message(user_message, None);
+            self.inner.emitter.user_message(user_message, None, None);
         }
         self.inner.emitter.typing_status_changed(true);
         let message = super::workspace_prompt(message, Some(&self.launch.workspace_roots));
@@ -2504,6 +2504,7 @@ fn antigravity_history(brain_dir: &Path, session_id: &str) -> Result<Vec<ChatEve
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty());
         events.push(ChatEvent::MessageAdded(ChatMessage {
+            origin: None,
             message_id: Some(ChatMessageId(format!("agy-{session_id}-step-{index}"))),
             timestamp: row
                 .get("created_at")
@@ -3161,6 +3162,7 @@ fn map_emitter_event(raw: &Value) -> Option<BackendEvent> {
         }
         "Error" => Some(BackendEvent::Chat(ChatEvent::MessageAdded(
             protocol::ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: now_ms(),
                 sender: protocol::MessageSender::Error,

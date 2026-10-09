@@ -209,7 +209,14 @@ pub fn ChatMessageView(
         entry_for_meta.with(|e| match &e.message.sender {
             MessageSender::User => (
                 "chat-card chat-card-user".to_owned(),
-                "You".to_owned(),
+                if matches!(
+                    e.message.origin,
+                    Some(protocol::MessageOrigin::Tychat { .. })
+                ) {
+                    "You · Tychat".to_owned()
+                } else {
+                    "You".to_owned()
+                },
                 true,
                 false,
                 false,
@@ -1095,6 +1102,7 @@ mod wasm_tests {
     fn assistant_msg(token_usage: Option<MessageTokenUsage>) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::Assistant {
@@ -1115,6 +1123,7 @@ mod wasm_tests {
     fn user_msg(text: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::User,
@@ -1381,6 +1390,7 @@ mod wasm_tests {
         let copy = "Supervisor could not verify whether this task was complete after 2 attempts and has stopped retrying. Send a follow-up message if you want the agent to continue.";
         let container = mount_message(ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::Warning,
@@ -1918,6 +1928,7 @@ mod wasm_tests {
             let state = AppState::new();
             let entry = ChatMessageEntry {
                 message: ChatMessage {
+                    origin: None,
                     message_id: Some(message_id_mount.clone()),
                     timestamp: 0,
                     sender: protocol::MessageSender::Assistant {

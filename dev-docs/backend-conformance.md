@@ -48,6 +48,15 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Typed input origins
+
+`real_mid_turn_steering` passes distinct `MessageOrigin::Tychat` identities in
+its initial send and mid-turn steer and requires those exact identities on the
+backend-emitted user messages. Ordinary input remains untagged. Claude, Codex
+and Hermes passed the same real-provider scenario after failing its new origin
+assertion before the emitter fix. The server does not attach origins by matching
+echo order; the interleaved UI/Tychat case is covered by the host sim flow.
+
 ## Child user-question policy and superseding input
 
 The server applies `ToolCategory::AskUser` exclusion to child agents, including

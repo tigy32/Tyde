@@ -249,6 +249,7 @@ fn write_host_settings_with_launch_profiles(
             .collect(),
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
+        tychat: Default::default(),
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(

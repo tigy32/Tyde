@@ -486,6 +486,7 @@ fn project_label(projects: &[ProjectInfo], agent: &AgentInfo) -> String {
 
 fn origin_label(origin: AgentOrigin) -> &'static str {
     match origin {
+        AgentOrigin::Tychat => "Tychat",
         AgentOrigin::User => "User",
         AgentOrigin::AgentControl => "Agent control",
         AgentOrigin::BackendNative => "Native",

@@ -1874,6 +1874,7 @@ mod wasm_tests {
             launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
+            tychat: Default::default(),
         }
     }
 
@@ -1958,6 +1959,7 @@ mod wasm_tests {
             &agent_ref,
             crate::state::ChatMessageEntry {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: None,
                     timestamp: 0,
                     sender: protocol::MessageSender::User,

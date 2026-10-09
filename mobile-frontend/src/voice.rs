@@ -660,6 +660,7 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
                         &agent_ref,
                         crate::state::ChatMessageEntry {
                             message: protocol::ChatMessage {
+                                origin: None,
                                 message_id: payload.message_id,
                                 timestamp: js_sys::Date::now() as u64,
                                 sender: match payload.speaker {

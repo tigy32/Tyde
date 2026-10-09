@@ -2149,7 +2149,8 @@ impl MobileAccessActor {
                 // a dozen of them would otherwise buzz the phone a dozen times.
                 match start.origin {
                     AgentOrigin::User => {}
-                    AgentOrigin::AgentControl
+                    AgentOrigin::Tychat
+                    | AgentOrigin::AgentControl
                     | AgentOrigin::BackendNative
                     | AgentOrigin::TeamMember
                     | AgentOrigin::SwarmMember

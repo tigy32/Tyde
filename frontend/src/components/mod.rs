@@ -47,3 +47,5 @@ pub mod workflow_view;
 pub mod workflows_panel;
 
 pub mod app_updates;
+
+pub mod tychat_settings;

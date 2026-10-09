@@ -1442,6 +1442,7 @@ mod wasm_tests {
     fn make_message(sender: MessageSender, content: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender,

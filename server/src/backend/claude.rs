@@ -2193,6 +2193,7 @@ impl ClaudeInner {
             self.emit_user_message_added(
                 &message,
                 (!images.is_empty()).then_some(images.as_slice()),
+                origin,
             );
         }
         let message_id = format!("claude-msg-{turn_id}");
@@ -2306,6 +2307,7 @@ impl ClaudeInner {
         self.emit_user_message_added(
             &payload.message,
             (!images.is_empty()).then_some(images.as_slice()),
+            payload.origin,
         );
         SteerOutcome::Accepted
     }
@@ -5449,7 +5451,12 @@ impl ClaudeInner {
             .expect("Claude response mutex poisoned") = Some((message_id.to_owned(), response));
     }
 
-    fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
+    fn emit_user_message_added(
+        &self,
+        content: &str,
+        images: Option<&[ImageAttachment]>,
+        origin: Option<protocol::MessageOrigin>,
+    ) {
         let image_payload = images.map(|images| {
             images
                 .iter()
@@ -5459,7 +5466,7 @@ impl ClaudeInner {
                 })
                 .collect::<Vec<_>>()
         });
-        self.emitter.user_message(content, image_payload);
+        self.emitter.user_message(content, image_payload, origin);
     }
 
     fn emit_stream_delta(&self, message_id: &str, text: &str) {
@@ -5606,7 +5613,7 @@ impl ClaudeInner {
                 .cloned()
                 .and_then(|images| serde_json::from_value(images).ok());
             self.emitter
-                .user_message(super::workspace_prompt_user_text(content), images);
+                .user_message(super::workspace_prompt_user_text(content), images, None);
             return;
         }
 
@@ -14598,6 +14605,7 @@ pub(crate) fn resolve_session_settings(
 
 fn backend_error_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,

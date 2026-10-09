@@ -351,7 +351,7 @@ fn push_mcp_server(
     Ok(())
 }
 
-fn startup_mcp_server_to_protocol(server: &StartupMcpServer) -> McpServerConfig {
+pub(crate) fn startup_mcp_server_to_protocol(server: &StartupMcpServer) -> McpServerConfig {
     McpServerConfig {
         id: McpServerId(format!("builtin:{}", server.name)),
         name: server.name.clone(),

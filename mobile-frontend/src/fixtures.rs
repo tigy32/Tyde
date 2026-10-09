@@ -381,6 +381,7 @@ fn fixture_messages() -> Vec<ChatMessageEntry> {
     vec![
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: Some(ChatMessageId("fixture-user".to_owned())),
                 timestamp: 1_721_000_000_000,
                 sender: MessageSender::User,
@@ -396,6 +397,7 @@ fn fixture_messages() -> Vec<ChatMessageEntry> {
         },
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: Some(ChatMessageId("fixture-assistant".to_owned())),
                 timestamp: 1_721_000_003_000,
                 sender: MessageSender::Assistant {

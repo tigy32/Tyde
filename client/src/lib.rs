@@ -458,6 +458,14 @@ impl Connection {
             .await
     }
 
+    pub async fn tychat_command(
+        &mut self,
+        payload: protocol::TychatCommandPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TychatCommand, &payload)
+            .await
+    }
+
     pub async fn settings_write(
         &mut self,
         payload: protocol::SettingsWritePayload,
@@ -1507,6 +1515,10 @@ impl Connection {
                 }
                 FrameKind::TaskTokenUsage => {
                     let _: TaskTokenUsagePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TychatState => {
+                    let _: protocol::TychatStatePayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::MobileAccessState => {

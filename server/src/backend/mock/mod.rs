@@ -110,6 +110,15 @@ pub fn accepted_messages_in_order() -> Vec<(SessionId, protocol::SendMessagePayl
         .clone()
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn session_startup_mcp_servers(session_id: &SessionId) -> Option<Vec<String>> {
+    session_store()
+        .lock()
+        .ok()?
+        .get(&session_id.0)
+        .map(|record| record.startup_mcp_servers.clone())
+}
+
 /// The builtin steering the server resolved for a mock session's latest spawn.
 #[cfg(any(test, feature = "test-support"))]
 pub fn session_builtin_steering(session_id: &SessionId) -> Option<String> {
@@ -981,7 +990,7 @@ fn emit_resume_history(
 ) {
     for (prompt_index, prompt) in prompts.iter().enumerate() {
         if prompt.trim() == "/compact" {
-            let _ = events_tx.send_event(emit::user_bubble(prompt));
+            let _ = events_tx.send_event(emit::user_bubble(prompt, None));
             let _ = events_tx.send_event(emit::compaction_observation(
                 session_id,
                 prompt_index,
@@ -991,7 +1000,7 @@ fn emit_resume_history(
             continue;
         }
         if user_bubbles {
-            let _ = events_tx.send_event(emit::user_bubble(prompt));
+            let _ = events_tx.send_event(emit::user_bubble(prompt, None));
         }
         let content = format!(
             "{}mock backend response to: {prompt}",

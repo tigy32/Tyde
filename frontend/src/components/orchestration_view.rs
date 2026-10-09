@@ -848,6 +848,7 @@ mod wasm_tests {
         let host = "host";
         let user_message = || {
             ChatEvent::MessageAdded(ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::User,

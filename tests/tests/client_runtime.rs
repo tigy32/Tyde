@@ -752,6 +752,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::McpServerNotify(_)
                 | HostEvent::WorkflowNotify(_)
                 | HostEvent::WorkflowRunNotify(_)
+                | HostEvent::TychatState(_)
                 | HostEvent::MobileAccessState(_)
                 | HostEvent::MobilePairingOffer(_)
                 | HostEvent::SwarmNotify(_)

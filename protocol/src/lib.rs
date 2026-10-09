@@ -234,3 +234,10 @@ pub use types::{
 pub use types::{SwarmHumanPost, SwarmThreadState};
 
 pub use types::{SwarmThreadCreate, SwarmThreadUpdate};
+
+pub use types::{
+    BackendSteeringCapability, MidTurnSteeringCapability, TychatBridgeStatus, TychatCommandPayload,
+    TychatDeliveryPath, TychatDeliveryReceipt, TychatFingerprints, TychatMessageId,
+    TychatOutboundId, TychatOutboundMessage, TychatOutboundSnapshot, TychatOwnerMessage,
+    TychatPairingId, TychatSettings, TychatSettingsApplication, TychatStatePayload, TychatTurnId,
+};

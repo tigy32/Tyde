@@ -620,6 +620,8 @@ impl ProtocolValidator {
                     "AgentsViewPreferencesNotify",
                 )
             }
+            FrameKind::TychatCommand => parse_host_payload::<crate::TychatCommandPayload>(self, envelope, "TychatCommand"),
+            FrameKind::TychatState => parse_host_payload::<crate::TychatStatePayload>(self, envelope, "TychatState"),
             FrameKind::MobileAccessState => {
                 parse_host_payload::<MobileAccessStatePayload>(self, envelope, "MobileAccessState")
             }
@@ -1671,7 +1673,8 @@ fn validate_agent_origin(
         AgentOrigin::Workflow if workflow.is_none() => {
             Err("workflow agents must include workflow metadata".to_owned())
         }
-        AgentOrigin::User
+        AgentOrigin::Tychat
+        | AgentOrigin::User
         | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative
@@ -1680,7 +1683,8 @@ fn validate_agent_origin(
         {
             Err("non-team_member agents must not include team_id or team_member_id".to_owned())
         }
-        AgentOrigin::User
+        AgentOrigin::Tychat
+        | AgentOrigin::User
         | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative
@@ -1689,7 +1693,8 @@ fn validate_agent_origin(
         {
             Err("non-workflow agents must not include workflow metadata".to_owned())
         }
-        AgentOrigin::User
+        AgentOrigin::Tychat
+        | AgentOrigin::User
         | AgentOrigin::SwarmMember
         | AgentOrigin::AgentControl
         | AgentOrigin::BackendNative

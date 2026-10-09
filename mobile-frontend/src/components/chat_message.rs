@@ -421,6 +421,7 @@ mod wasm_tests {
     fn assistant_entry(token_usage: Option<MessageTokenUsage>) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 0,
                 sender: MessageSender::Assistant {

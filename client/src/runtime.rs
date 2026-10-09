@@ -151,6 +151,7 @@ pub enum HostEvent {
     SteeringNotify(SteeringNotifyPayload),
     SkillNotify(SkillNotifyPayload),
     McpServerNotify(McpServerNotifyPayload),
+    TychatState(protocol::TychatStatePayload),
     MobileAccessState(MobileAccessStatePayload),
     MobilePairingOffer(MobilePairingOfferPayload),
     SwarmNotify(protocol::SwarmNotifyPayload),
@@ -1038,6 +1039,14 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::BackendCapacity(payload)).await;
+            true
+        }
+        FrameKind::TychatState => {
+            let payload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::TychatState(payload)).await;
             true
         }
         FrameKind::MobileAccessState => {

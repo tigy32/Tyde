@@ -30,6 +30,9 @@ pub fn agent_passes_filters(
     awaiting_user: &HashSet<AgentId>,
     lowercase_query: &str,
 ) -> bool {
+    if agent.origin == AgentOrigin::Tychat {
+        return lowercase_query.is_empty() || agent.name.to_lowercase().contains(lowercase_query);
+    }
     if filters.hide_sub_agents && agent.parent_agent_id.is_some() {
         return false;
     }
@@ -753,11 +756,21 @@ fn build_sidebar_sections(
                 }
             }
 
+            project_order.sort_by_key(|project| {
+                !leaf_agents
+                    .get(&(host_id.clone(), project.clone()))
+                    .is_some_and(|(_, groups)| {
+                        groups
+                            .iter()
+                            .any(|group| group.parent.origin == AgentOrigin::Tychat)
+                    })
+            });
             let sections: Vec<AgentProjectSection> = project_order
                 .into_iter()
                 .filter_map(|project_id| {
                     let key = (host_id.clone(), project_id.clone());
-                    let (swarms, groups) = leaf_agents.remove(&key)?;
+                    let (swarms, mut groups) = leaf_agents.remove(&key)?;
+                    groups.sort_by_key(|group| group.parent.origin != AgentOrigin::Tychat);
                     let label = project_label(&project_labels, &host_id, project_id.as_ref());
                     Some(AgentProjectSection {
                         key: project_id
@@ -2065,6 +2078,7 @@ fn agent_card(
     let host_id_for_edit = agent.host_id.clone();
     let stream_for_edit = agent.instance_stream.clone();
 
+    let is_tychat = agent.origin == AgentOrigin::Tychat;
     let close_host_id = agent.host_id.clone();
     let close_stream = agent.instance_stream.clone();
     let close_name = name.clone();
@@ -2072,6 +2086,9 @@ fn agent_card(
     let close_state = state.clone();
     let on_close = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
+        if is_tychat {
+            return;
+        }
         let is_active = close_state
             .active_agent
             .with_untracked(|a| a.as_ref().is_some_and(|a| a.agent_id == close_agent_id));
@@ -2354,7 +2371,7 @@ fn agent_card(
                         }.into_any()
                     } else {
                         view! {
-                            <span class="agent-card-name">{name.clone()}</span>
+                            <span class="agent-card-name">{name.clone()}{is_tychat.then_some(" · Tychat · Pinned")}</span>
                         }.into_any()
                     }
                 }}
@@ -2508,6 +2525,7 @@ fn agent_card(
                         class="filter-toggle agent-card-close agent-card-action"
                         title="Close agent"
                         aria-label="Close agent"
+                        disabled=is_tychat
                         on:click=on_close
                         on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
                     >
@@ -3241,6 +3259,7 @@ mod wasm_tests {
                 AgentId(agent_id.to_owned()),
                 vec![ChatRowHandle::new(ChatMessageEntry {
                     message: ChatMessage {
+                        origin: None,
                         message_id: None,
                         timestamp: 0,
                         sender: MessageSender::User,
@@ -3818,6 +3837,7 @@ mod wasm_tests {
         ));
         apply(protocol::ChatEvent::StreamEnd(protocol::StreamEndData {
             message: protocol::ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 1,
                 sender: protocol::MessageSender::Assistant {

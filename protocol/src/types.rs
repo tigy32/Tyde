@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 76;
+pub const PROTOCOL_VERSION: u32 = 77;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -737,6 +737,8 @@ pub enum BackendAccessMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOrigin {
+    /// Server-owned host singleton communicating with the owner through Tychat.
+    Tychat,
     /// Explicitly spawned or resumed by a human user.
     User,
     /// Spawned programmatically through Tyde-owned orchestration (e.g. agent-control MCP).
@@ -1190,6 +1192,8 @@ pub enum FrameKind {
     BackendConfigSnapshots,
     BackendCapacity,
     LaunchProfileCatalogNotify,
+    TychatCommand,
+    TychatState,
     MobileAccessState,
     MobilePairingOffer,
     ReviewCreate,
@@ -1404,6 +1408,8 @@ impl fmt::Display for FrameKind {
             Self::BackendConfigSnapshots => f.write_str("backend_config_snapshots"),
             Self::BackendCapacity => f.write_str("backend_capacity"),
             Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
+            Self::TychatCommand => f.write_str("tychat_command"),
+            Self::TychatState => f.write_str("tychat_state"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
             Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
             Self::ReviewCreate => f.write_str("review_create"),
@@ -1733,6 +1739,8 @@ pub struct WorkflowRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBootstrapPayload<S = Value> {
+    #[serde(default)]
+    pub tychat: TychatStatePayload,
     #[serde(default)]
     pub agents_with_background_work: Vec<AgentId>,
     pub settings: S,
@@ -3516,6 +3524,9 @@ pub struct SendMessagePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageOrigin {
+    Tychat {
+        message_id: TychatMessageId,
+    },
     User,
     AgentControl,
     Review {
@@ -8152,6 +8163,8 @@ pub enum MessageSender {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
     /// Tyde-owned presentation identity. Provider response ids and tool-call
     /// ids are never reused as message ids. Consumers still render a message
     /// when this is absent; it only loses addressable late metadata.
@@ -9811,4 +9824,155 @@ pub struct SwarmCommit<T> {
 pub struct SwarmLegacySource {
     pub team: Team,
     pub members: Vec<TeamMember>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidTurnSteeringCapability {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSteeringCapability {
+    pub backend_kind: BackendKind,
+    pub mid_turn: MidTurnSteeringCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TychatSettings {
+    pub enabled: bool,
+    pub api_base_url: String,
+    pub backend_kind: Option<BackendKind>,
+    pub session_settings: SessionSettingsValues,
+    pub launch_profile_id: Option<LaunchProfileId>,
+    pub access_mode: BackendAccessMode,
+}
+
+impl Default for TychatSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base_url: "https://chat.tyggs.com".into(),
+            backend_kind: None,
+            session_settings: SessionSettingsValues::default(),
+            launch_profile_id: None,
+            access_mode: BackendAccessMode::Unrestricted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TychatBridgeStatus {
+    #[default]
+    Unpaired,
+    Connecting,
+    Connected,
+    AwaitingOwnerConfirmation,
+    Paused {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TychatSettingsApplication {
+    #[default]
+    Inactive,
+    Live,
+    AppliesOnReset,
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatFingerprints {
+    pub bot: String,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TychatMessageId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TychatPairingId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TychatDeliveryPath {
+    Started,
+    Steered,
+    StartedAfterRace,
+    InterruptedThenStarted,
+    Answered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatDeliveryReceipt {
+    pub message_id: TychatMessageId,
+    pub path: TychatDeliveryPath,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatStatePayload {
+    pub status: TychatBridgeStatus,
+    pub fingerprints: Option<TychatFingerprints>,
+    pub agent_id: Option<AgentId>,
+    pub settings_application: TychatSettingsApplication,
+    pub backend_capabilities: Vec<BackendSteeringCapability>,
+    pub last_delivery: Option<TychatDeliveryReceipt>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TychatCommandPayload {
+    Pair { code: String },
+    Unpair,
+    ResetAgent,
+}
+
+impl fmt::Debug for TychatCommandPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pair { .. } => "Pair { code: <redacted> }",
+            Self::Unpair => "Unpair",
+            Self::ResetAgent => "ResetAgent",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatOwnerMessage {
+    pub message_id: TychatMessageId,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TychatOutboundId(pub [u8; 16]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TychatTurnId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatOutboundMessage {
+    pub message_id: TychatOutboundId,
+    pub agent_id: AgentId,
+    pub turn_id: TychatTurnId,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TychatOutboundSnapshot {
+    pub typing: bool,
+    pub pending: Vec<TychatOutboundMessage>,
 }

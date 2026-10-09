@@ -143,6 +143,8 @@ impl TurnRecovery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     #[serde(default)]
+    pub origin: Option<protocol::AgentOrigin>,
+    #[serde(default)]
     pub swarm_membership: Option<protocol::SwarmMembership>,
     #[serde(default)]
     pub turn_recovery: Option<TurnRecovery>,
@@ -370,6 +372,7 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    origin: None,
                     swarm_membership: swarm_membership.clone(),
                     turn_recovery: None,
                     id: session.id.clone(),
@@ -575,6 +578,7 @@ impl SessionStore {
         restore_state: SessionRestoreState,
     ) -> Result<(), String> {
         self.update(session_id, |record| {
+            record.origin = Some(restore_state.origin);
             record.restore_state = Some(restore_state);
         })
     }
@@ -1064,8 +1068,9 @@ impl SessionStore {
                 .ok_or("the agent's session record is missing")?;
             record.turn_recovery = reservation.turn_recovery;
             record.queued_messages = reservation.queued_messages;
-            if restore_state.is_some() {
-                record.restore_state = restore_state;
+            if let Some(restore_state) = restore_state {
+                record.origin = Some(restore_state.origin);
+                record.restore_state = Some(restore_state);
             }
             write_records(transaction, &original, records)?;
             transaction

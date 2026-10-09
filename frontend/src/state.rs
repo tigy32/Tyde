@@ -3895,6 +3895,7 @@ pub struct AppState {
     /// a file view, so the F12 keybinding (which has no file context of its own)
     /// can navigate from the current caret in that file.
     pub code_intel_focus: RwSignal<Option<FileFocus>>,
+    pub tychat_by_host: RwSignal<HashMap<String, protocol::TychatStatePayload>>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub host_settings_schema_by_host: RwSignal<HashMap<String, serde_json::Value>>,
     pub configured_secrets_by_host: RwSignal<HashMap<String, Vec<protocol::ConfiguredSecret>>>,
@@ -4379,6 +4380,7 @@ impl AppState {
             code_intel_notice: RwSignal::new(None),
             cmd_held: RwSignal::new(false),
             code_intel_focus: RwSignal::new(None),
+            tychat_by_host: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             host_settings_schema_by_host: RwSignal::new(HashMap::new()),
             configured_secrets_by_host: RwSignal::new(HashMap::new()),

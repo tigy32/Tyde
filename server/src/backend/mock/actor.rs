@@ -54,8 +54,10 @@ pub(super) fn start_mock_command_loop(
         script,
         unbounded_echo,
         user_bubbles,
+        held_user_bubbles: None,
         slash_commands,
         phase: TurnPhase::Idle,
+        end_before_steer: false,
         pending_async_questions: HashSet::new(),
         goal_status: None,
         violations: Vec::new(),
@@ -112,8 +114,10 @@ struct MockActor {
     script: VecDeque<MockTurn>,
     unbounded_echo: bool,
     user_bubbles: bool,
+    held_user_bubbles: Option<Vec<crate::backend::BackendEvent>>,
     slash_commands: Option<Vec<protocol::SlashCommand>>,
     phase: TurnPhase,
+    end_before_steer: bool,
     pending_async_questions: HashSet<String>,
     goal_status: Option<protocol::GoalStatus>,
     violations: Vec<MockViolation>,
@@ -169,7 +173,7 @@ impl MockActor {
                 message: initial_message.clone(),
             });
             let compact = initial_message.trim() == "/compact";
-            if self.user_bubbles && !compact && !self.emit_user_bubble(&initial_message) {
+            if self.user_bubbles && !compact && !self.emit_user_bubble(&initial_message, None) {
                 return;
             }
             let turn = if compact {
@@ -241,15 +245,46 @@ impl MockActor {
 
     fn handle_control(&mut self, command: MockControlCommand) {
         match command {
+            MockControlCommand::HoldUserBubbles { hold, ack } => {
+                if hold {
+                    assert!(
+                        self.held_user_bubbles.is_none(),
+                        "user echoes are already held"
+                    );
+                    self.held_user_bubbles = Some(Vec::new());
+                } else {
+                    for event in self.held_user_bubbles.take().expect("user echoes are held") {
+                        assert!(
+                            self.events_tx.send_event(event),
+                            "user echo subscriber remains open"
+                        );
+                    }
+                }
+                let _ = ack.send(());
+            }
+            MockControlCommand::EndHeldTurnBeforeSteer { ack } => {
+                assert!(
+                    matches!(self.phase, TurnPhase::Held { .. }),
+                    "race control requires a held turn"
+                );
+                self.end_before_steer = true;
+                let _ = ack.send(());
+            }
             MockControlCommand::Enqueue { turns, ack } => {
                 self.script.extend(turns);
                 let _ = ack.send(());
             }
             MockControlCommand::Steer { payload, reply } => {
+                if std::mem::take(&mut self.end_before_steer) {
+                    self.phase = TurnPhase::Idle;
+                    self.events_tx.send_event(emit::typing(false));
+                }
                 let in_turn = self.parked_at_gate || !matches!(self.phase, TurnPhase::Idle);
                 let outcome = if !in_turn {
                     crate::backend::SteerOutcome::NoActiveTurn(payload)
-                } else if self.user_bubbles && !self.emit_user_bubble(&payload.message) {
+                } else if self.user_bubbles
+                    && !self.emit_user_bubble(&payload.message, payload.origin.clone())
+                {
                     crate::backend::SteerOutcome::Closed
                 } else {
                     self.requests.push(MockRequest::Steer(payload));
@@ -297,7 +332,7 @@ impl MockActor {
         if self.user_bubbles
             && payload.origin != Some(protocol::MessageOrigin::HostRestart)
             && !compact
-            && !self.emit_user_bubble(&payload.message)
+            && !self.emit_user_bubble(&payload.message, payload.origin.clone())
         {
             return false;
         }
@@ -353,8 +388,14 @@ impl MockActor {
         self.run_turn(turn, WAKEUP_INPUT, control).await
     }
 
-    fn emit_user_bubble(&mut self, message: &str) -> bool {
-        self.events_tx.send_event(emit::user_bubble(message))
+    fn emit_user_bubble(&mut self, message: &str, origin: Option<protocol::MessageOrigin>) -> bool {
+        let event = emit::user_bubble(message, origin);
+        if let Some(held) = self.held_user_bubbles.as_mut() {
+            held.push(event);
+            true
+        } else {
+            self.events_tx.send_event(event)
+        }
     }
 
     async fn handle_tool_response(

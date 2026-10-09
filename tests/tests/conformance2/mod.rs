@@ -1248,11 +1248,17 @@ pub async fn interrupt_turn<B: Backend>(
 pub async fn steer_turn<B: Backend>(
     host: &mut Harness<B>,
     agent: &Agent,
-    prompt: &str,
-    steer: &str,
+    prompt: SendMessagePayload,
+    steer: SendMessagePayload,
 ) -> Turn {
-    send_prompt(host, agent, prompt).await;
-    let mut turn = host.turn(prompt);
+    let mut turn = host.turn(&prompt.message);
+    assert!(
+        matches!(
+            try_deliver_message(host, agent, prompt, false).await,
+            SendOutcome::Accepted
+        ),
+        "backend accepts the tagged initial input"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     let mut steer_at = None;
     let mut steered = false;
@@ -1272,18 +1278,18 @@ pub async fn steer_turn<B: Backend>(
                 .backend
                 .as_ref()
                 .expect("backend must be running")
-                .steer(user_message(steer))
+                .steer(steer.clone())
                 .await;
             assert!(
                 matches!(outcome, SteerOutcome::Accepted),
-                "{}: backend did not take a message into its running turn: {outcome:?}",
+                "{}: backend did not take a message into its running turn",
                 turn.label()
             );
             steered = true;
             continue;
         };
         let event = event.unwrap_or_else(|| panic!("{}: backend closed mid-turn", turn.label()));
-        eprintln!("{} {event:?}", turn.label());
+        eprintln!("{} steering progress event received", turn.label());
         match event {
             BackendEvent::Chat(event) => {
                 if steer_at.is_none()

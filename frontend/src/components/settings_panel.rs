@@ -416,6 +416,7 @@ enum SettingsTab {
     Skills,
     CodeIntelligence,
     Voice,
+    Tychat,
     Mobile,
     Debug,
 }
@@ -448,6 +449,7 @@ impl SettingsTab {
             Self::Skills => "Skills",
             Self::CodeIntelligence => "Code Intelligence",
             Self::Voice => "Voice",
+            Self::Tychat => "Tychat",
             Self::Mobile => "Mobile",
             Self::Debug => "Debug",
         }
@@ -470,6 +472,7 @@ impl SettingsTab {
             | Self::Skills
             | Self::CodeIntelligence
             | Self::Voice
+            | Self::Tychat
             | Self::Mobile
             | Self::Debug => SettingsScope::Host,
         }
@@ -680,6 +683,7 @@ impl SettingsTab {
                 "New steering",
             ],
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
+            Self::Tychat => &["Tychat", "Pairing", "Bot", "Owner", "Reset", "API base URL"],
             Self::Mobile => &[
                 "Mobile",
                 "Mobile connections",
@@ -718,7 +722,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 18] = [
+const ALL_TABS: [SettingsTab; 19] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
@@ -735,6 +739,7 @@ const ALL_TABS: [SettingsTab; 18] = [
     SettingsTab::Skills,
     SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
+    SettingsTab::Tychat,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
@@ -755,7 +760,7 @@ const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 13] = [
+const HOST_GROUP_TABS: [SettingsTab; 14] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
@@ -767,6 +772,7 @@ const HOST_GROUP_TABS: [SettingsTab; 13] = [
     SettingsTab::McpServers,
     SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
+    SettingsTab::Tychat,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
@@ -973,6 +979,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
                                     SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
+                                    SettingsTab::Tychat => view! { <super::tychat_settings::TychatTab /> }.into_any(),
                                     SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
                                     SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
                                 },
@@ -7528,7 +7535,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     }
 }
 
-fn backend_value(kind: BackendKind) -> &'static str {
+pub(super) fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
         BackendKind::Kiro => "kiro",
@@ -7541,7 +7548,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
     }
 }
 
-fn backend_label(kind: BackendKind) -> &'static str {
+pub(super) fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
         BackendKind::Kiro => "Kiro",
@@ -9621,6 +9628,7 @@ mod wasm_tests {
                     launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
             );
         });
@@ -9815,6 +9823,222 @@ mod wasm_tests {
                 .unwrap()
                 .as_bool()
                 .unwrap()
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn tychat_tab_renders_host_truth_and_sends_typed_changes() {
+        let calls = install_settings_send_stub();
+        let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, "host-lp");
+        install_launch_profile_host(&state, Vec::new());
+        state.host_settings_by_host.update(|hosts| {
+            let settings = hosts.get_mut("host-lp").unwrap();
+            settings.enabled_backends = vec![
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Hermes,
+                BackendKind::Kiro,
+            ];
+            settings.tychat.backend_kind = Some(BackendKind::Hermes);
+        });
+        let mut snapshot = protocol::TychatStatePayload {
+            backend_capabilities: vec![
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Hermes,
+                BackendKind::Kiro,
+            ]
+            .into_iter()
+            .map(|backend_kind| protocol::BackendSteeringCapability {
+                backend_kind,
+                mid_turn: if backend_kind == BackendKind::Kiro {
+                    protocol::MidTurnSteeringCapability::Unsupported
+                } else {
+                    protocol::MidTurnSteeringCapability::Supported
+                },
+            })
+            .collect(),
+            ..Default::default()
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::TychatState,
+                0,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        let container = make_container();
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            mounted.settings_open.set(true);
+            provide_context(mounted);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Tychat");
+        next_tick().await;
+        let text = container.text_content().unwrap();
+        assert!(text.contains("Unpaired"));
+        assert!(
+            text.contains("API base URL")
+                && text.contains("Launch profile")
+                && text.contains("Access mode")
+        );
+        assert!(
+            text.contains("Model") && text.contains("Sonnet"),
+            "render the backend-defined session controls"
+        );
+        let labels = container.query_selector_all("label").unwrap();
+        let backend: HtmlSelectElement = (0..labels.length())
+            .find_map(|index| {
+                let label = labels.item(index)?.dyn_into::<HtmlElement>().ok()?;
+                label.text_content()?.starts_with("Backend").then(|| {
+                    label
+                        .query_selector("select")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into()
+                        .unwrap()
+                })
+            })
+            .expect("backend control");
+        let options = backend.query_selector_all("option").unwrap();
+        let names: Vec<_> = (0..options.length())
+            .map(|index| options.item(index).unwrap().text_content().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Choose a steer-capable backend",
+                "Claude",
+                "Codex",
+                "Hermes"
+            ]
+        );
+        let enabled: HtmlInputElement = container
+            .query_selector("input[type='checkbox']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        enabled.set_checked(true);
+        dispatch_change(&enabled);
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        assert!(
+            writes
+                .iter()
+                .any(|op| replacement_value(op, "/tychat/enabled") == Some(&Value::Bool(true)))
+        );
+        let code: HtmlInputElement = container
+            .query_selector("input[type='password']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        code.set_value("test-pairing-code");
+        dispatch_event_from_js(&code, "input", None);
+        next_tick().await;
+        click_tab(&container, "Pair");
+        next_tick().await;
+        assert!(
+            code.value().is_empty(),
+            "pairing code must leave the form after submission"
+        );
+        let paired = calls.iter().any(|entry| {
+            let entry = entry.dyn_into::<js_sys::Array>().unwrap();
+            if entry.get(0).as_string().as_deref() != Some("send_host_line") { return false; }
+            let args: Value = serde_json::from_str(&entry.get(1).as_string().unwrap()).unwrap();
+            let envelope: protocol::Envelope = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+            envelope.kind == FrameKind::TychatCommand && matches!(envelope.parse_payload::<protocol::TychatCommandPayload>(), Ok(protocol::TychatCommandPayload::Pair { code }) if code == "test-pairing-code")
+        });
+        assert!(paired, "pair sends a typed command, not a settings secret");
+        assert!(
+            !writes
+                .iter()
+                .any(|op| op.to_string().contains("test-pairing-code"))
+        );
+        snapshot.status = protocol::TychatBridgeStatus::Connected;
+        snapshot.fingerprints = Some(protocol::TychatFingerprints {
+            bot: "public bot fingerprint".into(),
+            owner: "public owner fingerprint".into(),
+        });
+        snapshot.agent_id = Some(protocol::AgentId("tychat-agent".into()));
+        snapshot.settings_application = protocol::TychatSettingsApplication::AppliesOnReset;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::TychatState,
+                1,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let text = container.text_content().unwrap();
+        assert!(text.contains("Connected") && text.contains("Applies on reset"));
+        assert!(
+            text.contains("public bot fingerprint") && text.contains("public owner fingerprint")
+        );
+        snapshot.status = protocol::TychatBridgeStatus::Paused {
+            reason: "Owner identity needs verification".into(),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::TychatState,
+                2,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Paused: Owner identity needs verification")
+        );
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("host-lp").unwrap().tychat.enabled = true;
+        });
+        snapshot.agent_id = None;
+        snapshot.status = protocol::TychatBridgeStatus::Failed {
+            reason: "Session could not resume".into(),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::TychatState,
+                3,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let buttons = container.query_selector_all("button").unwrap();
+        let reset = (0..buttons.length())
+            .find_map(|index| {
+                let button = buttons.item(index)?.dyn_into::<HtmlElement>().ok()?;
+                (button.text_content()?.trim() == "Reset Tychat agent").then_some(button)
+            })
+            .expect("reset control");
+        assert!(
+            !reset.has_attribute("disabled"),
+            "reset must recover a failed resume without a live agent"
         );
         drop(handle);
         container.remove();
@@ -11142,6 +11366,7 @@ mod wasm_tests {
                     launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
             );
         });
@@ -12028,6 +12253,7 @@ mod wasm_tests {
             launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
+            tychat: Default::default(),
         }
     }
 
@@ -14481,6 +14707,7 @@ mod wasm_tests {
                         .collect(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
             );
         });

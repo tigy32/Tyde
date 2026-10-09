@@ -148,6 +148,7 @@ fn expected_empty_settings() -> HostSettings {
         launch_profiles: Default::default(),
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
+        tychat: Default::default(),
     }
 }
 
@@ -401,6 +402,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
+            tychat: Default::default(),
         }
     );
 }

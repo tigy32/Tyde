@@ -942,6 +942,7 @@ fn canonicalize_backends(mut backends: Vec<BackendKind>) -> Vec<BackendKind> {
 
 fn canonicalize_origins(mut origins: Vec<AgentOrigin>) -> Vec<AgentOrigin> {
     origins.sort_by_key(|origin| match *origin {
+        AgentOrigin::Tychat => 6,
         AgentOrigin::User => 0,
         AgentOrigin::AgentControl => 1,
         AgentOrigin::BackendNative => 2,

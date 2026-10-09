@@ -142,6 +142,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         release_version: None,
     };
     let bootstrap = BootstrapHostPayload {
+        tychat: protocol::TychatStatePayload::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -170,6 +171,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             launch_profiles: Default::default(),
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
+            tychat: Default::default(),
         },
         settings_etag: String::new(),
         settings_schema: serde_json::Value::Null,
@@ -752,6 +754,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     format!("failed to parse command_error payload: {error}"),
                 );
             }
+        },
+        FrameKind::TychatState => match envelope.parse_payload::<protocol::TychatStatePayload>() {
+            Ok(payload) => state.tychat_by_host.update(|map| {
+                map.insert(host_id.to_string(), payload);
+            }),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("Invalid Tychat state: {error}"),
+            ),
         },
         FrameKind::HostSettings => match envelope.parse_payload::<HostSettingsPayload>() {
             Ok(payload) => {
@@ -5147,6 +5161,7 @@ fn apply_agent_error(state: &AppState, host_id: &str, payload: AgentErrorPayload
         agent_id,
         ChatMessageEntry {
             message: protocol::ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: crate::state::now_ms(),
                 sender: protocol::MessageSender::Error,
@@ -6714,6 +6729,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         payload.team_members.len(),
     );
 
+    state.tychat_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.tychat);
+    });
     state.host_settings_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.settings);
     });
@@ -7563,6 +7581,7 @@ pub(crate) mod restore_fixtures {
             FrameKind::HostBootstrap,
             seq,
             &HostBootstrapPayload {
+                tychat: protocol::TychatStatePayload::default(),
                 agents_with_background_work: Vec::new(),
                 settings: settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -7591,6 +7610,7 @@ pub(crate) mod restore_fixtures {
                     launch_profiles: Default::default(),
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                 },
                 settings_etag: String::new(),
                 settings_schema: serde_json::Value::Null,
@@ -9377,6 +9397,7 @@ mod wasm_tests {
             &agent_id,
             ChatEvent::StreamEnd(protocol::StreamEndData {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: None,
                     timestamp: 1,
                     sender: protocol::MessageSender::Assistant {
@@ -9402,6 +9423,7 @@ mod wasm_tests {
             "host-1",
             &agent_id,
             ChatEvent::MessageAdded(protocol::ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: 2,
                 sender: protocol::MessageSender::Error,
@@ -9550,6 +9572,7 @@ mod wasm_tests {
         let tool_name = "mcp__tyde-agent-control__tyde_send_agent_message";
         let malformed_arguments = serde_json::json!({ "agent_id": "", "message": "" });
         let assistant = protocol::ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: 1,
             sender: protocol::MessageSender::Assistant {
@@ -9569,6 +9592,7 @@ mod wasm_tests {
             images: None,
         };
         let error = protocol::ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: 2,
             sender: protocol::MessageSender::Error,
@@ -10546,6 +10570,7 @@ mod wasm_tests {
             &agent_id,
             ChatEvent::StreamEnd(protocol::StreamEndData {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: Some(protocol::ChatMessageId("end-id".to_owned())),
                     timestamp: 1,
                     sender: protocol::MessageSender::Assistant {
@@ -10593,6 +10618,7 @@ mod wasm_tests {
         let state = AppState::new();
         let agent_id = AgentId("desktop-empty-completion".to_owned());
         let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
+            origin: None,
             message_id: Some(protocol::ChatMessageId(id.to_owned())),
             timestamp: 1,
             sender: protocol::MessageSender::Assistant {

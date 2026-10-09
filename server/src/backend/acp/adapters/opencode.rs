@@ -180,6 +180,7 @@ impl OpenCodeAdapter {
                 )
             });
             let message = ChatMessage {
+                origin: None,
                 message_id: info
                     .get("id")
                     .and_then(Value::as_str)

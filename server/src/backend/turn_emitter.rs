@@ -335,9 +335,15 @@ impl TurnEmitter {
         state.tx = replacement;
     }
 
-    pub fn user_message(&self, content: &str, images: Option<Vec<ImageData>>) {
+    pub fn user_message(
+        &self,
+        content: &str,
+        images: Option<Vec<ImageData>>,
+        origin: Option<protocol::MessageOrigin>,
+    ) {
         let mut state = self.lock();
         state.send_chat(ChatEvent::MessageAdded(protocol::ChatMessage {
+            origin,
             message_id: None,
             timestamp: now_ms(),
             sender: protocol::MessageSender::User,
@@ -870,6 +876,7 @@ impl TurnEmitterState {
             .or_else(|| response.model.map(|model| ModelInfo { model }));
 
         protocol::ChatMessage {
+            origin: None,
             message_id: Some(response.message_id),
             timestamp: now_ms(),
             sender: protocol::MessageSender::Assistant {
@@ -912,6 +919,7 @@ impl TurnEmitterState {
         message_id: ChatMessageId,
     ) -> protocol::ChatMessage {
         protocol::ChatMessage {
+            origin: None,
             message_id: Some(message_id),
             timestamp: now_ms(),
             sender: protocol::MessageSender::Assistant {
@@ -1354,6 +1362,7 @@ fn awaits_user_response(tool_type: &ToolRequestType) -> bool {
 
 fn simple_message(sender: protocol::MessageSender, content: &str) -> protocol::ChatMessage {
     protocol::ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: now_ms(),
         sender,

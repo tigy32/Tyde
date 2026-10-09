@@ -15,6 +15,8 @@ pub(crate) mod mobile_access;
 pub(crate) mod mobile_http;
 pub(crate) mod mobile_push;
 pub mod paths;
+pub mod tychat;
+mod tychat_bridge;
 pub(crate) mod usage_wakeup;
 pub use tyde_process_env as process_env;
 pub(crate) mod project_stream;

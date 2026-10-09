@@ -3102,7 +3102,31 @@ async fn real_mid_turn_steering<B: Backend>(host: &mut Harness<B>) {
     let secret = unique_payload();
     let prompt = steerable_command_prompt(&proof);
     let steer = format!("The secret word is {secret}.");
-    let steered = steer_turn(host, &agent, &prompt, &steer).await;
+    let start_origin = protocol::MessageOrigin::Tychat {
+        message_id: protocol::TychatMessageId("conformance-start".into()),
+    };
+    let steer_origin = protocol::MessageOrigin::Tychat {
+        message_id: protocol::TychatMessageId("conformance-steer".into()),
+    };
+    let mut input = user_message(&prompt);
+    input.origin = Some(start_origin.clone());
+    let mut redirect = user_message(&steer);
+    redirect.origin = Some(steer_origin.clone());
+    let steered = steer_turn(host, &agent, input, redirect).await;
+    let user_origins = steered
+        .user_messages()
+        .map(|message| message.origin.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        user_origins == vec![Some(start_origin), Some(steer_origin)],
+        "both send and steer must emit their exact payload origins without server-side reconstruction"
+    );
+    assert!(
+        launched
+            .user_messages()
+            .all(|message| message.origin.is_none()),
+        "ordinary UI input remains untagged"
+    );
 
     assert_final_text_contains(&steered, &format!("WORD={secret}"));
     assert_eq!(

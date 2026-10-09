@@ -2936,8 +2936,11 @@ impl KiroInner {
         }
 
         self.flush_replay_assistant_message().await;
-        self.emitter
-            .user_message(crate::backend::workspace_prompt_user_text(&text), None);
+        self.emitter.user_message(
+            crate::backend::workspace_prompt_user_text(&text),
+            None,
+            None,
+        );
         self.state
             .lock()
             .await
@@ -4627,7 +4630,7 @@ impl KiroInner {
                 })
                 .collect::<Vec<_>>()
         });
-        self.emitter.user_message(content, image_payload);
+        self.emitter.user_message(content, image_payload, None);
     }
 }
 
@@ -7332,6 +7335,7 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
                 .map(|s| s.to_string());
             Some(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
+                    origin: None,
                     message_id: msg
                         .get("message_id")
                         .or_else(|| msg.get("messageId"))

@@ -3308,6 +3308,7 @@ mod wasm_tests {
                     backend_config: HashMap::new(),
                     launch_profiles: Default::default(),
                     voice: Default::default(),
+                    tychat: Default::default(),
                     hermes_disabled_providers: HashMap::from([(
                         HERMES_DEFAULT_PROFILE.to_owned(),
                         disabled.clone(),

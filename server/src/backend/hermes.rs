@@ -3007,7 +3007,8 @@ impl HermesSessionActor {
             .and_then(|catalog| catalog.invoked_by(&payload.message))
             .cloned()
         {
-            self.run_slash_command(&payload.message, &command).await;
+            self.run_slash_command(&payload.message, &command, payload.origin)
+                .await;
             return;
         }
 
@@ -3026,6 +3027,7 @@ impl HermesSessionActor {
             self.emit(ChatEvent::MessageAdded(user_message(
                 &payload.message,
                 (!images.is_empty()).then_some(images),
+                payload.origin,
             )));
         }
         self.mapper.typing_active = true;
@@ -3093,6 +3095,7 @@ impl HermesSessionActor {
                     self.emit(ChatEvent::MessageAdded(user_message(
                         &payload.message,
                         None,
+                        payload.origin,
                     )));
                     SteerOutcome::Accepted
                 }
@@ -3122,9 +3125,14 @@ impl HermesSessionActor {
     /// `slash.exec` answers most commands directly; skills and prompt-building
     /// built-ins come back as a message to submit, which then runs as an
     /// ordinary turn under the command the user typed.
-    async fn run_slash_command(&mut self, message: &str, command: &protocol::SlashCommand) {
+    async fn run_slash_command(
+        &mut self,
+        message: &str,
+        command: &protocol::SlashCommand,
+        origin: Option<protocol::MessageOrigin>,
+    ) {
         self.recent_stderr.clear();
-        self.emit(ChatEvent::MessageAdded(user_message(message, None)));
+        self.emit(ChatEvent::MessageAdded(user_message(message, None, origin)));
         self.mapper.typing_active = true;
         self.emit(ChatEvent::TypingStatusChanged(true));
         let args = message.trim_start()[1 + command.name.len()..]
@@ -3202,6 +3210,7 @@ impl HermesSessionActor {
         }));
         self.emit(ChatEvent::StreamEnd(StreamEndData {
             message: ChatMessage {
+                origin: None,
                 message_id: None,
                 timestamp: unix_now_ms(),
                 sender: MessageSender::Assistant {
@@ -3875,6 +3884,7 @@ impl HermesSessionActor {
                     ))));
                 } else {
                     child_events.push(ChatEvent::MessageAdded(ChatMessage {
+                        origin: None,
                         message_id: None,
                         timestamp: unix_now_ms(),
                         sender: MessageSender::Assistant {
@@ -6485,6 +6495,7 @@ impl HermesEventMapper {
             self.user_response_closed_stream = true;
             events.push(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
+                    origin: None,
                     message_id: Some(protocol::ChatMessageId(message_id)),
                     timestamp: unix_now_ms(),
                     sender: MessageSender::Assistant {
@@ -6680,6 +6691,7 @@ impl HermesEventMapper {
 
         vec![ChatEvent::StreamEnd(StreamEndData {
             message: ChatMessage {
+                origin: None,
                 message_id,
                 timestamp: unix_now_ms(),
                 sender: MessageSender::Assistant {
@@ -8084,6 +8096,7 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             continue;
         }
         events.push(ChatEvent::MessageAdded(ChatMessage {
+            origin: None,
             message_id: None,
             timestamp: unix_now_ms(),
             sender,
@@ -9278,8 +9291,13 @@ fn current_context_usage_from_hermes(value: &Value) -> Option<CurrentContextUsag
     })
 }
 
-fn user_message(content: &str, images: Option<Vec<ImageData>>) -> ChatMessage {
+fn user_message(
+    content: &str,
+    images: Option<Vec<ImageData>>,
+    origin: Option<protocol::MessageOrigin>,
+) -> ChatMessage {
     ChatMessage {
+        origin,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::User,
@@ -9295,6 +9313,7 @@ fn user_message(content: &str, images: Option<Vec<ImageData>>) -> ChatMessage {
 
 fn system_message(content: impl Into<String>) -> ChatMessage {
     ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::System,
@@ -9310,6 +9329,7 @@ fn system_message(content: impl Into<String>) -> ChatMessage {
 
 fn warning_message(content: impl Into<String>) -> ChatMessage {
     ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Warning,
@@ -9325,6 +9345,7 @@ fn warning_message(content: impl Into<String>) -> ChatMessage {
 
 fn error_message(content: impl Into<String>) -> ChatMessage {
     ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,

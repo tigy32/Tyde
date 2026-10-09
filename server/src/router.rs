@@ -121,6 +121,13 @@ pub(crate) async fn route_client_envelope(
                 let payload: SetAgentGroupsPayload = parse_payload(&envelope, "set_agent_groups")?;
                 host.set_agent_groups(payload).await?;
             }
+            FrameKind::TychatCommand => {
+                let payload: protocol::TychatCommandPayload =
+                    parse_payload(&envelope, "tychat_command")?;
+                host.tychat_command(payload)
+                    .await
+                    .map_err(|error| crate::error::AppError::invalid("tychat_command", error))?;
+            }
             FrameKind::MobilePairingStart => {
                 let payload: MobilePairingStartPayload =
                     parse_payload(&envelope, "mobile_pairing_start")?;
@@ -599,10 +606,16 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "send_message")?;
-                if payload.origin == Some(protocol::MessageOrigin::HostRestart) {
+                if matches!(
+                    payload.origin,
+                    Some(
+                        protocol::MessageOrigin::HostRestart
+                            | protocol::MessageOrigin::Tychat { .. }
+                    )
+                ) {
                     return Err(AppError::invalid(
                         "send_message",
-                        "host restart origin is reserved for the server",
+                        "message origin is reserved for the server",
                     ));
                 }
                 validate_message_images("send_message", payload.images.as_deref())?;
@@ -620,10 +633,16 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "steer_message")?;
-                if payload.origin == Some(protocol::MessageOrigin::HostRestart) {
+                if matches!(
+                    payload.origin,
+                    Some(
+                        protocol::MessageOrigin::HostRestart
+                            | protocol::MessageOrigin::Tychat { .. }
+                    )
+                ) {
                     return Err(AppError::invalid(
                         "steer_message",
-                        "host restart origin is reserved for the server",
+                        "message origin is reserved for the server",
                     ));
                 }
                 validate_message_images("steer_message", payload.images.as_deref())?;
@@ -774,6 +793,17 @@ pub(crate) async fn route_client_envelope(
             FrameKind::CloseAgent => {
                 let agent_id = parse_agent_id(&envelope.stream)?;
                 let _: CloseAgentPayload = parse_payload(&envelope, "close_agent")?;
+                if host
+                    .agent_start_snapshot(&agent_id)
+                    .await
+                    .is_some_and(|agent| agent.origin == protocol::AgentOrigin::Tychat)
+                {
+                    tracing::info!("Rejected close of the host-owned Tychat agent");
+                    return Err(AppError::invalid(
+                        "close_agent",
+                        "Use Reset Tychat agent instead of closing the host-owned agent",
+                    ));
+                }
                 host.close_agent(&agent_id).await;
             }
             FrameKind::SetSessionSettings => {

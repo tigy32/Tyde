@@ -2805,6 +2805,7 @@ mod wasm_tests {
             state,
             ChatEvent::StreamEnd(protocol::StreamEndData {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: None,
                     timestamp: 1,
                     sender: protocol::MessageSender::Assistant {
@@ -2891,6 +2892,7 @@ mod wasm_tests {
             &state,
             ChatEvent::StreamEnd(protocol::StreamEndData {
                 message: protocol::ChatMessage {
+                    origin: None,
                     message_id: None,
                     timestamp: 1,
                     sender: protocol::MessageSender::Assistant {
@@ -3050,6 +3052,7 @@ mod wasm_tests {
             vec![
                 ChatEvent::StreamEnd(protocol::StreamEndData {
                     message: protocol::ChatMessage {
+                        origin: None,
                         message_id: None,
                         timestamp: 1,
                         sender: protocol::MessageSender::Assistant {

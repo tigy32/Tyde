@@ -656,6 +656,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                         target.agent_id,
                         crate::state::ChatMessageEntry {
                             message: protocol::ChatMessage {
+                                origin: None,
                                 message_id: transcript.message_id,
                                 timestamp: crate::state::now_ms(),
                                 sender: match transcript.speaker {

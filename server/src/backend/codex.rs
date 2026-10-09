@@ -8250,10 +8250,11 @@ impl CodexInner {
         };
         let message = payload.message.clone();
         let images = protocol_images_to_attachments(payload.images.clone());
+        let origin = payload.origin.clone();
         let outcome = self.steer_user_message(payload).await;
         if matches!(outcome, SteerOutcome::Accepted) {
             self.withdraw_async_questions(superseded).await;
-            self.emit_user_message_added(&message, images.as_deref());
+            self.emit_user_message_added(&message, images.as_deref(), origin.clone());
         }
         outcome
     }
@@ -8387,7 +8388,7 @@ impl CodexInner {
                 origin,
             } => {
                 if origin != Some(protocol::MessageOrigin::HostRestart) {
-                    self.emit_user_message_added(&message, images.as_deref());
+                    self.emit_user_message_added(&message, images.as_deref(), origin.clone());
                 }
                 // UI contract: show typing immediately when a user turn is submitted,
                 // without waiting for Codex to acknowledge turn/started.
@@ -8911,7 +8912,7 @@ impl CodexInner {
                         if text.trim().is_empty() {
                             continue;
                         }
-                        self.emitter.user_message(&text, None);
+                        self.emitter.user_message(&text, None, None);
                     }
                     "agentMessage" => {
                         let text = extract_codex_item_text(item);
@@ -17214,7 +17215,12 @@ impl CodexInner {
         lines.join("\n")
     }
 
-    fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
+    fn emit_user_message_added(
+        &self,
+        content: &str,
+        images: Option<&[ImageAttachment]>,
+        origin: Option<protocol::MessageOrigin>,
+    ) {
         let image_payload = images.map(|images| {
             images
                 .iter()
@@ -17224,7 +17230,7 @@ impl CodexInner {
                 })
                 .collect::<Vec<_>>()
         });
-        self.emitter.user_message(content, image_payload);
+        self.emitter.user_message(content, image_payload, origin);
     }
 }
 
@@ -22668,6 +22674,7 @@ pub(crate) fn resolve_session_settings(
 
 fn backend_error_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,
@@ -22691,6 +22698,7 @@ fn emit_codex_resume_startup_error(
 
 fn backend_warning_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
+        origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Warning,

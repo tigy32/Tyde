@@ -906,6 +906,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::VoiceTranscript
         | FrameKind::VoiceState
         | FrameKind::VoiceOutput
+        | FrameKind::TychatCommand
+        | FrameKind::TychatState
         | FrameKind::VoiceError => OutputLane::Control,
     }
 }
