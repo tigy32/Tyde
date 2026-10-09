@@ -8672,7 +8672,15 @@ async fn run_hermes_version_command(
     if let Some(path) = process_env::resolved_child_process_path() {
         command_proc.env("PATH", path);
     }
-    let mut child = match command_proc.group_spawn() {
+    let spawned = tokio::task::spawn_blocking(move || command_proc.group_spawn())
+        .await
+        .map_err(|error| {
+            HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Hermes version probe spawn worker failed: {error}"),
+            )
+        })?;
+    let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
             let code = if err.kind() == io::ErrorKind::NotFound {
@@ -8857,17 +8865,25 @@ pub(crate) async fn probe_hermes_python_gateway_import(
     if let Some(path) = process_env::resolved_child_process_path() {
         command_proc.env("PATH", path);
     }
-    let mut child = command_proc.group_spawn().map_err(|err| {
-        let code = if err.kind() == io::ErrorKind::NotFound {
-            BackendSetupDiagnosticCode::CommandNotFound
-        } else {
-            BackendSetupDiagnosticCode::CommandFailed
-        };
-        HermesProbeFailure::new(
-            code,
-            format!("Failed to run Hermes gateway import probe with {command}: {err}"),
-        )
-    })?;
+    let mut child = tokio::task::spawn_blocking(move || command_proc.group_spawn())
+        .await
+        .map_err(|error| {
+            HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Hermes import probe spawn worker failed: {error}"),
+            )
+        })?
+        .map_err(|err| {
+            let code = if err.kind() == io::ErrorKind::NotFound {
+                BackendSetupDiagnosticCode::CommandNotFound
+            } else {
+                BackendSetupDiagnosticCode::CommandFailed
+            };
+            HermesProbeFailure::new(
+                code,
+                format!("Failed to run Hermes gateway import probe with {command}: {err}"),
+            )
+        })?;
     let mut stdout_pipe = child.take_stdout().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,

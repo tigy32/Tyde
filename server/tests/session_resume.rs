@@ -2498,6 +2498,112 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
 }
 
 #[tokio::test]
+async fn mobile_open_many_agents_keeps_ancient_transcripts_off_the_hot_path() {
+    let mut fixture = Fixture::new().await;
+    let large_reply = "old transcript ".repeat(75_000);
+    let mut script = MockScript::new();
+    for _ in 0..32 {
+        script = script.then(MockTurn::text(large_reply.clone()));
+    }
+    for index in 0..16 {
+        script = script.then(MockTurn::text_with_late_usage(format!("recent {index}")));
+    }
+    let agent = fixture.spawn_scripted("long-mobile-chat", script).await;
+    fixture.finish_turn(&agent).await;
+    for index in 1..48 {
+        fixture
+            .client
+            .send_message(&agent.stream, format!("turn {index}"))
+            .await
+            .expect("send history turn");
+        fixture.finish_turn(&agent).await;
+    }
+    for index in 0..24 {
+        let other = fixture
+            .spawn_scripted(
+                &format!("other-{index}"),
+                MockScript::one(MockTurn::text("other chat")),
+            )
+            .await;
+        fixture.finish_turn(&other).await;
+    }
+    let started = std::time::Instant::now();
+    let (mut mobile, bootstrap) =
+        fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), "performance-phone")
+            .await;
+    let host_elapsed = started.elapsed();
+    assert_eq!(bootstrap.agents.len(), 25);
+    let stream = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("long chat advertised")
+        .instance_stream
+        .clone();
+    let started = std::time::Instant::now();
+    fixture::send_load_agent_on(&mut mobile, &stream).await;
+    let env = fixture::next_frame_matching_on(&mut mobile, "on-demand mobile bootstrap", |env| {
+        assert!(
+            !env.stream.0.starts_with("/agent/") || env.stream == stream,
+            "unopened conversation must not hydrate"
+        );
+        env.kind == FrameKind::AgentBootstrap && env.stream == stream
+    })
+    .await;
+    let chat_elapsed = started.elapsed();
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("mobile chat bootstrap");
+    let before = assert_bootstrap_prior_history_indicator(&payload, 33);
+    let expected = (1..16)
+        .map(|index| format!("recent {index}"))
+        .collect::<Vec<_>>();
+    assert_bootstrap_tail_messages(
+        &payload,
+        &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert!(
+        payload
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => Some(&end.message),
+                _ => None,
+            })
+            .all(|message| message.token_usage.is_some()),
+        "late usage metadata must survive bounded replay"
+    );
+    eprintln!(
+        "Mobile performance: agents={}, old_body_bytes={}, host_ms={}, chat_ms={}",
+        bootstrap.agents.len(),
+        large_reply.len() * 32,
+        host_elapsed.as_millis(),
+        chat_elapsed.as_millis()
+    );
+    assert!(
+        bootstrap.task_token_usages.is_empty(),
+        "mobile must not collect unused per-agent usage rollups before showing its list"
+    );
+    assert!(
+        host_elapsed < Duration::from_millis(100),
+        "local mobile host hydration exceeded 100 ms: {} ms",
+        host_elapsed.as_millis()
+    );
+    assert!(
+        chat_elapsed < Duration::from_millis(100),
+        "local mobile chat hydration exceeded 100 ms: {} ms",
+        chat_elapsed.as_millis()
+    );
+    let older = fetch_history_page(
+        &mut mobile,
+        &stream,
+        agent.new_agent.agent_id.clone(),
+        Some(before),
+        1,
+    )
+    .await;
+    assert_history_page(&older, &["recent 0"], true);
+}
+
+#[tokio::test]
 async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     let mut fixture = Fixture::new().await;
 

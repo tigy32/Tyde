@@ -886,6 +886,55 @@ async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
         "found-unusable diagnostic should include an actionable gateway-Python remedy: {}",
         diagnostic.message
     );
+
+    let script = std::fs::read_to_string(&fake_hermes).expect("read CLI probe script");
+    std::fs::write(
+        &fake_hermes,
+        script
+            .replace("then\n", "then\n  sleep 1\n")
+            .replace("v9.9.9", "v9.9.8"),
+    )
+    .expect("delay the next inventory probe");
+    let started = std::time::Instant::now();
+    let (mut mobile, mobile_bootstrap) =
+        fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), "inventory-phone")
+            .await;
+    let elapsed = started.elapsed();
+    eprintln!(
+        "Mobile inventory startup: elapsed_ms={}, delayed_probe_ms=1000",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "mobile startup waited for backend discovery: {} ms",
+        elapsed.as_millis()
+    );
+    assert_eq!(
+        mobile_bootstrap.backend_setup, payload,
+        "mobile must render the host's known installation state first"
+    );
+    let refreshed: protocol::BackendSetupPayload =
+        next_frame_matching_on(&mut mobile, "background inventory refresh", |env| {
+            env.kind == FrameKind::BackendSetup
+        })
+        .await
+        .parse_payload()
+        .expect("updated backend setup");
+    let refreshed_hermes = refreshed
+        .backends
+        .iter()
+        .find(|info| info.backend_kind == BackendKind::Hermes)
+        .expect("refreshed Hermes inventory");
+    assert_eq!(refreshed_hermes.status, BackendSetupStatus::Unavailable);
+    assert!(
+        refreshed_hermes
+            .diagnostic
+            .as_ref()
+            .expect("fresh probe diagnostic")
+            .message
+            .contains("v9.9.8"),
+        "background discovery must still publish installation changes"
+    );
 }
 
 fn replace_op(path: &str, value: serde_json::Value, expected: serde_json::Value) -> SettingOp {

@@ -23,10 +23,12 @@ command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspa
 [[profile.default.overrides]]
 filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found_unusable_hermes_cli)'
 threads-required = "num-test-threads"
+success-output = "final"
 
 [[profile.ci.overrides]]
 filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found_unusable_hermes_cli)'
 threads-required = "num-test-threads"
+success-output = "final"
 
 # Keep startup ordering evidence even when the intermittent side-question race passes.
 [[profile.default.overrides]]
@@ -41,6 +43,17 @@ success-output = "final"
 # Retain safe frame-order evidence for the review parent-close flow.
 [[profile.default.overrides]]
 filter = 'binary_id(server::review) & test(configured_reviews_are_awaited_without_injecting_parent_messages)'
+success-output = "final"
+
+# Measure the real protocol hot path without competing process-heavy tests.
+[[profile.default.overrides]]
+filter = 'binary_id(server::session_resume) & test(mobile_open_many_agents_keeps_ancient_transcripts_off_the_hot_path)'
+threads-required = "num-test-threads"
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::session_resume) & test(mobile_open_many_agents_keeps_ancient_transcripts_off_the_hot_path)'
+threads-required = "num-test-threads"
 success-output = "final"
 
 [profile.default]

@@ -91,6 +91,83 @@ const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 /// leaves an agent the user cannot cancel, close, or message.
 const CLOSE_TURN_GRACE: Duration = Duration::from_secs(10);
 const INITIAL_HISTORY_TAIL_LIMIT: usize = 15;
+
+// These offsets index the canonical log, not a second transcript. Opening a
+// chat must not deserialize old message bodies just to discard them.
+#[derive(Default)]
+struct AgentEventLog {
+    entries: Vec<Envelope>,
+    message_starts: Vec<usize>,
+    message_terminals: Vec<usize>,
+    stream_start: Option<usize>,
+}
+
+impl Deref for AgentEventLog {
+    type Target = [Envelope];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl AgentEventLog {
+    fn push(&mut self, envelope: Envelope) {
+        if envelope.kind == FrameKind::ChatEvent {
+            let event = <ChatEvent as serde::Deserialize>::deserialize(&envelope.payload)
+                .expect("typed replay log must contain ChatEvent");
+            self.index_chat_event(&event);
+        }
+        self.entries.push(envelope);
+    }
+
+    fn push_chat_event(&mut self, envelope: Envelope, event: &ChatEvent) {
+        debug_assert_eq!(envelope.kind, FrameKind::ChatEvent);
+        self.index_chat_event(event);
+        self.entries.push(envelope);
+    }
+
+    fn index_chat_event(&mut self, event: &ChatEvent) {
+        let index = self.entries.len();
+        match event {
+            ChatEvent::StreamStart(_) => self.stream_start = Some(index),
+            ChatEvent::MessageAdded(_) => {
+                self.message_starts.push(index);
+                self.message_terminals.push(index);
+                self.stream_start = None;
+            }
+            ChatEvent::StreamEnd(_) => {
+                self.message_starts
+                    .push(self.stream_start.take().unwrap_or(index));
+                self.message_terminals.push(index);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_chat_events(&mut self) {
+        self.entries
+            .retain(|event| event.kind != FrameKind::ChatEvent);
+        self.message_starts.clear();
+        self.message_terminals.clear();
+        self.stream_start = None;
+    }
+
+    fn initial_history_log(&self) -> &[Envelope] {
+        let start = if self.message_starts.len() > INITIAL_HISTORY_TAIL_LIMIT {
+            self.message_starts[self.message_starts.len() - INITIAL_HISTORY_TAIL_LIMIT]
+        } else {
+            0
+        };
+        &self.entries[start..]
+    }
+
+    fn prior_message_count(&self, before_seq: u64) -> u32 {
+        self.message_terminals
+            .partition_point(|index| self.entries[*index].seq < before_seq)
+            .min(u32::MAX as usize) as u32
+    }
+}
+
 pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 const COMPACTION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
@@ -131,7 +208,7 @@ struct TerminalFailureContext<'a> {
     accepting_input: &'a Arc<AtomicBool>,
     status_handle: &'a registry::AgentStatusHandle,
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
@@ -160,7 +237,7 @@ struct InitialFollowUpContext<'a> {
     accepting_input: &'a Arc<AtomicBool>,
     status_handle: &'a registry::AgentStatusHandle,
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     latest_output: &'a mut AgentControlLatestOutput,
     latest_slash_commands: Option<&'a protocol::SlashCommandCatalog>,
     pending_attaches: &'a mut Vec<(Stream, oneshot::Sender<bool>)>,
@@ -176,7 +253,7 @@ struct QueueDispatchTerminalContext<'a> {
     accepting_input: &'a Arc<AtomicBool>,
     status_handle: &'a registry::AgentStatusHandle,
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
@@ -202,7 +279,7 @@ struct AgentNameChangeContext<'a> {
     pending_alias: &'a mut Option<InitialAgentAlias>,
     current_start: &'a mut AgentStartPayload,
     start_tx: &'a watch::Sender<AgentStartPayload>,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     subscribers: &'a mut Vec<Stream>,
 }
 
@@ -3075,7 +3152,7 @@ pub(crate) fn spawn_agent_actor(
         let initial_session_settings = spawn_config.session_settings.clone();
         let mut compaction_spawn_config = spawn_config.clone();
         let canonical_stream = format!("/agent/{}", agent_id);
-        let mut event_log: Vec<Envelope> = Vec::new();
+        let mut event_log = AgentEventLog::default();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
         let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
@@ -4910,7 +4987,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                         }
                         if resume_replay_gate_pending {
-                            event_log.retain(|event| event.kind != FrameKind::ChatEvent);
+                            event_log.clear_chat_events();
                             replay_state = AgentReplayState {
                                 journal: replay_state.journal.take(),
                                 ..Default::default()
@@ -9730,7 +9807,7 @@ pub(crate) fn spawn_relay_agent_actor(
         actor_processes.scope(async move {
         status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
         let canonical_stream = format!("/agent/{}", agent_id);
-        let mut event_log: Vec<Envelope> = Vec::new();
+        let mut event_log = AgentEventLog::default();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState {
             journal: Some(transcript_store.open_session(&session_id)),
@@ -10840,7 +10917,7 @@ struct CancelledUserInteractions<'a> {
 async fn retire_cancelled_user_interactions(
     tools: CancelledUserInteractions<'_>,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
 ) {
@@ -11073,7 +11150,7 @@ fn terminal_progress_for_live_activity(
 
 struct LiveActivityTerminalContext<'a> {
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     open_tool_call_ids: &'a mut HashSet<String>,
@@ -11106,7 +11183,7 @@ async fn expire_pending_user_interactions(context: &mut LiveActivityTerminalCont
 
 async fn terminalize_open_tool(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
     subscribers: &mut Vec<Stream>,
     tool_call_id: String,
@@ -11221,7 +11298,7 @@ async fn park_terminal_agent(
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     pending_inputs: &mut VecDeque<AgentInput>,
@@ -11430,7 +11507,7 @@ async fn park_relay_terminal_agent(
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -11805,8 +11882,8 @@ async fn apply_agent_name_change(
     true
 }
 
-fn overwrite_agent_start_payload(event_log: &mut [Envelope], current_start: &AgentStartPayload) {
-    let Some(first) = event_log.first_mut() else {
+fn overwrite_agent_start_payload(event_log: &mut AgentEventLog, current_start: &AgentStartPayload) {
+    let Some(first) = event_log.entries.first_mut() else {
         panic!("agent replay log is empty; AgentStart must always be present");
     };
     assert_eq!(
@@ -12029,7 +12106,7 @@ async fn notify_review_bundle_consumed(
 
 async fn emit_unknown_queued_message_error(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
     queued_message_id: &QueuedMessageId,
@@ -12052,7 +12129,7 @@ async fn emit_unknown_queued_message_error(
 
 async fn emit_uneditable_queued_message_error(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
     queued_message_id: &QueuedMessageId,
@@ -12174,7 +12251,7 @@ fn tool_completion_error(completion: &ToolExecutionCompletedData) -> Option<Stri
 
 async fn append_event<T: serde::Serialize>(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     kind: FrameKind,
     payload: &T,
@@ -12200,7 +12277,7 @@ async fn append_event<T: serde::Serialize>(
 #[allow(clippy::too_many_arguments)]
 async fn close_untracked_background_card(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     completed_tool_call_ids: &mut HashSet<String>,
@@ -12242,7 +12319,7 @@ async fn close_untracked_background_card(
 
 async fn append_chat_event(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
@@ -12345,7 +12422,7 @@ async fn read_viewed_image(
 
 async fn append_backend_chat_event(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     backend_kind: BackendKind,
@@ -12365,7 +12442,7 @@ async fn append_backend_chat_event(
 
 async fn append_chat_event_with_transcript_metadata(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     transcript_metadata: Option<(BackendKind, &EventStream)>,
@@ -12459,7 +12536,7 @@ async fn seed_fork_transcript_history(
     source_session_id: &SessionId,
     fork_session_id: &SessionId,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
 ) -> Result<(), String> {
     if !store.actor_io_enabled() {
         return Ok(());
@@ -12511,7 +12588,7 @@ async fn seed_existing_transcript_history(
     store: &TranscriptStore,
     session_id: &SessionId,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
 ) -> Result<(), String> {
     if !store.actor_io_enabled() {
         return Ok(());
@@ -12738,7 +12815,7 @@ async fn journal_new_replay_records(
 /// per event.
 async fn report_transcript_persistence(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     persistence: Result<Option<crate::store::transcript::TranscriptAppend>, String>,
@@ -12813,7 +12890,7 @@ async fn report_transcript_persistence(
 /// attaches after the fact still sees it.
 async fn report_agent_problem(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
     message: String,
@@ -12866,7 +12943,7 @@ async fn mark_transcript_authoritative(store: &TranscriptStore, session_id: &Ses
 
 async fn upsert_activity_stats_snapshot(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
     stats: AgentActivityStats,
@@ -12879,6 +12956,7 @@ async fn upsert_activity_stats_snapshot(
         serde_json::to_value(&payload).expect("failed to serialize AgentActivityStats payload");
 
     if let Some(snapshot) = event_log
+        .entries
         .iter_mut()
         .find(|event| event.kind == FrameKind::AgentActivityStats)
     {
@@ -12896,7 +12974,7 @@ async fn upsert_activity_stats_snapshot(
 }
 
 async fn flush_pending_agent_attaches(
-    event_log: &[Envelope],
+    event_log: &AgentEventLog,
     replay_state: Option<&AgentReplayState>,
     latest_output: &mut AgentControlLatestOutput,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
@@ -13335,7 +13413,7 @@ fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {
 async fn publish_resumed_agent_idle(
     status_handle: &registry::AgentStatusHandle,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
 ) {
@@ -13370,7 +13448,7 @@ async fn ingest_gated_replay_event(
     event: &mut ChatEvent,
     canonical_stream: &str,
     agent_id: &AgentId,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     activity_stats: &mut AgentActivityStatsTracker,
@@ -13403,7 +13481,7 @@ async fn ingest_gated_replay_event(
 
 fn record_chat_event_for_replay(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
 ) {
@@ -13616,7 +13694,7 @@ fn record_chat_event_for_replay(
 /// discarded; replay then shows the same calls a live client saw.
 fn push_stream_tool_events_to_replay_log(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
     tool_events: Vec<ChatEvent>,
 ) {
@@ -13641,14 +13719,15 @@ fn push_stream_tool_events_to_replay_log(
 /// completion) is preserved.
 fn coalesce_progress_into_replay_log(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
     tool_call_id: String,
     event: &ChatEvent,
 ) {
     if let Some(&index) = replay_state.progress_log_index.get(&tool_call_id) {
         let seq = event_log[index].seq;
-        event_log[index] = replay_envelope(canonical_stream, seq, FrameKind::ChatEvent, event);
+        event_log.entries[index] =
+            replay_envelope(canonical_stream, seq, FrameKind::ChatEvent, event);
     } else {
         replay_state
             .progress_log_index
@@ -13659,7 +13738,7 @@ fn coalesce_progress_into_replay_log(
 
 fn push_chat_event_to_replay_log(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     event: &ChatEvent,
 ) {
     let envelope = replay_envelope(
@@ -13668,7 +13747,7 @@ fn push_chat_event_to_replay_log(
         FrameKind::ChatEvent,
         event,
     );
-    event_log.push(envelope);
+    event_log.push_chat_event(envelope, event);
 }
 
 fn replay_log_latest_task_snapshot_is(
@@ -14081,7 +14160,7 @@ fn cap_activity_text(text: &str, max_chars: usize) -> String {
 
 async fn update_queued_messages_snapshot(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     queue: &VecDeque<SequencedQueuedMessage>,
     session_store: &Arc<SessionStoreHandle>,
@@ -14116,6 +14195,7 @@ async fn update_queued_messages_snapshot(
         serde_json::to_value(&payload).expect("failed to serialize queued messages payload");
 
     if let Some(snapshot) = event_log
+        .entries
         .iter_mut()
         .find(|event| event.kind == FrameKind::QueuedMessages)
     {
@@ -14142,7 +14222,7 @@ struct ContextCompactionDispatchContext<'a> {
     status_handle: &'a registry::AgentStatusHandle,
     current_session_settings: &'a SessionSettingsValues,
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     subscribers: &'a mut Vec<Stream>,
     spawn_config: &'a BackendSpawnConfig,
     use_mock_backend: bool,
@@ -14178,7 +14258,7 @@ async fn record_context_compaction_terminal(
     session_id: &SessionId,
     start: &AgentStartPayload,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
     subscribers: &mut Vec<Stream>,
     activity_stats: &mut AgentActivityStatsTracker,
@@ -14321,7 +14401,7 @@ async fn release_context_compaction_barrier(
     in_turn: &mut bool,
     idle_transition_armed: &mut bool,
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
     session_store: &Arc<SessionStoreHandle>,
@@ -14364,7 +14444,7 @@ struct QueuedMessageDispatchContext<'a> {
     in_turn: &'a mut bool,
     idle_transition_armed: &'a mut bool,
     canonical_stream: &'a str,
-    event_log: &'a mut Vec<Envelope>,
+    event_log: &'a mut AgentEventLog,
     subscribers: &'a mut Vec<Stream>,
     agent_id: &'a AgentId,
     session_store: &'a Arc<SessionStoreHandle>,
@@ -14785,7 +14865,7 @@ async fn try_dispatch_context_compaction(
 
 async fn upsert_context_compaction_snapshot(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     authoritative_logical_session_id: &SessionId,
     payload: &ContextCompactionNotifyPayload,
@@ -14797,6 +14877,7 @@ async fn upsert_context_compaction_snapshot(
     let value =
         serde_json::to_value(&payload).expect("failed to serialize context compaction payload");
     if let Some(snapshot) = event_log
+        .entries
         .iter_mut()
         .find(|event| event.kind == FrameKind::ContextCompactionNotify)
     {
@@ -14814,13 +14895,14 @@ async fn upsert_context_compaction_snapshot(
 
 async fn upsert_context_compaction_capability(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     payload: &ContextCompactionCapabilityPayload,
 ) {
     let value =
         serde_json::to_value(payload).expect("failed to serialize compaction capability payload");
     if let Some(snapshot) = event_log
+        .entries
         .iter_mut()
         .find(|event| event.kind == FrameKind::ContextCompactionCapability)
     {
@@ -14838,7 +14920,7 @@ async fn upsert_context_compaction_capability(
 
 async fn append_compaction_marker_once(
     canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
     marker: &ContextCompactionTimelineEvent,
@@ -14978,7 +15060,7 @@ fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
 }
 
 fn attach_subscriber_with_latest_output(
-    event_log: &[Envelope],
+    event_log: &AgentEventLog,
     replay_state: Option<&AgentReplayState>,
     latest_output: &AgentControlOutput,
     activity: AgentActivity,
@@ -14986,6 +15068,7 @@ fn attach_subscriber_with_latest_output(
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) -> bool {
+    let bootstrap_started = Instant::now();
     let stream_path = stream.path().clone();
     let mut events = agent_bootstrap_events_from_log(event_log);
     if let Some(catalog) = slash_commands {
@@ -14993,10 +15076,11 @@ fn attach_subscriber_with_latest_output(
             ChatEvent::SlashCommandsChanged(catalog.clone()),
         ));
     }
-    let history_entries = filtered_session_history_entries_from_log(event_log, replay_state);
+    let history_entries =
+        filtered_session_history_entries_from_log(event_log.initial_history_log(), replay_state);
     let history_tail = initial_history_tail_entries(&history_entries);
     if let Some((oldest_tail_seq, _)) = history_tail.first() {
-        let prior_history_count = prior_history_message_count(&history_entries, *oldest_tail_seq);
+        let prior_history_count = event_log.prior_message_count(*oldest_tail_seq);
         if prior_history_count > 0 {
             events.push(AgentBootstrapEvent::HasPriorHistory {
                 message_count: prior_history_count,
@@ -15058,6 +15142,7 @@ fn attach_subscriber_with_latest_output(
     }
 
     subscribers.push(stream);
+    tracing::info!(target: "tyde::connection_bootstrap", log_records = event_log.len(), bootstrap_event_count, elapsed_ms = bootstrap_started.elapsed().as_millis(), "agent bootstrap queued");
     tracing::debug!(
         stream = %stream_path,
         bootstrap_event_count,
@@ -15103,14 +15188,6 @@ fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrap
         }
     }
     events
-}
-
-fn prior_history_message_count(entries: &[(u64, ChatEvent)], before_seq: u64) -> u32 {
-    entries
-        .iter()
-        .filter(|(seq, event)| *seq < before_seq && history_message_terminal(event))
-        .count()
-        .min(u32::MAX as usize) as u32
 }
 
 fn session_history_window(

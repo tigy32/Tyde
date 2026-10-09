@@ -35,6 +35,16 @@ stream, emitted only for agents whose instance stream the subscriber knows but
 has not attached; once attached, `agent_bootstrap` and the agent's own events
 are authoritative and the host-stream frame stops.
 
+A lazy subscriber receives the host's last discovered backend installation
+state immediately; a background discovery publishes any changes through
+`backend_setup`. Nonessential discovery starts after the entire host bootstrap
+has been flushed, with the existing first-client-work grace used for capacity
+replay. CLI version-process spawning runs on blocking workers: fork/exec is
+synchronous and must not starve the connection writer or chat loading. The first discovery of a fresh host and eager desktop
+registration still complete discovery before bootstrap. Mobile does not render
+`task_token_usage` rollups, so lazy subscribers neither collect them during
+bootstrap nor receive their subsequent fanout. Desktop rollups are unchanged.
+
 `HostBootstrap` reuses the existing `SessionSummary` type for sessions.
 Session schemas are treated as the subscriber's initial snapshot; later
 `session_schemas` live frames are emitted only when the schema snapshot changes.
@@ -73,6 +83,25 @@ agent event log plus active replay state:
 - chat events
 
 After this frame, the stream continues with granular live agent events.
+
+The initial transcript is the newest 15 complete messages, subject to the
+existing byte budget, with `HasPriorHistory` advertising the rest. In-memory
+message-boundary offsets index the canonical event log as typed chat events
+arrive. Bootstrap deserializes only that suffix, rather than cloning and parsing
+all older message bodies before throwing them away. No transcript or activity
+state is duplicated in this index; reset of replay history also clears its
+offsets. Explicit older-history pages retain the original ordered projection,
+including late metadata updates.
+
+The protocol regression exercises 25 open agents and 36 MB of old chat text,
+asserts local list/chat hydration each stays under 100 ms, and verifies lazy
+attachment, recent-message ordering, late usage metadata, and older paging.
+A separate inventory flow holds a CLI version probe for one second and verifies
+that mobile bootstrap does not wait for it while the changed inventory still
+arrives afterward. These are local host-path budgets, not a promise that a cold
+PWA download, browser/Wasm startup, or a remote network round trip takes 100 ms.
+
+
 
 ### `review_bootstrap`
 

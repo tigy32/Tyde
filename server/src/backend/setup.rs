@@ -688,8 +688,13 @@ async fn run_version_command_with_child_path(
         .to_string_lossy()
         .into_owned();
     trace_version_probe_stage(started, &command_name, "group_spawn_started");
-    let mut child = command
-        .group_spawn()
+    // fork/exec can take tens of milliseconds even before the child runs.
+    // Inventory refresh must yield to the connection writer during that work.
+    let mut child = tokio::task::spawn_blocking(move || command.group_spawn())
+        .await
+        .map_err(|error| {
+            VersionCommandFailure::Start(format!("version probe spawn worker failed: {error}"))
+        })?
         .map_err(|error| VersionCommandFailure::Start(format!("failed to spawn: {error}")))?;
     trace_version_probe_stage(started, &command_name, "group_spawn_completed");
     let mut stdout_pipe = child.take_stdout().ok_or_else(|| {

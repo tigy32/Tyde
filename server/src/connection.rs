@@ -7,7 +7,7 @@ use protocol::{
     encode_frame,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::Connection;
@@ -231,6 +231,7 @@ async fn run_connection_with_origin(
         let cancel = cancel.clone();
         tokio::spawn(reader_loop(reader, inbound_tx, cancel))
     };
+    let (bootstrap_written_tx, bootstrap_written_rx) = oneshot::channel();
     let writer_task = {
         let cancel = cancel.clone();
         tokio::spawn(writer_loop(
@@ -238,8 +239,33 @@ async fn run_connection_with_origin(
             output_queue.clone(),
             outgoing_seq,
             cancel,
+            Some(bootstrap_written_tx),
         ))
     };
+    let catalog_refresh_host = host.clone();
+    let catalog_refresh_cancel = cancel.clone();
+    let catalog_refresh_task = tokio::spawn(async move {
+        if agent_replay != AgentReplayMode::Lazy {
+            return;
+        }
+        tokio::select! {
+            _ = catalog_refresh_cancel.cancelled() => return,
+            written = bootstrap_written_rx => {
+                if written.is_err() {
+                    return;
+                }
+            }
+        }
+        // Nonessential discovery starts only after the complete bootstrap is
+        // flushed, with the same first-client-work grace as capacity replay.
+        tokio::select! {
+            _ = catalog_refresh_cancel.cancelled() => return,
+            _ = tokio::time::sleep(BOOTSTRAP_REPLAY_GRACE) => {}
+        }
+        catalog_refresh_host
+            .refresh_lazy_connection_catalogs()
+            .await;
+    });
     let first_request = Arc::new(Notify::new());
     let app_task = {
         let cancel = cancel.clone();
@@ -337,6 +363,8 @@ async fn run_connection_with_origin(
     }
     capacity_replay_task.abort();
     let _ = capacity_replay_task.await;
+    catalog_refresh_task.abort();
+    let _ = catalog_refresh_task.await;
 
     host.unregister_host_stream(&host_stream).await;
     normalize_peer_disconnect(result)
@@ -380,12 +408,14 @@ async fn writer_loop<W>(
     output: OutputQueue,
     mut outgoing_seq: std::collections::HashMap<protocol::StreamPath, u64>,
     cancel: CancellationToken,
+    mut bootstrap_written: Option<oneshot::Sender<()>>,
 ) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut pending_records = std::collections::VecDeque::<EncodedRecord>::new();
     let mut pending_record_stream: Option<protocol::StreamPath> = None;
+    let mut pending_host_bootstrap = false;
     let mut pending_record_completions = Vec::<SchedulerToken>::new();
     let mut deferred_same_stream = std::collections::VecDeque::<QueuedOutput>::new();
     let mut deferred_same_stream_bytes = 0usize;
@@ -466,6 +496,12 @@ where
                                 pending_record_completions.clear();
                                 pending_record_stream = None;
                                 writer.flush().await?;
+                                if pending_host_bootstrap {
+                                    pending_host_bootstrap = false;
+                                    if let Some(written) = bootstrap_written.take() {
+                                        let _ = written.send(());
+                                    }
+                                }
                             } else {
                                 tokio::task::yield_now().await;
                             }
@@ -504,6 +540,7 @@ where
                     }
                     interleaved_audio_streak = 0;
                     pending_record_stream = Some(queued.frame.envelope.stream.clone());
+                    pending_host_bootstrap = queued.frame.envelope.kind == FrameKind::HostBootstrap;
                     pending_record_completions.clone_from(&queued.completions);
                     pending_records.extend(records);
                     tokio::task::yield_now().await;
@@ -512,6 +549,9 @@ where
                     writer.flush().await?;
                     if queued.frame.envelope.kind == FrameKind::HostBootstrap {
                         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = write_started.elapsed().as_millis(), "host bootstrap transport flush completed");
+                        if let Some(written) = bootstrap_written.take() {
+                            let _ = written.send(());
+                        }
                     }
                 }
             }
@@ -621,6 +661,7 @@ pub fn start_production_writer_probe(
             task_queue,
             initial_sequences,
             CancellationToken::new(),
+            None,
         )
         .await
     });

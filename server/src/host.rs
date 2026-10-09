@@ -2738,9 +2738,19 @@ impl HostHandle {
         voice_desktop: Option<bool>,
         project_files: ProjectFileDelivery,
     ) -> Vec<DeferredAgentAttachment> {
-        let backend_setup = self.collect_backend_setup_respecting_probe().await;
+        let bootstrap_started = Instant::now();
         let mut state = self.state.lock().await;
-        state.backend_setup = backend_setup.clone();
+        let backend_setup =
+            if agent_replay == AgentReplayMode::Lazy && state.capacity_polling_started {
+                state.backend_setup.clone()
+            } else {
+                drop(state);
+                let setup = self.collect_backend_setup_respecting_probe().await;
+                state = self.state.lock().await;
+                state.backend_setup = setup.clone();
+                setup
+            };
+        tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap discovery completed");
         // Backend discovery has now run at least once, which is the earliest
         // point the poller can tell an installed backend from a missing one.
         if !std::mem::replace(&mut state.capacity_polling_started, true) {
@@ -3024,6 +3034,7 @@ impl HostHandle {
             None => None,
         };
 
+        tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap catalogs completed");
         let agent_ids = state.registry.agent_ids();
         let agent_visibility = state.agent_visibility.clone();
         let mut agents = Vec::new();
@@ -3097,8 +3108,10 @@ impl HostHandle {
                 });
             }
         }
-        let (usage_handles, closed_usage_snapshots, live_usage_agent_ids, usage_agent_sessions) =
-            task_token_usage_sources_for_state(&state);
+        let usage_sources = match agent_replay {
+            AgentReplayMode::Lazy => None,
+            AgentReplayMode::Eager => Some(task_token_usage_sources_for_state(&state)),
+        };
         let mut agents_with_background_work = Vec::new();
         for agent in &agents {
             if state.registry.has_background_work(&agent.agent_id).await {
@@ -3109,14 +3122,21 @@ impl HostHandle {
         let agent_restoration_failures = state.agent_restoration_failures.clone();
         let tychat_snapshot = state.tychat.state.lock().await.snapshot.clone();
         drop(state);
-        let task_token_usages = task_token_usage_rollups_from_handles(
-            usage_handles,
-            closed_usage_snapshots,
-            &live_usage_agent_ids,
-            &usage_agent_sessions,
-        )
-        .await;
+        tracing::info!(target: "tyde::connection_bootstrap", agent_count = agents.len(), elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap descriptors completed");
+        let task_token_usages = match usage_sources {
+            Some((handles, closed_snapshots, live_agent_ids, agent_sessions)) => {
+                task_token_usage_rollups_from_handles(
+                    handles,
+                    closed_snapshots,
+                    &live_agent_ids,
+                    &agent_sessions,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
 
+        tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap usage completed");
         let (settings_doc, configured_secrets, settings_etag) = {
             let store = settings_store_for_projection.lock().await;
             settings_wire_projection(&store, &settings)
@@ -3293,11 +3313,20 @@ impl HostHandle {
         }
 
         drop(state);
-        if refresh_dynamic_session_schemas {
-            self.schedule_session_schema_refresh();
+        if agent_replay == AgentReplayMode::Eager {
+            if refresh_dynamic_session_schemas {
+                self.schedule_session_schema_refresh();
+            }
+            self.schedule_backend_config_snapshot_refresh();
         }
-        self.schedule_backend_config_snapshot_refresh();
+        tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap queued");
         deferred_attachments
+    }
+
+    pub(crate) async fn refresh_lazy_connection_catalogs(&self) {
+        self.refresh_pending_session_discovery().await;
+        self.refresh_backend_config_snapshots().await;
+        self.refresh_backend_setup().await;
     }
 
     pub(crate) async fn attach_deferred_agent_stream(&self, attachment: DeferredAgentAttachment) {
@@ -19362,6 +19391,9 @@ async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskToke
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
+        if subscriber.agent_replay == AgentReplayMode::Lazy {
+            continue;
+        }
         for payload in &payloads {
             if subscriber
                 .last_task_token_usages
