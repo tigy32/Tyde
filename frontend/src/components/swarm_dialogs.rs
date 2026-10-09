@@ -1370,6 +1370,118 @@ fn DraftMemberRow(
 
 // ── Live changes ───────────────────────────────────────────────────────────
 
+/// Who a new human request wakes. Saved directly, without a change preview,
+/// because it changes no members.
+#[component]
+fn RequestRoutingFields(
+    swarm: Memo<Option<protocol::Swarm>>,
+    send: Callback<SwarmCommandPayload>,
+) -> impl IntoView {
+    const EVERYONE: &str = "everyone";
+    const DECIDER: &str = "decider";
+    let choice = RwSignal::new(String::new());
+    let instructions = RwSignal::new(String::new());
+    let saved = Memo::new(move |_| {
+        swarm.with(|swarm| {
+            swarm
+                .as_ref()
+                .map(|swarm| swarm.request_routing.clone())
+                .unwrap_or_default()
+        })
+    });
+    Effect::new(move |_| {
+        let (value, text) = match saved.get() {
+            protocol::SwarmRequestRouting::Everyone => (EVERYONE.to_owned(), String::new()),
+            protocol::SwarmRequestRouting::Designated { member_id } => (member_id.0, String::new()),
+            protocol::SwarmRequestRouting::Decider { instructions } => {
+                (DECIDER.to_owned(), instructions)
+            }
+        };
+        choice.set(value);
+        instructions.set(text);
+    });
+    let edited = Memo::new(move |_| match choice.get().as_str() {
+        EVERYONE => protocol::SwarmRequestRouting::Everyone,
+        DECIDER => protocol::SwarmRequestRouting::Decider {
+            instructions: instructions.get(),
+        },
+        member_id => protocol::SwarmRequestRouting::Designated {
+            member_id: protocol::SwarmMemberId(member_id.to_owned()),
+        },
+    });
+    let members = Memo::new(move |_| {
+        swarm.with(|swarm| {
+            swarm
+                .as_ref()
+                .map(|swarm| {
+                    swarm
+                        .members
+                        .iter()
+                        .filter(|member| !protocol::swarm_member_inactive(member))
+                        .map(|member| (member.spec.id.0.clone(), member.spec.name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    });
+    let save = move |_| {
+        let Some(swarm_id) =
+            swarm.with_untracked(|swarm| swarm.as_ref().map(|swarm| swarm.id.clone()))
+        else {
+            return;
+        };
+        send.run(SwarmCommandPayload::SetRequestRouting {
+            swarm_id,
+            routing: edited.get_untracked(),
+        });
+    };
+    view! {
+        <div class="swarm-field" data-field="request-routing">
+            <span class="swarm-field-label">"New requests wake"</span>
+            <select
+                class="swarm-input"
+                aria-label="New requests wake"
+                on:change=move |ev| choice.set(event_target_value(&ev))
+            >
+                <option value=EVERYONE selected=move || choice.get() == EVERYONE>"Everyone"</option>
+                {move || members.get().into_iter().map(|(id, name)| {
+                    let selected_id = id.clone();
+                    view! {
+                        <option value=id selected=move || choice.get() == selected_id>{format!("Only {name}")}</option>
+                    }
+                }).collect_view()}
+                <option value=DECIDER selected=move || choice.get() == DECIDER>"A decider picks one member"</option>
+            </select>
+            <Show when=move || choice.get() == DECIDER>
+                <textarea
+                    class="swarm-input swarm-textarea"
+                    rows="3"
+                    aria-label="Routing instructions"
+                    placeholder="How to pick, such as: use Ada for quick fixes, Bo for design work, and prefer whoever is idle."
+                    prop:value=move || instructions.get()
+                    on:input=move |ev| instructions.set(event_target_value(&ev))
+                ></textarea>
+            </Show>
+            <span class="swarm-field-help">
+                "@mentioning a member always overrides this. A single picked member leads the request and can @mention others to help."
+            </span>
+            <span class="swarm-field-row">
+                <button
+                    class="swarm-btn"
+                    data-action="save-routing"
+                    disabled=move || {
+                        edited.get() == saved.get()
+                            || matches!(edited.get(), protocol::SwarmRequestRouting::Decider { instructions } if instructions.trim().is_empty())
+                    }
+                    on:click=save
+                >
+                    "Save"
+                </button>
+            </span>
+        </div>
+    }
+}
+
 #[component]
 pub fn ManageSwarmDialog(
     host_id: String,
@@ -1625,6 +1737,7 @@ pub fn ManageSwarmDialog(
             <div class="swarm-modal-body swarm-modal-split">
                 <section class="swarm-modal-pane" aria-label="Constraints">
                     <ConstraintsFields host=host form=form locked_scope=true />
+                    <RequestRoutingFields swarm=swarm send=Callback::new(send) />
                 </section>
                 <section
                     class="swarm-modal-pane swarm-preview-pane"
@@ -2542,6 +2655,99 @@ mod wasm_tests {
 
     /// Manage previews a change on the host against the swarm's revision and
     /// applies exactly that preview with the chosen retirement policy.
+    #[wasm_bindgen_test]
+    async fn manage_saves_who_new_requests_wake_without_a_preview() {
+        let harness = host_with_catalog("host-swarm-routing");
+        let sid = "sw-routing";
+        let mut swarm = make_swarm(
+            sid,
+            "Route me",
+            vec![
+                idle("ada", "Ada"),
+                idle("bo", "Bo"),
+                member("cy", "Cy", SwarmMemberState::Retired, None, None),
+            ],
+        );
+        harness.swarm(&swarm);
+        let (container, _handle) = mount_view(&harness, sid);
+        settle().await;
+        button(&container, "Manage").click();
+        settle().await;
+        let dialog = modal(&container).expect("manage dialog");
+        let choice = one(&dialog, "[aria-label='New requests wake']");
+        let options: Vec<String> = all(&choice, "option")
+            .iter()
+            .map(|option| text_of(option))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                "Everyone",
+                "Only Ada",
+                "Only Bo",
+                "A decider picks one member"
+            ],
+            "only active members can receive new requests"
+        );
+        assert_eq!(
+            choice
+                .dyn_ref::<web_sys::HtmlSelectElement>()
+                .unwrap()
+                .value(),
+            "everyone"
+        );
+        let save = action(&dialog, "save-routing");
+        assert!(
+            is_disabled(&save),
+            "nothing to save until the choice changes"
+        );
+
+        change_control(&choice, "bo");
+        settle().await;
+        assert!(!is_disabled(&save));
+        save.click();
+        settle().await;
+        let saved = harness.commands_of("set_request_routing");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0]["swarm_id"], sid);
+        assert_eq!(
+            saved[0]["routing"],
+            serde_json::json!({"kind": "designated", "member_id": "bo"})
+        );
+        assert!(
+            harness.commands_of("preview_change").is_empty(),
+            "routing applies without a change preview"
+        );
+
+        swarm.request_routing = protocol::SwarmRequestRouting::Designated {
+            member_id: SwarmMemberId("bo".into()),
+        };
+        harness.swarm(&swarm);
+        settle().await;
+        assert!(is_disabled(&save), "the saved choice is the current one");
+
+        change_control(&choice, "decider");
+        settle().await;
+        let rules = one(&dialog, "[aria-label='Routing instructions']");
+        assert!(
+            is_disabled(&save),
+            "a decider needs routing instructions before it can be saved"
+        );
+        type_into(&rules, "Bo takes design work; everything else goes to Ada");
+        settle().await;
+        save.click();
+        settle().await;
+        let saved = harness.commands_of("set_request_routing");
+        assert_eq!(saved.len(), 2);
+        assert_eq!(
+            saved[1]["routing"],
+            serde_json::json!({
+                "kind": "decider",
+                "instructions": "Bo takes design work; everything else goes to Ada"
+            })
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn manage_previews_and_applies_the_exact_change_revision() {
         let harness = host_with_catalog("host-swarm-manage");

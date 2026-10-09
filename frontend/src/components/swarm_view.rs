@@ -1212,6 +1212,7 @@ struct ThreadHeader {
     parent: Option<(SwarmThreadId, String)>,
     title: Option<String>,
     naming_error: Option<String>,
+    assigning_error: Option<String>,
     summary: String,
     children: Vec<(SwarmThreadId, String)>,
 }
@@ -1332,6 +1333,10 @@ fn SwarmThread(
                 parent,
                 title: state.title.clone(),
                 naming_error: state.naming_error.clone(),
+                assigning_error: state
+                    .assigning
+                    .then(|| state.assigning_error.clone())
+                    .flatten(),
                 summary: state.summary.clone(),
                 children: children
                     .into_iter()
@@ -1491,6 +1496,7 @@ fn SwarmThread(
                         </details>
                     })}
                     {header.naming_error.map(|message| view! { <p class="swarm-thread-error" role="status">{format!("Naming failed, retrying: {message}")}</p> })}
+                    {header.assigning_error.map(|message| view! { <p class="swarm-thread-error" role="status">{format!("Assigning failed, retrying: {message}")}</p> })}
                 </div>
             })}
             {move || match thread_posts.with(|(root, _)| root.clone()) {
@@ -1716,6 +1722,26 @@ fn SwarmPostCard(
         view! { <div class="swarm-delivery">{rows}</div> }.into_any()
     };
 
+    let lead_label = move || {
+        let (is_root, thread_id) =
+            post.with_value(|post| (post.id.0 == post.thread_id.0, post.thread_id.clone()));
+        if !is_root {
+            return None;
+        }
+        swarm.with(|swarm| {
+            let swarm = swarm.as_ref()?;
+            let thread = swarm
+                .threads
+                .iter()
+                .find(|thread| thread.thread_id == thread_id)?;
+            let label = if thread.assigning {
+                "Assigning…".to_owned()
+            } else {
+                format!("Led by {}", member_name(Some(swarm), thread.lead.as_ref()?))
+            };
+            Some(view! { <span class="swarm-lead-label" role="status">{label}</span> })
+        })
+    };
     let (post_id, created_at_ms, is_result) =
         post.with_value(|post| (post.id.0.clone(), post.created_at_ms, post.result));
     view! {
@@ -1735,6 +1761,7 @@ fn SwarmPostCard(
                     {is_result.then(|| view! { <span class="swarm-result-label">{swarm_icon(SwarmIcon::Check)}"Result"</span> })}
                     <span class="swarm-post-author">{author}</span>
                     <time class="swarm-post-time">{format_time(created_at_ms)}</time>
+                    {lead_label}
                     <span class="swarm-post-actions">
                         <button class="swarm-post-action" on:click=move |_| on_reply.run(())>"Reply"</button>
                         <button class="swarm-post-action" title="Link this post in a reply" on:click=move |_| on_quote.run(post.get_value())>"Link"</button>
@@ -2606,13 +2633,27 @@ fn SwarmComposer(
             let loading = "Loading thread…".to_owned();
             return (loading.clone(), Some(loading));
         }
-        let recipients = protocol::swarm_publication_recipients(
+        let current_thread = thread.with_value(|thread_id| {
+            thread_id.as_ref().and_then(|thread_id| {
+                current
+                    .threads
+                    .iter()
+                    .find(|thread| thread.thread_id == *thread_id)
+                    .cloned()
+            })
+        });
+        let route = protocol::swarm_publication_route(
             &current,
             &SwarmAuthor::Human,
             target_board,
             root_author.as_ref(),
+            current_thread.as_ref(),
             &body,
         );
+        let recipients = route.recipients;
+        if recipients.is_empty() && route.assigning {
+            return ("The decider will pick who leads this.".to_owned(), None);
+        }
         if recipients.is_empty() {
             let nobody = "No one will be notified.".to_owned();
             return (nobody.clone(), Some(nobody));
@@ -3287,6 +3328,7 @@ pub(crate) mod wasm_tests {
             change_preview: None,
             error: None,
             legacy_team_id: None,
+            request_routing: Default::default(),
         }
     }
 
@@ -4048,6 +4090,9 @@ pub(crate) mod wasm_tests {
             title: Some("Review documentation".into()),
             description: Some("Human review request".into()),
             naming_error: None,
+            lead: None,
+            assigning: false,
+            assigning_error: None,
             summary: "Documentation review in progress".into(),
             seq: 2,
             child_seq: 0,
@@ -4149,7 +4194,7 @@ pub(crate) mod wasm_tests {
         settle().await;
         let composer = one(&editing_thread, ".swarm-reply-composer");
         let draft_input = one(&composer, "textarea");
-        // protocol::swarm_publication_recipients wakes every active member
+        // protocol::swarm_publication_route wakes every active member
         // for an unmentioned human reply on a human Briefing request.
         assert_eq!(
             one(&composer, ".swarm-composer-send")
@@ -5261,6 +5306,9 @@ pub(crate) mod wasm_tests {
             title: Some("Image request".to_owned()),
             description: Some(String::new()),
             naming_error: None,
+            lead: None,
+            assigning: false,
+            assigning_error: None,
             summary: String::new(),
             seq: 1,
             child_seq: 0,
@@ -5961,6 +6009,9 @@ pub(crate) mod wasm_tests {
                 title: title.map(str::to_owned),
                 description: title.map(|_| "A human request".to_owned()),
                 naming_error: None,
+                lead: None,
+                assigning: false,
+                assigning_error: None,
                 summary: String::new(),
                 seq: 1,
                 child_seq: 0,
@@ -6004,6 +6055,48 @@ pub(crate) mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "an empty summary renders nothing"
+        );
+        let new_request_hint = || {
+            one(
+                &container,
+                ".swarm-root-composer:not([hidden]) .swarm-composer-send",
+            )
+            .get_attribute("title")
+            .unwrap_or_default()
+        };
+        assert_eq!(new_request_hint(), "Notifies Ada.");
+
+        swarm.request_routing = protocol::SwarmRequestRouting::Decider {
+            instructions: "Ada takes everything".into(),
+        };
+        swarm.threads[0].assigning = true;
+        swarm.threads[0].assigning_error = Some("Decider offline".into());
+        harness.swarm(&swarm);
+        settle().await;
+        let root_card = one(&container, "[data-post-id='human-root']");
+        assert!(
+            text_of(&root_card).contains("Assigning…")
+                && text_of(&one(&container, ".swarm-thread-head"))
+                    .contains("Assigning failed, retrying: Decider offline"),
+            "a request awaiting the decider shows the server's assignment state"
+        );
+        assert_eq!(
+            new_request_hint(),
+            "The decider will pick who leads this.",
+            "with a decider, a new request previews no wake until a lead is picked"
+        );
+
+        swarm.threads[0].assigning = false;
+        swarm.threads[0].assigning_error = None;
+        swarm.threads[0].lead = Some(SwarmMemberId("ada".into()));
+        harness.swarm(&swarm);
+        settle().await;
+        let root_card = one(&container, "[data-post-id='human-root']");
+        assert!(
+            text_of(&root_card).contains("Led by Ada")
+                && !text_of(&container).contains("Assigning"),
+            "the picked member is shown as the request's lead: {}",
+            text_of(&root_card)
         );
 
         swarm.threads[0].title = Some("Investigate rendering".into());

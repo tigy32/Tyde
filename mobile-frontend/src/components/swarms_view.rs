@@ -335,6 +335,7 @@ struct ThreadHeading {
     parent: Option<(SwarmThreadId, String)>,
     title: Option<String>,
     naming_error: Option<String>,
+    lead: Option<String>,
     summary: String,
     children: Vec<(SwarmThreadId, String)>,
 }
@@ -364,6 +365,21 @@ fn thread_heading(swarm: &Swarm, thread_id: &SwarmThreadId) -> Option<ThreadHead
         parent,
         title: thread.title.clone(),
         naming_error: thread.naming_error.clone(),
+        lead: if thread.assigning {
+            Some(match &thread.assigning_error {
+                Some(message) => format!("Assigning failed, retrying: {message}"),
+                None => "Assigning…".to_owned(),
+            })
+        } else {
+            thread.lead.as_ref().map(|lead| {
+                let name = swarm
+                    .members
+                    .iter()
+                    .find(|member| member.spec.id == *lead)
+                    .map_or("a removed member", |member| member.spec.name.as_str());
+                format!("Led by {name}")
+            })
+        },
         summary: thread.summary.clone(),
         children: children
             .into_iter()
@@ -448,6 +464,7 @@ fn SwarmPostCard(
                     {heading.parent.map(|(parent_id, title)| view! { <button type="button" class="mobile-swarm-link" on:click=move |_| on_link.run(SwarmPostId(parent_id.0.clone()))>{format!("Re: {title}")}</button> })}
                     <h3 class:mobile-swarm-naming=heading.title.is_none()>{heading.title.clone().unwrap_or_else(|| "Naming…".to_owned())}</h3>
                     {heading.naming_error.map(|message| view! { <p class="mobile-swarm-muted" role="status">{format!("Naming failed, retrying: {message}")}</p> })}
+                    {heading.lead.map(|lead| view! { <p class="mobile-swarm-muted" role="status">{lead}</p> })}
                     {(!heading.summary.is_empty()).then(|| view! { <details><summary>"Agent notes"</summary><div class="mobile-swarm-thread-summary">{heading.summary}</div></details> })}
                     {(!heading.children.is_empty()).then(|| view! {
                         <nav class="mobile-swarm-thread-children" aria-label="Coordination threads">
@@ -655,14 +672,21 @@ fn SwarmComposer(
                     .map(|p| p.author.clone())
             })
         });
-        let recipients = protocol::swarm_publication_recipients(
+        let current_thread = thread
+            .get()
+            .and_then(|id| s.threads.iter().find(|t| t.thread_id == id).cloned());
+        let route = protocol::swarm_publication_route(
             &s,
             &SwarmAuthor::Human,
             board.get(),
             root_author.as_ref(),
+            current_thread.as_ref(),
             &body.get(),
         );
-        if recipients.is_empty() {
+        let recipients = route.recipients;
+        if recipients.is_empty() && route.assigning {
+            "The decider will pick who leads this.".into()
+        } else if recipients.is_empty() {
             "Stored on the board. @mention an agent to notify them.".into()
         } else {
             let names = recipients
@@ -952,6 +976,7 @@ pub(crate) mod wasm_tests {
             change_preview: None,
             error: None,
             legacy_team_id: None,
+            request_routing: Default::default(),
             recovery_requirement: protocol::SwarmRecoveryRequirement::None,
         }
     }
@@ -1119,6 +1144,9 @@ pub(crate) mod wasm_tests {
             title: None,
             description: None,
             naming_error: None,
+            lead: None,
+            assigning: false,
+            assigning_error: None,
             summary: String::new(),
             seq: 1,
             child_seq: 0,
@@ -1221,6 +1249,9 @@ pub(crate) mod wasm_tests {
             title: Some("Review plan".into()),
             description: Some("How the agents split the review".into()),
             naming_error: None,
+            lead: None,
+            assigning: false,
+            assigning_error: None,
             summary: String::new(),
             seq: 1,
             child_seq: 0,

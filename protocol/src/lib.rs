@@ -15,7 +15,8 @@ pub use types::{
     AgentControlLatestOutput, AgentControlOutputProjectionError, AgentControlReadDebugResult,
     SWARM_MAX_POST_BYTES, SWARM_MAX_READ_PAGE_BYTES, SWARM_READ_PAGE_CONTAINER_BYTES, SwarmCommit,
     SwarmCommitStatus, SwarmLegacySource, agent_control_output_from_chat_event,
-    agent_control_output_from_envelope, cap_agent_control_events, swarm_publication_recipients,
+    agent_control_output_from_envelope, cap_agent_control_events, swarm_member_inactive,
+    swarm_publication_route,
 };
 pub use types::{
     AcpAdapterId, AcpAgentSpec, AgentActivity, AgentActivityChangedPayload, AgentActivityStats,
@@ -200,16 +201,17 @@ pub use types::mobile_rtc::*;
 
 pub use types::SwarmFailure;
 pub use types::{
-    Swarm, SwarmAttachment, SwarmAuthor, SwarmBackendAllocation, SwarmBoard,
-    SwarmBoardNotifyPayload, SwarmBoardPage, SwarmBoardPosition, SwarmBoardRead, SwarmBoardView,
-    SwarmBodySegment, SwarmChangePreview, SwarmCommandPayload, SwarmConstraints,
-    SwarmDeliveryState, SwarmDescribe, SwarmDraft, SwarmDraftGeneration, SwarmDraftId,
-    SwarmDraftNotifyPayload, SwarmErrorCode, SwarmErrorNotifyPayload, SwarmId, SwarmImage,
-    SwarmImageId, SwarmImageNotifyPayload, SwarmImageOutcome, SwarmImageRead, SwarmImageUpload,
-    SwarmLifecycle, SwarmMember, SwarmMemberId, SwarmMemberReplacement, SwarmMemberSpec,
-    SwarmMemberState, SwarmNotification, SwarmNotificationId, SwarmNotifyPayload, SwarmPost,
-    SwarmPostId, SwarmPostNotifyPayload, SwarmPublication, SwarmPublicationId,
-    SwarmPublicationOutcome, SwarmRetirementPolicy, SwarmRound, SwarmRoundId, SwarmStoreSnapshot,
+    SWARM_MAX_ROUTING_INSTRUCTIONS_BYTES, Swarm, SwarmAttachment, SwarmAuthor,
+    SwarmBackendAllocation, SwarmBoard, SwarmBoardNotifyPayload, SwarmBoardPage,
+    SwarmBoardPosition, SwarmBoardRead, SwarmBoardView, SwarmBodySegment, SwarmChangePreview,
+    SwarmCommandPayload, SwarmConstraints, SwarmDeliveryState, SwarmDescribe, SwarmDraft,
+    SwarmDraftGeneration, SwarmDraftId, SwarmDraftNotifyPayload, SwarmErrorCode,
+    SwarmErrorNotifyPayload, SwarmId, SwarmImage, SwarmImageId, SwarmImageNotifyPayload,
+    SwarmImageOutcome, SwarmImageRead, SwarmImageUpload, SwarmLifecycle, SwarmMember,
+    SwarmMemberId, SwarmMemberReplacement, SwarmMemberSpec, SwarmMemberState, SwarmNotification,
+    SwarmNotificationId, SwarmNotifyPayload, SwarmPost, SwarmPostId, SwarmPostNotifyPayload,
+    SwarmPublication, SwarmPublicationId, SwarmPublicationOutcome, SwarmRequestRouting,
+    SwarmRetirementPolicy, SwarmRound, SwarmRoundId, SwarmRoute, SwarmStoreSnapshot,
     SwarmStoredImage, SwarmThreadId, SwarmThreadNotifyPayload, SwarmThreadPage, SwarmThreadRead,
     SwarmWorkspacePolicy,
 };

@@ -9158,7 +9158,24 @@ pub struct Swarm {
     pub change_preview: Option<SwarmChangePreview>,
     pub error: Option<String>,
     pub legacy_team_id: Option<TeamId>,
+    #[serde(default)]
+    pub request_routing: SwarmRequestRouting,
 }
+/// Which members a new human request wakes when it @mentions no one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmRequestRouting {
+    #[default]
+    Everyone,
+    Designated {
+        member_id: SwarmMemberId,
+    },
+    /// A helper turn follows these instructions to pick one member.
+    Decider {
+        instructions: String,
+    },
+}
+pub const SWARM_MAX_ROUTING_INSTRUCTIONS_BYTES: usize = 8 * 1024;
 impl Swarm {
     pub fn thread_deleted(&self, thread_id: &SwarmThreadId) -> bool {
         self.threads
@@ -9272,6 +9289,16 @@ pub struct SwarmThread {
     /// remains so sibling sequences keep counting it.
     #[serde(default)]
     pub deleted: bool,
+    /// The member responsible for this Briefing request. Only the lead, or a
+    /// member the human @mentions in the thread, may reply in it.
+    #[serde(default)]
+    pub lead: Option<SwarmMemberId>,
+    /// The decider has not yet picked this request's lead.
+    #[serde(default)]
+    pub assigning: bool,
+    /// Latest decider failure; assignment keeps retrying.
+    #[serde(default)]
+    pub assigning_error: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SwarmHumanPost {
@@ -9561,6 +9588,10 @@ pub enum SwarmCommandPayload {
     Pause {
         swarm_id: SwarmId,
     },
+    SetRequestRouting {
+        swarm_id: SwarmId,
+        routing: SwarmRequestRouting,
+    },
     Resume {
         swarm_id: SwarmId,
     },
@@ -9684,13 +9715,31 @@ pub const SWARM_READ_PAGE_CONTAINER_BYTES: usize = 4096;
 pub const SWARM_MAX_POST_BYTES: usize =
     (SWARM_MAX_READ_PAGE_BYTES - SWARM_READ_PAGE_CONTAINER_BYTES - 1) / 2;
 
-pub fn swarm_publication_recipients(
+/// Who a publication wakes, and the thread's resulting lead assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwarmRoute {
+    pub recipients: Vec<SwarmMemberId>,
+    pub lead: Option<SwarmMemberId>,
+    pub assigning: bool,
+}
+
+pub fn swarm_member_inactive(member: &SwarmMember) -> bool {
+    matches!(
+        member.state,
+        SwarmMemberState::Retiring | SwarmMemberState::RetiringReserved | SwarmMemberState::Retired
+    )
+}
+
+/// Routes a publication. `thread` is the thread being replied to, or `None`
+/// for a new thread.
+pub fn swarm_publication_route(
     swarm: &Swarm,
     author: &SwarmAuthor,
     board: SwarmBoard,
     root_author: Option<&SwarmAuthor>,
+    thread: Option<&SwarmThread>,
     body: &[SwarmBodySegment],
-) -> Vec<SwarmMemberId> {
+) -> SwarmRoute {
     let mut recipients = body
         .iter()
         .filter_map(|segment| match segment {
@@ -9698,26 +9747,37 @@ pub fn swarm_publication_recipients(
             _ => None,
         })
         .collect::<Vec<_>>();
+    let mut lead = thread.and_then(|thread| thread.lead.clone());
+    let mut assigning = thread.is_some_and(|thread| thread.assigning);
     match author {
         SwarmAuthor::Human => match root_author {
             Some(SwarmAuthor::Member { member_id }) => recipients.push(member_id.clone()),
-            None | Some(SwarmAuthor::Human)
-                if board == SwarmBoard::Briefing && recipients.is_empty() =>
-            {
-                recipients.extend(
-                    swarm
-                        .members
-                        .iter()
-                        .filter(|member| {
-                            !matches!(
-                                member.state,
-                                SwarmMemberState::Retiring
-                                    | SwarmMemberState::RetiringReserved
-                                    | SwarmMemberState::Retired
-                            )
-                        })
-                        .map(|member| member.spec.id.clone()),
-                )
+            None | Some(SwarmAuthor::Human) if board == SwarmBoard::Briefing => {
+                if lead.is_none()
+                    && swarm.request_routing != SwarmRequestRouting::Everyone
+                    && let Some(first) = recipients.first()
+                {
+                    lead = Some(first.clone());
+                    assigning = false;
+                }
+                if recipients.is_empty() {
+                    match (&lead, assigning, &swarm.request_routing) {
+                        (Some(lead), _, _) => recipients.push(lead.clone()),
+                        (None, true, _) => {}
+                        (None, false, SwarmRequestRouting::Everyone) => recipients.extend(
+                            swarm
+                                .members
+                                .iter()
+                                .filter(|member| !swarm_member_inactive(member))
+                                .map(|member| member.spec.id.clone()),
+                        ),
+                        (None, false, SwarmRequestRouting::Designated { member_id }) => {
+                            lead = Some(member_id.clone());
+                            recipients.push(member_id.clone());
+                        }
+                        (None, false, SwarmRequestRouting::Decider { .. }) => assigning = true,
+                    }
+                }
             }
             _ => {}
         },
@@ -9725,7 +9785,11 @@ pub fn swarm_publication_recipients(
     }
     recipients.sort_by(|left, right| left.0.cmp(&right.0));
     recipients.dedup();
-    recipients
+    SwarmRoute {
+        recipients,
+        lead,
+        assigning,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1538,6 +1538,7 @@ fn apply(
                 change_preview: None,
                 error: None,
                 legacy_team_id: draft.legacy_team_id.clone(),
+                request_routing: Default::default(),
             };
             if let Some(team_id) = draft.legacy_team_id.as_ref() {
                 // Session ownership was stored in the migration snapshot before conversion.
@@ -1709,6 +1710,34 @@ fn apply(
             };
             Ok(vec![swarm_event(swarm)])
         }
+        SwarmCommandPayload::SetRequestRouting { swarm_id, routing } => {
+            let swarm = swarm_mut(file, &swarm_id)?;
+            match &routing {
+                SwarmRequestRouting::Everyone => {}
+                SwarmRequestRouting::Designated { member_id } => {
+                    if !swarm.members.iter().any(|member| {
+                        member.spec.id == *member_id && !swarm_member_inactive(member)
+                    }) {
+                        return Err(failure(
+                            SwarmErrorCode::Invalid,
+                            "New requests must go to an active member of this swarm",
+                        ));
+                    }
+                }
+                SwarmRequestRouting::Decider { instructions } => {
+                    if instructions.trim().is_empty()
+                        || instructions.len() > SWARM_MAX_ROUTING_INSTRUCTIONS_BYTES
+                    {
+                        return Err(failure(
+                            SwarmErrorCode::Invalid,
+                            "Routing instructions must be 1–8 KiB",
+                        ));
+                    }
+                }
+            }
+            swarm.request_routing = routing;
+            Ok(vec![swarm_event(swarm)])
+        }
         SwarmCommandPayload::Resume { swarm_id } => {
             let swarm = swarm_mut(file, &swarm_id)?;
             validate_constraints(&swarm.constraints)?;
@@ -1821,7 +1850,18 @@ fn apply(
                 .iter()
                 .filter(|member| !retained.contains(&member.id))
                 .map(|member| member.id.clone())
-                .collect();
+                .collect::<Vec<_>>();
+            if let SwarmRequestRouting::Designated { member_id } = &swarm.request_routing
+                && retirements.contains(member_id)
+            {
+                let name = previous
+                    .iter()
+                    .find(|member| member.id == *member_id)
+                    .map_or("The designated member", |member| member.name.as_str());
+                conflicts.push(format!(
+                    "{name} receives new requests and cannot be retired; change who new requests wake first"
+                ));
+            }
             let revision = swarm
                 .change_preview_revision
                 .max(
@@ -1865,6 +1905,23 @@ fn apply(
                     SwarmErrorCode::Conflict,
                     "resolve change preview conflicts",
                 ));
+            }
+            if let SwarmRequestRouting::Designated { member_id } = &swarm.request_routing
+                && preview.retirements.contains(member_id)
+            {
+                return Err(failure(
+                    SwarmErrorCode::Conflict,
+                    "The member that receives new requests cannot be retired",
+                ));
+            }
+            for thread in &mut swarm.threads {
+                if thread
+                    .lead
+                    .as_ref()
+                    .is_some_and(|lead| preview.retirements.contains(lead))
+                {
+                    thread.lead = None;
+                }
             }
             for id in &preview.retirements {
                 let member = member_mut(swarm, id)?;
@@ -2122,11 +2179,44 @@ fn publish(
             "Only a member's reply in a Briefing thread can be a result",
         ));
     }
-    let recipients = swarm_publication_recipients(
+    let current_thread = publication.thread_id.as_ref().and_then(|thread_id| {
+        swarm
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == *thread_id)
+    });
+    if let (SwarmAuthor::Member { member_id }, Some(thread), Some(root)) =
+        (&author, current_thread, root)
+        && let Some(lead) = &thread.lead
+        && root.board == SwarmBoard::Briefing
+        && lead != member_id
+        && !file.posts.iter().any(|post| {
+            post.swarm_id == *id
+                && post.thread_id == thread.thread_id
+                && post.author == SwarmAuthor::Human
+                && post.body.iter().any(|segment| {
+                    matches!(segment, SwarmBodySegment::MemberMention { member_id: mentioned } if mentioned == member_id)
+                })
+        })
+    {
+        let lead_name = swarm
+            .members
+            .iter()
+            .find(|member| member.spec.id == *lead)
+            .map_or("its lead", |member| member.spec.name.as_str());
+        return Err(failure(
+            SwarmErrorCode::Unauthorized,
+            format!(
+                "{lead_name} leads this request, so only {lead_name} or a member the human @mentions there may reply in its Briefing thread. Post in a Coordination thread under it instead and @mention {lead_name}"
+            ),
+        ));
+    }
+    let route = swarm_publication_route(
         swarm,
         &author,
         publication.board,
         root.map(|post| &post.author),
+        current_thread,
         &publication.body,
     );
     let new_round = matches!(author, SwarmAuthor::Human);
@@ -2155,7 +2245,14 @@ fn publish(
         .thread_id
         .clone()
         .unwrap_or_else(|| SwarmThreadId(post_id.0.clone()));
-    let threads = prepare_thread(file, id, &thread_id, cursor, &author, &publication)?;
+    let mut threads = prepare_thread(file, id, &thread_id, cursor, &author, &publication)?;
+    if author == SwarmAuthor::Human && publication.board == SwarmBoard::Briefing {
+        threads.thread.lead = route.lead.clone();
+        threads.thread.assigning = route.assigning;
+        if !route.assigning {
+            threads.thread.assigning_error = None;
+        }
+    }
     let post = SwarmPost {
         thread_change: publication.thread_change.clone(),
         result: publication.result,
@@ -2207,7 +2304,7 @@ fn publish(
             agent_activations_remaining: swarm.constraints.agent_wake_budget,
         });
     }
-    for recipient in recipients {
+    for recipient in route.recipients {
         let member = swarm
             .members
             .iter()
@@ -2407,6 +2504,16 @@ pub(crate) enum SwarmHelperChange {
         thread_id: SwarmThreadId,
         message: String,
     },
+    /// Resolves an assigning thread: `Some` makes that member its lead,
+    /// `None` wakes every active member.
+    RouteThread {
+        thread_id: SwarmThreadId,
+        lead: Option<SwarmMemberId>,
+    },
+    AssigningFailed {
+        thread_id: SwarmThreadId,
+        message: String,
+    },
 }
 
 fn apply_helper_change(
@@ -2433,6 +2540,82 @@ fn apply_helper_change(
         SwarmHelperChange::NamingFailed { thread_id, message } => {
             let swarm = swarm_mut(file, id)?;
             thread_mut(swarm, &thread_id)?.naming_error = Some(message);
+            Ok(vec![swarm_event(swarm)])
+        }
+        SwarmHelperChange::RouteThread { thread_id, lead } => {
+            let unrouted = {
+                let swarm = file
+                    .swarms
+                    .iter()
+                    .find(|swarm| swarm.id == *id)
+                    .ok_or(failure(SwarmErrorCode::NotFound, "swarm does not exist"))?;
+                file.posts
+                    .iter()
+                    .filter(|post| {
+                        post.swarm_id == *id
+                            && post.thread_id == thread_id
+                            && post.author == SwarmAuthor::Human
+                            && !swarm
+                                .notifications
+                                .iter()
+                                .any(|notification| notification.post_ids.contains(&post.id))
+                    })
+                    .map(|post| (post.id.clone(), post.round_id.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let swarm = swarm_mut(file, id)?;
+            let thread = thread_mut(swarm, &thread_id)?;
+            if !thread.assigning || thread.deleted {
+                return Ok(Vec::new());
+            }
+            let recipients = match &lead {
+                Some(lead) => vec![lead.clone()],
+                None => swarm
+                    .members
+                    .iter()
+                    .filter(|member| !swarm_member_inactive(member))
+                    .map(|member| member.spec.id.clone())
+                    .collect(),
+            };
+            if let Some(lead) = &lead
+                && !swarm
+                    .members
+                    .iter()
+                    .any(|member| member.spec.id == *lead && !swarm_member_inactive(member))
+            {
+                return Err(failure(
+                    SwarmErrorCode::Invalid,
+                    "Decider picked a member that cannot take requests",
+                ));
+            }
+            let thread = thread_mut(swarm, &thread_id)?;
+            thread.lead = lead;
+            thread.assigning = false;
+            thread.assigning_error = None;
+            if let Some((_, round_id)) = unrouted.last() {
+                let post_ids = unrouted
+                    .iter()
+                    .map(|(post_id, _)| post_id.clone())
+                    .collect::<Vec<_>>();
+                for member_id in recipients {
+                    swarm.notifications.push(SwarmNotification {
+                        id: SwarmNotificationId(fresh()),
+                        member_id,
+                        post_ids: post_ids.clone(),
+                        round_id: round_id.clone(),
+                        state: SwarmDeliveryState::Pending,
+                        error: None,
+                    });
+                }
+            }
+            Ok(vec![swarm_event(swarm)])
+        }
+        SwarmHelperChange::AssigningFailed { thread_id, message } => {
+            let swarm = swarm_mut(file, id)?;
+            let thread = thread_mut(swarm, &thread_id)?;
+            if thread.assigning {
+                thread.assigning_error = Some(message);
+            }
             Ok(vec![swarm_event(swarm)])
         }
     }
@@ -2563,6 +2746,9 @@ fn prepare_thread(
                     title: None,
                     description: None,
                     naming_error: None,
+                    lead: None,
+                    assigning: false,
+                    assigning_error: None,
                     summary: String::new(),
                     seq: 1,
                     child_seq: 0,
@@ -2616,6 +2802,9 @@ fn prepare_thread(
                     title: Some(title.clone()),
                     description: Some(description.clone()),
                     naming_error: None,
+                    lead: None,
+                    assigning: false,
+                    assigning_error: None,
                     summary: summary.clone(),
                     seq: 1,
                     child_seq: 0,
@@ -3206,7 +3395,7 @@ fn reserve(
                 .unwrap_or(swarm.members[index].context_cursor);
             let mut message = notified
                 .iter()
-                .map(|post| wake_line(swarm, post))
+                .map(|post| wake_line(swarm, &swarm.members[index].spec.id, post))
                 .collect::<Vec<_>>()
                 .join("\n");
             if swarm.members[index].guidance_changed {
@@ -3242,7 +3431,7 @@ fn reserve(
     Ok((batches, events))
 }
 /// One line per notified post; standing steering explains the board and tools.
-fn wake_line(swarm: &Swarm, post: &SwarmPost) -> String {
+fn wake_line(swarm: &Swarm, recipient: &SwarmMemberId, post: &SwarmPost) -> String {
     let author = match &post.author {
         SwarmAuthor::Human => "Human".to_owned(),
         SwarmAuthor::Member { member_id } => swarm
@@ -3251,15 +3440,21 @@ fn wake_line(swarm: &Swarm, post: &SwarmPost) -> String {
             .find(|member| member.spec.id == *member_id)
             .map_or_else(|| member_id.0.clone(), |member| member.spec.name.clone()),
     };
-    let title = swarm
+    let thread = swarm
         .threads
         .iter()
-        .find(|thread| thread.thread_id == post.thread_id)
+        .find(|thread| thread.thread_id == post.thread_id);
+    let title = thread
         .and_then(|thread| thread.title.as_deref())
         .map(|title| format!(" \"{title}\""))
         .unwrap_or_default();
+    let lead = if thread.is_some_and(|thread| thread.lead.as_ref() == Some(recipient)) {
+        " You lead this request."
+    } else {
+        ""
+    };
     format!(
-        "Swarm: {author} posted in thread {}{title}, post {}.",
+        "Swarm: {author} posted in thread {}{title}, post {}.{lead}",
         post.thread_id.0, post.id.0
     )
 }

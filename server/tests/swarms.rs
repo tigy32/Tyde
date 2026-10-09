@@ -888,6 +888,7 @@ fn last_dispatch_context(requests: &[MockRequest]) -> (Vec<protocol::SwarmPostId
         .lines()
         .filter_map(|line| {
             let (_, post) = line.strip_prefix("Swarm: ")?.rsplit_once(", post ")?;
+            let post = post.strip_suffix(" You lead this request.").unwrap_or(post);
             Some(protocol::SwarmPostId(post.strip_suffix('.')?.to_owned()))
         })
         .collect();
@@ -11980,4 +11981,304 @@ async fn failed_members_are_replaced_by_fresh_agents_until_the_replacement_cap()
     assert_eq!(retried.members[0].consecutive_replacements, 0);
     assert!(retried.members[0].error.is_none());
     assert_ne!(retried.lifecycle, SwarmLifecycle::AttentionRequired);
+}
+
+fn settled_member(swarm: &Swarm, member_id: &protocol::SwarmMemberId, post: &SwarmPost) -> bool {
+    swarm.notifications.iter().any(|notification| {
+        notification.member_id == *member_id
+            && notification.post_ids.contains(&post.id)
+            && notification.state == SwarmDeliveryState::Accepted
+    }) && swarm.members.iter().any(|member| {
+        member.spec.id == *member_id
+            && member.runtime_status == Some(AgentControlStatus::Idle)
+            && member.unfinished_notification_ids.is_empty()
+    })
+}
+
+fn woken_by(swarm: &Swarm, post: &SwarmPost) -> Vec<protocol::SwarmMemberId> {
+    swarm
+        .notifications
+        .iter()
+        .filter(|notification| notification.post_ids.contains(&post.id))
+        .map(|notification| notification.member_id.clone())
+        .collect()
+}
+
+fn lead_of(swarm: &Swarm, post: &SwarmPost) -> Option<protocol::SwarmMemberId> {
+    swarm
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == post.thread_id)
+        .and_then(|thread| thread.lead.clone())
+}
+
+#[tokio::test]
+async fn new_requests_wake_one_lead_who_owns_the_briefing_thread() {
+    let mut scenario = Scenario::new().await;
+    let mut constraints = scenario.constraints(3);
+    constraints.agent_wake_budget = None;
+    let draft = scenario.generate(constraints).await;
+    let live = scenario.launch(&draft).await;
+    assert_eq!(
+        live.request_routing,
+        protocol::SwarmRequestRouting::Everyone,
+        "new requests wake everyone by default"
+    );
+    let (helper, peer, lead) = (
+        live.members[0].spec.clone(),
+        live.members[1].spec.clone(),
+        live.members[2].spec.clone(),
+    );
+
+    scenario
+        .send(SwarmCommandPayload::SetRequestRouting {
+            swarm_id: live.id.clone(),
+            routing: protocol::SwarmRequestRouting::Decider {
+                instructions: "  ".into(),
+            },
+        })
+        .await;
+    scenario.error(SwarmErrorCode::Invalid).await;
+    let designated = protocol::SwarmRequestRouting::Designated {
+        member_id: lead.id.clone(),
+    };
+    scenario
+        .send(SwarmCommandPayload::SetRequestRouting {
+            swarm_id: live.id.clone(),
+            routing: designated.clone(),
+        })
+        .await;
+    let routed = scenario
+        .swarm(&live.id, |swarm| swarm.request_routing == designated)
+        .await;
+    scenario
+        .send(SwarmCommandPayload::PreviewChange {
+            swarm_id: live.id.clone(),
+            expected_revision: routed.revision,
+            constraints: scenario.constraints(2),
+        })
+        .await;
+    let previewed = scenario
+        .swarm(&live.id, |swarm| swarm.change_preview.is_some())
+        .await;
+    let preview = previewed.change_preview.expect("lower-capacity preview");
+    assert!(
+        preview.retirements == vec![lead.id.clone()]
+            && preview
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains(&lead.name)),
+        "the member that receives new requests cannot be retired while designated"
+    );
+    scenario
+        .send(SwarmCommandPayload::DiscardChangePreview {
+            swarm_id: live.id.clone(),
+        })
+        .await;
+    scenario
+        .swarm(&live.id, |swarm| swarm.change_preview.is_none())
+        .await;
+
+    let request = scenario
+        .post(
+            &live.id,
+            publication(
+                SwarmBoard::Briefing,
+                "designated-request",
+                vec![text("Fix the flaky login test")],
+            ),
+        )
+        .await;
+    let led = scenario
+        .swarm(&live.id, |swarm| settled_member(swarm, &lead.id, &request))
+        .await;
+    assert!(
+        lead_of(&led, &request) == Some(lead.id.clone())
+            && woken_by(&led, &request) == vec![lead.id.clone()]
+            && led
+                .members
+                .iter()
+                .filter(|member| member.spec.id != lead.id)
+                .all(|member| member.agent_id.is_none()),
+        "a designated swarm wakes only the designated member, who leads the request"
+    );
+    let lead_member = led.members[2].clone();
+    let lead_mock = scenario
+        .fixture
+        .mock_by_id(lead_member.agent_id.as_ref().expect("lead runtime"))
+        .await;
+    let (_, ping) = last_dispatch_context(&lead_mock.requests().await);
+    assert!(
+        ping.ends_with(&format!("post {}. You lead this request.", request.id.0)),
+        "the lead's wake tells it that it leads the request"
+    );
+
+    let lead_caller = scenario
+        .fixture
+        .agent_control_caller(lead_member.agent_id.as_ref().expect("lead runtime"))
+        .await;
+    let delegation = agent_published(
+        &lead_caller,
+        &publication(
+            SwarmBoard::Coordination,
+            "lead-delegates",
+            vec![
+                text("Please reproduce the failure "),
+                SwarmBodySegment::MemberMention {
+                    member_id: helper.id.clone(),
+                },
+            ],
+        ),
+    )
+    .await;
+    let delegated = scenario
+        .swarm(&live.id, |swarm| {
+            settled_member(swarm, &helper.id, &delegation)
+        })
+        .await;
+    let helper_caller = scenario
+        .fixture
+        .agent_control_caller(
+            delegated.members[0]
+                .agent_id
+                .as_ref()
+                .expect("delegated helper runtime"),
+        )
+        .await;
+    let mut briefing_reply = publication(
+        SwarmBoard::Briefing,
+        "helper-briefing-reply",
+        vec![text("I reproduced it")],
+    );
+    briefing_reply.thread_id = Some(request.thread_id.clone());
+    let refused = agent_post(
+        &helper_caller,
+        serde_json::to_value(&briefing_reply).expect("serialize reply"),
+    )
+    .await;
+    swarm_tool_error(&refused, SwarmErrorCode::Unauthorized);
+
+    let mut asked = publication(
+        SwarmBoard::Briefing,
+        "human-asks-helper",
+        vec![
+            text("What did you find? "),
+            SwarmBodySegment::MemberMention {
+                member_id: helper.id.clone(),
+            },
+        ],
+    );
+    asked.thread_id = Some(request.thread_id.clone());
+    let asked = scenario.post(&live.id, asked).await;
+    let answered_state = scenario
+        .swarm(&live.id, |swarm| settled_member(swarm, &helper.id, &asked))
+        .await;
+    assert_eq!(
+        woken_by(&answered_state, &asked),
+        vec![helper.id.clone()],
+        "a human mention in a led thread wakes only the mentioned member"
+    );
+    let mut answer = briefing_reply.clone();
+    answer.publication_id = SwarmPublicationId("helper-answers-human".into());
+    agent_published(&helper_caller, &answer).await;
+
+    let mut follow_up = publication(
+        SwarmBoard::Briefing,
+        "unmentioned-follow-up",
+        vec![text("Any update?")],
+    );
+    follow_up.thread_id = Some(request.thread_id.clone());
+    let follow_up = scenario.post(&live.id, follow_up).await;
+    let followed = scenario
+        .swarm(&live.id, |swarm| {
+            settled_member(swarm, &lead.id, &follow_up)
+        })
+        .await;
+    assert_eq!(
+        woken_by(&followed, &follow_up),
+        vec![lead.id.clone()],
+        "an unmentioned follow-up wakes only the lead"
+    );
+
+    scenario
+        .send(SwarmCommandPayload::SetRequestRouting {
+            swarm_id: live.id.clone(),
+            routing: protocol::SwarmRequestRouting::Decider {
+                instructions: "Use whoever fits".into(),
+            },
+        })
+        .await;
+    let assigning = scenario
+        .post(
+            &live.id,
+            publication(
+                SwarmBoard::Briefing,
+                "decider-request",
+                vec![text("Design the settings page")],
+            ),
+        )
+        .await;
+    let stuck = scenario
+        .swarm(&live.id, |swarm| {
+            swarm.threads.iter().any(|thread| {
+                thread.thread_id == assigning.thread_id
+                    && thread.assigning
+                    && thread.assigning_error.is_some()
+            })
+        })
+        .await;
+    assert!(
+        woken_by(&stuck, &assigning).is_empty() && lead_of(&stuck, &assigning).is_none(),
+        "a failed decider wakes no one and guesses no lead"
+    );
+    let decider = protocol::SwarmRequestRouting::Decider {
+        instructions: format!("Send design work to {}", peer.name),
+    };
+    scenario
+        .send(SwarmCommandPayload::SetRequestRouting {
+            swarm_id: live.id.clone(),
+            routing: decider,
+        })
+        .await;
+    let decided = scenario
+        .swarm(&live.id, |swarm| {
+            settled_member(swarm, &peer.id, &assigning)
+        })
+        .await;
+    assert!(
+        lead_of(&decided, &assigning) == Some(peer.id.clone())
+            && woken_by(&decided, &assigning) == vec![peer.id.clone()]
+            && decided.threads.iter().any(|thread| {
+                thread.thread_id == assigning.thread_id
+                    && !thread.assigning
+                    && thread.assigning_error.is_none()
+            }),
+        "the decider's retry picks one lead and wakes it exactly once"
+    );
+
+    let mentioned = scenario
+        .post(
+            &live.id,
+            publication(
+                SwarmBoard::Briefing,
+                "mention-overrides-decider",
+                vec![
+                    text("Take this one "),
+                    SwarmBodySegment::MemberMention {
+                        member_id: helper.id.clone(),
+                    },
+                ],
+            ),
+        )
+        .await;
+    let overridden = scenario
+        .swarm(&live.id, |swarm| {
+            settled_member(swarm, &helper.id, &mentioned)
+        })
+        .await;
+    assert!(
+        lead_of(&overridden, &mentioned) == Some(helper.id.clone())
+            && woken_by(&overridden, &mentioned) == vec![helper.id.clone()],
+        "a mention in a new request overrides routing and makes that member lead"
+    );
 }
