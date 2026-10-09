@@ -683,7 +683,7 @@ impl SettingsTab {
                 "New steering",
             ],
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
-            Self::Tychat => &["Tychat", "Pairing", "Bot", "Owner", "Reset", "API base URL"],
+            Self::Tychat => &["Tychat", "Pairing", "Bot", "Owner", "Reset"],
             Self::Mobile => &[
                 "Mobile",
                 "Mobile connections",
@@ -9886,10 +9886,15 @@ mod wasm_tests {
         next_tick().await;
         let text = container.text_content().unwrap();
         assert!(text.contains("Unpaired"));
+        assert!(text.contains("Launch profile") && text.contains("Access mode"));
         assert!(
-            text.contains("API base URL")
-                && text.contains("Launch profile")
-                && text.contains("Access mode")
+            !text.contains("API base")
+                && container
+                    .query_selector_all("input[type=url]")
+                    .unwrap()
+                    .length()
+                    == 0,
+            "the host owns the Tychat origin; the tab offers no endpoint field"
         );
         assert!(
             text.contains("Model") && text.contains("Sonnet"),

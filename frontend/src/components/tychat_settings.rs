@@ -79,8 +79,6 @@ pub fn TychatTab() -> impl IntoView {
         <fieldset disabled=move || config.get().is_none()>
             <label class="settings-toggle-row"><input type="checkbox" prop:checked=move || config.get().is_some_and(|config| config.enabled)
                 on:change=move |event| send_host_replace(&state.get_value(), "/tychat/enabled", event_target_checked(&event)) />"Enable Tychat"</label>
-            <label class="settings-field">"API base URL"<input class="settings-input" type="url" prop:value=move || config.get().map(|config| config.api_base_url).unwrap_or_default()
-                on:change=move |event| send_host_replace(&state.get_value(), "/tychat/api_base_url", event_target_value(&event)) /></label>
             <label class="settings-field">"Backend"<select class="settings-select" prop:value=move || config.get().and_then(|config| config.backend_kind).map(|kind| backend_value(kind).to_owned()).unwrap_or_default()
                 on:change=move |event| {
                     let key = event_target_value(&event);

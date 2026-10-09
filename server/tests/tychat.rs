@@ -34,7 +34,6 @@ async fn pair(fixture: &mut Fixture) -> (TychatPairingId, TestAgent) {
     let host = fixture.tychat_host();
     let generation = host
         .install_tychat_pairing(
-            TychatSettings::default().api_base_url,
             server::tychat::SecretBotState(vec![7; 32]),
             TychatFingerprints {
                 bot: "bot-fingerprint".into(),
@@ -147,7 +146,6 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
     assert_eq!(host.agent_ids().await.len(), 1);
     assert!(
         host.install_tychat_pairing(
-            TychatSettings::default().api_base_url,
             server::tychat::SecretBotState(vec![9]),
             TychatFingerprints {
                 bot: "other".into(),
@@ -304,14 +302,18 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         .replace_setting(
             "/tychat/api_base_url",
             "http://localhost:5000/api/v1",
-            TychatSettings::default().api_base_url,
+            "https://chat.tyggs.com",
         )
         .await
         .unwrap();
     assert!(
-        !fixture::expect_settings_write_result(&mut fixture.client, &url, "pin paired origin")
-            .await
-            .applied
+        !fixture::expect_settings_write_result(
+            &mut fixture.client,
+            &url,
+            "the host owns the Tychat origin"
+        )
+        .await
+        .applied
     );
 
     let bootstrap = fixture.restart_host().await;

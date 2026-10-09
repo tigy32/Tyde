@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 77;
+pub const PROTOCOL_VERSION: u32 = 78;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -9843,7 +9843,6 @@ pub struct BackendSteeringCapability {
 #[serde(deny_unknown_fields)]
 pub struct TychatSettings {
     pub enabled: bool,
-    pub api_base_url: String,
     pub backend_kind: Option<BackendKind>,
     pub session_settings: SessionSettingsValues,
     pub launch_profile_id: Option<LaunchProfileId>,
@@ -9854,7 +9853,6 @@ impl Default for TychatSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            api_base_url: "https://chat.tyggs.com".into(),
             backend_kind: None,
             session_settings: SessionSettingsValues::default(),
             launch_profile_id: None,

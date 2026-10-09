@@ -14,8 +14,12 @@ host events; they never infer activity, turn boundaries or delivery from history
 is pinned to git revision `36959436702547e5b2b27234b26931254fb59405` from
 `https://github.com/tigy32/tychat-bot`; Tyde does not fork its crypto or simulate
 Tychat. Production uses the root origin `https://chat.tyggs.com`, matching
-`tychat_bot::PRODUCTION_API_BASE`. The SDK appends `/api/v1`; settings reject an
-API path. Local integration uses a numeric loopback HTTP origin.
+`tychat_bot::PRODUCTION_API_BASE`. The SDK appends `/api/v1`. The origin is not a
+user setting: new pairings always redeem against production, and each pairing
+journals the origin it was redeemed against for reconnects. Only the
+`test-support` `HostRuntimeConfig::tychat_api_base` override points the host at a
+numeric loopback origin for local integration. Settings and secret journals
+written by v0.9.5-beta.10, which exposed the field, are migrated on load.
 
 ## Identity and lifecycle
 
@@ -39,7 +43,7 @@ credential and authorization checks remain intact.
 
 ## Settings and secrets
 
-The typed host settings contain enablement, API base URL, backend, backend-native
+The typed host settings contain enablement, backend, backend-native
 session values, optional launch profile and access mode. Only backends whose
 server declaration says they can steer mid-turn are admitted. Claude, Codex and
 Hermes implement `SteerOutcome` today; other providers inherit Unsupported.
@@ -51,7 +55,7 @@ profile and access-mode changes explicitly display **Applies on reset**; they
 never silently replace a live session. A pending backend change does not block
 resuming the existing backend session. Reset remains available after a failed
 resume, even without a live agent. Invalid settings fail before persistence.
-A paired API origin cannot change without unpairing.
+Writes to the retired `/tychat/api_base_url` path are rejected.
 
 Bot credentials, private keys, owner pin and cursors are serialized SDK
 `BotState`, kept opaque outside the bridge. They are never settings,
@@ -161,7 +165,6 @@ pub async fn tychat_bot_state(
 ) -> Option<(TychatPairingId, String, SecretBotState)>;
 pub async fn install_tychat_pairing(
     &self,
-    api_base_url: String,
     secret: SecretBotState,
     fingerprints: TychatFingerprints,
 ) -> Result<TychatPairingId, String>;

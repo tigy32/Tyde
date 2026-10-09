@@ -7,23 +7,6 @@ pub(super) async fn validate_tychat_settings(
     settings: &settings_model::HostSettings,
 ) -> Result<(), String> {
     let config = &settings.tychat;
-    let url =
-        url::Url::parse(&config.api_base_url).map_err(|_| "Tychat API base URL is invalid")?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if (url.scheme() != "https" && !(url.scheme() == "http" && local))
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("Tychat requires HTTPS (HTTP is allowed only on loopback), as an origin without a path, credentials, query or fragment".into());
-    }
-    if let Some(pairing) = &state.tychat.state.lock().await.journal.pairing
-        && pairing.api_base_url != config.api_base_url
-    {
-        return Err("Unpair before changing the Tychat API base URL".into());
-    }
     let Some(kind) = config.backend_kind else {
         return if config.enabled {
             Err("Choose a Tychat backend before enabling".into())
@@ -144,7 +127,6 @@ impl HostHandle {
     /// Phase B passes only a successfully redeemed and verified BotState here.
     pub async fn install_tychat_pairing(
         &self,
-        api_base_url: String,
         secret: SecretBotState,
         fingerprints: protocol::TychatFingerprints,
     ) -> Result<protocol::TychatPairingId, String> {
@@ -156,10 +138,6 @@ impl HostHandle {
         let generation = protocol::TychatPairingId(uuid::Uuid::new_v4().to_string());
         {
             let _guard = service.lifecycle.lock().await;
-            let settings = self.state.lock().await.settings_store.lock().await.get()?;
-            if settings.tychat.api_base_url != api_base_url {
-                return Err("Tychat API URL changed during pairing".into());
-            }
             let mut state = service.state.lock().await;
             if state.journal.pairing.is_some() {
                 return Err("Unpair before pairing another bot".into());
@@ -168,7 +146,7 @@ impl HostHandle {
             journal.pairing = Some(Pairing {
                 generation: generation.clone(),
                 secret,
-                api_base_url,
+                api_base_url: service.api_base.to_string(),
                 fingerprints: fingerprints.clone(),
             });
             state.commit(journal)?;
@@ -345,15 +323,13 @@ impl HostHandle {
     pub(crate) async fn tychat_command(&self, command: TychatCommandPayload) -> Result<(), String> {
         match command {
             TychatCommandPayload::Pair { code } => {
-                // Pair consumes the code; exclude URL/settings changes until its secret is durable.
+                // Pair consumes the code; exclude settings changes until its secret is durable.
                 let _settings_guard = self.settings_apply_lock.lock().await;
                 if self.tychat_bot_state().await.is_some() {
                     return Err("Unpair before pairing another bot".into());
                 }
-                let settings = self.tychat_settings().await?;
-                let base = url::Url::parse(&settings.api_base_url)
-                    .map_err(|_| "Invalid Tychat API origin")?;
                 let service = self.state.lock().await.tychat.clone();
+                let base = service.api_base.clone();
                 service.acquire_process_lock()?;
                 let paired = match tychat_bot::pair(&base, code.trim()).await {
                     Ok(paired) => paired,
@@ -366,7 +342,6 @@ impl HostHandle {
                     }
                 };
                 self.install_tychat_pairing(
-                    settings.api_base_url,
                     crate::tychat_bridge::encode(&paired.state)?,
                     protocol::TychatFingerprints {
                         bot: paired.bot_fingerprint,

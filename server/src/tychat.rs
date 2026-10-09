@@ -77,12 +77,27 @@ impl State {
     }
 }
 
+/// v0.9.5-beta.10 persisted the API origin inside the session's settings copy.
+fn decode_journal(bytes: &[u8]) -> Result<Journal, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "Invalid Tychat secret journal".to_owned())?;
+    if let Some(settings) = value
+        .pointer_mut("/session/settings")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        settings.remove("api_base_url");
+    }
+    serde_json::from_value(value).map_err(|_| "Invalid Tychat secret journal".to_owned())
+}
+
 #[derive(Clone)]
 pub(crate) struct TychatService {
     pub state: Arc<Mutex<State>>,
     pub lifecycle: Arc<Mutex<()>>,
     changed: watch::Sender<u64>,
     pub bridge: Arc<crate::tychat_bridge::BridgeHandle>,
+    /// Where new pairings are redeemed; an existing pairing keeps its own origin.
+    pub api_base: url::Url,
     #[cfg(feature = "test-support")]
     pub outbound_ack_gate: Arc<Mutex<Option<Arc<crate::host::SpawnOperationTestGateInner>>>>,
     process_lock: Arc<StdMutex<Option<std::fs::File>>>,
@@ -90,7 +105,7 @@ pub(crate) struct TychatService {
 }
 
 impl TychatService {
-    pub fn load(path: PathBuf) -> Result<Self, String> {
+    pub fn load(path: PathBuf, api_base: url::Url) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| "Cannot create Tychat secret directory")?;
         }
@@ -111,8 +126,7 @@ impl TychatService {
         let journal = match std::fs::read(&path) {
             Ok(bytes) => {
                 enforce_owner_only_file(&path)?;
-                serde_json::from_slice::<Journal>(&bytes)
-                    .map_err(|_| "Invalid Tychat secret journal".to_owned())?
+                decode_journal(&bytes)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Journal::default(),
             Err(_) => return Err("Cannot read Tychat secret journal".to_owned()),
@@ -142,6 +156,7 @@ impl TychatService {
             lifecycle: Arc::new(Mutex::new(())),
             changed,
             bridge: Arc::new(crate::tychat_bridge::BridgeHandle::default()),
+            api_base,
             #[cfg(feature = "test-support")]
             outbound_ack_gate: Arc::new(Mutex::new(None)),
             process_lock: Arc::new(StdMutex::new(process_lock)),
@@ -166,8 +181,7 @@ impl TychatService {
             .map_err(|_| "Another host owns this Tychat state")?;
         match std::fs::read(self.lock_path.with_extension("json")) {
             Ok(bytes) => {
-                let journal: Journal =
-                    serde_json::from_slice(&bytes).map_err(|_| "Invalid Tychat secret journal")?;
+                let journal = decode_journal(&bytes)?;
                 if journal.pairing.is_some() {
                     return Err(
                         "Another host saved a pairing; restart this host before continuing".into(),

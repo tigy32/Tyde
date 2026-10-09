@@ -126,14 +126,18 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
         tychat: TychatSettings {
             enabled: true,
             backend_kind: Some(BackendKind::Claude),
-            api_base_url: local.base.to_string().trim_end_matches('/').into(),
             ..Default::default()
         },
         ..Default::default()
     };
-    let mut fixture =
-        Fixture::new_with_settings_file(&serde_json::json!({ "settings": settings }).to_string())
-            .await;
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            tychat_api_base: Some(local.base.clone()),
+            ..Default::default()
+        },
+        &serde_json::json!({ "settings": settings }).to_string(),
+    )
+    .await;
     let host = fixture.tychat_host();
     let gate = MockGateHandle::new();
     let reply = format!("{}{}tail", "🦀".repeat(4100), " ".repeat(8100));

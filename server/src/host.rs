@@ -373,6 +373,9 @@ pub struct HostRuntimeConfig {
     /// Server-boundary simulations do not run a transport. Real Tychat tests leave this false.
     #[cfg(feature = "test-support")]
     pub tychat_bridge_disabled: bool,
+    /// Real local-Tychat tests pair against a loopback binary instead of production.
+    #[cfg(feature = "test-support")]
+    pub tychat_api_base: Option<url::Url>,
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -422,6 +425,8 @@ impl Default for HostRuntimeConfig {
         Self {
             #[cfg(feature = "test-support")]
             tychat_bridge_disabled: false,
+            #[cfg(feature = "test-support")]
+            tychat_api_base: None,
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
@@ -15565,8 +15570,17 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     crate::process_env::initialize_process_env()?;
-    let tychat =
-        crate::tychat::TychatService::load(paths.settings.with_file_name("tychat-secrets.json"))?;
+    let tychat_api_base = url::Url::parse(tychat_bot::PRODUCTION_API_BASE)
+        .map_err(|_| "Invalid production Tychat origin".to_owned())?;
+    #[cfg(feature = "test-support")]
+    let tychat_api_base = runtime_config
+        .tychat_api_base
+        .clone()
+        .unwrap_or(tychat_api_base);
+    let tychat = crate::tychat::TychatService::load(
+        paths.settings.with_file_name("tychat-secrets.json"),
+        tychat_api_base,
+    )?;
     let usage_wakeup_store =
         crate::usage_wakeup::WakeupStore::new(paths.settings.with_file_name("usage_wakeups.json"));
     let transcript_root =
