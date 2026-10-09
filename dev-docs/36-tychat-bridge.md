@@ -11,7 +11,7 @@ Protocol types live in `protocol/src/types.rs`. The host owns the singleton,
 settings, lifecycle, delivery and durable outbound journal. Frontends project
 host events; they never infer activity, turn boundaries or delivery from history.
 `server/src/tychat_bridge.rs` runs the real `tychat-bot` client. The public SDK
-is pinned to git revision `d856923f98d4c6c85b74013d31be3e43a63bf401` from
+is pinned to git revision `36959436702547e5b2b27234b26931254fb59405` from
 `https://github.com/tigy32/tychat-bot`; Tyde does not fork its crypto or simulate
 Tychat. Production uses the root origin `https://chat.tyggs.com`, matching
 `tychat_bot::PRODUCTION_API_BASE`. The SDK appends `/api/v1`; settings reject an
