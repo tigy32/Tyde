@@ -77,7 +77,8 @@ impl State {
     }
 }
 
-/// v0.9.5-beta.10 persisted the API origin inside the session's settings copy.
+/// v0.9.5-beta.10 persisted the API origin and access mode inside the
+/// session's settings copy, and that session ran without a custom agent.
 fn decode_journal(bytes: &[u8]) -> Result<Journal, String> {
     let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| "Invalid Tychat secret journal".to_owned())?;
@@ -86,6 +87,10 @@ fn decode_journal(bytes: &[u8]) -> Result<Journal, String> {
         .and_then(serde_json::Value::as_object_mut)
     {
         settings.remove("api_base_url");
+        settings.remove("access_mode");
+        settings
+            .entry("custom_agent_id")
+            .or_insert(serde_json::Value::Null);
     }
     serde_json::from_value(value).map_err(|_| "Invalid Tychat secret journal".to_owned())
 }
@@ -351,7 +356,7 @@ pub(crate) fn steering_capabilities() -> Vec<BackendSteeringCapability> {
 
 pub(crate) const STARTUP_MESSAGE: &str = "Your Tychat session is ready. Greet the owner in one short sentence, then wait for their message. Do not start any tasks until asked.";
 
-pub(crate) const INSTRUCTIONS: &str = "You are the Tychat agent, the owner's personal assistant on this Tyde host. You talk to the owner on their phone through Tychat. Keep replies short. Delegate coding to agents in their own Tyde workbenches; do not do coding in your host workspace. Use agent-control MCP with global: true to see, read, await and drive every agent on the host. Check tyde_list_launch_options before spawning. Await pending agents, read their results, and report to the owner. Follow repository workbench and validation rules. Do not expose credentials or private keys.";
+pub(crate) const INSTRUCTIONS: &str = "## Tychat\n\nYou are the Tychat agent: the owner messages you from their phone through Tychat, and your final message each turn is sent back to them. Keep replies short and phone-readable. Unless the owner asks you to do something yourself, hand work to independent top-level agents rather than doing it in this session, and report back when it finishes. Agent-control MCP with global: true lets you spawn, list, read, await and steer every agent on the host. Never expose credentials or private keys.";
 
 pub(crate) fn answer(request: &ToolRequest, text: &str) -> Result<SendMessageToolResponse, String> {
     match request.tool_type {

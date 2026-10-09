@@ -22,8 +22,10 @@ pub(super) async fn validate_tychat_settings(
     if !settings.enabled_backends.contains(&kind) {
         return Err("Tychat backend must be enabled".into());
     }
-    if config.access_mode == protocol::BackendAccessMode::EnforcedReadOnly {
-        return Err("Tychat supports unrestricted or advisory read-only access".into());
+    if let Some(id) = config.custom_agent_id.as_ref()
+        && state.custom_agent_store.lock().await.get(id).is_none()
+    {
+        return Err("Tychat agent's custom agent no longer exists".into());
     }
     let mut values = match config.launch_profile_id.as_ref() {
         Some(id) => {
@@ -504,7 +506,7 @@ impl HostHandle {
                 let saved = saved.ok_or("Tychat live session has no durable binding")?;
                 let mut application = if saved.settings.backend_kind != settings.tychat.backend_kind
                     || saved.settings.launch_profile_id != settings.tychat.launch_profile_id
-                    || saved.settings.access_mode != settings.tychat.access_mode
+                    || saved.settings.custom_agent_id != settings.tychat.custom_agent_id
                     || !desired_profile
                         .as_ref()
                         .is_ok_and(|profile| profile == &saved.launch_profile)
@@ -582,7 +584,7 @@ impl HostHandle {
                 backend_kind: backend,
                 launch_profile_id: settings.tychat.launch_profile_id.clone(),
                 cost_hint: None,
-                access_mode: settings.tychat.access_mode,
+                access_mode: protocol::BackendAccessMode::Unrestricted,
                 session_settings: Some(settings.tychat.session_settings.clone()),
             },
         };
@@ -592,7 +594,10 @@ impl HostHandle {
                     name: Some("Tychat agent".into()),
                     parent_agent_id: None,
                     project_id: None,
-                    custom_agent_id: None,
+                    custom_agent_id: match &params {
+                        SpawnAgentParams::New { .. } => settings.tychat.custom_agent_id.clone(),
+                        _ => None,
+                    },
                     params,
                 },
                 AgentOrigin::Tychat,

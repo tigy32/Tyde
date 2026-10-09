@@ -36,26 +36,34 @@ unpair, so archived sessions cannot be adopted as another Tychat agent. Resume
 failure is visible, never an implicit fresh conversation.
 
 Agent-control and await MCP are always injected, even when ordinary injection
-is disabled. Instructions identify the owner/phone channel, request short
-replies, and require delegation of coding into workbenches. The agent uses
+is disabled. The agent always runs unrestricted. It runs as the custom agent
+chosen in settings, by default the builtin **Tyde Operator** (id `tyde-help`,
+formerly Help), which also gets `tyde-config` and coordinates independent
+top-level agents. Tychat instructions identify the owner/phone channel, request
+short replies, and ask the agent to hand work to other top-level agents unless
+the owner asks it to act directly; tool policy does not forbid direct work. The agent uses
 `global: true` for host-wide list/read/await/send operations. Existing MCP
 credential and authorization checks remain intact.
 
 ## Settings and secrets
 
-The typed host settings contain enablement, backend, backend-native
-session values, optional launch profile and access mode. Only backends whose
+The typed host settings contain enablement, custom agent (`None` is the plain
+Default agent), backend, backend-native session values and optional launch
+profile. A custom agent that no longer exists is rejected. Only backends whose
 server declaration says they can steer mid-turn are admitted. Claude, Codex and
 Hermes implement `SteerOutcome` today; other providers inherit Unsupported.
 The frontend filters the server-published capability entries, not backend names.
 Session controls reuse backend-defined schemas and launch-profile resolution.
 A changed launch profile definition also explicitly applies on reset.
-Live session settings use the existing acknowledged application path. Backend,
-profile and access-mode changes explicitly display **Applies on reset**; they
+Live session settings use the existing acknowledged application path. Custom agent,
+backend and profile changes explicitly display **Applies on reset**; they
 never silently replace a live session. A pending backend change does not block
 resuming the existing backend session. Reset remains available after a failed
 resume, even without a live agent. Invalid settings fail before persistence.
-Writes to the retired `/tychat/api_base_url` path are rejected.
+Writes to the retired `/tychat/api_base_url` and `/tychat/access_mode` paths
+are rejected. Settings and secret journals written by v0.9.5-beta.10 are
+migrated on load to the Operator; a session started by beta.10 keeps running
+as before and reports **Applies on reset** until it is reset.
 
 Bot credentials, private keys, owner pin and cursors are serialized SDK
 `BotState`, kept opaque outside the bridge. They are never settings,

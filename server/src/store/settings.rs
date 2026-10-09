@@ -80,7 +80,7 @@ impl HostSettingsStore {
         // that reason. It must also precede `read_from_disk`, which strips
         // unrecognized backend kinds and would drop "kiro" rather than rename
         // it.
-        Self::migrate_tychat_api_base(&path)?;
+        Self::migrate_tychat_settings(&path)?;
         Self::migrate_review_aspects(&path)?;
         Self::migrate_reviewers(&path)?;
         Self::migrate_legacy_kiro_settings(&path)?;
@@ -298,21 +298,34 @@ impl HostSettingsStore {
     }
 
     /// v0.9.5-beta.10 stored a Tychat API origin setting; the host now owns it.
-    fn migrate_tychat_api_base(path: &Path) -> Result<(), String> {
+    /// v0.9.5-beta.10 exposed an API origin and an access mode for the Tychat
+    /// agent; the host now owns both, and the agent runs as a custom agent.
+    fn migrate_tychat_settings(path: &Path) -> Result<(), String> {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("Cannot read Tychat settings: {error}")),
         };
         let mut value: Value = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
-        let removed = value
+        let Some(tychat) = value
             .pointer_mut("/settings/tychat")
             .and_then(Value::as_object_mut)
-            .and_then(|tychat| tychat.remove("api_base_url"));
-        if removed.is_none() {
+        else {
+            return Ok(());
+        };
+        let retired_origin = tychat.remove("api_base_url").is_some();
+        let retired_access = tychat.remove("access_mode").is_some();
+        let added = !tychat.contains_key("custom_agent_id");
+        if added {
+            tychat.insert(
+                "custom_agent_id".into(),
+                Value::String(protocol::OPERATOR_CUSTOM_AGENT_ID.into()),
+            );
+        }
+        if !retired_origin && !retired_access && !added {
             return Ok(());
         }
-        tracing::info!("removed the retired Tychat API origin setting");
+        tracing::info!("migrated Tychat settings to the custom-agent shape");
         Self::save_raw(path, &value)
     }
 

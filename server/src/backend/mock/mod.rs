@@ -129,6 +129,16 @@ pub fn session_builtin_steering(session_id: &SessionId) -> Option<String> {
         .map(|record| record.builtin_steering.clone())
 }
 
+/// The custom-agent instructions the server resolved for a mock session's latest spawn.
+#[cfg(any(test, feature = "test-support"))]
+pub fn session_instructions(session_id: &SessionId) -> Option<String> {
+    session_store()
+        .lock()
+        .expect("mock backend session store mutex poisoned")
+        .get(&session_id.0)
+        .and_then(|record| record.instructions.clone())
+}
+
 fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
     static STORE: OnceLock<Mutex<HashMap<String, MockSessionRecord>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))

@@ -87,8 +87,8 @@ const DID_YOU_KNOW_TIPS: &[(&str, &str)] = &[
         "Pick the Orchestrator agent from the New Chat \u{25be} menu: every backend drafts a plan, the plans cross-review to consensus, one agent implements, and the other backends review the result.",
     ),
     (
-        "Ask the Help agent",
-        "Pick Help from the New Chat \u{25be} menu to ask how anything in Tyde works \u{2014} it can change settings and create agents for you.",
+        "Ask the Tyde Operator",
+        "Pick Tyde Operator from the New Chat \u{25be} menu to ask how anything in Tyde works \u{2014} it can change settings and run other agents for you.",
     ),
     (
         "Customize your default agent",

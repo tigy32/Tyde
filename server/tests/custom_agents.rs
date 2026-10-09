@@ -454,13 +454,15 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     assert_orchestrator_uses_tyde_agent_control(orchestrator);
     let help = builtins
         .get(&CustomAgentId("tyde-help".to_owned()))
-        .expect("built-in Help should be seeded");
-    assert_eq!(help.name, "Help");
+        .expect("built-in Tyde Operator should be seeded");
+    assert_eq!(help.name, "Tyde Operator");
     assert!(
-        help.instructions
-            .as_deref()
-            .is_some_and(|instructions| instructions.contains("tyde-config")),
-        "Help should reference its config tools: {help:?}"
+        help.instructions.as_deref().is_some_and(|instructions| {
+            instructions.contains("tyde-config")
+                && instructions.contains("top-level coordinator")
+                && instructions.contains("tyde_config_spawn_agent")
+        }),
+        "the Operator should coordinate through its config tools: {help:?}"
     );
     assert!(
         help.instructions.as_deref().is_some_and(|instructions| {
@@ -529,8 +531,12 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         .expect("Help v2 must document its global controls")
         .0
         .to_owned();
-    for instructions in [shipped_help_v1, shipped_help_v2] {
+    let shipped_help_v3 = server::store::custom_agents::superseded_help_v3_instructions();
+    for instructions in [shipped_help_v1, shipped_help_v2, shipped_help_v3] {
         let mut previous_help = help.clone();
+        previous_help.name = "Help".to_owned();
+        previous_help.description =
+            "Answers questions about Tyde and can configure settings for you.".to_owned();
         previous_help.instructions = Some(instructions);
         fixture
             .client
@@ -551,7 +557,7 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         assert_eq!(
             replayed.get(&help.id),
             Some(help),
-            "Unedited shipped Help must upgrade to the active instructions on restart"
+            "Unedited shipped Help must upgrade to the Tyde Operator on restart"
         );
         assert_eq!(
             replayed.get(&orchestrator_id),

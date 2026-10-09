@@ -268,7 +268,7 @@ Input:
 - `global?`: default `false`
 
 With `global: true` the spawn creates an independent top-level agent through
-the same path Help uses: no parent, and nothing inherited from the caller.
+the same path the Tyde Operator uses: no parent, and nothing inherited from the caller.
 Supply a `project_id` from `tyde_list_workbenches` with `global: true`, or
 absolute `workspace_roots`. The caller reaches the new agent with the `global`
 forms of await, read, and send; it is not a child, so close does not apply.

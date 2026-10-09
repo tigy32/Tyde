@@ -2,7 +2,7 @@
 //!
 //! Exposes host configuration — settings, custom agents, skills, MCP servers,
 //! backend setup status, and host-wide agent lifecycle — as MCP tools. Attached only to spawns of the
-//! builtin Help agent so a user can ask it to inspect and change Tyde
+//! builtin Tyde Operator so a user can ask it to inspect and change Tyde
 //! configuration directly. All mutations go through the same `HostHandle`
 //! methods the protocol handlers use, so connected clients see changes
 //! immediately via the usual notify fan-out.
@@ -477,7 +477,7 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "List all open agents across all projects on this Tyde host, including top-level agents and children, with server-owned status and parent/project IDs. Not limited to Help's children. Excludes closed session history."
+        description = "List all open agents across all projects on this Tyde host, including top-level agents and children, with server-owned status and parent/project IDs. Not limited to the Operator's children. Excludes closed session history."
     )]
     async fn tyde_config_list_agents(
         &self,
@@ -490,7 +490,7 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Create an independent top-level agent, not a child of Help, on this Tyde host. Supply a project ID from tyde_config_list_projects or absolute workspace roots. Read tyde_config_list_launch_options first and follow the user's launch preference unless explicitly directed otherwise. Returns agent_id after launch; does not wait for completion."
+        description = "Create an independent top-level agent, not a child of the Operator, on this Tyde host. Supply a project ID from tyde_config_list_projects or absolute workspace roots. Read tyde_config_list_launch_options first and follow the user's launch preference unless explicitly directed otherwise. Returns agent_id after launch; does not wait for completion."
     )]
     async fn tyde_config_spawn_agent(
         &self,
@@ -514,7 +514,7 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Send a message to any open agent on this Tyde host by exact agent_id. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Not limited to Help's children."
+        description = "Send a message to any open agent on this Tyde host by exact agent_id. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Not limited to the Operator's children."
     )]
     async fn tyde_config_send_agent_message(
         &self,
@@ -534,7 +534,7 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Close any open agent on this Tyde host by exact agent_id, stopping its active work and closing its descendants through the normal lifecycle. Does not delete saved session history. Confirm the target with the user before closing; never close Help itself while it is handling the request."
+        description = "Close any open agent on this Tyde host by exact agent_id, stopping its active work and closing its descendants through the normal lifecycle. Does not delete saved session history. Confirm the target with the user before closing; never close the Operator itself while it is handling the request."
     )]
     async fn tyde_config_close_agent(
         &self,

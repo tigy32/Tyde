@@ -683,7 +683,9 @@ impl SettingsTab {
                 "New steering",
             ],
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
-            Self::Tychat => &["Tychat", "Pairing", "Bot", "Owner", "Reset"],
+            Self::Tychat => &[
+                "Tychat", "Pairing", "Bot", "Owner", "Agent", "Operator", "Reset",
+            ],
             Self::Mobile => &[
                 "Mobile",
                 "Mobile connections",
@@ -9844,6 +9846,23 @@ mod wasm_tests {
             ];
             settings.tychat.backend_kind = Some(BackendKind::Hermes);
         });
+        state.custom_agents.update(|hosts| {
+            let agents = hosts.entry("host-lp".to_owned()).or_default();
+            for (id, name) in [("reviewer", "Reviewer"), ("tyde-help", "Tyde Operator")] {
+                agents.insert(
+                    CustomAgentId(id.to_owned()),
+                    CustomAgent {
+                        id: CustomAgentId(id.to_owned()),
+                        name: name.to_owned(),
+                        description: String::new(),
+                        instructions: None,
+                        skill_ids: Vec::new(),
+                        mcp_server_ids: Vec::new(),
+                        tool_policy: protocol::ToolPolicy::Unrestricted,
+                    },
+                );
+            }
+        });
         let mut snapshot = protocol::TychatStatePayload {
             backend_capabilities: vec![
                 BackendKind::Claude,
@@ -9884,9 +9903,79 @@ mod wasm_tests {
         next_tick().await;
         click_tab(&container, "Tychat");
         next_tick().await;
+        let status_text = |container: &HtmlElement| {
+            container
+                .query_selector(".settings-panel-header [role=status]")
+                .unwrap()
+                .expect("status chip")
+                .text_content()
+                .unwrap()
+        };
+        let control = |container: &HtmlElement, label: &str| -> HtmlSelectElement {
+            let labels = container.query_selector_all("label").unwrap();
+            let id = (0..labels.length())
+                .find_map(|index| {
+                    let label_el = labels.item(index)?.dyn_into::<web_sys::Element>().ok()?;
+                    (label_el.text_content()?.trim() == label)
+                        .then(|| label_el.get_attribute("for"))
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("{label} label"));
+            container
+                .query_selector(&format!("#{id}"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label} control"))
+                .dyn_into()
+                .unwrap()
+        };
+        let option_names = |select: &HtmlSelectElement| -> Vec<String> {
+            let options = select.query_selector_all("option").unwrap();
+            (0..options.length())
+                .map(|index| options.item(index).unwrap().text_content().unwrap())
+                .collect()
+        };
         let text = container.text_content().unwrap();
-        assert!(text.contains("Unpaired"));
-        assert!(text.contains("Launch profile") && text.contains("Access mode"));
+        assert_eq!(status_text(&container), "Not paired");
+        assert!(
+            text.contains("Settings → Bots"),
+            "the unpaired tab says where the pairing code comes from"
+        );
+        assert!(
+            !text.contains("Access mode") && !text.contains("Launch profile"),
+            "the Tychat agent always runs unrestricted, and Hermes has no launch profiles here"
+        );
+        let agent = control(&container, "Agent");
+        assert_eq!(
+            option_names(&agent),
+            vec!["Default agent", "Tyde Operator", "Reviewer"],
+            "the Operator leads the agent picker"
+        );
+        assert_eq!(
+            agent.value(),
+            "tyde-help",
+            "the Tychat agent runs as the Tyde Operator by default"
+        );
+        agent.set_value("reviewer");
+        agent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        agent.set_value("");
+        agent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        assert!(
+            writes
+                .iter()
+                .any(|op| replacement_value(op, "/tychat/custom_agent_id")
+                    == Some(&Value::String("reviewer".into())))
+                && writes.iter().any(
+                    |op| replacement_value(op, "/tychat/custom_agent_id") == Some(&Value::Null)
+                ),
+            "the agent picker writes the typed custom agent id"
+        );
         assert!(
             !text.contains("API base")
                 && container
@@ -9900,32 +9989,10 @@ mod wasm_tests {
             text.contains("Model") && text.contains("Sonnet"),
             "render the backend-defined session controls"
         );
-        let labels = container.query_selector_all("label").unwrap();
-        let backend: HtmlSelectElement = (0..labels.length())
-            .find_map(|index| {
-                let label = labels.item(index)?.dyn_into::<HtmlElement>().ok()?;
-                label.text_content()?.starts_with("Backend").then(|| {
-                    label
-                        .query_selector("select")
-                        .unwrap()
-                        .unwrap()
-                        .dyn_into()
-                        .unwrap()
-                })
-            })
-            .expect("backend control");
-        let options = backend.query_selector_all("option").unwrap();
-        let names: Vec<_> = (0..options.length())
-            .map(|index| options.item(index).unwrap().text_content().unwrap())
-            .collect();
+        let backend = control(&container, "Backend");
         assert_eq!(
-            names,
-            vec![
-                "Choose a steer-capable backend",
-                "Claude",
-                "Codex",
-                "Hermes"
-            ]
+            option_names(&backend),
+            vec!["Choose a backend", "Claude", "Codex", "Hermes"]
         );
         let enabled: HtmlInputElement = container
             .query_selector("input[type='checkbox']")
@@ -9990,9 +10057,18 @@ mod wasm_tests {
         );
         next_tick().await;
         let text = container.text_content().unwrap();
-        assert!(text.contains("Connected") && text.contains("Applies on reset"));
+        assert_eq!(status_text(&container), "Connected");
+        assert!(text.contains("Applies on reset"));
         assert!(
             text.contains("public bot fingerprint") && text.contains("public owner fingerprint")
+        );
+        assert!(
+            container
+                .query_selector("input[type='password']")
+                .unwrap()
+                .is_none()
+                && text.contains("Unpair"),
+            "a paired host offers Unpair instead of another pairing code"
         );
         snapshot.status = protocol::TychatBridgeStatus::Paused {
             reason: "Owner identity needs verification".into(),
@@ -10009,11 +10085,12 @@ mod wasm_tests {
             .unwrap(),
         );
         next_tick().await;
+        assert_eq!(status_text(&container), "Paused");
         assert!(
             container
                 .text_content()
                 .unwrap()
-                .contains("Paused: Owner identity needs verification")
+                .contains("Owner identity needs verification")
         );
         state.host_settings_by_host.update(|hosts| {
             hosts.get_mut("host-lp").unwrap().tychat.enabled = true;

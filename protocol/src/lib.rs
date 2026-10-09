@@ -13,10 +13,10 @@ pub use types::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlCappedEvents,
     AgentControlLatestOutput, AgentControlOutputProjectionError, AgentControlReadDebugResult,
-    SWARM_MAX_POST_BYTES, SWARM_MAX_READ_PAGE_BYTES, SWARM_READ_PAGE_CONTAINER_BYTES, SwarmCommit,
-    SwarmCommitStatus, SwarmLegacySource, agent_control_output_from_chat_event,
-    agent_control_output_from_envelope, cap_agent_control_events, swarm_member_inactive,
-    swarm_publication_route,
+    OPERATOR_CUSTOM_AGENT_ID, SWARM_MAX_POST_BYTES, SWARM_MAX_READ_PAGE_BYTES,
+    SWARM_READ_PAGE_CONTAINER_BYTES, SwarmCommit, SwarmCommitStatus, SwarmLegacySource,
+    agent_control_output_from_chat_event, agent_control_output_from_envelope,
+    cap_agent_control_events, swarm_member_inactive, swarm_publication_route,
 };
 pub use types::{
     AcpAdapterId, AcpAgentSpec, AgentActivity, AgentActivityChangedPayload, AgentActivityStats,

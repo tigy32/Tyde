@@ -17877,9 +17877,10 @@ pub(crate) fn startup_mcp_servers_for_settings(
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
 
-    // The builtin Help agent gets the host-configuration tools; no other
+    // The builtin Tyde Operator gets the host-configuration tools; no other
     // agent does.
-    if custom_agent_id.is_some_and(|id| id.0 == crate::store::custom_agents::HELP_CUSTOM_AGENT_ID)
+    if custom_agent_id
+        .is_some_and(|id| id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID)
         && !config_mcp.url.is_empty()
     {
         servers.push(StartupMcpServer {

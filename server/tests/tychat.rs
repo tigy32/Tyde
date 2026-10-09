@@ -171,10 +171,17 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         .unwrap();
     let instructions = server::backend::mock::session_builtin_steering(&original).unwrap();
     assert!(instructions.contains("global: true"));
-    assert!(instructions.contains("workbench"));
+    let operator = server::backend::mock::session_instructions(&original)
+        .expect("the Tychat agent runs as the Tyde Operator by default");
+    assert!(operator.contains("top-level coordinator") && operator.contains("workbench"));
+    let operator_tools = vec![
+        "tyde-config(http)",
+        "tyde-agent-control(http)",
+        "tyde-agent-await(http)",
+    ];
     assert_eq!(
         server::backend::mock::session_startup_mcp_servers(&original).unwrap(),
-        vec!["tyde-agent-control(http)", "tyde-agent-await(http)"]
+        operator_tools
     );
 
     let invalid = fixture
@@ -264,10 +271,47 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         )
         .await
         .unwrap();
+    assert!(
+        !fixture::expect_settings_write_result(
+            &mut fixture.client,
+            &access,
+            "the Tychat agent always runs unrestricted"
+        )
+        .await
+        .applied
+    );
+    let operator_id = Some(CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()));
+    let missing = fixture
+        .client
+        .replace_setting(
+            "/tychat/custom_agent_id",
+            Some(CustomAgentId("deleted-agent".into())),
+            operator_id.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !fixture::expect_settings_write_result(
+            &mut fixture.client,
+            &missing,
+            "reject an unknown custom agent"
+        )
+        .await
+        .applied
+    );
+    let custom_agent = fixture
+        .client
+        .replace_setting(
+            "/tychat/custom_agent_id",
+            Some(CustomAgentId("tyde-default".into())),
+            operator_id,
+        )
+        .await
+        .unwrap();
     fixture::expect_settings_write_applied(
         &mut fixture.client,
-        &access,
-        "stage immutable settings",
+        &custom_agent,
+        "stage another custom agent",
     )
     .await;
     assert_eq!(
@@ -323,6 +367,11 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
     assert!(
         fixture.agent_session_ids().await == vec![original.clone()],
         "resume preserves the backend session"
+    );
+    assert_eq!(
+        server::backend::mock::session_startup_mcp_servers(&original).unwrap(),
+        operator_tools,
+        "resume keeps the custom agent the session started with"
     );
     assert!(host.tychat_bot_state().await.is_some());
     let secret = serde_json::to_string(&vec![7u8; 32]).unwrap();
@@ -382,9 +431,18 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         })
         .await;
     assert_eq!(host.agent_ids().await.len(), 1);
+    let fresh = fixture.agent_session_ids().await;
     assert!(
-        fixture.agent_session_ids().await != vec![original.clone()],
+        fresh != vec![original.clone()],
         "reset creates a fresh backend session"
+    );
+    assert!(
+        !server::backend::mock::session_startup_mcp_servers(&fresh[0])
+            .unwrap()
+            .contains(&"tyde-config(http)".to_owned())
+            && !server::backend::mock::session_instructions(&fresh[0])
+                .is_some_and(|instructions| instructions.contains("top-level coordinator")),
+        "reset starts the staged custom agent instead of the Operator"
     );
     fixture
         .client
@@ -767,5 +825,49 @@ async fn turn_end_race_starts_without_queueing() {
             .await
             .iter()
             .any(|request| matches!(request, MockRequest::Interrupt))
+    );
+}
+
+#[tokio::test]
+async fn beta10_stores_upgrade_to_the_operator() {
+    let mut fixture = configured().await;
+    let (generation, _agent) = pair(&mut fixture).await;
+    let journal_path = fixture.tychat_secret_path();
+    let settings_path = journal_path.with_file_name("settings.json");
+    let beta10 = |value: &mut serde_json::Value, pointer: &str| {
+        let tychat = value.pointer_mut(pointer).unwrap().as_object_mut().unwrap();
+        assert!(tychat.remove("custom_agent_id").is_some());
+        tychat.insert("api_base_url".into(), "https://chat.tyggs.com".into());
+        tychat.insert("access_mode".into(), "unrestricted".into());
+    };
+    fixture
+        .restart_host_with_runtime_config(|_| {
+            for (path, pointer) in [
+                (&settings_path, "/settings/tychat"),
+                (&journal_path, "/session/settings"),
+            ] {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                beta10(&mut value, pointer);
+                std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+        })
+        .await;
+    let host = fixture.tychat_host();
+    ready(&host).await;
+    assert_eq!(host.tychat_bot_state().await.unwrap().0, generation);
+    assert_eq!(
+        host.tychat_settings().await.unwrap().custom_agent_id,
+        Some(CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned())),
+        "an upgraded host runs the Tychat agent as the Operator"
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    let persisted = persisted.pointer("/settings/tychat").unwrap();
+    assert!(persisted.get("api_base_url").is_none() && persisted.get("access_mode").is_none());
+    assert_eq!(
+        host.tychat_state().await.settings_application,
+        TychatSettingsApplication::AppliesOnReset,
+        "the beta.10 session ran without a custom agent until it is reset"
     );
 }

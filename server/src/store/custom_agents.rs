@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub const TEAM_LEAD_CUSTOM_AGENT_ID: &str = "tyde-team-lead";
 pub const DEFAULT_CUSTOM_AGENT_ID: &str = "tyde-default";
-pub const HELP_CUSTOM_AGENT_ID: &str = "tyde-help";
+pub const OPERATOR_CUSTOM_AGENT_ID: &str = protocol::OPERATOR_CUSTOM_AGENT_ID;
 pub const PROJECT_MANAGER_CUSTOM_AGENT_ID: &str = "tyde-project-manager";
 pub const LANDER_CUSTOM_AGENT_ID: &str = "tyde-lander";
 
@@ -1207,7 +1207,36 @@ where in the UI the answer would be visible.
 
 const HELP_V2_BUILTIN_AGENTS: &str = "Three are\n  built in: **Default** (used whenever no other agent is picked — edit it to\n  customize every plain chat), **Orchestrator** (coordinates multi-backend\n  plan/implement/review workflows), and **Help** (you).";
 
-fn help_instructions() -> String {
+const OPERATOR_INTRO: &str =
+    "You are the Tyde Operator, the top-level coordinator for this Tyde host.
+
+You can inspect and change Tyde itself (settings, custom agents, skills, MCP
+servers) and see, create, steer, and close every agent on the host with your
+`tyde-config` tools. You also answer questions about how to use Tyde.";
+
+const OPERATOR_COORDINATION: &str = "## Coordinating work
+
+You coordinate; other agents do the work. For code changes, investigations,
+or any substantial task, create independent top-level agents with
+`tyde_config_spawn_agent` (in a workbench when the project's rules call for
+one), steer them with `tyde_config_send_agent_message`, follow their status
+with `tyde_config_list_agents`, and report what they did. Do the work yourself
+only when the user explicitly asks you to.";
+
+fn operator_instructions() -> String {
+    format!(
+        "{}\n\n{OPERATOR_COORDINATION}",
+        superseded_help_v3_instructions()
+            .replacen(
+                "You are the Tyde Help agent.\n\nYou answer questions about how to use Tyde and, when asked, configure it\ndirectly using your `tyde-config` tools.",
+                OPERATOR_INTRO,
+                1,
+            )
+            .replacen("and **Help**\n  (you).", "and **Tyde Operator**\n  (you).", 1)
+    )
+}
+
+pub fn superseded_help_v3_instructions() -> String {
     superseded_help_v2_instructions().replace(
         HELP_V2_BUILTIN_AGENTS,
         "Five are\n  built in: **Default** (used whenever no other agent is picked — edit it to\n  customize every plain chat), **Orchestrator** (coordinates multi-backend\n  plan/implement/review workflows), **Project Manager** (takes a dump of tasks,\n  runs one Implementer per task, and lands them through the Lander), **Lander**\n  (lands finished workbench commits on main in validated batches), and **Help**\n  (you).",
@@ -1872,11 +1901,12 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
-            id: CustomAgentId(HELP_CUSTOM_AGENT_ID.to_owned()),
-            name: "Help".to_owned(),
-            description: "Answers questions about Tyde and can configure settings for you."
-                .to_owned(),
-            instructions: Some(help_instructions()),
+            id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
+            name: "Tyde Operator".to_owned(),
+            description:
+                "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde."
+                    .to_owned(),
+            instructions: Some(operator_instructions()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
@@ -1932,7 +1962,7 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
 fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     let mut published = legacy_builtin_team_custom_agents();
     published.push(CustomAgent {
-        id: CustomAgentId(HELP_CUSTOM_AGENT_ID.to_owned()),
+        id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),
         description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
         instructions: Some(HELP_INSTRUCTIONS.trim().to_owned()),
@@ -1941,10 +1971,19 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         tool_policy: ToolPolicy::Unrestricted,
     });
     published.push(CustomAgent {
-        id: CustomAgentId(HELP_CUSTOM_AGENT_ID.to_owned()),
+        id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),
         description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
         instructions: Some(superseded_help_v2_instructions()),
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+        tool_policy: ToolPolicy::Unrestricted,
+    });
+    published.push(CustomAgent {
+        id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
+        name: "Help".to_owned(),
+        description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
+        instructions: Some(superseded_help_v3_instructions()),
         skill_ids: Vec::new(),
         mcp_server_ids: Vec::new(),
         tool_policy: ToolPolicy::Unrestricted,

@@ -414,7 +414,7 @@ reviewer inheriting the host default backend and its current settings at launch.
 Each entry has a stable `id`, a `name`, and a typed `target`: `kind: default`,
 or `kind: explicit` with `backend_kind` and `session_settings`. Lists must be
 nonempty and IDs unique within each mode. Multiple entries can use the same
-backend with different models/settings. Help uses `review_reviewers` with
+backend with different models/settings. The Tyde Operator uses `review_reviewers` with
 `mode` and `reviewers` to replace a list.
 
 Lite launches one agent per reviewer, each receiving all enabled aspects.

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 78;
+pub const PROTOCOL_VERSION: u32 = 79;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -383,9 +383,12 @@ impl fmt::Display for ProjectId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct CustomAgentId(pub String);
+
+/// The builtin Tyde Operator; the id predates its rename from Help.
+pub const OPERATOR_CUSTOM_AGENT_ID: &str = "tyde-help";
 
 impl fmt::Display for CustomAgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -9846,7 +9849,8 @@ pub struct TychatSettings {
     pub backend_kind: Option<BackendKind>,
     pub session_settings: SessionSettingsValues,
     pub launch_profile_id: Option<LaunchProfileId>,
-    pub access_mode: BackendAccessMode,
+    /// `None` runs the plain Default agent.
+    pub custom_agent_id: Option<CustomAgentId>,
 }
 
 impl Default for TychatSettings {
@@ -9856,7 +9860,7 @@ impl Default for TychatSettings {
             backend_kind: None,
             session_settings: SessionSettingsValues::default(),
             launch_profile_id: None,
-            access_mode: BackendAccessMode::Unrestricted,
+            custom_agent_id: Some(CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned())),
         }
     }
 }
