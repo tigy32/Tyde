@@ -378,6 +378,11 @@ struct SpawnAgentToolInput {
     /// task — runs on the most capable configuration. Omit for normal tasks.
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
+    /// Create an independent top-level agent instead of your child. Supply a
+    /// project_id from tyde_list_workbenches with global=true, or absolute
+    /// workspace_roots; nothing is inherited from you.
+    #[serde(default)]
+    global: bool,
     // OpenCode decorates MCP calls that resemble its native task tool with
     // these fields even though they are absent from the advertised schema.
     #[serde(default)]
@@ -416,6 +421,14 @@ struct ReadAgentToolInput {
     agent_id: String,
     /// Opt in to targeting any live agent on this host, including other
     /// top-level agents, instead of only your direct children.
+    #[serde(default)]
+    global: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListWorkbenchesToolInput {
+    /// List every project and workbench on this host instead of only yours.
     #[serde(default)]
     global: bool,
 }
@@ -509,7 +522,7 @@ struct CreatedWorkbenchRootResult {
 
 #[derive(Debug, Serialize)]
 struct ListWorkbenchesResult {
-    caller_project_id: String,
+    caller_project_id: Option<String>,
     projects: Vec<ProjectOverview>,
 }
 
@@ -1098,7 +1111,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
+        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. global=true instead creates an independent top-level agent in any project on this host. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
     )]
     async fn tyde_spawn_agent(
         &self,
@@ -1109,7 +1122,19 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
-        match do_spawn_agent(&self.host, input.into(), Some(caller)).await {
+        let global = input.global;
+        let request = SpawnRequestInput::from(input);
+        let result = if global {
+            if request.parent_agent_id.is_some() {
+                return Ok(err_text(
+                    "parent_agent_id cannot be combined with global=true",
+                ));
+            }
+            do_spawn_agent(&self.host, request, None).await
+        } else {
+            do_spawn_agent(&self.host, request, Some(caller)).await
+        };
+        match result {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -1135,11 +1160,11 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning."
+        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning. global=true lists every project and workbench on this host for global spawns."
     )]
     async fn tyde_list_workbenches(
         &self,
-        Parameters(_input): Parameters<EmptyToolInput>,
+        Parameters(input): Parameters<ListWorkbenchesToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = match require_authenticated_caller(self, &parts, "tyde_list_workbenches").await
@@ -1147,7 +1172,7 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
-        match do_list_workbenches(&self.host, &caller).await {
+        match do_list_workbenches(&self.host, &caller, input.global).await {
             Ok(result) => ok_json(result),
             Err(error) => Ok(err_text(error)),
         }
@@ -2396,8 +2421,24 @@ fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchR
 async fn do_list_workbenches(
     host: &HostHandle,
     caller: &AgentId,
+    global: bool,
 ) -> Result<ListWorkbenchesResult, String> {
-    let (caller_project_id, projects) = caller_project_scope(host, caller).await?;
+    let (caller_project_id, projects) = if global {
+        if host
+            .is_swarm_agent(caller)
+            .await
+            .map_err(|error| error.message)?
+        {
+            return Err("global=true is outside the swarm workspace scope".to_owned());
+        }
+        (
+            host.project_id_for_agent(caller).await,
+            host.list_projects().await?,
+        )
+    } else {
+        let (caller_project_id, projects) = caller_project_scope(host, caller).await?;
+        (Some(caller_project_id), projects)
+    };
     let projects = projects
         .into_iter()
         .map(|project| {
@@ -2429,7 +2470,7 @@ async fn do_list_workbenches(
         })
         .collect();
     Ok(ListWorkbenchesResult {
-        caller_project_id: caller_project_id.0,
+        caller_project_id: caller_project_id.map(|id| id.0),
         projects,
     })
 }
@@ -3060,6 +3101,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
             name,
             cost_hint,
             access_mode,
+            global: _,
             command: _,
             description: _,
             subagent_type: _,

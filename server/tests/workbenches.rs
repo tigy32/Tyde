@@ -1347,6 +1347,79 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
     assert!(is_error, "mismatched roots unexpectedly spawned: {body}");
     assert!(body.contains("authoritative roots"));
     assert_no_new_agent(&mut fixture.client, "rejecting mismatched roots").await;
+
+    // global=true lets the agent discover another project and start an
+    // independent top-level agent there instead of a child in its own project.
+    let other_repo = init_git_repo("agent-control-other-project");
+    let other = create_project(&mut fixture.client, vec![other_repo.path()]).await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "scoped list failed: {body}");
+    let scoped: Value = serde_json::from_str(&body).expect("scoped list JSON");
+    assert!(
+        scoped["projects"]
+            .as_array()
+            .expect("scoped projects")
+            .iter()
+            .all(|project| project["project_id"] != other.id.0),
+        "default listing must stay within the caller's project"
+    );
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_list_workbenches",
+        json!({ "global": true }),
+    )
+    .await;
+    assert!(!is_error, "global list failed: {body}");
+    let global: Value = serde_json::from_str(&body).expect("global list JSON");
+    assert_eq!(global["caller_project_id"], parent.id.0);
+    let global_ids = global["projects"]
+        .as_array()
+        .expect("global projects")
+        .iter()
+        .filter_map(|project| project["project_id"].as_str())
+        .collect::<Vec<_>>();
+    for expected in [&parent.id, &workbench.id, &other.id] {
+        assert!(
+            global_ids.contains(&expected.0.as_str()),
+            "global listing must include every host project"
+        );
+    }
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "project_id": other.id.0, "prompt": "work elsewhere",
+            "backend_kind": "codex", "global": true
+        }),
+    )
+    .await;
+    assert!(!is_error, "global spawn failed: {body}");
+    let top_level: NewAgentPayload =
+        expect_kind(&mut fixture.client, FrameKind::NewAgent, "global NewAgent")
+            .await
+            .parse_payload()
+            .expect("global NewAgent payload");
+    assert_eq!(top_level.project_id.as_ref(), Some(&other.id));
+    assert_eq!(top_level.parent_agent_id, None);
+    assert_eq!(top_level.workspace_roots, project_roots(&other));
+    let top_level_start: AgentStartPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentStart,
+        "global AgentStart",
+    )
+    .await
+    .parse_payload()
+    .expect("global AgentStart payload");
+    assert_eq!(top_level_start.project_id.as_ref(), Some(&other.id));
+    assert_eq!(top_level_start.parent_agent_id, None);
     let (is_error, body) = call_agent_control(
         &fixture,
         &orchestrator.agent_id,

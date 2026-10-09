@@ -845,7 +845,10 @@ Not part of v1:
 Authenticated control-surface callers can use `tyde_list_workbenches`,
 `tyde_create_workbench`, and `tyde_remove_workbench`. Listing is read-only and
 is limited to the caller's canonical standalone project plus that project's
-workbenches. Creation and removal are limited to that same standalone parent
+workbenches unless the caller passes `global: true`, which lists every project
+and workbench on the host (with the caller's own project as
+`caller_project_id`, or null) so the caller can spawn a top-level agent there.
+Swarm members cannot list globally. Creation and removal are limited to that same standalone parent
 regardless of access mode. Removal defaults to safe dirty-root rejection;
 `force: true` is the explicit destructive override.
 
