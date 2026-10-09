@@ -4666,6 +4666,17 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     assert!(!failed, "record disposition: {disposition}");
     let visible = subscribe_review(&mut observer, &review.id).await;
     assert!(visible.ai_reviewer.rounds[0].dispositions[&finding.id.0].starts_with("Addressed:"));
+    let closed = visible
+        .suggestions
+        .iter()
+        .find(|s| s.id == finding.id)
+        .expect("dispositioned finding");
+    assert_eq!(
+        closed.state,
+        ReviewSuggestionState::Resolved,
+        "An agent disposition must close the finding in the user's review"
+    );
+    assert_eq!(disposition["findings"][0]["state"]["state"], "resolved");
     fs::write(
         root.path().join("src/lib.rs"),
         "fn value() -> i32 {\n    3\n}\n",

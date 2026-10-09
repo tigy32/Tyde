@@ -1507,7 +1507,16 @@ impl ReviewActor {
         }
         round
             .dispositions
-            .insert(suggestion_id.0, reason.trim().to_owned());
+            .insert(suggestion_id.0.clone(), reason.trim().to_owned());
+        let resolved = self
+            .review
+            .suggestions
+            .iter_mut()
+            .find(|s| s.id == suggestion_id && matches!(s.state, ReviewSuggestionState::Pending))
+            .map(|suggestion| {
+                suggestion.state = ReviewSuggestionState::Resolved;
+                suggestion.clone()
+            });
         self.review.updated_at_ms = now_ms();
         if !self
             .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
@@ -1519,6 +1528,11 @@ impl ReviewActor {
             state: self.review.ai_reviewer.clone(),
         })
         .await;
+        if let Some(suggestion) = resolved {
+            self.broadcast(ReviewEventPayload::SuggestionUpsert { suggestion })
+                .await;
+            self.notify_project_changed();
+        }
         Ok(self.review.clone())
     }
 

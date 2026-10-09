@@ -2443,7 +2443,7 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                                         let reason = dispositions.get(&finding.id.0).cloned();
                                         view! {
                                             <div class="review-round-finding">
-                                                <small>{finding.location.relative_path.clone()}</small>
+                                                <small>{format!("{} · {}", finding.location.relative_path, finding.state.status_label())}</small>
                                                 <p>{finding.body}</p>
                                                 {reason.map(|reason| view! { <p class="review-round-note">"Agent response: "{reason}</p> })}
                                             </div>

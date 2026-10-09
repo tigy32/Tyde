@@ -432,7 +432,13 @@ backend defaults through the normal spawn path. Missing explicit backends fail
 visibly, never silently change provider or reduce required coverage. Historical
 records missing the new fields remain readable. Agent-requested members remain
 children of the requester. Await waits for the whole round, and findings are
-read through tools, never injected into conversations. Manual reviews retain
+read through tools, never injected into conversations. The requesting agent
+closes a finding with `tyde_review_disposition`: the reason is recorded in the
+round's `dispositions`, and a `Pending` suggestion becomes
+`ReviewSuggestionState::Resolved` (protocol version 80), broadcast as a
+`SuggestionUpsert` and dropped from pending counts. Resolved findings leave
+the inline and comments surfaces; the review rounds history keeps them with
+the agent's response. Accepted or rejected findings keep the user's state. Manual reviews retain
 the accept-and-submit flow and independent finding attribution.
 
 Before any typed settings read, startup migrates `review.agents` into aspects,

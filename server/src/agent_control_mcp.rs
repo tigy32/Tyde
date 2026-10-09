@@ -1080,7 +1080,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Record a visible reason for addressing or dismissing a review finding. Only the requesting agent may do this; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
+        description = "Record a visible reason for addressing or dismissing a review finding and close it. A pending finding becomes resolved and leaves the user's open review comments; the reason stays visible in the review round. Only the requesting agent may do this; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
     )]
     async fn tyde_review_disposition(
         &self,
@@ -1836,7 +1836,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or the Tyde Operator, not by coding agents."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition, which closes them in the user's review, and request another round after fixes. Review configuration is managed by the user or the Tyde Operator, not by coding agents."
             }
             AgentControlMcpSurface::Await => {
                 "Long-running tools for awaiting direct child agents and requested review rounds. tyde_await_review waits for all reviewers in the specified round; use tyde_get_review on the control server to read findings."

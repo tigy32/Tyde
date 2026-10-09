@@ -3967,6 +3967,7 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 ReviewSuggestionState::Pending => "pending",
                 ReviewSuggestionState::Accepted { .. } => "accepted",
                 ReviewSuggestionState::Rejected => "rejected",
+                ReviewSuggestionState::Resolved => "resolved",
             };
             state
                 .review_action_target_pending
@@ -3983,7 +3984,7 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                             ReviewActionTarget::RejectSuggestion(suggestion.id.clone()),
                         ));
                     }
-                    ReviewSuggestionState::Pending => {}
+                    ReviewSuggestionState::Pending | ReviewSuggestionState::Resolved => {}
                 });
             log::info!(
                 "review.event.suggestion_upsert review={review_id} suggestion_id={} state={suggestion_state_label} cleared_accept={cleared_accept} cleared_reject={cleared_reject}",

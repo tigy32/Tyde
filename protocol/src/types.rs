@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 79;
+pub const PROTOCOL_VERSION: u32 = 80;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -6735,8 +6735,13 @@ impl ReviewSeverity {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ReviewSuggestionState {
     Pending,
-    Accepted { comment_id: ReviewCommentId },
+    Accepted {
+        comment_id: ReviewCommentId,
+    },
     Rejected,
+    /// The agent that requested the review recorded a disposition; its
+    /// reason lives in the owning round's `dispositions`.
+    Resolved,
 }
 
 impl ReviewSuggestionState {
@@ -6745,6 +6750,7 @@ impl ReviewSuggestionState {
             Self::Pending => "pending",
             Self::Accepted { .. } => "accepted",
             Self::Rejected => "rejected",
+            Self::Resolved => "resolved",
         }
     }
 }
