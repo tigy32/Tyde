@@ -191,7 +191,7 @@ pub fn TychatTab() -> impl IntoView {
                         let value = event_target_value(&event);
                         send_host_replace(&state.get_value(), "/tychat/custom_agent_id", (!value.is_empty()).then_some(CustomAgentId(value)));
                     }>
-                    <option value="">"Default agent"</option>
+                    {move || config.get().is_some_and(|config| config.custom_agent_id.is_none()).then(|| view! { <option value="">"No custom agent"</option> })}
                     {move || custom_agents.get().into_iter().map(|(id, name)| view! { <option value=id.0>{name}</option> }).collect_view()}
                 </select>
             </div>

@@ -9947,8 +9947,8 @@ mod wasm_tests {
         let agent = control(&container, "Agent");
         assert_eq!(
             option_names(&agent),
-            vec!["Default agent", "Tyde Operator", "Reviewer"],
-            "the Operator leads the agent picker"
+            vec!["Tyde Operator", "Reviewer"],
+            "the Operator leads the agent picker, without a duplicate default entry"
         );
         assert_eq!(
             agent.value(),
@@ -9960,7 +9960,7 @@ mod wasm_tests {
             .dispatch_event(&web_sys::Event::new("change").unwrap())
             .unwrap();
         next_tick().await;
-        agent.set_value("");
+        agent.set_value("tyde-help");
         agent
             .dispatch_event(&web_sys::Event::new("change").unwrap())
             .unwrap();
@@ -9971,9 +9971,10 @@ mod wasm_tests {
                 .iter()
                 .any(|op| replacement_value(op, "/tychat/custom_agent_id")
                     == Some(&Value::String("reviewer".into())))
-                && writes.iter().any(
-                    |op| replacement_value(op, "/tychat/custom_agent_id") == Some(&Value::Null)
-                ),
+                && writes
+                    .iter()
+                    .any(|op| replacement_value(op, "/tychat/custom_agent_id")
+                        == Some(&Value::String("tyde-help".into()))),
             "the agent picker writes the typed custom agent id"
         );
         assert!(
