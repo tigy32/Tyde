@@ -2148,7 +2148,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2419,7 +2419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3611,7 +3611,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4648,7 +4648,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4862,7 +4862,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6068,7 +6068,7 @@ dependencies = [
  "quinn-udp 0.5.15",
  "rustc-hash",
  "rustls 0.23.39",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6106,9 +6106,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6120,8 +6120,8 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "log",
- "socket2 0.5.10",
- "windows-sys 0.59.0",
+ "socket2 0.6.3",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7067,7 +7067,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7138,7 +7138,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7931,7 +7931,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8713,7 +8713,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9270,7 +9270,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9343,7 +9343,7 @@ dependencies = [
 [[package]]
 name = "tychat-bot"
 version = "0.1.0"
-source = "git+https://github.com/tigy32/tychat-bot?rev=36959436702547e5b2b27234b26931254fb59405#36959436702547e5b2b27234b26931254fb59405"
+source = "git+https://github.com/tigy32/tychat-bot?rev=b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613#b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -9366,7 +9366,7 @@ dependencies = [
 [[package]]
 name = "tychat-crypto"
 version = "0.0.0"
-source = "git+https://github.com/tigy32/tychat-bot?rev=36959436702547e5b2b27234b26931254fb59405#36959436702547e5b2b27234b26931254fb59405"
+source = "git+https://github.com/tigy32/tychat-bot?rev=b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613#b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -9383,7 +9383,7 @@ dependencies = [
 [[package]]
 name = "tychat-protocol"
 version = "0.0.0"
-source = "git+https://github.com/tigy32/tychat-bot?rev=36959436702547e5b2b27234b26931254fb59405#36959436702547e5b2b27234b26931254fb59405"
+source = "git+https://github.com/tigy32/tychat-bot?rev=b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613#b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613"
 dependencies = [
  "hex",
  "serde",
@@ -10209,7 +10209,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

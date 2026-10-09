@@ -153,6 +153,7 @@ impl tokio::io::AsyncWrite for PausedWriter {
 
 pub struct Fixture {
     tychat_bridge_disabled: bool,
+    tychat_api_base: Option<url::Url>,
     pub client: client::Connection,
     #[allow(dead_code)]
     pub bootstrap: HostBootstrapPayload,
@@ -403,6 +404,7 @@ impl Fixture {
                 .expect("seed fixture enabled backends");
         }
         let tychat_bridge_disabled = runtime_config.tychat_bridge_disabled;
+        let tychat_api_base = runtime_config.tychat_api_base.clone();
         let host = if use_mock_backend {
             server::spawn_host_with_mock_backend_and_runtime_config(
                 session_path,
@@ -423,6 +425,7 @@ impl Fixture {
 
         Self {
             tychat_bridge_disabled,
+            tychat_api_base,
             client,
             bootstrap,
             host,
@@ -799,6 +802,7 @@ impl Fixture {
     fn fresh_host_runtime_config(&self) -> server::HostRuntimeConfig {
         server::HostRuntimeConfig {
             tychat_bridge_disabled: self.tychat_bridge_disabled,
+            tychat_api_base: self.tychat_api_base.clone(),
             backend_storage_roots: [(
                 BackendKind::Antigravity,
                 self.antigravity_conversations_dir.path().to_path_buf(),

@@ -128,7 +128,7 @@ impl TychatService {
         enforce_owner_only_file(&lock_path)?;
         fs2::FileExt::try_lock_exclusive(&file)
             .map_err(|_| "Another host owns this Tychat state")?;
-        let journal = match std::fs::read(&path) {
+        let mut journal = match std::fs::read(&path) {
             Ok(bytes) => {
                 enforce_owner_only_file(&path)?;
                 decode_journal(&bytes)?
@@ -136,6 +136,15 @@ impl TychatService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Journal::default(),
             Err(_) => return Err("Cannot read Tychat secret journal".to_owned()),
         };
+        // The SDK owns the fingerprint format; older SDKs saved 60-digit forms.
+        if let Some(pairing) = journal.pairing.as_mut()
+            && let Ok(bot) = serde_json::from_slice::<tychat_bot::BotState>(&pairing.secret.0)
+        {
+            pairing.fingerprints = TychatFingerprints {
+                bot: bot.bot_fingerprint().to_owned(),
+                owner: bot.owner_fingerprint(),
+            };
+        }
         let process_lock = journal.pairing.as_ref().map(|_| file);
         let snapshot = TychatStatePayload {
             status: if journal.pairing.is_some() {

@@ -241,12 +241,26 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
         pending.pending.len() == 1 && !pending.typing,
         "send succeeded while acknowledgement remains deliberately uncommitted"
     );
-    fixture.restart_host().await;
+    let journal_path = fixture.tychat_secret_path();
+    fixture
+        .restart_host_with_runtime_config(|_| {
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+            let legacy = "0".repeat(60);
+            journal["pairing"]["fingerprints"] =
+                serde_json::json!({ "bot": legacy, "owner": legacy });
+            std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        })
+        .await;
     let host = fixture.tychat_host();
     let resumed = state_when(&host, |state| {
         state.status == TychatBridgeStatus::Connected && state.agent_id.is_some()
     })
     .await;
+    assert!(
+        resumed.fingerprints.as_ref() == Some(&fingerprints),
+        "restart shows the SDK's fingerprints, not ones saved by an older SDK"
+    );
     drained(&host, &generation).await;
     assert!(
         owner.bot_texts(&chat, sent.seq).await.unwrap() == before,

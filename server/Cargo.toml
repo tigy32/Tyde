@@ -8,7 +8,7 @@ full-backends = []
 test-support = []
 
 [dependencies]
-tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "36959436702547e5b2b27234b26931254fb59405" }
+tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613" }
 tyde-process-env = { path = "../process-env" }
 tyde-agent-adapter = { path = "../agent-adapter" }
 aes-gcm = "0.10"
@@ -66,7 +66,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
-tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "36959436702547e5b2b27234b26931254fb59405", features = ["owner-kit"] }
+tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613", features = ["owner-kit"] }
 server = { path = ".", features = ["test-support"] }
 aes-gcm = "0.10"
 base64 = "0.22"

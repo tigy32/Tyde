@@ -11,7 +11,7 @@ Protocol types live in `protocol/src/types.rs`. The host owns the singleton,
 settings, lifecycle, delivery and durable outbound journal. Frontends project
 host events; they never infer activity, turn boundaries or delivery from history.
 `server/src/tychat_bridge.rs` runs the real `tychat-bot` client. The public SDK
-is pinned to git revision `36959436702547e5b2b27234b26931254fb59405` from
+is pinned to git revision `b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613` from
 `https://github.com/tigy32/tychat-bot`; Tyde does not fork its crypto or simulate
 Tychat. Production uses the root origin `https://chat.tyggs.com`, matching
 `tychat_bot::PRODUCTION_API_BASE`. The SDK appends `/api/v1`. The origin is not a
@@ -70,7 +70,9 @@ Bot credentials, private keys, owner pin and cursors are serialized SDK
 bootstrap payloads, diagnostics or Debug output. Storage uses the same
 `atomic_write_owner_only`/`enforce_owner_only_file` boundary as mobile pairings,
 with 0600 permissions, beside the host stores. Fingerprints are public and are
-published separately. Pairing codes are transient commands, never persisted.
+published separately. The SDK owns their format (24 base64url characters in six
+groups of four); the host re-derives them from `BotState` on load, so journals
+holding the older 60-digit form show the current format after upgrade. Pairing codes are transient commands, never persisted.
 
 Bridge status is typed: Unpaired, Connecting, Connected,
 AwaitingOwnerConfirmation, Paused { reason }, Failed { reason }. The bridge maps
