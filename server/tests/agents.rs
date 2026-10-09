@@ -5011,7 +5011,8 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     let reservation = fixture
         .reserve_next_mock_launch(
             "credential-child-b",
-            MockScript::one(MockTurn::empty_agent_control_output()),
+            MockScript::one(MockTurn::empty_agent_control_output())
+                .then(MockTurn::text("global follow-up reply")),
         )
         .await;
     let child_b = mcp_spawn_agent_as(
@@ -5067,6 +5068,84 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             "{tool} must deny cross-parent target"
         );
         assert!(mcp_result_text(&response).contains("not a direct child"));
+    }
+
+    // Opting into global scope reaches another top-level agent's child; the
+    // default stays child-scoped as asserted above.
+    let global_listed = mcp_success_json(
+        &mcp_tool_call_as(
+            &caller_a,
+            false,
+            "tyde_list_agents",
+            json!({ "global": true }),
+        )
+        .await,
+    );
+    let global_ids = global_listed
+        .as_array()
+        .expect("global list agents array")
+        .iter()
+        .filter_map(|agent| agent["agent_id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for expected in [&parent_a.agent_id, &parent_b.agent_id, &child_a, &child_b] {
+        assert!(
+            global_ids.contains(expected.0.as_str()),
+            "global list must include every live host agent"
+        );
+    }
+    let sent = mcp_tool_call_as(
+        &caller_a,
+        false,
+        "tyde_send_agent_message",
+        json!({ "agent_id": child_b.0, "message": "global follow-up", "global": true }),
+    )
+    .await;
+    assert_eq!(mcp_success_json(&sent)["ok"], true);
+    let awaited = mcp_tool_call_as(
+        &caller_a,
+        true,
+        "tyde_await_agents",
+        json!({ "agent_ids": [child_b.0], "global": true }),
+    )
+    .await;
+    assert_eq!(mcp_success_json(&awaited)["ready"][0]["status"], "idle");
+    let read = mcp_tool_call_as(
+        &caller_a,
+        false,
+        "tyde_read_agent",
+        json!({ "agent_id": child_b.0, "global": true }),
+    )
+    .await;
+    assert_eq!(
+        mcp_success_json(&read)["output"]["text"].as_str(),
+        Some("global follow-up reply")
+    );
+    for (tool, await_surface, arguments, expected) in [
+        (
+            "tyde_send_agent_message",
+            false,
+            json!({ "agent_id": parent_a.agent_id.0, "message": "self", "global": true }),
+            "caller itself",
+        ),
+        (
+            "tyde_await_agents",
+            true,
+            json!({ "agent_ids": [parent_a.agent_id.0], "global": true }),
+            "caller itself",
+        ),
+        (
+            "tyde_read_agent",
+            false,
+            json!({ "agent_id": "00000000-0000-0000-0000-000000000000", "global": true }),
+            "not a live agent",
+        ),
+    ] {
+        let response = mcp_tool_call_as(&caller_a, await_surface, tool, arguments).await;
+        assert!(
+            mcp_result_is_error(&response),
+            "{tool} must reject global self or unknown targets"
+        );
+        assert!(mcp_result_text(&response).contains(expected));
     }
 
     let base_url = fixture.agent_control_http_url().await;

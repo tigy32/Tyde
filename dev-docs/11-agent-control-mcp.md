@@ -305,7 +305,8 @@ same server-signed agent bearer credential as the other caller-bound tools.
 
 Lists only agents whose server-owned `parent_agent_id` is the authenticated
 calling agent id. It excludes grandchildren, unrelated host agents, and
-children owned by other callers. Missing, invalid, or mismatched credentials
+children owned by other callers. `global: true` instead lists every live agent on
+the host. Missing, invalid, or mismatched credentials
 are rejected.
 It returns metadata only:
 
@@ -382,6 +383,13 @@ debug-read also admit one server-owned team relation: the caller is its team's
 active manager and the target is the live agent bound to a report on that team
 (`19-agent-teams.md` §8). Managers message reports only through
 `tyde_team_message_member`; send, close, and list stay direct-child only.
+
+List, await, read, and send accept an optional `global` boolean, default
+`false`. With `global: true` the caller opts out of child scoping: list returns
+every live agent on the host, and await, read, and send admit any live agent
+other than the caller itself, including other top-level agents. Unknown targets
+and self-targets are rejected. Close and debug-read never take `global`; they
+stay child- or report-scoped.
 
 #### `tyde_read_agent`
 

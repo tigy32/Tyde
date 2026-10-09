@@ -398,12 +398,34 @@ struct AwaitAgentsToolInput {
     /// transition to idle, awaiting_user, or failed should wake this wait.
     #[schemars(length(min = 1), inner(length(min = 1)))]
     agent_ids: Vec<String>,
+    /// Opt in to targeting any live agent on this host, including other
+    /// top-level agents, instead of only your direct children.
+    #[serde(default)]
+    global: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AgentIdToolInput {
     agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadAgentToolInput {
+    agent_id: String,
+    /// Opt in to targeting any live agent on this host, including other
+    /// top-level agents, instead of only your direct children.
+    #[serde(default)]
+    global: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListAgentsToolInput {
+    /// List every live agent on this host instead of only your direct children.
+    #[serde(default)]
+    global: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -426,6 +448,10 @@ struct SendAgentMessageToolInput {
     /// natively, or queues until it ends when steering is unsupported.
     #[serde(default)]
     interrupt: bool,
+    /// Opt in to targeting any live agent on this host, including other
+    /// top-level agents, instead of only your direct children.
+    #[serde(default)]
+    global: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -847,6 +873,29 @@ async fn authorize_direct_children(
     Ok(())
 }
 
+async fn authorize_global_targets(
+    host: &HostHandle,
+    caller: &AgentId,
+    targets: &[AgentId],
+) -> Result<(), String> {
+    let agents = host.list_agents().await;
+    for target in targets {
+        if target == caller {
+            return Err(format!(
+                "authorization: agent_id {} is the caller itself",
+                target.0
+            ));
+        }
+        if !agents.iter().any(|agent| agent.agent_id == *target) {
+            return Err(format!(
+                "authorization: agent_id {} is not a live agent on this host",
+                target.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn authorize_observed_agents(
     host: &HostHandle,
     caller: &AgentId,
@@ -1144,7 +1193,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
+        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. global=true admits any other live agent on this host, including other top-level agents. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
@@ -1161,7 +1210,12 @@ impl TydeAgentControlMcpServer {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
-        if let Err(error) = authorize_observed_agents(&self.host, &caller, &agent_ids).await {
+        let authorized = if input.global {
+            authorize_global_targets(&self.host, &caller, &agent_ids).await
+        } else {
+            authorize_observed_agents(&self.host, &caller, &agent_ids).await
+        };
+        if let Err(error) = authorized {
             return Ok(err_text(error));
         }
         let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
@@ -1183,11 +1237,11 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record, with its current status. An awaiting_user agent is waiting on the user, not finished. Never scans backward."
+        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record, with its current status. global=true admits any other live agent on this host. An awaiting_user agent is waiting on the user, not finished. Never scans backward."
     )]
     async fn tyde_read_agent(
         &self,
-        Parameters(input): Parameters<AgentIdToolInput>,
+        Parameters(input): Parameters<ReadAgentToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = match require_authenticated_caller(self, &parts, "tyde_read_agent").await {
@@ -1198,9 +1252,13 @@ impl TydeAgentControlMcpServer {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
-        if let Err(error) =
-            authorize_observed_agents(&self.host, &caller, std::slice::from_ref(&agent_id)).await
-        {
+        let targets = std::slice::from_ref(&agent_id);
+        let authorized = if input.global {
+            authorize_global_targets(&self.host, &caller, targets).await
+        } else {
+            authorize_observed_agents(&self.host, &caller, targets).await
+        };
+        if let Err(error) = authorized {
             return Ok(err_text(error));
         }
         match do_read_agent(&self.host, &agent_id).await {
@@ -1274,7 +1332,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Send a follow-up to a direct child. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle children start immediately. Await then read to collect output."
+        description = "Send a follow-up to a direct child, or with global=true to any other live agent on this host, including other top-level agents. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Await then read to collect output."
     )]
     async fn tyde_send_agent_message(
         &self,
@@ -1293,13 +1351,13 @@ impl TydeAgentControlMcpServer {
         if input.message.trim().is_empty() {
             return Ok(err_text("message must not be empty"));
         }
-        if let Err(error) = authorize_direct_children(
-            &self.host,
-            &request_agent_id,
-            std::slice::from_ref(&agent_id),
-        )
-        .await
-        {
+        let targets = std::slice::from_ref(&agent_id);
+        let authorized = if input.global {
+            authorize_global_targets(&self.host, &request_agent_id, targets).await
+        } else {
+            authorize_direct_children(&self.host, &request_agent_id, targets).await
+        };
+        if let Err(error) = authorized {
             return Ok(err_text(error));
         }
         let _active = ActiveSendRequestGuard::new(Arc::clone(&self.active_send_requests));
@@ -1728,10 +1786,12 @@ impl TydeAgentControlMcpServer {
         }
     }
 
-    #[tool(description = "List only agents directly created by the calling Tyde agent.")]
+    #[tool(
+        description = "List agents directly created by the calling Tyde agent. global=true lists every live agent on this host, including other top-level agents."
+    )]
     async fn tyde_list_agents(
         &self,
-        Parameters(_input): Parameters<EmptyToolInput>,
+        Parameters(input): Parameters<ListAgentsToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let request_agent_id =
@@ -1739,7 +1799,8 @@ impl TydeAgentControlMcpServer {
                 Ok(agent_id) => agent_id,
                 Err(err) => return Ok(err_text(err)),
             };
-        match do_list_agents(&self.host, Some(&request_agent_id)).await {
+        let scope = (!input.global).then_some(&request_agent_id);
+        match do_list_agents(&self.host, scope).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
