@@ -3777,9 +3777,10 @@ pub(crate) fn spawn_agent_actor(
         );
         let mut tychat_turn: Option<protocol::TychatTurnId> = None;
         let mut tychat_final: Option<String> = None;
-        // Messages the agent sent through tychat_send_message this turn; any
-        // send replaces the automatic final reply.
         let mut tychat_sends: u32 = 0;
+        // True while tychat_send_message is the agent's latest tool call this
+        // turn; only then does it replace the automatic final reply.
+        let mut tychat_final_covered = false;
         let mut tychat_handoff: Option<(protocol::TychatOwnerMessage, oneshot::Sender<Result<protocol::TychatDeliveryReceipt, String>>)> = None;
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
@@ -5866,6 +5867,9 @@ pub(crate) fn spawn_agent_actor(
                             ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Assistant { .. }) => tychat_final = Some(message.content.clone()),
                             ChatEvent::StreamEnd(data) => tychat_final = Some(data.message.content.clone()),
                             ChatEvent::ToolRequest(request) => {
+                                if !crate::backend::agent_control_progress::is_tychat_send_tool_name(&request.tool_name) {
+                                    tychat_final_covered = false;
+                                }
                                 if let Some(text) = crate::tychat::question_text(request) && let Some(turn) = tychat_turn
                                     && let Err(error) = tychat.append(&current_start.agent_id, turn, crate::tychat::TychatPart::Question(&request.tool_call_id), text).await { tychat.fail(error).await; }
                             }
@@ -6253,7 +6257,8 @@ pub(crate) fn spawn_agent_actor(
                         && let Some(turn) = tychat_turn.take()
                     {
                         let final_text = tychat_final.take();
-                        if std::mem::take(&mut tychat_sends) == 0
+                        tychat_sends = 0;
+                        if !std::mem::take(&mut tychat_final_covered)
                             && let Some(text) = final_text
                             && let Err(error) = tychat.append(&current_start.agent_id, turn, crate::tychat::TychatPart::Final, text).await
                         {
@@ -6628,6 +6633,7 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await?;
                                 tychat_sends = index + 1;
+                                tychat_final_covered = true;
                                 Ok(())
                             }
                             .await;
@@ -6784,7 +6790,8 @@ pub(crate) fn spawn_agent_actor(
                                         // The provider, not a delayed idle event, authoritatively closed this turn.
                                         if let Some(turn) = tychat_turn.take() {
                                             let final_text = tychat_final.take();
-                                            if std::mem::take(&mut tychat_sends) == 0
+                                            tychat_sends = 0;
+                                            if !std::mem::take(&mut tychat_final_covered)
                                                 && let Some(text) = final_text
                                                 && let Err(error) = tychat
                                                     .append(

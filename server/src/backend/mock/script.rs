@@ -311,14 +311,37 @@ impl MockTurn {
         gate: &MockGateHandle,
         text: impl Into<String>,
     ) -> Self {
+        Self::tychat_send_then_text_with_work(message, gate, false, text)
+    }
+
+    /// Like [`Self::tychat_send_then_text`], but calls another tool after the
+    /// send and before the final reply when `then_work` is set.
+    pub fn tychat_send_then_text_with_work(
+        message: impl Into<String>,
+        gate: &MockGateHandle,
+        then_work: bool,
+        text: impl Into<String>,
+    ) -> Self {
         let mut steps = text_steps(text.into(), TextShape::default());
-        steps.splice(
-            1..1,
-            [
-                MockStep::TychatSend(message.into()),
-                MockStep::Gate(gate.gate()),
-            ],
+        let mut inserted = vec![MockStep::TychatSend(message.into())];
+        // The provider's view of the send call lands after the MCP request.
+        inserted.extend(
+            emit::mcp_tool_frames("mock-tychat-send", "mcp__tyde-tychat__tychat_send_message")
+                .into_iter()
+                .map(MockStep::emit),
         );
+        inserted.push(MockStep::Gate(gate.gate()));
+        if then_work {
+            inserted.extend(
+                emit::mcp_tool_frames(
+                    "mock-tychat-work",
+                    "mcp__tyde-agent-control__tyde_list_agents",
+                )
+                .into_iter()
+                .map(MockStep::emit),
+            );
+        }
+        steps.splice(1..1, inserted);
         Self::done(steps)
     }
 

@@ -830,9 +830,10 @@ async fn turn_end_race_starts_without_queueing() {
 }
 
 #[tokio::test]
-async fn send_tool_messages_mid_turn_and_replaces_the_final() {
+async fn send_tool_replaces_the_final_only_when_called_last() {
     let mut fixture = configured().await;
     let gate = MockGateHandle::new();
+    let work_gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "Tychat agent",
@@ -842,7 +843,13 @@ async fn send_tool_messages_mid_turn_and_replaces_the_final() {
                     &gate,
                     "unsent final",
                 ))
-                .then(MockTurn::text("plain final")),
+                .then(MockTurn::text("plain final"))
+                .then(MockTurn::tychat_send_then_text_with_work(
+                    "Checking",
+                    &work_gate,
+                    true,
+                    "worked final",
+                )),
         )
         .await;
     let (generation, _agent) = pair(&mut fixture).await;
@@ -896,6 +903,35 @@ async fn send_tool_messages_mid_turn_and_replaces_the_final() {
         "a turn that used tychat_send_message does not also send its final"
     );
     assert_ne!(replies.pending[0].turn_id, acknowledged.pending[0].turn_id);
+    host.acknowledge_tychat_outbound(&generation, replies.pending[0].message_id)
+        .await
+        .unwrap();
+
+    host.deliver_tychat_message(&generation, message("three", "go check"))
+        .await
+        .unwrap();
+    let checking = outbox(&host, &generation, 1).await;
+    assert_eq!(checking.pending[0].text, "Checking");
+    host.acknowledge_tychat_outbound(&generation, checking.pending[0].message_id)
+        .await
+        .unwrap();
+    work_gate.release_one();
+    let followed_up = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = host.tychat_outbound(&generation).await.unwrap();
+            if !snapshot.typing && snapshot.pending.len() == 1 {
+                return snapshot;
+            }
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("work after a tool message re-arms the final reply");
+    assert_eq!(
+        followed_up.pending[0].text, "worked final",
+        "a tool call after tychat_send_message means the final follows up"
+    );
+    assert_eq!(followed_up.pending[0].turn_id, checking.pending[0].turn_id);
 }
 
 #[tokio::test]

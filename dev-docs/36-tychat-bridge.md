@@ -126,10 +126,11 @@ progress mid-turn. The server shares the agent-control listener (`/tychat`) and
 its per-agent bearer; it rejects callers that are not the live Tychat-origin
 agent. A call goes through the agent actor, which owns the turn: it is accepted
 only during a turn, journals one outbox entry through the same producer path,
-and returns once that entry is durable, not when Tychat delivers it. A turn that
-called the tool at least once does not also send its final message; a turn that
-never called it sends its final message as before. Questions and typing are
-unaffected.
+and returns once that entry is durable, not when Tychat delivers it. The final
+message is skipped only when a successful `tychat_send_message` is the turn's
+latest tool call. Any later tool request (spawning, awaiting, reading, asking a
+question) re-arms the final message, so an "On it!" followed by work always ends
+with a follow-up. Questions and typing are unaffected.
 
 Turn identities and outbox records survive restart. Message IDs are a
 domain-separated deterministic digest of agent ID and turn ID (questions also

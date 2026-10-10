@@ -401,6 +401,22 @@ pub(super) fn exit_plan_mode_completion(
     (completion, message)
 }
 
+pub(super) fn mcp_tool_frames(tool_call_id: &str, tool_name: &str) -> Vec<BackendEvent> {
+    vec![
+        tool_request(ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            tool_type: ToolRequestType::Other { args: json!({}) },
+        }),
+        tool_completed(ToolExecutionCompletedData {
+            tool_call_id: tool_call_id.to_owned(),
+            outcome: ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other { result: json!({}) },
+            },
+        }),
+    ]
+}
+
 pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
     const TOOL_CALL_ID: &str = "mock-codex-successful-tool";
     vec![

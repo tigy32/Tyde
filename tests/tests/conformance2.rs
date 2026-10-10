@@ -8723,13 +8723,19 @@ async fn real_tychat_send_tool<B: Backend>(host: &mut Harness<B>) {
     );
 
     let payload = unique_payload();
+    // Grok's router rejects the bare MCP tool name, and its model tries that
+    // first unless told the qualified one.
+    let tool = match host.backend() {
+        BackendKind::Grok => "named `tyde-tychat__tychat_send_message`",
+        _ => "whose name ends in `tychat_send_message`",
+    };
     let sent = ask(
         host,
         &agent,
         &format!(
-            "Use the Tyde tool whose name ends in `tychat_send_message` exactly once, passing \
-             text `{payload}`. Do not use any other tool. After it returns, reply with exactly \
-             {TYCHAT_SENT_MARKER} and nothing else."
+            "Use the Tyde tool {tool} exactly once, passing text `{payload}`. Do not use any \
+             other tool. After it returns, reply with exactly {TYCHAT_SENT_MARKER} and nothing \
+             else."
         ),
     )
     .await;
@@ -8752,6 +8758,22 @@ async fn real_tychat_send_tool<B: Backend>(host: &mut Harness<B>) {
         "{}: expected one tychat_send_message call; declared: {declared:?}; completions: {:?}",
         sent.label(),
         sent.completion_summaries()
+    );
+    let requested: Vec<&str> = sent
+        .tool_requests()
+        .map(|request| request.tool_name.as_str())
+        .collect();
+    assert_eq!(
+        requested
+            .iter()
+            .filter(|name| {
+                server::backend::agent_control_progress::is_tychat_send_tool_name(name)
+            })
+            .count(),
+        1,
+        "{}: the actor must recognize the send request to decide the final; \
+         requested: {requested:?}",
+        sent.label()
     );
     assert_final_text_contains(&sent, TYCHAT_SENT_MARKER);
 

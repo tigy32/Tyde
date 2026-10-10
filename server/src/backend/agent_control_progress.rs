@@ -369,6 +369,10 @@ fn agent_control_progress_data(
     })
 }
 
+pub fn is_tychat_send_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name).ends_with("tychatsendmessage")
+}
+
 fn is_tyde_agent_control_tool_name(tool_name: &str, bare_normalized_name: &str) -> bool {
     let normalized = normalize_tool_name(tool_name);
     normalized == bare_normalized_name
