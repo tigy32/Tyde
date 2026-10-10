@@ -380,9 +380,9 @@ struct SpawnAgentToolInput {
     /// task — runs on the most capable configuration. Omit for normal tasks.
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
-    /// Create an independent top-level agent instead of your child. Supply a
-    /// project_id from tyde_list_workbenches with global=true, or absolute
-    /// workspace_roots; nothing is inherited from you.
+    /// Top-level agents only: create an independent top-level agent instead
+    /// of your child. Supply a project_id from tyde_list_workbenches with
+    /// global=true, or absolute workspace_roots; nothing is inherited from you.
     #[serde(default)]
     global: bool,
     // OpenCode decorates MCP calls that resemble its native task tool with
@@ -405,8 +405,8 @@ struct AwaitAgentsToolInput {
     /// transition to idle, awaiting_user, or failed should wake this wait.
     #[schemars(length(min = 1), inner(length(min = 1)))]
     agent_ids: Vec<String>,
-    /// Opt in to targeting any live agent on this host, including other
-    /// top-level agents, instead of only your direct children.
+    /// Top-level agents only: target any other live agent on this host,
+    /// including other top-level agents, instead of only your direct children.
     #[serde(default)]
     global: bool,
 }
@@ -421,8 +421,8 @@ struct AgentIdToolInput {
 #[serde(deny_unknown_fields)]
 struct ReadAgentToolInput {
     agent_id: String,
-    /// Opt in to targeting any live agent on this host, including other
-    /// top-level agents, instead of only your direct children.
+    /// Top-level agents only: target any other live agent on this host,
+    /// including other top-level agents, instead of only your direct children.
     #[serde(default)]
     global: bool,
 }
@@ -430,7 +430,8 @@ struct ReadAgentToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ListWorkbenchesToolInput {
-    /// List every project and workbench on this host instead of only yours.
+    /// Top-level agents only: list every project and workbench on this host
+    /// instead of only yours, for global spawns.
     #[serde(default)]
     global: bool,
 }
@@ -438,7 +439,8 @@ struct ListWorkbenchesToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ListAgentsToolInput {
-    /// List every live agent on this host instead of only your direct children.
+    /// Top-level agents only: list every live agent on this host instead of
+    /// only your direct children.
     #[serde(default)]
     global: bool,
 }
@@ -463,8 +465,8 @@ struct SendAgentMessageToolInput {
     /// natively, or queues until it ends when steering is unsupported.
     #[serde(default)]
     interrupt: bool,
-    /// Opt in to targeting any live agent on this host, including other
-    /// top-level agents, instead of only your direct children.
+    /// Top-level agents only: target any other live agent on this host,
+    /// including other top-level agents, instead of only your direct children.
     #[serde(default)]
     global: bool,
 }
@@ -888,6 +890,22 @@ async fn authorize_direct_children(
     Ok(())
 }
 
+/// Global scope lets an agent reach peers and its own ancestors. A sub-agent
+/// reports to its parent only by finishing its turn, so only parentless
+/// agents may opt in.
+async fn require_top_level_caller(host: &HostHandle, caller: &AgentId) -> Result<(), String> {
+    if caller_is_subagent(host, caller).await {
+        return Err("authorization: global=true is only available to top-level agents; a sub-agent may manage only its own children and reports to its parent by finishing its turn".to_owned());
+    }
+    Ok(())
+}
+
+async fn caller_is_subagent(host: &HostHandle, caller: &AgentId) -> bool {
+    host.agent_handle(caller)
+        .await
+        .is_some_and(|handle| handle.snapshot().parent_agent_id.is_some())
+}
+
 async fn authorize_global_targets(
     host: &HostHandle,
     caller: &AgentId,
@@ -1113,7 +1131,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. global=true instead creates an independent top-level agent in any project on this host. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
+        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
     )]
     async fn tyde_spawn_agent(
         &self,
@@ -1127,6 +1145,9 @@ impl TydeAgentControlMcpServer {
         let global = input.global;
         let request = SpawnRequestInput::from(input);
         let result = if global {
+            if let Err(error) = require_top_level_caller(&self.host, &caller).await {
+                return Ok(err_text(error));
+            }
             if request.parent_agent_id.is_some() {
                 return Ok(err_text(
                     "parent_agent_id cannot be combined with global=true",
@@ -1162,7 +1183,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning. global=true lists every project and workbench on this host for global spawns."
+        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning."
     )]
     async fn tyde_list_workbenches(
         &self,
@@ -1220,7 +1241,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. global=true admits any other live agent on this host, including other top-level agents. Requires the calling agent's bearer credential and returns statuses only."
+        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
@@ -1237,6 +1258,11 @@ impl TydeAgentControlMcpServer {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
+        if input.global
+            && let Err(error) = require_top_level_caller(&self.host, &caller).await
+        {
+            return Ok(err_text(error));
+        }
         let authorized = if input.global {
             authorize_global_targets(&self.host, &caller, &agent_ids).await
         } else {
@@ -1264,7 +1290,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record, with its current status. global=true admits any other live agent on this host. An awaiting_user agent is waiting on the user, not finished. Never scans backward."
+        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record, with its current status. An awaiting_user agent is waiting on the user, not finished. Never scans backward."
     )]
     async fn tyde_read_agent(
         &self,
@@ -1280,6 +1306,11 @@ impl TydeAgentControlMcpServer {
             Err(err) => return Ok(err_text(err)),
         };
         let targets = std::slice::from_ref(&agent_id);
+        if input.global
+            && let Err(error) = require_top_level_caller(&self.host, &caller).await
+        {
+            return Ok(err_text(error));
+        }
         let authorized = if input.global {
             authorize_global_targets(&self.host, &caller, targets).await
         } else {
@@ -1359,7 +1390,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Send a follow-up to a direct child, or with global=true to any other live agent on this host, including other top-level agents. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Await then read to collect output."
+        description = "Send a follow-up to a direct child. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle children start immediately. Await then read to collect output."
     )]
     async fn tyde_send_agent_message(
         &self,
@@ -1379,6 +1410,11 @@ impl TydeAgentControlMcpServer {
             return Ok(err_text("message must not be empty"));
         }
         let targets = std::slice::from_ref(&agent_id);
+        if input.global
+            && let Err(error) = require_top_level_caller(&self.host, &request_agent_id).await
+        {
+            return Ok(err_text(error));
+        }
         let authorized = if input.global {
             authorize_global_targets(&self.host, &request_agent_id, targets).await
         } else {
@@ -1813,9 +1849,7 @@ impl TydeAgentControlMcpServer {
         }
     }
 
-    #[tool(
-        description = "List agents directly created by the calling Tyde agent. global=true lists every live agent on this host, including other top-level agents."
-    )]
+    #[tool(description = "List agents directly created by the calling Tyde agent.")]
     async fn tyde_list_agents(
         &self,
         Parameters(input): Parameters<ListAgentsToolInput>,
@@ -1826,6 +1860,11 @@ impl TydeAgentControlMcpServer {
                 Ok(agent_id) => agent_id,
                 Err(err) => return Ok(err_text(err)),
             };
+        if input.global
+            && let Err(error) = require_top_level_caller(&self.host, &request_agent_id).await
+        {
+            return Ok(err_text(error));
+        }
         let scope = (!input.global).then_some(&request_agent_id);
         match do_list_agents(&self.host, scope).await {
             Ok(result) => ok_json(result),
@@ -1861,18 +1900,21 @@ impl ServerHandler for TydeAgentControlMcpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let swarm_caller = match context.extensions.get::<axum::http::request::Parts>() {
-            Some(parts) => match authenticated_caller_from_parts(&self.credentials, parts) {
-                Ok(Some(caller)) => self
-                    .host
-                    .is_swarm_agent(&caller)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.message, None))?,
-                Ok(None) => false,
-                Err(error) => return Err(McpError::invalid_params(error, None)),
-            },
-            None => false,
-        };
+        let (swarm_caller, subagent_caller) =
+            match context.extensions.get::<axum::http::request::Parts>() {
+                Some(parts) => match authenticated_caller_from_parts(&self.credentials, parts) {
+                    Ok(Some(caller)) => (
+                        self.host
+                            .is_swarm_agent(&caller)
+                            .await
+                            .map_err(|error| McpError::internal_error(error.message, None))?,
+                        caller_is_subagent(&self.host, &caller).await,
+                    ),
+                    Ok(None) => (false, false),
+                    Err(error) => return Err(McpError::invalid_params(error, None)),
+                },
+                None => (false, false),
+            };
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| match self.surface {
             AgentControlMcpSurface::Control => !matches!(
@@ -1918,6 +1960,17 @@ impl ServerHandler for TydeAgentControlMcpServer {
                     {
                         properties.remove("cost_hint");
                     }
+                }
+            }
+        }
+        if subagent_caller {
+            for tool in &mut tools {
+                let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
+                if let Some(properties) = schema
+                    .get_mut("properties")
+                    .and_then(|value| value.as_object_mut())
+                {
+                    properties.remove("global");
                 }
             }
         }
@@ -2430,6 +2483,7 @@ async fn do_list_workbenches(
     global: bool,
 ) -> Result<ListWorkbenchesResult, String> {
     let (caller_project_id, projects) = if global {
+        require_top_level_caller(host, caller).await?;
         if host
             .is_swarm_agent(caller)
             .await

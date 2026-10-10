@@ -5222,6 +5222,97 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     )
     .await;
     drop(reservation);
+
+    // A sub-agent reports to its parent by finishing its turn: global scope is
+    // neither advertised to it nor honored, so it cannot reach its parent or
+    // peers, while it still manages its own children.
+    for (caller, await_surface, expect_global) in [
+        (&caller_a, false, true),
+        (&caller_a, true, true),
+        (&child_caller, false, false),
+        (&child_caller, true, false),
+    ] {
+        let url = if await_surface {
+            &caller.await_url
+        } else {
+            &caller.url
+        };
+        let tools_response = post_json_with_headers(
+            url,
+            &[("Authorization", &caller.authorization)],
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        let tools = tools_response["result"]["tools"]
+            .as_array()
+            .expect("tools/list result");
+        let global_tools = tools
+            .iter()
+            .filter(|tool| tool["inputSchema"]["properties"].get("global").is_some())
+            .count();
+        if expect_global {
+            assert!(global_tools > 0, "top-level callers must see global scope");
+        } else {
+            assert_eq!(global_tools, 0, "sub-agents must not see global scope");
+        }
+        for tool in tools {
+            let description = tool["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.contains("global"),
+                "{} description must not advertise global scope",
+                tool["name"]
+            );
+        }
+    }
+    for (tool, await_surface, arguments) in [
+        (
+            "tyde_send_agent_message",
+            false,
+            json!({ "agent_id": parent_a.agent_id.0, "message": "to parent", "global": true }),
+        ),
+        (
+            "tyde_send_agent_message",
+            false,
+            json!({ "agent_id": child_b.0, "message": "to peer", "global": true }),
+        ),
+        (
+            "tyde_read_agent",
+            false,
+            json!({ "agent_id": parent_a.agent_id.0, "global": true }),
+        ),
+        (
+            "tyde_await_agents",
+            true,
+            json!({ "agent_ids": [parent_a.agent_id.0], "global": true }),
+        ),
+        ("tyde_list_agents", false, json!({ "global": true })),
+        ("tyde_list_workbenches", false, json!({ "global": true })),
+        (
+            "tyde_spawn_agent",
+            false,
+            json!({
+                "workspace_roots": ["/tmp/credential-global-from-child"],
+                "prompt": "escape", "backend_kind": "claude", "global": true
+            }),
+        ),
+    ] {
+        let response = mcp_tool_call_as(&child_caller, await_surface, tool, arguments).await;
+        assert!(
+            mcp_result_is_error(&response),
+            "{tool} must reject global scope from a sub-agent"
+        );
+        assert!(mcp_result_text(&response).contains("only available to top-level agents"));
+    }
+    let child_listed = mcp_list_agents(&child_caller).await;
+    assert_eq!(
+        child_listed
+            .as_array()
+            .expect("child list agents array")
+            .iter()
+            .filter_map(|agent| agent["agent_id"].as_str())
+            .collect::<Vec<_>>(),
+        vec![grandchild.0.as_str()]
+    );
     for (caller, target) in [
         (&caller_a, &parent_a.agent_id),
         (&caller_a, &parent_b.agent_id),

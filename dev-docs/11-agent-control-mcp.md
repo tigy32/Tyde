@@ -398,6 +398,12 @@ other than the caller itself, including other top-level agents. Unknown targets
 and self-targets are rejected. Close and debug-read never take `global`; they
 stay child- or report-scoped.
 
+Global scope belongs only to top-level agents (no `parent_agent_id`). A
+sub-agent may spawn, message, await, read, list, and close only its own
+children, and it reports to its parent solely by finishing its turn. Its
+`tools/list` omits every `global` property, and any `global: true` call from it,
+including spawn and workbench listing, is rejected with an authorization error.
+
 #### `tyde_read_agent`
 
 Reads exactly one latest output record from one agent. The result is one of:

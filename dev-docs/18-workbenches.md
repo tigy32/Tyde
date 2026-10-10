@@ -848,7 +848,7 @@ is limited to the caller's canonical standalone project plus that project's
 workbenches unless the caller passes `global: true`, which lists every project
 and workbench on the host (with the caller's own project as
 `caller_project_id`, or null) so the caller can spawn a top-level agent there.
-Swarm members cannot list globally. Creation and removal are limited to that same standalone parent
+Swarm members and sub-agents cannot list globally. Creation and removal are limited to that same standalone parent
 regardless of access mode. Removal defaults to safe dirty-root rejection;
 `force: true` is the explicit destructive override.
 
