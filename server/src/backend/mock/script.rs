@@ -304,6 +304,24 @@ impl MockTurn {
         Self::done(steps)
     }
 
+    /// Sends `message` through the real `tyde-tychat` MCP mid-turn, parks at
+    /// `gate`, then finishes with `text` as the final reply.
+    pub fn tychat_send_then_text(
+        message: impl Into<String>,
+        gate: &MockGateHandle,
+        text: impl Into<String>,
+    ) -> Self {
+        let mut steps = text_steps(text.into(), TextShape::default());
+        steps.splice(
+            1..1,
+            [
+                MockStep::TychatSend(message.into()),
+                MockStep::Gate(gate.gate()),
+            ],
+        );
+        Self::done(steps)
+    }
+
     pub fn text_after_gate(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         let mut steps = vec![MockStep::Gate(gate.gate())];
         steps.extend(text_steps(text.into(), TextShape::default()));
@@ -974,6 +992,7 @@ pub(super) enum MockStep {
     Gate(MockGate),
     SpawnNativeChild(MockNativeChild),
     AgentControlAwait(MockAgentControlAwait),
+    TychatSend(String),
 }
 
 impl MockStep {

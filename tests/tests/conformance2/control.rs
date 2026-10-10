@@ -39,15 +39,24 @@ enum ChildCommand {
 pub struct ControlService<B: Backend> {
     pub root_id: protocol::AgentId,
     pub children: Mutex<Vec<Child>>,
+    /// Texts received by `tychat_send_message`, in call order.
+    pub tychat_messages: Mutex<Vec<String>>,
     config: BackendSpawnConfig,
     base_url: String,
     changed: watch::Sender<u64>,
     backend_type: std::marker::PhantomData<B>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Control,
+    Await,
+    Tychat,
+}
+
 struct Endpoint<B: Backend> {
     service: Arc<ControlService<B>>,
-    await_only: bool,
+    surface: Surface,
 }
 
 impl<B: Backend> ControlService<B> {
@@ -59,18 +68,19 @@ impl<B: Backend> ControlService<B> {
         let service = Arc::new(Self {
             root_id: protocol::AgentId(uuid::Uuid::new_v4().to_string()),
             children: Mutex::new(Vec::new()),
+            tychat_messages: Mutex::new(Vec::new()),
             config,
             base_url: format!("http://{}", listener.local_addr().expect("fixture address")),
             changed,
             backend_type: std::marker::PhantomData,
         });
-        let endpoint = |await_only| {
+        let endpoint = |surface| {
             let service = service.clone();
             StreamableHttpService::new(
                 move || {
                     Ok(Endpoint {
                         service: service.clone(),
-                        await_only,
+                        surface,
                     })
                 },
                 Arc::new(LocalSessionManager::default()),
@@ -78,8 +88,9 @@ impl<B: Backend> ControlService<B> {
             )
         };
         let router = axum::Router::new()
-            .nest_service("/control", endpoint(false))
-            .nest_service("/await", endpoint(true));
+            .nest_service("/control", endpoint(Surface::Control))
+            .nest_service("/await", endpoint(Surface::Await))
+            .nest_service("/tychat", endpoint(Surface::Tychat));
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
@@ -88,11 +99,20 @@ impl<B: Backend> ControlService<B> {
         (service, task)
     }
 
-    pub fn configure(&self, caller: &protocol::AgentId, config: &mut BackendSpawnConfig) {
-        for (name, path) in [
+    pub fn configure(
+        &self,
+        caller: &protocol::AgentId,
+        config: &mut BackendSpawnConfig,
+        tychat: bool,
+    ) {
+        let mut servers = vec![
             ("tyde-agent-control", "control"),
             ("tyde-agent-await", "await"),
-        ] {
+        ];
+        if tychat {
+            servers.push(("tyde-tychat", "tychat"));
+        }
+        for (name, path) in servers {
             config
                 .startup_mcp_servers
                 .push(server::backend::StartupMcpServer {
@@ -205,7 +225,7 @@ impl<B: Backend> ControlService<B> {
         };
         let service = self.clone();
         let mut config = self.config.clone();
-        self.configure(&id, &mut config);
+        self.configure(&id, &mut config, false);
         tokio::spawn(async move {
             let (backend, mut events) = match B::spawn(
                 roots,
@@ -368,15 +388,20 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let definitions = if self.await_only {
-            vec![(
+        let definitions = match self.surface {
+            Surface::Await => vec![(
                 "tyde_await_agents",
                 "Wait for a direct child to stop thinking.",
                 json!({"agent_ids":{"type":"array","items":{"type":"string"}}}),
                 vec!["agent_ids"],
-            )]
-        } else {
-            vec![
+            )],
+            Surface::Tychat => vec![(
+                "tychat_send_message",
+                "Send a message to the owner's phone through Tychat right now, mid-turn.",
+                json!({"text":{"type":"string"}}),
+                vec!["text"],
+            )],
+            Surface::Control => vec![
                 (
                     "tyde_spawn_agent",
                     "Start a real child backend and return its agent_id immediately.",
@@ -389,7 +414,7 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
                     json!({"agent_id":{"type":"string"},"message":{"type":"string"}}),
                     vec!["agent_id", "message"],
                 ),
-            ]
+            ],
         };
         let tools = definitions
             .into_iter()
@@ -420,11 +445,26 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
             let caller = self.service.caller(&context)?;
             let args = Value::Object(request.arguments.unwrap_or_default());
             match request.name.as_ref() {
-                "tyde_spawn_agent" if !self.await_only => self.service.spawn(caller, args).await,
-                "tyde_await_agents" if self.await_only => {
+                "tyde_spawn_agent" if self.surface == Surface::Control => {
+                    self.service.spawn(caller, args).await
+                }
+                "tychat_send_message" if self.surface == Surface::Tychat => {
+                    let text = args
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or("missing text")?
+                        .to_owned();
+                    self.service
+                        .tychat_messages
+                        .lock()
+                        .expect("tychat messages")
+                        .push(text);
+                    Ok(json!({"status":"queued"}))
+                }
+                "tyde_await_agents" if self.surface == Surface::Await => {
                     self.service.await_children(caller, args, context).await
                 }
-                "tyde_send_agent_message" if !self.await_only => {
+                "tyde_send_agent_message" if self.surface == Surface::Control => {
                     let id = protocol::AgentId(
                         args.get("agent_id")
                             .and_then(Value::as_str)

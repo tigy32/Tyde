@@ -5765,7 +5765,7 @@ impl HostHandle {
                 tyde_agent_control_max_depth: u8::MAX,
                 ..Default::default()
             };
-            let servers = startup_mcp_servers_for_settings(
+            let mut servers = startup_mcp_servers_for_settings(
                 &forced,
                 &request.workspace_roots,
                 &debug_mcp,
@@ -5780,6 +5780,15 @@ impl HostHandle {
                     "Agent-control MCP is unavailable",
                 ));
             }
+            servers.push(StartupMcpServer {
+                name: crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME.to_string(),
+                supports_parallel_tool_calls: false,
+                transport: StartupMcpTransport::Http {
+                    url: agent_control_mcp.tychat_url.clone(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            });
             for server in servers {
                 if !request
                     .resolved_spawn_config

@@ -387,6 +387,10 @@ enum AgentCommand {
         values: SessionSettingsValues,
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    TychatSend {
+        text: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     SendInput(AgentInput),
     /// Agent-control follow-up whose acceptance the actor acknowledges itself.
     /// See [`AgentHandle::deliver_message`] for the contract; the mailbox
@@ -1751,6 +1755,16 @@ impl AgentHandle {
         result
             .await
             .map_err(|_| "Tychat delivery was not acknowledged".to_owned())?
+    }
+
+    pub(crate) async fn send_tychat(&self, text: String) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::TychatSend { text, reply })
+            .map_err(|_| "Tychat agent closed")?;
+        result
+            .await
+            .map_err(|_| "Tychat message was not acknowledged".to_owned())?
     }
 
     pub(crate) async fn apply_tychat_settings(
@@ -3590,6 +3604,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
+                        AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::DeliverMessage { input, redirect, reply } => {
                             if matches!(
                                 redirect,
@@ -3762,6 +3777,9 @@ pub(crate) fn spawn_agent_actor(
         );
         let mut tychat_turn: Option<protocol::TychatTurnId> = None;
         let mut tychat_final: Option<String> = None;
+        // Messages the agent sent through tychat_send_message this turn; any
+        // send replaces the automatic final reply.
+        let mut tychat_sends: u32 = 0;
         let mut tychat_handoff: Option<(protocol::TychatOwnerMessage, oneshot::Sender<Result<protocol::TychatDeliveryReceipt, String>>)> = None;
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
@@ -5849,7 +5867,7 @@ pub(crate) fn spawn_agent_actor(
                             ChatEvent::StreamEnd(data) => tychat_final = Some(data.message.content.clone()),
                             ChatEvent::ToolRequest(request) => {
                                 if let Some(text) = crate::tychat::question_text(request) && let Some(turn) = tychat_turn
-                                    && let Err(error) = tychat.append(&current_start.agent_id, turn, Some(&request.tool_call_id), text).await { tychat.fail(error).await; }
+                                    && let Err(error) = tychat.append(&current_start.agent_id, turn, crate::tychat::TychatPart::Question(&request.tool_call_id), text).await { tychat.fail(error).await; }
                             }
                             _ => {}
                         }
@@ -6232,9 +6250,15 @@ pub(crate) fn spawn_agent_actor(
                     }
 
                     if current_start.origin == protocol::AgentOrigin::Tychat && real_idle_transition
-                        && let Some(turn) = tychat_turn.take() && let Some(text) = tychat_final.take()
-                        && let Err(error) = tychat.append(&current_start.agent_id, turn, None, text).await {
-                        tychat.fail(error).await;
+                        && let Some(turn) = tychat_turn.take()
+                    {
+                        let final_text = tychat_final.take();
+                        if std::mem::take(&mut tychat_sends) == 0
+                            && let Some(text) = final_text
+                            && let Err(error) = tychat.append(&current_start.agent_id, turn, crate::tychat::TychatPart::Final, text).await
+                        {
+                            tychat.fail(error).await;
+                        }
                     }
                     if real_idle_transition {
                         let session_id = current_session_id
@@ -6575,6 +6599,40 @@ pub(crate) fn spawn_agent_actor(
                         command => command,
                     };
                     match command {
+                        AgentCommand::TychatSend { text, reply } => {
+                            let result = async {
+                                if current_start.origin != protocol::AgentOrigin::Tychat {
+                                    return Err("Only the Tychat agent can message the owner".to_owned());
+                                }
+                                if text.trim().is_empty() {
+                                    return Err("Message text must not be empty".to_owned());
+                                }
+                                if !in_turn {
+                                    return Err("tychat_send_message is only available during a turn".to_owned());
+                                }
+                                let turn = match tychat_turn {
+                                    Some(turn) => turn,
+                                    None => {
+                                        let turn = tychat.begin_turn().await?;
+                                        tychat_turn = Some(turn);
+                                        turn
+                                    }
+                                };
+                                let index = tychat_sends;
+                                tychat
+                                    .append(
+                                        &current_start.agent_id,
+                                        turn,
+                                        crate::tychat::TychatPart::Send(index),
+                                        text,
+                                    )
+                                    .await?;
+                                tychat_sends = index + 1;
+                                Ok(())
+                            }
+                            .await;
+                            let _ = reply.send(result);
+                        }
                         AgentCommand::TychatSettings { values, reply } => {
                             let result = async {
                                 let Some(schema) = session_schema.as_ref() else {
@@ -6724,13 +6782,21 @@ pub(crate) fn spawn_agent_actor(
                                     SteerOutcome::NoActiveTurn(_) => {
                                         path = protocol::TychatDeliveryPath::StartedAfterRace;
                                         // The provider, not a delayed idle event, authoritatively closed this turn.
-                                        if let Some(turn) = tychat_turn.take()
-                                            && let Some(text) = tychat_final.take()
-                                            && let Err(error) = tychat
-                                                .append(&current_start.agent_id, turn, None, text)
-                                                .await
-                                        {
-                                            tychat.fail(error).await;
+                                        if let Some(turn) = tychat_turn.take() {
+                                            let final_text = tychat_final.take();
+                                            if std::mem::take(&mut tychat_sends) == 0
+                                                && let Some(text) = final_text
+                                                && let Err(error) = tychat
+                                                    .append(
+                                                        &current_start.agent_id,
+                                                        turn,
+                                                        crate::tychat::TychatPart::Final,
+                                                        text,
+                                                    )
+                                                    .await
+                                            {
+                                                tychat.fail(error).await;
+                                            }
                                         }
                                     }
                                     SteerOutcome::Closed => {
@@ -10237,6 +10303,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
+            AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::DeliverMessage { reply, .. } => {
                             // A relay mirrors a backend-native child and never
                             // accepts direct input. Answering the caller is the
@@ -11474,6 +11541,9 @@ async fn park_terminal_agent(
             AgentCommand::TychatSettings { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
+            AgentCommand::TychatSend { reply, .. } => {
+                let _ = reply.send(Err("Tychat agent is not running".into()));
+            }
             AgentCommand::DeliverMessage { reply, .. } => {
                 // The fire-and-forget arm above answers a client with a typed
                 // transcript rejection because a human is watching this chat.
@@ -11684,6 +11754,9 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
             AgentCommand::TychatSettings { reply, .. } => {
+                let _ = reply.send(Err("Tychat agent is not running".into()));
+            }
+            AgentCommand::TychatSend { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
             AgentCommand::DeliverMessage { reply, .. } => {

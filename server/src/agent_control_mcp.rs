@@ -62,6 +62,7 @@ const AWAIT_TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 pub struct AgentControlMcpHandle {
     pub url: String,
     pub await_url: String,
+    pub tychat_url: String,
     credentials: AgentControlCredentialAuthority,
     active_await_requests: Arc<AtomicUsize>,
     await_request_cancellations: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
@@ -89,7 +90,7 @@ impl std::fmt::Debug for AgentControlMcpCaller {
 }
 
 #[derive(Clone)]
-struct AgentControlCredentialAuthority {
+pub(crate) struct AgentControlCredentialAuthority {
     secret: Arc<[u8; 32]>,
 }
 
@@ -149,6 +150,7 @@ impl AgentControlMcpHandle {
         Self {
             url: String::new(),
             await_url: String::new(),
+            tychat_url: String::new(),
             credentials: AgentControlCredentialAuthority::new(),
             active_await_requests: Arc::new(AtomicUsize::new(0)),
             await_request_cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -766,7 +768,7 @@ fn claimed_agent_id_from_parts(
     }
 }
 
-fn authenticated_caller_from_parts(
+pub(crate) fn authenticated_caller_from_parts(
     credentials: &AgentControlCredentialAuthority,
     parts: &axum::http::request::Parts,
 ) -> Result<Option<AgentId>, String> {
@@ -2147,10 +2149,13 @@ pub fn start_server(
                         ..Default::default()
                     },
                 );
+                let tychat_service =
+                    crate::tychat_mcp::service(host_handle.clone(), server_credentials.clone());
                 let router = Router::new()
                     .route("/healthz", get(healthz_handler))
                     .nest_service("/mcp", control_service)
-                    .nest_service("/await", await_service);
+                    .nest_service("/await", await_service)
+                    .nest_service("/tychat", tychat_service);
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::warn!("agent-control MCP HTTP server stopped: {err}");
                 }
@@ -2161,6 +2166,7 @@ pub fn start_server(
     Ok(AgentControlMcpHandle {
         url: format!("http://{local_addr}/mcp"),
         await_url: format!("http://{local_addr}/await"),
+        tychat_url: format!("http://{local_addr}/tychat"),
         credentials,
         active_await_requests,
         await_request_cancellations,

@@ -21,6 +21,7 @@ use crate::agent_control_mcp::{
 };
 use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
+use crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 use protocol::McpTransportConfig;
 
@@ -780,6 +781,7 @@ impl AgentRegistry {
                 server.name.as_str(),
                 AGENT_CONTROL_MCP_SERVER_NAME
                     | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                    | TYCHAT_MCP_SERVER_NAME
                     | REVIEW_FEEDBACK_MCP_SERVER_NAME
                     | WORKFLOW_PROGRESS_MCP_SERVER_NAME
             ) {
@@ -790,7 +792,9 @@ impl AgentRegistry {
             };
             if matches!(
                 server.name.as_str(),
-                AGENT_CONTROL_MCP_SERVER_NAME | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                AGENT_CONTROL_MCP_SERVER_NAME
+                    | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                    | TYCHAT_MCP_SERVER_NAME
             ) {
                 headers.insert(
                     axum::http::header::AUTHORIZATION.as_str().to_owned(),

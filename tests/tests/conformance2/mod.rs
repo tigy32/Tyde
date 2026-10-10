@@ -565,13 +565,33 @@ impl<B: Backend> Harness<B> {
     }
 
     pub async fn install_agent_control(&mut self) {
+        self.install_control_tools(false).await;
+    }
+
+    /// Agent control plus the Tychat agent's `tyde-tychat` messaging tool.
+    pub async fn install_tychat_tools(&mut self) {
+        self.install_control_tools(true).await;
+    }
+
+    async fn install_control_tools(&mut self, tychat: bool) {
         assert!(
             self.backend.is_none(),
             "install MCP tools before starting a backend"
         );
         let (service, task) = control::ControlService::start(self.config.clone()).await;
-        service.configure(&service.root_id, &mut self.config);
+        service.configure(&service.root_id, &mut self.config, tychat);
         self.control = Some((service, task));
+    }
+
+    pub fn tychat_messages(&self) -> Vec<String> {
+        self.control
+            .as_ref()
+            .expect("tychat MCP fixture")
+            .0
+            .tychat_messages
+            .lock()
+            .expect("tychat messages")
+            .clone()
     }
 
     /// Chat protocol violations the backend's turn emitter recorded so far in

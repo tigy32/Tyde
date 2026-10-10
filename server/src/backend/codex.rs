@@ -19202,6 +19202,7 @@ fn codex_mcp_elicitation_result(params: &Value) -> Value {
                 | "tyde-agent-control"
                 | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
                 | REVIEW_FEEDBACK_MCP_SERVER_NAME
+                | crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME
         )
     {
         return json!({
@@ -21241,7 +21242,9 @@ fn codex_mcp_config_overrides(
         if tyde_loopback_reachable
             && matches!(
                 name,
-                AGENT_CONTROL_MCP_SERVER_NAME | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                AGENT_CONTROL_MCP_SERVER_NAME
+                    | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                    | crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME
             )
         {
             // These are load-bearing Tyde conversation-control tools. Codex

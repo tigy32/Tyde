@@ -196,7 +196,14 @@ impl MockBackend {
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
-        let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
+        let agent_control_await_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME,
+        );
+        let tychat_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME,
+        );
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
@@ -255,6 +262,7 @@ impl MockBackend {
                 initial_message: Some(initial_message),
                 user_bubbles_from_history: false,
                 agent_control_await_mcp,
+                tychat_mcp,
                 launch_script,
             },
         );
@@ -299,7 +307,14 @@ impl MockBackend {
         let send_gate = launch_script.send_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
-        let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
+        let agent_control_await_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME,
+        );
+        let tychat_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME,
+        );
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let resolved_spawn_config = config.resolved_spawn_config.clone();
         let (
@@ -406,6 +421,7 @@ impl MockBackend {
                     initial_message: None,
                     user_bubbles_from_history: session_user_bubbles,
                     agent_control_await_mcp,
+                    tychat_mcp,
                     launch_script,
                 },
             );
@@ -473,7 +489,14 @@ impl MockBackend {
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
-        let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
+        let agent_control_await_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME,
+        );
+        let tychat_mcp = emit::startup_http_mcp(
+            &config.startup_mcp_servers,
+            crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME,
+        );
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
@@ -535,6 +558,7 @@ impl MockBackend {
                 initial_message: Some(initial_message),
                 user_bubbles_from_history: source_user_bubbles,
                 agent_control_await_mcp,
+                tychat_mcp,
                 launch_script,
             },
         );

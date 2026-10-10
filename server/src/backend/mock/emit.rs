@@ -759,12 +759,13 @@ pub(super) struct MockAgentControlAwaitMcp {
     authorization: Option<String>,
 }
 
-pub(super) fn agent_control_await_mcp(
+pub(super) fn startup_http_mcp(
     startup_mcp_servers: &[StartupMcpServer],
+    name: &str,
 ) -> Option<MockAgentControlAwaitMcp> {
     startup_mcp_servers
         .iter()
-        .find(|server| server.name == crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
+        .find(|server| server.name == name)
         .and_then(|server| match &server.transport {
             StartupMcpTransport::Http { url, headers, .. } => Some(MockAgentControlAwaitMcp {
                 url: url.clone(),
@@ -850,6 +851,32 @@ pub(super) async fn agent_control_await(
         message_id.map(ChatMessageId),
         response_text,
     )))
+}
+
+pub(super) async fn tychat_send(config: Option<&MockAgentControlAwaitMcp>, text: String) {
+    let Some(config) = config else {
+        tracing::error!("mock backend has no tyde-tychat MCP server");
+        return;
+    };
+    let result = post_mcp_json(
+        config,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "mock-tychat-send",
+            "method": "tools/call",
+            "params": {
+                "name": "tychat_send_message",
+                "arguments": { "text": text }
+            }
+        }),
+    )
+    .await;
+    match result {
+        Ok(response)
+            if response.pointer("/result/isError").and_then(Value::as_bool) == Some(false) => {}
+        Ok(response) => tracing::error!("mock tychat_send_message failed: {response}"),
+        Err(error) => tracing::error!("mock tychat_send_message failed: {error}"),
+    }
 }
 
 async fn call_agent_control_await_mcp(

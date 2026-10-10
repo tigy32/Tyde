@@ -21,6 +21,7 @@ pub(super) struct MockLoopConfig {
     pub(super) initial_message: Option<String>,
     pub(super) user_bubbles_from_history: bool,
     pub(super) agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
+    pub(super) tychat_mcp: Option<MockAgentControlAwaitMcp>,
     pub(super) launch_script: MockScript,
 }
 
@@ -37,6 +38,7 @@ pub(super) fn start_mock_command_loop(
         initial_message,
         user_bubbles_from_history,
         agent_control_await_mcp,
+        tychat_mcp,
         launch_script,
     } = config;
     let script = VecDeque::from(launch_script.turns);
@@ -49,6 +51,7 @@ pub(super) fn start_mock_command_loop(
         events_tx,
         subagent_emitter,
         agent_control_await_mcp,
+        tychat_mcp,
         active_subagents: Vec::new(),
         initial_message,
         script,
@@ -109,6 +112,7 @@ struct MockActor {
     events_tx: MockEventSender,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
+    tychat_mcp: Option<MockAgentControlAwaitMcp>,
     active_subagents: Vec<SubAgentHandle>,
     initial_message: Option<String>,
     script: VecDeque<MockTurn>,
@@ -588,6 +592,10 @@ impl MockActor {
                     step,
                 )
                 .await
+            }
+            MockStep::TychatSend(text) => {
+                emit::tychat_send(self.tychat_mcp.as_ref(), text).await;
+                true
             }
         }
     }

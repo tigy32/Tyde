@@ -295,7 +295,7 @@ impl TychatService {
         &self,
         agent: &AgentId,
         turn: TychatTurnId,
-        question: Option<&str>,
+        part: TychatPart<'_>,
         text: String,
     ) -> Result<(), String> {
         if text.trim().is_empty() {
@@ -306,8 +306,13 @@ impl TychatService {
         hash.update((agent.0.len() as u64).to_be_bytes());
         hash.update(agent.0.as_bytes());
         hash.update(turn.0.to_be_bytes());
-        if let Some(question) = question {
-            hash.update(question.as_bytes());
+        match part {
+            TychatPart::Final => {}
+            TychatPart::Question(tool_call_id) => hash.update(tool_call_id.as_bytes()),
+            TychatPart::Send(index) => {
+                hash.update(b"\0send\0");
+                hash.update(index.to_be_bytes());
+            }
         }
         let digest = hash.finalize();
         let mut bytes = [0; 16];
@@ -347,6 +352,15 @@ impl TychatService {
     }
 }
 
+/// Which outbound message of a turn is being journaled; it keys the
+/// deterministic message id so retries never duplicate a delivery.
+#[derive(Clone, Copy)]
+pub enum TychatPart<'a> {
+    Final,
+    Question(&'a str),
+    Send(u32),
+}
+
 pub(crate) fn steering_capabilities() -> Vec<BackendSteeringCapability> {
     crate::backend::SUPPORTED_BACKENDS
         .into_iter()
@@ -365,7 +379,7 @@ pub(crate) fn steering_capabilities() -> Vec<BackendSteeringCapability> {
 
 pub(crate) const STARTUP_MESSAGE: &str = "Your Tychat session is ready. Greet the owner in one short sentence, then wait for their message. Do not start any tasks until asked.";
 
-pub(crate) const INSTRUCTIONS: &str = "## Tychat\n\nYou are the Tychat agent: the owner messages you from their phone through Tychat, and your final message each turn is sent back to them. Keep replies short and phone-readable. Unless the owner asks you to do something yourself, hand work to independent top-level agents rather than doing it in this session, and report back when it finishes. Agent-control MCP with global: true lets you spawn, list, read, await and steer every agent on the host. Never expose credentials or private keys.";
+pub(crate) const INSTRUCTIONS: &str = "## Tychat\n\nYou are the Tychat agent: the owner messages you from their phone through Tychat. Keep replies short and phone-readable. Use the tyde-tychat tychat_send_message tool to message the owner during a turn: acknowledge a request before starting work that takes more than a moment (for example \"On it!\"), then send progress and results the same way. If you call tychat_send_message during a turn, your final message is not sent, so put everything the owner should read in tool messages; if you never call it, your final message is sent as the reply. Unless the owner asks you to do something yourself, hand work to independent top-level agents rather than doing it in this session, and report back when it finishes. Agent-control MCP with global: true lets you spawn, list, read, await and steer every agent on the host. Never expose credentials or private keys.";
 
 pub(crate) fn answer(request: &ToolRequest, text: &str) -> Result<SendMessageToolResponse, String> {
     match request.tool_type {

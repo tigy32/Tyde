@@ -124,9 +124,15 @@ macro_rules! conformance2_scenario {
                 claude,
                 server::backend::claude::ClaudeBackend,
                 Profile::new(
-                    // The OpenRouter gateway reports the same pinned Haiku 4.5
-                    // as anthropic/claude-haiku-4.5 in native model events.
-                    &["haiku", "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4.5"],
+                    // The CLI resolves the haiku alias to Haiku 5.5 since its
+                    // release. The OpenRouter gateway reports the pinned Haiku
+                    // 4.5 as anthropic/claude-haiku-4.5 in native model events.
+                    &[
+                        "haiku",
+                        "claude-haiku-5-5",
+                        "claude-haiku-4-5-20251001",
+                        "anthropic/claude-haiku-4.5",
+                    ],
                     &[("model", "haiku"), ("effort", "low")]
                 )
             );
@@ -8477,7 +8483,7 @@ fn real_claude_session_location() {
                 .block_on(async {
                     let mut host = Harness::<server::backend::claude::ClaudeBackend>::new(
                         Profile::new(
-                            &["haiku", "claude-haiku-4-5-20251001"],
+                            &["haiku", "claude-haiku-5-5", "claude-haiku-4-5-20251001"],
                             &[("model", "haiku"), ("effort", "low")],
                         ),
                         "real_claude_session_location",
@@ -8700,6 +8706,60 @@ fn assert_compaction_completed_once(compaction: &Compaction) {
         );
     }
 }
+
+conformance2_scenario!(
+    real_tychat_send_tool,
+    [BackendCapability::AgentControlTools]
+);
+async fn real_tychat_send_tool<B: Backend>(host: &mut Harness<B>) {
+    host.install_tychat_tools().await;
+
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    assert!(
+        host.tychat_messages().is_empty(),
+        "launch turn sent a Tychat message unprompted"
+    );
+
+    let payload = unique_payload();
+    let sent = ask(
+        host,
+        &agent,
+        &format!(
+            "Use the Tyde tool whose name ends in `tychat_send_message` exactly once, passing \
+             text `{payload}`. Do not use any other tool. After it returns, reply with exactly \
+             {TYCHAT_SENT_MARKER} and nothing else."
+        ),
+    )
+    .await;
+    assert_eq!(
+        host.tychat_messages(),
+        vec![payload],
+        "{}: the tyde-tychat server received exactly the dictated message",
+        sent.label()
+    );
+    let declared: Vec<&str> = sent
+        .tool_declarations()
+        .map(|call| call.name.as_str())
+        .collect();
+    assert_eq!(
+        declared
+            .iter()
+            .filter(|name| name.contains("tychat_send_message"))
+            .count(),
+        1,
+        "{}: expected one tychat_send_message call; declared: {declared:?}; completions: {:?}",
+        sent.label(),
+        sent.completion_summaries()
+    );
+    assert_final_text_contains(&sent, TYCHAT_SENT_MARKER);
+
+    assert_universal_contract(&[launched, sent]);
+    assert_clean_close(host, &agent).await;
+}
+
+const TYCHAT_SENT_MARKER: &str = "TYCHAT_SENT";
 
 conformance2_scenario!(
     real_tyde_agent_spawn,

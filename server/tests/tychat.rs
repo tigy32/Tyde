@@ -170,7 +170,7 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         .next()
         .unwrap();
     let instructions = server::backend::mock::session_builtin_steering(&original).unwrap();
-    assert!(instructions.contains("global: true"));
+    assert!(instructions.contains("global: true") && instructions.contains("tychat_send_message"));
     let operator = server::backend::mock::session_instructions(&original)
         .expect("the Tychat agent runs as the Tyde Operator by default");
     assert!(operator.contains("top-level coordinator") && operator.contains("workbench"));
@@ -178,6 +178,7 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         "tyde-config(http)",
         "tyde-agent-control(http)",
         "tyde-agent-await(http)",
+        "tyde-tychat(http)",
     ];
     assert_eq!(
         server::backend::mock::session_startup_mcp_servers(&original).unwrap(),
@@ -826,6 +827,75 @@ async fn turn_end_race_starts_without_queueing() {
             .iter()
             .any(|request| matches!(request, MockRequest::Interrupt))
     );
+}
+
+#[tokio::test]
+async fn send_tool_messages_mid_turn_and_replaces_the_final() {
+    let mut fixture = configured().await;
+    let gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Tychat agent",
+            MockScript::one(MockTurn::text("Ready"))
+                .then(MockTurn::tychat_send_then_text(
+                    "On it!",
+                    &gate,
+                    "unsent final",
+                ))
+                .then(MockTurn::text("plain final")),
+        )
+        .await;
+    let (generation, _agent) = pair(&mut fixture).await;
+    drop(reservation);
+    let host = fixture.tychat_host();
+
+    host.deliver_tychat_message(&generation, message("one", "do the thing"))
+        .await
+        .unwrap();
+    let acknowledged = outbox(&host, &generation, 1).await;
+    assert_eq!(
+        acknowledged.pending[0].text, "On it!",
+        "the tool message is journaled while the turn is still running"
+    );
+    assert!(
+        acknowledged.typing,
+        "the turn that sent the tool message has not ended yet"
+    );
+    host.acknowledge_tychat_outbound(&generation, acknowledged.pending[0].message_id)
+        .await
+        .unwrap();
+    gate.release_one();
+    typing(&host, &generation, false).await;
+
+    host.deliver_tychat_message(&generation, message("two", "just answer"))
+        .await
+        .unwrap();
+    let mut changed = host.subscribe_tychat().await;
+    let replies = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = host.tychat_outbound(&generation).await.unwrap();
+            if snapshot
+                .pending
+                .last()
+                .is_some_and(|message| message.text == "plain final")
+            {
+                return snapshot;
+            }
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a turn without tool messages sends its final reply");
+    assert_eq!(
+        replies
+            .pending
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["plain final"],
+        "a turn that used tychat_send_message does not also send its final"
+    );
+    assert_ne!(replies.pending[0].turn_id, acknowledged.pending[0].turn_id);
 }
 
 #[tokio::test]

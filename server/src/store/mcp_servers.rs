@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use protocol::{McpServerConfig, McpServerId, McpTransportConfig};
 use serde::{Deserialize, Serialize};
 
-pub const RESERVED_MCP_SERVER_NAMES: [&str; 4] = [
+pub const RESERVED_MCP_SERVER_NAMES: [&str; 5] = [
     "tyde-debug",
     "tyde-agent-control",
     "tyde-agent-await",
     "tyde-review-feedback",
+    "tyde-tychat",
 ];
 
 #[derive(Debug, Serialize, Deserialize)]

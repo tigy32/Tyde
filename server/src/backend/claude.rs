@@ -6255,6 +6255,7 @@ fn claude_startup_mcp_is_required(name: &str) -> bool {
             | "tyde-agent-control"
             | "tyde-agent-await"
             | "tyde-review-feedback"
+            | "tyde-tychat"
     )
 }
 

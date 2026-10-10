@@ -120,9 +120,21 @@ one outbox entry before advertising it to the bridge. Questions are published
 as numbered text immediately so a blocked turn can receive an answer.
 Proactive turns use exactly the same producer path.
 
+The Tychat agent also gets the built-in `tyde-tychat` MCP server with one tool,
+`tychat_send_message { text }`, so it can acknowledge work ("On it!") and report
+progress mid-turn. The server shares the agent-control listener (`/tychat`) and
+its per-agent bearer; it rejects callers that are not the live Tychat-origin
+agent. A call goes through the agent actor, which owns the turn: it is accepted
+only during a turn, journals one outbox entry through the same producer path,
+and returns once that entry is durable, not when Tychat delivers it. A turn that
+called the tool at least once does not also send its final message; a turn that
+never called it sends its final message as before. Questions and typing are
+unaffected.
+
 Turn identities and outbox records survive restart. Message IDs are a
 domain-separated deterministic digest of agent ID and turn ID (questions also
-include the canonical tool ID). Retry sends exactly the stored ID and body.
+include the canonical tool ID; tool messages include `\0send\0` and their
+zero-based big-endian u32 index within the turn). Retry sends exactly the stored ID and body.
 Acknowledgement removes the pending item durably; a send-success/ack-crash
 retries the same ID and relies on BotClient's idempotent append. This is
 at-least-once transport with once-only user-visible delivery, not a fictional
