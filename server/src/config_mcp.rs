@@ -265,6 +265,8 @@ struct SpawnAgentToolInput {
     launch_profile_id: Option<String>,
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
+    /// Agent type: a custom agent id from tyde_config_list_launch_options.
+    custom_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -506,6 +508,7 @@ impl TydeConfigMcpServer {
             launch_profile_id: input.launch_profile_id,
             cost_hint: input.cost_hint,
             access_mode: input.access_mode,
+            custom_agent_id: input.custom_agent_id,
         };
         match do_spawn_agent(&self.host, request, None).await {
             Ok(agent) => ok_json(agent),

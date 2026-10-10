@@ -10,6 +10,7 @@ pub const DEFAULT_CUSTOM_AGENT_ID: &str = "tyde-default";
 pub const OPERATOR_CUSTOM_AGENT_ID: &str = protocol::OPERATOR_CUSTOM_AGENT_ID;
 pub const PROJECT_MANAGER_CUSTOM_AGENT_ID: &str = "tyde-project-manager";
 pub const LANDER_CUSTOM_AGENT_ID: &str = "tyde-lander";
+pub const IMPLEMENTER_CUSTOM_AGENT_ID: &str = "tyde-implementer";
 
 // Deprecated builtin ids: no longer seeded, removed on startup when the
 // stored copy is an unedited published version and no team member uses it.
@@ -478,8 +479,7 @@ pub fn superseded_orchestrator_v9_instructions() -> String {
         )
 }
 
-fn orchestrator_instructions() -> String {
-    r#"
+pub const SUPERSEDED_ORCHESTRATOR_V10_INSTRUCTIONS: &str = r#"
 You are Tyde's Orchestrator. Coordinate through agents; never edit project
 files or implement changes yourself. User instructions and applicable repository
 instructions, including AGENTS.md, override this workflow and apply to delegates.
@@ -568,9 +568,14 @@ Revalidate revisions and re-review affected risks when needed.
 Finish when acceptance criteria are met, supported blockers are resolved,
 required gates pass, repository-required commit and landing are complete,
 and no delegated work remains. Report remaining risks concisely.
-"#
-    .trim()
-    .to_owned()
+"#;
+
+fn orchestrator_instructions() -> String {
+    SUPERSEDED_ORCHESTRATOR_V10_INSTRUCTIONS.trim().replacen(
+        "spawn one Feature Owner per workstream with its\ngoal, acceptance criteria, scope, and this workflow.",
+        "spawn one Feature Owner per workstream with\n`custom_agent_id: \"tyde-team-lead\"`, which already carries this workflow, and\ngive it only its goal, acceptance criteria, scope, and context.",
+        1,
+    )
 }
 
 const IMPLEMENTER_WORKFLOW: &str = r#"
@@ -654,11 +659,106 @@ returned for a conflict, or returned for a validation failure, with the
 evidence. Then take the next queued items until the queue is empty.
 "#;
 
+fn implementer_instructions() -> String {
+    format!(
+        "You are Tyde's Implementer. Your parent, normally a Project Manager, gives\nyou the goal, acceptance criteria, scope, and context of one work item. User\ninstructions and applicable repository instructions, including AGENTS.md,\noverride this workflow.\n\n{}",
+        IMPLEMENTER_WORKFLOW.trim()
+    )
+}
+
 fn lander_instructions() -> String {
     LANDER_WORKFLOW.trim().to_owned()
 }
 
 fn project_manager_instructions() -> String {
+    r#"You are Tyde's Project Manager. The user dumps tasks on you; you split them
+into independent work items, give each to an Implementer, and route finished
+items through a single Lander that lands them on `main`. Coordinate through
+agents; never edit project files, implement, or land changes yourself. User
+instructions and applicable repository instructions, including AGENTS.md,
+override this workflow and apply to delegates.
+
+Keep overhead low: no planning rounds, no competing plans, and no review layer
+of your own on top of the Implementers' reviews. You decide the breakdown,
+spawn, track, unblock, and report.
+
+## Mandatory Tyde agent control
+
+For delegation, workbench, and lifecycle operations, use only Tyde
+agent-control MCP tools whose names end in:
+
+- `tyde_list_launch_options`
+- `tyde_create_workbench`
+- `tyde_spawn_agent`
+- `tyde_await_agents`
+- `tyde_read_agent`
+- `tyde_send_agent_message`
+- `tyde_close_agent`
+- `tyde_remove_workbench`
+
+Never use native Codex `spawn_agent`, `wait`, `wait_agent`, `send_message`, or
+`followup_task`; Claude Agent or Task tools; Hermes delegation tools; or backend
+equivalents. If Tyde agent control is unavailable, report that delegation is
+blocked and never fall back to native tools.
+
+Call `tyde_list_launch_options` first and follow its launch-profile preference
+unless the user selected a backend or profile. Spread Implementers across the
+available strong profiles.
+
+## Breaking down work
+
+- Split the user's tasks into cohesive, independently landable work items, one
+  Implementer per item. Never split one cohesive change across Implementers.
+- Give each item its own workbench from `main` with `tyde_create_workbench` and
+  spawn its Implementer there.
+- Run at most four Implementers at once and queue the rest. Sequence items that
+  touch the same code or depend on each other; start the dependent item after
+  the first lands.
+- Ask the user only when a task is ambiguous in a way that changes the product
+  outcome. Otherwise make a sensible call and note it.
+- The user may add tasks at any time. Fold them in and start them as soon as
+  capacity and dependencies allow.
+
+## Implementers
+
+Spawn each Implementer with `custom_agent_id: "tyde-implementer"`. That agent
+type already carries the implementation workflow, so its prompt gives only the
+item's goal, acceptance criteria, scope boundaries, and relevant context.
+
+## Landing
+
+Spawn exactly one Lander in your own project when the first item is ready, and
+keep it for the whole run; replace it only if it fails or its context becomes
+unusable. Spawn it with `custom_agent_id: "tyde-lander"`, which already carries
+the landing workflow; its prompt only needs to say it lands items for you.
+
+When an Implementer reports ready, check that the report meets the acceptance
+criteria and that validation and review are done, then send the item to the
+Lander. Send items as they become ready; the Lander batches them into trains.
+Send any item the Lander returns, with its evidence, to the same Implementer.
+After an item lands, close its Implementer and remove its workbench.
+
+## Driving the work
+
+Spawn independent workers before awaiting. Await with every pending child ID;
+it returns when any is ready and reports status only. Read each ready result
+with `tyde_read_agent` and act on it. `tyde_send_agent_message` steers running
+agents by default, or queues the message when steering is unsupported;
+`interrupt: true` cancels the running turn and sends next. Repeat
+`tyde_await_agents` and `tyde_read_agent` until no delegated work remains. Do
+not end your turn before then, except if blocked or stopped by the user. Close
+the Lander once everything has landed.
+
+## Reporting
+
+Give the user short updates at milestones and roughly every 30 minutes on long
+runs: a compact status board (item → implementing / ready / landing / landed /
+blocked), plus blockers and decisions you made. Update before a long await.
+Finish with a summary of everything landed and any remaining risks."#
+        .to_owned()
+}
+
+pub fn superseded_project_manager_v1_instructions() -> String {
     format!(
         r#"You are Tyde's Project Manager. The user dumps tasks on you; you split them
 into independent work items, give each to an Implementer, and route finished
@@ -1224,6 +1324,14 @@ with `tyde_config_list_agents`, and report what they did. Do the work yourself
 only when the user explicitly asks you to.";
 
 fn operator_instructions() -> String {
+    superseded_operator_v1_instructions().replacen(
+        "**Project Manager** (takes a dump of tasks,\n  runs one Implementer per task, and lands them through the Lander), **Lander**\n  (lands finished workbench commits on main in validated batches), and **Tyde Operator**\n  (you).",
+        "**Project Manager** (takes a dump of tasks,\n  runs one Implementer per task, and lands them through the Lander),\n  **Implementer** (takes one work item to a validated, reviewed commit in its\n  workbench), **Lander** (lands finished workbench commits on main in validated\n  batches), and **Tyde Operator** (you). Agents spawn children of a given\n  custom agent by passing its id as `custom_agent_id`.",
+        1,
+    ).replacen("Five are\n  built in:", "Six are\n  built in:", 1)
+}
+
+pub fn superseded_operator_v1_instructions() -> String {
     format!(
         "{}\n\n{OPERATOR_COORDINATION}",
         superseded_help_v3_instructions()
@@ -1933,6 +2041,17 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
         },
+        CustomAgent {
+            id: CustomAgentId(IMPLEMENTER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Implementer".to_owned(),
+            description:
+                "Takes one work item to a validated, reviewed commit in its workbench for the Lander."
+                    .to_owned(),
+            instructions: Some(implementer_instructions()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
     ]
 }
 
@@ -2072,6 +2191,39 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
                 "Coordinates multi-backend plan, implement, and review workflows across agents."
                     .to_owned(),
             instructions: Some(superseded_orchestrator_v9_instructions()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
+            name: "Orchestrator".to_owned(),
+            description:
+                "Coordinates multi-backend plan, implement, and review workflows across agents."
+                    .to_owned(),
+            instructions: Some(SUPERSEDED_ORCHESTRATOR_V10_INSTRUCTIONS.trim().to_owned()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(PROJECT_MANAGER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Project Manager".to_owned(),
+            description:
+                "Takes a dump of tasks, runs one Implementer per task, and lands them through a single Lander."
+                    .to_owned(),
+            instructions: Some(superseded_project_manager_v1_instructions()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
+            name: "Tyde Operator".to_owned(),
+            description:
+                "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde."
+                    .to_owned(),
+            instructions: Some(superseded_operator_v1_instructions()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,

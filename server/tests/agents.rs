@@ -4530,6 +4530,129 @@ async fn agent_control_spawn_without_name_returns_generated_name() {
 }
 
 #[tokio::test]
+async fn agent_control_spawns_children_by_custom_agent_type() {
+    let mut fixture = Fixture::new().await;
+
+    let parent_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "typed-parent",
+            MockScript::one(MockTurn::gated_text(
+                "typed parent stays active",
+                &parent_gate,
+            )),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("typed-parent".to_owned()),
+            custom_agent_id: Some(protocol::CustomAgentId("tyde-project-manager".to_owned())),
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/typed-parent".to_owned()],
+                prompt: "typed parent stays active".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn typed parent failed");
+    let env = expect_next_event(&mut fixture.client, "typed parent NewAgent").await;
+    let parent_new: NewAgentPayload = env.parse_payload().expect("parse typed parent NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "typed parent AgentStart").await;
+    drop(reservation);
+    parent_gate.wait_until_entered().await;
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+
+    let options = mcp_list_launch_options(&caller).await;
+    let offered = options["custom_agents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("launch options must list agent types: {options}"))
+        .iter()
+        .map(|agent| agent["id"].as_str().expect("agent type id").to_owned())
+        .collect::<Vec<_>>();
+    for expected in ["tyde-implementer", "tyde-lander", "tyde-team-lead"] {
+        assert!(
+            offered.iter().any(|id| id == expected),
+            "launch options should offer {expected}: {offered:?}"
+        );
+    }
+    assert!(
+        !offered.iter().any(|id| id == "tyde-help"),
+        "the host Operator must not be offered as a child agent type: {offered:?}"
+    );
+
+    let unknown = mcp_spawn_agent_error_as(
+        &caller,
+        json!({
+            "prompt": "child of a missing type",
+            "backend_kind": "claude",
+            "custom_agent_id": "no-such-agent"
+        }),
+    )
+    .await;
+    assert!(
+        unknown.contains("unknown custom_agent_id no-such-agent")
+            && unknown.contains("tyde_list_launch_options"),
+        "an unknown agent type must be refused with a discovery hint: {unknown}"
+    );
+    let operator = mcp_spawn_agent_error_as(
+        &caller,
+        json!({
+            "prompt": "child operator",
+            "backend_kind": "claude",
+            "custom_agent_id": "tyde-help"
+        }),
+    )
+    .await;
+    assert!(
+        operator.contains("cannot be spawned through agent control"),
+        "agent control must not grant a child the Operator's host configuration tools: {operator}"
+    );
+
+    let child_agent_id = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/typed-child"],
+            "prompt": "implement the typed child item",
+            "backend_kind": "claude",
+            "name": "typed-child",
+            "custom_agent_id": "tyde-implementer"
+        }),
+    )
+    .await;
+    let implementer_id = Some(protocol::CustomAgentId("tyde-implementer".to_owned()));
+    let child_new =
+        expect_replayed_new_agent(&mut fixture.client, &child_agent_id, "typed child NewAgent")
+            .await;
+    assert_eq!(child_new.custom_agent_id, implementer_id);
+    assert_eq!(
+        child_new.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "typed child AgentStart",
+    )
+    .await;
+    assert_eq!(child_start.custom_agent_id, implementer_id);
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "[instructions: You are Tyde's Implementer.",
+    )
+    .await;
+    parent_gate.release_one();
+}
+
+#[tokio::test]
 async fn agent_control_http_binds_parent_to_authenticated_caller() {
     let mut fixture = Fixture::new().await;
 
@@ -10448,6 +10571,14 @@ async fn help_controls_top_level_agents_across_projects() {
             .unwrap()
             .contains(&json!("claude"))
     );
+    assert!(
+        options["custom_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["id"] == "tyde-project-manager"),
+        "Help must discover agent types: {options}"
+    );
 
     let existing = spawn_agent_control_parent(&mut fixture, "existing top level").await;
     let ordinary = fixture.agent_control_caller(&existing.agent_id).await;
@@ -10484,7 +10615,7 @@ async fn help_controls_top_level_agents_across_projects() {
         "tyde_config_spawn_agent",
         json!({
             "project_id": project.id.0, "prompt": "Begin", "name": "Help-created top level",
-            "backend_kind": "claude"
+            "backend_kind": "claude", "custom_agent_id": "tyde-project-manager"
         }),
     )
     .await;
@@ -10497,6 +10628,8 @@ async fn help_controls_top_level_agents_across_projects() {
         new.parent_agent_id.is_none(),
         "Help must create independent roots"
     );
+    let project_manager = Some(protocol::CustomAgentId("tyde-project-manager".to_owned()));
+    assert_eq!(new.custom_agent_id, project_manager);
     let start = expect_agent_start_on_stream(
         &mut fixture.client,
         &new.instance_stream,
@@ -10504,6 +10637,7 @@ async fn help_controls_top_level_agents_across_projects() {
     )
     .await;
     assert_eq!(start.project_id, Some(project.id.clone()));
+    assert_eq!(start.custom_agent_id, project_manager);
     assert!(start.parent_agent_id.is_none());
     assert_eq!(start.workspace_roots, project_roots(&project));
     fixture::next_chat_event_matching_on(&mut fixture.client, &new.instance_stream, "held initial output", |event| {

@@ -24,6 +24,13 @@ small set of built-in team custom agents (for example Code Reviewer) when their
 stable ids are missing. They are still normal `CustomAgent` records: users can
 edit them, and seeding does not overwrite an existing edited record.
 
+Coordinator builtins delegate by agent type. The Project Manager spawns each
+work item with `custom_agent_id: "tyde-implementer"` and its single Lander with
+`custom_agent_id: "tyde-lander"`; the Orchestrator spawns Feature Owners as
+`tyde-team-lead`. Each child's workflow lives in its own record rather than in
+the coordinator's prompt, so editing the Implementer changes every future
+Implementer.
+
 ---
 
 ## 2. Data Model

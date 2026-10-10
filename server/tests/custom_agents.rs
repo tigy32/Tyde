@@ -55,6 +55,7 @@ fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
         "tyde-help",
         "tyde-project-manager",
         "tyde-lander",
+        "tyde-implementer",
     ]
     .into_iter()
     .collect()
@@ -193,8 +194,13 @@ fn assert_project_manager_and_lander(builtins: &HashMap<CustomAgentId, CustomAge
         .get(&CustomAgentId("tyde-lander".to_owned()))
         .expect("built-in Lander should be seeded");
     assert_eq!(lander.name, "Lander");
+    let implementer = builtins
+        .get(&CustomAgentId("tyde-implementer".to_owned()))
+        .expect("built-in Implementer should be seeded");
+    assert_eq!(implementer.name, "Implementer");
     let manager_text = normalized_instructions(manager);
     let lander_text = normalized_instructions(lander);
+    let implementer_text = normalized_instructions(implementer);
 
     for suffix in [
         "tyde_list_launch_options",
@@ -224,17 +230,20 @@ fn assert_project_manager_and_lander(builtins: &HashMap<CustomAgentId, CustomAge
         "Project Manager must delegate, cap concurrency, and serialize landing"
     );
     assert!(
-        manager_text.contains("`tyde_request_review` in its default mode")
-            && manager_text.contains("You do not land it on `main`; the Lander does")
-            && manager_text.contains("Stay available"),
-        "Project Manager must hand Implementers the review-then-ready workflow"
+        implementer_text.contains("`tyde_request_review` in its default mode")
+            && implementer_text.contains("You do not land it on `main`; the Lander does")
+            && implementer_text.contains("Stay available"),
+        "the Implementer agent type must carry the review-then-ready workflow"
     );
     assert!(
-        manager_text.contains(&format!(
-            "<lander-workflow> {lander_text} </lander-workflow>"
-        )) && manager_text.contains("<implementer-workflow> You own this change")
-            && manager_text.contains("</implementer-workflow>"),
-        "Project Manager must fence the Implementer workflow and the verbatim Lander workflow"
+        manager_text
+            .contains("Spawn each Implementer with `custom_agent_id: \"tyde-implementer\"`")
+            && manager_text.contains("Spawn it with `custom_agent_id: \"tyde-lander\"`")
+            && !manager_text.contains("<implementer-workflow>")
+            && !manager_text.contains("<lander-workflow>")
+            && !manager_text.contains("You own this change")
+            && !manager_text.contains(&lander_text),
+        "Project Manager must spawn workers by agent type instead of pasting their workflows"
     );
     assert!(
         lander_text.contains("land everything queued as one train")
@@ -428,8 +437,8 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
     assert_eq!(
         builtins.len(),
-        5,
-        "expected Default, Orchestrator, Help, Project Manager, and Lander builtins: {builtins:?}"
+        6,
+        "expected Default, Orchestrator, Help, Project Manager, Lander, and Implementer builtins: {builtins:?}"
     );
     let default = builtins
         .get(&CustomAgentId("tyde-default".to_owned()))
@@ -466,7 +475,10 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     );
     assert!(
         help.instructions.as_deref().is_some_and(|instructions| {
-            instructions.contains("**Project Manager**") && instructions.contains("**Lander**")
+            instructions.contains("**Project Manager**")
+                && instructions.contains("**Lander**")
+                && instructions.contains("**Implementer**")
+                && instructions.contains("`custom_agent_id`")
         }),
         "Help should introduce the Project Manager and Lander builtins: {help:?}"
     );
@@ -703,19 +715,51 @@ async fn superseded_orchestrator_v7_upgrades_on_restart() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn superseded_orchestrator_v8_and_v9_upgrade_on_restart() {
+async fn superseded_builtin_prompts_upgrade_on_restart() {
     let mut fixture = Fixture::new().await;
+    let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
     let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
-    let active = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap)
-        .remove(&orchestrator_id)
-        .expect("built-in Orchestrator should be seeded");
+    let orchestrator = normalized_instructions(&builtins[&orchestrator_id]);
+    assert!(
+        orchestrator.contains(
+            "spawn one Feature Owner per workstream with `custom_agent_id: \"tyde-team-lead\"`"
+        ) && !orchestrator.contains("scope, and this workflow"),
+        "Orchestrator must spawn Feature Owners by agent type: {orchestrator}"
+    );
 
-    for instructions in [
-        server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
-            .trim()
-            .to_owned(),
-        server::store::custom_agents::superseded_orchestrator_v9_instructions(),
+    for (id, instructions) in [
+        (
+            "tyde-team-lead",
+            server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
+                .trim()
+                .to_owned(),
+        ),
+        (
+            "tyde-team-lead",
+            server::store::custom_agents::superseded_orchestrator_v9_instructions(),
+        ),
+        (
+            "tyde-team-lead",
+            server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V10_INSTRUCTIONS
+                .trim()
+                .to_owned(),
+        ),
+        (
+            "tyde-project-manager",
+            server::store::custom_agents::superseded_project_manager_v1_instructions(),
+        ),
+        (
+            "tyde-help",
+            server::store::custom_agents::superseded_operator_v1_instructions(),
+        ),
     ] {
+        let id = CustomAgentId(id.to_owned());
+        let active = builtins[&id].clone();
+        assert_ne!(
+            active.instructions.as_deref(),
+            Some(instructions.as_str()),
+            "{id} must have changed since the superseded version"
+        );
         let mut previous = active.clone();
         previous.instructions = Some(instructions);
         fixture
@@ -724,9 +768,9 @@ async fn superseded_orchestrator_v8_and_v9_upgrade_on_restart() {
                 custom_agent: previous,
             })
             .await
-            .expect("install superseded Orchestrator failed");
+            .expect("install superseded builtin failed");
         fixture
-            .next_frame_matching("superseded Orchestrator upsert", |env| {
+            .next_frame_matching("superseded builtin upsert", |env| {
                 env.kind == FrameKind::CustomAgentNotify
                     && env
                         .parse_payload::<CustomAgentNotifyPayload>()
@@ -734,7 +778,7 @@ async fn superseded_orchestrator_v8_and_v9_upgrade_on_restart() {
                             matches!(
                                 payload,
                                 CustomAgentNotifyPayload::Upsert { custom_agent }
-                                    if custom_agent.id == orchestrator_id
+                                    if custom_agent.id == id
                             )
                         })
             })
@@ -742,13 +786,15 @@ async fn superseded_orchestrator_v8_and_v9_upgrade_on_restart() {
 
         let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
         let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
-            .remove(&orchestrator_id)
-            .expect("upgraded Orchestrator should be replayed");
+            .remove(&id)
+            .expect("upgraded builtin should be replayed");
         assert_eq!(
             upgraded, active,
-            "an unedited published record should upgrade to the active prompt"
+            "an unedited published {id} should upgrade to the active prompt"
         );
-        assert_orchestrator_uses_tyde_agent_control(&upgraded);
+        if id == orchestrator_id {
+            assert_orchestrator_uses_tyde_agent_control(&upgraded);
+        }
     }
 }
 

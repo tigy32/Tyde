@@ -265,7 +265,17 @@ Input:
 - `project_id?`
 - `name?`
 - `cost_hint?`
+- `custom_agent_id?`
 - `global?`: default `false`
+
+`custom_agent_id` selects the child's agent type: a custom agent from
+`tyde_list_launch_options`. The child is spawned exactly as a user selection of
+that custom agent would be, so its instructions, skills, MCP servers, and tool
+policy come from the record and the prompt carries only the task. This is how
+coordinators delegate to the built-in Implementer and Lander without pasting
+their workflows into every spawn. Unknown ids are rejected. The host Operator
+(`tyde-help`) is refused because it would grant the child host-configuration
+tools.
 
 With `global: true` the spawn creates an independent top-level agent through
 the same path the Tyde Operator uses: no parent, and nothing inherited from the caller.
@@ -294,7 +304,8 @@ and never overrides explicit input.
 Returns the live host settings and catalog projection on every call, so a
 running agent observes preference changes without relaunch. The response
 contains enabled backends, ready launch profiles, defaults, complexity-tier
-availability, and the saved ordered preference. Saved IDs remain in the
+availability, the saved ordered preference, and `custom_agents` (id, name,
+description) accepted as `custom_agent_id`, excluding the host Operator. Saved IDs remain in the
 preference even when absent from the current catalog.
 
 `backend_limits` is backend-scoped and contains an entry only when the host has

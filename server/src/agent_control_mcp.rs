@@ -380,6 +380,10 @@ struct SpawnAgentToolInput {
     /// task — runs on the most capable configuration. Omit for normal tasks.
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
+    /// Agent type: a custom agent id from tyde_list_launch_options. The child
+    /// runs with that agent's instructions, so the prompt carries only the
+    /// task. Omit for a plain agent.
+    custom_agent_id: Option<String>,
     /// Top-level agents only: create an independent top-level agent instead
     /// of your child. Supply a project_id from tyde_list_workbenches with
     /// global=true, or absolute workspace_roots; nothing is inherited from you.
@@ -575,6 +579,14 @@ pub(crate) struct ListLaunchOptionsResult {
     default_launch_profile_id: Option<String>,
     launch_profile_preference: Vec<String>,
     backend_limits: Vec<BackendKnownLimits>,
+    custom_agents: Vec<CustomAgentOption>,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomAgentOption {
+    id: String,
+    name: String,
+    description: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1222,7 +1234,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List enabled backends, launch profiles, the user's ordered advisory preference, factual last-known backend limits when Tyde has an actual report, defaults, and whether optional task complexity tiers may be requested. Requires the calling agent's bearer credential."
+        description = "List enabled backends, launch profiles, the user's ordered advisory preference, factual last-known backend limits when Tyde has an actual report, defaults, whether optional task complexity tiers may be requested, and the custom agents (agent types) tyde_spawn_agent accepts as custom_agent_id. Requires the calling agent's bearer credential."
     )]
     async fn tyde_list_launch_options(
         &self,
@@ -2319,10 +2331,28 @@ pub(crate) async fn do_spawn_agent(
             .unwrap_or_default();
     }
     let requested_name = input.name.filter(|value| !value.trim().is_empty());
+    let custom_agent_id = match input.custom_agent_id.as_deref().map(str::trim) {
+        None => None,
+        Some("") => return Err("custom_agent_id must not be empty".to_owned()),
+        Some(id) if id == protocol::OPERATOR_CUSTOM_AGENT_ID => {
+            return Err(format!(
+                "custom_agent_id {id} is the host Operator and cannot be spawned through agent control"
+            ));
+        }
+        Some(id) => {
+            let id = CustomAgentId(id.to_owned());
+            if host.custom_agent_by_id(&id).await?.is_none() {
+                return Err(format!(
+                    "unknown custom_agent_id {id}; call tyde_list_launch_options for available agents"
+                ));
+            }
+            Some(id)
+        }
+    };
 
     let payload = SpawnAgentPayload {
         name: requested_name.clone(),
-        custom_agent_id: None,
+        custom_agent_id,
         parent_agent_id,
         project_id,
         params: SpawnAgentParams::New {
@@ -2610,6 +2640,17 @@ pub(crate) async fn do_list_launch_options(
             LaunchProfileEntry::Unavailable { .. } => None,
         })
         .collect();
+    let custom_agents = host
+        .list_custom_agents()
+        .await?
+        .into_iter()
+        .filter(|agent| agent.id.0 != protocol::OPERATOR_CUSTOM_AGENT_ID)
+        .map(|agent| CustomAgentOption {
+            id: agent.id.0,
+            name: agent.name,
+            description: agent.description,
+        })
+        .collect();
     Ok(ListLaunchOptionsResult {
         enabled_backends: settings.enabled_backends,
         default_backend: settings.default_backend,
@@ -2622,6 +2663,7 @@ pub(crate) async fn do_list_launch_options(
             .map(|id| id.0)
             .collect(),
         backend_limits,
+        custom_agents,
     })
 }
 
@@ -3147,6 +3189,7 @@ pub(crate) struct SpawnRequestInput {
     pub(crate) name: Option<String>,
     pub(crate) cost_hint: Option<CostHintInput>,
     pub(crate) access_mode: Option<BackendAccessModeInput>,
+    pub(crate) custom_agent_id: Option<String>,
 }
 
 impl From<SpawnAgentToolInput> for SpawnRequestInput {
@@ -3161,6 +3204,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
             name,
             cost_hint,
             access_mode,
+            custom_agent_id,
             global: _,
             command: _,
             description: _,
@@ -3176,6 +3220,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
             name,
             cost_hint,
             access_mode,
+            custom_agent_id,
         }
     }
 }
