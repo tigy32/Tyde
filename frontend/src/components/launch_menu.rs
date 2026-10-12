@@ -4,7 +4,7 @@ use wasm_bindgen::JsCast;
 use crate::actions::begin_new_chat_with_profile;
 use crate::state::{AppState, DEFAULT_CUSTOM_AGENT_ID};
 
-use protocol::{BackendKind, CustomAgent, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind};
+use protocol::{BackendKind, CustomAgent, CustomAgentId, LaunchProfileEntry, LaunchProfileKind};
 
 fn backend_label_for(kind: BackendKind) -> &'static str {
     match kind {
@@ -44,312 +44,345 @@ fn backend_tag_for(
     }
 }
 
-const ITEM_STYLE: &str = "display:flex;align-items:center;gap:0.5rem;width:100%;text-align:left;padding:0.4rem 0.6rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;";
-const SUBITEM_STYLE: &str = "display:block;width:100%;text-align:left;padding:0.4rem 0.8rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;";
-const BADGE_STYLE: &str =
-    "font-size:0.65rem;opacity:0.6;text-transform:uppercase;letter-spacing:0.03em;";
-const CHEVRON_STYLE: &str = "opacity:0.5;font-size:0.7rem;";
-// Top-aligned with the hovered row (`top:0`) so the flyout reads as attached to
-// the row rather than floating above it. The 2px horizontal overlap tucks the
-// flyout under the parent's border so there is no visible gap on either side.
-const SUBMENU_STYLE_RIGHT: &str = "position:absolute;left:100%;top:0;margin-left:-2px;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
-const SUBMENU_STYLE_LEFT: &str = "position:absolute;right:100%;top:0;margin-right:-2px;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
-
-/// Which side a row's custom-agent submenu expands toward. Positioning is a
-/// pure presentation concern owned by the caller, not derived from any server
-/// state.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SubmenuAlign {
-    /// Always open to the right of the row (`left:100%`).
-    Right,
-    /// Always open to the left of the row (`right:100%`).
-    Left,
-    /// Prefer the natural right-side flyout, but flip to the left when the row
-    /// sits too close to the viewport's right edge for the flyout to fit. Used
-    /// by the chat-top New Chat dropdown, which is right-anchored: with room it
-    /// reads as a normal attached flyout, and near the edge it stays on-screen
-    /// and cleanly attached to the row's left instead of floating off-screen.
-    Auto,
-}
-
-/// Width we assume a custom-agent flyout needs before it would clip the right
-/// edge. Only used to decide the flip side in [`SubmenuAlign::Auto`]; the flyout
-/// itself is content-sized. A generous estimate biases toward flipping left one
-/// row early rather than letting the flyout spill off-screen.
-const SUBMENU_ESTIMATED_WIDTH: f64 = 240.0;
-
-fn submenu_style_for(align: SubmenuAlign) -> &'static str {
-    match align {
-        SubmenuAlign::Left => SUBMENU_STYLE_LEFT,
-        // `Auto` is resolved to Left/Right before this is read; default the
-        // unresolved case to the natural right-side flyout.
-        SubmenuAlign::Right | SubmenuAlign::Auto => SUBMENU_STYLE_RIGHT,
+fn backend_icon(kind: BackendKind) -> impl IntoView {
+    let mark = match kind {
+        BackendKind::Tycode => view! { <path d="m7 5-5 7 5 7m10-14 5 7-5 7m-3-16-4 18" /> }.into_any(),
+        BackendKind::Kiro => view! {
+            <path d="m12 2 9 5v10l-9 5-9-5V7z" />
+            <circle cx="12" cy="12" r="3" />
+            <circle cx="13" cy="11" r="0.8" fill="currentColor" />
+        }.into_any(),
+        BackendKind::Claude => view! {
+            <g stroke="#d97757" stroke-width="1.9">
+                <path d="M12 1v22M1 12h22M4.2 4.2l15.6 15.6M4.2 19.8 19.8 4.2M7.8 1.8l8.4 20.4M1.8 7.8l20.4 8.4M1.8 16.2l20.4-8.4M7.8 22.2l8.4-20.4" />
+            </g>
+        }.into_any(),
+        BackendKind::Codex => view! {
+            <g stroke-width="1.4">
+                {(0..6).map(|i| view! {
+                    <path transform=format!("rotate({} 12 12)", i * 60)
+                        d="M12 3c-3-3-8 0-7 4l1 6 6 3 5-3V7l-5-3-5 3v6" />
+                }).collect_view()}
+            </g>
+        }.into_any(),
+        BackendKind::Antigravity => view! {
+            <path d="m3 20 9-17 9 17" stroke="#a58cff" stroke-width="4" />
+            <path d="m12 3 4.5 8.5" stroke="#f39b88" stroke-width="4" />
+            <path d="m16.5 11.5 4.5 8.5" stroke="#69b8ff" stroke-width="4" />
+        }.into_any(),
+        BackendKind::Hermes => view! {
+            <path d="M2 3c4 7 13 2 20 14-7-7-14 0-19-8m1 3c5 7 12 1 18 8-7-3-11 2-16-4m3 3c4 4 8 1 12 3" />
+        }.into_any(),
+        BackendKind::Grok => view! {
+            <path d="M18 4a9 9 0 1 0 3 6M2 22 22 2m-5 1h5v5" />
+        }.into_any(),
+        BackendKind::Opencode => view! {
+            <rect x="2" y="2" width="20" height="20" rx="3" />
+            <path d="m6 7 4 5-4 5m7 0h5" />
+        }.into_any(),
+    };
+    view! {
+        <svg class="launch-backend-icon" width="24" height="24" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+            stroke-linejoin="round" aria-hidden="true" focusable="false">{mark}</svg>
     }
 }
 
-fn chevron_for(align: SubmenuAlign) -> &'static str {
-    match align {
-        SubmenuAlign::Left => "◀",
-        SubmenuAlign::Right | SubmenuAlign::Auto => "▶",
-    }
-}
-
-/// Resolve an [`SubmenuAlign::Auto`] row to a concrete side by measuring where
-/// the hovered row sits in the viewport. Opens right when the flyout fits, else
-/// flips left so it never spills off the right edge.
-fn resolve_auto_align(ev: &web_sys::MouseEvent) -> SubmenuAlign {
-    let Some(target) = ev.current_target() else {
-        return SubmenuAlign::Left;
-    };
-    let Ok(row) = target.dyn_into::<web_sys::Element>() else {
-        return SubmenuAlign::Left;
-    };
-    let Some(viewport_width) = web_sys::window()
-        .and_then(|w| w.inner_width().ok())
-        .and_then(|v| v.as_f64())
-    else {
-        return SubmenuAlign::Left;
-    };
-    let room_to_right = viewport_width - row.get_bounding_client_rect().right();
-    if room_to_right >= SUBMENU_ESTIMATED_WIDTH {
-        SubmenuAlign::Right
-    } else {
-        SubmenuAlign::Left
-    }
-}
-
-/// Shared new-chat launch menu body used by both the Home tab dropdown and the
-/// chat-top New Chat split button. Renders the server-owned launch profile
-/// catalog for the current chat context host: ready profiles are clickable and
-/// expand a side submenu of custom agents; unavailable profiles render disabled
-/// with the server-provided reason. The caller owns the surrounding popover
-/// container; this component only renders the rows and closes `open_sig` on a
-/// successful selection. `submenu_align` lets the caller open the side submenu
-/// toward the viewport interior.
 #[component]
-pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> impl IntoView {
+pub fn LaunchChooser(open_sig: RwSignal<bool>) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let open_profile = RwSignal::new(None::<LaunchProfileId>);
-    // The concrete side the flyout currently opens toward. Fixed for
-    // `Right`/`Left`; for `Auto` it is re-measured each time a row is hovered so
-    // it flips only when the row is too close to the right edge. Chevron and
-    // flyout style both read this, so the arrow can never disagree with the side
-    // the flyout actually opens.
-    let resolved_align = RwSignal::new(match submenu_align {
-        SubmenuAlign::Left => SubmenuAlign::Left,
-        SubmenuAlign::Right | SubmenuAlign::Auto => SubmenuAlign::Right,
-    });
-
+    let host = state.chat_context_host_id_untracked();
     let entries_state = state.clone();
+    let entries_host = host.clone();
     let entries = Memo::new(move |_| {
-        let Some(host_id) = entries_state.chat_context_host_id() else {
-            return Vec::new();
-        };
-        entries_state
-            .launch_profile_catalog
-            .get()
-            .get(&host_id)
-            .map(|catalog| catalog.entries.clone())
-            .unwrap_or_default()
+        entries_state.launch_profile_catalog.with(|catalogs| {
+            entries_host
+                .as_ref()
+                .and_then(|host| catalogs.get(host))
+                .map(|catalog| catalog.entries.clone())
+                .unwrap_or_default()
+        })
     });
-
+    let initial_profile = state.launch_profile_catalog.with_untracked(|catalogs| {
+        let catalog = catalogs.get(host.as_ref()?)?;
+        let id = catalog.default_profile_id.as_ref()?;
+        catalog.entries.iter().find_map(|entry| match entry {
+            LaunchProfileEntry::Ready { profile } if &profile.id == id => Some(id.clone()),
+            _ => None,
+        })
+    });
+    let selected_profile = RwSignal::new(initial_profile);
+    let selected_agent = RwSignal::new(None::<CustomAgentId>);
+    let backend_query = RwSignal::new(String::new());
+    let role_query = RwSignal::new(String::new());
     let agents_state = state.clone();
-    let custom_agents_for_host = Memo::new(move |_| {
-        let Some(host_id) = agents_state.chat_context_host_id() else {
-            return Vec::<CustomAgent>::new();
-        };
-        let mut agents: Vec<CustomAgent> = agents_state
-            .custom_agents
-            .get()
-            .get(&host_id)
-            .cloned()
-            .map(|m| m.into_values().collect())
-            .unwrap_or_default();
-        agents.retain(|a| a.id.0 != DEFAULT_CUSTOM_AGENT_ID);
+    let agents_host = host.clone();
+    let agents = Memo::new(move |_| {
+        let mut agents: Vec<CustomAgent> = agents_state.custom_agents.with(|hosts| {
+            agents_host
+                .as_ref()
+                .and_then(|host| hosts.get(host))
+                .map(|agents| agents.values().cloned().collect())
+                .unwrap_or_default()
+        });
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
     });
-
-    move || {
-        let entries = entries.get();
-        if entries.is_empty() {
-            return view! {
-                <div class="new-chat-menu-empty panel-empty">
-                    "No launch profiles available. Enable a backend in Settings → Backends."
-                </div>
-            }
-            .into_any();
-        }
-
-        let agents = custom_agents_for_host.get();
-        let rows = entries
+    let ready_profile = Memo::new(move |_| {
+        let id = selected_profile.get()?;
+        entries.get().into_iter().find_map(|entry| match entry {
+            LaunchProfileEntry::Ready { profile } if profile.id == id => Some(profile),
+            _ => None,
+        })
+    });
+    let role_available = Memo::new(move |_| {
+        selected_agent
+            .get()
+            .is_none_or(|id| agents.get().iter().any(|agent| agent.id == id))
+    });
+    let role_name = Memo::new(move |_| match selected_agent.get() {
+        None => "Default agent".to_owned(),
+        Some(id) => agents
+            .get()
             .into_iter()
-            .map(|entry| match entry {
-                LaunchProfileEntry::Ready { profile } => {
-                    let profile_id = profile.id.clone();
-                    let backend = profile.backend_kind;
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.name)
+            .unwrap_or_else(|| "Role unavailable".to_owned()),
+    });
+    let default_description = Memo::new(move |_| {
+        agents
+            .get()
+            .into_iter()
+            .find(|agent| agent.id.0 == DEFAULT_CUSTOM_AGENT_ID)
+            .map(|agent| agent.description)
+            .unwrap_or_else(|| "Use this host's default agent".to_owned())
+    });
 
-                    let on_row_click = {
-                        let profile = profile.clone();
-                        move |ev: web_sys::MouseEvent| {
-                            ev.stop_propagation();
-                            open_sig.set(false);
-                            let s = expect_context::<AppState>();
-                            begin_new_chat_with_profile(&s, profile.clone(), None);
-                        }
-                    };
+    let context_state = state.clone();
+    let context_host = host.clone();
+    Effect::new(move |_| {
+        if context_state.chat_context_host_id() != context_host {
+            open_sig.set(false);
+        }
+    });
 
-                    let agents_for_sub = agents.clone();
-                    let submenu_profile = profile.clone();
-                    let submenu_id = profile_id.clone();
-                    let submenu = move || {
-                        if open_profile.get() != Some(submenu_id.clone()) {
-                            return None;
-                        }
-                        let on_default = {
-                            let profile = submenu_profile.clone();
-                            move |ev: web_sys::MouseEvent| {
-                                ev.stop_propagation();
-                                open_sig.set(false);
-                                let s = expect_context::<AppState>();
-                                begin_new_chat_with_profile(&s, profile.clone(), None);
-                            }
-                        };
-                        let agent_items = agents_for_sub
-                            .clone()
-                            .into_iter()
-                            .map(|agent| {
-                                let profile = submenu_profile.clone();
-                                let id = agent.id.clone();
-                                let name = agent.name.clone();
-                                let desc = agent.description.clone();
-                                let on_click = move |ev: web_sys::MouseEvent| {
-                                    ev.stop_propagation();
-                                    open_sig.set(false);
-                                    let s = expect_context::<AppState>();
-                                    begin_new_chat_with_profile(
-                                        &s,
-                                        profile.clone(),
-                                        Some(id.clone()),
-                                    );
-                                };
-                                view! {
-                                    <button
-                                        class="new-chat-flyout-item"
-                                        role="menuitem"
-                                        style=SUBITEM_STYLE
-                                        title=desc
-                                        on:click=on_click
-                                    >
-                                        {name}
-                                    </button>
+    let create = Callback::new(move |()| {
+        if !open_sig.get_untracked()
+            || state.chat_context_host_id_untracked() != host
+            || !role_available.get_untracked()
+        {
+            return;
+        }
+        if let Some(profile) = ready_profile.get_untracked() {
+            open_sig.set(false);
+            begin_new_chat_with_profile(&state, profile, selected_agent.get_untracked());
+        }
+    });
+    let dialog_ref = NodeRef::<leptos::html::Div>::new();
+    let search_ref = NodeRef::<leptos::html::Input>::new();
+    let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> = StoredValue::new_local(
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok()),
+    );
+    Effect::new(move |_| {
+        if let Some(search) = search_ref.get() {
+            let _ = search.focus();
+        }
+    });
+    on_cleanup(move || {
+        if let Some(opener) = opener.get_value() {
+            let _ = opener.focus();
+        }
+    });
+    let backdrop_press = RwSignal::new(false);
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        ev.stop_propagation();
+        if ev.is_composing() {
+            return;
+        }
+        match ev.key().as_str() {
+            "Escape" => {
+                ev.prevent_default();
+                open_sig.set(false);
+            }
+            "Enter"
+                if !ev.repeat()
+                    && ev
+                        .target()
+                        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                        .is_some_and(|target| target.tag_name() == "INPUT") =>
+            {
+                ev.prevent_default();
+                create.run(());
+            }
+            "Tab" => {
+                let Some(dialog) = dialog_ref.get_untracked() else {
+                    return;
+                };
+                let Ok(nodes) =
+                    dialog.query_selector_all("button:not([disabled]), input:not([disabled])")
+                else {
+                    return;
+                };
+                let (Some(first), Some(last)) = (
+                    nodes
+                        .item(0)
+                        .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok()),
+                    nodes
+                        .item(nodes.length().saturating_sub(1))
+                        .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok()),
+                ) else {
+                    return;
+                };
+                let active = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.active_element());
+                if ev.shift_key()
+                    && active
+                        .as_ref()
+                        .is_some_and(|el| el.is_same_node(Some(&first)))
+                {
+                    ev.prevent_default();
+                    let _ = last.focus();
+                } else if !ev.shift_key()
+                    && active
+                        .as_ref()
+                        .is_some_and(|el| el.is_same_node(Some(&last)))
+                {
+                    ev.prevent_default();
+                    let _ = first.focus();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    view! {
+        <div class="launch-chooser-overlay"
+            on:pointerdown=move |ev| backdrop_press.set(ev.target() == ev.current_target())
+            on:pointercancel=move |_| backdrop_press.set(false)
+            on:click=move |ev| {
+                if backdrop_press.get_untracked() && ev.target() == ev.current_target() { open_sig.set(false); }
+                backdrop_press.set(false);
+            }>
+            <div class="launch-chooser" role="dialog" aria-modal="true" aria-label="New agent"
+                node_ref=dialog_ref on:keydown=on_keydown>
+                <header class="launch-chooser-header">
+                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
+                    <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
+                        on:click=move |_| open_sig.set(false)>"×"</button>
+                </header>
+                <div class="launch-chooser-body">
+                    <section class="launch-backends" aria-label="Backend">
+                        <h3>"Backend"</h3>
+                        <input type="search" aria-label="Find a backend" placeholder="Find a backend…"
+                            node_ref=search_ref prop:value=move || backend_query.get()
+                            on:input=move |ev| backend_query.set(event_target_value(&ev)) />
+                        <div class="launch-backend-list" role="group" aria-label="Backend choices">
+                            {move || {
+                                let query = backend_query.get().trim().to_lowercase();
+                                let filtered: Vec<_> = entries.get().into_iter().filter(|entry| {
+                                    let label = match entry { LaunchProfileEntry::Ready { profile } => &profile.label,
+                                        LaunchProfileEntry::Unavailable { label, .. } => label };
+                                    label.to_lowercase().contains(&query) || backend_label_for(entry.backend_kind()).to_lowercase().contains(&query)
+                                }).collect();
+                                if filtered.is_empty() {
+                                    return view! { <p class="launch-empty">{if entries.get().is_empty() {
+                                        "No launch profiles available. Enable a backend in Settings → Backends."
+                                    } else { "No backends match your search." }}</p> }.into_any();
                                 }
-                            })
-                            .collect_view();
-                        Some(
-                            view! {
-                                <div
-                                    class="new-chat-submenu"
-                                    role="menu"
-                                    style=move || submenu_style_for(resolved_align.get())
-                                >
-                                    <button
-                                        class="new-chat-flyout-item"
-                                        role="menuitem"
-                                        style=SUBITEM_STYLE
-                                        on:click=on_default
-                                    >
-                                        "Default agent"
-                                    </button>
-                                    {agent_items}
-                                </div>
-                            }
-                            .into_any(),
-                        )
-                    };
-
-                    let hover_id = profile_id.clone();
-                    let expanded_id = profile_id.clone();
-                    let label = profile.label.clone();
-                    let tag = backend_tag_for(profile.kind, backend, &label)
-                        .map(|t| view! { <span style=BADGE_STYLE>{t}</span> });
-                    view! {
-                        <div
-                            class="new-chat-backend-row-wrap"
-                            style="position:relative;"
-                            on:mouseenter=move |ev: web_sys::MouseEvent| {
-                                open_profile.set(Some(hover_id.clone()));
-                                if submenu_align == SubmenuAlign::Auto {
-                                    resolved_align.set(resolve_auto_align(&ev));
-                                }
-                            }
-                            on:mouseleave=move |_| open_profile.set(None)
-                        >
-                            <button
-                                class="new-chat-flyout-item new-chat-menu-item"
-                                role="menuitem"
-                                aria-haspopup="menu"
-                                aria-expanded=move || {
-                                    if open_profile.get() == Some(expanded_id.clone()) {
-                                        "true"
-                                    } else {
-                                        "false"
+                                filtered.into_iter().map(|entry| match entry {
+                                    LaunchProfileEntry::Ready { profile } => {
+                                        let id = profile.id.clone();
+                                        let pressed_id = id.clone();
+                                        let tag = backend_tag_for(profile.kind, profile.backend_kind, &profile.label);
+                                        view! {
+                                            <button type="button" class="launch-backend-choice"
+                                                aria-pressed=move || (selected_profile.get() == Some(pressed_id.clone())).to_string()
+                                                title=profile.description on:click=move |_| selected_profile.set(Some(id.clone()))>
+                                                {backend_icon(profile.backend_kind)}
+                                                <span class="launch-choice-text"><span>{profile.label}</span>
+                                                    {tag.map(|tag| view! { <small class="launch-backend-tag">{tag}</small> })}
+                                                </span>
+                                                <span class="launch-selection-mark" aria-hidden="true"></span>
+                                            </button>
+                                        }.into_any()
                                     }
-                                }
-                                style=ITEM_STYLE
-                                on:click=on_row_click
-                            >
-                                <span>{label}</span>
-                                <span style="flex:1;"></span>
-                                {tag}
-                                // Trailing arrow that points toward the side the
-                                // flyout actually opens; reactive so `Auto` flips
-                                // it in lock-step with the flyout.
-                                <span style=CHEVRON_STYLE>
-                                    {move || chevron_for(resolved_align.get())}
-                                </span>
-                            </button>
-                            {submenu}
+                                    LaunchProfileEntry::Unavailable { kind, backend_kind, label, message, .. } => {
+                                        let tag = backend_tag_for(kind, backend_kind, &label);
+                                        let title = message.clone();
+                                        view! {
+                                            <div class="launch-backend-choice launch-backend-unavailable" aria-disabled="true" title=title>
+                                                {backend_icon(backend_kind)}
+                                                <span class="launch-choice-text"><span>{label}</span>
+                                                    {tag.map(|tag| view! { <small class="launch-backend-tag">{tag}</small> })}
+                                                    <small class="launch-unavailable-reason">{message}</small>
+                                                </span>
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }).collect_view().into_any()
+                            }}
                         </div>
-                    }
-                    .into_any()
-                }
-                LaunchProfileEntry::Unavailable {
-                    id: _,
-                    kind,
-                    backend_kind,
-                    label,
-                    message,
-                } => {
-                    let title = message.clone();
-                    // Same padding/flex as the ready row so ready and
-                    // unavailable entries align down the menu.
-                    let tag = backend_tag_for(kind, backend_kind, &label)
-                        .map(|t| view! { <span style=BADGE_STYLE>{t}</span> });
-                    view! {
-                        <div
-                            class="new-chat-backend-row-wrap new-chat-menu-item-disabled"
-                            role="menuitem"
-                            aria-disabled="true"
-                            style="position:relative;opacity:0.55;cursor:not-allowed;padding:0.4rem 0.6rem;"
-                            title=title
-                        >
-                            <div style="display:flex;align-items:center;gap:0.5rem;">
-                                <span>{label}</span>
-                                <span style="flex:1;"></span>
-                                {tag}
-                            </div>
-                            <div style="font-size:0.7rem;opacity:0.8;white-space:normal;">
-                                {message}
-                            </div>
+                    </section>
+                    <section class="launch-roles" aria-label="Agent role">
+                        <h3>"Agent role"</h3>
+                        <input type="search" aria-label="Find a role" placeholder="Find a role…"
+                            prop:value=move || role_query.get() on:input=move |ev| role_query.set(event_target_value(&ev)) />
+                        <div class="launch-role-list" role="group" aria-label="Agent role choices">
+                            <Show when=move || "default agent".contains(&role_query.get().trim().to_lowercase())
+                                || default_description.get().to_lowercase().contains(&role_query.get().trim().to_lowercase())>
+                                <button type="button" class="launch-role-choice" aria-pressed=move || selected_agent.get().is_none().to_string()
+                                    title=move || default_description.get() on:click=move |_| selected_agent.set(None)>
+                                    <span class="launch-choice-text"><strong>"Default agent"</strong><small>{default_description}</small></span>
+                                    <span class="launch-selection-mark" aria-hidden="true"></span>
+                                </button>
+                            </Show>
+                            {move || {
+                                let query = role_query.get().trim().to_lowercase();
+                                agents.get().into_iter().filter(|agent| agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
+                                    && (agent.name.to_lowercase().contains(&query) || agent.description.to_lowercase().contains(&query)))
+                                    .map(|agent| {
+                                        let id = agent.id;
+                                        let pressed_id = id.clone();
+                                        let title = agent.description.clone();
+                                        view! {
+                                            <button type="button" class="launch-role-choice" title=title
+                                                aria-pressed=move || (selected_agent.get() == Some(pressed_id.clone())).to_string()
+                                                on:click=move |_| selected_agent.set(Some(id.clone()))>
+                                                <span class="launch-choice-text"><strong>{agent.name}</strong><small>{agent.description}</small></span>
+                                                <span class="launch-selection-mark" aria-hidden="true"></span>
+                                            </button>
+                                        }
+                                    }).collect_view()
+                            }}
+                            <Show when=move || {
+                                let query = role_query.get().trim().to_lowercase();
+                                !("default agent".contains(&query) || default_description.get().to_lowercase().contains(&query))
+                                    && !agents.get().iter().any(|agent| agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
+                                        && (agent.name.to_lowercase().contains(&query) || agent.description.to_lowercase().contains(&query)))
+                            }><p class="launch-empty">"No roles match your search."</p></Show>
                         </div>
-                    }
-                    .into_any()
-                }
-            })
-            .collect_view();
-
-        view! { <>{rows}</> }.into_any()
+                    </section>
+                </div>
+                <footer class="launch-chooser-footer">
+                    <div class="launch-summary" aria-live="polite">
+                        <small>"Ready to create"</small>
+                        <strong>{move || ready_profile.get().map(|profile| format!("{} · {}", profile.label, role_name.get()))
+                            .unwrap_or_else(|| "Choose an available backend".to_owned())}</strong>
+                        <Show when=move || !role_available.get()><small>"The selected role is no longer available."</small></Show>
+                    </div>
+                    <div class="launch-footer-actions">
+                        <div><button type="button" class="launch-cancel" on:click=move |_| open_sig.set(false)>"Cancel"</button>
+                            <button type="button" class="launch-create" disabled=move || ready_profile.get().is_none() || !role_available.get()
+                                on:click=move |_| create.run(())>"Create agent"</button></div>
+                        <small>"Enter in search to create · Esc to close"</small>
+                    </div>
+                </footer>
+            </div>
+        </div>
     }
 }
 
@@ -358,7 +391,7 @@ mod wasm_tests {
     use super::*;
     use leptos::mount::mount_to;
     use protocol::{
-        CustomAgentId, LaunchProfile, LaunchProfileCatalog, SessionSettingValue,
+        CustomAgentId, LaunchProfile, LaunchProfileCatalog, LaunchProfileId, SessionSettingValue,
         SessionSettingsValues, ToolPolicy,
     };
     use std::collections::HashMap;
@@ -370,8 +403,23 @@ mod wasm_tests {
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
+        if document
+            .get_element_by_id("launch-chooser-test-css")
+            .is_none()
+        {
+            let style = document.create_element("style").unwrap();
+            style.set_id("launch-chooser-test-css");
+            style.set_text_content(Some(include_str!("../../styles.css")));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
         let container = document.create_element("div").unwrap();
         document.body().unwrap().append_child(&container).unwrap();
+        container
+            .set_attribute(
+                "style",
+                "display:flex;flex-direction:column;width:100%;height:680px;",
+            )
+            .unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
     }
 
@@ -394,6 +442,19 @@ mod wasm_tests {
         (0..nodes.length())
             .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
             .find(|btn| btn.text_content().unwrap_or_default().contains(text))
+    }
+
+    fn search(container: &HtmlElement, label: &str, value: &str) {
+        let input = container
+            .query_selector(&format!("input[aria-label='{label}']"))
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value(value);
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
     }
 
     fn ready(id: &str, label: &str, backend: BackendKind) -> LaunchProfileEntry {
@@ -420,6 +481,57 @@ mod wasm_tests {
 
     fn set_catalog(state: &AppState, host_id: &str, entries: Vec<LaunchProfileEntry>) {
         state.selected_host_id.set(Some(host_id.to_owned()));
+        state.connection_statuses.update(|hosts| {
+            hosts.insert(
+                host_id.to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        state.host_settings_by_host.update(|hosts| {
+            hosts.insert(
+                host_id.to_owned(),
+                settings_model::HostSettings {
+                    enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
+                    default_backend: Some(BackendKind::Claude),
+                    ..Default::default()
+                },
+            );
+        });
+        state.session_schemas.update(|hosts| {
+            let schemas = hosts.entry(host_id.to_owned()).or_default();
+            for backend_kind in [BackendKind::Claude, BackendKind::Codex] {
+                schemas.insert(
+                    backend_kind,
+                    protocol::SessionSchemaEntry::Ready {
+                        schema: protocol::SessionSettingsSchema {
+                            backend_kind,
+                            model_resolutions: Default::default(),
+                            fields: vec![protocol::SessionSettingField {
+                                key: "model".to_owned(),
+                                label: "Model".to_owned(),
+                                description: None,
+                                use_slider: false,
+                                select_options_by_setting: None,
+                                field_type: protocol::SessionSettingFieldType::Select {
+                                    nullable: true,
+                                    default: None,
+                                    options: vec![
+                                        protocol::SelectOption {
+                                            value: "opus".to_owned(),
+                                            label: "Selected Opus".to_owned(),
+                                        },
+                                        protocol::SelectOption {
+                                            value: "updated-model".to_owned(),
+                                            label: "Updated model".to_owned(),
+                                        },
+                                    ],
+                                },
+                            }],
+                        },
+                    },
+                );
+            }
+        });
         state.launch_profile_catalog.update(|map| {
             map.insert(
                 host_id.to_owned(),
@@ -432,18 +544,78 @@ mod wasm_tests {
         });
     }
 
-    fn mount_menu(
-        container: &HtmlElement,
-        state: &AppState,
-        open: RwSignal<bool>,
-        align: SubmenuAlign,
-    ) {
-        let state = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state.clone());
-            view! { <LaunchMenuBody open_sig=open submenu_align=align /> }
+    fn track_rendered_tabs(state: &AppState) {
+        let active_state = state.clone();
+        let active = Memo::new(move |_| active_state.center_zone.with(|zone| zone.active_tab_id()));
+        let lru_state = state.clone();
+        // App installs this tracker; CenterZone reads it to mount active tabs.
+        Effect::new(move |_| {
+            if let Some(tab) = active.get() {
+                lru_state.bump_tab_lru(tab);
+            }
         });
-        std::mem::forget(_handle);
+    }
+
+    fn mount_menu(container: &HtmlElement, state: &AppState, open: RwSignal<bool>) -> impl Drop {
+        let state = state.clone();
+        mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            track_rendered_tabs(&state);
+            view! {
+                <crate::components::center_zone::CenterZone />
+                <Show when=move || open.get()><LaunchChooser open_sig=open /></Show>
+            }
+        })
+    }
+
+    async fn assert_rendered_draft(container: &HtmlElement, backend: &str, model: &str) {
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role=tab][aria-selected=true][aria-label='New Chat']")
+                .unwrap()
+                .is_some(),
+            "confirmation must open and activate a visible New Chat tab"
+        );
+        let textarea = container
+            .query_selector("textarea")
+            .unwrap()
+            .expect("the new draft has a real composer");
+        let rect = textarea.get_bounding_client_rect();
+        assert!(
+            rect.width() > 0.0 && rect.height() > 0.0,
+            "the new draft composer must be visible"
+        );
+        let heading = format!("Session Settings ({backend})");
+        let toggle = find_button_by_text(container, &heading)
+            .expect("the draft shows the selected backend's settings");
+        let accordion = toggle
+            .closest(".session-settings-accordion")
+            .unwrap()
+            .unwrap();
+        let controls_present = accordion.query_selector("select").unwrap().is_some();
+        wasm_bindgen_test::console_log!(
+            "Draft settings: controls_present_before_open={controls_present}"
+        );
+        // The real bar preserves expansion across backend changes. Clicking an
+        // already-open bar hides the correct controls instead of exposing them.
+        if !controls_present {
+            toggle.click();
+        }
+        next_tick().await;
+        let select = accordion
+            .query_selector("select")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        let selected = select.item(select.selected_index() as u32).unwrap();
+        assert_eq!(
+            selected.text_content().as_deref(),
+            Some(model),
+            "the selected model must be visibly rendered, not just stored"
+        );
     }
 
     /// Ready profiles render as selectable rows with a backend badge, and
@@ -468,7 +640,7 @@ mod wasm_tests {
             ],
         );
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         let text = visible_text(&container);
@@ -491,6 +663,37 @@ mod wasm_tests {
         assert!(
             find_button_by_text(&container, "Claude").is_some(),
             "ready profile must be a clickable button"
+        );
+
+        find_button_by_text(&container, "Claude").unwrap().click();
+        next_tick().await;
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.get_mut("local").unwrap().entries[0] = LaunchProfileEntry::Unavailable {
+                id: LaunchProfileId("claude:default".to_owned()),
+                kind: LaunchProfileKind::BackendDefault,
+                backend_kind: BackendKind::Claude,
+                label: "Claude".to_owned(),
+                message: "Backend is no longer ready".to_owned(),
+            };
+        });
+        next_tick().await;
+        let create = find_button_by_text(&container, "Create agent").unwrap();
+        assert!(
+            create.has_attribute("disabled"),
+            "a selected profile that becomes unavailable must not launch"
+        );
+        create.click();
+        assert!(open.get_untracked());
+        assert_eq!(
+            state.composer_untracked().launch_profile_id.get_untracked(),
+            None
+        );
+        assert!(visible_text(&container).contains("Backend is no longer ready"));
+        state.selected_host_id.set(Some("other".to_owned()));
+        next_tick().await;
+        assert!(
+            !open.get_untracked(),
+            "changing hosts must retire choices from the previous host"
         );
     }
 
@@ -518,11 +721,19 @@ mod wasm_tests {
         };
         set_catalog(&state, "local", vec![entry]);
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         find_button_by_text(&container, "Claude")
             .expect("ready profile row")
+            .click();
+        next_tick().await;
+        assert!(
+            open.get_untracked(),
+            "selection stays open until confirmation"
+        );
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
             .click();
         next_tick().await;
 
@@ -545,12 +756,12 @@ mod wasm_tests {
             !open.get_untracked(),
             "selecting a profile must close the menu"
         );
+        assert_rendered_draft(&container, "Claude", "Selected Opus").await;
     }
 
-    /// Hovering a ready profile reveals a side submenu of custom agents;
-    /// choosing one composes the custom agent with the selected profile.
+    /// The two visible choices still compose the custom agent with its profile.
     #[wasm_bindgen_test]
-    async fn custom_agent_submenu_composes_with_profile() {
+    async fn custom_role_composes_with_profile() {
         let container = make_container();
         let state = AppState::new();
         set_catalog(
@@ -574,23 +785,26 @@ mod wasm_tests {
             );
         });
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
-        // Reveal the side submenu by hovering the ready profile row.
-        let row = container
-            .query_selector(".new-chat-backend-row-wrap")
-            .unwrap()
-            .expect("ready profile row wrapper")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let enter = web_sys::MouseEvent::new("mouseenter").unwrap();
-        row.dispatch_event(&enter).unwrap();
-        next_tick().await;
-
+        // Roles are now visible without hover; the profile + role contract is unchanged.
+        find_button_by_text(&container, "Claude").unwrap().click();
         let agent_btn = find_button_by_text(&container, "Reviewer")
-            .expect("custom agent must appear in submenu");
+            .expect("custom role must already be visible");
         agent_btn.click();
+        let create = find_button_by_text(&container, "Create agent").unwrap();
+        let disabled_before_flush = create.has_attribute("disabled");
+        // Same-task programmatic clicks otherwise hit the still-disabled
+        // confirmation button, unlike separate browser pointer events.
+        next_tick().await;
+        wasm_bindgen_test::console_log!(
+            "Chooser confirmation: disabled_before_flush={}, disabled_after_flush={}",
+            disabled_before_flush,
+            create.has_attribute("disabled")
+        );
+        assert!(!create.has_attribute("disabled"));
+        create.click();
         next_tick().await;
 
         assert_eq!(
@@ -608,13 +822,14 @@ mod wasm_tests {
             Some(BackendKind::Claude),
             "custom agent selection must keep the profile backend"
         );
+        assert_rendered_draft(&container, "Claude", "Auto").await;
     }
 
-    /// A ready profile row advertises its submenu to assistive tech via
-    /// `aria-haspopup="menu"` and reflects the open state in `aria-expanded`,
-    /// which flips to `true` while the row is hovered.
+    // The approved chooser removes hover flyouts. Their former ARIA and
+    // alignment checks pinned that removed UI; preserve selection accessibility
+    // and viewport containment against the actual two-pane rendered output.
     #[wasm_bindgen_test]
-    async fn ready_row_exposes_haspopup_and_expanded() {
+    async fn ready_row_exposes_selected_state_without_submenu_semantics() {
         let container = make_container();
         let state = AppState::new();
         set_catalog(
@@ -623,104 +838,66 @@ mod wasm_tests {
             vec![ready("claude:default", "Claude", BackendKind::Claude)],
         );
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
-
-        let row_button = container
-            .query_selector(".new-chat-backend-row-wrap [aria-haspopup=\"menu\"]")
-            .unwrap()
-            .expect("ready row must advertise a popup submenu")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        assert_eq!(
-            row_button.get_attribute("aria-expanded").as_deref(),
-            Some("false"),
-            "submenu starts collapsed"
+        let row = find_button_by_text(&container, "Claude").unwrap();
+        assert_eq!(row.get_attribute("aria-pressed").as_deref(), Some("false"));
+        assert!(
+            row.get_attribute("aria-haspopup").is_none(),
+            "selection does not hide a submenu"
         );
-
-        let row = container
-            .query_selector(".new-chat-backend-row-wrap")
-            .unwrap()
-            .expect("ready profile row wrapper")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let enter = web_sys::MouseEvent::new("mouseenter").unwrap();
-        row.dispatch_event(&enter).unwrap();
+        row.click();
         next_tick().await;
-
-        assert_eq!(
-            row_button.get_attribute("aria-expanded").as_deref(),
-            Some("true"),
-            "hovering the row must expand its submenu in the a11y tree"
+        assert_eq!(row.get_attribute("aria-pressed").as_deref(), Some("true"));
+        assert!(
+            container
+                .query_selector("[role=dialog][aria-modal=true]")
+                .unwrap()
+                .is_some()
         );
     }
 
-    /// The submenu opens toward the side the caller requested: `Left` so the
-    /// chat-top (right-anchored) dropdown stays on-screen, `Right` for the Home
-    /// dropdown. Asserted via geometry, which is what the user perceives.
     #[wasm_bindgen_test]
-    async fn submenu_alignment_follows_caller_choice() {
-        async fn submenu_and_row_left(align: SubmenuAlign) -> (f64, f64) {
-            let container = make_container();
-            let state = AppState::new();
-            set_catalog(
-                &state,
-                "local",
-                vec![ready("claude:default", "Claude", BackendKind::Claude)],
+    async fn backend_and_role_panes_stay_visible_inside_the_dialog() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+        );
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role=dialog]")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let backend = container
+            .query_selector("section[aria-label=Backend]")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let roles = container
+            .query_selector("section[aria-label='Agent role']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            backend.right() <= roles.left() + 1.0,
+            "choices must sit alongside each other, not hover over one another"
+        );
+        assert!(backend.left() >= dialog.left() && roles.right() <= dialog.right());
+        for label in ["Claude", "Default agent"] {
+            let rect = find_button_by_text(&container, label)
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                rect.width() >= 44.0 && rect.height() >= 44.0,
+                "choices need comfortable pointer targets"
             );
-            state.custom_agents.update(|map| {
-                map.entry("local".to_owned()).or_default().insert(
-                    CustomAgentId("reviewer".to_owned()),
-                    CustomAgent {
-                        id: CustomAgentId("reviewer".to_owned()),
-                        name: "Reviewer".to_owned(),
-                        description: String::new(),
-                        instructions: None,
-                        skill_ids: Vec::new(),
-                        mcp_server_ids: Vec::new(),
-                        tool_policy: ToolPolicy::Unrestricted,
-                    },
-                );
-            });
-            let open = RwSignal::new(true);
-            mount_menu(&container, &state, open, align);
-            next_tick().await;
-
-            let row = container
-                .query_selector(".new-chat-backend-row-wrap")
-                .unwrap()
-                .expect("ready profile row wrapper")
-                .dyn_into::<HtmlElement>()
-                .unwrap();
-            let enter = web_sys::MouseEvent::new("mouseenter").unwrap();
-            row.dispatch_event(&enter).unwrap();
-            next_tick().await;
-
-            let submenu = container
-                .query_selector(".new-chat-submenu")
-                .unwrap()
-                .expect("submenu must be visible after hover")
-                .dyn_into::<HtmlElement>()
-                .unwrap();
-            (
-                row.get_bounding_client_rect().left(),
-                submenu.get_bounding_client_rect().left(),
-            )
         }
-
-        let (row_left, submenu_left) = submenu_and_row_left(SubmenuAlign::Left).await;
-        assert!(
-            submenu_left < row_left,
-            "left-aligned submenu must open to the left of its row \
-             (submenu_left={submenu_left}, row_left={row_left})"
-        );
-
-        let (row_left, submenu_left) = submenu_and_row_left(SubmenuAlign::Right).await;
-        assert!(
-            submenu_left >= row_left,
-            "right-aligned submenu must open at/to the right of its row \
-             (submenu_left={submenu_left}, row_left={row_left})"
-        );
     }
 
     /// When the host has no launch profiles yet, the empty state guides the
@@ -732,7 +909,7 @@ mod wasm_tests {
         // Host selected but no catalog entries → empty state.
         state.selected_host_id.set(Some("local".to_owned()));
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         let text = visible_text(&container);
@@ -742,7 +919,7 @@ mod wasm_tests {
         );
     }
 
-    /// Unavailable profile rows expose disabled menu semantics for assistive
+    /// Unavailable profile rows expose disabled semantics for assistive
     /// technology instead of looking like a plain clickable row.
     #[wasm_bindgen_test]
     async fn unavailable_row_exposes_aria_disabled() {
@@ -760,23 +937,240 @@ mod wasm_tests {
             }],
         );
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         let disabled = container
-            .query_selector("[aria-disabled=\"true\"][role=\"menuitem\"]")
+            .query_selector("[aria-disabled=\"true\"]")
             .unwrap();
         assert!(
             disabled.is_some(),
-            "unavailable profile row must expose disabled menu-item semantics"
+            "unavailable profile row must expose disabled semantics"
         );
     }
 
-    /// The primary "New Chat" button starts from the catalog's
-    /// `default_profile_id` when it names an exact ready entry — backend and
-    /// profile id come straight from the server-owned catalog.
+    /// Backend and role choices compose only on confirmation and keep tracking
+    /// live server catalogs, including same-id label and setting updates.
     #[wasm_bindgen_test]
-    fn primary_new_chat_honors_ready_default_profile() {
+    async fn eight_backends_and_roles_are_clickable_without_hover_or_early_launch() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![
+                ready("kiro:default", "Kiro (ACP)", BackendKind::Kiro),
+                ready("claude:default", "Claude", BackendKind::Claude),
+                ready("codex:default", "Codex", BackendKind::Codex),
+                ready(
+                    "antigravity:default",
+                    "Antigravity",
+                    BackendKind::Antigravity,
+                ),
+                ready("hermes:default", "Hermes", BackendKind::Hermes),
+                ready("grok:default", "Grok", BackendKind::Grok),
+                ready("opencode:default", "OpenCode", BackendKind::Opencode),
+                ready_kind(
+                    "hermes:local",
+                    "Hermes — qwen-local",
+                    BackendKind::Hermes,
+                    LaunchProfileKind::Custom,
+                ),
+            ],
+        );
+        state.custom_agents.update(|map| {
+            let agents = map.entry("local".to_owned()).or_default();
+            for name in [
+                "AXDB Ops",
+                "Code Reviewer",
+                "Help",
+                "Implementer",
+                "Lander",
+                "Orchestrator",
+                "Project Manager",
+            ] {
+                let id = CustomAgentId(name.to_owned());
+                agents.insert(
+                    id.clone(),
+                    CustomAgent {
+                        id,
+                        name: name.to_owned(),
+                        description: format!("{name} role"),
+                        instructions: None,
+                        skill_ids: Vec::new(),
+                        mcp_server_ids: Vec::new(),
+                        tool_policy: ToolPolicy::Unrestricted,
+                    },
+                );
+            }
+        });
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+
+        // The live desktop's 1280x784 content viewport clipped the final
+        // backend target by 23px. Match that layout box in the DOM fixture.
+        container
+            .query_selector(".launch-chooser-overlay")
+            .unwrap()
+            .unwrap()
+            .set_attribute(
+                "style",
+                "width:1280px;height:784px;inset:auto;top:0;left:0;",
+            )
+            .unwrap();
+        next_tick().await;
+        let backend_list = container
+            .query_selector("[aria-label='Backend choices']")
+            .unwrap()
+            .unwrap();
+        wasm_bindgen_test::console_log!(
+            "Chooser backend layout: visible_height={}, content_height={}",
+            backend_list.client_height(),
+            backend_list.scroll_height()
+        );
+        assert_eq!(
+            backend_list.client_height(),
+            backend_list.scroll_height(),
+            "all eight backend targets must fit completely at the standard desktop size"
+        );
+
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Backend choices'] button svg")
+                .unwrap()
+                .length(),
+            8
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Agent role choices'] button")
+                .unwrap()
+                .length(),
+            8
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Agent role choices'] svg")
+                .unwrap()
+                .length(),
+            0
+        );
+        search(&container, "Find a backend", "qwen-local");
+        search(&container, "Find a role", "Implementer");
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Backend choices'] button")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Agent role choices'] button")
+                .unwrap()
+                .length(),
+            1
+        );
+        search(&container, "Find a backend", "");
+        search(&container, "Find a role", "");
+        next_tick().await;
+        let implementer = find_button_by_text(&container, "Implementer")
+            .expect("roles must be visible without hovering over a backend");
+        implementer.click();
+        find_button_by_text(&container, "Codex").unwrap().click();
+        next_tick().await;
+        assert!(
+            open.get_untracked(),
+            "choosing options must not launch or dismiss"
+        );
+        assert_eq!(
+            state.composer_untracked().launch_profile_id.get_untracked(),
+            None,
+            "backend clicks must not create a draft before confirmation"
+        );
+        state.launch_profile_catalog.update(|catalogs| {
+            let catalog = catalogs.get_mut("local").unwrap();
+            let entry = catalog
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id().0 == "codex:default")
+                .unwrap();
+            if let LaunchProfileEntry::Ready { profile } = entry {
+                profile.label = "Codex updated".to_owned();
+                profile.session_settings.0.insert(
+                    "model".to_owned(),
+                    SessionSettingValue::String("updated-model".to_owned()),
+                );
+            }
+        });
+        state.custom_agents.update(|hosts| {
+            hosts
+                .get_mut("local")
+                .unwrap()
+                .get_mut(&CustomAgentId("Implementer".to_owned()))
+                .unwrap()
+                .name = "Updated implementer".to_owned();
+        });
+        next_tick().await;
+        assert!(
+            find_button_by_text(&container, "Codex updated").is_some(),
+            "same-id catalog updates must render live"
+        );
+        assert!(
+            find_button_by_text(&container, "Updated implementer").is_some(),
+            "same-id role updates must render live"
+        );
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().launch_profile_id.get_untracked(),
+            Some(LaunchProfileId("codex:default".to_owned()))
+        );
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            Some(CustomAgentId("Implementer".to_owned()))
+        );
+        assert_eq!(
+            state
+                .composer_untracked()
+                .session_settings
+                .get_untracked()
+                .0
+                .get("model"),
+            Some(&SessionSettingValue::String("updated-model".to_owned())),
+            "confirmation must use current server-owned profile settings, not a stale snapshot"
+        );
+        assert!(
+            !open.get_untracked(),
+            "only confirmation closes the chooser"
+        );
+        assert_rendered_draft(&container, "Codex", "Updated model").await;
+        container
+            .query_selector("button[title='New Chat']:not([role=tab])")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        assert_rendered_draft(&container, "Claude", "Auto").await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            None,
+            "one-click New Chat must reset a previously chosen custom role"
+        );
+        assert_eq!(
+            state.composer_untracked().launch_profile_id.get_untracked(),
+            None,
+            "without a catalog default, the primary button leaves resolution to the server"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn primary_new_chat_honors_ready_default_profile() {
         let state = AppState::new();
         set_catalog(
             &state,
@@ -789,7 +1183,37 @@ mod wasm_tests {
             }
         });
 
-        crate::actions::begin_new_chat_default(&state);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "local".to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        let container = make_container();
+        let mount_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            track_rendered_tabs(&mount_state);
+            view! { <crate::components::center_zone::CenterZone /> }
+        });
+        next_tick().await;
+        find_button_by_text(&container, "New Chat").unwrap().click();
+        next_tick().await;
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .query_selector("[role=dialog][aria-label='New agent']")
+                .unwrap()
+                .is_none(),
+            "primary button opens a draft directly without the portaled chooser"
+        );
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            None,
+            "primary button retains the default agent"
+        );
 
         assert_eq!(
             state.composer_untracked().launch_profile_id.get_untracked(),
@@ -801,13 +1225,86 @@ mod wasm_tests {
             Some(BackendKind::Claude),
             "primary button must use the default profile's backend"
         );
+
+        assert_rendered_draft(&container, "Claude", "Auto").await;
+        let arrow = container
+            .query_selector("button[aria-label='Choose backend and agent role']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        arrow.focus().unwrap();
+        arrow.click();
+        next_tick().await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        let dialog = document
+            .query_selector("[role=dialog][aria-label='New agent']")
+            .unwrap()
+            .expect("only the adjacent arrow opens the chooser");
+        assert_eq!(
+            dialog
+                .query_selector_all("button[aria-pressed=true]")
+                .unwrap()
+                .length(),
+            2,
+            "the server default profile and default role start selected"
+        );
+        let close = dialog
+            .query_selector("button[aria-label='Close agent chooser']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        close.focus().unwrap();
+        let tab = web_sys::KeyboardEventInit::new();
+        tab.set_key("Tab");
+        tab.set_shift_key(true);
+        tab.set_bubbles(true);
+        tab.set_cancelable(true);
+        close
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &tab)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            document.active_element().unwrap().text_content().as_deref(),
+            Some("Create agent"),
+            "keyboard focus wraps inside the dialog"
+        );
+        let escape = web_sys::KeyboardEventInit::new();
+        escape.set_key("Escape");
+        escape.set_bubbles(true);
+        escape.set_cancelable(true);
+        document
+            .active_element()
+            .unwrap()
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
+                    .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        assert!(
+            document
+                .query_selector("[role=dialog][aria-label='New agent']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&arrow)),
+            "closing returns focus to the chooser trigger"
+        );
     }
 
     /// With no server `default_profile_id`, the primary button opens an
     /// ordinary draft: no profile, no backend override (the server resolves its
     /// own default at spawn time). No inference from the catalog contents.
     #[wasm_bindgen_test]
-    fn primary_new_chat_without_default_leaves_profile_unset() {
+    async fn primary_new_chat_without_default_leaves_profile_unset() {
         let state = AppState::new();
         set_catalog(
             &state,
@@ -815,7 +1312,37 @@ mod wasm_tests {
             vec![ready("claude:default", "Claude", BackendKind::Claude)],
         );
 
-        crate::actions::begin_new_chat_default(&state);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "local".to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        let container = make_container();
+        let mount_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            track_rendered_tabs(&mount_state);
+            view! { <crate::components::center_zone::CenterZone /> }
+        });
+        next_tick().await;
+        find_button_by_text(&container, "New Chat").unwrap().click();
+        next_tick().await;
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .query_selector("[role=dialog][aria-label='New agent']")
+                .unwrap()
+                .is_none(),
+            "primary button opens a draft directly without the portaled chooser"
+        );
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            None,
+            "primary button retains the default agent"
+        );
 
         assert_eq!(
             state.composer_untracked().launch_profile_id.get_untracked(),
@@ -827,11 +1354,12 @@ mod wasm_tests {
             None,
             "no server default → no backend override; server resolves its default"
         );
+        assert_rendered_draft(&container, "Claude", "Auto").await;
     }
 
     fn row_button_text(container: &HtmlElement) -> String {
         container
-            .query_selector(".new-chat-menu-item")
+            .query_selector("[aria-label=\"Backend choices\"] button")
             .unwrap()
             .expect("ready profile row button")
             .dyn_into::<HtmlElement>()
@@ -863,7 +1391,7 @@ mod wasm_tests {
             )],
         );
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         let text = row_button_text(&container);
@@ -892,7 +1420,7 @@ mod wasm_tests {
             )],
         );
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
 
         let text = row_button_text(&container);
@@ -907,161 +1435,105 @@ mod wasm_tests {
         );
     }
 
-    /// The row chevron points toward the side the flyout actually opens: `▶`
-    /// when the caller opens the submenu to the right, `◀` when it opens left.
-    /// The glyph and the submenu side can never disagree.
     #[wasm_bindgen_test]
-    async fn chevron_direction_matches_submenu_alignment() {
-        async fn chevron_text(align: SubmenuAlign) -> String {
-            let container = make_container();
-            let state = AppState::new();
-            set_catalog(
-                &state,
-                "local",
-                vec![ready("claude:default", "Claude", BackendKind::Claude)],
-            );
-            let open = RwSignal::new(true);
-            mount_menu(&container, &state, open, align);
-            next_tick().await;
-            row_button_text(&container)
-        }
-
-        let right = chevron_text(SubmenuAlign::Right).await;
-        assert!(
-            right.contains('▶') && !right.contains('◀'),
-            "right-opening row must show a right chevron only: {right:?}"
-        );
-
-        let left = chevron_text(SubmenuAlign::Left).await;
-        assert!(
-            left.contains('◀') && !left.contains('▶'),
-            "left-opening row must show a left chevron only: {left:?}"
-        );
-    }
-
-    fn make_container_styled(style: &str) -> HtmlElement {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let container = document.create_element("div").unwrap();
-        container.set_attribute("style", style).unwrap();
-        document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
-    }
-
-    /// Mount an `Auto`-aligned menu (one ready profile + a custom agent so the
-    /// flyout has content) inside a container placed by `container_style`, hover
-    /// the row, and report its geometry plus the row button text.
-    async fn auto_hover_geometry(container_style: &str) -> (f64, f64, f64, f64, String) {
-        let container = make_container_styled(container_style);
+    async fn backend_icons_replace_chevrons_and_roles_remain_text_only() {
+        let container = make_container();
         let state = AppState::new();
         set_catalog(
             &state,
             "local",
             vec![ready("claude:default", "Claude", BackendKind::Claude)],
         );
-        state.custom_agents.update(|map| {
-            map.entry("local".to_owned()).or_default().insert(
-                CustomAgentId("reviewer".to_owned()),
-                CustomAgent {
-                    id: CustomAgentId("reviewer".to_owned()),
-                    name: "Reviewer".to_owned(),
-                    description: String::new(),
-                    instructions: None,
-                    skill_ids: Vec::new(),
-                    mcp_server_ids: Vec::new(),
-                    tool_policy: ToolPolicy::Unrestricted,
-                },
-            );
-        });
         let open = RwSignal::new(true);
-        mount_menu(&container, &state, open, SubmenuAlign::Auto);
+        let _handle = mount_menu(&container, &state, open);
         next_tick().await;
-
-        let row = container
-            .query_selector(".new-chat-backend-row-wrap")
+        let backend = find_button_by_text(&container, "Claude").unwrap();
+        let icon = backend
+            .query_selector("svg[aria-hidden=true]")
             .unwrap()
-            .expect("ready profile row wrapper")
-            .dyn_into::<HtmlElement>()
             .unwrap();
-        let enter = web_sys::MouseEvent::new("mouseenter").unwrap();
-        row.dispatch_event(&enter).unwrap();
-        next_tick().await;
-
-        let submenu = container
-            .query_selector(".new-chat-submenu")
-            .unwrap()
-            .expect("submenu must be visible after hover")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let row_rect = row.get_bounding_client_rect();
-        let result = (
-            row_rect.left(),
-            row_rect.right(),
-            submenu.get_bounding_client_rect().left(),
-            web_sys::window()
+        let rect = icon.get_bounding_client_rect();
+        assert!(
+            rect.width() >= 20.0 && rect.height() >= 20.0,
+            "backend identity has a visible icon"
+        );
+        assert!(!row_button_text(&container).contains(['▶', '◀']));
+        assert!(
+            find_button_by_text(&container, "Default agent")
                 .unwrap()
-                .inner_width()
+                .query_selector("svg")
                 .unwrap()
-                .as_f64()
-                .unwrap(),
-            row_button_text(&container),
-        );
-        container.remove();
-        result
-    }
-
-    /// `Auto` opens the natural right-side flyout when the row has room to its
-    /// right, with the chevron pointing right — the normal, attached flyout.
-    #[wasm_bindgen_test]
-    async fn auto_flyout_prefers_right_when_room() {
-        // Narrow menu pinned to the left edge → lots of room on the right.
-        let (row_left, row_right, submenu_left, viewport_width, text) =
-            auto_hover_geometry("position:fixed;top:0;left:0;width:160px;").await;
-        assert!(
-            row_left.abs() < 1.0 && viewport_width - row_right >= SUBMENU_ESTIMATED_WIDTH,
-            "fixture row must hug the viewport's left edge with enough room for the flyout \
-             (row_left={row_left}, row_right={row_right}, viewport_width={viewport_width})"
-        );
-        assert!(
-            submenu_left >= row_left,
-            "with room, Auto must open the flyout to the right \
-             (submenu_left={submenu_left}, row_left={row_left})"
-        );
-        assert!(
-            text.contains('▶') && !text.contains('◀'),
-            "right-opening Auto row must show a right chevron: {text:?}"
+                .is_none(),
+            "role choices have no pictograms"
         );
     }
 
-    /// `Auto` flips to a clean left-attached flyout when the row hugs the right
-    /// edge, so the custom-agent list stays on-screen instead of clipping — and
-    /// the chevron flips with it.
-    #[wasm_bindgen_test]
-    async fn auto_flyout_flips_left_near_right_edge() {
-        // Narrow menu pinned to the right edge → no room on the right.
-        let (row_left, row_right, submenu_left, viewport_width, text) =
-            auto_hover_geometry("position:fixed;top:0;right:0;width:160px;").await;
-        // Linux Chrome places right:0 at 765px in a 780px window with a 15px
-        // scrollbar. Compare against the layout width, excluding that scrollbar.
-        let layout_width = web_sys::window()
+    async fn dialog_at_edge(style: &str) -> (f64, f64, f64, f64) {
+        let container = make_container();
+        container.set_attribute("style", style).unwrap();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+        );
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role=dialog]")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let viewport = web_sys::window()
             .unwrap()
             .document()
             .unwrap()
             .document_element()
-            .unwrap()
-            .client_width() as f64;
+            .unwrap();
+        (
+            dialog.left(),
+            dialog.right(),
+            viewport.client_width() as f64,
+            dialog.bottom(),
+        )
+    }
+
+    #[wasm_bindgen_test]
+    async fn chooser_stays_on_screen_from_a_left_edge_trigger() {
+        let (left, right, width, bottom) =
+            dialog_at_edge("position:fixed;top:0;left:0;width:160px;").await;
         assert!(
-            (layout_width - row_right).abs() < 1.0,
-            "fixture row must hug the viewport's right edge before testing Auto \
-             (layout_width={layout_width}, viewport_width={viewport_width}, row_right={row_right})"
+            left >= 0.0 && right <= width,
+            "left-edge trigger cannot clip the chooser"
         );
         assert!(
-            submenu_left < row_left,
-            "near the right edge, Auto must flip the flyout to the left \
-             (submenu_left={submenu_left}, row_left={row_left})"
+            bottom
+                <= web_sys::window()
+                    .unwrap()
+                    .inner_height()
+                    .unwrap()
+                    .as_f64()
+                    .unwrap()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn chooser_stays_on_screen_from_a_right_edge_trigger() {
+        let (left, right, width, bottom) =
+            dialog_at_edge("position:fixed;top:0;right:0;width:160px;").await;
+        assert!(
+            left >= 0.0 && right <= width,
+            "right-edge trigger cannot clip the chooser"
         );
         assert!(
-            text.contains('◀') && !text.contains('▶'),
-            "left-flipped Auto row must show a left chevron: {text:?}"
+            bottom
+                <= web_sys::window()
+                    .unwrap()
+                    .inner_height()
+                    .unwrap()
+                    .as_f64()
+                    .unwrap()
         );
     }
 }

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use leptos::portal::Portal;
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
@@ -15,7 +16,7 @@ use crate::components::command_palette::{
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
-use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
+use crate::components::launch_menu::LaunchChooser;
 use crate::components::review_view::ReviewCommentsSurface;
 use crate::components::settings_panel::SettingsPanel;
 use crate::components::swarm_view::SwarmView;
@@ -1031,7 +1032,6 @@ fn PaneToolActions() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let menu_open = RwSignal::new(false);
-    let menu_position = RwSignal::new(None::<(f64, f64)>);
 
     let is_connected_state = state.clone();
     let is_connected = Memo::new(move |_| {
@@ -1085,37 +1085,7 @@ fn PaneToolActions() -> impl IntoView {
 
     let on_toggle_menu = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
-        if menu_open.get_untracked() {
-            menu_open.set(false);
-            menu_position.set(None);
-            return;
-        }
-
-        let Some(trigger) = ev
-            .current_target()
-            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-        else {
-            log::error!("new chat menu trigger click did not have an element target");
-            return;
-        };
-        let Some(window) = web_sys::window() else {
-            log::error!("new chat menu cannot open without a browser window");
-            return;
-        };
-        let Some(window_width) = window.inner_width().ok().and_then(|width| width.as_f64()) else {
-            log::error!("new chat menu cannot resolve window width");
-            return;
-        };
-        let rect = trigger.get_bounding_client_rect();
-        let top = rect.bottom() + 2.0;
-        let right = (window_width - rect.right()).max(0.0);
-        menu_position.set(Some((top, right)));
-        menu_open.set(true);
-    };
-
-    let close_menu = move |_: web_sys::MouseEvent| {
-        menu_open.set(false);
-        menu_position.set(None);
+        menu_open.update(|open| *open = !*open);
     };
 
     view! {
@@ -1144,10 +1114,11 @@ fn PaneToolActions() -> impl IntoView {
                 </button>
                 <button
                     class="new-chat-menu-trigger"
-                    title="Choose a launch profile for new chat"
+                    title="Choose backend and agent role"
+                    aria-label="Choose backend and agent role"
                     disabled=move || !is_connected.get()
                     on:click=on_toggle_menu
-                    aria-haspopup="menu"
+                    aria-haspopup="dialog"
                     aria-expanded=move || if menu_open.get() { "true" } else { "false" }
                 >
                     <svg width="10" height="6" viewBox="0 0 10 6" fill="none">
@@ -1155,22 +1126,8 @@ fn PaneToolActions() -> impl IntoView {
                     </svg>
                 </button>
 
-                <Show when=move || menu_open.get() && menu_position.get().is_some()>
-                    <div class="new-chat-backdrop" on:click=close_menu></div>
-                    <div
-                        class="new-chat-menu"
-                        role="menu"
-                        style=move || {
-                            menu_position
-                                .get()
-                                .map(|(top, right)| {
-                                    format!("top: {top}px; right: {right}px;")
-                                })
-                                .unwrap_or_default()
-                        }
-                    >
-                        <LaunchMenuBody open_sig=menu_open submenu_align=SubmenuAlign::Auto />
-                    </div>
+                <Show when=move || menu_open.get()>
+                    <Portal><LaunchChooser open_sig=menu_open /></Portal>
                 </Show>
             </div>
         </>

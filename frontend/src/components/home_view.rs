@@ -1,8 +1,9 @@
+use leptos::portal::Portal;
 use leptos::prelude::*;
 
 use crate::actions::begin_new_chat_default;
 use crate::components::host_browser::open_project_browser;
-use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
+use crate::components::launch_menu::LaunchChooser;
 use crate::state::{AppState, ConnectionStatus};
 use protocol::{BackendKind, BackendSetupStatus};
 
@@ -246,19 +247,7 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
 
     view! {
         <>
-            <Show when=move || open.get()>
-                <div
-                    style="position:fixed;inset:0;z-index:99;"
-                    on:click=move |_| open.set(false)
-                />
-            </Show>
-            <div
-                class="new-chat-button-wrap"
-                style=move || {
-                    let base = "position:relative;display:inline-flex;";
-                    if open.get() { format!("{base}z-index:100;") } else { base.to_string() }
-                }
-            >
+            <div class="new-chat-button-wrap" style="display:inline-flex;">
                 <button
                     class="action-btn primary"
                     style="border-radius:6px 0 0 6px;"
@@ -272,18 +261,15 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
                     style="padding:0 0.6rem;border-left:1px solid rgba(255,255,255,0.15);border-radius:0 6px 6px 0;"
                     on:click=on_toggle
                     disabled=move || !connected_sig.get()
-                    title="Pick a launch profile and custom agent"
+                    title="Choose backend and agent role"
+                    aria-label="Choose backend and agent role"
+                    aria-haspopup="dialog"
+                    aria-expanded=move || open.get().to_string()
                 >
                     "▾"
                 </button>
                 <Show when=move || open.get()>
-                    <div
-                        class="new-chat-flyout"
-                        role="menu"
-                        style="position:absolute;top:calc(100% + 4px);right:0;background:var(--bg-surface, #1e1e1e);border:1px solid var(--border-subtle, #333);border-radius:6px;padding:0.5rem 25px;z-index:100;box-shadow:0 4px 16px rgba(0,0,0,0.4);"
-                    >
-                        <LaunchMenuBody open_sig=open submenu_align=SubmenuAlign::Right />
-                    </div>
+                    <Portal><LaunchChooser open_sig=open /></Portal>
                 </Show>
             </div>
         </>
