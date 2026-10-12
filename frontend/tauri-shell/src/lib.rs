@@ -1187,6 +1187,23 @@ fn settings_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>
     Ok(menu)
 }
 
+#[cfg(target_os = "linux")]
+fn install_linux_pinch_zoom_guard(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    window.with_webview(|webview| {
+        use gtk::{gdk::EventType, glib::Propagation, prelude::WidgetExt};
+
+        // WebKitGTK pinch magnification has no app support and can shift the
+        // entire frame offscreen.
+        webview.inner().connect_event(|_, event| {
+            if event.event_type() == EventType::TouchpadPinch {
+                Propagation::Stop
+            } else {
+                Propagation::Proceed
+            }
+        });
+    })
+}
+
 /// WebKitGTK binds no undo/redo keys, and muda cannot create the Linux Edit
 /// menu's Undo/Redo items, so Ctrl+Z did nothing in text fields. WebKit
 /// re-dispatches key events the page left unhandled to the GTK window, so an
@@ -1487,6 +1504,7 @@ pub fn run() {
             updates::init(app.handle())?;
             #[cfg(target_os = "linux")]
             if let Some(window) = app.get_webview_window("main") {
+                install_linux_pinch_zoom_guard(&window)?;
                 install_linux_edit_history_keys(&window)?;
             }
             Ok(())
