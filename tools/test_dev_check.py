@@ -3442,7 +3442,25 @@ class WasmToolScriptTests(unittest.TestCase):
         runner = binaries / "wasm-bindgen-test-runner"
         cargo = binaries / "cargo"
         npm = binaries / "npm"
-        npm.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        trunk = binaries / "trunk"
+        trunk.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            '[[ "$*" == "build --features ui-fixtures" ]]\n'
+            '[[ "$(basename "$PWD")" == "mobile-frontend" ]]\n'
+            '[[ "${TRUNK_FAIL:-0}" != 1 ]]\n'
+            'printf "%s\\n" "$*" >"$UI_BUILD_RECORD"\n',
+            encoding="utf-8",
+        )
+        npm.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            'if [[ "$*" == "exec -- playwright test "* ]]; then\n'
+            '  printf "%s\\n" "$*" >>"$PLAYWRIGHT_RECORD"\n'
+            '  test -f "$UI_BUILD_RECORD"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
         npm.chmod(0o755)
         record = root / "cargo-invocations.txt"
         chrome.write_text(
@@ -3474,7 +3492,7 @@ class WasmToolScriptTests(unittest.TestCase):
             "exit 0\n",
             encoding="utf-8",
         )
-        for binary in (chrome, driver, runner, cargo):
+        for binary in (chrome, driver, runner, cargo, trunk):
             binary.chmod(0o755)
 
         env = os.environ.copy()
@@ -3485,6 +3503,7 @@ class WasmToolScriptTests(unittest.TestCase):
             "TYDE_WASM_TOOLS_PREPARED",
             "RUSTFLAGS",
             "CARGO_FAIL_IN",
+            "TRUNK_FAIL",
         ):
             env.pop(inherited, None)
         env.update(
@@ -3494,6 +3513,8 @@ class WasmToolScriptTests(unittest.TestCase):
                 "CHROMEDRIVER": str(driver),
                 "WASM_BINDGEN_TEST_RUNNER": str(runner),
                 "CARGO_RECORD": str(record),
+                "UI_BUILD_RECORD": str(root / "ui-build-ready.txt"),
+                "PLAYWRIGHT_RECORD": str(root / "playwright-invocations.txt"),
             }
         )
         return script, env, record
@@ -3527,6 +3548,27 @@ class WasmToolScriptTests(unittest.TestCase):
             for invocation in invocations:
                 # 120s, not the 20s the runner defaults to when nothing sets it.
                 self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
+            self.assertEqual(
+                pathlib.Path(env["UI_BUILD_RECORD"]).read_text(encoding="utf-8"),
+                "build --features ui-fixtures\n",
+            )
+            playwright_record = pathlib.Path(env["PLAYWRIGHT_RECORD"])
+            self.assertEqual(
+                playwright_record.read_text(encoding="utf-8"),
+                "exec -- playwright test --config playwright.mobile.config.mjs "
+                "--project composer-webkit\n",
+            )
+            pathlib.Path(env["UI_BUILD_RECORD"]).unlink()
+            playwright_record.unlink()
+            failed_build = subprocess.run(
+                [str(script)],
+                env=dict(env, TRUNK_FAIL="1"),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(failed_build.returncode, 0)
+            self.assertFalse(playwright_record.exists())
 
     def test_explicit_browser_suite_timeout_wins_and_invalid_values_fail(
         self,

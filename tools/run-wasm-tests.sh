@@ -728,4 +728,6 @@ cargo test --target wasm32-unknown-unknown "$@"
 cd "$repo_root"
 npm ci --ignore-scripts --no-audit --no-fund
 npm exec -- playwright install webkit
+# Keep cold fixture compilation outside the server-readiness deadline.
+(cd "$repo_root/mobile-frontend" && NO_COLOR=true trunk build --features ui-fixtures)
 npm exec -- playwright test --config playwright.mobile.config.mjs --project composer-webkit

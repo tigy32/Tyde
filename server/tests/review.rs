@@ -4555,6 +4555,37 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     drop(requester_reservation);
     let review = create_review(&mut client, &project, &requester).await;
     let caller = fixture.agent_control_caller(&requester.agent_id).await;
+    let tool_service = ()
+        .serve(StreamableHttpClientTransport::from_config(
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                caller.url.clone(),
+            )
+            .auth_header(
+                caller
+                    .authorization
+                    .strip_prefix("Bearer ")
+                    .expect("bearer"),
+            ),
+        ))
+        .await
+        .expect("connect requester MCP for review instructions");
+    let tools = tool_service.list_all_tools().await.expect("list tools");
+    let description = tools
+        .iter()
+        .find(|tool| tool.name == "tyde_request_review")
+        .and_then(|tool| tool.description.as_deref())
+        .expect("review scheduling instructions");
+    for instruction in [
+        "must close every AI-generated finding with tyde_review_disposition after addressing or dismissing it",
+        "A conversational reply alone does not close a finding",
+        "Before reporting completion, call tyde_get_review and verify that no AI-generated findings remain pending in any round you requested",
+    ] {
+        assert!(
+            description.contains(instruction),
+            "The scheduling tool must require complete finding closure: {instruction}"
+        );
+    }
+    tool_service.cancel().await.expect("close tools connection");
     let first_gate = MockGateHandle::new();
     let second_gate = MockGateHandle::new();
     let first_reservation = fixture

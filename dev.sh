@@ -768,12 +768,16 @@ run_check_stages() {
     local repetitions="$1"
     local wasm_pid tail_pid wasm_status=0 tail_status=0 status
     local n_wasm n_loader n_docs n_contract
+    local native_temp_dir="$DEV_CHECK_SCCACHE_ROOT/native-tmp/$(printf '%s' "$PWD" | hash_text | cut -c 1-12)"
 
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
     run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server -p tyde-dev-driver --bin tyde-dev-driver
-    run_stage "cargo nextest run" "$repetitions" cargo nextest run
+    # Avoid host /tmp churn, inherited Git roots, and long Unix socket paths.
+    mkdir -p "$native_temp_dir"
+    run_stage "cargo nextest run" "$repetitions" \
+        env TMPDIR="$native_temp_dir" cargo nextest run
 
     n_wasm=$((STAGE_NUMBER + 1))
     n_loader=$((STAGE_NUMBER + 2))
