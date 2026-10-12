@@ -466,7 +466,7 @@ struct SendAgentMessageToolInput {
     #[schemars(length(min = 1))]
     message: String,
     /// Interrupt active work and send next. False steers into the running turn
-    /// natively, or queues until it ends when steering is unsupported.
+    /// natively, or cancels it and sends next when steering is unsupported.
     #[serde(default)]
     interrupt: bool,
     /// Top-level agents only: target any other live agent on this host,
@@ -1439,7 +1439,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Send a follow-up to a direct child. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle children start immediately. Await then read to collect output."
+        description = "Send a follow-up to a direct child. By default steers into the running turn, or cancels it and sends next when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle children start immediately. Await then read to collect output."
     )]
     async fn tyde_send_agent_message(
         &self,

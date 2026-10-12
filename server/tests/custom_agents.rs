@@ -129,7 +129,7 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
         normalized.contains("Await returns status only")
             && normalized.contains("read each ready result")
             && normalized.contains("`tyde_send_agent_message` steers running agents by default")
-            && normalized.contains("queues the message when steering is unsupported")
+            && normalized.contains("cancels the turn and sends next when steering is unsupported")
             && normalized.contains("`interrupt: true` cancels the running turn and sends next")
             && normalized
                 .contains("Read needed results before closing agents with `tyde_close_agent`")
@@ -728,6 +728,18 @@ async fn superseded_builtin_prompts_upgrade_on_restart() {
     );
 
     for (id, instructions) in [
+        (
+            "tyde-team-lead",
+            server::store::custom_agents::superseded_orchestrator_v11_instructions(),
+        ),
+        (
+            "tyde-project-manager",
+            server::store::custom_agents::superseded_project_manager_v2_instructions(),
+        ),
+        (
+            "tyde-help",
+            server::store::custom_agents::superseded_operator_v2_instructions(),
+        ),
         (
             "tyde-team-lead",
             server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
@@ -1730,7 +1742,8 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
         "For your own backend, native subagents or Tyde are both fine",
         "native agent-count limits don't apply to Tyde",
         "`tyde_send_agent_message` steers into the child's running turn by default",
-        "`interrupt: true` cancels that turn and sends next.",
+        "it interrupts when its backend can't steer",
+        "`interrupt: true` always cancels that turn and sends next.",
         "`tyde_await_agents` with all pending child IDs: like select, it returns when any is ready",
         "Read ready children with `tyde_read_agent`",
         "then await remaining work. Don't poll or expect injected results.",

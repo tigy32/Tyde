@@ -571,6 +571,13 @@ and no delegated work remains. Report remaining risks concisely.
 "#;
 
 fn orchestrator_instructions() -> String {
+    superseded_orchestrator_v11_instructions().replace(
+        "running agents by default, or queues the message when steering is unsupported;",
+        "running agents by default, or cancels the turn and sends next when steering is unsupported;",
+    )
+}
+
+pub fn superseded_orchestrator_v11_instructions() -> String {
     SUPERSEDED_ORCHESTRATOR_V10_INSTRUCTIONS.trim().replacen(
         "spawn one Feature Owner per workstream with its\ngoal, acceptance criteria, scope, and this workflow.",
         "spawn one Feature Owner per workstream with\n`custom_agent_id: \"tyde-team-lead\"`, which already carries this workflow, and\ngive it only its goal, acceptance criteria, scope, and context.",
@@ -671,6 +678,13 @@ fn lander_instructions() -> String {
 }
 
 fn project_manager_instructions() -> String {
+    superseded_project_manager_v2_instructions().replace(
+        "agents by default, or queues the message when steering is unsupported;",
+        "agents by default, or cancels the turn and sends next when steering is unsupported;",
+    )
+}
+
+pub fn superseded_project_manager_v2_instructions() -> String {
     r#"You are Tyde's Project Manager. The user dumps tasks on you; you split them
 into independent work items, give each to an Implementer, and route finished
 items through a single Lander that lands them on `main`. Coordinate through
@@ -1324,6 +1338,13 @@ with `tyde_config_list_agents`, and report what they did. Do the work yourself
 only when the user explicitly asks you to.";
 
 fn operator_instructions() -> String {
+    superseded_operator_v2_instructions().replace(
+        "`tyde_config_send_agent_message` steers into running work by default; set\ninterrupt=true only when the user wants to cancel active work.",
+        "`tyde_config_send_agent_message` steers into running work by default, or\ncancels the turn and sends next when steering is unsupported. Set\ninterrupt=true to always cancel active work and send next.",
+    )
+}
+
+pub fn superseded_operator_v2_instructions() -> String {
     superseded_operator_v1_instructions().replacen(
         "**Project Manager** (takes a dump of tasks,\n  runs one Implementer per task, and lands them through the Lander), **Lander**\n  (lands finished workbench commits on main in validated batches), and **Tyde Operator**\n  (you).",
         "**Project Manager** (takes a dump of tasks,\n  runs one Implementer per task, and lands them through the Lander),\n  **Implementer** (takes one work item to a validated, reviewed commit in its\n  workbench), **Lander** (lands finished workbench commits on main in validated\n  batches), and **Tyde Operator** (you). Agents spawn children of a given\n  custom agent by passing its id as `custom_agent_id`.",
@@ -2080,6 +2101,15 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
 /// builtin records from user-edited ones.
 fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     let mut published = legacy_builtin_team_custom_agents();
+    for mut agent in builtin_custom_agents() {
+        agent.instructions = match agent.id.0.as_str() {
+            TEAM_LEAD_CUSTOM_AGENT_ID => Some(superseded_orchestrator_v11_instructions()),
+            PROJECT_MANAGER_CUSTOM_AGENT_ID => Some(superseded_project_manager_v2_instructions()),
+            OPERATOR_CUSTOM_AGENT_ID => Some(superseded_operator_v2_instructions()),
+            _ => continue,
+        };
+        published.push(agent);
+    }
     published.push(CustomAgent {
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),

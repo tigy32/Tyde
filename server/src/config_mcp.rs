@@ -280,8 +280,8 @@ struct AgentIdToolInput {
 struct SendAgentMessageToolInput {
     agent_id: String,
     message: String,
-    /// Steer, or queue when steering is unsupported, by default; true cancels
-    /// active work and sends next.
+    /// Steer, or cancel and send next when steering is unsupported, by default;
+    /// true always cancels active work and sends next.
     #[serde(default)]
     interrupt: bool,
 }
@@ -517,7 +517,7 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Send a message to any open agent on this Tyde host by exact agent_id. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Not limited to the Operator's children."
+        description = "Send a message to any open agent on this Tyde host by exact agent_id. By default steers into the running turn, or cancels it and sends next when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle agents start immediately. Not limited to the Operator's children."
     )]
     async fn tyde_config_send_agent_message(
         &self,

@@ -374,8 +374,10 @@ finished one.
 
 Sends a follow-up message to an existing agent. This does not return agent
 output. By default, a busy child takes the message into its running turn
-through native in-turn steering; when the backend cannot steer, the message
-queues behind that turn and is never an interrupt. With `interrupt: true`, Tyde
+through native in-turn steering; when the backend cannot steer, Tyde cancels
+that turn and sends the message next. This includes Claude turns blocked on a
+user question or plan approval, which cannot accept native steering. With
+`interrupt: true`, Tyde
 always cancels the running turn and sends the message next, even when the
 backend could steer, like the UI's Cancel + send action. An idle child starts
 immediately in either mode. Existing queued messages are preserved. Acceptance is acknowledged

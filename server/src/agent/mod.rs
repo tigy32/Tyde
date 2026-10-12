@@ -371,8 +371,6 @@ enum RunningTurnRedirect {
     /// Join the turn natively; interrupt it and send next when the backend
     /// cannot take the message mid-turn. The chat input's Steer action.
     SteerElseInterrupt,
-    /// Join the turn natively; otherwise queue behind it like a plain send.
-    SteerElseQueue,
     /// Always interrupt the turn and send the message next.
     Interrupt,
 }
@@ -1462,14 +1460,14 @@ impl AgentHandle {
     }
 
     /// [`Self::deliver_message`] that steers into a running turn when the
-    /// backend supports it, and otherwise queues behind that turn.
+    /// backend supports it, and otherwise interrupts that turn and sends next.
     pub(crate) async fn deliver_steer_message(
         &self,
         payload: SendMessagePayload,
     ) -> Result<(), String> {
         self.deliver_input(
             AgentInput::SteerMessage(payload),
-            RunningTurnRedirect::SteerElseQueue,
+            RunningTurnRedirect::SteerElseInterrupt,
         )
         .await
     }
@@ -7638,10 +7636,14 @@ pub(crate) fn spawn_agent_actor(
                                         // The turn ended under the steer: the
                                         // idle drain sends it next.
                                         SteerOutcome::NoActiveTurn(payload) => (payload, false),
-                                        SteerOutcome::Unsupported(payload) => (
-                                            payload,
-                                            redirect != RunningTurnRedirect::SteerElseQueue,
-                                        ),
+                                        SteerOutcome::Unsupported(payload) => {
+                                            tracing::info!(
+                                                backend = ?current_start.backend_kind,
+                                                redirect = ?redirect,
+                                                "native steering unavailable; interrupting active turn"
+                                            );
+                                            (payload, true)
+                                        },
                                         }
                                     };
                                     let (payload, interrupt_turn) = if redirect
@@ -7664,13 +7666,7 @@ pub(crate) fn spawn_agent_actor(
                                             sequence,
                                             entry: queued_entry_from_send_payload(payload),
                                         };
-                                        // A message that declined to interrupt
-                                        // waits its turn behind earlier sends.
-                                        if redirect == RunningTurnRedirect::SteerElseQueue {
-                                            queue.push_back(queued);
-                                        } else {
-                                            queue.push_front(queued);
-                                        }
+                                        queue.push_front(queued);
                                         update_queued_messages_snapshot(
                                             &canonical_stream,
                                             &mut event_log,
