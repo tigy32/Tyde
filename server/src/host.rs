@@ -3599,6 +3599,10 @@ impl HostHandle {
         }
     }
 
+    pub(crate) fn is_stopping_for_restart(&self) -> bool {
+        self.restart.stopped.is_cancelled()
+    }
+
     pub async fn shutdown_for_restart(&self) {
         let mut complete = self.restart.complete.subscribe();
         if !self
@@ -9205,6 +9209,31 @@ impl HostHandle {
         }
 
         // These live checks depend on the old/new diff, not JSON shape alone.
+        let default_selection_touched = parsed_ops.iter().any(|(tokens, _, _)| {
+            tokens.first().is_some_and(|token| {
+                token == "default_backend" || token == "default_launch_profile_id"
+            })
+        });
+        if default_selection_touched
+            && let Some(profile_id) = candidate.default_launch_profile_id.as_ref()
+        {
+            let catalog = launch_profile_catalog_for_settings(&state, &candidate);
+            match resolve_launch_profile_from_catalog(&catalog, profile_id) {
+                Ok(profile) if Some(profile.backend_kind) == candidate.default_backend => {}
+                Ok(_) => push_error(
+                    &mut field_errors,
+                    "/default_launch_profile_id",
+                    SettingsErrorCode::Invalid,
+                    "the default launch profile must target default_backend".to_owned(),
+                ),
+                Err(message) => push_error(
+                    &mut field_errors,
+                    "/default_launch_profile_id",
+                    SettingsErrorCode::Unavailable,
+                    message,
+                ),
+            }
+        }
         if candidate.supervisor.max_kicks_per_task != current.supervisor.max_kicks_per_task
             && candidate.supervisor.max_kicks_per_task == 0
         {
@@ -21658,9 +21687,29 @@ fn launch_profile_catalog_for_settings(
         }
     }
 
+    for entry in &entries {
+        if entry.kind() == protocol::LaunchProfileKind::Custom
+            && !custom_profile_schemas
+                .iter()
+                .any(|schema| &schema.launch_profile_id == entry.id())
+        {
+            custom_profile_schemas.push(LaunchProfileSessionSchema {
+                launch_profile_id: entry.id().clone(),
+                schema: session_schema_entry_for_backend(
+                    state,
+                    entry.backend_kind(),
+                    Some(entry.id()),
+                ),
+            });
+        }
+    }
+
     LaunchProfileCatalog {
         entries,
-        default_profile_id: settings.default_backend.map(default_launch_profile_id),
+        default_profile_id: settings
+            .default_launch_profile_id
+            .clone()
+            .or_else(|| settings.default_backend.map(default_launch_profile_id)),
         custom_profile_schemas,
     }
 }

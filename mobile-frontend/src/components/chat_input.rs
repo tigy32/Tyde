@@ -293,7 +293,12 @@ fn selected_backend_kind(state: &AppState) -> Option<protocol::BackendKind> {
 
     state
         .draft_backend_override
-        .get_untracked()
+        .get()
+        .or_else(|| {
+            state
+                .draft_default_profile()
+                .map(|entry| entry.backend_kind())
+        })
         .or_else(|| {
             state
                 .active_host_settings_untracked()
@@ -931,6 +936,13 @@ fn NewChatOptions() -> impl IntoView {
     });
     let default_state = state.clone();
     let default_backend_label = move || {
+        if let Some(entry) = default_state.default_profile_entry() {
+            let label = match entry {
+                protocol::LaunchProfileEntry::Ready { profile } => profile.label,
+                protocol::LaunchProfileEntry::Unavailable { label, .. } => label,
+            };
+            return format!("Host default ({label})");
+        }
         default_state
             .active_host_settings()
             .and_then(|settings| settings.default_backend)
@@ -1028,17 +1040,13 @@ fn NewChatOptions() -> impl IntoView {
     // enumerating settings nobody chose.
     let summary_state = state.clone();
     let draft_settings_summary = move || {
-        let values = summary_state.draft_session_settings.get();
+        let values = summary_state.effective_draft_session_settings();
         let chosen: Vec<String> = selected_backend_kind(&summary_state)
             .and_then(|backend| {
-                summary_state.session_schemas_by_host.with(|by_host| {
-                    let host = summary_state.active_local_host_id.get()?;
-                    by_host
-                        .get(&host)?
-                        .get(&backend)?
-                        .ready_schema()
-                        .map(|schema| schema.fields.clone())
-                })
+                let host = summary_state.active_local_host_id.get()?;
+                summary_state
+                    .draft_session_schema(&host, backend)?
+                    .and_then(|entry| entry.ready_schema().map(|schema| schema.fields.clone()))
             })
             .unwrap_or_default()
             .into_iter()
@@ -3114,6 +3122,232 @@ mod wasm_tests {
                 .contains("Review changes before they ship."),
             "the chosen agent's description should explain the selection"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn host_default_profile_applies_unless_backend_is_picked() {
+        for (explicit, edited) in [(false, false), (true, false), (false, true)] {
+            let send_guard = crate::bridge::test_capture_sends();
+            let container = make_container();
+            let state = AppState::new();
+            let host = LocalHostId("host-default-profile".to_owned());
+            state.active_local_host_id.set(Some(host.clone()));
+            state.host_streams.update(|streams| {
+                streams.insert(host.clone(), StreamPath("/host/default-profile".to_owned()));
+            });
+            state.host_settings_by_host.update(|settings| {
+                settings.insert(
+                    host,
+                    HostSettings {
+                        enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+                        default_backend: Some(BackendKind::Codex),
+                        default_launch_profile_id: Some(protocol::LaunchProfileId(
+                            "focus".to_owned(),
+                        )),
+                        ..HostSettings::default()
+                    },
+                );
+            });
+            let schema = |backend_kind| protocol::SessionSettingsSchema {
+                backend_kind,
+                model_resolutions: Default::default(),
+                fields: vec![protocol::SessionSettingField {
+                    key: "model".to_owned(),
+                    label: "Model".to_owned(),
+                    description: None,
+                    field_type: protocol::SessionSettingFieldType::Select {
+                        options: vec![
+                            protocol::SelectOption {
+                                value: "focused".to_owned(),
+                                label: "Focused model".to_owned(),
+                            },
+                            protocol::SelectOption {
+                                value: "other".to_owned(),
+                                label: "Other model".to_owned(),
+                            },
+                        ],
+                        default: None,
+                        nullable: true,
+                    },
+                    use_slider: false,
+                    select_options_by_setting: None,
+                }],
+            };
+            state.session_schemas_by_host.update(|schemas| {
+                schemas.insert(
+                    LocalHostId("host-default-profile".to_owned()),
+                    [
+                        (
+                            BackendKind::Codex,
+                            protocol::SessionSchemaEntry::Ready {
+                                schema: schema(BackendKind::Codex),
+                            },
+                        ),
+                        (
+                            BackendKind::Claude,
+                            protocol::SessionSchemaEntry::Ready {
+                                schema: schema(BackendKind::Claude),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+            });
+            crate::dispatch::reset_inbound_seq_for_host(&LocalHostId(
+                "host-default-profile".to_owned(),
+            ));
+            let profile = protocol::LaunchProfile {
+                id: protocol::LaunchProfileId("focus".to_owned()),
+                kind: protocol::LaunchProfileKind::Custom,
+                label: "Focus".to_owned(),
+                description: None,
+                backend_kind: BackendKind::Codex,
+                session_settings: protocol::SessionSettingsValues(
+                    [(
+                        "model".to_owned(),
+                        protocol::SessionSettingValue::String("focused".to_owned()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            };
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &LocalHostId("host-default-profile".to_owned()),
+                protocol::Envelope::from_payload(
+                    StreamPath("/host/default-profile".to_owned()),
+                    protocol::FrameKind::LaunchProfileCatalogNotify,
+                    0,
+                    &protocol::LaunchProfileCatalogPayload {
+                        catalog: protocol::LaunchProfileCatalog {
+                            entries: vec![protocol::LaunchProfileEntry::Ready { profile }],
+                            default_profile_id: Some(protocol::LaunchProfileId("focus".to_owned())),
+                            custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {
+                                launch_profile_id: protocol::LaunchProfileId("focus".to_owned()),
+                                schema: protocol::SessionSchemaEntry::Ready {
+                                    schema: schema(BackendKind::Codex),
+                                },
+                            }],
+                        },
+                    },
+                )
+                .expect("server catalog notification"),
+            );
+            let mounted_state = state.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(mounted_state);
+                view! { <ChatInput /> <crate::components::session_settings::SessionSettingsSheet /> }
+            });
+            next_tick().await;
+            let backend = container
+                .query_selector("[data-mobile-test='new-chat-backend']")
+                .unwrap()
+                .expect("new chat backend dropdown")
+                .dyn_into::<web_sys::HtmlSelectElement>()
+                .unwrap();
+            backend.set_value(if explicit { "claude" } else { "" });
+            backend
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            let settings_button = container
+                .query_selector("[data-mobile-test='new-chat-session-settings']")
+                .unwrap()
+                .expect("settings preview")
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            if explicit {
+                assert!(
+                    settings_button
+                        .text_content()
+                        .unwrap_or_default()
+                        .contains("Backend defaults")
+                );
+            } else {
+                assert!(
+                    settings_button
+                        .text_content()
+                        .unwrap_or_default()
+                        .contains("Model: Focused model"),
+                    "the preview must describe the saved profile, not backend defaults"
+                );
+            }
+            settings_button.click();
+            next_tick().await;
+            let model = container
+                .query_selector("[data-mobile-test='session-setting-model']")
+                .unwrap()
+                .expect("real model control")
+                .dyn_into::<web_sys::HtmlSelectElement>()
+                .unwrap();
+            assert_eq!(model.value(), if explicit { "" } else { "focused" });
+            if edited {
+                model.set_value("other");
+                model
+                    .dispatch_event(&web_sys::Event::new("change").unwrap())
+                    .unwrap();
+                next_tick().await;
+            }
+
+            container
+                .query_selector("[data-mobile-test='session-settings-done']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            if edited {
+                assert!(
+                    settings_button
+                        .text_content()
+                        .unwrap_or_default()
+                        .contains("Model: Other model")
+                );
+            }
+            type_text(&container, "hello");
+            next_tick().await;
+            primary(&container).unchecked_ref::<HtmlElement>().click();
+            next_tick().await;
+            next_tick().await;
+            let frames: Vec<serde_json::Value> = crate::bridge::test_sent_lines()
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("sent frame"))
+                .collect();
+            let frame = frames
+                .iter()
+                .find(|frame| frame["kind"] == "spawn_agent")
+                .expect("Send starts a new chat");
+            assert_eq!(
+                frame["payload"]["params"]["backend_kind"],
+                if explicit { "claude" } else { "codex" }
+            );
+            if explicit {
+                assert!(
+                    frame["payload"]["params"]
+                        .get("launch_profile_id")
+                        .is_none(),
+                    "an explicit backend must not inherit the default profile"
+                );
+            } else {
+                assert_eq!(frame["payload"]["params"]["launch_profile_id"], "focus");
+                if edited {
+                    assert_eq!(
+                        frame["payload"]["params"]["session_settings"]["model"],
+                        serde_json::json!({"string": "other"})
+                    );
+                } else {
+                    assert!(
+                        frame["payload"]["params"].get("session_settings").is_none(),
+                        "rendering preset values must not turn them into stale explicit overrides"
+                    );
+                }
+            }
+            drop(handle);
+            container.remove();
+            drop(send_guard);
+        }
     }
 
     /// **A double-tap must never buy two agents.**

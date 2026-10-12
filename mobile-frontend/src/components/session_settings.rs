@@ -64,6 +64,11 @@ pub fn SessionSettingsSheet() -> impl IntoView {
             let backend_kind = binding_state
                 .draft_backend_override
                 .get()
+                .or_else(|| {
+                    binding_state
+                        .draft_default_profile()
+                        .map(|entry| entry.backend_kind())
+                })
                 .or_else(|| host_settings.as_ref().and_then(|s| s.default_backend))
                 .or_else(|| {
                     host_settings
@@ -90,11 +95,7 @@ pub fn SessionSettingsSheet() -> impl IntoView {
                 .with(|map| map.get(&active.as_agent_ref()).cloned())?;
             return Some(schema.map(|schema| SessionSchemaEntry::Ready { schema }));
         }
-        schema_state.session_schemas_by_host.with(|by_host| {
-            by_host
-                .get(&host)
-                .map(|schemas| schemas.get(&backend_kind).cloned())
-        })
+        schema_state.draft_session_schema(&host, backend_kind)
     });
 
     let values_state = state.clone();
@@ -103,7 +104,7 @@ pub fn SessionSettingsSheet() -> impl IntoView {
             .agent_session_settings
             .with(|map| map.get(&active.as_agent_ref()).cloned())
             .unwrap_or_default(),
-        Some(SettingsTarget::Draft) | None => values_state.draft_session_settings.get(),
+        Some(SettingsTarget::Draft) | None => values_state.effective_draft_session_settings(),
     });
 
     // Bumped for every edit the server never received. A control that has just
@@ -138,7 +139,20 @@ pub fn SessionSettingsSheet() -> impl IntoView {
                 });
             }
             Some(SettingsTarget::Draft) | None => {
-                change_state.draft_session_settings.set(new_values);
+                // Keep displayed preset values server-owned rather than freezing them as overrides.
+                let previous = untrack(|| change_state.effective_draft_session_settings());
+                change_state.draft_session_settings.update(|overrides| {
+                    for key in previous.0.keys() {
+                        if !new_values.0.contains_key(key) {
+                            overrides.0.insert(key.clone(), SessionSettingValue::Null);
+                        }
+                    }
+                    for (key, value) in new_values.0 {
+                        if previous.0.get(&key) != Some(&value) {
+                            overrides.0.insert(key, value);
+                        }
+                    }
+                });
             }
         }
     });

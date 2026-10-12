@@ -801,7 +801,7 @@ impl Fixture {
         self.session_store_dir.path().join("projects.json")
     }
 
-    fn settings_store_path(&self) -> PathBuf {
+    pub(crate) fn settings_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("settings.json")
     }
 

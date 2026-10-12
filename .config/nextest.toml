@@ -30,7 +30,24 @@ filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found
 threads-required = "num-test-threads"
 success-output = "final"
 
+# These real protocol flows spawn Git worktrees or probe native CLI settings.
+# Their event deadlines are unchanged; prevent unrelated process-heavy flows
+# from consuming those deadlines while the operations are queued.
+[[profile.default.overrides]]
+filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots)'
+threads-required = "num-test-threads"
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots)'
+threads-required = "num-test-threads"
+success-output = "final"
+
 # Keep startup ordering evidence even when the intermittent side-question race passes.
+[[profile.default.overrides]]
+filter = 'binary_id(server::swarms) & test(explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_without_transcript_posts)'
+success-output = "final"
+
 [[profile.default.overrides]]
 filter = 'binary_id(server::side_questions) & test(btw_sessions_recover_after_model_catalog_changes)'
 success-output = "final"

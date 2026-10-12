@@ -135,34 +135,50 @@ fn open_existing_session_agent(
 }
 
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
-    begin_new_chat_with(state, backend_override, None);
+    match backend_override {
+        Some(backend) => begin_new_chat_with(state, Some(backend), None),
+        None => begin_new_chat_default(state),
+    }
 }
 
 /// Begin a new chat from the primary "New Chat" button. If the current chat
 /// context host's server-owned catalog names a `default_profile_id` that
 /// resolves to an exact ready entry, start from that profile (backend +
-/// settings come straight from the server). Otherwise open an ordinary draft
-/// with no override, letting the server resolve its own default backend at
-/// spawn time. No id parsing, no guessing — only an exact catalog match is
-/// used.
+/// settings come straight from the server). An unavailable or missing default
+/// keeps its exact id so the server rejects the launch visibly, rather than
+/// silently selecting another profile.
 pub fn begin_new_chat_default(state: &AppState) {
     if let Some(host_id) = state.chat_context_host_id_untracked() {
-        let default_profile = state.launch_profile_catalog.with_untracked(|catalogs| {
+        let default_selection = state.launch_profile_catalog.with_untracked(|catalogs| {
             let catalog = catalogs.get(&host_id)?;
             let default_id = catalog.default_profile_id.as_ref()?;
-            catalog.entries.iter().find_map(|entry| match entry {
-                LaunchProfileEntry::Ready { profile } if &profile.id == default_id => {
-                    Some(profile.clone())
-                }
-                _ => None,
-            })
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id() == default_id);
+            Some((default_id.clone(), entry.cloned()))
         });
-        if let Some(profile) = default_profile {
-            begin_new_chat_with_profile(state, profile, None);
+        if let Some((default_id, entry)) = default_selection {
+            match entry {
+                Some(LaunchProfileEntry::Ready { profile }) => {
+                    begin_new_chat_with_profile(state, profile, None);
+                }
+                entry => {
+                    begin_new_chat_with(
+                        state,
+                        entry.as_ref().map(LaunchProfileEntry::backend_kind),
+                        None,
+                    );
+                    state
+                        .composer_untracked()
+                        .launch_profile_id
+                        .set(Some(default_id));
+                }
+            }
             return;
         }
     }
-    begin_new_chat(state, None);
+    begin_new_chat_with(state, None, None);
 }
 
 pub fn begin_new_chat_with(
@@ -378,7 +394,14 @@ pub fn spawn_new_chat(
     };
 
     let custom_agent_id = composer.custom_agent_id.get_untracked();
-    let launch_profile_id = composer.launch_profile_id.get_untracked();
+    let launch_profile_id = composer.launch_profile_id.get_untracked().or_else(|| {
+        if composer.backend_override.get_untracked().is_some() {
+            return None;
+        }
+        state
+            .launch_profile_catalog
+            .with_untracked(|catalogs| catalogs.get(&host_id)?.default_profile_id.clone())
+    });
 
     let draft_settings = composer.session_settings.get_untracked();
     let settings_dirty = composer.session_settings_dirty.get_untracked();
@@ -1974,6 +1997,7 @@ mod wasm_tests {
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
+                    default_launch_profile_id: None,
                     enable_mobile_connections: false,
 
                     mobile_direct_hosting_enabled: false,

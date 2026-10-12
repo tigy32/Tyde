@@ -2035,103 +2035,115 @@ impl ServerHandler for TydeAgentControlMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(parts) = context.extensions.get::<axum::http::request::Parts>() {
-            match authenticated_caller_from_parts(&self.credentials, parts) {
-                Ok(Some(caller)) => {
-                    let Some(handle) = self.host.agent_handle(&caller).await else {
-                        tracing::info!(
-                            caller_registered = false,
-                            "Authenticated MCP invocation rejected for unregistered caller"
-                        );
-                        return err_json(protocol::SwarmFailure {
-                            code: protocol::SwarmErrorCode::Unauthorized,
-                            message: "Authenticated agent-control caller is closing or no longer registered"
-                                .into(),
-                        });
-                    };
-                    let swarm_owned = if handle.snapshot().swarm_membership.is_some() {
-                        Ok(true)
-                    } else {
-                        self.host.is_swarm_agent(&caller).await
-                    };
-                    match swarm_owned {
-                        Ok(true) => {
-                            let active = !handle.is_closing()
-                                && self
-                                    .host
-                                    .agent_status_snapshot(&caller)
-                                    .await
-                                    .is_some_and(|status| !status.terminated);
-                            if !active {
-                                tracing::info!(
-                                    caller_registered = true,
-                                    swarm_owned = true,
-                                    closing = handle.is_closing(),
-                                    "Authenticated MCP invocation rejected for inactive swarm caller"
-                                );
-                                return err_json(protocol::SwarmFailure {
-                                    code: protocol::SwarmErrorCode::Unauthorized,
-                                    message: "Authenticated swarm caller is no longer active"
-                                        .into(),
-                                });
-                            }
-                            let allowed = match swarm_tool_allowed(
-                                &self.host,
-                                &caller,
-                                request.name.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(allowed) => allowed,
-                                Err(message) => {
+        let tool_name = request.name.clone();
+        let result = async {
+            if let Some(parts) = context.extensions.get::<axum::http::request::Parts>() {
+                match authenticated_caller_from_parts(&self.credentials, parts) {
+                    Ok(Some(caller)) => {
+                        let Some(handle) = self.host.agent_handle(&caller).await else {
+                            tracing::info!(
+                                caller_registered = false,
+                                "Authenticated MCP invocation rejected for unregistered caller"
+                            );
+                            return err_json(protocol::SwarmFailure {
+                                code: protocol::SwarmErrorCode::Unauthorized,
+                                message: "Authenticated agent-control caller is closing or no longer registered"
+                                    .into(),
+                            });
+                        };
+                        let swarm_owned = if handle.snapshot().swarm_membership.is_some() {
+                            Ok(true)
+                        } else {
+                            self.host.is_swarm_agent(&caller).await
+                        };
+                        match swarm_owned {
+                            Ok(true) => {
+                                let active = !handle.is_closing()
+                                    && self
+                                        .host
+                                        .agent_status_snapshot(&caller)
+                                        .await
+                                        .is_some_and(|status| !status.terminated);
+                                if !active {
+                                    tracing::info!(
+                                        caller_registered = true,
+                                        swarm_owned = true,
+                                        closing = handle.is_closing(),
+                                        "Authenticated MCP invocation rejected for inactive swarm caller"
+                                    );
                                     return err_json(protocol::SwarmFailure {
                                         code: protocol::SwarmErrorCode::Unauthorized,
-                                        message,
+                                        message: "Authenticated swarm caller is no longer active"
+                                            .into(),
                                     });
                                 }
-                            };
-                            if !allowed {
-                                return err_json(protocol::SwarmFailure {
-                                    code: protocol::SwarmErrorCode::Unauthorized,
-                                    message: "Tool is outside the swarm workspace scope; child/workflow/review/team execution is not authorized".into(),
-                                });
+                                let allowed = match swarm_tool_allowed(
+                                    &self.host,
+                                    &caller,
+                                    request.name.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(allowed) => allowed,
+                                    Err(message) => {
+                                        return err_json(protocol::SwarmFailure {
+                                            code: protocol::SwarmErrorCode::Unauthorized,
+                                            message,
+                                        });
+                                    }
+                                };
+                                if !allowed {
+                                    return err_json(protocol::SwarmFailure {
+                                        code: protocol::SwarmErrorCode::Unauthorized,
+                                        message: "Tool is outside the swarm workspace scope; child/workflow/review/team execution is not authorized".into(),
+                                    });
+                                }
                             }
+                            Ok(false) => {
+                                // Registered parked ordinary actors retain management authority;
+                                // closing/execution restrictions belong to their per-tool lifecycle checks.
+                                tracing::debug!(
+                                    caller_registered = true,
+                                    swarm_owned = false,
+                                    closing = handle.is_closing(),
+                                    "Authenticated MCP invocation using ordinary caller authority"
+                                );
+                            }
+                            Err(error) => return err_json(error),
                         }
-                        Ok(false) => {
-                            // Registered parked ordinary actors retain management authority;
-                            // closing/execution restrictions belong to their per-tool lifecycle checks.
-                            tracing::debug!(
-                                caller_registered = true,
-                                swarm_owned = false,
-                                closing = handle.is_closing(),
-                                "Authenticated MCP invocation using ordinary caller authority"
-                            );
-                        }
-                        Err(error) => return err_json(error),
                     }
+                    Ok(None) => {}
+                    Err(error) => return Ok(err_text(error)),
                 }
-                Ok(None) => {}
-                Err(error) => return Ok(err_text(error)),
             }
+            let allowed = match self.surface {
+                AgentControlMcpSurface::Control => !matches!(
+                    request.name.as_ref(),
+                    "tyde_await_agents" | "tyde_await_review"
+                ),
+                AgentControlMcpSurface::Await => matches!(
+                    request.name.as_ref(),
+                    "tyde_await_agents" | "tyde_await_review"
+                ),
+            };
+            if !allowed {
+                return Ok(err_text(format!(
+                    "tool {} is not available on this agent-control MCP endpoint",
+                    request.name
+                )));
+            }
+            let context = ToolCallContext::new(self, request, context);
+            self.tool_router.call(context).await
         }
-        let allowed = match self.surface {
-            AgentControlMcpSurface::Control => !matches!(
-                request.name.as_ref(),
-                "tyde_await_agents" | "tyde_await_review"
-            ),
-            AgentControlMcpSurface::Await => matches!(
-                request.name.as_ref(),
-                "tyde_await_agents" | "tyde_await_review"
-            ),
-        };
-        if !allowed {
-            return Ok(err_text(format!(
-                "tool {} is not available on this agent-control MCP endpoint",
-                request.name
-            )));
+        .await;
+        // Authorization can finish after the swarm registry stops, before
+        // the await handler has entered its expiration-aware wait.
+        if self.surface == AgentControlMcpSurface::Await && self.host.is_stopping_for_restart() {
+            tracing::debug!("Host restart interrupted await tool routing");
+            AwaitToolFailure::HostStopping.into_tool_result(tool_name.as_ref())
+        } else {
+            result
         }
-        let context = ToolCallContext::new(self, request, context);
-        self.tool_router.call(context).await
     }
 }
 

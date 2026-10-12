@@ -160,6 +160,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
 
             mobile_direct_hosting_enabled: false,
@@ -7618,6 +7619,7 @@ pub(crate) mod restore_fixtures {
                     review: Default::default(),
                     enabled_backends: Vec::new(),
                     default_backend: None,
+                    default_launch_profile_id: None,
                     enable_mobile_connections: false,
 
                     mobile_direct_hosting_enabled: false,

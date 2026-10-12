@@ -168,6 +168,8 @@ impl Scenario {
     }
 
     async fn add_workbench(&mut self, parent: &Project, branch: &str) -> Project {
+        let started = tokio::time::Instant::now();
+        eprintln!("WORKBENCH PROTOCOL starting creation");
         self.fixture
             .client
             .workbench_create(protocol::WorkbenchCreatePayload {
@@ -180,6 +182,10 @@ impl Scenario {
         let event: ProjectNotifyPayload = self.wait(FrameKind::ProjectNotify, "new workbench", |event| {
             matches!(event, ProjectNotifyPayload::Upsert { project } if project.name == branch)
         }).await;
+        eprintln!(
+            "WORKBENCH PROTOCOL observed upsert elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         match event {
             ProjectNotifyPayload::Upsert { project } => project,
             ProjectNotifyPayload::Delete { .. } => panic!("expected new workbench"),
@@ -8043,6 +8049,18 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
         )
         .await
         .1;
+    // The protocol showed one pending wake clearing after the idle projection,
+    // with every other member field unchanged. Compare fully settled snapshots
+    // so the reconnect assertion still protects the complete converted state.
+    let converted = scenario
+        .snapshot_until(&converted.id, |swarm| {
+            ready(swarm)
+                && swarm
+                    .members
+                    .iter()
+                    .all(|member| member.unfinished_notification_ids.is_empty())
+        })
+        .await;
     assert!(
         converted.legacy_team_id.as_ref() == Some(&team.id),
         "conversion must encode legacy ownership explicitly"
@@ -8098,6 +8116,33 @@ async fn explicit_legacy_conversion_requires_quiescence_and_preserves_sessions_w
         .await;
     scenario.error(SwarmErrorCode::Conflict).await;
     let reconnect = scenario.snapshot(&converted.id).await;
+    for old in &converted.members {
+        if let Some(current) = reconnect
+            .members
+            .iter()
+            .find(|member| member.spec.id == old.spec.id)
+        {
+            let mut without_wake_progress = current.clone();
+            without_wake_progress.unfinished_notification_ids =
+                old.unfinished_notification_ids.clone();
+            eprintln!(
+                "MIGRATION RECONNECT identity_same={} spec_same={} agent_same={} retained_session_same={} state_same={} status_same={} cursor_same={} round_same={} notifications_same={} prior_pending={} current_pending={} only_wake_progress={} member_equal={}",
+                current.spec.id == old.spec.id,
+                current.spec == old.spec,
+                current.agent_id == old.agent_id,
+                current.session_id == old.session_id,
+                current.state == old.state,
+                current.runtime_status == old.runtime_status,
+                current.context_cursor == old.context_cursor,
+                current.current_round_id == old.current_round_id,
+                current.unfinished_notification_ids == old.unfinished_notification_ids,
+                old.unfinished_notification_ids.len(),
+                current.unfinished_notification_ids.len(),
+                &without_wake_progress == old,
+                current == old
+            );
+        }
+    }
     assert!(
         reconnect.legacy_team_id == converted.legacy_team_id
             && reconnect.members == converted.members,

@@ -22,9 +22,31 @@ pub async fn spawn_new_chat(
 
     let host_settings = state.active_host_settings_untracked();
 
+    let default_profile_id = if state.draft_backend_override.get_untracked().is_none() {
+        state
+            .launch_profile_catalog_by_host
+            .with_untracked(|catalogs| {
+                catalogs
+                    .get(&host)
+                    .and_then(|catalog| catalog.default_profile_id.clone())
+            })
+    } else {
+        None
+    };
+    let default_profile_backend = state
+        .launch_profile_catalog_by_host
+        .with_untracked(|catalogs| {
+            let catalog = catalogs.get(&host)?;
+            catalog
+                .entries
+                .iter()
+                .find(|entry| Some(entry.id()) == default_profile_id.as_ref())
+                .map(|entry| entry.backend_kind())
+        });
     let backend_kind = state
         .draft_backend_override
         .get_untracked()
+        .or(default_profile_backend)
         .or_else(|| host_settings.as_ref().and_then(|s| s.default_backend))
         .or_else(|| {
             host_settings
@@ -81,10 +103,10 @@ pub async fn spawn_new_chat(
                 Some(images)
             },
             backend_kind,
-            launch_profile_id: None,
+            launch_profile_id: default_profile_id,
             cost_hint: None,
             access_mode: Default::default(),
-            session_settings: Some(session_settings),
+            session_settings: (!session_settings.0.is_empty()).then_some(session_settings),
         },
     };
 

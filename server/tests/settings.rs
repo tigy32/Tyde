@@ -128,6 +128,7 @@ fn expected_empty_settings() -> HostSettings {
         review: Default::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
+        default_launch_profile_id: None,
         enable_mobile_connections: false,
 
         mobile_direct_hosting_enabled: false,
@@ -153,43 +154,36 @@ fn expected_empty_settings() -> HostSettings {
     }
 }
 
-#[test]
-fn missing_store_returns_empty_settings() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-
-    let store = HostSettingsStore::load(path.clone()).expect("load missing settings store");
-
-    assert_eq!(
-        store.get().expect("read settings from missing store"),
-        expected_empty_settings()
+#[tokio::test]
+async fn missing_store_returns_empty_settings() {
+    let fixture = Fixture::new().await;
+    assert_eq!(fixture.bootstrap.settings, expected_empty_settings());
+    assert!(
+        fixture
+            .bootstrap
+            .launch_profile_catalog
+            .default_profile_id
+            .is_none()
     );
     assert!(
-        !path.exists(),
+        !fixture.settings_store_path().exists(),
         "loading a missing settings store should not write a file"
     );
 }
 
-#[test]
-fn persisted_empty_settings_are_valid() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-    fs::write(
-        &path,
-        r#"{
-  "settings": {
-    "enabled_backends": [],
-    "default_backend": null
-  }
-}"#,
+#[tokio::test]
+async fn persisted_empty_settings_are_valid() {
+    let fixture = Fixture::new_with_settings_file(
+        r#"{"settings": {"enabled_backends": [], "default_backend": null}}"#,
     )
-    .expect("write empty settings store");
-
-    let store = HostSettingsStore::load(path).expect("load empty settings store");
-
-    assert_eq!(
-        store.get().expect("read empty settings"),
-        expected_empty_settings()
+    .await;
+    assert_eq!(fixture.bootstrap.settings, expected_empty_settings());
+    assert!(
+        fixture
+            .bootstrap
+            .launch_profile_catalog
+            .default_profile_id
+            .is_none()
     );
 }
 
@@ -353,12 +347,9 @@ fn the_legacy_acp_backend_spelling_is_migrated_to_kiro() {
     );
 }
 
-#[test]
-fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let path = dir.path().join("settings.json");
-    fs::write(
-        &path,
+#[tokio::test]
+async fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
+    let fixture = Fixture::new_with_settings_file(
         r#"{
   "settings": {
     "enabled_backends": ["gemini", "claude", "tycode", "kiro", "claude"],
@@ -366,12 +357,10 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
   }
 }"#,
     )
-    .expect("write settings store");
-
-    let store = HostSettingsStore::load(path).expect("load settings store");
+    .await;
 
     assert_eq!(
-        store.get().expect("read canonicalized settings"),
+        fixture.bootstrap.settings,
         HostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
@@ -382,6 +371,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
                 BackendKind::Antigravity,
             ],
             default_backend: Some(BackendKind::Claude),
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
 
             mobile_direct_hosting_enabled: false,
@@ -407,8 +397,11 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             chatgpt_dots_enabled: false,
         }
     );
+    assert_eq!(
+        fixture.bootstrap.launch_profile_catalog.default_profile_id,
+        Some(protocol::LaunchProfileId("claude:default".to_owned()))
+    );
 }
-
 #[tokio::test(start_paused = true)]
 async fn supervisor_settings_apply_and_validate_over_protocol() {
     let mut fixture = Fixture::new().await;
@@ -1671,6 +1664,7 @@ async fn settings_write_enabled_backends_refreshes_schemas_and_config_snapshots(
     .await;
     assert!(fixture.bootstrap.settings.enabled_backends.is_empty());
 
+    let initial_snapshot_started = tokio::time::Instant::now();
     next_frame_matching_on(
         &mut fixture.client,
         "initial Hermes native settings snapshot",
@@ -1688,6 +1682,10 @@ async fn settings_write_enabled_backends_refreshes_schemas_and_config_snapshots(
         },
     )
     .await;
+    eprintln!(
+        "NATIVE SNAPSHOT PROTOCOL initial replay elapsed_ms={}",
+        initial_snapshot_started.elapsed().as_millis()
+    );
     let hermes_home = temp_home.path().join(".hermes");
     fs::create_dir_all(&hermes_home).expect("create Hermes home");
     fs::write(hermes_home.join("config.yaml"), "model: refreshed-model\n")
@@ -2143,6 +2141,338 @@ fn profile_is_ready(catalog: &protocol::LaunchProfileCatalog, profile_id: &str) 
     catalog.entries.iter().any(|entry| {
         entry.id().0 == profile_id && matches!(entry, protocol::LaunchProfileEntry::Ready { .. })
     })
+}
+
+#[tokio::test]
+async fn default_launch_profile_persists_and_drives_new_chats() {
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [(
+                BackendKind::Codex,
+                server::backend::mock::MockDiscovery::new(vec![Ok({
+                    let mut discovery = mock_model_discovery("gpt-default-profile", &["low", "high"]);
+                    discovery.launch_profiles.push(protocol::LaunchProfileEntry::Ready { profile: protocol::LaunchProfile {
+                        id: protocol::LaunchProfileId("discovered".to_owned()),
+                        kind: protocol::LaunchProfileKind::Custom, label: "Discovered preset".to_owned(),
+                        description: None, backend_kind: BackendKind::Codex,
+                        session_settings: protocol::SessionSettingsValues::default(),
+                    } });
+                    discovery
+                })]),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        r#"{"settings": {
+            "enabled_backends": ["codex", "claude"],
+            "default_backend": "claude",
+            "launch_profiles": {"focus": {
+                "id": "focus", "label": "Focus", "backend_kind": "codex",
+                "session_settings": {"model": {"string": "gpt-default-profile"}, "reasoning_effort": {"string": "high"}}
+            }}
+        }}"#,
+    )
+    .await;
+    wait_for_launch_profile_catalog(&mut fixture, "ready default candidate", |catalog| {
+        profile_is_ready(catalog, "focus")
+    })
+    .await;
+    let (mut watcher, _) = fixture.connect_with_bootstrap().await;
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-default-profile",
+        vec![
+            replace_op(
+                "/default_backend",
+                serde_json::json!("codex"),
+                serde_json::json!("claude"),
+            ),
+            replace_op(
+                "/default_launch_profile_id",
+                serde_json::json!("focus"),
+                serde_json::Value::Null,
+            ),
+        ],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-default-profile",
+        "save default profile",
+    )
+    .await;
+    assert!(
+        result.applied,
+        "default launch selection must apply: {:?}",
+        result.field_errors
+    );
+    let live_settings = expect_host_settings_frame(&mut watcher, "default choice fanout").await;
+    assert_eq!(
+        live_settings.settings.default_backend,
+        Some(BackendKind::Codex)
+    );
+    assert_eq!(
+        live_settings.settings.default_launch_profile_id,
+        Some(protocol::LaunchProfileId("focus".to_owned()))
+    );
+    let live_catalog = next_frame_matching_on(&mut watcher, "default catalog fanout", |env| {
+        env.kind == FrameKind::LaunchProfileCatalogNotify
+            && env
+                .parse_payload::<protocol::LaunchProfileCatalogPayload>()
+                .is_ok_and(|payload| {
+                    payload
+                        .catalog
+                        .default_profile_id
+                        .as_ref()
+                        .is_some_and(|id| id.0 == "focus")
+                })
+    })
+    .await;
+    assert_eq!(live_catalog.kind, FrameKind::LaunchProfileCatalogNotify);
+
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        bootstrap.launch_profile_catalog.default_profile_id,
+        Some(protocol::LaunchProfileId("focus".to_owned()))
+    );
+    let discovered_schema = bootstrap
+        .launch_profile_catalog
+        .custom_profile_schemas
+        .iter()
+        .find(|entry| entry.launch_profile_id.0 == "discovered")
+        .expect("discovered custom profiles must carry their server-owned schema too");
+    assert!(discovered_schema.schema.ready_schema().is_some());
+    let (_, restarted) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        restarted.launch_profile_catalog.default_profile_id,
+        bootstrap.launch_profile_catalog.default_profile_id,
+        "the saved default must survive a host restart"
+    );
+
+    let (agent, start) = fixture
+        .spawn_with(protocol::SpawnAgentPayload {
+            name: Some("Profile default".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: bootstrap.launch_profile_catalog.default_profile_id.clone(),
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    assert_eq!(start.backend_kind, BackendKind::Codex);
+    assert_eq!(
+        start.launch_profile_id,
+        bootstrap.launch_profile_catalog.default_profile_id
+    );
+    let settings = expect_agent_session_settings(
+        &mut fixture.client,
+        &agent.stream,
+        "profile default settings",
+    )
+    .await;
+    assert_eq!(
+        settings.values.0.get("model"),
+        Some(&SessionSettingValue::String(
+            "gpt-default-profile".to_owned()
+        ))
+    );
+    assert_eq!(
+        settings.values.0.get("reasoning_effort"),
+        Some(&SessionSettingValue::String("high".to_owned()))
+    );
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-missing-default",
+        vec![replace_op(
+            "/default_launch_profile_id",
+            serde_json::json!("missing"),
+            serde_json::json!("focus"),
+        )],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-missing-default",
+        "reject missing default",
+    )
+    .await;
+    assert!(
+        !result.applied,
+        "a missing profile cannot become the default"
+    );
+    assert!(
+        result
+            .field_errors
+            .iter()
+            .any(|error| error.pointer == "/default_launch_profile_id"
+                && error.code == SettingsErrorCode::Unavailable)
+    );
+    send_settings_write(
+        &mut fixture.client,
+        "w-mismatched-default",
+        vec![replace_op(
+            "/default_backend",
+            serde_json::json!("claude"),
+            serde_json::json!("codex"),
+        )],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-mismatched-default",
+        "reject mismatched backend",
+    )
+    .await;
+    assert!(
+        !result.applied,
+        "a profile must not be paired with another backend"
+    );
+    let (_, unchanged) = fixture.connect_with_bootstrap().await;
+    assert_eq!(unchanged.settings.default_backend, Some(BackendKind::Codex));
+    assert_eq!(
+        unchanged.launch_profile_catalog.default_profile_id,
+        bootstrap.launch_profile_catalog.default_profile_id
+    );
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-delete-default",
+        vec![SettingOp::Remove {
+            path: "/launch_profiles/focus".to_owned(),
+            expected: SettingExpectation::Value {
+                value: serde_json::to_value(
+                    bootstrap
+                        .settings
+                        .launch_profiles
+                        .get(&protocol::LaunchProfileId("focus".to_owned()))
+                        .expect("saved profile"),
+                )
+                .expect("serialize profile"),
+            },
+        }],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-delete-default",
+        "delete selected profile",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    let (_, missing) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        missing.launch_profile_catalog.default_profile_id,
+        bootstrap.launch_profile_catalog.default_profile_id,
+        "removing a selected profile must not silently select a different one"
+    );
+    assert!(
+        !missing
+            .launch_profile_catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id().0 == "focus")
+    );
+
+    fixture
+        .client
+        .spawn_agent(protocol::SpawnAgentPayload {
+            name: Some("Missing default".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: missing.launch_profile_catalog.default_profile_id.clone(),
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit missing default");
+    let failure = next_frame_matching_on(
+        &mut fixture.client,
+        "visible missing default error",
+        |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::NewAgent,
+                "a missing default must not start a substitute agent"
+            );
+            env.kind == FrameKind::CommandError
+        },
+    )
+    .await;
+    let failure: protocol::CommandErrorPayload = failure.parse_payload().expect("launch failure");
+    assert_eq!(failure.request_kind, FrameKind::SpawnAgent);
+    assert_eq!(failure.code, protocol::CommandErrorCode::InvalidInput);
+    assert!(failure.message.contains("unknown launch_profile_id"));
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-backend-default",
+        vec![
+            replace_op(
+                "/default_backend",
+                serde_json::json!("codex"),
+                serde_json::json!("codex"),
+            ),
+            replace_op(
+                "/default_launch_profile_id",
+                serde_json::Value::Null,
+                serde_json::json!("focus"),
+            ),
+        ],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-backend-default",
+        "restore backend default",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    let (_, restored) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        restored.launch_profile_catalog.default_profile_id,
+        Some(protocol::LaunchProfileId("codex:default".to_owned()))
+    );
+    send_settings_write(
+        &mut fixture.client,
+        "w-no-default",
+        vec![
+            replace_op(
+                "/default_backend",
+                serde_json::Value::Null,
+                serde_json::json!("codex"),
+            ),
+            replace_op(
+                "/default_launch_profile_id",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+        ],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-no-default", "clear default").await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    let (_, cleared) = fixture.connect_with_bootstrap().await;
+    assert!(cleared.launch_profile_catalog.default_profile_id.is_none());
 }
 
 async fn wait_for_launch_profile_catalog(

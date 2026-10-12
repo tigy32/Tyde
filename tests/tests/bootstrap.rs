@@ -226,6 +226,7 @@ fn write_host_settings_with_launch_profiles(
         review: Default::default(),
         enabled_backends: backends.to_vec(),
         default_backend,
+        default_launch_profile_id: None,
         enable_mobile_connections: false,
 
         mobile_direct_hosting_enabled: false,

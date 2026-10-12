@@ -133,6 +133,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
 
             mobile_direct_hosting_enabled: false,
@@ -1326,14 +1327,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             }
         }
         FrameKind::LaunchProfileCatalogNotify => {
-            if let Err(error) = envelope.parse_payload::<LaunchProfileCatalogPayload>() {
-                log::error!(
-                    "failed to parse LaunchProfileCatalogNotify host={} stream={} seq={}: {}",
-                    host,
-                    envelope.stream,
-                    envelope.seq,
-                    error
-                );
+            match envelope.parse_payload::<LaunchProfileCatalogPayload>() {
+                Ok(payload) => state.launch_profile_catalog_by_host.update(|catalogs| {
+                    catalogs.insert(host.clone(), payload.catalog);
+                }),
+                Err(error) => {
+                    log::error!(
+                        "failed to parse LaunchProfileCatalogNotify host={} stream={} seq={}: {}",
+                        host,
+                        envelope.stream,
+                        envelope.seq,
+                        error
+                    );
+                }
             }
         }
         FrameKind::AgentRestorationStatus => {
@@ -3125,6 +3131,9 @@ fn apply_host_bootstrap(
         }
         map.insert(host.clone(), schemas);
     });
+    state.launch_profile_catalog_by_host.update(|map| {
+        map.insert(host.clone(), payload.launch_profile_catalog);
+    });
     state.sessions.update(|sessions| {
         sessions.retain(|s| s.local_host_id != *host);
         sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
@@ -4435,6 +4444,7 @@ mod wasm_tests {
                 review: Default::default(),
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),
+                default_launch_profile_id: None,
                 enable_mobile_connections: false,
 
                 mobile_direct_hosting_enabled: false,

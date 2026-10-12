@@ -114,6 +114,9 @@ pub struct HostSettings {
     pub enabled_backends: Vec<BackendKind>,
     #[serde(default)]
     pub default_backend: Option<BackendKind>,
+    /// Named profile used for new chats; None keeps the backend default.
+    #[serde(default)]
+    pub default_launch_profile_id: Option<LaunchProfileId>,
     #[serde(default)]
     pub enable_mobile_connections: bool,
     /// Serve the mobile web app straight from this host over HTTP instead of
@@ -200,6 +203,7 @@ impl Default for HostSettings {
             review: ReviewSettings::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,

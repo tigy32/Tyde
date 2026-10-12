@@ -2178,6 +2178,7 @@ mod wasm_tests {
             review: Default::default(),
             enabled_backends: enabled,
             default_backend: default,
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
 
             mobile_direct_hosting_enabled: false,

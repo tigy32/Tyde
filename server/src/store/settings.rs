@@ -789,6 +789,7 @@ fn empty_settings() -> HostSettings {
         review: settings_model::ReviewSettings::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
+        default_launch_profile_id: None,
         enable_mobile_connections: false,
 
         mobile_direct_hosting_enabled: false,
@@ -969,6 +970,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         pause_swarms_on_restart: settings.pause_swarms_on_restart,
         enabled_backends,
         default_backend: settings.default_backend,
+        default_launch_profile_id: settings.default_launch_profile_id,
         enable_mobile_connections: settings.enable_mobile_connections,
 
         mobile_direct_hosting_enabled: settings.mobile_direct_hosting_enabled,

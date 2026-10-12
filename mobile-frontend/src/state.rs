@@ -911,6 +911,8 @@ pub struct AppState {
         RwSignal<HashMap<LocalHostId, HashMap<BackendKind, protocol::BackendCapacitySnapshot>>>,
     pub session_schemas_by_host:
         RwSignal<HashMap<LocalHostId, HashMap<BackendKind, SessionSchemaEntry>>>,
+    pub launch_profile_catalog_by_host:
+        RwSignal<HashMap<LocalHostId, protocol::LaunchProfileCatalog>>,
     pub custom_agents_by_host: RwSignal<HashMap<LocalHostId, HashMap<CustomAgentId, CustomAgent>>>,
     pub mcp_servers_by_host: RwSignal<HashMap<LocalHostId, HashMap<McpServerId, McpServerConfig>>>,
     pub steering_by_host: RwSignal<HashMap<LocalHostId, HashMap<SteeringId, Steering>>>,
@@ -1143,6 +1145,7 @@ impl AppState {
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             backend_capacity_by_host: RwSignal::new(HashMap::new()),
             session_schemas_by_host: RwSignal::new(HashMap::new()),
+            launch_profile_catalog_by_host: RwSignal::new(HashMap::new()),
             custom_agents_by_host: RwSignal::new(HashMap::new()),
             mcp_servers_by_host: RwSignal::new(HashMap::new()),
             steering_by_host: RwSignal::new(HashMap::new()),
@@ -1665,6 +1668,67 @@ impl AppState {
         self.host_settings_by_host.get().get(&host).cloned()
     }
 
+    pub fn default_profile_entry(&self) -> Option<protocol::LaunchProfileEntry> {
+        let host = self.active_local_host_id.get()?;
+        self.launch_profile_catalog_by_host.with(|catalogs| {
+            let catalog = catalogs.get(&host)?;
+            let id = catalog.default_profile_id.as_ref()?;
+            catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id() == id)
+                .cloned()
+        })
+    }
+
+    pub fn draft_default_profile(&self) -> Option<protocol::LaunchProfileEntry> {
+        if self.draft_backend_override.get().is_some() {
+            return None;
+        }
+        self.default_profile_entry()
+    }
+
+    pub fn effective_draft_session_settings(&self) -> SessionSettingsValues {
+        let mut values = match self.draft_default_profile() {
+            Some(protocol::LaunchProfileEntry::Ready { profile }) => profile.session_settings,
+            _ => SessionSettingsValues::default(),
+        };
+        for (key, value) in self.draft_session_settings.get().0 {
+            if value == protocol::SessionSettingValue::Null {
+                values.0.remove(&key);
+            } else {
+                values.0.insert(key, value);
+            }
+        }
+        values
+    }
+
+    pub fn draft_session_schema(
+        &self,
+        host: &LocalHostId,
+        backend: BackendKind,
+    ) -> Option<Option<SessionSchemaEntry>> {
+        if let Some(profile) = self.draft_default_profile()
+            && profile.kind() == protocol::LaunchProfileKind::Custom
+        {
+            return self.launch_profile_catalog_by_host.with(|catalogs| {
+                Some(
+                    catalogs
+                        .get(host)?
+                        .custom_profile_schemas
+                        .iter()
+                        .find(|entry| &entry.launch_profile_id == profile.id())
+                        .map(|entry| entry.schema.clone()),
+                )
+            });
+        }
+        self.session_schemas_by_host.with(|schemas| {
+            schemas
+                .get(host)
+                .map(|schemas| schemas.get(&backend).cloned())
+        })
+    }
+
     pub fn active_host_settings_untracked(&self) -> Option<HostSettings> {
         let host = self.active_local_host_id.get_untracked()?;
         self.host_settings_by_host
@@ -1822,6 +1886,9 @@ impl AppState {
             m.remove(host);
         });
         self.session_schemas_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.launch_profile_catalog_by_host.update(|m| {
             m.remove(host);
         });
         self.custom_agents_by_host.update(|m| {

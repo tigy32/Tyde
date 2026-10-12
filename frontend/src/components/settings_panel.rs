@@ -2814,16 +2814,45 @@ fn BackendsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Default backend"</label>
-            <p class="settings-description">"Used for new agents when you don't pick one."</p>
+            <p class="settings-description">"Used for new chats when you don't pick a backend or launch profile."</p>
             {move || match state.selected_host_settings() {
                 Some(settings) => {
                     let state_for_change = state.clone();
                     let has_enabled = !settings.enabled_backends.is_empty();
-                    let default_backend_value = settings
-                        .default_backend
-                        .map(backend_value)
-                        .unwrap_or("")
-                        .to_owned();
+                    let selected_profile = settings.default_launch_profile_id.clone();
+                    let default_backend_value = match &selected_profile {
+                        Some(id) => format!("profile:{}", id.0),
+                        None => settings.default_backend.map(backend_value).unwrap_or("").to_owned(),
+                    };
+                    let catalog = state.selected_host_id.get().and_then(|host_id| {
+                        state.launch_profile_catalog.get().get(&host_id).cloned()
+                    });
+                    let entries = catalog.map(|catalog| catalog.entries).unwrap_or_default();
+                    let missing_selection = selected_profile.as_ref().filter(|id| {
+                        !entries.iter().any(|entry| entry.id() == *id)
+                    }).map(|id| view! {
+                        <option value=format!("profile:{}", id.0) disabled=true>
+                            {format!("{} — unavailable launch profile", id.0)}
+                        </option>
+                    });
+                    let profile_options = entries.into_iter().filter(|entry| {
+                        entry.kind() == protocol::LaunchProfileKind::Custom
+                            || selected_profile.as_ref() == Some(entry.id())
+                    }).map(|entry| {
+                        let value = format!("profile:{}", entry.id().0);
+                        match entry {
+                            LaunchProfileEntry::Ready { profile } => view! {
+                                <option value=value>
+                                    {format!("{} ({})", profile.label, backend_label(profile.backend_kind))}
+                                </option>
+                            }.into_any(),
+                            LaunchProfileEntry::Unavailable { label, backend_kind, message, .. } => view! {
+                                <option value=value disabled=true>
+                                    {format!("{} ({}) — unavailable: {}", label, backend_label(backend_kind), message)}
+                                </option>
+                            }.into_any(),
+                        }
+                    }).collect::<Vec<_>>();
                     let options = settings
                         .enabled_backends
                         .into_iter()
@@ -2837,29 +2866,51 @@ fn BackendsTab() -> impl IntoView {
                     view! {
                         <select
                             class="settings-select"
+                            aria-label="Default backend"
                             prop:value=default_backend_value
-                            disabled=!has_enabled
+                            disabled=!has_enabled && selected_profile.is_none()
                             on:change=move |ev: web_sys::Event| {
                                 let target = ev.target().unwrap();
                                 let el: web_sys::HtmlSelectElement = target.unchecked_into();
-                                let default_backend = if el.value().is_empty() {
-                                    None
-                                } else {
-                                    let Some(kind) = parse_backend_kind(&el.value()) else {
-                                        log::error!("unknown backend value {} in select", el.value());
+                                let value = el.value();
+                                let (default_backend, default_profile) = if value.is_empty() {
+                                    (None, None)
+                                } else if let Some(profile_id) = value.strip_prefix("profile:") {
+                                    let profile = state_for_change.selected_host_id.get_untracked().and_then(|host_id| {
+                                        state_for_change.launch_profile_catalog.with_untracked(|catalogs| {
+                                            catalogs.get(&host_id)?.entries.iter().find_map(|entry| match entry {
+                                                LaunchProfileEntry::Ready { profile } if profile.id.0 == profile_id => Some(profile.clone()),
+                                                _ => None,
+                                            })
+                                        })
+                                    });
+                                    let Some(profile) = profile else {
+                                        crate::notices::report_settings_error(&state_for_change, "This launch profile is no longer available.");
                                         return;
                                     };
-                                    Some(kind)
+                                    (Some(profile.backend_kind), Some(profile.id))
+                                } else {
+                                    let Some(kind) = parse_backend_kind(&value) else {
+                                        log::error!("unknown backend value in default select");
+                                        crate::notices::report_settings_error(&state_for_change, "This backend selection is invalid.");
+                                        return;
+                                    };
+                                    (Some(kind), None)
                                 };
-                                send_host_replace(
-                                    &state_for_change,
-                                    "/default_backend",
-                                    default_backend,
-                                );
+                                send_host_change(&state_for_change, move |doc| {
+                                    Ok(vec![
+                                        replace_setting_op(doc, "/default_backend".to_owned(), serde_json::json!(default_backend))?,
+                                        replace_setting_op(doc, "/default_launch_profile_id".to_owned(), serde_json::json!(default_profile))?,
+                                    ])
+                                });
                             }
                         >
                             <option value="">"No default backend"</option>
                             {options}
+                            <optgroup label="Launch profiles">
+                                {missing_selection}
+                                {profile_options}
+                            </optgroup>
                         </select>
                     }
                     .into_any()
@@ -9627,6 +9678,7 @@ mod wasm_tests {
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
+                    default_launch_profile_id: None,
                     enable_mobile_connections: enabled,
 
                     mobile_direct_hosting_enabled: false,
@@ -11701,6 +11753,7 @@ mod wasm_tests {
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
+                    default_launch_profile_id: None,
                     enable_mobile_connections: false,
 
                     mobile_direct_hosting_enabled: false,
@@ -12592,6 +12645,7 @@ mod wasm_tests {
             review: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
+            default_launch_profile_id: None,
             enable_mobile_connections: false,
 
             mobile_direct_hosting_enabled: false,
@@ -13686,6 +13740,389 @@ mod wasm_tests {
                 .length(),
             3,
             "the backend page renders one control per schema field"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn default_backend_dropdown_selects_profiles_for_new_chats() {
+        let calls = install_settings_send_stub();
+        let sent_frames = || {
+            calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                    if entry.get(0).as_string()?.as_str() != "send_host_line" {
+                        return None;
+                    }
+                    let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
+                    serde_json::from_str::<Value>(args.get("line")?.as_str()?).ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        async fn submit_new_chat(container: &HtmlElement) {
+            container
+                .query_selector("button[title='New Chat']")
+                .unwrap()
+                .expect("primary New Chat button")
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            next_tick().await;
+            submit_current_chat(container).await;
+        }
+        async fn submit_current_chat(container: &HtmlElement) {
+            let input = container
+                .query_selector("textarea")
+                .unwrap()
+                .expect("new chat composer")
+                .dyn_into::<web_sys::HtmlTextAreaElement>()
+                .unwrap();
+            input.set_value("hello");
+            input
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+            next_tick().await;
+            container
+                .query_selector("[data-test='chat-send-primary']")
+                .unwrap()
+                .expect("Send button")
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            next_tick().await;
+        }
+        let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, false, false, None);
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut("host-general")
+                .unwrap()
+                .enabled_backends
+                .push(BackendKind::Codex);
+        });
+        crate::dispatch::reset_inbound_state_for_host("host-general");
+        let profile = protocol::LaunchProfile {
+            id: LaunchProfileId("focus".to_owned()),
+            kind: protocol::LaunchProfileKind::Custom,
+            label: "Focus".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Codex,
+            session_settings: SessionSettingsValues::default(),
+        };
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.insert(
+                "host-general".to_owned(),
+                protocol::LaunchProfileCatalog {
+                    entries: vec![
+                        LaunchProfileEntry::Ready {
+                            profile: profile.clone(),
+                        },
+                        LaunchProfileEntry::Unavailable {
+                            id: LaunchProfileId("broken".to_owned()),
+                            kind: protocol::LaunchProfileKind::Custom,
+                            backend_kind: BackendKind::Codex,
+                            label: "Broken".to_owned(),
+                            message: "Profile model unavailable".to_owned(),
+                        },
+                    ],
+                    default_profile_id: None,
+                    custom_profile_schemas: Vec::new(),
+                },
+            );
+        });
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! {
+                <crate::components::header::Header />
+                <SettingsPanel />
+                <crate::components::center_zone::CenterZone />
+            }
+        });
+        next_tick().await;
+        click_tab(&container, "Overview");
+        next_tick().await;
+
+        let default_select = || {
+            container
+                .query_selector("select[aria-label='Default backend']")
+                .unwrap()
+                .expect("existing default dropdown")
+                .dyn_into::<HtmlSelectElement>()
+                .unwrap()
+        };
+        let option_named = |select: &HtmlSelectElement, label: &str| {
+            (0..select.length())
+                .filter_map(|index| select.item(index)?.dyn_into::<HtmlOptionElement>().ok())
+                .find(|option| option.text().contains(label))
+                .expect("visible default option")
+        };
+        let select = default_select();
+        assert_eq!(
+            option_named(&select, "Claude").text(),
+            "Claude",
+            "the original backend choice stays available"
+        );
+        assert!(
+            option_named(&select, "Broken").disabled(),
+            "unavailable profiles cannot be selected"
+        );
+        select.set_value(&option_named(&select, "Focus").value());
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        next_tick().await;
+        let frames = sent_frames();
+        let writes = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "settings_write")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes.len(),
+            1,
+            "the default choice must be atomic at the envelope boundary"
+        );
+        let ops = writes[0]["payload"]["ops"]
+            .as_array()
+            .expect("settings operations");
+        assert_eq!(ops.len(), 2, "the one write carries both values");
+        assert_eq!(
+            replacement_value(&ops[0], "/default_backend"),
+            Some(&serde_json::json!("codex"))
+        );
+        assert_eq!(
+            replacement_value(&ops[1], "/default_launch_profile_id"),
+            Some(&serde_json::json!("focus"))
+        );
+
+        crate::actions::open_new_chat_with_prefill(
+            &state,
+            "host-general".to_owned(),
+            None,
+            String::new(),
+        );
+        next_tick().await;
+        state.host_settings_by_host.update(|hosts| {
+            let settings = hosts.get_mut("host-general").unwrap();
+            settings.default_backend = Some(BackendKind::Codex);
+            settings.default_launch_profile_id = Some(profile.id.clone());
+        });
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.get_mut("host-general").unwrap().default_profile_id = Some(profile.id.clone());
+        });
+        next_tick().await;
+        assert!(option_named(&default_select(), "Focus").selected());
+
+        container
+            .query_selector("button[title='Close settings']")
+            .unwrap()
+            .expect("close settings")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
+        submit_current_chat(&container).await;
+        let frames = sent_frames();
+        let spawn = frames
+            .iter()
+            .find(|frame| frame["kind"] == "spawn_agent")
+            .expect("new chat emits a real protocol frame");
+        assert_eq!(spawn["payload"]["params"]["backend_kind"], "codex");
+        assert_eq!(spawn["payload"]["params"]["launch_profile_id"], "focus");
+        assert!(
+            spawn["payload"]["params"].get("session_settings").is_none(),
+            "the server owns the profile's current settings"
+        );
+
+        submit_new_chat(&container).await;
+        let frames = sent_frames();
+        let primary_spawn = frames
+            .iter()
+            .rev()
+            .find(|frame| frame["kind"] == "spawn_agent")
+            .expect("primary default chat");
+        assert_eq!(
+            primary_spawn["payload"]["params"]["launch_profile_id"],
+            "focus"
+        );
+        assert!(
+            primary_spawn["payload"]["params"]
+                .get("session_settings")
+                .is_none()
+        );
+
+        crate::actions::begin_new_chat(&state, Some(BackendKind::Claude));
+        next_tick().await;
+        submit_current_chat(&container).await;
+        let frames = sent_frames();
+        let explicit = frames
+            .iter()
+            .rev()
+            .find(|frame| frame["kind"] == "spawn_agent")
+            .expect("explicit backend draft");
+        assert_eq!(explicit["payload"]["params"]["backend_kind"], "claude");
+        assert!(
+            explicit["payload"]["params"]
+                .get("launch_profile_id")
+                .is_none(),
+            "an explicit backend-only draft must not inherit the saved profile"
+        );
+
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs
+                .get_mut("host-general")
+                .unwrap()
+                .entries
+                .retain(|entry| entry.id().0 != "focus");
+        });
+        state.settings_open.set(true);
+        next_tick().await;
+        let select = default_select();
+        let unavailable = option_named(&select, "unavailable launch profile");
+        assert!(
+            unavailable.selected() && unavailable.disabled(),
+            "a missing saved choice stays visibly unavailable, never another backend"
+        );
+        container
+            .query_selector("button[title='Close settings']")
+            .unwrap()
+            .expect("close settings")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        for (seq, id, message) in [
+            (0, "broken", "Selected launch profile is unavailable"),
+            (1, "focus", "Selected launch profile no longer exists"),
+        ] {
+            state.host_settings_by_host.update(|hosts| {
+                hosts
+                    .get_mut("host-general")
+                    .unwrap()
+                    .default_launch_profile_id = Some(LaunchProfileId(id.to_owned()));
+            });
+            state.launch_profile_catalog.update(|catalogs| {
+                catalogs.get_mut("host-general").unwrap().default_profile_id =
+                    Some(LaunchProfileId(id.to_owned()));
+            });
+            submit_new_chat(&container).await;
+            let frames = sent_frames();
+            let spawn = frames
+                .iter()
+                .rev()
+                .find(|frame| frame["kind"] == "spawn_agent")
+                .expect("failed default still emits a launch request");
+            assert_eq!(spawn["payload"]["params"]["backend_kind"], "codex");
+            assert_eq!(
+                spawn["payload"]["params"]["launch_profile_id"], id,
+                "an unavailable default must never become a backend-only launch"
+            );
+            let stream = protocol::StreamPath("/host/host-general".to_owned());
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "host-general",
+                protocol::Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::CommandError,
+                    seq,
+                    &protocol::CommandErrorPayload {
+                        context: None,
+                        request_id: None,
+                        stream,
+                        request_kind: FrameKind::SpawnAgent,
+                        operation: "spawn_agent".to_owned(),
+                        code: protocol::CommandErrorCode::InvalidInput,
+                        message: message.to_owned(),
+                        fatal: false,
+                    },
+                )
+                .expect("server launch error envelope"),
+            );
+            next_tick().await;
+            let banner = container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .expect("the existing global launch error banner");
+            assert_eq!(banner.get_attribute("role").as_deref(), Some("alert"));
+            assert!(
+                banner.text_content().unwrap_or_default().contains(message),
+                "the server's launch failure must be visible"
+            );
+            banner
+                .query_selector("button")
+                .unwrap()
+                .expect("dismiss launch error")
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+        }
+        state.settings_open.set(true);
+        next_tick().await;
+        click_tab(&container, "Overview");
+        next_tick().await;
+        let select = default_select();
+        select.set_value("claude");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        next_tick().await;
+        let frames = sent_frames();
+        let writes = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "settings_write")
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+        let ops = writes.last().unwrap()["payload"]["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            replacement_value(&ops[0], "/default_backend"),
+            Some(&serde_json::json!("claude"))
+        );
+        assert_eq!(
+            replacement_value(&ops[1], "/default_launch_profile_id"),
+            Some(&Value::Null),
+            "returning to a backend clears the saved profile"
+        );
+        state.host_settings_by_host.update(|hosts| {
+            let settings = hosts.get_mut("host-general").unwrap();
+            settings.default_backend = Some(BackendKind::Claude);
+            settings.default_launch_profile_id = None;
+        });
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.get_mut("host-general").unwrap().default_profile_id =
+                Some(LaunchProfileId("claude:default".to_owned()));
+        });
+        next_tick().await;
+        let select = default_select();
+        select.set_value("");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        next_tick().await;
+        let frames = sent_frames();
+        let writes = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "settings_write")
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 3);
+        let ops = writes.last().unwrap()["payload"]["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            replacement_value(&ops[0], "/default_backend"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            replacement_value(&ops[1], "/default_launch_profile_id"),
+            Some(&Value::Null)
         );
     }
 
@@ -15044,6 +15481,7 @@ mod wasm_tests {
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
+                    default_launch_profile_id: None,
                     enable_mobile_connections: false,
 
                     mobile_direct_hosting_enabled: false,

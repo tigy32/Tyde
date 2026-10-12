@@ -30,6 +30,21 @@ The server resolves the profile before spawning the agent:
 Existing backend-kind launches remain supported by omitting
 `launch_profile_id`.
 
+## Default for new chats
+
+Settings → Backends → Overview → **Default backend** offers enabled backends
+and server-catalog launch profiles in the same dropdown. Selecting a profile
+atomically saves its backend and `HostSettings.default_launch_profile_id`.
+Selecting a backend or **No default backend** clears that profile selection.
+Existing settings without the optional field keep their backend-default
+behavior.
+
+The server emits the saved choice as `LaunchProfileCatalog.default_profile_id`.
+New chats use that exact profile and its current server-owned settings; explicit
+backend/profile choices and existing sessions remain unchanged. If the selected
+profile disappears or becomes unavailable, its saved selection stays visible
+as unavailable and a new chat fails visibly instead of using another profile.
+
 ## Current IDs and explicit profiles
 
 Every enabled backend gets a default profile:

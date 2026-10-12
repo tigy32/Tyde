@@ -333,6 +333,7 @@ mod wasm_tests {
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
+                    default_launch_profile_id: None,
                     enable_mobile_connections: false,
 
                     mobile_direct_hosting_enabled: false,
