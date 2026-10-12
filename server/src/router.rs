@@ -121,6 +121,13 @@ pub(crate) async fn route_client_envelope(
                 let payload: SetAgentGroupsPayload = parse_payload(&envelope, "set_agent_groups")?;
                 host.set_agent_groups(payload).await?;
             }
+            FrameKind::DotsCommand => {
+                let payload: protocol::DotsCommandPayload =
+                    parse_payload(&envelope, "dots_command")?;
+                host.dots_command(payload)
+                    .await
+                    .map_err(|error| crate::error::AppError::invalid("dots_command", error))?;
+            }
             FrameKind::TychatCommand => {
                 let payload: protocol::TychatCommandPayload =
                     parse_payload(&envelope, "tychat_command")?;

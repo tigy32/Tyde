@@ -250,6 +250,7 @@ fn write_host_settings_with_launch_profiles(
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
         tychat: Default::default(),
+        chatgpt_dots_enabled: false,
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(

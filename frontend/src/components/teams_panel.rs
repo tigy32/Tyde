@@ -2767,6 +2767,7 @@ mod wasm_tests {
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                 },
             );
         });

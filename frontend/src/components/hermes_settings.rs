@@ -3309,6 +3309,7 @@ mod wasm_tests {
                     launch_profiles: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                     hermes_disabled_providers: HashMap::from([(
                         HERMES_DEFAULT_PROFILE.to_owned(),
                         disabled.clone(),

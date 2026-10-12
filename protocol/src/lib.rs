@@ -241,3 +241,10 @@ pub use types::{
     TychatOutboundId, TychatOutboundMessage, TychatOutboundSnapshot, TychatOwnerMessage,
     TychatPairingId, TychatSettings, TychatSettingsApplication, TychatStatePayload, TychatTurnId,
 };
+
+pub use types::{DotsCommandPayload, DotsConnectionStatus, DotsStatePayload};
+
+pub use types::{
+    DotsAgentInput, DotsEmptyInput, DotsHostRegistrationPayload, DotsMessageInput, DotsRelayFrame,
+    DotsSpawnAgentInput,
+};

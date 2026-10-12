@@ -177,6 +177,12 @@ impl Fixture {
         self.session_store_dir.path().join("tychat-secrets.json")
     }
 
+    // The shared fixture is compiled by every integration binary; only Dots uses this credential path.
+    #[allow(dead_code)]
+    pub fn dots_secret_path(&self) -> PathBuf {
+        self.session_store_dir.path().join("dots-host-secrets.json")
+    }
+
     // Each integration binary compiles this shared fixture, but only project flows use scan hooks.
     #[allow(dead_code)]
     pub fn on_project_scan(
@@ -925,12 +931,15 @@ pub async fn next_frame_matching_on_with_timeout(
         }
         if matches!(context, "NewAgent" | "AgentStart") && env.kind == FrameKind::ChatEvent {
             eprintln!(
-                "SPAWN WAIT DISCARDED context={context} stream={} payload={}",
-                env.stream, env.payload
+                "SPAWN WAIT DISCARDED context={context} kind={:?} seq={}",
+                env.kind, env.seq
             );
         }
         if env.kind == FrameKind::AgentStart {
-            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
+            eprintln!(
+                "TYDE FIXTURE SKIPPED AGENT START context={context} seq={}",
+                env.seq
+            );
         }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
@@ -998,7 +1007,10 @@ async fn next_frame_matching_strict_inner(
             env.stream
         );
         if env.kind == FrameKind::AgentStart {
-            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
+            eprintln!(
+                "TYDE FIXTURE SKIPPED AGENT START context={context} seq={}",
+                env.seq
+            );
         }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
@@ -1264,7 +1276,10 @@ pub async fn next_logical_frame_matching_on(
             let _ = is_builtin_team_custom_agent_notify(&env);
         }
         if env.kind == FrameKind::AgentStart {
-            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
+            eprintln!(
+                "TYDE FIXTURE SKIPPED AGENT START context={context} seq={}",
+                env.seq
+            );
         }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }

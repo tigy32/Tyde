@@ -3141,7 +3141,7 @@ async fn await_result_from_snapshot(
     })
 }
 
-async fn do_read_agent(
+pub(crate) async fn do_read_agent(
     host: &HostHandle,
     agent_id: &AgentId,
 ) -> Result<AgentControlReadResult, String> {

@@ -417,6 +417,7 @@ enum SettingsTab {
     CodeIntelligence,
     Voice,
     Tychat,
+    ChatgptDots,
     Mobile,
     Debug,
 }
@@ -449,6 +450,7 @@ impl SettingsTab {
             Self::Skills => "Skills",
             Self::CodeIntelligence => "Code Intelligence",
             Self::Voice => "Voice",
+            Self::ChatgptDots => "ChatGPT Dots",
             Self::Tychat => "Tychat",
             Self::Mobile => "Mobile",
             Self::Debug => "Debug",
@@ -472,6 +474,7 @@ impl SettingsTab {
             | Self::Skills
             | Self::CodeIntelligence
             | Self::Voice
+            | Self::ChatgptDots
             | Self::Tychat
             | Self::Mobile
             | Self::Debug => SettingsScope::Host,
@@ -683,6 +686,14 @@ impl SettingsTab {
                 "New steering",
             ],
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
+            Self::ChatgptDots => &[
+                "Integrations",
+                "ChatGPT",
+                "Dots",
+                "Pair",
+                "Connect",
+                "OAuth",
+            ],
             Self::Tychat => &[
                 "Tychat", "Pairing", "Bot", "Owner", "Agent", "Operator", "Reset",
             ],
@@ -724,7 +735,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 19] = [
+const ALL_TABS: [SettingsTab; 20] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
@@ -742,6 +753,7 @@ const ALL_TABS: [SettingsTab; 19] = [
     SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
     SettingsTab::Tychat,
+    SettingsTab::ChatgptDots,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
@@ -762,7 +774,7 @@ const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 14] = [
+const HOST_GROUP_TABS: [SettingsTab; 13] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
@@ -774,7 +786,6 @@ const HOST_GROUP_TABS: [SettingsTab; 14] = [
     SettingsTab::McpServers,
     SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
-    SettingsTab::Tychat,
     SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
@@ -948,6 +959,12 @@ pub fn SettingsPanel() -> impl IntoView {
                                 active_page
                                 search_query
                             />
+                            <SettingsNavGroup
+                                title=Signal::derive(|| "Integrations".to_owned())
+                                tabs=vec![SettingsTab::Tychat, SettingsTab::ChatgptDots]
+                                active_page
+                                search_query
+                            />
                             <BackendsNavGroup active_page search_query />
                             <div class="settings-nav-footer">
                                 <button class="settings-feedback-link" on:click=move |_| {
@@ -981,6 +998,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
                                     SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
+                                    SettingsTab::ChatgptDots => view! { <super::dots_settings::DotsTab /> }.into_any(),
                                     SettingsTab::Tychat => view! { <super::tychat_settings::TychatTab /> }.into_any(),
                                     SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
                                     SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
@@ -9631,6 +9649,7 @@ mod wasm_tests {
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                 },
             );
         });
@@ -9825,6 +9844,263 @@ mod wasm_tests {
                 .unwrap()
                 .as_bool()
                 .unwrap()
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn integrations_render_dots_host_truth_and_keep_tychat_grouped() {
+        let calls = install_settings_send_stub();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, "host-lp", |bootstrap| {
+            bootstrap.settings.chatgpt_dots_enabled = true;
+            bootstrap.dots = protocol::DotsStatePayload {
+                status: protocol::DotsConnectionStatus::AwaitingPairing,
+                mcp_url: Some("https://bootstrap.example/mcp".into()),
+                pairing_code: Some("bootstrap-code".into()),
+            };
+        });
+        let container = make_container();
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            mounted.settings_open.set(true);
+            provide_context(mounted);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        let labels = container.query_selector_all(".settings-nav-group").unwrap();
+        let groups = (0..labels.length())
+            .map(|i| labels.item(i).unwrap().text_content().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            groups.iter().any(|text| text.contains("Integrations")
+                && text.contains("Tychat")
+                && text.contains("ChatGPT Dots")),
+            "Both integrations must appear together under the visible Integrations heading"
+        );
+        click_tab(&container, "ChatGPT Dots");
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Awaiting pairing")
+        );
+        let bootstrap_code: web_sys::HtmlInputElement = container
+            .query_selector("#dots-pairing-code")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            bootstrap_code.value() == "bootstrap-code",
+            "Initial bootstrap must render its nondefault pairing code without a live DotsState frame"
+        );
+        let bootstrap_url: web_sys::HtmlInputElement = container
+            .query_selector("#dots-server-url")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            bootstrap_url.value() == "https://bootstrap.example/mcp",
+            "Initial MCP URL must come from HostBootstrap"
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::DotsState,
+                0,
+                &protocol::DotsStatePayload::default(),
+            )
+            .unwrap(),
+        );
+        crate::dispatch::clear_stream_seq_for_tests(
+            "host-lp",
+            &protocol::StreamPath("/host/host-lp".into()),
+        );
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("host-lp").unwrap().chatgpt_dots_enabled = false;
+        });
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Disabled"));
+        let enabled: web_sys::HtmlInputElement = container
+            .query_selector("#dots-enabled")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        enabled.set_checked(true);
+        dispatch_change(&enabled);
+        next_tick().await;
+        assert!(recorded_settings_write_ops(&calls).iter().any(|op| {
+            op.get("path").and_then(Value::as_str) == Some("/chatgpt_dots_enabled")
+                && op.get("value") == Some(&Value::Bool(true))
+        }));
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("host-lp").unwrap().chatgpt_dots_enabled = true;
+        });
+        let snapshot = protocol::DotsStatePayload {
+            status: protocol::DotsConnectionStatus::AwaitingPairing,
+            mcp_url: Some("https://dots.example/mcp".into()),
+            pairing_code: Some("test-code".into()),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::DotsState,
+                0,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Awaiting pairing")
+        );
+        let code: web_sys::HtmlInputElement = container
+            .query_selector("#dots-pairing-code")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            code.value() == "test-code",
+            "Pairing code must come from the selected host's event"
+        );
+        let snapshot = protocol::DotsStatePayload {
+            status: protocol::DotsConnectionStatus::Connected,
+            mcp_url: snapshot.mcp_url,
+            pairing_code: None,
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::DotsState,
+                1,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Disconnect ChatGPT")
+        );
+        assert!(
+            container
+                .query_selector("#dots-pairing-code")
+                .unwrap()
+                .is_none(),
+            "Consumed pairing code must no longer be rendered"
+        );
+
+        let commands = || {
+            calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                    if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                        return None;
+                    }
+                    let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
+                    let envelope: protocol::Envelope =
+                        serde_json::from_str(args.get("line")?.as_str()?).ok()?;
+                    (envelope.kind == FrameKind::DotsCommand).then(|| {
+                        envelope
+                            .parse_payload::<protocol::DotsCommandPayload>()
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let publish = |status, seq| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "host-lp",
+                protocol::Envelope::from_payload(
+                    protocol::StreamPath("/host/host-lp".into()),
+                    FrameKind::DotsState,
+                    seq,
+                    &protocol::DotsStatePayload {
+                        status,
+                        mcp_url: Some("https://dots.example/mcp".into()),
+                        pairing_code: Some("new-test-code".into()),
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        publish(
+            protocol::DotsConnectionStatus::Failed {
+                reason: "Connection interrupted".into(),
+            },
+            2,
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Connection interrupted")
+        );
+        click_tab(&container, "Retry");
+        next_tick().await;
+        assert!(matches!(
+            commands().as_slice(),
+            [protocol::DotsCommandPayload::Retry]
+        ));
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 3);
+        next_tick().await;
+        click_tab(&container, "New pairing code");
+        next_tick().await;
+        assert!(matches!(
+            commands().as_slice(),
+            [
+                protocol::DotsCommandPayload::Retry,
+                protocol::DotsCommandPayload::Retry
+            ]
+        ));
+        publish(protocol::DotsConnectionStatus::Connected, 4);
+        next_tick().await;
+        js_sys::eval(r#"window.__dots_confirm_answer = 'Cancel'; const dotsOriginalInvoke = window.__TAURI__.core.invoke; window.__TAURI__.core.invoke = function(cmd, args) { if (cmd === 'plugin:dialog|message') { window.__test_send_calls.push([cmd, JSON.stringify(args)]); return Promise.resolve(window.__dots_confirm_answer); } return dotsOriginalInvoke(cmd, args); };"#).unwrap();
+        click_tab(&container, "Disconnect ChatGPT");
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            commands().len(),
+            2,
+            "Cancelled confirmation must not revoke access"
+        );
+        assert!(container.text_content().unwrap().contains("Connected"));
+        js_sys::eval("window.__dots_confirm_answer = 'Ok'").unwrap();
+        click_tab(&container, "Disconnect ChatGPT");
+        next_tick().await;
+        next_tick().await;
+        assert!(matches!(
+            commands().last(),
+            Some(protocol::DotsCommandPayload::Disconnect)
+        ));
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 5);
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Awaiting pairing")
         );
         drop(handle);
         container.remove();
@@ -11450,6 +11726,7 @@ mod wasm_tests {
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                 },
             );
         });
@@ -12337,6 +12614,7 @@ mod wasm_tests {
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
             tychat: Default::default(),
+            chatgpt_dots_enabled: false,
         }
     }
 
@@ -14791,6 +15069,7 @@ mod wasm_tests {
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                 },
             );
         });

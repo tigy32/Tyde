@@ -122,6 +122,15 @@ pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
 /// upserts.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
+    prime_host_with_bootstrap_for_tests(state, host_id, |_| {});
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub fn prime_host_with_bootstrap_for_tests(
+    state: &AppState,
+    host_id: &str,
+    configure: impl FnOnce(&mut protocol::HostBootstrapPayload<settings_model::HostSettings>),
+) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
         MobileAccessStatePayload as BootstrapMobileAccess,
@@ -141,8 +150,9 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         tyde_version: TYDE_VERSION,
         release_version: None,
     };
-    let bootstrap = BootstrapHostPayload {
+    let mut bootstrap = BootstrapHostPayload {
         tychat: protocol::TychatStatePayload::default(),
+        dots: Default::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -172,6 +182,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
             tychat: Default::default(),
+            chatgpt_dots_enabled: false,
         },
         settings_etag: String::new(),
         settings_schema: serde_json::Value::Null,
@@ -219,6 +230,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         agents_view_preferences: None,
     };
 
+    configure(&mut bootstrap);
     let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
         .expect("synthetic Welcome");
     dispatch_envelope(state, host_id, welcome_env);
@@ -754,6 +766,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     format!("failed to parse command_error payload: {error}"),
                 );
             }
+        },
+        FrameKind::DotsState => match envelope.parse_payload::<protocol::DotsStatePayload>() {
+            Ok(payload) => state.dots_by_host.update(|map| {
+                map.insert(host_id.to_string(), payload);
+            }),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("Invalid Dots state: {error}"),
+            ),
         },
         FrameKind::TychatState => match envelope.parse_payload::<protocol::TychatStatePayload>() {
             Ok(payload) => state.tychat_by_host.update(|map| {
@@ -6730,6 +6754,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         payload.team_members.len(),
     );
 
+    state.dots_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.dots);
+    });
     state.tychat_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.tychat);
     });
@@ -7583,6 +7610,7 @@ pub(crate) mod restore_fixtures {
             seq,
             &HostBootstrapPayload {
                 tychat: protocol::TychatStatePayload::default(),
+                dots: Default::default(),
                 agents_with_background_work: Vec::new(),
                 settings: settings_model::HostSettings {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -7612,6 +7640,7 @@ pub(crate) mod restore_fixtures {
                     hermes_disabled_providers: Default::default(),
                     voice: Default::default(),
                     tychat: Default::default(),
+                    chatgpt_dots_enabled: false,
                 },
                 settings_etag: String::new(),
                 settings_schema: serde_json::Value::Null,

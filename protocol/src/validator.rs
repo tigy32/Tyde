@@ -620,6 +620,8 @@ impl ProtocolValidator {
                     "AgentsViewPreferencesNotify",
                 )
             }
+            FrameKind::DotsCommand => parse_host_payload::<crate::DotsCommandPayload>(self, envelope, "DotsCommand"),
+            FrameKind::DotsState => parse_host_payload::<crate::DotsStatePayload>(self, envelope, "DotsState"),
             FrameKind::TychatCommand => parse_host_payload::<crate::TychatCommandPayload>(self, envelope, "TychatCommand"),
             FrameKind::TychatState => parse_host_payload::<crate::TychatStatePayload>(self, envelope, "TychatState"),
             FrameKind::MobileAccessState => {

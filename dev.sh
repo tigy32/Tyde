@@ -797,7 +797,7 @@ run_check_stages() {
     (
         trap - EXIT INT TERM HUP
         run_stage_at "$n_loader" "web loader tests" "$repetitions" \
-            bash -c 'cd web/loader && exec node --test test/*.test.js' &&
+            bash -c 'node --test services/chatgpt-dots/test/*.test.mjs && cd web/loader && exec node --test test/*.test.js' &&
             run_stage_at "$n_docs" "customer documentation" 1 \
                 python3 docs/build.py --check &&
             run_stage_at "$n_contract" "dev check contract tests" 1 \

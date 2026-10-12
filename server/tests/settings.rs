@@ -149,6 +149,7 @@ fn expected_empty_settings() -> HostSettings {
         hermes_disabled_providers: Default::default(),
         voice: Default::default(),
         tychat: Default::default(),
+        chatgpt_dots_enabled: false,
     }
 }
 
@@ -403,6 +404,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
             tychat: Default::default(),
+            chatgpt_dots_enabled: false,
         }
     );
 }

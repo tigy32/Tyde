@@ -458,6 +458,14 @@ impl Connection {
             .await
     }
 
+    pub async fn dots_command(
+        &mut self,
+        payload: protocol::DotsCommandPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::DotsCommand, &payload)
+            .await
+    }
+
     pub async fn tychat_command(
         &mut self,
         payload: protocol::TychatCommandPayload,
@@ -1515,6 +1523,10 @@ impl Connection {
                 }
                 FrameKind::TaskTokenUsage => {
                     let _: TaskTokenUsagePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::DotsState => {
+                    let _: protocol::DotsStatePayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::TychatState => {

@@ -306,6 +306,12 @@ Return findings in priority order, with a proposed correction.</code></pre>
 <h2 id="settings-other-settings">Other settings</h2>
 <p>Settings also include steering instructions, voice options, and agent activity features. Configure these for your workflow after the basic backend and project setup works. For any provider-backed feature, review its required credentials and usage implications on the selected host.</p>
 
+<h2 id="settings-integrations">Integrations</h2>
+<p><strong>Settings → Integrations</strong> contains Tychat and ChatGPT Dots. Both apply to the selected host. Tychat retains its existing bot-pairing and agent settings.</p>
+<p>Enable <strong>ChatGPT Dots</strong> to let your dot manage this host's projects and agents. Tyde creates and maintains an outbound connection automatically, without OpenAI Platform keys or inbound firewall ports. On first use, follow the displayed steps to add the MCP server in ChatGPT Plugins with OAuth authentication, then enter the one-time code in the Tyde authorization page. Do not put the pairing code in a chat.</p>
+<p>Pairing grants access to this host's agent controls; agents may modify files and use your existing provider credentials. Tool inputs and results pass through the Tyde connection service and OpenAI over TLS, not end-to-end encryption. ChatGPT account and workspace permissions still apply.</p>
+<p>Turning the toggle off blocks new remote commands but does not stop existing agents. Turning it back on reconnects the paired host. <strong>Disconnect ChatGPT</strong> revokes the host's connection and invalidates its OAuth grants. Connection and authorization failures are shown explicitly; use Retry to reconnect or regenerate an expired pairing code.</p>
+
 
 <h2 id="troubleshooting">Troubleshooting</h2>
 

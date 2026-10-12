@@ -303,7 +303,7 @@ impl fmt::Display for MobilePairingQrUri {
 }
 
 /// Strongly typed agent identifier. Wraps a UUID string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AgentId(pub String);
 
@@ -1195,6 +1195,8 @@ pub enum FrameKind {
     BackendConfigSnapshots,
     BackendCapacity,
     LaunchProfileCatalogNotify,
+    DotsCommand,
+    DotsState,
     TychatCommand,
     TychatState,
     MobileAccessState,
@@ -1411,6 +1413,8 @@ impl fmt::Display for FrameKind {
             Self::BackendConfigSnapshots => f.write_str("backend_config_snapshots"),
             Self::BackendCapacity => f.write_str("backend_capacity"),
             Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
+            Self::DotsCommand => f.write_str("dots_command"),
+            Self::DotsState => f.write_str("dots_state"),
             Self::TychatCommand => f.write_str("tychat_command"),
             Self::TychatState => f.write_str("tychat_state"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
@@ -1744,6 +1748,8 @@ pub struct WorkflowRefreshPayload {}
 pub struct HostBootstrapPayload<S = Value> {
     #[serde(default)]
     pub tychat: TychatStatePayload,
+    #[serde(default)]
+    pub dots: DotsStatePayload,
     #[serde(default)]
     pub agents_with_background_work: Vec<AgentId>,
     pub settings: S,
@@ -9983,4 +9989,83 @@ pub struct TychatOutboundMessage {
 pub struct TychatOutboundSnapshot {
     pub typing: bool,
     pub pending: Vec<TychatOutboundMessage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DotsConnectionStatus {
+    #[default]
+    Disabled,
+    Connecting,
+    AwaitingPairing,
+    Connected,
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DotsStatePayload {
+    pub status: DotsConnectionStatus,
+    pub mcp_url: Option<String>,
+    pub pairing_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DotsCommandPayload {
+    Retry,
+    Disconnect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DotsSpawnAgentInput {
+    pub project_id: ProjectId,
+    pub prompt: String,
+    pub launch_profile_id: Option<LaunchProfileId>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DotsAgentInput {
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DotsMessageInput {
+    pub agent_id: AgentId,
+    pub message: String,
+    #[serde(default)]
+    pub interrupt: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DotsEmptyInput {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DotsRelayFrame {
+    Connection {
+        paired: bool,
+    },
+    Request {
+        transport_id: String,
+        body: String,
+    },
+    Response {
+        transport_id: String,
+        status: u16,
+        body: String,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DotsHostRegistrationPayload {
+    pub host_id: String,
+    pub host_key: String,
+    pub pairing_hash: String,
 }

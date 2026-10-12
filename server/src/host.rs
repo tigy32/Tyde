@@ -376,6 +376,11 @@ pub struct HostRuntimeConfig {
     /// Real local-Tychat tests pair against a loopback binary instead of production.
     #[cfg(feature = "test-support")]
     pub tychat_api_base: Option<url::Url>,
+    #[cfg(feature = "test-support")]
+    pub dots_service_origin: Option<url::Url>,
+    /// Hold connection reconfiguration while real MCP requests continue across the transport.
+    #[cfg(feature = "test-support")]
+    pub dots_configuration_gate: Option<watch::Receiver<bool>>,
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -427,6 +432,10 @@ impl Default for HostRuntimeConfig {
             tychat_bridge_disabled: false,
             #[cfg(feature = "test-support")]
             tychat_api_base: None,
+            #[cfg(feature = "test-support")]
+            dots_service_origin: None,
+            #[cfg(feature = "test-support")]
+            dots_configuration_gate: None,
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
@@ -738,6 +747,7 @@ type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
     tychat: crate::tychat::TychatService,
+    dots: crate::dots::DotsHandle,
     #[cfg(feature = "test-support")]
     tychat_bridge_disabled: bool,
     pub swarm_registry: SwarmRegistryHandle,
@@ -1832,6 +1842,30 @@ impl Drop for InstalledWorkbenchRemoveHook {
 }
 
 impl HostHandle {
+    pub(crate) async fn dots_command(
+        &self,
+        command: protocol::DotsCommandPayload,
+    ) -> Result<(), String> {
+        self.state.lock().await.dots.command(command)
+    }
+
+    pub(crate) async fn publish_dots_state(&self, snapshot: protocol::DotsStatePayload) {
+        let payload = match serde_json::to_value(snapshot) {
+            Ok(payload) => payload,
+            Err(_) => {
+                tracing::error!("Cannot serialize Dots connection state");
+                return;
+            }
+        };
+        self.state
+            .lock()
+            .await
+            .host_streams
+            .retain(|_, subscriber| {
+                emit_or_queue_host_frame(subscriber, FrameKind::DotsState, payload.clone()).is_ok()
+            });
+    }
+
     pub(crate) async fn begin_usage_wakeup_tick(&self, now_ms: u64) -> Option<Vec<BackendKind>> {
         let mut state = self.state.lock().await;
         let usage = state.usage_limits_tx.borrow().settings;
@@ -3121,6 +3155,7 @@ impl HostHandle {
         let settings_store_for_projection = Arc::clone(&state.settings_store);
         let agent_restoration_failures = state.agent_restoration_failures.clone();
         let tychat_snapshot = state.tychat.state.lock().await.snapshot.clone();
+        let dots_snapshot = state.dots.state.borrow().clone();
         drop(state);
         tracing::info!(target: "tyde::connection_bootstrap", agent_count = agents.len(), elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap descriptors completed");
         let task_token_usages = match usage_sources {
@@ -3143,6 +3178,7 @@ impl HostHandle {
         };
         let bootstrap = HostBootstrapPayload {
             tychat: tychat_snapshot,
+            dots: dots_snapshot,
             agents_with_background_work,
             settings,
             settings_etag,
@@ -9311,6 +9347,16 @@ impl HostHandle {
             }
             if service.state.lock().await.journal.pairing.is_some() {
                 service.notify();
+            }
+        }
+        if current.chatgpt_dots_enabled != committed.chatgpt_dots_enabled {
+            let dots = self.state.lock().await.dots.clone();
+            if let Err(reason) = dots.configure(committed.chatgpt_dots_enabled) {
+                self.publish_dots_state(protocol::DotsStatePayload {
+                    status: protocol::DotsConnectionStatus::Failed { reason },
+                    ..Default::default()
+                })
+                .await;
             }
         }
         let new_etag = {
@@ -15608,6 +15654,19 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     crate::process_env::initialize_process_env()?;
+    let (dots, dots_commands, dots_state) = crate::dots::DotsHandle::new();
+    let dots_path = paths.settings.with_file_name("dots-host-secrets.json");
+    #[cfg(feature = "test-support")]
+    let dots_configuration_gate = runtime_config.dots_configuration_gate.clone();
+    #[cfg(not(feature = "test-support"))]
+    let dots_configuration_gate = None;
+    let dots_origin =
+        url::Url::parse(crate::dots::SERVICE_ORIGIN).map_err(|_| "Invalid Dots service origin")?;
+    #[cfg(feature = "test-support")]
+    let dots_origin = runtime_config
+        .dots_service_origin
+        .clone()
+        .unwrap_or(dots_origin);
     let tychat_api_base = url::Url::parse(tychat_bot::PRODUCTION_API_BASE)
         .map_err(|_| "Invalid production Tychat origin".to_owned())?;
     #[cfg(feature = "test-support")]
@@ -15776,6 +15835,7 @@ fn spawn_host_inner(
             ..Default::default()
         }),
         state: Arc::new(Mutex::new(HostState {
+            dots,
             #[cfg(feature = "test-support")]
             tychat_bridge_disabled: runtime_config.tychat_bridge_disabled,
             tychat,
@@ -16067,6 +16127,24 @@ fn spawn_host_inner(
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
     spawn_supervisor_compaction_executor(host.clone(), supervisor_compaction_rx);
+    let dots_state_on_start_failure = dots_state.clone();
+    if let Err(reason) = crate::dots::start(
+        host.clone(),
+        dots_commands,
+        dots_state,
+        crate::dots::ConnectionConfig {
+            path: dots_path,
+            origin: dots_origin,
+            configuration_gate: dots_configuration_gate,
+        },
+        host.restart.stopped.clone(),
+        host.restart.complete.subscribe(),
+    ) {
+        dots_state_on_start_failure.send_replace(protocol::DotsStatePayload {
+            status: protocol::DotsConnectionStatus::Failed { reason },
+            ..Default::default()
+        });
+    }
     spawn_open_agent_restoration_task(host.clone());
 
     Ok(host)

@@ -1718,7 +1718,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             lines.index("native-tools-prepare"), lines.index("wasm-prepare")
         )
         self.assertEqual(lines.count("wasm"), 1)
-        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 1)
+        # The stage now runs the real Dots worker before the existing loader.
+        # Require each boundary once, rather than rejecting the second suite.
+        self.assertEqual(sum(line.startswith("node --test services/chatgpt-dots/test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 2)
         self.assertTrue(
             all(
                 "real-ai=unset/unset/unset" in line
@@ -1884,7 +1888,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         lines = self._log_lines()
         self.assertEqual(lines.count("wasm"), 1)
-        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test services/chatgpt-dots/test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 2)
         self.assertEqual(lines.count("contract"), 1)
         self.assertIn("PASS  wasm browser tests (1/1", result.stdout)
         self.assertIn("PASS  web loader tests (1/1", result.stdout)

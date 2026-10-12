@@ -125,6 +125,7 @@ pub fn prime_host_with_bootstrap_for_tests(
     };
     let mut bootstrap = BootstrapHostPayload {
         tychat: Default::default(),
+        dots: Default::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -154,6 +155,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
             tychat: Default::default(),
+            chatgpt_dots_enabled: false,
         },
         settings_etag: String::new(),
         settings_schema: serde_json::Value::Null,
@@ -4425,6 +4427,7 @@ mod wasm_tests {
         };
         let bootstrap = settings_model::HostBootstrapPayload {
             tychat: protocol::TychatStatePayload::default(),
+            dots: Default::default(),
             agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
                 resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -4454,6 +4457,7 @@ mod wasm_tests {
                 hermes_disabled_providers: Default::default(),
                 voice: Default::default(),
                 tychat: Default::default(),
+                chatgpt_dots_enabled: false,
             },
             settings_etag: String::new(),
             settings_schema: serde_json::Value::Null,

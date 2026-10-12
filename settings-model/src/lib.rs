@@ -99,6 +99,8 @@ impl Default for ReviewSettings {
 pub struct HostSettings {
     #[serde(default)]
     pub tychat: protocol::TychatSettings,
+    #[serde(default)]
+    pub chatgpt_dots_enabled: bool,
     #[serde(default = "default_resume_previous_agents")]
     pub resume_previous_agents: bool,
     /// When true, swarms that were running at shutdown wait for an explicit
@@ -192,6 +194,7 @@ impl Default for HostSettings {
     fn default() -> Self {
         Self {
             tychat: protocol::TychatSettings::default(),
+            chatgpt_dots_enabled: false,
             resume_previous_agents: default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: ReviewSettings::default(),

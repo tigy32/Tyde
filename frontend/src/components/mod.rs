@@ -49,3 +49,5 @@ pub mod workflows_panel;
 pub mod app_updates;
 
 pub mod tychat_settings;
+
+pub mod dots_settings;

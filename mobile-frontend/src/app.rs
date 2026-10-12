@@ -1875,6 +1875,7 @@ mod wasm_tests {
             hermes_disabled_providers: Default::default(),
             voice: Default::default(),
             tychat: Default::default(),
+            chatgpt_dots_enabled: false,
         }
     }
 
@@ -2110,6 +2111,17 @@ mod wasm_tests {
             frame_document.document_element().unwrap(),
             frame_document.body().unwrap().into(),
         ] {
+            wasm_bindgen_test::console_log!(
+                "Recovered paint surface: tag={}, height={}, inline_height={}, shell_height={}",
+                element.tag_name(),
+                element.get_bounding_client_rect().height(),
+                element
+                    .unchecked_ref::<HtmlElement>()
+                    .style()
+                    .get_property_value("height")
+                    .unwrap(),
+                shell.get_bounding_client_rect().height()
+            );
             assert!(
                 (element.get_bounding_client_rect().height() - 852.0).abs() <= 1.0,
                 "the document paint surface must grow with the recovered shell"

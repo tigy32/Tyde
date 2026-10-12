@@ -30,3 +30,5 @@ mobile-frontend/dist/
 
 # Local tauri config overrides
 tauri.no-reload.conf.json
+
+.wrangler/

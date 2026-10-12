@@ -8,6 +8,8 @@ pub(crate) mod code_intel;
 pub(crate) mod config_mcp;
 pub(crate) mod connection;
 pub(crate) mod debug_mcp;
+pub(crate) mod dots;
+mod dots_mcp;
 pub(crate) mod error;
 pub(crate) mod host;
 pub mod mcp_bridge;
@@ -153,4 +155,12 @@ impl std::fmt::Debug for Connection {
             .field("outgoing_seq", &self.outgoing_seq)
             .finish_non_exhaustive()
     }
+}
+
+pub fn dots_connection_schema() -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "relay": rmcp::schemars::schema_for!(protocol::DotsRelayFrame),
+        "host_registration": rmcp::schemars::schema_for!(protocol::DotsHostRegistrationPayload),
+    }))
+    .map_err(|_| "Cannot encode Dots connection schemas".to_owned())
 }

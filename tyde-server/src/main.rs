@@ -17,6 +17,7 @@ enum CliMode {
     HostLaunchUds,
     HostBridgeUds,
     McpBridge,
+    DotsSchema,
     Version,
     Help,
     Error(String),
@@ -38,6 +39,9 @@ fn main() {
         CliMode::HostLaunchUds => exit_on_error(run_host_launch_uds()),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
         CliMode::McpBridge => exit_on_error(run_mcp_bridge()),
+        CliMode::DotsSchema => {
+            exit_on_error(server::dots_connection_schema().map(|schema| println!("{schema}")))
+        }
         CliMode::Version => println!("{}", env!("CARGO_PKG_VERSION")),
         CliMode::Help => print_usage(),
         CliMode::Error(message) => {
@@ -136,6 +140,9 @@ where
     if args.as_slice() == ["mcp-bridge"] || args.as_slice() == ["hermes-mcp-bridge"] {
         return CliMode::McpBridge;
     }
+    if args.as_slice() == ["dots-schema"] {
+        return CliMode::DotsSchema;
+    }
 
     match args.as_slice() {
         [host] if host == "host" => CliMode::Error(
@@ -159,6 +166,7 @@ fn print_usage() {
     println!("  tyde-server host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde-server host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
     println!("  tyde-server mcp-bridge      Run the process-local Tyde MCP bridge");
+    println!("  tyde-server dots-schema     Export canonical connection-service schemas");
 }
 
 fn run_mcp_bridge() -> Result<(), String> {
