@@ -96,16 +96,33 @@ impl ReviewHandle {
             .map_err(|_| "review request dropped".to_owned())?
     }
 
+    pub(crate) async fn edit_finding(
+        &self,
+        suggestion_id: ReviewSuggestionId,
+        body: String,
+    ) -> Result<Review, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ReviewCommand::EditFinding {
+                suggestion_id,
+                body,
+                reply,
+            })
+            .await
+            .map_err(|_| "review stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "review comment edit dropped".to_owned())?
+    }
+
     pub(crate) async fn disposition(
         &self,
-        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         reason: String,
     ) -> Result<Review, String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ReviewCommand::Disposition {
-                caller,
                 suggestion_id,
                 reason,
                 reply,

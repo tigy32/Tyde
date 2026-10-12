@@ -85,8 +85,12 @@ pub(crate) enum ReviewCommand {
         scope: protocol::ReviewAiScope,
         reply: oneshot::Sender<Result<Review, String>>,
     },
+    EditFinding {
+        suggestion_id: ReviewSuggestionId,
+        body: String,
+        reply: oneshot::Sender<Result<Review, String>>,
+    },
     Disposition {
-        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         reason: String,
         reply: oneshot::Sender<Result<Review, String>>,
@@ -227,13 +231,20 @@ impl ReviewActor {
                     };
                     let _ = reply.send(result);
                 }
+                ReviewCommand::EditFinding {
+                    suggestion_id,
+                    body,
+                    reply,
+                } => {
+                    let result = self.edit_finding(suggestion_id, body).await;
+                    let _ = reply.send(result);
+                }
                 ReviewCommand::Disposition {
-                    caller,
                     suggestion_id,
                     reason,
                     reply,
                 } => {
-                    let result = self.record_disposition(caller, suggestion_id, reason).await;
+                    let result = self.record_disposition(suggestion_id, reason).await;
                     let _ = reply.send(result);
                 }
 
@@ -1475,9 +1486,76 @@ impl ReviewActor {
         Ok(suggestion_id)
     }
 
+    async fn edit_finding(
+        &mut self,
+        suggestion_id: ReviewSuggestionId,
+        body: String,
+    ) -> Result<Review, String> {
+        if self.review.status != ReviewStatus::Draft {
+            return Err("Only draft review comments can be edited".to_owned());
+        }
+        if body.trim().is_empty() {
+            return Err("Comment body must not be empty".to_owned());
+        }
+        let index = self
+            .review
+            .suggestions
+            .iter()
+            .position(|suggestion| suggestion.id == suggestion_id)
+            .ok_or_else(|| "Unknown finding".to_owned())?;
+        let comment_index = match &self.review.suggestions[index].state {
+            ReviewSuggestionState::Accepted { comment_id } => Some(
+                self.review
+                    .comments
+                    .iter()
+                    .position(|comment| {
+                        &comment.id == comment_id
+                            && matches!(&comment.source, ReviewCommentSource::AiSuggestion { suggestion_id: source_id, .. } if source_id == &suggestion_id)
+                    })
+                    .ok_or_else(|| "Accepted finding has no backing comment".to_owned())?,
+            ),
+            ReviewSuggestionState::Pending
+            | ReviewSuggestionState::Rejected
+            | ReviewSuggestionState::Resolved => None,
+        };
+        let previous = self.review.clone();
+        let now = now_ms();
+        self.review.suggestions[index].body = body.clone();
+        let suggestion = self.review.suggestions[index].clone();
+        let comment = comment_index.map(|index| {
+            let comment = &mut self.review.comments[index];
+            comment.body = body;
+            comment.updated_at_ms = now;
+            comment.source = ReviewCommentSource::AiSuggestion {
+                suggestion_id: suggestion_id.clone(),
+                edited: true,
+            };
+            comment.clone()
+        });
+        self.review.updated_at_ms = now;
+        if !self
+            .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
+            .await
+        {
+            return Err("Failed to save comment edit".to_owned());
+        }
+        self.broadcast(ReviewEventPayload::SuggestionUpsert { suggestion })
+            .await;
+        if let Some(comment) = comment {
+            self.broadcast(ReviewEventPayload::CommentUpsert { comment })
+                .await;
+        }
+        self.notify_project_changed();
+        tracing::debug!(
+            review_id = %self.review.id,
+            accepted_comment_updated = comment_index.is_some(),
+            "edited project review finding"
+        );
+        Ok(self.review.clone())
+    }
+
     async fn record_disposition(
         &mut self,
-        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         reason: String,
     ) -> Result<Review, String> {
@@ -1502,9 +1580,6 @@ impl ReviewActor {
                 })
             })
             .ok_or_else(|| "Finding has no review round".to_owned())?;
-        if round.requested_by.as_ref() != Some(&caller) {
-            return Err("Only the requesting agent can record a disposition".to_owned());
-        }
         round
             .dispositions
             .insert(suggestion_id.0.clone(), reason.trim().to_owned());
@@ -1533,6 +1608,10 @@ impl ReviewActor {
                 .await;
             self.notify_project_changed();
         }
+        tracing::debug!(
+            review_id = %self.review.id,
+            "recorded project review disposition"
+        );
         Ok(self.review.clone())
     }
 

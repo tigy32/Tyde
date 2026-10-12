@@ -6739,7 +6739,7 @@ pub enum ReviewSuggestionState {
         comment_id: ReviewCommentId,
     },
     Rejected,
-    /// The agent that requested the review recorded a disposition; its
+    /// An agent in the review's project recorded a disposition; its
     /// reason lives in the owning round's `dispositions`.
     Resolved,
 }

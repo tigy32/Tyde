@@ -432,14 +432,26 @@ backend defaults through the normal spawn path. Missing explicit backends fail
 visibly, never silently change provider or reduce required coverage. Historical
 records missing the new fields remain readable. Agent-requested members remain
 children of the requester. Await waits for the whole round, and findings are
-read through tools, never injected into conversations. The requesting agent
-closes a finding with `tyde_review_disposition`: the reason is recorded in the
+read through tools, never injected into conversations. Any authenticated agent
+in the review's project can close a finding or update its recorded reason with
+`tyde_review_disposition`, including findings requested by another agent or from
+a manual review, even when the requester or reviewer is no longer available.
+Project membership is checked at the host boundary; requester ownership remains
+required only for awaiting a round. The reason is recorded in the
 round's `dispositions`, and a `Pending` suggestion becomes
 `ReviewSuggestionState::Resolved` (protocol version 80), broadcast as a
 `SuggestionUpsert` and dropped from pending counts. Resolved findings leave
 the inline and comments surfaces; the review rounds history keeps them with
 the agent's response. Accepted or rejected findings keep the user's state. Manual reviews retain
 the accept-and-submit flow and independent finding attribution.
+
+`tyde_edit_review_comment` lets any authenticated agent in the same project edit
+an AI finding's text in a draft review without accepting, closing, or reopening
+it. Attribution, anchor, severity, and dispositions remain unchanged. Accepted
+findings and their backing comments are updated together through the review
+actor and broadcast as `SuggestionUpsert` and `CommentUpsert`; edits never create
+parallel comment state. Empty text, unknown findings, non-draft reviews, missing
+credentials, and cross-project edits are refused.
 
 Before any typed settings read, startup migrates `review.agents` into aspects,
 then migrates legacy execution settings. Untouched Light (Codex, empty settings)

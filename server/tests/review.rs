@@ -3378,6 +3378,138 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         }
     }
     close_agent_and_wait(&mut client, &reviewer_stream).await;
+
+    let peer_caller = fixture.agent_control_caller(&agent.agent_id).await;
+    let mut edit_observer = fixture.connect().await;
+    let before_edit = subscribe_review(&mut edit_observer, &review.id).await;
+    assert!(
+        before_edit.ai_reviewer.rounds[0].requested_by.is_none(),
+        "This flow covers a manually requested review"
+    );
+    let accepted_before = before_edit
+        .suggestions
+        .iter()
+        .find(|s| s.id == suggestion.id)
+        .expect("accepted finding");
+    let accepted_comment_id = match &accepted_before.state {
+        ReviewSuggestionState::Accepted { comment_id } => comment_id.clone(),
+        _ => panic!("Expected the user's accepted finding"),
+    };
+    let accepted_body = "Updated accepted finding after reviewer closure";
+    let (failed, edited) = review_mcp_call(
+        &peer_caller.url,
+        Some(&peer_caller.authorization),
+        "tyde_edit_review_comment",
+        json!({"review_id": review.id, "suggestion_id": suggestion.id, "body": accepted_body}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "Agents can edit accepted comments after their reviewer closes"
+    );
+    assert!(
+        edited["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == json!(suggestion.id) && s["state"]["state"] == "accepted")
+    );
+    match expect_review_delta(&mut edit_observer, "accepted finding edit").await {
+        ReviewEventPayload::SuggestionUpsert {
+            suggestion: changed,
+        } => {
+            let mut expected = accepted_before.clone();
+            expected.body = accepted_body.to_owned();
+            assert!(
+                changed == expected,
+                "Text edits preserve the user's acceptance and finding attribution"
+            );
+        }
+        _ => panic!("Expected an accepted suggestion update"),
+    }
+    match expect_review_delta(&mut edit_observer, "accepted comment edit").await {
+        ReviewEventPayload::CommentUpsert { comment } => {
+            assert!(comment.id == accepted_comment_id && comment.body == accepted_body);
+            assert_eq!(
+                comment.source,
+                ReviewCommentSource::AiSuggestion {
+                    suggestion_id: suggestion.id.clone(),
+                    edited: true
+                }
+            );
+        }
+        _ => panic!("Expected the backing comment to update too"),
+    }
+    for id in [
+        &staged_suggestion.id,
+        &suggestion.id,
+        &rejected_suggestion.id,
+    ] {
+        let (failed, _) = review_mcp_call(&peer_caller.url, Some(&peer_caller.authorization), "tyde_review_disposition", json!({"review_id": review.id, "suggestion_id": id, "reason": "Handled by a project agent after reviewer closure"})).await;
+        assert!(
+            !failed,
+            "Manual review findings can be dispositioned by project agents"
+        );
+    }
+    let after_edit = subscribe_review(&mut edit_observer, &review.id).await;
+    for (id, expected) in [
+        (&staged_suggestion.id, ReviewSuggestionState::Resolved),
+        (
+            &suggestion.id,
+            ReviewSuggestionState::Accepted {
+                comment_id: accepted_comment_id,
+            },
+        ),
+        (&rejected_suggestion.id, ReviewSuggestionState::Rejected),
+    ] {
+        assert!(
+            after_edit
+                .suggestions
+                .iter()
+                .any(|s| &s.id == id && s.state == expected),
+            "Disposition closes pending findings without overwriting user choices"
+        );
+        assert!(
+            after_edit.ai_reviewer.rounds[0]
+                .dispositions
+                .contains_key(&id.0)
+        );
+    }
+    edit_observer
+        .review_action(&review.id, ReviewActionPayload::Cancel)
+        .await
+        .expect("cancel review with accepted finding");
+    next_frame_matching_on(&mut edit_observer, "review cancelled", |env| {
+        env.kind == FrameKind::ReviewEvent
+            && matches!(
+                env.parse_payload::<ReviewEventPayload>(),
+                Ok(ReviewEventPayload::StatusChanged {
+                    status: ReviewStatus::Cancelled { .. }
+                })
+            )
+    })
+    .await;
+    let (failed, denied) = review_mcp_call(
+        &peer_caller.url,
+        Some(&peer_caller.authorization),
+        "tyde_edit_review_comment",
+        json!({"review_id": review.id, "suggestion_id": suggestion.id, "body": "Must not change cancelled review"}),
+    )
+    .await;
+    assert!(
+        failed && denied.as_str().is_some_and(|s| s.contains("draft")),
+        "Cancelled review comments cannot be edited"
+    );
+    let cancelled = subscribe_review(&mut edit_observer, &review.id).await;
+    assert!(matches!(cancelled.status, ReviewStatus::Cancelled { .. }));
+    assert!(
+        cancelled.suggestions == after_edit.suggestions,
+        "Rejected edits must preserve every finding"
+    );
+    assert!(
+        cancelled.comments == after_edit.comments,
+        "Rejected edits must preserve accepted backing comments"
+    );
 }
 
 #[tokio::test]
@@ -4687,7 +4819,65 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         ReviewSuggestionState::Pending
     );
     let finding = &completed.suggestions[0];
-    let (failed, disposition) = review_mcp_call(&caller.url, Some(&caller.authorization), "tyde_review_disposition", json!({ "review_id": review.id, "suggestion_id": finding.id, "reason": "Addressed: assert on the actual protocol event" })).await;
+    let (peer, _) = spawn_idle_project_agent(&mut client, &project).await;
+    let peer_caller = fixture.agent_control_caller(&peer.agent_id).await;
+    for (tool, arguments) in [
+        (
+            "tyde_edit_review_comment",
+            json!({"review_id": review.id, "suggestion_id": finding.id, "body": "Peer edit"}),
+        ),
+        (
+            "tyde_review_disposition",
+            json!({"review_id": review.id, "suggestion_id": finding.id, "reason": "Peer resolution"}),
+        ),
+    ] {
+        let (failed, _) = review_mcp_call(&peer_caller.url, None, tool, arguments).await;
+        assert!(failed, "Review mutations require authenticated agents");
+    }
+    for arguments in [
+        json!({"review_id": review.id, "suggestion_id": finding.id, "body": "  "}),
+        json!({"review_id": review.id, "suggestion_id": "missing-finding", "body": "Peer edit"}),
+    ] {
+        let (failed, _) = review_mcp_call(
+            &peer_caller.url,
+            Some(&peer_caller.authorization),
+            "tyde_edit_review_comment",
+            arguments,
+        )
+        .await;
+        assert!(
+            failed,
+            "Invalid edits must fail without changing the finding"
+        );
+    }
+    let mut edit_observer = fixture.connect().await;
+    subscribe_review(&mut edit_observer, &review.id).await;
+    let edited_body = "Peer clarified the review issue.";
+    let (failed, peer_edited) = review_mcp_call(
+        &peer_caller.url,
+        Some(&peer_caller.authorization),
+        "tyde_edit_review_comment",
+        json!({"review_id": review.id, "suggestion_id": finding.id, "body": edited_body}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "A same-project peer can edit another agent's finding"
+    );
+    assert!(peer_edited["findings"][0]["body"].as_str() == Some(edited_body));
+    let mut expected = finding.clone();
+    expected.body = edited_body.to_owned();
+    match expect_review_delta(&mut edit_observer, "peer edit broadcasts finding").await {
+        ReviewEventPayload::SuggestionUpsert { suggestion } => {
+            assert!(
+                suggestion == expected,
+                "Editing text must preserve finding state and attribution"
+            );
+        }
+        _ => panic!("Expected a suggestion update after peer edit"),
+    }
+    let (failed, disposition) = review_mcp_call(&peer_caller.url, Some(&peer_caller.authorization), "tyde_review_disposition", json!({ "review_id": review.id, "suggestion_id": finding.id, "reason": "Addressed: assert on the actual protocol event" })).await;
+    eprintln!("Same-project peer disposition: rejected={failed}");
     assert!(!failed, "record disposition: {disposition}");
     let visible = subscribe_review(&mut observer, &review.id).await;
     assert!(visible.ai_reviewer.rounds[0].dispositions[&finding.id.0].starts_with("Addressed:"));
@@ -4879,6 +5069,37 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let other_project = create_project(&mut client, other_root.path()).await;
     let (other_agent, _) = spawn_idle_project_agent(&mut client, &other_project).await;
     let other_caller = fixture.agent_control_caller(&other_agent.agent_id).await;
+    for (tool, arguments) in [
+        (
+            "tyde_edit_review_comment",
+            json!({"review_id": review.id, "suggestion_id": finding.id, "body": "Unauthorized edit"}),
+        ),
+        (
+            "tyde_review_disposition",
+            json!({"review_id": review.id, "suggestion_id": finding.id, "reason": "Unauthorized resolution"}),
+        ),
+    ] {
+        let (failed, denied) = review_mcp_call(
+            &other_caller.url,
+            Some(&other_caller.authorization),
+            tool,
+            arguments,
+        )
+        .await;
+        assert!(
+            failed
+                && denied
+                    .as_str()
+                    .is_some_and(|s| s.contains("different project")),
+            "Cross-project review mutations must be refused"
+        );
+    }
+    let unchanged = subscribe_review(&mut edit_observer, &review.id).await;
+    assert!(unchanged.suggestions[0].body == edited_body);
+    assert_eq!(
+        unchanged.suggestions[0].state,
+        ReviewSuggestionState::Resolved
+    );
     let (failed, denied) = review_mcp_call(
         &other_caller.url,
         Some(&other_caller.authorization),
@@ -5544,4 +5765,26 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     );
     drop(reconnected);
     drop(close_reservation);
+    let (failed, updated) = review_mcp_call(&peer_caller.url, Some(&peer_caller.authorization), "tyde_review_disposition", json!({"review_id": review.id, "suggestion_id": finding.id, "reason": "Peer updated the disposition after requester closure"})).await;
+    assert!(
+        !failed,
+        "Closed requesters must not strand their review findings"
+    );
+    assert!(
+        updated["rounds"][0]["dispositions"][&finding.id.0].as_str()
+            == Some("Peer updated the disposition after requester closure")
+    );
+    let (failed, edited) = review_mcp_call(&peer_caller.url, Some(&peer_caller.authorization), "tyde_edit_review_comment", json!({"review_id": review.id, "suggestion_id": finding.id, "body": "Clarified after requester closure"})).await;
+    assert!(
+        !failed,
+        "Closed requesters and reviewers must not block text edits"
+    );
+    assert_eq!(edited["findings"][0]["state"]["state"], "resolved");
+    assert!(edited["findings"][0]["body"].as_str() == Some("Clarified after requester closure"));
+    let persisted = subscribe_review(&mut observer, &review.id).await;
+    assert!(persisted.suggestions[0].body == "Clarified after requester closure");
+    assert_eq!(
+        persisted.suggestions[0].state,
+        ReviewSuggestionState::Resolved
+    );
 }

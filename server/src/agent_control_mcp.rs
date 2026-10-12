@@ -1005,6 +1005,14 @@ struct ReviewDispositionToolInput {
     reason: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EditReviewCommentToolInput {
+    review_id: String,
+    suggestion_id: String,
+    body: String,
+}
+
 fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpError> {
     let round_id = review
         .ai_reviewer
@@ -1112,7 +1120,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Record a visible reason for addressing or dismissing a review finding and close it. A pending finding becomes resolved and leaves the user's open review comments; the reason stays visible in the review round. Only the requesting agent may do this; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
+        description = "Record a visible reason for addressing or dismissing a review finding and close it. A pending finding becomes resolved and leaves the user's open review comments; the reason stays visible in the review round. Any authenticated agent in the review's project may close a finding or update its recorded reason, even if the requester is no longer available; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
     )]
     async fn tyde_review_disposition(
         &self,
@@ -1129,9 +1137,38 @@ impl TydeAgentControlMcpServer {
                 .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
                 .await?
                 .disposition(
-                    caller,
                     protocol::ReviewSuggestionId(input.suggestion_id),
                     input.reason,
+                )
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => review_tool_result(review),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Edit the text of an AI review comment in a draft review. Any authenticated agent in the review's project may edit it, even if the requester or reviewer is no longer available. Use suggestion_id from tyde_get_review. Preserves the finding's state, attribution, location, and any recorded disposition; an accepted comment is updated with its backing suggestion. Does not accept or close the finding."
+    )]
+    async fn tyde_edit_review_comment(
+        &self,
+        Parameters(input): Parameters<EditReviewCommentToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_edit_review_comment").await {
+                Ok(caller) => caller,
+                Err(error) => return Ok(err_text(error)),
+            };
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .await?
+                .edit_finding(
+                    protocol::ReviewSuggestionId(input.suggestion_id),
+                    input.body,
                 )
                 .await
         }
