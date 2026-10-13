@@ -211,9 +211,20 @@ impl SharedProjectWatcher {
                 roots = roots.len(),
                 "creating shared project filesystem watcher"
             );
+            let config = Config::default().with_follow_symlinks(false);
+            // Read opens fill inotify's kernel queue before access events can be dropped.
+            #[cfg(target_os = "linux")]
+            let config = config.with_event_kinds(
+                notify::EventKindMask::CORE | notify::EventKindMask::ACCESS_CLOSE,
+            );
+            #[cfg(target_os = "linux")]
+            tracing::debug!(
+                event_kinds = ?config.event_kinds(),
+                "configured native project watcher event mask"
+            );
             let watcher = RecommendedWatcher::new(
                 move |event| routes.lock().unwrap().dispatch(generation, event),
-                Config::default().with_follow_symlinks(false),
+                config,
             );
             #[cfg(feature = "test-support")]
             for root in roots {

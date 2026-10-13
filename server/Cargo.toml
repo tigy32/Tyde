@@ -38,7 +38,6 @@ regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 prost = "0.14"
 same-file = "1"
-notify = "8"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 portable-pty = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
@@ -65,6 +64,12 @@ aws-types = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify = "=9.0.0-rc.5"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+notify = "8"
 
 [dev-dependencies]
 tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613", features = ["owner-kit"] }

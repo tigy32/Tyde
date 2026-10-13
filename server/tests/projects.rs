@@ -4043,6 +4043,104 @@ async fn project_watch_failures_keep_other_projects_live() {
         .unwrap();
     let before =
         expect_project_file_contents(&mut fixture.client, "observe before kernel overflow").await;
+    let queue_capacity: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let storm_watches = directory_watch_ids(storm_repo.path());
+    assert_eq!(storm_watches.len(), 1);
+    let duplicate = unsafe { libc::fcntl(storm_watches[0].0, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(duplicate >= 0);
+    let native_queue = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let paused = fixture.on_project_scan(
+        storm_repo.path().join("a.rs"),
+        server::ScanPoint::WatcherDispatch,
+        move || {
+            let _ = paused_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release native drain after read-only flood");
+        },
+    );
+    fs::write(storm_repo.path().join("a.rs"), "pause for reads\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), paused_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let queued_before = rustix::io::ioctl_fionread(&native_queue).unwrap();
+    let started = std::time::Instant::now();
+    for index in 0..queue_capacity + 128 {
+        fs::read_dir(if index % 2 == 0 {
+            storm_repo.path().to_owned()
+        } else {
+            storm_repo.path().join("gone")
+        })
+        .unwrap()
+        .for_each(|entry| {
+            entry.unwrap();
+        });
+        fs::read(
+            storm_repo
+                .path()
+                .join(if index % 2 == 0 { "a.rs" } else { "b.rs" }),
+        )
+        .unwrap();
+    }
+    let queued_after = rustix::io::ioctl_fionread(&native_queue).unwrap();
+    eprintln!(
+        "native read flood: queue_capacity={queue_capacity} read_count={} queued_before={queued_before} queued_after={queued_after} elapsed_ms={}",
+        2 * (queue_capacity + 128),
+        started.elapsed().as_millis()
+    );
+    release_tx.send(()).unwrap();
+    drop(paused);
+    drop(native_queue);
+    // Native queue sizes are diagnostics; the protocol must prove reads leave
+    // versions unchanged and both projects still receive subsequent writes.
+    fs::write(storm_repo.path().join("b.rs"), "write after read flood\n").unwrap();
+    expect_watched_change(&mut fixture.client, "b.rs").await;
+    assert_no_watched_changes(&mut fixture.client, &["src/file.rs"]).await;
+    fixture
+        .client
+        .project_read_file(
+            &projects[1].id,
+            ProjectReadFilePayload {
+                path: before.path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let after_reads =
+        expect_project_file_contents(&mut fixture.client, "read after read-only flood").await;
+    assert_eq!(after_reads.version, before.version);
+    assert_eq!(after_reads.contents, before.contents);
+    fs::write(
+        healthy_repo.path().join("src/file.rs"),
+        "healthy write after read flood\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "src/file.rs").await;
+    fixture
+        .client
+        .project_read_file(
+            &projects[1].id,
+            ProjectReadFilePayload {
+                path: before.path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let healthy_after_reads =
+        expect_project_file_contents(&mut fixture.client, "healthy write after read flood").await;
+    assert_eq!(
+        healthy_after_reads.contents.as_deref(),
+        Some("healthy write after read flood\n")
+    );
+    assert!(healthy_after_reads.version > before.version);
+    let before = healthy_after_reads;
     let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let paused = fixture.on_project_scan(
@@ -4067,11 +4165,6 @@ async fn project_watch_failures_keep_other_projects_live() {
     tokio::time::timeout(Duration::from_secs(5), paused_rx)
         .await
         .unwrap()
-        .unwrap();
-    let queue_capacity: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
-        .unwrap()
-        .trim()
-        .parse()
         .unwrap();
     let started = std::time::Instant::now();
     for index in 0..queue_capacity + 128 {
