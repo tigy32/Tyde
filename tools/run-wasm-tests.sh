@@ -19,9 +19,9 @@
 #   tools/run-wasm-tests.sh --identity       # read-only current identity
 #
 # Environment:
-#   WASM_BINDGEN_TEST_TIMEOUT  seconds allowed for a whole browser suite, not
-#                              per test. Defaults to 120; an explicit positive
-#                              whole number wins and an invalid value fails.
+#   WASM_BINDGEN_TEST_TIMEOUT  only u64::MAX is accepted, disabling the upstream
+#                              suite cutoff. A streamed per-test guard owns
+#                              the ten-minute hung-test limit instead.
 #
 # Requires: cargo; curl; unzip.
 
@@ -98,14 +98,15 @@ if [[ -n "${WASM_BINDGEN_TEST_RUNNER:-}" &&
     die "WASM_BINDGEN_TEST_RUNNER must be named wasm-bindgen-test-runner so Cargo runs the fingerprinted executable"
 fi
 
-# An explicit browser-suite timeout is authoritative, like CHROME and
-# CHROMEDRIVER, and an invalid one fails here — in every mode, before any
-# provisioning, browser, or Cargo work. Without this guard a typo surfaces as a
-# panic inside wasm-bindgen-test-runner after Chrome has already started, and a
-# `0` is accepted silently and times out every suite instantly.
 if [[ -n "${WASM_BINDGEN_TEST_TIMEOUT:-}" ]]; then
     positive_u64_seconds_or_die \
         WASM_BINDGEN_TEST_TIMEOUT "$WASM_BINDGEN_TEST_TIMEOUT"
+    normalized_timeout="$WASM_BINDGEN_TEST_TIMEOUT"
+    while [[ "$normalized_timeout" == 0?* ]]; do
+        normalized_timeout="${normalized_timeout#0}"
+    done
+    [[ "$normalized_timeout" == 18446744073709551615 ]] ||
+        die "WASM_BINDGEN_TEST_TIMEOUT whole-suite deadlines are not supported; individual tests have a ten-minute hung guard"
 fi
 
 sha256_file() {
@@ -641,7 +642,12 @@ fi
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
 export PATH="$(dirname "$runner_bin"):$PATH"
-export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner_bin"
+export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$(python3 - "$repo_root/tools/run-test-hang-guard.py" "$runner_bin" <<'PY'
+import shlex
+import sys
+print(shlex.join(["python3", sys.argv[1], "--hang-seconds", "600", "--", sys.argv[2]]))
+PY
+)"
 
 # Build the wasm test modules without DWARF.
 #
@@ -667,30 +673,7 @@ export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner_bin"
 # RUSTFLAGS from the environment wins, so a debugging session can opt back in.
 export RUSTFLAGS="${RUSTFLAGS:--C debuginfo=0}"
 
-# Cap the whole browser suite, not each test.
-#
-# wasm-bindgen-test-runner applies WASM_BINDGEN_TEST_TIMEOUT to the entire
-# headless session — one Instant, started before the page loads and never reset
-# by progress — even though upstream documents it as a per-test timeout. Its
-# default is 20 seconds, which this repository had never set and so silently
-# inherited.
-#
-# Every frontend test runs in one browser instance and that suite measured
-# 19.25-19.58s on main. The repository was living on under a second of margin
-# and the stage failed roughly a third of the time, on main as well as on
-# feature branches, with no assertion text and a SIGKILL line that reads exactly
-# like an out-of-memory crash and is not one. The real signal is the
-# `finished in Xs` line the harness prints on success: that is the number to
-# watch, and it is now visible instead of hiding behind a cliff.
-#
-# 120s is ~5.7x the current suite, so it absorbs years of test growth while
-# still bounding a genuinely wedged suite at two minutes. dev.sh imposes no
-# stage timeout of its own, so this is the only ceiling.
-#
-# This weakens no assertion. A hung or failing test still fails the stage. An
-# explicit value from the environment wins and is validated at the top of this
-# script, so a debugging session can shorten it without editing anything.
-export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-120}"
+export WASM_BINDGEN_TEST_TIMEOUT=18446744073709551615
 
 cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
@@ -706,12 +689,10 @@ cleanup_rtc_fixture() {
     rm -f "$fixture_ready"
 }
 trap cleanup_rtc_fixture EXIT
-for ((attempt=0; attempt<100; attempt++)); do
-    [[ ! -s "$fixture_ready" ]] || break
+while [[ ! -s "$fixture_ready" ]]; do
     kill -0 "$fixture_pid" 2>/dev/null || { cat "$fixture_log" >&2; die "TURN fixture exited before readiness"; }
     sleep 0.1
 done
-[[ -s "$fixture_ready" ]] || die "TURN fixture did not become ready"
 export TYDE_RTC_TEST_URL="$(cat "$fixture_ready")"
 cd "$repo_root/rtc-transport"
 log "running: cargo test --target wasm32-unknown-unknown $* (rtc-transport)"
@@ -728,6 +709,6 @@ cargo test --target wasm32-unknown-unknown "$@"
 cd "$repo_root"
 npm ci --ignore-scripts --no-audit --no-fund
 npm exec -- playwright install webkit
-# Keep cold fixture compilation outside the server-readiness deadline.
+# Build once before the server starts; cold compilation has no deadline.
 (cd "$repo_root/mobile-frontend" && NO_COLOR=true trunk build --features ui-fixtures)
 npm exec -- playwright test --config playwright.mobile.config.mjs --project composer-webkit

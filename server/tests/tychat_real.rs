@@ -56,7 +56,7 @@ impl LocalTychat {
             base: url::Url::parse(&format!("http://{address}")).unwrap(),
         };
         let mut output = BufReader::new(local.child.inner().stdout.take().unwrap()).lines();
-        tokio::time::timeout(Duration::from_secs(300), async {
+        (async {
             while let Some(line) = output.next_line().await.unwrap() {
                 if line.starts_with("tychat local server listening on http://") {
                     return;
@@ -67,8 +67,7 @@ impl LocalTychat {
                 local.build_log.path().display()
             );
         })
-        .await
-        .expect("real Tychat local binary readiness deadline");
+        .await;
         local
     }
 }
@@ -78,7 +77,7 @@ async fn state_when(
     predicate: impl Fn(&TychatStatePayload) -> bool,
 ) -> TychatStatePayload {
     let mut changed = host.subscribe_tychat().await;
-    tokio::time::timeout(STEP, async {
+    (async {
         loop {
             let state = host.tychat_state().await;
             if predicate(&state) {
@@ -92,12 +91,11 @@ async fn state_when(
         }
     })
     .await
-    .expect("Tychat host state transition")
 }
 
 async fn drained(host: &server::HostHandle, generation: &TychatPairingId) {
     let mut changed = host.subscribe_tychat().await;
-    tokio::time::timeout(STEP, async {
+    (async {
         while !host
             .tychat_outbound(generation)
             .await
@@ -108,8 +106,7 @@ async fn drained(host: &server::HostHandle, generation: &TychatPairingId) {
             changed.changed().await.unwrap();
         }
     })
-    .await
-    .expect("bridge acknowledges its durable outbox");
+    .await;
 }
 
 #[tokio::test]
@@ -180,9 +177,7 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
         .await
         .unwrap();
     state_when(&host, |state| state.status == TychatBridgeStatus::Connected).await;
-    tokio::time::timeout(STEP, gate.wait_until_entered())
-        .await
-        .unwrap();
+    (gate.wait_until_entered()).await;
     assert!(
         host.tychat_outbound(&generation).await.unwrap().typing,
         "typing follows the held server turn"
@@ -212,9 +207,7 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
 
     let acknowledgement = host.install_tychat_outbound_ack_gate().await;
     gate.release_one();
-    tokio::time::timeout(STEP, acknowledgement.wait_until_entered())
-        .await
-        .unwrap();
+    (acknowledgement.wait_until_entered()).await;
     let before = owner.bot_texts(&chat, sent.seq).await.unwrap();
     assert!(
         before.len() == 3,

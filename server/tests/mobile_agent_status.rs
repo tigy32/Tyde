@@ -582,9 +582,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         "agent-control must report Thinking during independent work with an unanswered async card"
     );
     question_follow_up.release_one();
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), awaiting)
-        .await
-        .expect("await completes after terminal idle");
+    let ready = (awaiting).await;
     assert_eq!(ready["ready"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         ready["ready"][0]["status"], "awaiting_user",

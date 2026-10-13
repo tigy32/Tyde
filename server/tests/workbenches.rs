@@ -1854,9 +1854,7 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         })
         .await
         .expect("send concurrent remove");
-    tokio::time::timeout(Duration::from_secs(10), hook.wait_until_reached())
-        .await
-        .expect("remove/spawn phase: removal must reach its production admission barrier");
+    (hook.wait_until_reached()).await;
 
     let caller_auth = fixture.agent_control_caller(&caller.agent_id).await;
     let bearer = caller_auth

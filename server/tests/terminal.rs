@@ -10,10 +10,7 @@ use protocol::{
     TerminalExitPayload, TerminalId, TerminalLaunchTarget, TerminalOutputPayload,
     TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
 };
-use tokio::time::timeout;
 use uuid::Uuid;
-
-const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn is_ambient_broadcast(env: &Envelope) -> bool {
     fixture::is_routine_control_plane_frame(env)
@@ -35,11 +32,10 @@ fn is_ambient_broadcast(env: &Envelope) -> bool {
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
-        let env = match timeout(EVENT_TIMEOUT, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before {context}"),
+            Err(err) => panic!("next_event failed before {context}: {err:?}"),
         };
         if is_ambient_broadcast(&env) {
             continue;

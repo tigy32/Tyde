@@ -536,10 +536,7 @@ impl Fixture {
         let client = client::connect(&client::ClientConfig::current(), client_stream)
             .await
             .expect("paused client handshake");
-        tokio::time::timeout(EVENT_TIMEOUT, blocked)
-            .await
-            .expect("server must reach paused output")
-            .expect("paused writer must remain alive");
+        blocked.await.expect("paused writer must remain alive");
         (client, release)
     }
 
@@ -831,8 +828,6 @@ impl Fixture {
     }
 }
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub struct TestAgent {
     pub stream: StreamPath,
     #[allow(dead_code)]
@@ -901,27 +896,13 @@ impl Turn {
 pub async fn next_frame_matching_on(
     client: &mut client::Connection,
     context: &str,
-    matches: impl FnMut(&Envelope) -> bool,
-) -> Envelope {
-    next_frame_matching_on_with_timeout(client, context, EVENT_TIMEOUT, matches).await
-}
-
-// Each integration binary compiles the fixture, but only timed recovery flows use this.
-#[allow(dead_code)]
-pub async fn next_frame_matching_on_with_timeout(
-    client: &mut client::Connection,
-    context: &str,
-    timeout: Duration,
     mut matches: impl FnMut(&Envelope) -> bool,
 ) -> Envelope {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut skipped: Vec<String> = Vec::new();
     loop {
-        let env = match tokio::time::timeout_at(deadline, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed waiting for {context}"),
-            Ok(Err(err)) => panic!("next_event failed waiting for {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}; skipped frames: {skipped:#?}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed waiting for {context}"),
+            Err(err) => panic!("next_event failed waiting for {context}: {err:?}"),
         };
         if matches(&env) {
             return env;
@@ -941,7 +922,6 @@ pub async fn next_frame_matching_on_with_timeout(
                 env.seq
             );
         }
-        skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
 }
 
@@ -974,15 +954,13 @@ async fn next_frame_matching_strict_inner(
     mut matches: impl FnMut(&Envelope) -> bool,
     raw: bool,
 ) -> Envelope {
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     let mut skipped: Vec<String> = Vec::new();
     loop {
         let env = if raw {
-            let env = match tokio::time::timeout_at(deadline, client.reader.read_envelope()).await {
-                Ok(Ok(Some(env))) => env,
-                Ok(Ok(None)) => panic!("connection closed waiting for {context}"),
-                Ok(Err(err)) => panic!("read_envelope failed waiting for {context}: {err:?}"),
-                Err(_) => panic!("timed out waiting for {context}; skipped frames: {skipped:#?}"),
+            let env = match client.reader.read_envelope().await {
+                Ok(Some(env)) => env,
+                Ok(None) => panic!("connection closed waiting for {context}"),
+                Err(err) => panic!("read_envelope failed waiting for {context}: {err:?}"),
             };
             client
                 .incoming_seq
@@ -990,11 +968,10 @@ async fn next_frame_matching_strict_inner(
                 .expect("incoming sequence must be valid");
             env
         } else {
-            match tokio::time::timeout_at(deadline, client.next_event()).await {
-                Ok(Ok(Some(env))) => env,
-                Ok(Ok(None)) => panic!("connection closed waiting for {context}"),
-                Ok(Err(err)) => panic!("next_event failed waiting for {context}: {err:?}"),
-                Err(_) => panic!("timed out waiting for {context}; skipped frames: {skipped:#?}"),
+            match client.next_event().await {
+                Ok(Some(env)) => env,
+                Ok(None) => panic!("connection closed waiting for {context}"),
+                Err(err) => panic!("next_event failed waiting for {context}: {err:?}"),
             }
         };
         if matches(&env) {
@@ -1219,13 +1196,11 @@ pub async fn next_frame_unpacking_agent_bootstrap_on(
     client: &mut client::Connection,
     context: &str,
 ) -> Envelope {
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     loop {
-        let env = match tokio::time::timeout_at(deadline, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed waiting for {context}"),
-            Ok(Err(err)) => panic!("next_event failed waiting for {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed waiting for {context}"),
+            Err(err) => panic!("next_event failed waiting for {context}: {err:?}"),
         };
         if env.kind != FrameKind::AgentBootstrap {
             return env;
@@ -1253,14 +1228,11 @@ pub async fn next_logical_frame_matching_on(
     if let Some(env) = pop_pending_frame_matching_on(client, &mut matches) {
         return env;
     }
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
-    let mut skipped = Vec::new();
     loop {
-        let env = match tokio::time::timeout_at(deadline, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed waiting for {context}"),
-            Ok(Err(err)) => panic!("next_event failed waiting for {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}; skipped frames: {skipped:#?}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed waiting for {context}"),
+            Err(err) => panic!("next_event failed waiting for {context}: {err:?}"),
         };
         if env.kind == FrameKind::AgentBootstrap {
             push_pending_frames_on(client, agent_bootstrap_frames(&env));
@@ -1281,7 +1253,6 @@ pub async fn next_logical_frame_matching_on(
                 env.seq
             );
         }
-        skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
 }
 
@@ -1732,27 +1703,19 @@ async fn connect_client_with_bootstrap(
     (client, bootstrap)
 }
 
-// Store actors run on real threads; paused Tokio time must not expire their I/O.
+// Keep paused Tokio clocks from advancing while the real store threads do I/O.
 async fn read_initial_host_bootstrap(client: &mut client::Connection) -> HostBootstrapPayload {
-    let env = {
-        let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
-        let next_event = client.next_event();
-        tokio::pin!(next_event);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut next_event => match result {
-                    Ok(Some(env)) => break env,
-                    Ok(None) => panic!("connection closed before initial host bootstrap"),
-                    Err(err) => panic!("initial host bootstrap read failed: {err:?}"),
-                },
-                _ = tokio::task::yield_now() => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "timed out waiting for initial host bootstrap"
-                    );
-                }
-            }
+    let next_event = client.next_event();
+    tokio::pin!(next_event);
+    let env = loop {
+        tokio::select! {
+            biased;
+            result = &mut next_event => match result {
+                Ok(Some(env)) => break env,
+                Ok(None) => panic!("connection closed before initial host bootstrap"),
+                Err(err) => panic!("initial host bootstrap read failed: {err:?}"),
+            },
+            _ = tokio::task::yield_now() => {},
         }
     };
     assert_eq!(

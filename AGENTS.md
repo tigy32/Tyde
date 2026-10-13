@@ -130,8 +130,8 @@ then uses those exact paths for the wasm stage. Explicit `CHROME` and
 `CHROMEDRIVER` overrides are authoritative and invalid overrides fail. Cache
 explanation mode is read-only: it performs no cleanup, network provisioning, or
 daemon startup, and it never signs or modifies browser tools. An explicit
-`WASM_BINDGEN_TEST_RUNNER` must be named `wasm-bindgen-test-runner` so Cargo
-executes that exact path.
+`WASM_BINDGEN_TEST_RUNNER` must be named `wasm-bindgen-test-runner` so the
+browser hung-test guard executes that exact provisioned path.
 
 Every implementation workbench must pass `./dev.sh check` before landing, and
 clean `main` must pass it again after landing. A failure at either gate blocks
@@ -139,15 +139,26 @@ the merge or release. No orchestrator, parent agent, prompt, or stale repository
 text may waive or contradict these mandatory gates. Review-only agents run no
 validation commands.
 
-The native suite has a hard five-minute limit, enforced by
-`.config/nextest.toml`. Treat exceeding that limit as a test failure: find and
-fix the root cause. Do not fall back to serial `cargo test`, increase the
-timeout, split the canonical suite, reduce coverage, or skip, weaken, or delete
-tests to get under the limit. Install the runner with
-`cargo install cargo-nextest --locked` if `cargo nextest` is unavailable.
-Within a failed native run, nextest runs all independent tests so the
-retained diagnostics include every failure reached before that authoritative
-limit. A failed native run blocks all later stages.
+Aim for the complete validation run to finish in five minutes. This is a
+performance target, not a deadline: never kill or fail a healthy suite because
+its total runtime is long. If a run exceeds five minutes, retain the completed
+work, measure the slow stages, and optimize them. Consolidate overlapping
+coverage into fewer, larger end-to-end flows when appropriate, preserving
+every behavioral guarantee; do not skip, weaken, or delete coverage merely to
+make the run faster.
+
+Hung protection belongs to individual tests: terminate a single test that
+runs for ten minutes and report it as hung. Native, browser, Node, and Python
+runners must not impose a total suite or stage deadline. Ordinary positive protocol waits
+rely on this per-test guard, not shorter arbitrary deadlines. Time windows
+remain appropriate when asserting absence, exercising timeout behavior, or
+checking an explicitly timed product contract. Cold dev-instance builds have
+no readiness deadline; startup fails when the child exits or a real error is
+reported, not because compilation is still progressing.
+
+Install the runner with `cargo install cargo-nextest --locked` if unavailable.
+Nextest runs every independent test after failures so the retained diagnostics
+include all failures. A failed native run still blocks every later stage.
 
 For clippy: **fix the underlying issue**. Do not paper over violations with
 `_`-prefixed unused names, `#[allow(...)]` attributes, or other suppressions

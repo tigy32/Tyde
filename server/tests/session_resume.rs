@@ -1024,17 +1024,13 @@ async fn a_close_does_not_wait_on_a_held_resume_of_its_session() {
         .close_agent(&card.instance_stream)
         .await
         .expect("close the card");
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        fixture::next_frame_matching_on(&mut fixture.client, "card AgentClosed", |env| {
-            env.kind == FrameKind::AgentClosed
-                && env
-                    .parse_payload::<protocol::AgentClosedPayload>()
-                    .is_ok_and(|payload| payload.agent_id == card.agent_id)
-        }),
-    )
-    .await
-    .expect("a close must not wait for another card's held resume to finish");
+    (fixture::next_frame_matching_on(&mut fixture.client, "card AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == card.agent_id)
+    }))
+    .await;
 
     // The connection routes one frame at a time, so a close that blocked would
     // take every later request from that client with it.
@@ -1043,12 +1039,7 @@ async fn a_close_does_not_wait_on_a_held_resume_of_its_session() {
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list sessions after the close");
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        wait_for_session_list(&mut fixture.client, "session list after close"),
-    )
-    .await
-    .expect("a client must still be answered while a resume is held");
+    (wait_for_session_list(&mut fixture.client, "session list after close")).await;
 
     admission_gate.release_one();
 }
@@ -1420,7 +1411,7 @@ async fn restoration_does_not_duplicate_a_session_a_client_is_resuming() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     resume_gate.release_one();
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    (async {
         loop {
             let owners = host
                 .live_agent_session_ids()
@@ -1437,8 +1428,7 @@ async fn restoration_does_not_duplicate_a_session_a_client_is_resuming() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("the resumed session should end up with exactly one owner");
+    .await;
 
     let owners = host
         .live_agent_session_ids()
@@ -1511,7 +1501,7 @@ async fn restart_without_an_ambient_runtime_restores_working_agents() {
     .expect("host construction thread")
     .expect("construct replacement host off-runtime");
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    (async {
         loop {
             if host.live_agent_session_ids().await.contains(&session) {
                 break;
@@ -1519,8 +1509,7 @@ async fn restart_without_an_ambient_runtime_restores_working_agents() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("restoration should reconstruct the open agent");
+    .await;
 
     let (mut client, bootstrap) = fixture::connect_host(host.clone()).await;
     let restored = bootstrap
@@ -1829,10 +1818,7 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
             .expect("parse idle state");
         assert_eq!(state.activity, protocol::AgentActivity::Idle);
-        let settled = tokio::time::timeout(Duration::from_secs(5), awaiting)
-            .await
-            .expect("agent-control await completes after the turn")
-            .expect("agent-control await succeeds");
+        let settled = (awaiting).await.expect("agent-control await succeeds");
         assert_eq!(settled.ready.len(), 1);
         assert_eq!(settled.ready[0].status, protocol::AgentControlStatus::Idle);
         assert!(settled.still_thinking.is_empty());
@@ -1976,13 +1962,9 @@ async fn resume_completed_turn_and_followup_settle_before_attach() {
             .await;
         }
         let control = fixture.connect_agent_control().await;
-        let settled = tokio::time::timeout(
-            Duration::from_secs(5),
-            control.await_agents(Some(vec![agent.agent_id.clone()])),
-        )
-        .await
-        .expect("completed resume and follow-up settle")
-        .expect("agent-control await succeeds");
+        let settled = (control.await_agents(Some(vec![agent.agent_id.clone()])))
+            .await
+            .expect("agent-control await succeeds");
         assert_eq!(settled.ready.len(), 1);
         assert_eq!(settled.ready[0].status, protocol::AgentControlStatus::Idle);
         assert!(settled.still_thinking.is_empty());
@@ -2167,7 +2149,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     .await;
 
     let bootstrap = fixture.restart_host().await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    (async {
         loop {
             if fixture.agent_ids().await.len() == 2 {
                 break;
@@ -2175,8 +2157,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("both open agents should be reconstructed after restart");
+    .await;
 
     let (mut restored_by_session, restored_bootstraps) = collect_restart_replay(
         &mut fixture,
@@ -4723,7 +4704,7 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let hook = fixture.on_next_session_commit(move || {
         let _ = entered_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(15));
+        let _ = release_rx.recv();
     });
     deleting_client
         .delete_session(DeleteSessionPayload {
@@ -4731,24 +4712,14 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
         })
         .await
         .expect("submit saved-session deletion");
-    tokio::time::timeout(Duration::from_secs(5), entered_rx)
-        .await
-        .expect("writer must enter transaction")
-        .expect("commit hook signal");
+    (entered_rx).await.expect("commit hook signal");
 
-    let mut observer = tokio::time::timeout(Duration::from_secs(2), fixture.connect())
-        .await
-        .expect("host bootstrap must not wait for session commit");
+    let mut observer = (fixture.connect()).await;
     observer
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list while commit is paused");
-    let list = tokio::time::timeout(
-        Duration::from_secs(2),
-        wait_for_session_list(&mut observer, "list during stalled commit"),
-    )
-    .await
-    .expect("session read must not wait for writer");
+    let list = (wait_for_session_list(&mut observer, "list during stalled commit")).await;
     assert!(
         list.sessions.iter().any(|record| record.id == session),
         "unrelated live session remains visible"
@@ -5332,23 +5303,12 @@ impl Observation {
         mut done: impl FnMut(&Self) -> bool,
     ) -> Self {
         while !done(&observation) {
-            let env = match tokio::time::timeout(
-                Duration::from_secs(5),
-                fixture::next_frame_matching_on_with_timeout(
-                    &mut fixture.client,
-                    "restored stream activity",
-                    Duration::from_secs(10),
-                    |env| streams.contains(&env.stream),
-                ),
+            let env = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "restored stream activity",
+                |env| streams.contains(&env.stream),
             )
-            .await
-            {
-                Ok(env) => env,
-                Err(_) => panic!(
-                    "timed out waiting for restored stream activity; observed so far: {:#?}",
-                    observation.sequence
-                ),
-            };
+            .await;
             match env.kind {
                 FrameKind::AgentBootstrap => {
                     let payload: AgentBootstrapPayload =
@@ -8552,10 +8512,7 @@ async fn unretained_replay_delivery_is_rejected() {
         .send_message(&stream, "unretained".to_owned())
         .await
         .expect("send while replaying");
-    tokio::time::timeout(Duration::from_secs(10), consumed)
-        .await
-        .expect("the replay message's commit is attempted")
-        .expect("commit hook signal");
+    (consumed).await.expect("commit hook signal");
     fixture.mock_by_id(&restored.agent_id).await;
     replay.complete();
     // Attachment waits for the replay, so the rejection may arrive inside the

@@ -143,13 +143,11 @@ async fn send_code_intel_subscribe(
 }
 
 async fn next_raw_event(client: &mut client::Connection, context: &str) -> Envelope {
-    let env =
-        match tokio::time::timeout(Duration::from_secs(5), client.reader.read_envelope()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("read_envelope failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
+    let env = match client.reader.read_envelope().await {
+        Ok(Some(env)) => env,
+        Ok(None) => panic!("connection closed before {context}"),
+        Err(err) => panic!("read_envelope failed before {context}: {err:?}"),
+    };
     client
         .incoming_seq
         .validate(&env.stream, env.seq, env.kind)
@@ -198,12 +196,7 @@ async fn wait_for_code_intel_unavailable(
 ) -> (CodeIntelStatusPayload, CodeIntelErrorPayload) {
     let mut unavailable = None;
     let mut error = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while unavailable.is_none() || error.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for code-intel unavailable/error frames"
-        );
         let env = next_raw_event(client, "code-intel error").await;
         if fixture::is_routine_control_plane_frame(&env) {
             continue;
@@ -253,12 +246,7 @@ async fn wait_for_code_intel_unavailable_with_overview(
     let mut unavailable = None;
     let mut error = None;
     let mut overview = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while unavailable.is_none() || error.is_none() || overview.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for code-intel unavailable/error/overview frames"
-        );
         let env = next_raw_event(client, "code-intel unavailable overview").await;
         if fixture::is_routine_control_plane_frame(&env) {
             continue;
@@ -337,12 +325,7 @@ async fn wait_for_code_intel_warm_unavailable_overview(
     root: &ProjectRootPath,
     provider: &CodeIntelProviderId,
 ) -> CodeIntelOverviewPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for code-intel warm unavailable overview"
-        );
         let env = next_raw_event(client, "code-intel warm overview").await;
         if fixture::is_routine_control_plane_frame(&env) {
             continue;

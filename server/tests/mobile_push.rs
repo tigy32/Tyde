@@ -37,7 +37,6 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 const DEVICE_ID: &str = "test-device";
-const PUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Everything the device half of a Web Push subscription holds.
 struct DeviceKeys {
@@ -338,9 +337,8 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
         .await
         .expect("send follow-up");
 
-    let captured = tokio::time::timeout(PUSH_WAIT, pushes.recv())
+    let captured = (pushes.recv())
         .await
-        .expect("timed out waiting for a push delivery")
         .expect("push endpoint closed without delivering");
 
     assert_eq!(
@@ -389,10 +387,7 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
         .send_message(&agent.stream, "Finish the native goal".to_owned())
         .await
         .expect("send goal turn");
-    let captured = tokio::time::timeout(PUSH_WAIT, pushes.recv())
-        .await
-        .expect("native goal completion push")
-        .expect("push endpoint remains open");
+    let captured = (pushes.recv()).await.expect("push endpoint remains open");
     let notification: MobilePushNotification =
         serde_json::from_slice(&keys.decrypt(&captured.body)).expect("native goal push payload");
     assert_eq!(
@@ -447,9 +442,8 @@ async fn a_gone_subscription_is_recorded_as_expired() {
         )
         .await;
 
-    tokio::time::timeout(PUSH_WAIT, pushes.recv())
+    (pushes.recv())
         .await
-        .expect("timed out waiting for a push delivery")
         .expect("push endpoint closed without delivering");
 
     // The rejection must reach the device list rather than being swallowed: a
@@ -553,7 +547,7 @@ async fn swarm_push_frame(
     phase: &str,
     predicate: impl Fn(&protocol::Envelope) -> bool,
 ) -> protocol::Envelope {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    (async {
         loop {
             let event = match fixture.client.next_event().await {
                 Ok(Some(event)) => event,
@@ -587,9 +581,7 @@ async fn swarm_push_frame(
                 return event;
             }
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("swarm push lifecycle timed out during {phase}"))
+    }).await
 }
 
 /// Orchestrated agents must not notify: a workflow or team fanning out to a
@@ -623,10 +615,7 @@ async fn only_agents_the_user_started_notify() {
         )
         .await;
     let parent_id = parent.new_agent.agent_id.clone();
-    let first = tokio::time::timeout(PUSH_WAIT, pushes.recv())
-        .await
-        .expect("timed out waiting for the orchestrator's own push")
-        .expect("push endpoint closed");
+    let first = (pushes.recv()).await.expect("push endpoint closed");
     let first: MobilePushNotification =
         serde_json::from_slice(&keys.decrypt(&first.body)).expect("notification");
     assert_eq!(first.agent_name, "orchestrator");
@@ -822,12 +811,7 @@ async fn only_agents_the_user_started_notify() {
         .swarm_membership
         .as_ref()
         .expect("canonical active swarm membership");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        swarm_turn_gate.wait_until_entered(),
-    )
-    .await
-    .expect("actual mock-native swarm turn must reach its completion boundary");
+    (swarm_turn_gate.wait_until_entered()).await;
     let swarm_control = fixture.mock_by_id(&member.agent_id).await;
     swarm_turn_gate.release_one();
     let idle_event = swarm_push_frame(&mut fixture, "canonical member idle completion", |event| {
@@ -886,9 +870,8 @@ async fn only_agents_the_user_started_notify() {
         )
         .await;
 
-    let captured = tokio::time::timeout(PUSH_WAIT, pushes.recv())
+    let captured = (pushes.recv())
         .await
-        .expect("timed out waiting for the user-started agent's push")
         .expect("push endpoint closed without delivering");
     let notification: MobilePushNotification =
         serde_json::from_slice(&keys.decrypt(&captured.body)).expect("notification");

@@ -718,6 +718,11 @@ It does not ask the shell to expose MCP directly.
 
 ## Launcher Command
 
+Cold compilation and readiness have no elapsed-time cutoff. The driver waits
+for the actual readiness signals or a child process failure, not a startup
+budget. Test runners separately terminate an individual hung test after ten
+minutes; five minutes is the suite performance target, never a kill deadline.
+
 The old version hardcoded `npx tauri dev`. We should not repeat that as
 scattered string concatenation.
 
@@ -726,8 +731,8 @@ The repository-supported launcher is the installed `cargo-tauri` executable
 exact path before spawning and fails with an actionable prerequisite error when
 it is absent. It never falls back to `npx`, `npm`, or any command that may
 install packages or access the network. Child stdout and stderr are continuously
-drained into one bounded 32 KiB in-memory tail; an early exit or readiness
-timeout returns that tail so the originating compiler, frontend, or Tauri error
+drained into one bounded 32 KiB in-memory tail; an early exit returns that
+tail so the originating compiler, frontend, or Tauri error
 is visible to the caller without risking pipe backpressure or unbounded logs.
 
 The new driver should have one repo-specific launcher module that owns the exact

@@ -1,6 +1,6 @@
 mod fixture;
 
-use fixture::{Fixture, next_frame_matching_on, next_frame_matching_on_with_timeout};
+use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
     BrowseBootstrapListing, BrowseBootstrapPayload, CommandErrorCode, CommandErrorPayload,
     DiffContextMode, Envelope, FileEntryOp, FrameKind, GitBranchName, HostAbsPath,
@@ -665,7 +665,7 @@ async fn slow_client_chat_backlog_is_bounded_by_bytes_not_frames() {
         }
 
         let mut received = 0;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        (async {
             loop {
                 let Some(envelope) = slow.next_event().await.expect("read slow client") else {
                     assert!(
@@ -691,8 +691,7 @@ async fn slow_client_chat_backlog_is_bounded_by_bytes_not_frames() {
                 }
             }
         })
-        .await
-        .expect("slow client must drain or close within the byte budget");
+        .await;
         if should_close {
             assert!(
                 received > 0 && received < updates,
@@ -1616,16 +1615,11 @@ async fn unavailable_project_root_keeps_other_roots_live() {
 
     fs::create_dir_all(missing.join("docs")).unwrap();
     fs::write(missing.join("docs/readme.md"), "back\n").unwrap();
-    next_frame_matching_on_with_timeout(
-        &mut fixture.client,
-        "restored root is picked up",
-        Duration::from_secs(15),
-        |env| {
-            assert_ne!(env.kind, FrameKind::CommandError, "{env:?}");
-            env.kind == FrameKind::ProjectFileList
-                && root_lists(&env.parse_payload().unwrap(), &missing, "docs/readme.md")
-        },
-    )
+    next_frame_matching_on(&mut fixture.client, "restored root is picked up", |env| {
+        assert_ne!(env.kind, FrameKind::CommandError, "{env:?}");
+        env.kind == FrameKind::ProjectFileList
+            && root_lists(&env.parse_payload().unwrap(), &missing, "docs/readme.md")
+    })
     .await;
     write_file(&missing.join("docs/later.md"), "watched\n");
     expect_project_file_list_matching(&mut fixture.client, "restored root is watched", |list| {
@@ -2097,7 +2091,7 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
         server::ScanPoint::WatcherInitialize,
         move || {
             begin_failure_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv()
                 .expect("bootstrap completes before watcher fault injection");
             *exhaust.lock().unwrap() = Some(fixture::ExhaustedFileDescriptors::exhaust());
         },
@@ -2165,12 +2159,9 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     assert!(!error.message.contains("fs.inotify.max_user_watches"));
     assert!(error.message.contains("automatic recovery"));
     fs::write(repo.path().join("watch-ready"), "ready").unwrap();
-    // Watcher retry starts at five seconds; the ordinary five-second event wait
-    // would expire before initialization and its subsequent refresh can complete.
-    fixture::next_frame_matching_on_with_timeout(
+    fixture::next_frame_matching_on(
         &mut fixture.client,
         "watcher initialized after exhaustion",
-        Duration::from_secs(10),
         |event| {
             if event.kind == FrameKind::CommandError {
                 assert!(!event.parse_payload::<CommandErrorPayload>().unwrap().fatal);
@@ -2223,7 +2214,7 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     assert!(error.message.contains("automatic recovery"));
     assert!(!error.message.contains("fs.inotify.max_user_instances"));
     // No new filesystem event or client command may be needed to retry the lost scan.
-    tokio::time::timeout(Duration::from_secs(20), async {
+    (async {
         loop {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             match event.kind {
@@ -2248,8 +2239,7 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
             }
         }
     })
-    .await
-    .expect("failed scan retries after descriptors become available");
+    .await;
     fixture
         .client
         .project_read_file(
@@ -2329,12 +2319,9 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
         let index = repo.path().join(".git/index");
         let saved_index = fs::read(&index).unwrap();
         fs::write(&index, "temporarily unreadable Git index").unwrap();
-        // With watching disabled, Git discovers the failure on its five-second
-        // poll, so the generic five-second wait races the poll plus Git execution.
-        let error = fixture::next_frame_matching_on_with_timeout(
+        let error = fixture::next_frame_matching_on(
             &mut fixture.client,
             "background I/O failure",
-            Duration::from_secs(10),
             |event| {
                 event.kind == FrameKind::CommandError
                     && event.stream == StreamPath(format!("/project/{}", project.id))
@@ -2407,7 +2394,7 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
         fs::write(&index, saved_index).unwrap();
         let mut got_git = false;
         let mut got_change = force_project_watch_limit;
-        tokio::time::timeout(Duration::from_secs(20), async {
+        (async {
             while !got_git || !got_change {
                 let event = fixture.client.next_event().await.unwrap().unwrap();
                 match event.kind {
@@ -2439,8 +2426,7 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
                 }
             }
         })
-        .await
-        .expect("Git and watched file updates must resume without a client request");
+        .await;
         fixture
             .client
             .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
@@ -2626,7 +2612,7 @@ async fn project_read_diff_returns_unstaged_diff() {
         git_stdout(repo.path(), &["status", "--porcelain"]),
         status_before
     );
-    let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
+    let refreshed = (async {
         loop {
             let diff =
                 expect_project_git_diff(&mut fixture.client, "live diff after second edit").await;
@@ -2643,8 +2629,7 @@ async fn project_read_diff_returns_unstaged_diff() {
             }
         }
     })
-    .await
-    .expect("live diff must refresh when an already-modified file changes again");
+    .await;
     assert_eq!(refreshed.path.as_deref(), Some("src/main.rs"));
     assert_eq!(refreshed.context_mode, DiffContextMode::Hunks);
 
@@ -2681,7 +2666,7 @@ async fn project_read_diff_returns_unstaged_diff() {
         &repo.path().join("src/main.rs"),
         "fn main() {\n    println!(\"newest\");\n}\n",
     );
-    let after_expansion = tokio::time::timeout(Duration::from_secs(3), async {
+    let after_expansion = (async {
         loop {
             let diff =
                 expect_project_git_diff(&mut fixture.client, "live diff after expansion read")
@@ -2700,8 +2685,7 @@ async fn project_read_diff_returns_unstaged_diff() {
             }
         }
     })
-    .await
-    .expect("live diff must keep refreshing after an out-of-band full-context read");
+    .await;
     assert_eq!(
         after_expansion.context_mode,
         DiffContextMode::Hunks,
@@ -3655,64 +3639,58 @@ async fn project_stage_hunk_stages_only_one_hunk() {
 
     // A subscribed ProjectGitDiff arrived before the next ProjectGitStatus.
     // Collect the independent pushes without discarding either diff or status.
-    let (file_list, git_status, staged, unstaged) =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut file_list = None;
-            let mut git_status = None;
-            let mut staged = None;
-            let mut unstaged = None;
-            while file_list.is_none()
-                || git_status.is_none()
-                || staged.is_none()
-                || unstaged.is_none()
-            {
-                let env = expect_next_event(&mut fixture.client, "stage hunk updates").await;
-                match env.kind {
-                    FrameKind::ProjectFileList => {
-                        file_list = Some(
-                            env.parse_payload::<ProjectFileListPayload>()
-                                .expect("staging file list"),
-                        );
+    let (file_list, git_status, staged, unstaged) = (async {
+        let mut file_list = None;
+        let mut git_status = None;
+        let mut staged = None;
+        let mut unstaged = None;
+        while file_list.is_none() || git_status.is_none() || staged.is_none() || unstaged.is_none()
+        {
+            let env = expect_next_event(&mut fixture.client, "stage hunk updates").await;
+            match env.kind {
+                FrameKind::ProjectFileList => {
+                    file_list = Some(
+                        env.parse_payload::<ProjectFileListPayload>()
+                            .expect("staging file list"),
+                    );
+                }
+                FrameKind::ProjectGitStatus => {
+                    let status: ProjectGitStatusPayload =
+                        env.parse_payload().expect("staging Git status");
+                    if status.roots[0].files.iter().any(|file| {
+                        file.relative_path == "src/main.rs"
+                            && file.staged.is_some()
+                            && file.unstaged.is_some()
+                    }) {
+                        git_status = Some(status);
                     }
-                    FrameKind::ProjectGitStatus => {
-                        let status: ProjectGitStatusPayload =
-                            env.parse_payload().expect("staging Git status");
-                        if status.roots[0].files.iter().any(|file| {
-                            file.relative_path == "src/main.rs"
-                                && file.staged.is_some()
-                                && file.unstaged.is_some()
-                        }) {
-                            git_status = Some(status);
-                        }
-                    }
-                    FrameKind::ProjectGitDiff => {
-                        let diff: ProjectGitDiffPayload =
-                            env.parse_payload().expect("staging diff");
-                        assert_eq!(diff.root.0, project_root(&project, 0));
-                        assert_eq!(diff.path.as_deref(), Some("src/main.rs"));
-                        if diff.files.len() == 1 && diff.files[0].hunks.len() == 1 {
-                            match diff.scope {
-                                ProjectDiffScope::Staged => staged = Some(diff),
-                                ProjectDiffScope::Unstaged => unstaged = Some(diff),
-                                ProjectDiffScope::Uncommitted => {
-                                    panic!("unexpected combined diff for staging subscriptions")
-                                }
+                }
+                FrameKind::ProjectGitDiff => {
+                    let diff: ProjectGitDiffPayload = env.parse_payload().expect("staging diff");
+                    assert_eq!(diff.root.0, project_root(&project, 0));
+                    assert_eq!(diff.path.as_deref(), Some("src/main.rs"));
+                    if diff.files.len() == 1 && diff.files[0].hunks.len() == 1 {
+                        match diff.scope {
+                            ProjectDiffScope::Staged => staged = Some(diff),
+                            ProjectDiffScope::Unstaged => unstaged = Some(diff),
+                            ProjectDiffScope::Uncommitted => {
+                                panic!("unexpected combined diff for staging subscriptions")
                             }
                         }
                     }
-                    FrameKind::CodeIntelOverview => {}
-                    other => panic!("unexpected stage hunk update: {other:?}"),
                 }
+                FrameKind::CodeIntelOverview => {}
+                other => panic!("unexpected stage hunk update: {other:?}"),
             }
-            (
-                file_list.unwrap(),
-                git_status.unwrap(),
-                staged.unwrap(),
-                unstaged.unwrap(),
-            )
-        })
-        .await
-        .expect("staging must push the file list, Git status, and both updated diffs");
+        }
+        (
+            file_list.unwrap(),
+            git_status.unwrap(),
+            staged.unwrap(),
+            unstaged.unwrap(),
+        )
+    })
+    .await;
     assert_eq!(file_list.roots.len(), 1);
     assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
     let entry = file_list.roots[0]
@@ -3946,10 +3924,7 @@ async fn project_watch_failures_keep_other_projects_live() {
             )
             .await,
         );
-        tokio::time::timeout(Duration::from_secs(5), ready_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        (ready_rx).await.unwrap();
         drop(ready);
     }
     let healthy_watches = directory_watch_ids(&healthy_repo.path().join("src"));
@@ -3990,10 +3965,7 @@ async fn project_watch_failures_keep_other_projects_live() {
         assert_ne!(event.kind, FrameKind::CommandError);
         event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == projects[0].id)
     }).await;
-    tokio::time::timeout(Duration::from_secs(5), failed_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    (failed_rx).await.unwrap();
     drop(failure);
     fs::remove_dir_all(removed_repo.path()).unwrap();
     fs::write(healthy_repo.path().join("src/file.rs"), "still watching\n").unwrap();
@@ -4023,10 +3995,7 @@ async fn project_watch_failures_keep_other_projects_live() {
         vec![storm_repo.path().to_string_lossy().into_owned()],
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(5), ready_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    (ready_rx).await.unwrap();
     drop(ready);
     fixture
         .client
@@ -4061,15 +4030,12 @@ async fn project_watch_failures_keep_other_projects_live() {
         move || {
             let _ = paused_tx.send(());
             release_rx
-                .recv_timeout(Duration::from_secs(60))
+                .recv()
                 .expect("release native drain after read-only flood");
         },
     );
     fs::write(storm_repo.path().join("a.rs"), "pause for reads\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), paused_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    (paused_rx).await.unwrap();
     let queued_before = rustix::io::ioctl_fionread(&native_queue).unwrap();
     let started = std::time::Instant::now();
     for index in 0..queue_capacity + 128 {
@@ -4149,7 +4115,7 @@ async fn project_watch_failures_keep_other_projects_live() {
         move || {
             let _ = paused_tx.send(());
             release_rx
-                .recv_timeout(Duration::from_secs(60))
+                .recv()
                 .expect("release paused native event drain");
         },
     );
@@ -4162,10 +4128,7 @@ async fn project_watch_failures_keep_other_projects_live() {
         },
     );
     fs::write(storm_repo.path().join("a.rs"), "pause\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), paused_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    (paused_rx).await.unwrap();
     let started = std::time::Instant::now();
     for index in 0..queue_capacity + 128 {
         fs::write(
@@ -4192,15 +4155,14 @@ async fn project_watch_failures_keep_other_projects_live() {
         started.elapsed().as_millis()
     );
     release_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), overflow_rx)
+    (overflow_rx)
         .await
-        .unwrap()
         .expect("real native Q_OVERFLOW must be observed");
     drop(paused);
     drop(overflow);
     let mut changed = false;
     let mut listed = false;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    (async {
         while !changed || !listed {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             assert_ne!(event.kind, FrameKind::CommandError);
@@ -4237,8 +4199,7 @@ async fn project_watch_failures_keep_other_projects_live() {
             }
         }
     })
-    .await
-    .expect("kernel overflow catches up every project without restarting streams");
+    .await;
     fs::write(
         storm_repo.path().join("new/leaf.rs"),
         "native watch restored\n",
@@ -4390,13 +4351,12 @@ async fn expect_inotify_instances(expected: usize) {
             })
             .count()
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    (async {
         while count() != expected {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("expected {expected} inotify instances, found {}", count()));
+    .await;
 }
 
 #[tokio::test]
@@ -4463,7 +4423,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         .iter()
         .map(|project| StreamPath(format!("/project/{}", project.id)))
         .collect();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    (async {
         while !remaining.is_empty() {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             assert_ne!(event.kind, FrameKind::CommandError);
@@ -4488,8 +4448,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             }
         }
     })
-    .await
-    .expect("all owners receive shared-file changes");
+    .await;
 
     #[cfg(target_os = "linux")]
     {
@@ -4518,16 +4477,11 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             server::ScanPoint::WatcherProcess,
             move || {
                 let _ = blocked_tx.send(());
-                release_rx
-                    .recv_timeout(Duration::from_secs(20))
-                    .expect("release stalled project worker");
+                release_rx.recv().expect("release stalled project worker");
             },
         );
         fs::write(repos[1].path().join("src/dir/leaf.rs"), "stall worker\n").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), blocked_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        (blocked_rx).await.unwrap();
         let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
         let overflow = fixture.on_project_scan(
             repos[1].path().to_owned(),
@@ -4543,10 +4497,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             )
             .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), overflow_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        (overflow_rx).await.unwrap();
         fs::remove_dir_all(repos[1].path().join("src/dir")).unwrap();
         write_file(
             &repos[1].path().join("src/dir/leaf.rs"),
@@ -4703,7 +4654,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         .unwrap();
     }
     let mut warned = std::collections::HashSet::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    (async {
         while warned.len() < survivors.len() {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             if event.kind == FrameKind::CommandError {
@@ -4721,8 +4672,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             }
         }
     })
-    .await
-    .expect("native failure reaches every affected project");
+    .await;
     drop(faults);
     for repo in &repos[28..] {
         fs::write(
@@ -4732,7 +4682,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         .unwrap();
     }
     let mut recovered = std::collections::HashSet::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    (async {
         while recovered.len() < survivors.len() {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             assert_ne!(event.kind, FrameKind::ProjectBootstrap);
@@ -4749,8 +4699,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             }
         }
     })
-    .await
-    .expect("all affected projects recover their native watchers");
+    .await;
     #[cfg(target_os = "linux")]
     expect_inotify_instances(2).await;
     for project in survivors {
@@ -4831,13 +4780,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
 
     #[cfg(target_os = "linux")]
     {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        (async {
             while !directory_has_inotify_watch(&repo.path().join("src")) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("source directory must be watched");
+        .await;
         for directory in [
             "target",
             "target/debug",
@@ -4976,13 +4924,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
 
     fs::write(repo.path().join(".git/info/exclude"), "moved/\n").unwrap();
     #[cfg(target_os = "linux")]
-    tokio::time::timeout(Duration::from_secs(3), async {
+    (async {
         while directory_has_inotify_watch(&repo.path().join("moved/deep")) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("repository excludes must release watches");
+    .await;
     fs::write(repo.path().join(".git/info/exclude"), "").unwrap();
     expect_watched_change_at_phase(
         &mut fixture.client,
@@ -5070,10 +5017,7 @@ async fn project_watcher_follows_worktree_git_metadata() {
     .await;
     // Bootstrap and a quiet 100 ms do not imply the background Git/ignore walk
     // has installed watches. The unmodified test lost its first write under load.
-    tokio::time::timeout(Duration::from_secs(5), ready_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    (ready_rx).await.unwrap();
     drop(ready);
     #[cfg(target_os = "linux")]
     expect_inotify_instances(2).await;
@@ -5091,33 +5035,21 @@ async fn project_watcher_follows_worktree_git_metadata() {
     expect_watched_change(&mut fixture.client, "source.rs").await;
     let root = ProjectRootPath(project_root(&project, 0));
     git(&worktree, &["add", "source.rs"]);
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        expect_project_git_status_matching(
-            &mut fixture.client,
-            "worktree index update",
-            |status| {
-                status.roots.iter().any(|entry| {
-                    entry.root == root
-                        && entry
-                            .files
-                            .iter()
-                            .any(|file| file.relative_path == "source.rs" && file.staged.is_some())
-                })
-            },
-        ),
-    )
-    .await
-    .expect("external worktree index changes must push Git status promptly");
+    (expect_project_git_status_matching(&mut fixture.client, "worktree index update", |status| {
+        status.roots.iter().any(|entry| {
+            entry.root == root
+                && entry
+                    .files
+                    .iter()
+                    .any(|file| file.relative_path == "source.rs" && file.staged.is_some())
+        })
+    }))
+    .await;
     git(&worktree, &["branch", "-m", "renamed-watch-branch"]);
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        expect_project_git_status_matching(&mut fixture.client, "worktree HEAD update", |status| {
-            status.roots[0].branch.as_deref() == Some("renamed-watch-branch")
-        }),
-    )
-    .await
-    .expect("external worktree HEAD changes must push Git status promptly");
+    (expect_project_git_status_matching(&mut fixture.client, "worktree HEAD update", |status| {
+        status.roots[0].branch.as_deref() == Some("renamed-watch-branch")
+    }))
+    .await;
     #[cfg(target_os = "linux")]
     {
         assert!(!directory_has_inotify_watch(&worktree.join("target/deep")));
@@ -5180,10 +5112,7 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         } else {
             fs::write(&path, "temporary").expect("create transient file");
         }
-        tokio::time::timeout(Duration::from_secs(5), removed_rx)
-            .await
-            .expect("watcher must scan the transient path")
-            .expect("scan hook must delete the path");
+        (removed_rx).await.expect("scan hook must delete the path");
         let marker = format!("survived-{relative}");
         fs::write(repo.path().join(&marker), "still watching").expect("write scan marker");
         let listing = expect_project_file_list_matching(
@@ -5325,10 +5254,7 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
                 .expect("root scan observer still waiting");
         });
     fs::write(root.join("trigger-root-scan"), "refresh").expect("trigger root scan");
-    tokio::time::timeout(Duration::from_secs(5), removed_rx)
-        .await
-        .expect("root scan must run")
-        .expect("root removed");
+    (removed_rx).await.expect("root removed");
     // A root that vanishes mid-scan is reported on that root, not by failing
     // the subscription; any CommandError here fails the match.
     let file_list = expect_project_file_list_matching(

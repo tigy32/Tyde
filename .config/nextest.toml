@@ -5,7 +5,7 @@
 # is the main reason the integration suite is much faster under nextest.
 #
 # The canonical wrapper invokes nextest. Do not run this stage directly; use
-# `./dev.sh check` so repetition, time limits, compact logs, and cleanup apply.
+# `./dev.sh check` so repetition, hung-test protection, compact logs, and cleanup apply.
 
 nextest-version = "0.9.113"
 experimental = ["wrapper-scripts"]
@@ -16,6 +16,15 @@ command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspa
 # macOS test binaries are cloned outside the enormous shared target directory
 # to avoid dyld paging stalls. The wrapper keys clones by logical test target,
 # removes superseded identities, and safely recovers locks left by dead copiers.
+
+# Start the deliberate long startup regression early, overlapping other flows.
+[[profile.default.overrides]]
+filter = 'binary_id(server::dev_instances)'
+priority = 100
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::dev_instances)'
+priority = 100
 
 # These tests intentionally exercise real CLI probes at tight process timeout
 # boundaries. Reserve the runner while they probe so unrelated process-heavy
@@ -31,8 +40,7 @@ threads-required = "num-test-threads"
 success-output = "final"
 
 # These real protocol flows spawn Git worktrees or probe native CLI settings.
-# Their event deadlines are unchanged; prevent unrelated process-heavy flows
-# from consuming those deadlines while the operations are queued.
+# Reserve process-heavy flows so their I/O does not contend with the suite.
 [[profile.default.overrides]]
 filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots)'
 threads-required = "num-test-threads"
@@ -74,14 +82,9 @@ threads-required = "num-test-threads"
 success-output = "final"
 
 [profile.default]
-# The native suite is a fast local gate, not a background job. Crossing five
-# minutes is a test failure that must be fixed rather than normalized.
-global-timeout = "5m"
-# A healthy integration test finishes well under 30s; anything slower is
-# flagged in the run output so a creeping regression (e.g. a fixture that
-# started spawning real subprocesses) is visible instead of silently bloating
-# the suite.
-slow-timeout = "30s"
+# Five minutes is a suite optimization target, not a deadline. Only an
+# individual test running for ten minutes is terminated as hung.
+slow-timeout = { period = "60s", terminate-after = 10 }
 retries = 0
 fail-fast = false
 # Keep the source runner concise; dev.sh retains the complete repetition log
@@ -98,8 +101,7 @@ list-wrapper = "macos-test-binary"
 run-wrapper = "macos-test-binary"
 
 [profile.ci]
-global-timeout = "5m"
-slow-timeout = "60s"
+slow-timeout = { period = "60s", terminate-after = 10 }
 # Retry flaky tests a couple of times before declaring failure, and keep going
 # after the first failure so one bad test doesn't mask others.
 retries = 2
@@ -115,17 +117,10 @@ platform = 'cfg(target_os = "macos")'
 list-wrapper = "macos-test-binary"
 run-wrapper = "macos-test-binary"
 
-# The paid conformance suite (`TYDE_RUN_REAL_AI_TESTS=1`). Not part of
-# `./dev.sh check` — these are `#[ignore]`d and drive real providers over the
-# network, so the default profile's rule that "crossing five minutes is a test
-# failure" does not apply to them and actively breaks them: one scenario alone
-# runs past 100s, and the default 5m cap silently truncates the run. It reports
-# `SIGTERM` on whatever was mid-flight plus "N tests were not run", which reads
-# like a backend failure rather than a clock.
+# Paid conformance is opt-in and has the same per-test hung protection. A
+# longer total run must not discard completed work or interrupt healthy tests.
 [profile.conformance]
-global-timeout = "45m"
-# Warn only. A real provider taking two minutes is information, not a verdict.
-slow-timeout = "120s"
+slow-timeout = { period = "120s", terminate-after = 5 }
 # A paid run costs money to repeat: never retry silently, and never let one red
 # scenario hide the state of the others.
 retries = 0

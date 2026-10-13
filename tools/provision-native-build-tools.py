@@ -16,7 +16,6 @@ from contextlib import contextmanager
 
 MESON_VERSION = "1.11.2"
 NINJA_PACKAGE_VERSION = "1.11.1.4"
-LOCK_TIMEOUT_SECONDS = 300
 
 
 def executable(directory: pathlib.Path, name: str) -> pathlib.Path:
@@ -88,7 +87,6 @@ def provisioning_lock(root: pathlib.Path):
     root.parent.mkdir(parents=True, exist_ok=True)
     lock_path = root.with_name(f".{root.name}.lock")
     with lock_path.open("a+b") as lock:
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 if os.name == "nt":
@@ -106,10 +104,6 @@ def provisioning_lock(root: pathlib.Path):
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        f"timed out waiting for native build-tool lock {lock_path}"
-                    )
                 time.sleep(0.1)
         try:
             yield

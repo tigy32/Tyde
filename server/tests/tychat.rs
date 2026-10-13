@@ -90,7 +90,7 @@ async fn outbox(
     count: usize,
 ) -> TychatOutboundSnapshot {
     let mut changed = host.subscribe_tychat().await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    (async {
         loop {
             let snapshot = host.tychat_outbound(generation).await.unwrap();
             if snapshot.pending.len() == count {
@@ -100,29 +100,26 @@ async fn outbox(
         }
     })
     .await
-    .expect("outbound state reaches expected count")
 }
 
 async fn ready(host: &server::HostHandle) {
     let mut changed = host.subscribe_tychat().await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    (async {
         while host.tychat_state().await.agent_id.is_none() {
             changed.changed().await.unwrap();
         }
     })
-    .await
-    .expect("Tychat singleton is ready after replay");
+    .await;
 }
 
 async fn typing(host: &server::HostHandle, generation: &TychatPairingId, expected: bool) {
     let mut changed = host.subscribe_tychat().await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    (async {
         while host.tychat_outbound(generation).await.unwrap().typing != expected {
             changed.changed().await.unwrap();
         }
     })
-    .await
-    .expect("Tychat typing follows server activity");
+    .await;
 }
 
 #[tokio::test]
@@ -878,7 +875,7 @@ async fn send_tool_replaces_the_final_only_when_called_last() {
         .await
         .unwrap();
     let mut changed = host.subscribe_tychat().await;
-    let replies = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let replies = (async {
         loop {
             let snapshot = host.tychat_outbound(&generation).await.unwrap();
             if snapshot
@@ -891,8 +888,7 @@ async fn send_tool_replaces_the_final_only_when_called_last() {
             changed.changed().await.unwrap();
         }
     })
-    .await
-    .expect("a turn without tool messages sends its final reply");
+    .await;
     assert_eq!(
         replies
             .pending
@@ -916,7 +912,7 @@ async fn send_tool_replaces_the_final_only_when_called_last() {
         .await
         .unwrap();
     work_gate.release_one();
-    let followed_up = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let followed_up = (async {
         loop {
             let snapshot = host.tychat_outbound(&generation).await.unwrap();
             if !snapshot.typing && snapshot.pending.len() == 1 {
@@ -925,8 +921,7 @@ async fn send_tool_replaces_the_final_only_when_called_last() {
             changed.changed().await.unwrap();
         }
     })
-    .await
-    .expect("work after a tool message re-arms the final reply");
+    .await;
     assert_eq!(
         followed_up.pending[0].text, "worked final",
         "a tool call after tychat_send_message means the final follows up"

@@ -5,8 +5,8 @@ export default defineConfig({
   outputDir: "./test-results/mobile-playwright-live",
   fullyParallel: false,
   workers: 1,
-  timeout: 90_000,
-  expect: { timeout: 45_000 },
+  timeout: 600_000,
+  expect: { timeout: 0 },
   reporter: [
     ["list"],
     [

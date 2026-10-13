@@ -52,7 +52,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.action != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

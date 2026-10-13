@@ -98,7 +98,7 @@ for raw_path in sys.argv[1:]:
 PY
 
 log "Running release tooling Python tests"
-python3 -B -m unittest \
+python3 -B tools/run-test-hang-guard.py --python-tests -- -m unittest \
     tools/test_dev_check.py \
     tools/test_release_tooling.py \
     tools/test_check_mobile_web_manifest.py
@@ -107,7 +107,7 @@ log "Running canonical dev checks"
 ./dev.sh check
 
 log "Running web deploy manifest tests"
-node --test web/deploy/*.test.mjs
+python3 tools/run-test-hang-guard.py --node-tests web/deploy/*.test.mjs
 
 log "Checking web deploy shell syntax"
 bash -n web/deploy/deploy.sh

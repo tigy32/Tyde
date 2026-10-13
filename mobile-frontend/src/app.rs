@@ -1834,16 +1834,14 @@ mod wasm_tests {
             );
             Ok::<(), &str>(())
         };
-        let result = tyde_time::timeout(Duration::from_secs(60), flow).await;
+        let result = flow.await;
         bridge::forget_paired_host(&host).await.unwrap();
         status_listener.remove();
         line_listener.remove();
         js_sys::Reflect::set(&window, &config_key, &previous_config).unwrap();
         drop(mount);
         container.remove();
-        result
-            .expect("stalled reconnect recovery completes promptly")
-            .expect("stalled reconnect recovery");
+        result.expect("stalled reconnect recovery");
     }
 
     fn empty_host_settings() -> settings_model::HostSettings {

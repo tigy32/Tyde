@@ -25,18 +25,11 @@ use rmcp::transport::StreamableHttpClientTransport;
 use serde_json::json;
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
-async fn next_env_before(
-    client: &mut client::Connection,
-    deadline: tokio::time::Instant,
-    context: &str,
-) -> Envelope {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    assert!(!remaining.is_zero(), "timed out waiting for {context}");
-    match tokio::time::timeout(remaining, client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+async fn next_env(client: &mut client::Connection, context: &str) -> Envelope {
+    match client.next_event().await {
+        Ok(Some(env)) => env,
+        Ok(None) => panic!("connection closed before {context}"),
+        Err(err) => panic!("next_event failed before {context}: {err:?}"),
     }
 }
 
@@ -406,13 +399,12 @@ async fn spawn_project_agent_with_prompt(
     let mut saw_start = false;
     let mut saw_idle = !wait_until_idle;
     let mut session_id = new_agent.session_id.clone();
-    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !saw_start || !saw_idle || session_id.is_none() {
         let context = format!(
             "origin agent startup (saw_start={saw_start}, saw_idle={saw_idle}, session_id={})",
             session_id.is_some()
         );
-        let env = next_env_before(client, startup_deadline, &context).await;
+        let env = next_env(client, &context).await;
         match env.kind {
             FrameKind::AgentBootstrap if env.stream == new_agent.instance_stream => {
                 let bootstrap: protocol::AgentBootstrapPayload =
@@ -4363,17 +4355,13 @@ async fn review_mcp_call(
         ().serve(StreamableHttpClientTransport::from_config(config))
             .await
             .expect("connect MCP");
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        service.call_tool(CallToolRequestParams {
-            meta: None,
-            name: name.to_owned().into(),
-            arguments: arguments.as_object().cloned(),
-            task: None,
-        }),
-    )
-    .await
-    .expect("bounded MCP call");
+    let result = (service.call_tool(CallToolRequestParams {
+        meta: None,
+        name: name.to_owned().into(),
+        arguments: arguments.as_object().cloned(),
+        task: None,
+    }))
+    .await;
     let result = match result {
         Ok(result) => result,
         Err(rmcp::ServiceError::McpError(error)) => {

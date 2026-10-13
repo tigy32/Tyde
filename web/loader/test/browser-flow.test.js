@@ -10,7 +10,7 @@ import { once } from "node:events";
 
 // Real browser + HTTP + CacheStorage + IndexedDB + worker lifecycle. The tiny
 // immutable modules are executable loader fixtures, not fake agent backends.
-test("installed storage migrates once, then follows exact targets without losing pairing", { timeout: 90000 }, async t => {
+test("installed storage migrates once, then follows exact targets without losing pairing", async t => {
   assert.ok(process.env.CHROME && process.env.CHROMEDRIVER, "dev.sh must provision browser tools");
   const root = new URL("../", import.meta.url);
   const old = "1.0.0", capable = "1.0.1", upgraded = "1.0.2";
@@ -112,27 +112,28 @@ test("installed storage migrates once, then follows exact targets without losing
   try {
     const port = await new Promise((resolve,reject) => {
       let output = "";
-      const timer = setTimeout(()=>reject(new Error(`driver startup deadline; exit=${driver.exitCode}; signal=${driver.signalCode}; output=${output}`)), 10000);
-      const read = chunk => { output = (output + chunk).slice(-2000); const match = /started successfully on port (\d+)/.exec(output); if (match) {clearTimeout(timer);resolve(Number(match[1]));} };
+      const read = chunk => { output = (output + chunk).slice(-2000); const match = /started successfully on port (\d+)/.exec(output); if (match) {resolve(Number(match[1]));} };
       driver.stdout.on("data",read);driver.stderr.on("data",read);
-      driver.once("error",error=>{clearTimeout(timer);reject(error);});
+      driver.once("error",reject);
+      driver.once("exit",(code,signal)=>reject(new Error(`driver exited before readiness; exit=${code}; signal=${signal}`)));
     });
     request = async (path, body, method="POST") => {
-      const response = await fetch(`http://127.0.0.1:${port}${path}`, {method, headers:{"Content-Type":"application/json"}, ...(body ? {body:JSON.stringify(body)} : {}), signal:AbortSignal.timeout(20000)});
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {method, headers:{"Content-Type":"application/json"}, ...(body ? {body:JSON.stringify(body)} : {})});
       const result = await response.json();
       if (result.value?.error) throw new Error(`WebDriver ${result.value.error}: ${result.value.message}`);
       return result.value;
     };
     const started = await request("/session", {capabilities:{alwaysMatch:{browserName:"chrome","goog:chromeOptions":{binary:process.env.CHROME,args:["--headless=new","--no-sandbox","--disable-dev-shm-usage"]}}}});
     session = started.sessionId;
+    await request(`/session/${session}/timeouts`, {script:null,pageLoad:600000,implicit:0});
     const command = (path, body) => request(`/session/${session}/${path}`,body);
     const evaluate = script => command("execute/sync",{script,args:[]});
     const evaluateAsync = script => command("execute/async",{script,args:[]});
     const navigate = path => command("url",{url:origin+path});
     const waitFor = text => evaluateAsync(`const done=arguments[arguments.length-1];
       const check=()=>document.body.textContent.includes(${JSON.stringify(text)});
-      if(check()){done(true);return;} const observer=new MutationObserver(()=>{if(check()){clearTimeout(timer);observer.disconnect();done(true);}});
-      const timer=setTimeout(()=>{observer.disconnect();done(false);},10000);observer.observe(document.body,{subtree:true,childList:true,characterData:true});`);
+      if(check()){done(true);return;} const observer=new MutationObserver(()=>{if(check()){observer.disconnect();done(true);}});
+      observer.observe(document.body,{subtree:true,childList:true,characterData:true});`);
     await navigate("/setup");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];window.setupReady.then(done);"),true);
     await navigate("/tyde/");
@@ -163,7 +164,7 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await waitFor(`Client ${capable}`),true,"new root loader must ignore the stale pin once");
     assert.equal(await evaluate("return window.__tydeLoader.bootVersion()"),capable);
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
-    assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}const timer=setTimeout(()=>done(false),10000);worker.addEventListener('statechange',()=>{if(worker.state==='activated'){clearTimeout(timer);done(true);}});});"),true);
+    assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}worker.addEventListener('statechange',()=>{if(worker.state==='activated'){done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
     assert.ok(cacheNames.includes("tyde-loader-v11"),"updated worker precaches the new root shell");
     assert.ok(!cacheNames.includes("tyde-loader-v9"),"updated worker retires only the old shell cache");

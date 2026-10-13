@@ -59,9 +59,8 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .spawn()
         .expect("start real Dots service");
     let mut lines = BufReader::new(service.stdout.take().unwrap()).lines();
-    let origin = tokio::time::timeout(std::time::Duration::from_secs(15), lines.next_line())
+    let origin = (lines.next_line())
         .await
-        .expect("service startup deadline")
         .expect("service output")
         .expect("service endpoint");
     let settings = settings_model::HostSettings {

@@ -30,7 +30,6 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const DEBUG_REPO_ROOT_ENV: &str = "TYDE_DEBUG_REPO_ROOT";
-const START_TIMEOUT: Duration = Duration::from_secs(105);
 const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
 #[derive(Clone, Debug)]
 pub struct DebugServerConfig {
@@ -946,7 +945,6 @@ async fn debug_snapshot(
 }
 
 async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), String> {
-    let started = tokio::time::Instant::now();
     loop {
         match record.child.try_wait() {
             Ok(Some(exit_status)) => {
@@ -976,16 +974,6 @@ async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), S
                     &record.startup_output,
                 ));
             }
-        }
-
-        if started.elapsed() > START_TIMEOUT {
-            return Err(with_startup_diagnostics(
-                format!(
-                    "timed out waiting for dev instance {} to become ready",
-                    record.instance_id
-                ),
-                &record.startup_output,
-            ));
         }
 
         let host_ready = matches!(

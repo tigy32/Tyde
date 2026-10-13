@@ -205,20 +205,13 @@ async fn expect_activity_summary_matching(
     context: &str,
     mut matches_state: impl FnMut(&AgentActivitySummaryState) -> bool,
 ) -> AgentActivitySummaryPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for activity summary {context}"
-        );
-        let env = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before activity summary {context}"),
-            Ok(Err(err)) => {
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before activity summary {context}"),
+            Err(err) => {
                 panic!("next_event failed before activity summary {context}: {err:?}")
             }
-            Err(_) => panic!("timed out waiting for activity summary {context}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
@@ -564,18 +557,11 @@ async fn wait_for_ready_launch_profile(
     client: &mut client::Connection,
     profile_id: &str,
 ) -> LaunchProfileCatalogPayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            panic!("timed out waiting for ready launch profile {profile_id}");
-        }
-
-        let env = match tokio::time::timeout(deadline - now, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before launch profile {profile_id} ready"),
-            Ok(Err(err)) => panic!("next_event failed before launch profile {profile_id}: {err:?}"),
-            Err(_) => panic!("timed out waiting for launch profile {profile_id}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before launch profile {profile_id} ready"),
+            Err(err) => panic!("next_event failed before launch profile {profile_id}: {err:?}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
@@ -646,13 +632,9 @@ async fn await_dev_driver_agent_ready(
     agent_id: &str,
     context: &str,
 ) -> tyde_dev_driver::agent_control::AwaitAgentsResult {
-    let awaited = tokio::time::timeout(
-        Duration::from_secs(15),
-        control.await_agents(Some(vec![protocol::AgentId(agent_id.to_owned())])),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
-    .unwrap_or_else(|err| panic!("agent control await failed for {context}: {err}"));
+    let awaited = (control.await_agents(Some(vec![protocol::AgentId(agent_id.to_owned())])))
+        .await
+        .unwrap_or_else(|err| panic!("agent control await failed for {context}: {err}"));
     assert!(
         awaited.still_thinking.is_empty(),
         "agent control await should observe {context} ready, got {awaited:?}"
@@ -694,9 +676,7 @@ async fn wait_for_agent_control_status(
     caller: &server::AgentControlMcpCaller,
     agent_id: &protocol::AgentId,
     expected_status: &str,
-    timeout: Duration,
 ) {
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let agents = mcp_list_agents(caller).await;
         let matching = agents
@@ -714,11 +694,6 @@ async fn wait_for_agent_control_status(
         if status == expected_status {
             return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for agent {} status {expected_status}; last status: {status}",
-            agent_id.0,
-        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -878,21 +853,12 @@ async fn expect_task_token_usage_matching(
     context: &str,
     mut matches_payload: impl FnMut(&TaskTokenUsagePayload) -> bool,
 ) -> TaskTokenUsagePayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let mut observed = Vec::new();
+    let mut observed = 0usize;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for task token usage {context}; observed={observed:#?}"
-        );
-        let env = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before task token usage {context}"),
-            Ok(Err(err)) => panic!("next_event failed before task token usage {context}: {err:?}"),
-            Err(_) => {
-                panic!("timed out waiting for task token usage {context}; observed={observed:#?}")
-            }
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before task token usage {context}"),
+            Err(err) => panic!("next_event failed before task token usage {context}: {err:?}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
@@ -906,7 +872,8 @@ async fn expect_task_token_usage_matching(
         }
         let payload: TaskTokenUsagePayload = env.parse_payload().expect("TaskTokenUsage");
         if &payload.root_agent_id == root_agent_id {
-            observed.push(payload.clone());
+            observed += 1;
+            eprintln!("Task token usage wait observed-count={observed}");
         }
         if &payload.root_agent_id == root_agent_id && matches_payload(&payload) {
             return payload;
@@ -1135,7 +1102,6 @@ async fn expect_metadata_update_and_task_token_usage_on_stream(
     expected_total: u64,
     context: &str,
 ) -> (MessageMetadataUpdateData, TaskTokenUsagePayload) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut update = None;
     let mut token_usage = None;
     let mut typing_finished = false;
@@ -1146,13 +1112,10 @@ async fn expect_metadata_update_and_task_token_usage_on_stream(
             }
             update = Some(found_update);
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for {context}");
-        let env = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before {context}"),
+            Err(err) => panic!("next_event failed before {context}: {err:?}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
@@ -1201,11 +1164,10 @@ async fn expect_raw_agent_bootstrap_on_stream(
     context: &str,
 ) -> AgentBootstrapPayload {
     loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
+        let env = match client.next_event().await {
+            Ok(Some(env)) => env,
+            Ok(None) => panic!("connection closed before {context}"),
+            Err(err) => panic!("next_event failed before {context}: {err:?}"),
         };
         if fixture::is_routine_control_plane_frame(&env)
             || matches!(
@@ -3461,9 +3423,7 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
         .close_agent(&parent.stream)
         .await
         .expect("close closing-spawn parent failed");
-    tokio::time::timeout(Duration::from_secs(10), shutdown_gate.wait_until_entered())
-        .await
-        .expect("closing-parent phase: native teardown must be entered before invoking MCP");
+    (shutdown_gate.wait_until_entered()).await;
 
     let error = mcp_spawn_agent_error_as(
         &caller,
@@ -3666,7 +3626,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         "update live dev-driver preference",
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    (async {
         loop {
             if control.list_launch_options().launch_profile_preference == live_preference {
                 break;
@@ -3674,8 +3634,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("connected dev driver should observe HostSettings update");
+    .await;
 
     fixture
         .host_for_test()
@@ -3692,7 +3651,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
             },
         )
         .await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    (async {
         loop {
             let options = control.list_launch_options();
             if options.backend_limits.iter().any(|limits| {
@@ -3704,8 +3663,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("connected dev driver should observe factual BackendCapacity update");
+    .await;
 
     let spawned = control
         .spawn_agent(SpawnRequest {
@@ -4224,12 +4182,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
             .await;
 
-    let pending_await = tokio::time::timeout(
-        Duration::from_secs(2),
-        mcp_await_agent(&caller, &new_agent.agent_id),
-    )
-    .await
-    .expect("tyde_await_agents must return while plan approval is pending");
+    let pending_await = (mcp_await_agent(&caller, &new_agent.agent_id)).await;
     assert_await_result_ready(&pending_await, &new_agent.agent_id, "awaiting_user");
 
     fixture
@@ -4286,12 +4239,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     // approval can still be pending when HTTP observes it. Gate the idle
     // assertion on the approval's actual completion, not write admission.
     eprintln!("EXIT PLAN AWAIT approval completion observed before idle query");
-    let resumed_await = tokio::time::timeout(
-        Duration::from_secs(5),
-        mcp_await_agent(&caller, &new_agent.agent_id),
-    )
-    .await
-    .expect("tyde_await_agents must return after plan approval resumes the turn");
+    let resumed_await = (mcp_await_agent(&caller, &new_agent.agent_id)).await;
     assert_await_result_ready(&resumed_await, &new_agent.agent_id, "idle");
 
     fixture
@@ -4393,12 +4341,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
             .await;
 
-    let pending_await = tokio::time::timeout(
-        Duration::from_secs(2),
-        mcp_await_agent(&caller, &new_agent.agent_id),
-    )
-    .await
-    .expect("tyde_await_agents must return while stream-end-first plan approval is pending");
+    let pending_await = (mcp_await_agent(&caller, &new_agent.agent_id)).await;
     assert_await_result_ready(&pending_await, &new_agent.agent_id, "awaiting_user");
 
     fixture
@@ -4419,13 +4362,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         .await
         .expect("send stream-end-first ExitPlanMode approval");
 
-    wait_for_agent_control_status(
-        &caller,
-        &new_agent.agent_id,
-        "thinking",
-        Duration::from_millis(500),
-    )
-    .await;
+    wait_for_agent_control_status(&caller, &new_agent.agent_id, "thinking").await;
     gate_before_completion.wait_until_entered().await;
     gate_before_completion.release_one();
 
@@ -4446,13 +4383,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     }
     gate_after_completion.wait_until_entered().await;
 
-    wait_for_agent_control_status(
-        &caller,
-        &new_agent.agent_id,
-        "thinking",
-        Duration::from_millis(500),
-    )
-    .await;
+    wait_for_agent_control_status(&caller, &new_agent.agent_id, "thinking").await;
 
     let await_while_resuming = tokio::time::timeout(
         Duration::from_millis(150),
@@ -4491,12 +4422,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         }
     }
 
-    let finished_await = tokio::time::timeout(
-        Duration::from_secs(2),
-        mcp_await_agent(&caller, &new_agent.agent_id),
-    )
-    .await
-    .expect("tyde_await_agents must return after stream-end-first resumed turn finishes");
+    let finished_await = (mcp_await_agent(&caller, &new_agent.agent_id)).await;
     assert_await_result_ready(&finished_await, &new_agent.agent_id, "idle");
 }
 
@@ -5680,9 +5606,7 @@ async fn agent_control_await_endpoint_isolated_and_remains_pending() {
         .interrupt(&held_new.instance_stream)
         .await
         .expect("interrupt held await child");
-    let response = tokio::time::timeout(Duration::from_secs(5), &mut pending)
-        .await
-        .expect("await should finish after child becomes idle");
+    let response = (&mut pending).await;
     assert!(!mcp_result_is_error(&response));
 }
 
@@ -5735,9 +5659,7 @@ async fn agent_control_await_cut_short_by_host_restart_reports_typed_host_stoppi
         host.shutdown_for_restart().await;
     });
     stop_gate.wait_until_entered().await;
-    let response = tokio::time::timeout(Duration::from_secs(5), &mut pending)
-        .await
-        .expect("the restart must end the parked await before agents are stopped");
+    let response = (&mut pending).await;
     assert!(
         mcp_result_is_error(&response),
         "an await the host cut short did not complete: {response}"
@@ -5870,9 +5792,8 @@ async fn agent_control_http_await_emits_progress_notifications() {
         .await
         .expect("interrupt held agent");
 
-    let server_result = tokio::time::timeout(Duration::from_secs(5), &mut response)
+    let server_result = (&mut response)
         .await
-        .expect("await tool should finish after interrupt")
         .expect("await tool response should succeed");
     let ServerResult::CallToolResult(result) = server_result else {
         panic!("expected CallToolResult, got {server_result:?}");
@@ -5997,13 +5918,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
 
     let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
-    wait_for_agent_control_status(
-        &caller,
-        &child_new.agent_id,
-        "thinking",
-        Duration::from_secs(1),
-    )
-    .await;
+    wait_for_agent_control_status(&caller, &child_new.agent_id, "thinking").await;
 
     fixture
         .mock_by_id(&parent_new.agent_id)
@@ -6085,8 +6000,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
 
-    wait_for_agent_control_status(&caller, &child_new.agent_id, "idle", Duration::from_secs(2))
-        .await;
+    wait_for_agent_control_status(&caller, &child_new.agent_id, "idle").await;
 
     let completion = expect_tool_completion_on_stream(
         &mut fixture.client,
@@ -7324,7 +7238,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     .await;
 
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
-    wait_for_agent_control_status(&caller, &child.agent_id, "idle", Duration::from_secs(2)).await;
+    wait_for_agent_control_status(&caller, &child.agent_id, "idle").await;
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     let replayed_child = bootstrapped_agent(&bootstrap, &child.agent_id);

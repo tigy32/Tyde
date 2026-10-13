@@ -35,7 +35,10 @@ fi
 mkdir -p "$config/plans" || exit 90
 printf 'plan\n' > "$config/plans/dev-instance-plan.md" || exit 91
 printf 'CLAUDE_PLAN_FILE=%s\n' "$config/plans/dev-instance-plan.md"
-printf 'CLAUDE_CREDENTIAL=%s\n' "$(cat "$credentials/.credentials.json" 2>/dev/null)"
+[ "$(cat "$credentials/.credentials.json" 2>/dev/null)" = "$TYDE_TEST_CLAUDE_CREDENTIAL" ] || exit 92
+printf 'CLAUDE_CREDENTIAL_MATCH=1\n'
+# Cross the old 105-second startup cutoff while the real launcher remains alive.
+sleep 106
 exit 3
 "#;
 
@@ -75,6 +78,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     unsafe {
         std::env::set_var("SHELL", &shell);
         std::env::set_var("CLAUDE_CONFIG_DIR", &parent_claude_home);
+        std::env::set_var("TYDE_TEST_CLAUDE_CREDENTIAL", CREDENTIAL_SENTINEL);
         std::env::remove_var("CLAUDE_SECURESTORAGE_CONFIG_DIR");
     }
     server::process_env::initialize_process_env().expect("resolve login PATH");
@@ -85,6 +89,10 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         .expect("test runtime")
         .block_on(start_dev_instance_expecting_exit());
 
+    assert!(
+        error.contains("exited before ready"),
+        "a live cold build must not be stopped by a startup deadline"
+    );
     let plan_file = error
         .lines()
         .find_map(|line| line.strip_prefix("CLAUDE_PLAN_FILE="))
@@ -109,7 +117,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     assert!(
         error
             .lines()
-            .any(|line| line == format!("CLAUDE_CREDENTIAL={CREDENTIAL_SENTINEL}")),
+            .any(|line| line == "CLAUDE_CREDENTIAL_MATCH=1"),
         "dev instance Claude must still read the parent's credentials"
     );
 }

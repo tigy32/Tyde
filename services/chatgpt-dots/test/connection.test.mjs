@@ -17,7 +17,11 @@ test("Real worker isolates paired hosts and enforces OAuth lifetime and revocati
     compatibilityDate: "2026-07-30", durableObjects: { BROKER: { className: "DotsBroker", useSQLite: true } }, port: 0 };
   const server = new Miniflare(options);
   const origin = (await server.ready).origin;
-  const request = (path, options) => fetch(`${origin}${path}`, options);
+  // Clock changes restart workerd; pooled sockets from the previous runtime
+  // otherwise race its exit and reset the first request after server.ready.
+  const request = (path, options = {}) => fetch(`${origin}${path}`, {
+    ...options, headers: { ...options.headers, Connection: "close" }
+  });
   const post = (path, data) => request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
   const registerHost = (id, key, pairing) => post("/hosts", JSON.parse(HostRegistration.encode(id, key, pairing)));
   const form = (path, data) => request(path, { method: "POST", redirect: "manual", headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: origin }, body: new URLSearchParams(data) });

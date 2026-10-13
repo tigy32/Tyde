@@ -8,10 +8,12 @@ import pathlib
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import shlex
 import unittest
 from unittest import mock
 
@@ -21,7 +23,7 @@ REPO_ROOT = TOOLS_DIR.parent
 TOOLCHAIN_UPDATE_LOG = "rustup update stable toolchain=unset"
 TOOLCHAIN_INSTALL_LOG = "rustup toolchain install toolchain=unset"
 # wasm-bindgen-test-runner parses WASM_BINDGEN_TEST_TIMEOUT as a Rust `u64`, so
-# that is the exact domain tools/run-wasm-tests.sh must accept and reject.
+# the sole accepted suite setting is u64::MAX; finite cutoffs are rejected.
 U64_MAX = 2**64 - 1
 U64_MAX_SECONDS = str(U64_MAX)
 
@@ -1419,6 +1421,8 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
 """,
             encoding="utf-8",
         )
+        shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", self.root / "tools")
+        shutil.copy2(REPO_ROOT / "tools" / "node-test-hang-guard.mjs", self.root / "tools")
         wasm_script.chmod(0o755)
         native_script = self.root / "tools" / "provision-native-build-tools.py"
         native_script.write_text(
@@ -1733,8 +1737,8 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(lines.count("wasm"), 1)
         # The stage now runs the real Dots worker before the existing loader.
         # Require each boundary once, rather than rejecting the second suite.
-        self.assertEqual(sum(line.startswith("node --test services/chatgpt-dots/test/") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("node --test test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") and "services/chatgpt-dots/test/" in line for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") and " test/" in line for line in lines), 1)
         self.assertEqual(sum(line.startswith("node --test ") for line in lines), 2)
         self.assertTrue(
             all(
@@ -1786,6 +1790,23 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 "native-tools-prepare",
                 "wasm-prepare",
             ],
+        )
+
+        tooling = self.root / "tools" / "test_dev_check.py"
+        original = tooling.read_text(encoding="utf-8")
+        before = self._log_lines()
+        try:
+            tooling.write_text("def broken(:\n", encoding="utf-8")
+            broken = self._run(check=False)
+        finally:
+            tooling.write_text(original, encoding="utf-8")
+        self.assertNotEqual(broken.returncode, 0)
+        self.assertIn("FAIL  Test tooling syntax", broken.stdout + broken.stderr)
+        self.assertIn("SyntaxError", broken.stdout + broken.stderr)
+        self.assertEqual(
+            self._log_lines()[len(before):],
+            [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG,
+             "native-tools-prepare", "wasm-prepare"],
         )
 
     def test_fingerprint_tracks_commit_and_worktree_content(self) -> None:
@@ -1901,8 +1922,8 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         lines = self._log_lines()
         self.assertEqual(lines.count("wasm"), 1)
-        self.assertEqual(sum(line.startswith("node --test services/chatgpt-dots/test/") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("node --test test/") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") and "services/chatgpt-dots/test/" in line for line in lines), 1)
+        self.assertEqual(sum(line.startswith("node --test ") and " test/" in line for line in lines), 1)
         self.assertEqual(sum(line.startswith("node --test ") for line in lines), 2)
         self.assertEqual(lines.count("contract"), 1)
         self.assertIn("PASS  wasm browser tests (1/1", result.stdout)
@@ -2992,7 +3013,6 @@ class TestingBehaviorContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         shared = {
-            'global-timeout = "5m"',
             'fail-fast = false',
             'status-level = "slow"',
             'final-status-level = "slow"',
@@ -3000,8 +3020,8 @@ class TestingBehaviorContractTests(unittest.TestCase):
             'failure-output = "final"',
         }
         profile_specific = {
-            "default": {'slow-timeout = "30s"', "retries = 0"},
-            "ci": {'slow-timeout = "60s"', "retries = 2"},
+            "default": {'slow-timeout = { period = "60s", terminate-after = 10 }', "retries = 0"},
+            "ci": {'slow-timeout = { period = "60s", terminate-after = 10 }', "retries = 2"},
         }
         for profile in ("default", "ci"):
             body = source.split(f"[profile.{profile}]\n", 1)[1].split(
@@ -3014,6 +3034,51 @@ class TestingBehaviorContractTests(unittest.TestCase):
                     1,
                     f"profile {profile} must contain {setting}",
                 )
+
+    def test_native_runner_retains_long_suites_and_kills_one_hung_case(self) -> None:
+        config = (REPO_ROOT / ".config" / "nextest.toml").read_text()
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name)
+            (root / "src").mkdir()
+            (root / ".config").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname="hang-guard-contract"\nversion="0.0.0"\n'
+                'edition="2024"\n[workspace]\n'
+            )
+            (root / "src" / "lib.rs").write_text(
+                '#[test] fn healthy_a() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
+                '#[test] fn healthy_b() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
+                '#[test] fn healthy_c() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
+                '#[test] #[ignore] fn hung() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n'
+            )
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"), RUSTC_WRAPPER="")
+            for name in ("default", "ci", "conformance"):
+                profile = config.split(f"[profile.{name}]\n", 1)[1].split("\n[", 1)[0]
+                self.assertNotIn("global-timeout", profile)
+                protection = re.search(r'slow-timeout = \{ period = "(\d+)s", terminate-after = (\d+) \}', profile)
+                self.assertIsNotNone(protection)
+                self.assertEqual(int(protection[1]) * int(protection[2]), 600)
+                # Scale only the deliberate guard under test, not the suite.
+                scaled = config.replace(
+                    'period = "60s"', 'period = "100ms"'
+                ).replace('period = "120s"', 'period = "200ms"')
+                # The toy workspace has none of the repository's binary IDs;
+                # retain profile policy, not binary-specific wrappers or filters.
+                scaled = re.sub(r'\[\[profile\.\w+\.(?:scripts|overrides)\]\][\s\S]*?(?=\n\[|\Z)', '', scaled)
+                (root / ".config" / "nextest.toml").write_text(scaled)
+                command = ["cargo", "nextest", "run", "--profile", name, "--test-threads", "1"]
+                healthy = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
+                self.assertEqual(healthy.returncode, 0, healthy.stderr)
+                self.assertIn("3 tests run: 3 passed", healthy.stderr)
+                hung = subprocess.run(
+                    [*command, "--run-ignored", "only"], cwd=root, env=env,
+                    text=True, capture_output=True,
+                )
+                self.assertNotEqual(hung.returncode, 0)
+                # CI retries label attempts TMT; the summary is authoritative
+                # in every profile and must report exactly one timed-out case.
+                self.assertIn("1 test run: 0 passed, 1 timed out", hung.stderr)
+                self.assertIn("hung", hung.stderr)
 
     def test_fixture_tracing_defaults_to_warn_without_hiding_rust_log(self) -> None:
         source = (REPO_ROOT / "server" / "tests" / "fixture.rs").read_text(
@@ -3162,6 +3227,7 @@ class WasmToolScriptTests(unittest.TestCase):
             binaries.mkdir()
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3271,6 +3337,7 @@ class WasmToolScriptTests(unittest.TestCase):
             binaries.mkdir()
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3355,6 +3422,7 @@ class WasmToolScriptTests(unittest.TestCase):
             binaries.mkdir()
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3421,16 +3489,10 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertIn("run preparation to provision", identity.stderr)
             self.assertFalse(marker.exists())
 
-    # ── Browser-suite timeout contract ────────────────────────────────────
+    # ── Browser hung-test contract ────────────────────────────────────
     #
-    # wasm-bindgen-test-runner applies WASM_BINDGEN_TEST_TIMEOUT to a whole
-    # headless session, not to each test, and defaults it to 20 seconds. The
-    # frontend suite measured 19.25-19.58s against that default, so the stage
-    # failed roughly a third of the time with no assertion text. These tests
-    # pin the explicit default, the caller override across the runner's full
-    # `u64` domain, propagation to both wasm invocations, and the absence of any
-    # test-selection argument — because the tempting "fix" for a slow suite is
-    # to shard or skip coverage, and that is exactly what AGENTS.md forbids.
+    # Exercise the real shell wrapper and streaming process guard. Total suite
+    # duration must not expire a healthy sequence of individual cases.
 
     def _write_run_fixture(
         self, root: pathlib.Path
@@ -3452,6 +3514,7 @@ class WasmToolScriptTests(unittest.TestCase):
         fixture.chmod(0o755)
         script = tools / "run-wasm-tests.sh"
         shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+        shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
         (root / "Cargo.lock").write_text(
             'name = "wasm-bindgen"\nversion = "0.2.118"\n', encoding="utf-8"
         )
@@ -3503,6 +3566,7 @@ class WasmToolScriptTests(unittest.TestCase):
             "  printf 'WASM_BINDGEN_TEST_TIMEOUT=%s\\n' "
             '"${WASM_BINDGEN_TEST_TIMEOUT-<unset>}"\n'
             "  printf 'RUSTFLAGS=%s\\n' \"${RUSTFLAGS-<unset>}\"\n"
+            "  printf 'RUNNER=%s\\n' \"${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER-<unset>}\"\n"
             "  printf '=== end ===\\n'\n"
             '} >>"$CARGO_RECORD"\n'
             'if [[ "${CARGO_FAIL_IN:-}" == "$(basename "$PWD")" ]]; then\n'
@@ -3552,7 +3616,7 @@ class WasmToolScriptTests(unittest.TestCase):
             current[key] = value
         return invocations
 
-    def test_canonical_run_sets_the_default_browser_suite_timeout(self) -> None:
+    def test_canonical_run_disables_the_browser_suite_cutoff(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = pathlib.Path(temp_name) / "repo"
             script, env, record = self._write_run_fixture(root)
@@ -3565,8 +3629,7 @@ class WasmToolScriptTests(unittest.TestCase):
             invocations = self._cargo_invocations(record)
             self.assertEqual(len(invocations), 3)
             for invocation in invocations:
-                # 120s, not the 20s the runner defaults to when nothing sets it.
-                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
             self.assertEqual(
                 pathlib.Path(env["UI_BUILD_RECORD"]).read_text(encoding="utf-8"),
                 "build --features ui-fixtures\n",
@@ -3589,14 +3652,14 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertNotEqual(failed_build.returncode, 0)
             self.assertFalse(playwright_record.exists())
 
-    def test_explicit_browser_suite_timeout_wins_and_invalid_values_fail(
+    def test_browser_suite_cutoffs_and_invalid_values_fail(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = pathlib.Path(temp_name) / "repo"
             script, env, record = self._write_run_fixture(root)
 
-            override = dict(env, WASM_BINDGEN_TEST_TIMEOUT="45")
+            override = dict(env, WASM_BINDGEN_TEST_TIMEOUT=U64_MAX_SECONDS)
             accepted = subprocess.run(
                 [str(script)],
                 env=override,
@@ -3608,7 +3671,7 @@ class WasmToolScriptTests(unittest.TestCase):
             invocations = self._cargo_invocations(record)
             self.assertEqual(len(invocations), 3)
             for invocation in invocations:
-                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "45")
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
 
             # An empty value reads as unset, matching how CHROME and
             # CHROMEDRIVER treat empty explicit overrides.
@@ -3623,12 +3686,17 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertEqual(empty.returncode, 0, empty.stderr)
             self.assertEqual(
                 self._cargo_invocations(record)[0]["WASM_BINDGEN_TEST_TIMEOUT"],
-                "120",
+                U64_MAX_SECONDS,
             )
 
             positive = "must be a positive whole number of seconds"
             bounded = f"must not exceed {U64_MAX_SECONDS} seconds"
             rejections = (
+                ("1", "whole-suite deadlines are not supported"),
+                ("20", "whole-suite deadlines are not supported"),
+                ("007", "whole-suite deadlines are not supported"),
+                ("4294967296", "whole-suite deadlines are not supported"),
+                (str(U64_MAX - 1), "whole-suite deadlines are not supported"),
                 ("0", positive),
                 ("00", positive),
                 ("abc", positive),
@@ -3667,16 +3735,11 @@ class WasmToolScriptTests(unittest.TestCase):
             root = pathlib.Path(temp_name) / "repo"
             script, env, record = self._write_run_fixture(root)
 
-            # Everything the pinned runner can parse must survive the guard,
-            # including the exact u64::MAX boundary and leading-zero forms. The
-            # caller's string is forwarded verbatim; the runner normalises it.
+            # Only the effectively disabled upstream suite deadline is valid,
+            # including its equivalent leading-zero form.
             for accepted in (
-                "1",
-                "20",
-                "007",
-                "4294967296",
-                str(U64_MAX - 1),
                 U64_MAX_SECONDS,
+                "000" + U64_MAX_SECONDS,
             ):
                 with self.subTest(timeout=accepted):
                     record.unlink(missing_ok=True)
@@ -3692,7 +3755,7 @@ class WasmToolScriptTests(unittest.TestCase):
                     self.assertEqual(len(invocations), 3)
                     for invocation in invocations:
                         self.assertEqual(
-                            invocation["WASM_BINDGEN_TEST_TIMEOUT"], accepted
+                            invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS
                         )
 
     def test_browser_suite_timeout_propagates_to_all_wasm_invocations(
@@ -3713,15 +3776,21 @@ class WasmToolScriptTests(unittest.TestCase):
                 ["frontend", "rtc-transport", "mobile-frontend"],
             )
             for invocation in invocations:
-                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
                 self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=0")
 
-            # Same override idiom as RUSTFLAGS: an explicit value reaches both.
+                command = shlex.split(invocation["RUNNER"])
+                self.assertEqual(command[0], "python3")
+                self.assertEqual(pathlib.Path(command[1]), root / "tools" / "run-test-hang-guard.py")
+                self.assertEqual(command[2:5], ["--hang-seconds", "600", "--"])
+                self.assertEqual(command[5], env["WASM_BINDGEN_TEST_RUNNER"])
+
+            # Flags and the disabled suite deadline reach all three suites.
             record.unlink()
             tuned = subprocess.run(
                 [str(script)],
                 env=dict(
-                    env, WASM_BINDGEN_TEST_TIMEOUT="90", RUSTFLAGS="-C debuginfo=2"
+                    env, WASM_BINDGEN_TEST_TIMEOUT=U64_MAX_SECONDS, RUSTFLAGS="-C debuginfo=2"
                 ),
                 text=True,
                 capture_output=True,
@@ -3729,7 +3798,7 @@ class WasmToolScriptTests(unittest.TestCase):
             )
             self.assertEqual(tuned.returncode, 0, tuned.stderr)
             for invocation in self._cargo_invocations(record):
-                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "90")
+                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
                 self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=2")
 
             # A failed frontend suite must not be followed by a mobile run that
@@ -3786,6 +3855,111 @@ class WasmToolScriptTests(unittest.TestCase):
                     invocation["argv"],
                     "test --target wasm32-unknown-unknown components::chat_view",
                 )
+    def test_mobile_ui_setup_waits_for_its_server_and_reports_process_death(self) -> None:
+        setup = REPO_ROOT / "tools" / "mobile-ui-server.mjs"
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name)
+            npm = root / "npm"
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            npm.write_text(
+                f"#!{sys.executable}\n"
+                "import http.server,time\n"
+                "time.sleep(1.2)\n"
+                f"http.server.HTTPServer(('127.0.0.1',{port}),http.server.SimpleHTTPRequestHandler).serve_forever()\n"
+            )
+            npm.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
+            command = ["node", "--input-type=module", "-e",
+                       f"import setup from {json.dumps(setup.as_uri())}; const stop = await setup({{projects:[{{use:{{baseURL:'http://127.0.0.1:{port}'}}}}]}}); console.log('READY'); stop();"]
+            started = time.monotonic()
+            ready = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(ready.returncode, 0, ready.stderr)
+            self.assertIn("READY", ready.stdout)
+            self.assertGreater(time.monotonic() - started, 1.2)
+            npm.write_text("#!/bin/sh\nexit 7\n")
+            dead = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
+            self.assertNotEqual(dead.returncode, 0)
+            self.assertIn("exited before readiness: 7", dead.stderr)
+
+    def test_streaming_browser_guard_preserves_work_and_stops_a_hung_case(self) -> None:
+        guard = REPO_ROOT / "tools" / "run-test-hang-guard.py"
+        with tempfile.TemporaryDirectory() as temp_name:
+            runner = pathlib.Path(temp_name) / "runner.py"
+            runner.write_text(
+                "import os,sys,time\n"
+                "assert os.environ['WASM_BINDGEN_TEST_TIMEOUT'] == '18446744073709551615'\n"
+                "assert os.environ['WASM_BINDGEN_TEST_DRIVER_TIMEOUT'] == '600'\n"
+                "print('running 3 tests', flush=True)\n"
+                "for name in ['first','second','third']:\n"
+                " time.sleep(0.6)\n"
+                " print('test fixture::'+name+' ... ok', flush=True)\n"
+                "print('test result: ok. 3 passed', flush=True)\n"
+            )
+            command = [sys.executable, str(guard), "--hang-seconds", "1", "--", sys.executable, str(runner)]
+            healthy = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            self.assertIn("third ... ok", healthy.stdout)
+            runner.write_text(
+                "import time\n"
+                "print('running 2 tests', flush=True)\n"
+                "print('test fixture::first ... ok', flush=True)\n"
+                "while True:\n"
+                " print('still producing logs', flush=True)\n"
+            )
+            hung = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(hung.returncode, 124, hung.stderr)
+            self.assertIn("first ... ok", hung.stdout)
+            self.assertIn("1 completed tests retained", hung.stderr)
+            runner.write_text("import sys\nprint('startup failure', flush=True)\nsys.exit(23)\n")
+            failure = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(failure.returncode, 23)
+            self.assertIn("startup failure", failure.stdout)
+
+            runner.write_text(
+                "import unittest,time\n"
+                "class Cases(unittest.TestCase):\n"
+                " def test_a(self): time.sleep(0.6)\n"
+                " def test_b(self): time.sleep(0.6)\n"
+                " def test_c(self): time.sleep(0.6)\n"
+                "unittest.main()\n"
+            )
+            python_command = [sys.executable, str(guard), "--hang-seconds", "1", "--python-tests", str(runner)]
+            healthy_python = subprocess.run(python_command, text=True, capture_output=True)
+            self.assertEqual(healthy_python.returncode, 0, healthy_python.stderr)
+            self.assertIn("Ran 3 tests", healthy_python.stderr)
+            runner.write_text(
+                "import unittest,time\n"
+                "class Cases(unittest.TestCase):\n"
+                " def test_hung(self): time.sleep(30)\n"
+                "unittest.main()\n"
+            )
+            hung_python = subprocess.run(python_command, text=True, capture_output=True)
+            self.assertNotEqual(hung_python.returncode, 0)
+            self.assertIn("Hung Python test", hung_python.stderr)
+
+            node_fixture = pathlib.Path(temp_name) / "cases.mjs"
+            node_fixture.write_text(
+                "import {test} from 'node:test';\n"
+                "import {setTimeout} from 'node:timers/promises';\n"
+                "for (const name of ['first','second','third']) test(name, async()=>{console.log('running 3 tests');await setTimeout(600);});\n"
+            )
+            node_command = [sys.executable, str(guard), "--hang-seconds", "1", "--node-tests", str(node_fixture)]
+            healthy_node = subprocess.run(node_command, text=True, capture_output=True)
+            self.assertEqual(healthy_node.returncode, 0, healthy_node.stderr)
+            self.assertIn("third", healthy_node.stdout)
+            node_fixture.write_text(
+                "import {test} from 'node:test';\n"
+                "test('completed-before-hang',()=>{});\n"
+                "test('synchronous-hang',()=>{while(true){}});\n"
+            )
+            hung_node = subprocess.run(node_command, text=True, capture_output=True)
+            self.assertNotEqual(hung_node.returncode, 0)
+            # The spec reporter forwards worker stderr through runner stdout.
+            self.assertIn("Hung Node test: synchronous-hang", hung_node.stdout + hung_node.stderr)
+            self.assertIn("✔ completed-before-hang", hung_node.stdout)
+
 
 
 class RustToolchainParityTests(unittest.TestCase):
@@ -3845,7 +4019,7 @@ profile = "minimal"
         self.assertIn("unset DEV_CHECK_CONTRACT_CHILD", source)
         self.assertNotIn('if [[ "${DEV_CHECK_CONTRACT_CHILD', source)
         self.assertIn('"dev check contract tests" 1 \\\n', source)
-        self.assertIn("python3 tools/test_dev_check.py", source)
+        self.assertIn("python3 tools/run-test-hang-guard.py --python-tests tools/test_dev_check.py", source)
 
 
 def load_tests(loader, suite, pattern):

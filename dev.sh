@@ -770,6 +770,7 @@ run_check_stages() {
     local n_wasm n_loader n_docs n_contract
     local native_temp_dir="$DEV_CHECK_SCCACHE_ROOT/native-tmp/$(printf '%s' "$PWD" | hash_text | cut -c 1-12)"
 
+    run_stage "Test tooling syntax" 1 python3 -c 'from pathlib import Path; [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in Path("tools").glob("*.py")]'
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
@@ -799,11 +800,11 @@ run_check_stages() {
     (
         trap - EXIT INT TERM HUP
         run_stage_at "$n_loader" "web loader tests" "$repetitions" \
-            bash -c 'node --test services/chatgpt-dots/test/*.test.mjs && cd web/loader && exec node --test test/*.test.js' &&
+            bash -c 'python3 tools/run-test-hang-guard.py --node-tests services/chatgpt-dots/test/*.test.mjs && cd web/loader && exec python3 ../../tools/run-test-hang-guard.py --node-tests test/*.test.js' &&
             run_stage_at "$n_docs" "customer documentation" 1 \
                 python3 docs/build.py --check &&
             run_stage_at "$n_contract" "dev check contract tests" 1 \
-                bash -c 'python3 tools/test_dev_check.py && python3 tools/test_release_tooling.py && python3 tools/test_release_cadence.py'
+                bash -c 'python3 tools/run-test-hang-guard.py --python-tests tools/test_dev_check.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_tooling.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_cadence.py'
     ) &
     tail_pid=$!
 
