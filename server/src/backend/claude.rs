@@ -2511,6 +2511,15 @@ impl ClaudeInner {
                 summary,
                 model_hint: result_model_hint,
             } => {
+                tracing::info!(
+                    turn_id,
+                    emitted_phases = summary.emitted_phase_count,
+                    streamed_bytes = summary.streamed_text.len(),
+                    assistant_bytes = summary.assistant_text.as_ref().map(String::len),
+                    result_bytes = summary.result_text.as_ref().map(String::len),
+                    tool_calls = summary.tool_calls.len(),
+                    "Claude completed native turn payload"
+                );
                 let mut summary = summary;
                 let turn_usage = self
                     .normalize_usage_for_turn(summary.result_turn_usage.clone())
@@ -6885,6 +6894,13 @@ async fn read_claude_stdout_persistent(
                         recent_system_subtypes.warn_once_on_dropped_turn_start(&value);
                         continue;
                     }
+                    tracing::info!(
+                        frame_type = value.get("type").and_then(|field| field.as_str()),
+                        frame_subtype = value.get("subtype").and_then(|field| field.as_str()),
+                        cli_wake = inner.has_pending_cli_wake(),
+                        steer_turn = inner.has_pending_steer_turn(),
+                        "Adopting Claude native continuation"
+                    );
                     if inner.begin_cli_initiated_turn().await.is_none() {
                         // The finished turn is still installed because its
                         // finalizer runs concurrently. Wait for the hand-off:
@@ -7082,7 +7098,17 @@ fn is_cli_turn_start_event(value: &Value) -> bool {
         .unwrap_or_default();
     match event_type {
         "assistant" | "stream_event" | "event" => true,
-        "system" => value.get("subtype").and_then(Value::as_str) == Some("init"),
+        // set_cwd also emits init metadata followed by an empty success result.
+        // Only actual model output (or a failure) can open an unsolicited turn.
+        "system" => false,
+        "result" => {
+            value.get("is_error").and_then(Value::as_bool) == Some(true)
+                || value.get("subtype").and_then(Value::as_str) == Some("error")
+                || value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+        }
         other => is_stream_event_type(other),
     }
 }
@@ -15732,22 +15758,29 @@ impl Backend for ClaudeBackend {
         }
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
-        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
+        let roots = super::validate_local_workspace_roots(workspace_roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let handle = self
             .command_handle
             .lock()
             .expect("Claude command handle slot poisoned")
             .clone()
-            .ok_or_else(|| "Claude session is not ready".to_owned())?;
+            .ok_or_else(|| {
+                super::WorkspaceRelocationError::Rejected("Claude session is not ready".to_owned())
+            })?;
         let inner = &handle.inner;
         let event_gate = inner.turn_event_gate.lock().await;
         let state = inner.state.lock().await;
         if state.ssh_host.is_some() || state.ephemeral {
-            return Err(
+            return Err(super::WorkspaceRelocationError::Rejected(
                 "Claude workspace relocation requires a persistent local session".to_owned(),
-            );
+            ));
         }
+        // The CLI wake latch permits late output; it is not outstanding work.
         if state.closing
             || state.active_turn.is_some()
             || state.pending_compaction.is_some()
@@ -15757,16 +15790,37 @@ impl Backend for ClaudeBackend {
             || inner
                 .background_work_active
                 .load(std::sync::atomic::Ordering::Acquire)
-            || inner
-                .pending_cli_wake
-                .load(std::sync::atomic::Ordering::Acquire)
             || !inner
                 .native_subagent_tasks
                 .lock()
                 .expect("Claude native task mutex poisoned")
                 .is_empty()
         {
-            return Err("Claude session must be idle with no running background work before changing workspace roots".to_owned());
+            tracing::info!(
+                closing = state.closing,
+                active_turn = state.active_turn.is_some(),
+                pending_outcome = state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.outcome_tx.is_some()),
+                compaction = state.pending_compaction.is_some(),
+                typing = inner
+                    .typing_active
+                    .load(std::sync::atomic::Ordering::Acquire),
+                background = inner
+                    .background_work_active
+                    .load(std::sync::atomic::Ordering::Acquire),
+                cli_wake = inner
+                    .pending_cli_wake
+                    .load(std::sync::atomic::Ordering::Acquire),
+                native_tasks = inner
+                    .native_subagent_tasks
+                    .lock()
+                    .expect("Claude native task mutex poisoned")
+                    .len(),
+                "Deferring Claude workspace relocation until native work settles"
+            );
+            return Err(super::WorkspaceRelocationError::Busy);
         }
         let cwd = &roots[0];
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -15783,7 +15837,8 @@ impl Backend for ClaudeBackend {
                 }),
                 CLAUDE_CONTROL_RESPONSE_TIMEOUT,
             )
-            .await?;
+            .await
+            .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
         let mut state = inner.state.lock().await;
         match response.get("status").and_then(Value::as_str) {
             Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
@@ -15793,22 +15848,24 @@ impl Backend for ClaudeBackend {
                     .and_then(Value::as_bool)
                     != Some(true)
                 {
-                    return Err("Claude changed directory but could not relocate its transcript; resume storage must be reconciled before continuing".to_owned());
+                    return Err(super::WorkspaceRelocationError::OutcomeUnknown("Claude changed directory but could not relocate its transcript; resume storage must be reconciled before continuing".to_owned()));
                 }
             }
             Some("needs_trust") => {
-                return Err(format!(
+                return Err(super::WorkspaceRelocationError::Rejected(format!(
                     "Claude requires the user to trust destination {} before changing workspace roots",
                     response.get("directory").unwrap_or(&Value::Null)
-                ));
+                )));
             }
             Some("rejected") => {
-                return Err(format!("Claude rejected workspace relocation: {response}"));
+                return Err(super::WorkspaceRelocationError::Rejected(format!(
+                    "Claude rejected workspace relocation: {response}"
+                )));
             }
             _ => {
-                return Err(format!(
+                return Err(super::WorkspaceRelocationError::OutcomeUnknown(format!(
                     "Claude did not confirm workspace relocation; provider state must be reconciled: {response}"
-                ));
+                )));
             }
         }
         drop(state);
@@ -15824,7 +15881,8 @@ impl Backend for ClaudeBackend {
                 }),
                 CLAUDE_CONTROL_RESPONSE_TIMEOUT,
             )
-            .await?;
+            .await
+            .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
         inner.state.lock().await.workspace_roots = Some(roots.clone());
         tracing::info!(?session_id, ?roots, "Claude confirmed workspace roots");
         Ok(())

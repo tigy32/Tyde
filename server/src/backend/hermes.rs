@@ -579,7 +579,10 @@ pub struct HermesBackend {
 }
 
 enum HermesBackendCommand {
-    SetWorkspaceRoots(Vec<String>, oneshot::Sender<Result<(), String>>),
+    SetWorkspaceRoots(
+        Vec<String>,
+        oneshot::Sender<Result<(), super::WorkspaceRelocationError>>,
+    ),
     ReadSessionSettings(oneshot::Sender<Result<SessionSettingsValues, String>>),
     Input(AgentInput),
     Steer(protocol::SendMessagePayload, oneshot::Sender<SteerOutcome>),
@@ -1680,20 +1683,29 @@ impl Backend for HermesBackend {
         }
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
         if !self.workspace_is_local {
-            return Err(
+            return Err(super::WorkspaceRelocationError::Rejected(
                 "Hermes workspace relocation is currently supported only for local sessions"
                     .to_owned(),
-            );
+            ));
         }
-        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let roots = super::validate_local_workspace_roots(workspace_roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let (reply, result) = oneshot::channel();
         self.command_tx
             .send(HermesBackendCommand::SetWorkspaceRoots(roots, reply))
-            .map_err(|_| "Hermes session has closed".to_owned())?;
+            .map_err(|_| {
+                super::WorkspaceRelocationError::Rejected("Hermes session has closed".to_owned())
+            })?;
         result.await.map_err(|_| {
-            "Hermes closed while changing workspace roots; provider outcome is unknown".to_owned()
+            super::WorkspaceRelocationError::OutcomeUnknown(
+                "Hermes closed while changing workspace roots; provider outcome is unknown"
+                    .to_owned(),
+            )
         })?
     }
 
@@ -2508,7 +2520,10 @@ fn model_summary_from_payload(value: &Value) -> Option<String> {
 }
 
 impl HermesSessionActor {
-    async fn set_workspace_roots(&mut self, roots: Vec<String>) -> Result<(), String> {
+    async fn set_workspace_roots(
+        &mut self,
+        roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
         if self.mapper.current_message_id.is_some()
             || self.mapper.current_reasoning_seen
             || !self.mapper.pending_tools.is_empty()
@@ -2521,7 +2536,7 @@ impl HermesSessionActor {
                 .expect("Hermes active compaction mutex poisoned")
                 .is_some()
         {
-            return Err("Hermes session must be idle with no running background work before changing workspace roots".to_owned());
+            return Err(super::WorkspaceRelocationError::Busy);
         }
         let cwd = &roots[0];
         tracing::info!(session_id = %self.live_session_id, %cwd, "Changing Hermes workspace roots");
@@ -2544,7 +2559,14 @@ impl HermesSessionActor {
                     tracing::debug!(session_id = %self.live_session_id, "Waiting for Hermes native post-turn cleanup before relocation");
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) if error.code == Some(4009) => {
+                    return Err(super::WorkspaceRelocationError::Busy);
+                }
+                Err(error) => {
+                    return Err(super::WorkspaceRelocationError::OutcomeUnknown(
+                        error.to_string(),
+                    ));
+                }
             }
         };
         if response.get("cwd").and_then(Value::as_str) != Some(cwd.as_str()) {
@@ -2552,7 +2574,7 @@ impl HermesSessionActor {
                 ?response,
                 "Hermes did not confirm the requested workspace roots"
             );
-            return Err("Hermes did not confirm the requested workspace roots; provider state must be reconciled before continuing".to_owned());
+            return Err(super::WorkspaceRelocationError::OutcomeUnknown("Hermes did not confirm the requested workspace roots; provider state must be reconciled before continuing".to_owned()));
         }
         tracing::info!(session_id = %self.live_session_id, ?roots, "Hermes confirmed workspace roots");
         self.workspace_roots = Some(roots);
@@ -5766,7 +5788,16 @@ impl HermesEventMapper {
         if self.current_message_id.is_none() {
             return Err("Hermes emitted message.complete before message.start".to_string());
         }
-        let final_text = optional_raw_string(&payload, &["text"], "message.complete")?;
+        let final_text = if payload.get("text").is_some_and(Value::is_null) {
+            tracing::info!(
+                status = %status,
+                streamed_text = !self.current_text.is_empty(),
+                "Hermes completed a turn without a final text value"
+            );
+            None
+        } else {
+            optional_raw_string(&payload, &["text"], "message.complete")?
+        };
         let final_reasoning = optional_raw_string(&payload, &["reasoning"], "message.complete")?;
         let usage = payload.get("usage").and_then(token_usage_from_value);
         let cumulative_usage = payload

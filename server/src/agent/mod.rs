@@ -796,6 +796,7 @@ struct AgentProjectMoveContext<'a> {
 }
 
 enum ProjectMoveFailure {
+    Busy,
     Rejected(String),
     Unreconciled(String),
 }
@@ -832,7 +833,13 @@ async fn apply_agent_project_move(
                 .move_to_project(session_id, project_id.clone(), roots.clone())
                 .await
         }
-        Err(error) => Err(error),
+        Err(crate::backend::WorkspaceRelocationError::Busy) => {
+            return Err(ProjectMoveFailure::Busy);
+        }
+        Err(crate::backend::WorkspaceRelocationError::Rejected(error)) => {
+            return Err(ProjectMoveFailure::Rejected(error));
+        }
+        Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(error)) => Err(error),
     };
     if let Err(error) = moved {
         if previous_roots != roots
@@ -3891,6 +3898,7 @@ pub(crate) fn spawn_agent_actor(
         // while typing is on.
         let mut backend_typing = false;
         let mut scheduled_project_move: Option<ScheduledProjectMove> = None;
+        let mut project_move_waiting_for_backend = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
         let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
@@ -4242,7 +4250,8 @@ pub(crate) fn spawn_agent_actor(
         )>();
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
-            if scheduled_project_move.is_some() && matches!(lifecycle, ActorLifecycle::Running)
+            if scheduled_project_move.is_some() && !project_move_waiting_for_backend
+                && matches!(lifecycle, ActorLifecycle::Running)
                 && !in_turn && !backend_typing && !compaction_blocked && active_compaction.is_none()
                 && context_compaction.is_none() && !resume_replay_gate_pending
                 && pending_tool_response_ids.is_empty() && open_tool_call_ids.is_empty()
@@ -4273,9 +4282,15 @@ pub(crate) fn spawn_agent_actor(
                     Err(error) => Err(error),
                 };
                 drop(parent_guard);
-                drop(movement.guard);
+                let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
                 match result {
+                    Err(ProjectMoveFailure::Busy) => {
+                        tracing::info!("Keeping scheduled project entry pending until backend work settles");
+                        scheduled_project_move = Some(movement);
+                        project_move_waiting_for_backend = true;
+                    }
                     Ok(start) => {
+                        drop(movement.guard);
                         broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
                         pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                             message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
@@ -4283,11 +4298,8 @@ pub(crate) fn spawn_agent_actor(
                             images: None, origin: Some(MessageOrigin::AgentControl), tool_response: None,
                         }));
                     }
-                    Err(error) => {
-                        let (message, fatal) = match error {
-                            ProjectMoveFailure::Rejected(message) => (message, false),
-                            ProjectMoveFailure::Unreconciled(message) => (message, true),
-                        };
+                    Err(ProjectMoveFailure::Rejected(message) | ProjectMoveFailure::Unreconciled(message)) => {
+                        drop(movement.guard);
                         tracing::error!(fatal, "Scheduled project entry failed");
                         append_event(&canonical_stream, &mut event_log, &mut subscribers,
                             FrameKind::AgentError, &AgentErrorPayload {
@@ -5100,6 +5112,7 @@ pub(crate) fn spawn_agent_actor(
                         events.recv_backend().await
                     }
                 } => {
+                    project_move_waiting_for_backend = false;
                     let Some(event) = maybe_event else {
                         if let Some(compaction) = active_compaction.take() {
                             let _ = compaction
@@ -5229,9 +5242,7 @@ pub(crate) fn spawn_agent_actor(
                             return;
                         }
                         if matches!(lifecycle, ActorLifecycle::Closing) {
-                            let reply = close_reply
-                                .take()
-                                .expect("close requested without pending close reply");
+                            let reply = close_reply.take();
                             if let Some(backend) = backend.take() {
                                 backend.shutdown().await;
                             }
@@ -6395,9 +6406,7 @@ pub(crate) fn spawn_agent_actor(
                     if real_idle_transition
                         && matches!(lifecycle, ActorLifecycle::Closing)
                     {
-                        let reply = close_reply
-                            .take()
-                            .expect("close requested without pending close reply");
+                        let reply = close_reply.take();
                         let backend = backend
                             .take()
                             .expect("backend must exist while closing a live actor");
@@ -9306,6 +9315,7 @@ pub(crate) fn spawn_agent_actor(
                             } else {
                                 tracing::info!(in_turn, "Scheduled agent project entry at the next turn boundary");
                                 scheduled_project_move = Some(movement);
+                                project_move_waiting_for_backend = false;
                                 let _ = reply.send(Ok(()));
                             }
                         }
@@ -9323,6 +9333,7 @@ pub(crate) fn spawn_agent_actor(
                                     workspace_emitter: &workspace_emitter,
                                 }, project_id, roots).await {
                                     Ok(start) => Ok(start),
+                                    Err(ProjectMoveFailure::Busy) => Err(crate::backend::WorkspaceRelocationError::Busy.to_string()),
                                     Err(ProjectMoveFailure::Rejected(message)) => Err(message),
                                     Err(ProjectMoveFailure::Unreconciled(message)) => {
                                         accepting_input_task.store(false, Ordering::SeqCst);
@@ -9700,7 +9711,7 @@ pub(crate) fn spawn_agent_actor(
                                 UNKNOWN_TOOL_OUTCOME_MESSAGE,
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::StopForRestart).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -9769,9 +9780,7 @@ pub(crate) fn spawn_agent_actor(
                                 pending_tool_response_ids.clear();
                             }
                             if !in_turn || waiting_for_user_response {
-                                let reply = close_reply
-                                    .take()
-                                    .expect("close requested without pending close reply");
+                                let reply = close_reply.take();
                                 let backend = backend
                                     .take()
                                     .expect("backend must exist while closing a live actor");
@@ -9846,13 +9855,11 @@ pub(crate) fn spawn_agent_actor(
                     // an idle transition. Waiting longer only preserves an
                     // agent the user can no longer cancel, close, or message,
                     // so tear it down and say plainly that we did.
-                    let reply = close_reply
-                        .take()
-                        .expect("close deadline armed without pending close reply");
+                    let reply = close_reply.take();
                     tracing::warn!(
-                        agent_id = %current_start.agent_id,
+                        client_close_requested = reply.is_some(),
                         grace_ms = CLOSE_TURN_GRACE.as_millis(),
-                        "agent turn did not settle after close interrupt; forcing shutdown"
+                        "Agent shutdown deadline reached; terminating remaining native work"
                     );
                     if let Some(backend) = backend.take() {
                         backend.shutdown().await;
@@ -10122,7 +10129,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 "agent closed",
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
                             return;
                         }
                         if status_handle.snapshot().await.is_active() {
@@ -10332,7 +10339,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             "agent closed",
                         )
                         .await;
-                        finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                        finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
                         return;
                     }
                 }
@@ -10515,7 +10522,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::StopForRestart { reply } => {
                             status_handle.prepare_restart().await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::StopForRestart).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -10548,7 +10555,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
-                                finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                                finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
                                 return;
                             }
                             // A relay mirrors a backend-native child and owns no
@@ -10638,7 +10645,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         "agent closed",
                     )
                     .await;
-                    finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                    finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
                     return;
                 }
             }
@@ -10871,7 +10878,7 @@ enum ActorFinish {
 async fn finish_actor_close(
     accepting_input: &Arc<AtomicBool>,
     status_handle: &registry::AgentStatusHandle,
-    reply: oneshot::Sender<()>,
+    reply: Option<oneshot::Sender<()>>,
     finish: ActorFinish,
 ) {
     accepting_input.store(false, Ordering::SeqCst);
@@ -10890,7 +10897,9 @@ async fn finish_actor_close(
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
         .await;
-    let _ = reply.send(());
+    if let Some(reply) = reply {
+        let _ = reply.send(());
+    }
 }
 
 #[derive(Debug)]
@@ -11792,14 +11801,20 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
-                finish_actor_close(accepting_input, status_handle, reply, ActorFinish::Close).await;
+                finish_actor_close(
+                    accepting_input,
+                    status_handle,
+                    Some(reply),
+                    ActorFinish::Close,
+                )
+                .await;
                 break;
             }
             AgentCommand::StopForRestart { reply } => {
                 finish_actor_close(
                     accepting_input,
                     status_handle,
-                    reply,
+                    Some(reply),
                     ActorFinish::StopForRestart,
                 )
                 .await;

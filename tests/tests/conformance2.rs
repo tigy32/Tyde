@@ -2675,6 +2675,7 @@ async fn real_background_task_outlives_its_turn<B: Backend>(host: &mut Harness<B
     assert_no_empty_response(&waited);
     assert_final_text_contains(&waited, WAITED_MARKER);
     assert_foreground_command_stayed_foreground(&waited);
+
     // A backend that declines to run the command produces a clean, fast,
     // meaningless pass — which is what happened when this prompt was a
     // bare `sleep`.
@@ -2729,6 +2730,150 @@ async fn real_background_task_outlives_its_turn<B: Backend>(host: &mut Harness<B
             .chain(reported.events().iter()),
     );
 
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_workspace_move_after_background_completion,
+    [
+        BackendCapability::BackgroundTasks,
+        BackendCapability::SetWorkspaceRoots
+    ]
+);
+
+async fn real_workspace_move_after_background_completion<B: Backend>(host: &mut Harness<B>) {
+    let workspace = host.workspace().to_path_buf();
+    let memory = unique_payload();
+    trust_fixture_workspace(&workspace);
+    for name in ["relocation-release", "relocation-completed"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(workspace.join(name))
+            .status()
+            .expect("create completion handshake");
+        assert!(status.success(), "create completion handshake");
+    }
+    // A native FIFO handshake makes overlap independent of model latency and load.
+    let command = format!(
+        "read -r release < relocation-release; echo DONE > {BG_FILE}; echo {BG_OUTPUT_MARKER}; echo completed > relocation-completed"
+    );
+    let launch = match host.backend() {
+        BackendKind::Codex => format!(
+            "Run this exact shell command in {}: {command}. Use an ordinary foreground command, not &, nohup or a detached subshell. Do not wait for its output.",
+            workspace_root(&workspace)
+        ),
+        BackendKind::Hermes => format!(
+            "Call terminal exactly once with background=true, notify=true, command `{command}`, and workdir {}. Both flags must be JSON boolean true. Do not wait or poll.",
+            workspace_root(&workspace)
+        ),
+        _ => format!(
+            "Run this exact shell command in the background in {} and arrange to be told its output when it finishes: {command}. Do not wait or poll.",
+            workspace_root(&workspace)
+        ),
+    };
+    let prompt = format!(
+        "{launch} Your next action must execute that native tool call, not just acknowledge this request. The synthetic conversation token is {memory}. Remember it for the later file-writing step, but do not write it to disk yet. Only after actually starting the command, reply with exactly {BG_MARKER} and nothing else."
+    );
+    let agent = spawn_agent(host, &prompt).await;
+    let started = collect_turn(host, &agent, &prompt).await;
+    assert_final_text_contains(&started, BG_MARKER);
+    assert_no_error_message(&started.label(), started.events());
+    let watched: Vec<_> = started
+        .tool_requests()
+        .filter(|request| {
+            !started
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == request.tool_call_id)
+        })
+        .map(|request| request.tool_call_id.clone())
+        .collect();
+    assert!(
+        !watched.is_empty(),
+        "relocation scenario requires real background work after turn end"
+    );
+    assert!(
+        !workspace.join(BG_FILE).exists(),
+        "background command must still be running"
+    );
+    let destination = tempfile::tempdir().expect("relocation destination");
+    trust_fixture_workspace(destination.path());
+    let roots = vec![destination.path().to_str().unwrap().to_owned()];
+    assert!(
+        matches!(
+            set_workspace_roots(host, roots.clone()).await,
+            Err(server::backend::WorkspaceRelocationError::Busy)
+        ),
+        "running native work must reject relocation without mutation"
+    );
+    let wait = format!(
+        "Run this exact shell command in the foreground and wait for it to finish: \
+         python3 -c \"from pathlib import Path; import time; \
+         Path('foreground-started').touch(); \
+         Path('relocation-release').write_text('release\\n'); \
+         Path('relocation-completed').read_text(); \
+         Path('foreground-finished').touch(); print('OK')\". \
+         Do not run it in the background. Then reply with exactly {WAITED_MARKER}."
+    );
+    let waited = ask_until_marker_and_idle(host, &agent, &wait, WAITED_MARKER).await;
+    assert_no_error_message(&waited.label(), waited.events());
+    assert_final_text_contains(&waited, WAITED_MARKER);
+    assert_foreground_command_stayed_foreground(&waited);
+    assert!(
+        waited
+            .tool_requests()
+            .any(|request| matches!(&request.tool_type,
+                ToolRequestType::RunCommand { command, .. }
+                    if command.contains("foreground-started")
+                        && command.contains("foreground-finished")
+                        && command.contains("relocation-release")
+                        && command.contains("relocation-completed")
+            )),
+        "provider must execute the requested foreground overlap command"
+    );
+    let foreground_started = std::fs::metadata(workspace.join("foreground-started"))
+        .expect("foreground command started")
+        .modified()
+        .expect("foreground start timestamp");
+    let foreground_finished = std::fs::metadata(workspace.join("foreground-finished"))
+        .expect("foreground command finished")
+        .modified()
+        .expect("foreground finish timestamp");
+    let background_finished = std::fs::metadata(workspace.join(BG_FILE))
+        .expect("background command finished")
+        .modified()
+        .expect("background finish timestamp");
+    assert!(
+        foreground_started <= background_finished && background_finished <= foreground_finished,
+        "background completion must occur during the real foreground command"
+    );
+    assert!(
+        workspace.join(BG_FILE).exists(),
+        "background completion must overlap the later foreground turn"
+    );
+    let settled = relocate_workspace_when_ready(host, roots).await;
+    assert_no_error_message("background completion relocation", &settled);
+    assert_background_output_reached_its_card(
+        &started.label(),
+        &watched,
+        started
+            .events()
+            .iter()
+            .chain(waited.events())
+            .chain(settled.iter()),
+    );
+    let relocated = ask_until_marker_and_idle(host, &agent, "In the current runtime default working directory, write relocation-ready.txt using a relative filename. Put only the synthetic conversation token from the initial user message in that file, not a command-output or reply marker. Do not change directory or set an explicit tool cwd. Reply with TYDE_RELOCATED_AFTER_BACKGROUND.", "TYDE_RELOCATED_AFTER_BACKGROUND").await;
+    assert_final_text_contains(&relocated, "TYDE_RELOCATED_AFTER_BACKGROUND");
+    let actual = std::fs::read_to_string(destination.path().join("relocation-ready.txt"))
+        .expect("native tools wrote in the relocated workspace");
+    assert!(
+        actual.trim() == memory,
+        "relocation did not preserve the unique conversation token; bytes={}",
+        actual.trim().len()
+    );
+    assert!(
+        !workspace.join("relocation-ready.txt").exists(),
+        "native tools must not retain the original cwd"
+    );
+    assert_no_error_message(&relocated.label(), relocated.events());
     assert_clean_close(host, &agent).await;
 }
 
@@ -7926,10 +8071,63 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
             "STARTUP_ACCESS_OK"
         );
     }
+    let release_path = host.workspace().join("relocation-active");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&release_path)
+            .status()
+            .expect("create foreground relocation handshake")
+            .success()
+    );
+    let active_prompt = "Run this exact shell command once in the foreground in your runtime default working directory: `read -r release < relocation-active; pwd > relocation-busy-cwd.txt; echo TYDE_BUSY_SETTLED`. Wait for it to finish. Do not use a background job, change directory, or override the tool cwd. Then reply TYDE_BUSY_SETTLED.";
+    send_prompt(host, &agent, active_prompt).await;
+    let mut active = host.turn(active_prompt);
+    collect_turn_until(host, &mut active, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(true))
+    })
+    .await;
+    assert!(
+        matches!(
+            set_workspace_roots(host, roots.clone()).await,
+            Err(server::backend::WorkspaceRelocationError::Busy)
+        ),
+        "active foreground work must reject relocation without mutation"
+    );
+    let release = tokio::task::spawn_blocking(move || {
+        std::fs::write(release_path, "release\n").expect("release real foreground command")
+    });
+    collect_turn_until(host, &mut active, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    release.await.expect("foreground handshake writer");
+    assert_final_text_contains(&active, "TYDE_BUSY_SETTLED");
+    assert_foreground_command_stayed_foreground(&active);
+    assert!(active.tool_requests().any(|request| matches!(
+        &request.tool_type, ToolRequestType::RunCommand { command, .. }
+            if command.contains("relocation-active") && command.contains("relocation-busy-cwd.txt")
+    )), "busy relocation must exercise a real foreground command");
+    assert!(
+        std::fs::read_to_string(host.workspace().join("relocation-busy-cwd.txt"))
+            .expect("native cwd after busy rejection")
+            .trim_end()
+            == host
+                .workspace()
+                .canonicalize()
+                .expect("original workspace")
+                .to_str()
+                .unwrap(),
+        "busy rejection changed the native working directory"
+    );
+    assert!(
+        !Path::new(&roots[0])
+            .join("relocation-busy-cwd.txt")
+            .exists()
+    );
     set_workspace_roots(host, roots.clone())
         .await
         .expect("relocate live conversation");
-    let mut turns = vec![ready, startup];
+    let mut turns = vec![ready, startup, active];
     for output in [
         "relocation-result.txt",
         "relocation-after-rejection.txt",
@@ -7976,8 +8174,11 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
                 ],
             ] {
                 assert!(
-                    set_workspace_roots(host, invalid).await.is_err(),
-                    "accepted invalid workspace roots"
+                    matches!(
+                        set_workspace_roots(host, invalid).await,
+                        Err(server::backend::WorkspaceRelocationError::Rejected(_))
+                    ),
+                    "invalid workspace roots must be rejected before mutation"
                 );
             }
         }

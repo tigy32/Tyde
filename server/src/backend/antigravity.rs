@@ -91,7 +91,7 @@ static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mute
 
 struct WorkspaceRootsRequest {
     roots: Vec<String>,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Result<(), super::WorkspaceRelocationError>>,
 }
 
 #[derive(Clone)]
@@ -1150,7 +1150,7 @@ impl Supervisor {
                     let result = if input_rx.is_empty() {
                         self.set_workspace_roots(&mut process, roots).await
                     } else {
-                        Err("Antigravity has queued input and cannot change workspace roots".to_owned())
+                        Err(super::WorkspaceRelocationError::Busy)
                     };
                     let _ = reply.send(result);
                 }
@@ -1636,7 +1636,7 @@ impl Supervisor {
         &mut self,
         process: &mut AgyProcess,
         roots: Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), super::WorkspaceRelocationError> {
         let state = self.inner.state.lock().await;
         if state.closing
             || state.turn_active
@@ -1645,7 +1645,7 @@ impl Supervisor {
             || !self.native_pending.is_empty()
             || !self.native_children.is_empty()
         {
-            return Err("Antigravity session must be idle with no running background work before changing workspace roots".to_owned());
+            return Err(super::WorkspaceRelocationError::Busy);
         }
         drop(state);
         let mut launch = self.launch.clone();
@@ -1657,7 +1657,11 @@ impl Supervisor {
                 projection
                     .path()
                     .to_str()
-                    .ok_or("Antigravity skill projection path is not UTF-8")?
+                    .ok_or_else(|| {
+                        super::WorkspaceRelocationError::Rejected(
+                            "Antigravity skill projection path is not UTF-8".to_owned(),
+                        )
+                    })?
                     .to_owned(),
             );
         }
@@ -1666,7 +1670,11 @@ impl Supervisor {
                 projection
                     .path()
                     .to_str()
-                    .ok_or("Antigravity tool policy path is not UTF-8")?
+                    .ok_or_else(|| {
+                        super::WorkspaceRelocationError::Rejected(
+                            "Antigravity tool policy path is not UTF-8".to_owned(),
+                        )
+                    })?
                     .to_owned(),
             );
         }
@@ -1694,11 +1702,12 @@ impl Supervisor {
             Ok(replacement) => *process = replacement,
             Err(error) => {
                 if let Ok((before, after)) = metadata {
-                    replace_antigravity_metadata(&self.conversation_db, &after, &before)?;
+                    replace_antigravity_metadata(&self.conversation_db, &after, &before)
+                        .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
                 }
                 *process = AgyProcess::start(&self.launch, Some(&self.session_id), Arc::clone(&self.inner.emitter)).await
-                    .map_err(|recovery| format!("Workspace relocation failed: {error}; original runtime recovery failed: {recovery}"))?;
-                return Err(error);
+                    .map_err(|recovery| super::WorkspaceRelocationError::OutcomeUnknown(format!("Workspace relocation failed: {error}; original runtime recovery failed: {recovery}")))?;
+                return Err(super::WorkspaceRelocationError::OutcomeUnknown(error));
             }
         }
         self.launch = launch;
@@ -2843,15 +2852,25 @@ impl Backend for AntigravityBackend {
             .map_err(|_| "Antigravity settings update channel closed".to_owned())?
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
-        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
+        let roots = super::validate_local_workspace_roots(workspace_roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let (reply, result) = oneshot::channel();
         self.workspace_tx
             .send(WorkspaceRootsRequest { roots, reply })
-            .map_err(|_| "Antigravity session has closed".to_owned())?;
+            .map_err(|_| {
+                super::WorkspaceRelocationError::Rejected(
+                    "Antigravity session has closed".to_owned(),
+                )
+            })?;
         result.await.map_err(|_| {
-            "Antigravity closed while changing workspace roots; provider outcome is unknown"
-                .to_owned()
+            super::WorkspaceRelocationError::OutcomeUnknown(
+                "Antigravity closed while changing workspace roots; provider outcome is unknown"
+                    .to_owned(),
+            )
         })?
     }
 

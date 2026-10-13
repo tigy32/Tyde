@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use protocol::AgentInput;
 
-use super::{Backend, SendOutcome};
+use super::{Backend, SendOutcome, WorkspaceRelocationError};
 
 pub(crate) type BackendHandle = Box<dyn BackendSender>;
 
@@ -11,7 +11,7 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + '_>>;
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability;
     fn begin_compaction<'a>(
         &'a self,
@@ -51,7 +51,8 @@ impl<B: Backend> BackendSender for B {
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + '_>>
+    {
         Box::pin(Backend::set_workspace_roots(self, roots))
     }
 

@@ -704,16 +704,23 @@ impl Backend for MockBackend {
         Ok(sessions)
     }
 
-    async fn set_workspace_roots(&mut self, roots: Vec<String>) -> Result<(), String> {
-        let roots = crate::backend::validate_local_workspace_roots(roots)?;
-        let mut store = session_store()
-            .lock()
-            .expect("mock backend session store mutex poisoned");
-        let record = store
-            .get_mut(&self.session_id.0)
-            .ok_or("mock session is missing")?;
-        record.workspace_roots = roots;
-        Ok(())
+    async fn set_workspace_roots(
+        &mut self,
+        roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
+        let roots = crate::backend::validate_local_workspace_roots(roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(MockCommand::SetWorkspaceRoots { roots, reply })
+            .map_err(|_| {
+                super::WorkspaceRelocationError::Rejected("Mock backend is closed".to_owned())
+            })?;
+        received.await.map_err(|_| {
+            super::WorkspaceRelocationError::OutcomeUnknown(
+                "Mock backend closed during relocation".to_owned(),
+            )
+        })?
     }
 
     fn session_id(&self) -> SessionId {

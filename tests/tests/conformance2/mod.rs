@@ -2130,16 +2130,98 @@ pub fn trust_fixture_workspace(path: &Path) {
 pub async fn set_workspace_roots<B: Backend>(
     host: &mut Harness<B>,
     roots: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), server::backend::WorkspaceRelocationError> {
     let backend = host.backend.as_mut().expect("live backend");
     let session_id = backend.session_id();
     let result = backend.set_workspace_roots(roots).await;
-    assert_eq!(
-        backend.session_id(),
-        session_id,
+    assert!(
+        backend.session_id() == session_id,
         "workspace change replaced the conversation"
     );
     result
+}
+
+pub async fn ask_until_marker_and_idle<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    marker: &str,
+) -> Turn {
+    send_prompt(host, agent, prompt).await;
+    let mut turn = host.turn(prompt);
+    let mut answered = false;
+    loop {
+        match host
+            .events
+            .as_mut()
+            .expect("live backend stream")
+            .recv_backend()
+            .await
+            .expect("backend stayed open awaiting the requested response")
+        {
+            BackendEvent::Chat(event) => {
+                answered |= matches!(&event, ChatEvent::StreamEnd(end) if end.message.content.contains(marker));
+                match &event {
+                    ChatEvent::StreamEnd(end) => eprintln!(
+                        "WORKSPACE FOLLOW-UP response bytes={} requested_marker={} tools={}",
+                        end.message.content.len(),
+                        end.message.content.contains(marker),
+                        end.message.tool_calls.len()
+                    ),
+                    ChatEvent::TypingStatusChanged(typing) => {
+                        eprintln!("WORKSPACE FOLLOW-UP typing={typing} answered={answered}")
+                    }
+                    ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, protocol::MessageSender::Error) =>
+                    {
+                        eprintln!("WORKSPACE FOLLOW-UP native error before requested response")
+                    }
+                    _ => {}
+                }
+                let done = answered && matches!(event, ChatEvent::TypingStatusChanged(false));
+                turn.events.push(event);
+                if done {
+                    return turn;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => turn.model_requests.push(usage),
+            BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume during a live follow-up")
+            }
+        }
+    }
+}
+
+pub async fn relocate_workspace_when_ready<B: Backend>(
+    host: &mut Harness<B>,
+    roots: Vec<String>,
+) -> Vec<ChatEvent> {
+    let mut events = Vec::new();
+    loop {
+        match set_workspace_roots(host, roots.clone()).await {
+            Ok(()) => return events,
+            Err(server::backend::WorkspaceRelocationError::Busy) => {}
+            Err(server::backend::WorkspaceRelocationError::Rejected(_)) => {
+                panic!("workspace relocation rejected after native work")
+            }
+            Err(server::backend::WorkspaceRelocationError::OutcomeUnknown(_)) => {
+                panic!("workspace relocation reported an unknown mutation outcome")
+            }
+        }
+        match host
+            .events
+            .as_mut()
+            .expect("live backend stream")
+            .recv_backend()
+            .await
+            .expect("backend stayed open while relocation was pending")
+        {
+            BackendEvent::Chat(event) => events.push(event),
+            BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => panic!("unexpected resume during relocation"),
+        }
+    }
 }
 
 pub async fn set_session_setting_value<B: Backend>(

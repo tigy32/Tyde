@@ -943,18 +943,22 @@ impl KiroInner {
     async fn set_workspace_roots(
         self: &Arc<Self>,
         workspace_roots: Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::backend::WorkspaceRelocationError> {
         if self.ssh_host.is_some() || !self.capabilities.load_session {
-            return Err(
+            return Err(crate::backend::WorkspaceRelocationError::Rejected(
                 "ACP workspace relocation requires a local provider with session/load support"
                     .to_owned(),
-            );
+            ));
         }
-        let roots = crate::backend::validate_local_workspace_roots(workspace_roots)?;
+        let roots = crate::backend::validate_local_workspace_roots(workspace_roots)
+            .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
         let prompt_guard = Arc::clone(&self.prompt_lock)
             .try_lock_owned()
-            .map_err(|_| "ACP session must be idle before changing workspace roots".to_owned())?;
-        self.bridge.sync_inbound().await?;
+            .map_err(|_| crate::backend::WorkspaceRelocationError::Busy)?;
+        self.bridge
+            .sync_inbound()
+            .await
+            .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
         let (session_id, previous_root, startup_mcp_servers, settings) = {
             let state = self.state.lock().await;
             if self.shutting_down.load(Ordering::Acquire)
@@ -966,7 +970,7 @@ impl KiroInner {
                 || !self.native_child_sessions.lock().await.is_empty()
                 || !self.native_owned_children.lock().await.is_empty()
             {
-                return Err("ACP session must be idle with no running background work before changing workspace roots".to_owned());
+                return Err(crate::backend::WorkspaceRelocationError::Busy);
             }
             (
                 state.session_id.clone(),
@@ -985,19 +989,26 @@ impl KiroInner {
             kind,
             protocol::BackendKind::Grok | protocol::BackendKind::Opencode
         ) {
-            let mut spec = self.adapter.spawn_spec(
-                &super::adapter::AcpSessionRoots {
-                    session_cwd: cwd.clone(),
-                    scope_root: cwd.clone(),
-                },
-                None,
-            )?;
+            let mut spec = self
+                .adapter
+                .spawn_spec(
+                    &super::adapter::AcpSessionRoots {
+                        session_cwd: cwd.clone(),
+                        scope_root: cwd.clone(),
+                    },
+                    None,
+                )
+                .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
             if kind == protocol::BackendKind::Grok {
                 let index = spec
                     .local_args
                     .iter()
                     .position(|argument| argument == "stdio")
-                    .ok_or("Grok relocation requires its native agent stdio invocation")?;
+                    .ok_or_else(|| {
+                        crate::backend::WorkspaceRelocationError::Rejected(
+                            "Grok relocation requires its native agent stdio invocation".to_owned(),
+                        )
+                    })?;
                 spec.local_args.insert(index, "--no-leader".to_owned());
             }
             let program = spec.local_program.clone();
@@ -1025,13 +1036,17 @@ impl KiroInner {
                         _ => unreachable!(),
                     }
                 })
-                .await?;
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let initialized = self
                 .bridge
                 .request("initialize", acp_initialize_params(self.adapter.as_ref()))
-                .await?;
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let capabilities = parse_capabilities(&initialized);
-            authenticate_if_required(&self.bridge, &capabilities, self.adapter.as_ref()).await?;
+            authenticate_if_required(&self.bridge, &capabilities, self.adapter.as_ref())
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
         }
         let response = self
             .bridge
@@ -1045,8 +1060,9 @@ impl KiroInner {
             )
             .await;
         let drained = self.bridge.sync_inbound().await;
-        let response = response?;
-        drained?;
+        let response =
+            response.map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+        drained.map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
         if let Some(reported) = response
             .get("cwd")
             .or_else(|| response.get("currentWorkingDirectory"))
@@ -1054,8 +1070,10 @@ impl KiroInner {
             .and_then(Value::as_str)
             && reported != cwd
         {
-            return Err(format!(
-                "ACP provider reported workspace {reported} instead of {cwd}; provider state must be reconciled"
+            return Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(
+                format!(
+                    "ACP provider reported workspace {reported} instead of {cwd}; provider state must be reconciled"
+                ),
             ));
         }
         {
@@ -1076,8 +1094,12 @@ impl KiroInner {
             settings,
             persist: false,
         })
-        .await?;
-        self.bridge.sync_inbound().await?;
+        .await
+        .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+        self.bridge
+            .sync_inbound()
+            .await
+            .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
         drop(reload_guard);
         drop(prompt_guard);
         tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "ACP session reloaded in new workspace roots");
@@ -7221,7 +7243,10 @@ impl Backend for KiroBackend {
             .await
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), crate::backend::WorkspaceRelocationError> {
         self.command_handle
             .inner
             .set_workspace_roots(workspace_roots)

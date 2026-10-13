@@ -24250,21 +24250,28 @@ impl Backend for CodexBackend {
         }
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
         if !self.workspace_is_local {
-            return Err(
+            return Err(super::WorkspaceRelocationError::Rejected(
                 "Codex workspace relocation is currently supported only for local sessions"
                     .to_owned(),
-            );
+            ));
         }
-        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let roots = super::validate_local_workspace_roots(workspace_roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let handle = self
             .compaction_handle
             .lock()
             .expect("Codex command handle mutex poisoned")
             .clone()
-            .ok_or_else(|| "Codex session is not ready".to_owned())?;
-        let state = handle.inner.state.lock().await;
+            .ok_or_else(|| {
+                super::WorkspaceRelocationError::Rejected("Codex session is not ready".to_owned())
+            })?;
+        let inbound_guard = handle.inner.inbound_gate.lock().await;
+        let mut state = handle.inner.state.lock().await;
         if state.active_turn_id.is_some()
             || state.awaiting_root_turn_start
             || state.pending_compaction.is_some()
@@ -24277,10 +24284,23 @@ impl Backend for CodexBackend {
             || !state.subagent_streams.is_empty()
             || !state.pending_subagent_spawns.is_empty()
         {
-            return Err("Codex session must be idle with no running background work before changing workspace roots".to_owned());
+            tracing::info!(
+                active_turn = state.active_turn_id.is_some(),
+                turn_reserved = state.awaiting_root_turn_start,
+                compaction = state.pending_compaction.is_some(),
+                user_request = state.pending_request.is_some(),
+                pending_tools = state.pending_tool_call_ids.len(),
+                background_commands = state.background_commands.len(),
+                outstanding_commands = state.outstanding_command_executions.len(),
+                pending_wakes = state.pending_background_wakes.len(),
+                wake_in_flight = state.background_wake_request_in_flight,
+                native_children = state.subagent_streams.len(),
+                pending_spawns = state.pending_subagent_spawns.len(),
+                "Deferring Codex workspace relocation until native work settles"
+            );
+            return Err(super::WorkspaceRelocationError::Busy);
         }
         let thread_id = state.thread_id.clone();
-        drop(state);
         tracing::info!(%thread_id, ?roots, "Changing Codex workspace roots");
         handle
             .inner
@@ -24289,10 +24309,13 @@ impl Backend for CodexBackend {
                 "thread/settings/update",
                 json!({"threadId": thread_id, "cwd": roots[0]}),
             )
-            .await?;
+            .await
+            .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
         // Loaded thread/resume ignores root overrides. The native settings
         // setter accepts cwd; runtime roots are applied on each next turn.
-        handle.inner.state.lock().await.workspace_roots_override = Some(roots.clone());
+        state.workspace_roots_override = Some(roots.clone());
+        drop(state);
+        drop(inbound_guard);
         tracing::info!(%thread_id, ?roots, "Codex accepted cwd and staged runtime roots for subsequent turns");
         Ok(())
     }

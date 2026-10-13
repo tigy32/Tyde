@@ -819,8 +819,16 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .bearer_auth(token)
         .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))
         .send()
-        .await
-        .unwrap();
+        .await;
+    tracing::info!(
+        response_received = revoked.is_ok(),
+        response_status = revoked
+            .as_ref()
+            .map(|response| response.status().as_u16())
+            .ok(),
+        "Observed revoked MCP request transport"
+    );
+    let revoked = revoked.expect("revoked MCP response");
     assert_eq!(revoked.status(), reqwest::StatusCode::UNAUTHORIZED);
     drop(fixture);
     drop(service.stdin.take());

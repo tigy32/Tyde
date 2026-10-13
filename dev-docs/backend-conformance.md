@@ -48,6 +48,50 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Workspace relocation readiness
+
+Workspace relocation distinguishes `Busy`, `Rejected`, and `OutcomeUnknown`.
+The first two guarantee no native workspace mutation. Scheduled project entry
+retains its reservation on `Busy` and retries after backend events, without
+attempting restoration. Only an uncertain mutation or a failed persistence
+update requires restoration; failed restoration still terminates the affected
+conversation rather than continuing with inconsistent roots. Fatal internal
+shutdown has no initiating client close request, so its terminalization does
+not require a client reply channel.
+
+Codex can publish idle while native background-completion wakes remain pending.
+Its relocation guard and native cwd update are serialized with wake admission.
+Claude's pending CLI-wake latch permits later output routing, but is not an
+outstanding operation: an inline task notification can leave it armed after
+all real work finishes. Actual turns, background tasks and compaction still
+block relocation. A native `set_cwd` init-only sequence is metadata, not a
+model turn; unsolicited turns start on real output or failure, preventing a
+stale wake latch from inventing an empty assistant response during relocation.
+Hermes can emit a null final text on a cancelled native
+continuation; it is absent text, not malformed prose. Real failed or empty
+successful responses retain their existing error reporting.
+
+`real_workspace_move_after_background_completion` runs the same real command,
+foreground overlap, busy rejection, completion-card and relocated-relative-write
+oracles for every backend declaring `BackgroundTasks` and `SetWorkspaceRoots`:
+Claude, Codex and Hermes. It also verifies native conversation identity and
+earlier context survive the move. Filesystem timestamps bracket physical
+background completion inside the real foreground command, independently of
+whether the provider delivers its notification immediately or at a turn
+boundary. The existing server workbench protocol flow
+covers rejection without restoration, deferred entry with its reservation held,
+successful restoration after an uncertain outcome, and fatal failed restoration.
+Restoring the old unconditional-restoration behavior makes its rejection
+assertion fail; restoring Codex's untyped busy classification makes the real
+scenario's initial busy assertion fail.
+
+The existing `real_workspace_relocation` flow additionally holds a real
+foreground command with a FIFO and requires typed `Busy` with the native cwd
+unchanged, then typed `Rejected` for invalid roots. Its setup and oracles are
+identical for all seven `SetWorkspaceRoots` providers, including those without
+background-task support. The completion-overlap flow also uses FIFO handshakes,
+so correctness does not depend on model latency or host load.
+
 ## Typed input origins
 
 `real_mid_turn_steering` passes distinct `MessageOrigin::Tychat` identities in

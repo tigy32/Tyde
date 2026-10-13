@@ -1947,10 +1947,12 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     }
     let initial = MockGateHandle::new();
     let continued = MockGateHandle::new();
+    let shutdown = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "Entering worker",
-            MockScript::one(MockTurn::gated_text("Finishing the parent turn", &initial)),
+            MockScript::one(MockTurn::gated_text("Finishing the parent turn", &initial))
+                .with_shutdown_gate(&shutdown),
         )
         .await;
     let (agent, start) = fixture
@@ -2349,7 +2351,264 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             .find(|entry| entry.agent_id == start.agent_id)
             .unwrap()
             .project_id,
-        Some(parent.id),
+        Some(parent.id.clone()),
         "failed entry must never relabel the agent"
     );
+
+    use server::backend::WorkspaceRelocationError;
+
+    let destination = create_workbench(&mut fixture.client, &parent, "feature/readiness").await;
+    let mock = fixture.mock(&agent).await;
+    let rejecting = MockGateHandle::new();
+    mock.enqueue_all([
+        MockTurn::gated_text("Finishing before rejected relocation", &rejecting),
+        MockTurn::text("Reporting the rejected relocation"),
+    ])
+    .await;
+    mock.set_workspace_relocation_results(vec![
+        Err(WorkspaceRelocationError::Rejected(
+            "Destination rejected before mutation".to_owned(),
+        )),
+        Err(WorkspaceRelocationError::Rejected(
+            "Restoration was never admissible".to_owned(),
+        )),
+    ])
+    .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Try the rejected destination".to_owned())
+        .await
+        .unwrap();
+    rejecting.wait_until_entered().await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": destination.id.0}),
+    )
+    .await;
+    assert!(!failed, "schedule preflight rejection");
+    rejecting.release_one();
+    let rejected = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentError,
+        "preflight rejection remains recoverable",
+    )
+    .await
+    .parse_payload::<protocol::AgentErrorPayload>()
+    .unwrap();
+    assert!(
+        !rejected.fatal,
+        "a rejected move cannot terminate the conversation"
+    );
+    assert!(rejected.message.contains("before mutation"));
+    fixture.finish_turn(&agent).await;
+    let (_, unchanged) = fixture.connect_with_bootstrap().await;
+    let live = unchanged
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .expect("rejected agent is still alive");
+    assert_eq!(live.project_id, Some(parent.id.clone()));
+    assert_eq!(live.workspace_roots, project_roots(&parent));
+    let saved = unchanged
+        .sessions
+        .iter()
+        .find(|session| Some(&session.id) == start.session_id.as_ref())
+        .unwrap();
+    assert_eq!(saved.project_id, Some(parent.id.clone()));
+    assert_eq!(saved.workspace_roots, project_roots(&parent));
+
+    let finishing = MockGateHandle::new();
+    let background = MockGateHandle::new();
+    let relocated = MockGateHandle::new();
+    mock.enqueue_all([
+        MockTurn::gated_text(
+            "Finishing before native completion continuation",
+            &finishing,
+        ),
+        MockTurn::gated_text("Native background completion continuation", &background),
+        MockTurn::gated_text("Continuing in the relocated workspace", &relocated),
+    ])
+    .await;
+    mock.set_workspace_relocation_results(vec![Err(WorkspaceRelocationError::Busy), Ok(())])
+        .await;
+    fixture
+        .client
+        .send_message(
+            &agent.stream,
+            "Move after background work settles".to_owned(),
+        )
+        .await
+        .unwrap();
+    finishing.wait_until_entered().await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": destination.id.0}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "schedule relocation across native background continuation"
+    );
+    finishing.release_one();
+    background.wait_until_entered().await;
+    let (_, pending) = fixture.connect_with_bootstrap().await;
+    let live = pending
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .expect("busy agent is still alive");
+    assert_eq!(
+        live.project_id,
+        Some(parent.id.clone()),
+        "busy move cannot relabel the conversation"
+    );
+    assert_eq!(live.workspace_roots, project_roots(&parent));
+    let (failed, _) =
+        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
+    assert!(
+        failed,
+        "busy relocation must retain its movement reservation"
+    );
+    background.release_one();
+    let moved = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentProjectChanged,
+        "relocation after background continuation",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(moved.project_id, Some(destination.id.clone()));
+    assert_eq!(moved.workspace_roots, project_roots(&destination));
+    assert!(
+        moved.session_id == start.session_id,
+        "native continuation relocation preserves conversation identity"
+    );
+    relocated.wait_until_entered().await;
+    relocated.release_one();
+    fixture.finish_turn(&agent).await;
+
+    eprintln!("WORKSPACE MOVE PHASE: uncertain phase begin");
+    for restoration_succeeds in [true, false] {
+        let finishing = MockGateHandle::new();
+        mock.enqueue(MockTurn::gated_text(
+            "Finishing before uncertain relocation",
+            &finishing,
+        ))
+        .await;
+        if restoration_succeeds {
+            mock.enqueue(MockTurn::workspace_roots()).await;
+        }
+        mock.set_workspace_relocation_results(vec![
+            Err(WorkspaceRelocationError::OutcomeUnknown(
+                "Native relocation outcome was not confirmed".to_owned(),
+            )),
+            if restoration_succeeds {
+                Ok(())
+            } else {
+                Err(WorkspaceRelocationError::Rejected(
+                    "Original workspace could not be restored".to_owned(),
+                ))
+            },
+        ])
+        .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "Try the uncertain destination".to_owned())
+            .await
+            .unwrap();
+        finishing.wait_until_entered().await;
+        let (failed, _) = call_agent_control(
+            &fixture,
+            &start.agent_id,
+            "tyde_move_to_project",
+            json!({"project_id": parent.id.0}),
+        )
+        .await;
+        assert!(!failed, "schedule uncertain relocation");
+        finishing.release_one();
+        let error = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentError,
+            "uncertain relocation",
+        )
+        .await
+        .parse_payload::<protocol::AgentErrorPayload>()
+        .unwrap();
+        assert_eq!(
+            error.fatal, !restoration_succeeds,
+            "only an unreconciled native workspace can terminate the conversation"
+        );
+        let state = if restoration_succeeds {
+            eprintln!("WORKSPACE MOVE PHASE: await native workspace report");
+            let reported = fixture.finish_turn(&agent).await;
+            let effective = reported
+                .frames
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::ChatEvent)
+                .map(|frame| frame.parse_payload::<protocol::ChatEvent>().unwrap())
+                .find_map(|event| match event {
+                    protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                    _ => None,
+                })
+                .expect("native workspace report");
+            let effective: Vec<String> =
+                serde_json::from_str(&effective).expect("native workspace roots JSON");
+            assert_eq!(
+                effective,
+                project_roots(&destination),
+                "restoration must repair the effective native workspace, not just server metadata"
+            );
+            fixture.connect_with_bootstrap().await.1
+        } else {
+            eprintln!("WORKSPACE MOVE PHASE: await native shutdown");
+            shutdown.wait_until_entered().await;
+            eprintln!("WORKSPACE MOVE PHASE: native shutdown entered");
+            // Bootstrap attaches to the actor, which cannot serve commands while
+            // its native shutdown is gated. Release that boundary before attaching.
+            shutdown.release_one();
+            let (_, stopped) = fixture.connect_with_bootstrap().await;
+            assert!(
+                stopped
+                    .agents
+                    .iter()
+                    .any(|entry| entry.agent_id == start.agent_id),
+                "internal shutdown does not remove the stopped card"
+            );
+            eprintln!("WORKSPACE MOVE PHASE: await mock cleanliness after release");
+            mock.assert_clean().await;
+            eprintln!("WORKSPACE MOVE PHASE: restart after internal shutdown");
+            let restarted = fixture.restart_host().await;
+            assert!(
+                !restarted
+                    .agents
+                    .iter()
+                    .any(|entry| entry.agent_id == start.agent_id
+                        || entry.session_id == start.session_id),
+                "fatal internal shutdown must withdraw recovery before host restart"
+            );
+            restarted
+        };
+        let live = state
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id);
+        assert_eq!(live.is_some(), restoration_succeeds);
+        if let Some(live) = live {
+            assert_eq!(live.project_id, Some(destination.id.clone()));
+            assert_eq!(live.workspace_roots, project_roots(&destination));
+        }
+        let saved = state
+            .sessions
+            .iter()
+            .find(|session| Some(&session.id) == start.session_id.as_ref())
+            .unwrap();
+        assert_eq!(saved.project_id, Some(destination.id.clone()));
+        assert_eq!(saved.workspace_roots, project_roots(&destination));
+    }
+    mock.assert_clean().await;
 }

@@ -13,6 +13,10 @@ pub(super) enum MockCommand {
     /// The backend handed a send back as `Busy` and asked the actor to run a
     /// turn "it started on its own".
     EmitBusySelfTurn,
+    SetWorkspaceRoots {
+        roots: Vec<String>,
+        reply: oneshot::Sender<Result<(), crate::backend::WorkspaceRelocationError>>,
+    },
 }
 
 /// A recorded invariant violation at the backend boundary.
@@ -73,6 +77,10 @@ pub enum MockRequest {
 }
 
 pub(super) enum MockControlCommand {
+    SetWorkspaceRelocationResults {
+        results: Vec<Result<(), crate::backend::WorkspaceRelocationError>>,
+        ack: oneshot::Sender<()>,
+    },
     HoldUserBubbles {
         hold: bool,
         ack: oneshot::Sender<()>,
@@ -178,6 +186,17 @@ impl MockControl {
             .send(MockControlCommand::HoldUserBubbles { hold, ack })
             .expect(CONTROL_CLOSED);
         applied.await.expect(CONTROL_CLOSED);
+    }
+
+    pub async fn set_workspace_relocation_results(
+        &self,
+        results: Vec<Result<(), crate::backend::WorkspaceRelocationError>>,
+    ) {
+        let (ack, installed) = oneshot::channel();
+        self.tx
+            .send(MockControlCommand::SetWorkspaceRelocationResults { results, ack })
+            .expect(CONTROL_CLOSED);
+        installed.await.expect(CONTROL_CLOSED);
     }
 
     /// Install one more scripted turn and return once it is queued.

@@ -53,6 +53,7 @@ pub(super) fn start_mock_command_loop(
         agent_control_await_mcp,
         tychat_mcp,
         active_subagents: Vec::new(),
+        workspace_relocation_results: VecDeque::new(),
         initial_message,
         script,
         unbounded_echo,
@@ -115,6 +116,7 @@ struct MockActor {
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
     tychat_mcp: Option<MockAgentControlAwaitMcp>,
     active_subagents: Vec<SubAgentHandle>,
+    workspace_relocation_results: VecDeque<Result<(), crate::backend::WorkspaceRelocationError>>,
     initial_message: Option<String>,
     script: VecDeque<MockTurn>,
     unbounded_echo: bool,
@@ -237,6 +239,27 @@ impl MockActor {
                                 "queued-message inputs must be handled by the agent actor before reaching the backend"
                             );
                         }
+                        MockCommand::SetWorkspaceRoots { roots, reply } => {
+                            let result = match self.workspace_relocation_results.pop_front() {
+                                Some(result) => result,
+                                None => Ok(()),
+                            };
+                            if result.is_ok() || matches!(&result, Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(_))) {
+                                let mut store = super::session_store()
+                                    .lock()
+                                    .expect("mock backend session store mutex poisoned");
+                                let record = store.get_mut(&self.session_id.0)
+                                    .expect("live mock session");
+                                record.workspace_roots = roots;
+                            }
+                            let busy = matches!(result, Err(crate::backend::WorkspaceRelocationError::Busy));
+                            let _ = reply.send(result);
+                            if busy {
+                                self.handle_busy_self_turn(control).await
+                            } else {
+                                true
+                            }
+                        }
                         MockCommand::EmitBusySelfTurn => self.handle_busy_self_turn(control).await,
                         MockCommand::Interrupt => self.handle_interrupt(control).await,
                     };
@@ -251,6 +274,10 @@ impl MockActor {
 
     fn handle_control(&mut self, command: MockControlCommand) {
         match command {
+            MockControlCommand::SetWorkspaceRelocationResults { results, ack } => {
+                self.workspace_relocation_results = results.into();
+                let _ = ack.send(());
+            }
             MockControlCommand::HoldUserBubbles { hold, ack } => {
                 if hold {
                     assert!(

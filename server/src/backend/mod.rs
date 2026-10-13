@@ -503,6 +503,24 @@ impl Default for BackendSpawnConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum WorkspaceRelocationError {
+    Busy,
+    Rejected(String),
+    OutcomeUnknown(String),
+}
+
+impl std::fmt::Display for WorkspaceRelocationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("The backend must finish its turn and background work before changing workspace roots"),
+            Self::Rejected(message) | Self::OutcomeUnknown(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceRelocationError {}
+
 /// Output stream from a backend session. The agent actor receives both chat
 /// events and backend-only accounting events while independently sending
 /// AgentInput through the Backend handle.
@@ -1485,14 +1503,17 @@ pub trait Backend: Send + Sync + 'static {
     /// Unsupported root sets must be rejected, never truncated. A transport
     /// failure can leave the provider's outcome unknown; callers must not
     /// assume that every error means the provider rolled back the operation.
+    /// Busy and Rejected guarantee no workspace mutation. A scheduled move
+    /// retains its reservation on Busy and retries after backend events;
+    /// OutcomeUnknown requires reconciliation before the actor can continue.
     fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send {
         async move {
-            Err(format!(
+            Err(WorkspaceRelocationError::Rejected(format!(
                 "This backend does not support changing workspace roots to {workspace_roots:?}"
-            ))
+            )))
         }
     }
 

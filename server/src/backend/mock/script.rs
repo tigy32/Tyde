@@ -277,6 +277,7 @@ pub(super) enum MockTurnBody {
     Steps(Vec<MockStep>),
     RenderedEcho(Option<MockGate>),
     RenderedHistoryJoin,
+    RenderedWorkspaceRoots,
 }
 
 impl MockTurn {
@@ -291,6 +292,13 @@ impl MockTurn {
 
     pub fn text(text: impl Into<String>) -> Self {
         Self::done(text_steps(text.into(), TextShape::default()))
+    }
+
+    pub fn workspace_roots() -> Self {
+        Self {
+            body: MockTurnBody::RenderedWorkspaceRoots,
+            finish: MockTurnFinish::Done,
+        }
     }
 
     pub fn background_task_wait(tool_call_id: &str, drain: &MockGateHandle) -> Self {
@@ -765,7 +773,9 @@ impl MockTurn {
                     protocol::ChatEvent::GoalChanged(Some(goal)),
                 )),
             ),
-            MockTurnBody::RenderedEcho(_) | MockTurnBody::RenderedHistoryJoin => {
+            MockTurnBody::RenderedEcho(_)
+            | MockTurnBody::RenderedHistoryJoin
+            | MockTurnBody::RenderedWorkspaceRoots => {
                 panic!("goal state requires a frozen turn")
             }
         }
@@ -888,7 +898,9 @@ impl MockTurn {
     fn with_appended_steps(mut self, extra: Vec<MockStep>) -> Self {
         match &mut self.body {
             MockTurnBody::Steps(steps) => steps.extend(extra),
-            MockTurnBody::RenderedEcho(_) | MockTurnBody::RenderedHistoryJoin => {
+            MockTurnBody::RenderedEcho(_)
+            | MockTurnBody::RenderedHistoryJoin
+            | MockTurnBody::RenderedWorkspaceRoots => {
                 panic!("post-idle step builders apply to frozen turns, not rendered ones")
             }
         }
@@ -954,6 +966,19 @@ impl MockTurn {
                 ),
                 TextShape::default(),
             ),
+            MockTurnBody::RenderedWorkspaceRoots => {
+                let roots = super::session_store()
+                    .lock()
+                    .expect("mock backend session store mutex poisoned")
+                    .get(&session_id.0)
+                    .expect("live mock session")
+                    .workspace_roots
+                    .clone();
+                text_steps(
+                    serde_json::to_string(&roots).expect("workspace roots JSON"),
+                    TextShape::default(),
+                )
+            }
         };
         (steps, self.finish)
     }

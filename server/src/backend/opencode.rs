@@ -352,7 +352,10 @@ impl crate::backend::Backend for OpencodeBackend {
         self.0.update_session_settings(payload).await
     }
 
-    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+    async fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), super::WorkspaceRelocationError> {
         self.0.set_workspace_roots(workspace_roots).await
     }
 
