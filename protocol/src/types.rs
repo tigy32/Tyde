@@ -10051,6 +10051,13 @@ pub struct DotsAgentInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct DotsAwaitAgentsInput {
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub agent_ids: Vec<AgentId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DotsMessageInput {
     pub agent_id: AgentId,
     pub message: String,

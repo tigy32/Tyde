@@ -574,7 +574,7 @@ struct AwaitAgentStatus {
 }
 
 #[derive(Debug, Serialize)]
-struct AwaitAgentsResult {
+pub(crate) struct AwaitAgentsResult {
     ready: Vec<AwaitAgentStatus>,
     still_thinking: Vec<AwaitAgentStatus>,
 }
@@ -720,7 +720,7 @@ enum AwaitToolErrorCode {
 }
 
 #[derive(Debug)]
-enum AwaitToolFailure {
+pub(crate) enum AwaitToolFailure {
     HostStopping,
     Message(String),
 }
@@ -732,7 +732,7 @@ impl From<String> for AwaitToolFailure {
 }
 
 impl AwaitToolFailure {
-    fn into_tool_result(self, tool_name: &str) -> Result<CallToolResult, McpError> {
+    pub(crate) fn into_tool_result(self, tool_name: &str) -> Result<CallToolResult, McpError> {
         match self {
             Self::HostStopping => err_json(AwaitToolError {
                 code: AwaitToolErrorCode::HostStopping,
@@ -1362,8 +1362,8 @@ impl TydeAgentControlMcpServer {
             &self.host,
             agent_ids,
             context,
-            host_cancellation,
-            self.await_expiration.clone(),
+            Some(host_cancellation),
+            Some(self.await_expiration.clone()),
         )
         .await
         {
@@ -3035,12 +3035,12 @@ async fn await_review_round(
     }
 }
 
-async fn do_await_agents(
+pub(crate) async fn do_await_agents(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
     context: RequestContext<RoleServer>,
-    host_cancellation: CancellationToken,
-    host_expiration: CancellationToken,
+    host_cancellation: Option<CancellationToken>,
+    host_expiration: Option<CancellationToken>,
 ) -> Result<AwaitAgentsResult, AwaitToolFailure> {
     let cancellation_token = context.ct.clone();
     let progress_reporter = AwaitProgressReporter::from_context(&context);
@@ -3048,8 +3048,8 @@ async fn do_await_agents(
         host,
         agent_ids,
         Some(cancellation_token),
-        Some(host_cancellation),
-        Some(host_expiration),
+        host_cancellation,
+        host_expiration,
         progress_reporter,
     )
     .await
@@ -3323,7 +3323,7 @@ pub(crate) fn parse_agent_id(input: &str) -> Result<AgentId, String> {
     Ok(AgentId(input.to_string()))
 }
 
-fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
+pub(crate) fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
     let mut agent_ids = Vec::with_capacity(inputs.len());
     for input in inputs {
         let agent_id = parse_agent_id(&input)?;

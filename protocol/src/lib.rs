@@ -245,6 +245,6 @@ pub use types::{
 pub use types::{DotsCommandPayload, DotsConnectionStatus, DotsStatePayload};
 
 pub use types::{
-    DotsAgentInput, DotsEmptyInput, DotsHostRegistrationPayload, DotsMessageInput, DotsRelayFrame,
-    DotsSpawnAgentInput,
+    DotsAgentInput, DotsAwaitAgentsInput, DotsEmptyInput, DotsHostRegistrationPayload,
+    DotsMessageInput, DotsRelayFrame, DotsSpawnAgentInput,
 };

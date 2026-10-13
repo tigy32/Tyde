@@ -418,38 +418,40 @@ async fn execute(
     }
     let (transport, mut output) = OneshotTransport::<RoleServer>::new(message);
     let service = rmcp::service::serve_directly(DotsMcpServer::new(host), transport, None);
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(message) = output.recv().await {
-            if matches!(
-                message,
-                ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
-            ) {
-                return serde_json::to_string(&message)
-                    .map_err(|_| "Cannot encode MCP result".to_owned());
-            }
+    let result = loop {
+        let Some(message) = output.recv().await else {
+            break Err("Dots MCP operation ended without a result".to_owned());
+        };
+        if matches!(
+            message,
+            ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+        ) {
+            break serde_json::to_string(&message)
+                .map_err(|_| "Cannot encode MCP result".to_owned());
         }
-        Err("Dots MCP operation ended without a result".to_owned())
-    })
-    .await;
+    };
     service
         .cancel()
         .await
         .map_err(|_| "Cannot stop completed Dots MCP operation")?;
     match result {
-        Ok(Ok(body)) if body.len() <= 1000000 => Ok(DotsRelayFrame::Response {
+        Ok(body) if body.len() <= 1000000 => Ok(DotsRelayFrame::Response {
             transport_id,
             status: 200,
             body,
         }),
-        Ok(Ok(_)) => Ok(DotsRelayFrame::Response {
+        Ok(_) => Ok(DotsRelayFrame::Response {
             transport_id,
             status: 413,
             body: "{\"error\":\"result_too_large\"}".into(),
         }),
-        Ok(Err(_)) | Err(_) => Ok(DotsRelayFrame::Response {
-            transport_id,
-            status: 504,
-            body: "{\"error\":\"operation_failed\"}".into(),
-        }),
+        Err(reason) => {
+            tracing::warn!(%reason, "Remote MCP operation failed");
+            Ok(DotsRelayFrame::Response {
+                transport_id,
+                status: 504,
+                body: "{\"error\":\"operation_failed\"}".into(),
+            })
+        }
     }
 }

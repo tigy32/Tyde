@@ -54,8 +54,9 @@ ChatGPT enable switch.
 3. When ChatGPT opens the Tyde authorization page, enter the selected host's
    pairing code and approve access. Keep the code out of chat messages.
 4. Use the installed plugin in a chat and ask it to list this host's Tyde
-   projects before starting an agent. Spawning is not completion: read the
-   agent's result separately.
+   projects before starting an agent. Spawning is not completion: call
+   `tyde_await_agents` with all pending agent IDs, then `tyde_read_agent` for
+   each ready agent. Repeat for remaining work instead of polling.
 
 ChatGPT account/workspace permissions still apply. See the official OpenAI
 [custom MCP server guide](https://developers.openai.com/api/docs/guides/custom-mcp-server)
@@ -88,15 +89,26 @@ query parameters or automating account consent.
 - Requests and replies are size-bounded; request concurrency, OAuth expiry,
   host isolation, and offline/error behavior are enforced at the boundary.
 
-The same seven tools are exposed to every authorized client:
+The same eight tools are exposed to every authorized client:
 
 - `tyde_list_projects`
 - `tyde_list_launch_options`
 - `tyde_list_agents`
 - `tyde_spawn_agent`
+- `tyde_await_agents`
 - `tyde_read_agent`
 - `tyde_send_agent_message`
 - `tyde_interrupt_agent`
+
+`tyde_await_agents` requires a nonempty `agent_ids` array of distinct live
+agent IDs on the paired host. It waits on Tyde's existing status subscription
+until any requested agent is idle, awaiting user input, or failed, and returns
+`ready` and `still_thinking` lists containing only agent IDs and statuses.
+Read each ready agent separately for its latest assistant-visible result.
+`awaiting_user` requires a human answer; it is not completion. Neither the host
+operation nor the relay imposes an elapsed-time deadline. Host disconnect or
+integration disable ends pending transport requests; agents continue running.
+Client-side tool deadlines remain the client's responsibility.
 
 The integration does not expose arbitrary shell execution, configuration
 changes, direct merges, releases, or proactive MCP Events. Agents can use

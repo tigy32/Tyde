@@ -283,6 +283,26 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     let initialized = rpc(&http, &origin, token, "initialize", json!({"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"boundary-test", "version":"1"}})).await;
     assert!(initialized["capabilities"]["tools"].is_object());
     let tools = rpc(&http, &origin, token, "tools/list", json!({})).await;
+    let await_tool = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "tyde_await_agents")
+        .expect("Remote MCP must expose agent waiting without polling");
+    assert!(
+        await_tool["annotations"]["readOnlyHint"] == true
+            && await_tool["annotations"]["destructiveHint"] == false,
+        "Waiting only reads server-owned status"
+    );
+    assert!(
+        await_tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "agent_ids")
+            && await_tool["inputSchema"]["properties"]["agent_ids"]["minItems"] == 1,
+        "Remote clients must supply at least one agent identity"
+    );
     assert!(
         tools["tools"]
             .as_array()
@@ -455,13 +475,14 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             },
         "Read output must exactly match the client's completed assistant message"
     );
-    use server::backend::mock::{MockScript, MockTurn};
+    use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
     let held = fixture
         .spawn_scripted(
             "Dots controlled turn",
             MockScript::one(MockTurn::held_text("Initial held reply"))
                 .then(MockTurn::held_echo())
                 .then(MockTurn::echo())
+                .then(MockTurn::held_echo())
                 .with_mid_turn_steering()
                 .with_user_bubbles(),
         )
@@ -492,6 +513,53 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             },
         "Held read returns the exact completed assistant output"
     );
+    for agent_ids in [
+        json!([]),
+        json!([""]),
+        json!(["not-an-agent"]),
+        json!(["00000000-0000-0000-0000-000000000000"]),
+        json!([agent_id, agent_id]),
+    ] {
+        let invalid = rpc(
+            &http,
+            &origin,
+            token,
+            "tools/call",
+            json!({"name":"tyde_await_agents", "arguments":{"agent_ids":agent_ids}}),
+        )
+        .await;
+        assert!(invalid["isError"] == true, "Invalid wait targets must fail");
+    }
+    let selected = rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_await_agents", "arguments":{"agent_ids":[held.new_agent.agent_id, agent_id]}}),
+    )
+    .await;
+    assert!(
+        selected["structuredContent"]["result"]
+            == json!({
+                "ready": [{"agent_id":agent_id, "status":"idle"}],
+                "still_thinking": [{"agent_id":held.new_agent.agent_id, "status":"thinking"}]
+            }),
+        "Waiting returns statuses for all requested agents when any is ready, not output"
+    );
+    let pending = rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_await_agents", "arguments":{"agent_ids":[held.new_agent.agent_id]}}),
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(26), &mut pending)
+            .await
+            .is_err(),
+        "A thinking agent must keep the remote wait pending beyond both former transport deadlines"
+    );
     let steered = rpc(&http, &origin, token, "tools/call", json!({"name":"tyde_send_agent_message", "arguments":{"agent_id":held.new_agent.agent_id, "message":"Steer this held turn", "interrupt":false}})).await;
     assert!(steered["isError"] != true);
     let mut cancelled = false;
@@ -521,6 +589,15 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             matches!(event, ChatEvent::TypingStatusChanged(false))
         })
         .await;
+    let settled = pending.await;
+    assert!(
+        settled["structuredContent"]["result"]
+            == json!({
+                "ready": [{"agent_id":held.new_agent.agent_id, "status":"idle"}],
+                "still_thinking": []
+            }),
+        "Concurrent remote interruption must wake the status wait"
+    );
     rpc(&http, &origin, token, "tools/call", json!({"name":"tyde_send_agent_message", "arguments":{"agent_id":held.new_agent.agent_id, "message":"Start another held turn", "interrupt":false}})).await;
     fixture
         .next_chat_event_matching(&held, "Follow-up starts a new turn", |event| {
@@ -568,6 +645,97 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             },
         "Completed read returns exactly the assistant message observed over the protocol"
     );
+    let question_gate = MockGateHandle::new();
+    let question = fixture
+        .spawn_scripted(
+            "Remote user decision",
+            MockScript::one(MockTurn::async_question_request(
+                "remote-question",
+                &question_gate,
+            )),
+        )
+        .await;
+    question_gate.wait_until_entered().await;
+    question_gate.release_one();
+    fixture
+        .expect_paused_tool_request(&question, "AskUserQuestion")
+        .await;
+    let awaiting_user = rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_await_agents", "arguments":{"agent_ids":[question.new_agent.agent_id]}}),
+    )
+    .await;
+    assert!(
+        awaiting_user["structuredContent"]["result"]
+            == json!({
+                "ready": [{"agent_id":question.new_agent.agent_id, "status":"awaiting_user"}],
+                "still_thinking": []
+            }),
+        "An unanswered user question wakes remote waiting without claiming completion"
+    );
+    let close_gate = MockGateHandle::new();
+    fixture
+        .mock_by_id(&remote.new_agent.agent_id)
+        .await
+        .enqueue(MockTurn::busy_then_close_stream(&close_gate))
+        .await;
+    rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_send_agent_message", "arguments":{"agent_id":agent_id, "message":"End the backend stream"}}),
+    )
+    .await;
+    close_gate.wait_until_entered().await;
+    close_gate.release_one();
+    let failed = rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_await_agents", "arguments":{"agent_ids":[agent_id]}}),
+    )
+    .await;
+    assert!(
+        failed["structuredContent"]["result"]
+            == json!({
+                "ready": [{"agent_id":agent_id, "status":"failed"}],
+                "still_thinking": []
+            }),
+        "A backend stream failure wakes remote waiting with a failed status"
+    );
+    rpc(
+        &http,
+        &origin,
+        token,
+        "tools/call",
+        json!({"name":"tyde_send_agent_message", "arguments":{"agent_id":held.new_agent.agent_id, "message":"Hold through integration disable"}}),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&held, "Disable-window turn remains held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let disconnected_wait = http
+        .post(format!("{origin}/mcp"))
+        .bearer_auth(token)
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tyde_await_agents","arguments":{"agent_ids":[held.new_agent.agent_id]}}}))
+        .send();
+    tokio::pin!(disconnected_wait);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut disconnected_wait
+        )
+        .await
+        .is_err(),
+        "The remote wait is pending before disabling the integration"
+    );
     configuration_gate.send_replace(false);
     let disabled_write = fixture
         .client
@@ -610,6 +778,19 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         matches!(status, DotsConnectionStatus::Disabled)
     })
     .await;
+    let disconnected_wait = disconnected_wait.await.expect("Disconnected wait response");
+    assert!(
+        disconnected_wait.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "Disabling Remote MCP must end pending waits at the relay boundary"
+    );
+    let (client_after_disable, after_disable) = fixture.connect_with_bootstrap().await;
+    assert!(
+        after_disable.agents.iter().any(|agent| {
+            agent.agent_id == held.new_agent.agent_id && agent.activity == AgentActivity::Thinking
+        }),
+        "Disabling the integration does not interrupt the agent being awaited"
+    );
+    drop(client_after_disable);
     let disabled = http.post(format!("{origin}/mcp")).bearer_auth(token).json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tyde_spawn_agent","arguments":{"project_id":project.id,"prompt":"Must not run"}}})).send().await.unwrap();
     assert!(
         !disabled.status().is_success(),

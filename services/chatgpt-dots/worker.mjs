@@ -330,10 +330,9 @@ export class DotsBroker extends DurableObject {
       const transport_id = random();
       const payload = await body(request);
       return await new Promise(resolve => {
-        const timer = setTimeout(() => { this.pending.delete(transport_id); resolve(json({ error: "host_timeout" }, 504)); }, 25000);
-        this.pending.set(transport_id, { host_id: token.host_id, resolve, timer });
+        this.pending.set(transport_id, { host_id: token.host_id, resolve });
         try { sockets[0].send(Relay.request(payload, transport_id)); }
-        catch { clearTimeout(timer); this.pending.delete(transport_id); resolve(json({ error: "host_offline" }, 503)); }
+        catch { this.pending.delete(transport_id); resolve(json({ error: "host_offline" }, 503)); }
       });
     }
     return json({ error: "not_found" }, 404);
@@ -348,7 +347,6 @@ export class DotsBroker extends DurableObject {
     if (!Relay.isResponse(frame) || frame.status < 200 || frame.status > 599) {
       socket.close(1003, "Invalid transport response"); return;
     }
-    clearTimeout(pending.timer);
     this.pending.delete(frame.transport_id);
     pending.resolve(new Response(frame.body || null, { status: frame.status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-transform" } }));
   }
@@ -358,7 +356,7 @@ export class DotsBroker extends DurableObject {
   disconnected(socket) {
     const host_id = socket.deserializeAttachment().host_id;
     for (const [id, pending] of this.pending) if (pending.host_id === host_id) {
-      clearTimeout(pending.timer); this.pending.delete(id); pending.resolve(json({ error: "host_offline" }, 503));
+      this.pending.delete(id); pending.resolve(json({ error: "host_offline" }, 503));
     }
   }
 

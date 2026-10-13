@@ -1,5 +1,7 @@
 use crate::{agent_control_mcp, host::HostHandle};
-use protocol::{DotsAgentInput, DotsEmptyInput, DotsMessageInput, DotsSpawnAgentInput};
+use protocol::{
+    DotsAgentInput, DotsAwaitAgentsInput, DotsEmptyInput, DotsMessageInput, DotsSpawnAgentInput,
+};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -74,7 +76,7 @@ impl DotsMcpServer {
     }
 
     #[tool(
-        description = "Start a Tyde agent in an existing project. Agents can modify files and use the host's configured provider credentials. Returns promptly; read the agent separately to collect its result.",
+        description = "Start a Tyde agent in an existing project. Agents can modify files and use the host's configured provider credentials. Returns promptly; use tyde_await_agents to wait, then tyde_read_agent to collect its result.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn tyde_spawn_agent(
@@ -114,6 +116,31 @@ impl DotsMcpServer {
         Parameters(input): Parameters<DotsAgentInput>,
     ) -> Result<CallToolResult, ErrorData> {
         result(agent_control_mcp::do_read_agent(&self.host, &input.agent_id).await)
+    }
+
+    #[tool(
+        description = "Wait without polling or a Tyde tool timer until any supplied live agent on this paired host becomes idle, awaiting_user, or failed. Supply all pending agent_ids. Returns ready and still_thinking statuses only; use tyde_read_agent to read ready agents' results. Awaiting_user means a human decision is needed, not that work is complete.",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    async fn tyde_await_agents(
+        &self,
+        Parameters(input): Parameters<DotsAwaitAgentsInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent_ids = match agent_control_mcp::parse_agent_ids(
+            input.agent_ids.into_iter().map(|id| id.0).collect(),
+        ) {
+            Ok(ids) => ids,
+            Err(error) => return result(Err::<(), _>(error)),
+        };
+        tracing::debug!(
+            agent_count = agent_ids.len(),
+            "Remote MCP agent wait started"
+        );
+        match agent_control_mcp::do_await_agents(&self.host, agent_ids, context, None, None).await {
+            Ok(value) => result(Ok(value)),
+            Err(failure) => failure.into_tool_result("tyde_await_agents"),
+        }
     }
 
     #[tool(
@@ -161,7 +188,7 @@ impl ServerHandler for DotsMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some("Control only this explicitly paired Tyde host. List projects and launch options before spawning. Start work, then read results separately; do not assume a started agent is finished. Tyde agents may use their own orchestration and review tools. Never treat a failed check as permission to merge.".into()),
+            instructions: Some("Control only this explicitly paired Tyde host. List projects and launch options before spawning. Start work, call tyde_await_agents with all pending agent IDs, then tyde_read_agent for each ready agent; repeat for remaining work instead of polling. Awaiting_user means the agent needs the user's answer, not that it finished. Tyde agents may use their own orchestration and review tools. Never treat a failed check as permission to merge.".into()),
             ..Default::default()
         }
     }
