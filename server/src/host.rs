@@ -6948,6 +6948,103 @@ impl HostHandle {
         handle.move_to_project(project_id.cloned(), roots).await
     }
 
+    pub(crate) async fn validate_agent_project_entry(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<crate::agent::AgentHandle, String> {
+        let state = self.state.lock().await;
+        let handle = state
+            .registry
+            .agent_handle(agent_id)
+            .ok_or_else(|| "This agent is no longer running".to_owned())?;
+        let start = handle.snapshot();
+        if start.swarm_membership.is_some()
+            || start.team_id.is_some()
+            || start.workflow.is_some()
+            || start.origin == AgentOrigin::Tychat
+        {
+            return Err(
+                "Team, workflow, swarm, and Tychat agents cannot move independently".to_owned(),
+            );
+        }
+        if handle.is_closing() || handle.is_moving_project() {
+            return Err("This agent is closing or already moving".to_owned());
+        }
+        if !crate::backend::capabilities_for_backend_kind(start.backend_kind)
+            .contains(tyde_agent_adapter::BackendCapability::SetWorkspaceRoots)
+        {
+            return Err("This backend cannot move a running conversation".to_owned());
+        }
+        if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+            return Err("Close this agent's child agents before moving it".to_owned());
+        }
+        Ok(handle)
+    }
+
+    pub(crate) async fn schedule_agent_project_move(
+        &self,
+        agent_id: &AgentId,
+        project_id: &ProjectId,
+    ) -> Result<(), String> {
+        let handle = self.validate_agent_project_entry(agent_id).await?;
+        let project_store = self.state.lock().await.project_store.clone();
+        let current_id = handle
+            .snapshot()
+            .project_id
+            .ok_or_else(|| "Caller has no project".to_owned())?;
+        let canonical_id = {
+            let store = project_store.lock().await;
+            let current = store
+                .get(&current_id)
+                .ok_or_else(|| "Caller project no longer exists".to_owned())?;
+            current
+                .parent_project_id()
+                .cloned()
+                .unwrap_or(current_id.clone())
+        };
+        let parent_lock = self.workbench_parent_lock(&canonical_id).await;
+        let parent_guard = parent_lock.lock().await;
+        {
+            let store = project_store.lock().await;
+            let destination = store
+                .get(project_id)
+                .ok_or_else(|| "Destination project no longer exists".to_owned())?;
+            if destination.id != canonical_id
+                && destination.parent_project_id() != Some(&canonical_id)
+            {
+                return Err("Destination is outside caller project scope".to_owned());
+            }
+            crate::backend::validate_local_workspace_roots(
+                destination
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect(),
+            )?;
+        }
+        let move_guard = {
+            let state = self.state.lock().await;
+            let guard = handle.reserve_project_move()?;
+            if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+                return Err("Close this agent's child agents before moving it".to_owned());
+            }
+            if handle.snapshot().project_id != Some(current_id) {
+                return Err("Caller project changed before entry was scheduled".to_owned());
+            }
+            guard
+        };
+        let result = handle
+            .schedule_project_move(crate::agent::ScheduledProjectMove {
+                project_id: project_id.clone(),
+                project_store,
+                parent_lock: parent_lock.clone(),
+                guard: move_guard,
+            })
+            .await;
+        drop(parent_guard);
+        result
+    }
+
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
         const OPERATION: &str = "project_rename";
         let mut state = self.state.lock().await;
@@ -14397,6 +14494,13 @@ impl HostHandle {
         caller: &AgentId,
         review_id: Option<ReviewId>,
     ) -> Result<crate::review::ReviewHandle, String> {
+        if self
+            .agent_handle(caller)
+            .await
+            .is_some_and(|handle| handle.is_moving_project())
+        {
+            return Err("Project entry is pending. Finish your turn and request review after Tyde continues in the destination project.".to_owned());
+        }
         let project_id = self
             .project_id_for_agent(caller)
             .await

@@ -6111,6 +6111,13 @@ impl AppState {
             return;
         }
 
+        #[cfg(test)]
+        log::info!(
+            "Reassigning composer draft owner; previous_owner={}, next_owner={}, text_bytes={}",
+            current.is_some(),
+            next.is_some(),
+            text.len()
+        );
         self.flush_composer_drafts();
         composer.text.set(String::new());
         composer.draft_owner.set(next.clone());
@@ -6413,6 +6420,60 @@ impl AppState {
         // show, so it outranks any restore still in flight.
         self.retire_pending_restores();
         self.apply_active_project(next);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn reassign_agent_composer_drafts(
+        &self,
+        host_id: &str,
+        start: &protocol::AgentStartPayload,
+    ) {
+        // Only a live server assignment may rekey across projects. Cold
+        // restoration still requires the original project identity.
+        let matches = |owner: &PersistedComposerDraftOwner| {
+            matches!(owner,
+            PersistedComposerDraftOwner::ActiveChat {
+                host_id: owner_host, agent_id, session_id, ..
+            } if owner_host == host_id && agent_id == &start.agent_id
+                && (session_id == &start.session_id || session_id.is_none()))
+        };
+        let next = PersistedComposerDraftOwner::ActiveChat {
+            host_id: host_id.to_owned(),
+            agent_id: start.agent_id.clone(),
+            project_id: start.project_id.clone(),
+            session_id: start.session_id.clone(),
+        };
+        self.flush_composer_drafts();
+        self.composer_drafts.update(|drafts| {
+            let moved = drafts
+                .entries
+                .iter()
+                .find(|draft| matches(&draft.owner))
+                .cloned();
+            let previous: Vec<_> = drafts
+                .entries
+                .iter()
+                .filter(|draft| matches(&draft.owner))
+                .map(|draft| draft.owner.clone())
+                .collect();
+            for owner in previous {
+                drafts.remove(&owner);
+            }
+            if let Some(mut draft) = moved {
+                draft.owner = next.clone();
+                drafts.total_text_bytes += draft.text.len();
+                drafts.entries.insert(0, draft);
+            }
+        });
+        for composer in self.composers_for_flush() {
+            if composer
+                .draft_owner
+                .with_untracked(|owner| owner.as_ref().is_some_and(&matches))
+            {
+                composer.draft_owner.set(Some(next.clone()));
+            }
+        }
+        self.flush_composer_drafts();
     }
 
     pub(crate) fn follow_moved_agent_project(&self, next: Option<ActiveProjectRef>) {

@@ -447,6 +447,10 @@ enum AgentCommand {
     ReleaseCompaction {
         reply: oneshot::Sender<()>,
     },
+    ScheduleProjectMove {
+        movement: ScheduledProjectMove,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     MoveToProject {
         project_id: Option<protocol::ProjectId>,
         roots: Vec<String>,
@@ -773,6 +777,80 @@ impl Drop for AgentProjectMoveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+pub(crate) struct ScheduledProjectMove {
+    pub project_id: protocol::ProjectId,
+    pub project_store: Arc<tokio::sync::Mutex<crate::store::project::ProjectStore>>,
+    pub parent_lock: Arc<tokio::sync::Mutex<()>>,
+    pub guard: AgentProjectMoveGuard,
+}
+
+struct AgentProjectMoveContext<'a> {
+    backend: &'a mut crate::backend::handle::BackendHandle,
+    session_store: &'a SessionStoreHandle,
+    session_id: Option<&'a SessionId>,
+    current_start: &'a mut AgentStartPayload,
+    start_tx: &'a watch::Sender<AgentStartPayload>,
+    event_log: &'a mut AgentEventLog,
+    workspace_emitter: &'a HostSubAgentEmitter,
+}
+
+enum ProjectMoveFailure {
+    Rejected(String),
+    Unreconciled(String),
+}
+
+async fn apply_agent_project_move(
+    context: AgentProjectMoveContext<'_>,
+    project_id: Option<protocol::ProjectId>,
+    roots: Vec<String>,
+) -> Result<AgentStartPayload, ProjectMoveFailure> {
+    let session_id = context.session_id.ok_or_else(|| {
+        ProjectMoveFailure::Rejected("Agent has no saved conversation to move".to_owned())
+    })?;
+    if context.current_start.project_id == project_id
+        && context.current_start.workspace_roots == roots
+    {
+        return Ok(context.current_start.clone());
+    }
+    let previous_roots = context.current_start.workspace_roots.clone();
+    tracing::info!(
+        project_assigned = project_id.is_some(),
+        root_count = roots.len(),
+        roots_changed = previous_roots != roots,
+        "Moving agent workspace and project"
+    );
+    let moved = if previous_roots == roots {
+        Ok(())
+    } else {
+        context.backend.set_workspace_roots(roots.clone()).await
+    };
+    let moved = match moved {
+        Ok(()) => {
+            context
+                .session_store
+                .move_to_project(session_id, project_id.clone(), roots.clone())
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = moved {
+        if previous_roots != roots
+            && let Err(rollback) = context.backend.set_workspace_roots(previous_roots).await
+        {
+            return Err(ProjectMoveFailure::Unreconciled(format!(
+                "{error}. The workspace could not be restored: {rollback}. Reopen the saved conversation before continuing."
+            )));
+        }
+        return Err(ProjectMoveFailure::Rejected(error));
+    }
+    context.current_start.project_id = project_id;
+    context.current_start.workspace_roots = roots.clone();
+    context.workspace_emitter.set_workspace_roots(roots);
+    overwrite_agent_start_payload(context.event_log, context.current_start);
+    context.start_tx.send_replace(context.current_start.clone());
+    Ok(context.current_start.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1663,6 +1741,22 @@ impl AgentHandle {
         received
             .await
             .map_err(|_| "agent stopped before compaction was admitted".to_owned())?
+    }
+
+    pub(crate) async fn schedule_project_move(
+        &self,
+        movement: ScheduledProjectMove,
+    ) -> Result<(), String> {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return Err("Wait until the agent is ready before moving it".to_owned());
+        }
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::ScheduleProjectMove { movement, reply })
+            .map_err(|_| "Agent stopped before entry was scheduled".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Agent stopped before entry was admitted".to_owned())?
     }
 
     pub async fn move_to_project(
@@ -3162,7 +3256,7 @@ pub(crate) fn spawn_agent_actor(
         };
         let initial_cost_hint = spawn_config.cost_hint;
         let initial_session_settings = spawn_config.session_settings.clone();
-        let mut compaction_spawn_config = spawn_config.clone();
+        let compaction_spawn_config = spawn_config.clone();
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log = AgentEventLog::default();
         let mut latest_output = AgentControlLatestOutput::default();
@@ -3538,6 +3632,9 @@ pub(crate) fn spawn_agent_actor(
                                 &activity_stats,
                             ));
                         }
+                        AgentCommand::ScheduleProjectMove { reply, .. } => {
+                            let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned()));
+                        }
                         AgentCommand::MoveToProject { reply, .. } => {
                             let _ = reply.send(Err(
                                 "Wait until the agent is ready before moving it".to_owned(),
@@ -3794,6 +3891,7 @@ pub(crate) fn spawn_agent_actor(
         // gated on this: they are a narrow, deliberately terminal marker even
         // while typing is on.
         let mut backend_typing = false;
+        let mut scheduled_project_move: Option<ScheduledProjectMove> = None;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
         let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
@@ -4146,6 +4244,71 @@ pub(crate) fn spawn_agent_actor(
         )>();
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
+            if scheduled_project_move.is_some() && matches!(lifecycle, ActorLifecycle::Running)
+                && !in_turn && !backend_typing && !compaction_blocked && active_compaction.is_none()
+                && context_compaction.is_none() && !resume_replay_gate_pending
+                && pending_tool_response_ids.is_empty() && open_tool_call_ids.is_empty()
+                && !status_handle.snapshot().await.has_background_work {
+                let movement = match scheduled_project_move.take() {
+                    Some(movement) => movement,
+                    None => continue,
+                };
+                let parent_guard = movement.parent_lock.lock().await;
+                let roots = {
+                    let store = movement.project_store.lock().await;
+                    store.get(&movement.project_id)
+                        .ok_or_else(|| ProjectMoveFailure::Rejected("Destination project was removed before entry".to_owned()))
+                        .and_then(|project| crate::backend::validate_local_workspace_roots(
+                            project.root_paths().into_iter().map(|root| root.0).collect())
+                            .map_err(ProjectMoveFailure::Rejected))
+                };
+                let result = match roots {
+                    Ok(roots) => apply_agent_project_move(AgentProjectMoveContext {
+                        backend: backend.as_mut().expect("running actor has backend"),
+                        session_store: &session_store,
+                        session_id: current_session_id.as_ref(),
+                        current_start: &mut current_start,
+                        start_tx: &start_tx,
+                        event_log: &mut event_log,
+                        workspace_emitter: &workspace_emitter,
+                    }, Some(movement.project_id.clone()), roots).await,
+                    Err(error) => Err(error),
+                };
+                drop(parent_guard);
+                drop(movement.guard);
+                match result {
+                    Ok(start) => {
+                        broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
+                        pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
+                            message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
+                                movement.project_id, current_start.workspace_roots.join(", ")),
+                            images: None, origin: Some(MessageOrigin::AgentControl), tool_response: None,
+                        }));
+                    }
+                    Err(error) => {
+                        let (message, fatal) = match error {
+                            ProjectMoveFailure::Rejected(message) => (message, false),
+                            ProjectMoveFailure::Unreconciled(message) => (message, true),
+                        };
+                        tracing::error!(fatal, "Scheduled project entry failed");
+                        append_event(&canonical_stream, &mut event_log, &mut subscribers,
+                            FrameKind::AgentError, &AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal,
+                                message, fatal,
+                            }).await;
+                        if fatal {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            lifecycle = ActorLifecycle::Closing;
+                            close_deadline = Some(tokio::time::Instant::now());
+                        } else {
+                            pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
+                                message: "Tyde could not enter the destination project. Your project and workspace are unchanged. Report the entry failure; do not edit outside your assigned project.".to_owned(),
+                                images: None, origin: Some(MessageOrigin::AgentControl), tool_response: None,
+                            }));
+                        }
+                    }
+                }
+            }
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed agent replay log must project latest output");
@@ -6391,6 +6554,7 @@ pub(crate) fn spawn_agent_actor(
                         && !usage_paused
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
+                        && scheduled_project_move.is_none()
                         && !queue.is_empty()
                         && context_compaction.as_ref().is_none_or(|flight| {
                             queue.front().is_some_and(|queued| {
@@ -7160,7 +7324,8 @@ pub(crate) fn spawn_agent_actor(
                                     }
                                     let admission = if (usage_paused
                                         || in_turn
-                                        || context_compaction.is_some())
+                                        || context_compaction.is_some()
+                                        || scheduled_project_move.is_some())
                                         && !is_tool_response
                                     {
                                         None
@@ -9219,43 +9384,37 @@ pub(crate) fn spawn_agent_actor(
                             }
                             let _ = reply.send(());
                         }
+                        AgentCommand::ScheduleProjectMove { movement, reply } => {
+                            if !matches!(lifecycle, ActorLifecycle::Running) || scheduled_project_move.is_some()
+                                || compaction_blocked || active_compaction.is_some() || context_compaction.is_some()
+                                || resume_replay_gate_pending || status_handle.snapshot().await.has_background_work {
+                                let _ = reply.send(Err("Finish compaction and background work before entering another project".to_owned()));
+                            } else {
+                                tracing::info!(in_turn, "Scheduled agent project entry at the next turn boundary");
+                                scheduled_project_move = Some(movement);
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
                         AgentCommand::MoveToProject { project_id, roots, reply } => {
                             let result = if !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
                                 Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned())
-                            } else if current_start.project_id == project_id && current_start.workspace_roots == roots {
-                                Ok(current_start.clone())
                             } else {
-                                let session_id = current_session_id.as_ref().expect("running agent has session");
-                                let previous_roots = current_start.workspace_roots.clone();
-                                let live = backend.as_mut().expect("running actor has backend");
-                                tracing::info!(%agent_id, project_assigned = project_id.is_some(), root_count = roots.len(), roots_changed = previous_roots != roots, "Moving agent workspace and project");
-                                let moved = if previous_roots == roots {
-                                    Ok(())
-                                } else {
-                                    live.set_workspace_roots(roots.clone()).await
-                                };
-                                let moved = match moved {
-                                    Ok(()) => session_store.move_to_project(session_id, project_id.clone(), roots.clone()).await,
-                                    Err(error) => Err(error),
-                                };
-                                match moved {
-                                    Ok(()) => {
-                                        current_start.project_id = project_id;
-                                        current_start.workspace_roots = roots.clone();
-                                        workspace_emitter.set_workspace_roots(roots);
-                                        compaction_spawn_config.subagent_emitter = Some(workspace_emitter.clone());
-                                        overwrite_agent_start_payload(&mut event_log, &current_start);
-                                        start_tx.send_replace(current_start.clone());
-                                        Ok(current_start.clone())
-                                    }
-                                    Err(error) => {
-                                        // Native transports can fail after mutation. Reconcile before accepting another turn.
-                                        if previous_roots != roots && let Err(rollback) = live.set_workspace_roots(previous_roots).await {
-                                            accepting_input_task.store(false, Ordering::SeqCst);
-                                            lifecycle = ActorLifecycle::Closing;
-                                            close_deadline = Some(tokio::time::Instant::now());
-                                            Err(format!("{error}. The workspace could not be restored: {rollback}. Reopen the saved conversation before continuing."))
-                                        } else { Err(error) }
+                                match apply_agent_project_move(AgentProjectMoveContext {
+                                    backend: backend.as_mut().expect("running actor has backend"),
+                                    session_store: &session_store,
+                                    session_id: current_session_id.as_ref(),
+                                    current_start: &mut current_start,
+                                    start_tx: &start_tx,
+                                    event_log: &mut event_log,
+                                    workspace_emitter: &workspace_emitter,
+                                }, project_id, roots).await {
+                                    Ok(start) => Ok(start),
+                                    Err(ProjectMoveFailure::Rejected(message)) => Err(message),
+                                    Err(ProjectMoveFailure::Unreconciled(message)) => {
+                                        accepting_input_task.store(false, Ordering::SeqCst);
+                                        lifecycle = ActorLifecycle::Closing;
+                                        close_deadline = Some(tokio::time::Instant::now());
+                                        Err(message)
                                     }
                                 }
                             };
@@ -9390,6 +9549,13 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
+                            if scheduled_project_move.take().is_some() {
+                                append_event(&canonical_stream, &mut event_log, &mut subscribers,
+                                    FrameKind::AgentError, &AgentErrorPayload {
+                                        agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal,
+                                        message: "Project entry cancelled. Your project is unchanged.".to_owned(), fatal: false,
+                                    }).await;
+                            }
                             // A user stop supersedes the host's offer to
                             // continue the pre-restart turn; left owed, it
                             // would fire at the next idle edge and hold the
@@ -10337,6 +10503,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             .await;
                             let _ = reply.send(InterruptOutcome::Rejected);
                         }
+                        AgentCommand::ScheduleProjectMove { reply, .. } => { let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned())); }
                         AgentCommand::MoveToProject { reply, .. } => { let _ = reply.send(Err("This agent cannot move in its current state".to_owned())); }
             AgentCommand::SetName {
                             name,
@@ -11397,6 +11564,11 @@ async fn park_terminal_agent(
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
+            AgentCommand::ScheduleProjectMove { reply, .. } => {
+                let _ = reply.send(Err(
+                    "This agent cannot enter another project in its current state".to_owned(),
+                ));
+            }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
@@ -11609,6 +11781,11 @@ async fn park_relay_terminal_agent(
         match command {
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
+            }
+            AgentCommand::ScheduleProjectMove { reply, .. } => {
+                let _ = reply.send(Err(
+                    "This agent cannot enter another project in its current state".to_owned(),
+                ));
             }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));

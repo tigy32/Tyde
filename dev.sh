@@ -774,6 +774,8 @@ run_check_stages() {
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
     run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server -p tyde-dev-driver --bin tyde-dev-driver
+    run_stage "Provision JavaScript test tools" 1 \
+        npm ci --ignore-scripts --no-audit --no-fund
     # Avoid host /tmp churn, inherited Git roots, and long Unix socket paths.
     mkdir -p "$native_temp_dir"
     run_stage "cargo nextest run" "$repetitions" \

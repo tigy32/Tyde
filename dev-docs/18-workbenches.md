@@ -843,7 +843,7 @@ Not part of v1:
 ## 11. Agent-control MCP
 
 Authenticated control-surface callers can use `tyde_list_workbenches`,
-`tyde_create_workbench`, and `tyde_remove_workbench`. Listing is read-only and
+`tyde_create_workbench`, `tyde_move_to_project`, and `tyde_remove_workbench`. Listing is read-only and
 is limited to the caller's canonical standalone project plus that project's
 workbenches unless the caller passes `global: true`, which lists every project
 and workbench on the host (with the caller's own project as
@@ -851,6 +851,17 @@ and workbench on the host (with the caller's own project as
 Swarm members and sub-agents cannot list globally. Creation and removal are limited to that same standalone parent
 regardless of access mode. Removal defaults to safe dirty-root rejection;
 `force: true` is the explicit destructive override.
+
+Creation has two actions: `action: "create_only"` (the default) creates for a
+worker without moving the caller; `action: "enter"` creates for the caller and
+schedules entry. `tyde_move_to_project` enters an existing workbench or returns
+to its canonical parent. After scheduling entry, the agent must end its turn
+immediately, without editing or requesting review. At the safe idle boundary,
+Tyde moves the backend workspace and saved conversation together, emits the
+canonical project assignment to clients, then continues automatically. Reviews
+follow that assignment, never the shell directory. Coordinators create only
+and spawn workers with the returned project id. Team, workflow, and swarm
+members cannot move independently, and children must be closed before moving.
 
 Creation accepts an optional `base_ref`. When omitted, every parent root uses
 its current `HEAD`. Before any worktree is added, the server resolves the base
@@ -867,5 +878,5 @@ authoritative roots; supplied roots must match them. Without a project id,
 explicit non-empty roots remain required.
 
 The UI creation path continues to use parent `HEAD`; exposing base selection in
-the protocol and UI is deferred. Removal, reassignment, journaling, startup
-reconciliation, and idempotency keys are not part of this MCP v1.
+the protocol and UI is deferred. Workbench journaling, startup reconciliation,
+and idempotency keys remain outside this MCP surface.

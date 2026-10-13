@@ -537,6 +537,49 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         "the built-in override must be notified verbatim"
     );
 
+    for (id, instructions) in [
+        (
+            "tyde-implementer",
+            server::store::custom_agents::superseded_implementer_v1_instructions(),
+        ),
+        (
+            "tyde-lander",
+            server::store::custom_agents::superseded_lander_v1_instructions(),
+        ),
+        (
+            "tyde-project-manager",
+            server::store::custom_agents::superseded_project_manager_v3_instructions(),
+        ),
+    ] {
+        let mut previous = builtins.get(&CustomAgentId(id.to_owned())).unwrap().clone();
+        previous.instructions = Some(instructions);
+        fixture
+            .client
+            .custom_agent_upsert(CustomAgentUpsertPayload {
+                custom_agent: previous,
+            })
+            .await
+            .unwrap();
+        fixture
+            .next_frame_matching("previous workflow saved", |env| {
+                env.kind == FrameKind::CustomAgentNotify
+            })
+            .await;
+    }
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
+    for id in ["tyde-implementer", "tyde-lander", "tyde-project-manager"] {
+        let id = CustomAgentId(id.to_owned());
+        assert!(
+            upgraded.get(&id) == builtins.get(&id),
+            "Unedited workflow must upgrade on restart"
+        );
+    }
+    assert!(
+        upgraded.get(&orchestrator_id) == Some(&edited),
+        "Workflow migration must preserve user edits"
+    );
+
     let shipped_help_v2 = server::store::custom_agents::superseded_help_v2_instructions();
     let shipped_help_v1 = shipped_help_v2
         .split_once("\n\n## Global agent control")

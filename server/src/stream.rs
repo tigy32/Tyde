@@ -879,6 +879,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::NewAgent
         | FrameKind::AgentStart
         | FrameKind::AgentMoveResult
+        | FrameKind::AgentProjectChanged
         | FrameKind::AgentRenamed
         | FrameKind::AgentCompactNotify
         | FrameKind::ContextCompactionNotify

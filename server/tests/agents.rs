@@ -9379,12 +9379,34 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
     let mut fixture = Fixture::new().await;
     set_activity_summaries(&mut fixture.client, true).await;
 
+    // The assistant's echoed startup instructions exceed the 1200-character
+    // activity excerpt. Emit the real user bubble so the failure scenario does
+    // not depend on finding its marker beyond that intentional truncation.
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "summary-error",
+            MockScript::new().with_unbounded_echo().with_user_bubbles(),
+        )
+        .await;
     let agent = fixture
         .spawn(
             "summary-error",
             "__mock_fail_activity_summary__ keep working",
         )
         .await;
+    drop(reservation);
+    let user = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &agent.stream,
+        "summary failure user input",
+        |event| matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User)),
+    )
+    .await;
+    assert!(
+        matches!(user, ChatEvent::MessageAdded(message)
+        if matches!(message.sender, MessageSender::User) && message.content.contains("__mock_fail_activity_summary__")),
+        "the real user message must carry the summary failure scenario"
+    );
 
     expect_strict_mock_turn(
         &mut fixture.client,
@@ -9421,6 +9443,17 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
         .send_message(&agent.stream, "activity after summary failure".to_owned())
         .await
         .expect("send follow-up after summary failure failed");
+    let user = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &agent.stream,
+        "summary failure follow-up input",
+        |event| matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User)),
+    )
+    .await;
+    assert!(
+        matches!(user, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User)),
+        "follow-up retains its real user bubble"
+    );
     expect_strict_mock_turn(
         &mut fixture.client,
         &agent.stream,

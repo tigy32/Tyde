@@ -501,6 +501,14 @@ struct CreateWorkbenchToolInput {
     branch: String,
     name: Option<String>,
     base_ref: Option<String>,
+    #[serde(default)]
+    action: protocol::WorkbenchCreateAction,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MoveProjectToolInput {
+    project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -518,6 +526,7 @@ struct CreateWorkbenchResult {
     branch: String,
     parent_project_id: String,
     roots: Vec<CreatedWorkbenchRootResult>,
+    entry_scheduled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1213,7 +1222,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Create a git workbench under the authenticated caller's project. Writable host/project swarms use their explicit workspace scope. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Uncommitted and untracked parent changes are disclosed but never copied. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
+        description = "Create a git workbench under the authenticated caller's project. Choose action=enter to create and schedule moving yourself into it; finish this turn immediately without editing or requesting review, and Tyde will move your conversation and automatically continue in that project. Choose action=create_only (the default) when coordinating workers; it leaves your project unchanged. Never work in a workbench just by changing shell directories. Writable host/project swarms may create only, within their explicit workspace scope. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Uncommitted and untracked parent changes are disclosed but never copied. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
     )]
     async fn tyde_create_workbench(
         &self,
@@ -1226,6 +1235,31 @@ impl TydeAgentControlMcpServer {
             Err(error) => return Ok(err_text(error)),
         };
         match do_create_workbench(&self.host, &caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Move yourself into your canonical project or one of its workbenches, preserving the conversation. Requires an explicit project_id from tyde_list_workbenches. Moving is scheduled at the end of your current turn: finish immediately without editing or requesting review; Tyde updates your backend workspace, UI project, and review target together, then automatically continues your task. Use this to enter an existing workbench or return to the parent before landing and removing it. Close your children and background work first. Team, workflow, and swarm members cannot move independently."
+    )]
+    async fn tyde_move_to_project(
+        &self,
+        Parameters(input): Parameters<MoveProjectToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_move_to_project").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let result = async {
+            let project_id = parse_project_id(&input.project_id)?;
+            self.host.schedule_agent_project_move(&caller, &project_id).await?;
+            Ok::<_, String>(json!({"project_id": project_id, "entry_scheduled": true,
+                "instruction": "Finish this turn now. Tyde will move your conversation and continue automatically in the destination project. Do not edit or request review before that continuation."}))
+        }.await;
+        match result {
             Ok(result) => ok_json(result),
             Err(error) => Ok(err_text(error)),
         }
@@ -2499,6 +2533,9 @@ async fn do_create_workbench(
             parent_project_id, canonical_project_id
         ));
     }
+    if input.action == protocol::WorkbenchCreateAction::Enter {
+        host.validate_agent_project_entry(caller).await?;
+    }
     let branch = input.branch.trim();
     if branch.is_empty() {
         return Err("branch must not be empty".to_owned());
@@ -2522,7 +2559,13 @@ async fn do_create_workbench(
         )
         .await
         .map_err(|error| error.to_string())?;
-    create_workbench_result(created)
+    let mut result = create_workbench_result(created)?;
+    if input.action == protocol::WorkbenchCreateAction::Enter {
+        host.schedule_agent_project_move(caller, &ProjectId(result.project_id.clone())).await
+            .map_err(|error| format!("Workbench {} was created, but entry failed: {error}. Your project is unchanged; use tyde_move_to_project to enter it explicitly.", result.project_id))?;
+        result.entry_scheduled = true;
+    }
+    Ok(result)
 }
 
 fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchResult, String> {
@@ -2539,6 +2582,7 @@ fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchR
         ));
     };
     Ok(CreateWorkbenchResult {
+        entry_scheduled: false,
         project_id,
         name,
         branch: branch.0,

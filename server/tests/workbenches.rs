@@ -10,11 +10,11 @@ use protocol::{
     AgentId, AgentStartPayload, BackendAccessMode, BackendKind, CommandErrorCode,
     CommandErrorPayload, CustomAgent, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
     GitBranchName, NewAgentPayload, NewTerminalPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectNotifyPayload,
-    ProjectRootPath, ProjectSource, SpawnAgentParams, SpawnAgentPayload, Steering, SteeringId,
-    SteeringScope, SteeringUpsertPayload, TeamCreatePayload, TeamMemberCreateSpec,
-    TerminalCreatePayload, TerminalLaunchTarget, ToolPolicy, WorkbenchCreatePayload,
-    WorkbenchRemovePayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectId,
+    ProjectNotifyPayload, ProjectRootPath, ProjectSource, SpawnAgentParams, SpawnAgentPayload,
+    Steering, SteeringId, SteeringScope, SteeringUpsertPayload, TeamCreatePayload,
+    TeamMemberCreateSpec, TerminalCreatePayload, TerminalLaunchTarget, ToolPolicy,
+    WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -1270,6 +1270,7 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
         .expect("project id")
         .to_owned();
     let root = &created["roots"][0];
+    assert_eq!(created["entry_scheduled"], false);
     assert_eq!(root["base_commit"], base_head);
     assert_eq!(root["parent_root_dirty"], true);
     let worktree_root = root["worktree_root"]
@@ -1912,4 +1913,445 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         "verifying losing concurrent spawn did not register",
     )
     .await;
+}
+
+#[tokio::test]
+async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() {
+    let repo = init_git_repo("self-entry");
+    let extra = init_git_repo("self-entry-extra");
+    let unrelated_repo = init_git_repo("unrelated-entry");
+    let mut fixture =
+        Fixture::new_with_mock_backend_for_enabled_backends(vec![BackendKind::Codex]).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let parent = create_project(&mut fixture.client, vec![repo.path(), extra.path()]).await;
+    let unrelated = create_project(&mut fixture.client, vec![unrelated_repo.path()]).await;
+    let config_url = fixture.config_mcp_http_url().await;
+    for (name, arguments) in [
+        (
+            "tyde_config_upsert_review_aspect",
+            json!({"aspect": {
+                "name": "Workspace", "description": "Workspace ownership", "instructions": "Review the frozen changes", "enabled": true
+            }}),
+        ),
+        (
+            "tyde_config_set_setting",
+            json!({"setting": {"setting": "review_reviewers", "mode": "light", "reviewers": [
+                {"id": "entry-reviewer", "name": "Entry", "target": {"kind": "explicit", "backend_kind": "codex", "session_settings": {}}}
+            ]}}),
+        ),
+    ] {
+        let (failed, _) =
+            call_agent_control_request(config_url.clone(), None, name.to_owned(), arguments).await;
+        assert!(!failed, "entry review configuration failed");
+    }
+    let initial = MockGateHandle::new();
+    let continued = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Entering worker",
+            MockScript::one(MockTurn::gated_text("Finishing the parent turn", &initial)),
+        )
+        .await;
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("Entering worker".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&parent),
+                prompt: "Work in an isolated workbench".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    initial.wait_until_entered().await;
+    fixture
+        .next_chat_event_matching(&agent, "parent turn active before entry", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue(MockTurn::gated_text(
+            "Working inside the workbench",
+            &continued,
+        ))
+        .await;
+    let mut observer = fixture.connect().await;
+    let (failed, created) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_create_workbench",
+        json!({
+            "parent_project_id": parent.id.0, "branch": "feature/self-entry", "action": "enter"
+        }),
+    )
+    .await;
+    assert!(!failed, "create and enter failed");
+    let created: Value = serde_json::from_str(&created).expect("entry JSON");
+    assert_eq!(created["entry_scheduled"], true);
+    let workbench_id = ProjectId(created["project_id"].as_str().unwrap().to_owned());
+    let roots: Vec<String> = created["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["worktree_root"].as_str().unwrap().to_owned())
+        .collect();
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let before = before
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .unwrap();
+    assert_eq!(
+        before.project_id,
+        Some(parent.id.clone()),
+        "pending entry must not relabel a running turn"
+    );
+    assert_eq!(before.workspace_roots, project_roots(&parent));
+    let (failed, _) =
+        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
+    assert!(failed, "pending entry must not review the old project");
+    initial.release_one();
+    let changed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentProjectChanged,
+        "workbench entry",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(changed.agent_id, start.agent_id);
+    assert!(
+        changed.session_id == start.session_id,
+        "entry preserves the conversation"
+    );
+    assert_eq!(changed.project_id, Some(workbench_id.clone()));
+    assert_eq!(changed.workspace_roots, roots);
+    let broadcast = expect_kind(
+        &mut observer,
+        FrameKind::AgentProjectChanged,
+        "second client entry",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(broadcast.project_id, changed.project_id);
+    assert_eq!(broadcast.workspace_roots, changed.workspace_roots);
+    continued.wait_until_entered().await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let saved = after
+        .sessions
+        .iter()
+        .find(|saved| Some(&saved.id) == start.session_id.as_ref())
+        .unwrap();
+    assert_eq!(saved.project_id, Some(workbench_id.clone()));
+    assert_eq!(saved.workspace_roots, roots);
+    continued.release_one();
+    let continuation = fixture.finish_turn(&agent).await;
+    assert!(
+        continuation
+            .chat_events()
+            .iter()
+            .any(|event| matches!(event, protocol::ChatEvent::TypingStatusChanged(true))),
+        "entry must start a client-visible continuation turn without user input"
+    );
+    assert!(
+        continuation
+            .chat_events()
+            .iter()
+            .any(|event| matches!(event,
+        protocol::ChatEvent::StreamEnd(end)
+            if matches!(end.message.sender, protocol::MessageSender::Assistant { .. })
+                && end.message.content == "Working inside the workbench")),
+        "the client must receive the automatic continuation's assistant output"
+    );
+
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": unrelated.id.0}),
+    )
+    .await;
+    assert!(failed, "entry must not widen caller project scope");
+    fs::write(
+        Path::new(&roots[0]).join("README.md"),
+        "# Workbench changes\n",
+    )
+    .unwrap();
+    next_frame_matching_on(&mut fixture.client, "workbench reviewable changes", |env| {
+        env.stream.0 == format!("/project/{}", workbench_id.0)
+            && env.kind == FrameKind::ProjectGitStatus
+            && env
+                .parse_payload::<protocol::ProjectGitStatusPayload>()
+                .unwrap()
+                .roots
+                .iter()
+                .any(|root| {
+                    root.root.0 == roots[0]
+                        && root.files.iter().any(|file| {
+                            file.relative_path == "README.md" && file.unstaged.is_some()
+                        })
+                })
+    })
+    .await;
+    let reviewer_gate = MockGateHandle::new();
+    let reviewer_reservation = fixture
+        .reserve_next_mock_launch(
+            "Review: Entry",
+            MockScript::one(MockTurn::gated_text(
+                "Reviewing the workbench",
+                &reviewer_gate,
+            )),
+        )
+        .await;
+    let (failed, body) =
+        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
+    assert!(!failed, "review after entry failed");
+    let review: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        review["status"], "running",
+        "configured reviewer must actually launch"
+    );
+    let reviewer = next_frame_matching_on(&mut fixture.client, "workbench reviewer", |env| {
+        env.kind == FrameKind::NewAgent
+            && env.parse_payload::<NewAgentPayload>().unwrap().name == "Review: Entry"
+    })
+    .await
+    .parse_payload::<NewAgentPayload>()
+    .unwrap();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &reviewer.instance_stream,
+        "entered project reviewer busy",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(true)),
+    )
+    .await;
+    let review_id = protocol::ReviewId(review["review_id"].as_str().unwrap().to_owned());
+    fixture
+        .client
+        .review_subscribe(&review_id, protocol::ReviewSubscribePayload::default())
+        .await
+        .unwrap();
+    let snapshot = expect_kind(
+        &mut fixture.client,
+        FrameKind::ReviewBootstrap,
+        "entered project review",
+    )
+    .await
+    .parse_payload::<protocol::ReviewBootstrapPayload>()
+    .unwrap()
+    .review;
+    assert_eq!(snapshot.project_id, workbench_id);
+    assert!(
+        snapshot.diffs.iter().any(|diff| diff.root.0 == roots[0]),
+        "review must freeze the workbench's actual changes"
+    );
+    assert_eq!(reviewer.project_id, Some(workbench_id.clone()));
+    assert_eq!(reviewer.parent_agent_id, Some(start.agent_id.clone()));
+    reviewer_gate.wait_until_entered().await;
+    reviewer_gate.release_one();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &reviewer.instance_stream,
+        "entered project reviewer idle",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&reviewer.instance_stream)
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "reviewer closed", |env| {
+        env.kind == FrameKind::AgentClosed
+    })
+    .await;
+    drop(reviewer_reservation);
+    assert!(review["review_id"].is_string());
+
+    let returned = MockGateHandle::new();
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue(MockTurn::gated_text(
+            "Back in the parent project",
+            &returned,
+        ))
+        .await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": parent.id.0}),
+    )
+    .await;
+    assert!(!failed, "return to parent failed");
+    let moved = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentProjectChanged,
+        "parent return",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(moved.project_id, Some(parent.id.clone()));
+    assert_eq!(moved.workspace_roots, project_roots(&parent));
+    assert!(
+        moved.session_id == start.session_id,
+        "return preserves the conversation"
+    );
+    returned.wait_until_entered().await;
+    let (failed, body) = call_agent_control(&fixture, &start.agent_id, "tyde_create_workbench", json!({
+        "parent_project_id": parent.id.0, "branch": "feature/coordinator", "action": "create_only"
+    })).await;
+    assert!(!failed, "create only failed");
+    let created: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(created["entry_scheduled"], false);
+    let (_, unchanged) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        unchanged
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap()
+            .project_id,
+        Some(parent.id.clone()),
+        "coordinators must stay in their project"
+    );
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": workbench_id.0, "force": true}),
+    )
+    .await;
+    assert!(!failed, "returning to parent must allow workbench cleanup");
+    returned.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "parent continuation idle", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue(MockTurn::held_text("Current turn before cancelled entry"))
+        .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Continue in the parent".to_owned())
+        .await
+        .unwrap();
+    fixture
+        .next_chat_event_matching(&agent, "cancellable turn active", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": created["project_id"]}),
+    )
+    .await;
+    assert!(!failed, "schedule existing workbench entry");
+    fixture.client.interrupt(&agent.stream).await.unwrap();
+    let cancelled = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentError,
+        "cancelled project entry",
+    )
+    .await
+    .parse_payload::<protocol::AgentErrorPayload>()
+    .unwrap();
+    assert!(cancelled.message.contains("entry cancelled"));
+    fixture
+        .next_chat_event_matching(&agent, "cancelled turn idle", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let (_, cancelled) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        cancelled
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap()
+            .project_id,
+        Some(parent.id.clone()),
+        "Stop must cancel entry and its automatic continuation"
+    );
+
+    let removal = MockGateHandle::new();
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue_all([
+            MockTurn::gated_text("Current turn before removed destination", &removal),
+            MockTurn::text("Reporting the explicit entry failure"),
+        ])
+        .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Check destination removal".to_owned())
+        .await
+        .unwrap();
+    removal.wait_until_entered().await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": created["project_id"]}),
+    )
+    .await;
+    assert!(!failed, "schedule entry before removal");
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: ProjectId(created["project_id"].as_str().unwrap().to_owned()),
+            force: false,
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "pending destination removed", |env| {
+        env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+            ProjectNotifyPayload::Delete { project } if project.id.0 == created["project_id"].as_str().unwrap())
+    }).await;
+    removal.release_one();
+    let failed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentError,
+        "removed destination entry error",
+    )
+    .await
+    .parse_payload::<protocol::AgentErrorPayload>()
+    .unwrap();
+    assert!(failed.message.contains("removed before entry"));
+    assert!(!failed.fatal);
+    fixture.finish_turn(&agent).await;
+    let (_, unchanged) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        unchanged
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap()
+            .project_id,
+        Some(parent.id),
+        "failed entry must never relabel the agent"
+    );
 }

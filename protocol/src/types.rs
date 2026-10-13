@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 80;
+pub const PROTOCOL_VERSION: u32 = 81;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1033,6 +1033,7 @@ pub enum FrameKind {
     ProjectCreate,
     AgentMove,
     AgentMoveResult,
+    AgentProjectChanged,
     ProjectRename,
     ProjectReorder,
     ProjectAddRoot,
@@ -1253,6 +1254,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectCreate => f.write_str("project_create"),
             Self::AgentMove => f.write_str("agent_move"),
             Self::AgentMoveResult => f.write_str("agent_move_result"),
+            Self::AgentProjectChanged => f.write_str("agent_project_changed"),
             Self::ProjectRename => f.write_str("project_rename"),
             Self::ProjectReorder => f.write_str("project_reorder"),
             Self::ProjectAddRoot => f.write_str("project_add_root"),
@@ -5605,6 +5607,14 @@ pub struct ProjectDeletePayload {
 pub enum ProjectNotifyPayload {
     Upsert { project: Project },
     Delete { project: Project },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchCreateAction {
+    #[default]
+    CreateOnly,
+    Enter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

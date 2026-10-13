@@ -70,7 +70,14 @@ pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
     "when its backend can't steer); `interrupt: true` always cancels that turn and sends next. Call `tyde_await_agents` with all pending child IDs: like select, ",
     "it returns when any is ready. Read ready children with `tyde_read_agent`, act on their ",
     "output, then await remaining work. Don't poll or expect injected results.\n",
-    "Close your agents when you no longer need them."
+    "Close your agents when you no longer need them.\n",
+    "Work in your assigned Tyde project. When creating a workbench for yourself, use ",
+    "`tyde_create_workbench` with `action: \"enter\"`; coordinators use `action: \"create_only\"` ",
+    "and spawn workers in its project. Use `tyde_move_to_project` to enter an existing workbench ",
+    "or return to its parent before landing and cleanup. Entry is scheduled at the end of ",
+    "your current turn: finish immediately, without editing or requesting review; Tyde ",
+    "will move your conversation and continue automatically. Never substitute a shell ",
+    "directory change for entering a project. Your UI location and reviews follow your project."
 );
 
 /// Tyde's own steering for a session holding `startup_mcp_servers`.

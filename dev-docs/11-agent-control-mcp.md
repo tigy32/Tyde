@@ -775,7 +775,25 @@ Creation accepts a branch, an optional non-blank display name, and optional
 passes only full commit SHAs to git, and reports each parent root, worktree
 root, base SHA, and dirty-parent flag. Dirty parent content is never copied.
 
-Agents enter a workbench by calling `tyde_spawn_agent` with its `project_id`.
-The server derives authoritative roots from that project. Supplied roots must
+Workbench creation has two actions: `action: "create_only"` (the default)
+leaves the caller in its project, while `action: "enter"` schedules entry into
+the new workbench. Coordinators create only and call `tyde_spawn_agent` with
+the workbench's `project_id`; workers request reviews of their own project.
+
+`tyde_move_to_project` enters an existing workbench or returns to its standalone
+parent. It accepts an explicit project id within the caller's canonical project
+scope. The caller must finish its current turn immediately after scheduling
+entry, without editing or requesting review. At the safe idle boundary the
+server changes the native backend workspace and saved conversation assignment,
+emits `AgentProjectChanged` with the canonical `AgentStartPayload`, and sends
+an automatic continuation. Agent identity, conversation, and parent-agent
+relationship are preserved. UI grouping, workspace roots, and reviews follow
+that one project assignment; shell directory changes never reassign it.
+Pending entry blocks child spawns and reviews. User interruption cancels it.
+Destination removal or relocation failure is surfaced explicitly without
+claiming the agent entered it. Team, workflow, and swarm scopes cannot move
+independently; existing manual UI moves still require an idle standalone agent.
+
+The server derives authoritative roots from the selected project. Supplied roots must
 match; missing/removing projects, mismatches, and a request with neither a
 project nor roots fail before agent registration.

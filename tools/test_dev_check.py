@@ -1498,6 +1498,14 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
 
     def _write_fake_commands(self) -> None:
         self._write(
+            "npm",
+            """#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == "ci --ignore-scripts --no-audit --no-fund" ]]
+echo "npm-ci" >> "$DEV_CHECK_TEST_LOG"
+""",
+        )
+        self._write(
             "cargo",
             """#!/usr/bin/env bash
 set -euo pipefail
@@ -1712,6 +1720,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo build -p tyde-server --bin tyde-server ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
+        self.assertEqual(lines.count("npm-ci"), 1)
+        self.assertLess(
+            lines.index("npm-ci"),
+            next(i for i, line in enumerate(lines) if line.startswith("cargo nextest run ")),
+        )
         self.assertEqual(lines.count("native-tools-prepare"), 1)
         self.assertEqual(lines.count("wasm-prepare"), 1)
         self.assertLess(

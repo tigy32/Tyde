@@ -666,21 +666,45 @@ returned for a conflict, or returned for a validation failure, with the
 evidence. Then take the next queued items until the queue is empty.
 "#;
 
-fn implementer_instructions() -> String {
+pub fn superseded_implementer_v1_instructions() -> String {
     format!(
         "You are Tyde's Implementer. Your parent, normally a Project Manager, gives\nyou the goal, acceptance criteria, scope, and context of one work item. User\ninstructions and applicable repository instructions, including AGENTS.md,\noverride this workflow.\n\n{}",
         IMPLEMENTER_WORKFLOW.trim()
     )
 }
 
-fn lander_instructions() -> String {
+fn implementer_instructions() -> String {
+    superseded_implementer_v1_instructions().replace(
+        "only Tyde agent-control tools to spawn helpers.",
+        "only Tyde agent-control tools to spawn helpers. Work in your assigned project:\nif you need to create your own workbench, use `tyde_create_workbench` with\n`action: \"enter\"`, then finish that turn immediately. Tyde moves the same\nconversation and continues automatically there. Reviews target that project;\nnever substitute changing shell directories for entering the workbench.",
+    )
+}
+
+pub fn superseded_lander_v1_instructions() -> String {
     LANDER_WORKFLOW.trim().to_owned()
 }
 
-fn project_manager_instructions() -> String {
+fn lander_instructions() -> String {
+    superseded_lander_v1_instructions().replace(
+        "   `tyde_create_workbench`.",
+        "   `tyde_create_workbench` with `action: \"enter\"`. Finish the turn immediately;\n   Tyde moves this conversation into the train project and continues there.",
+    ).replace(
+        "8. Remove the train workbench with `tyde_remove_workbench`.",
+        "8. Return to the parent project with `tyde_move_to_project` and finish the\n   turn immediately. After Tyde continues there, remove the train workbench\n   with `tyde_remove_workbench`.",
+    )
+}
+
+pub fn superseded_project_manager_v3_instructions() -> String {
     superseded_project_manager_v2_instructions().replace(
         "agents by default, or queues the message when steering is unsupported;",
         "agents by default, or cancels the turn and sends next when steering is unsupported;",
+    )
+}
+
+fn project_manager_instructions() -> String {
+    superseded_project_manager_v3_instructions().replace(
+        "- Give each item its own workbench from `main` with `tyde_create_workbench` and\n  spawn its Implementer there.",
+        "- Give each item its own workbench from `main` with `tyde_create_workbench`\n  using `action: \"create_only\"`, then spawn its Implementer in that project.\n  Stay in your coordination project; the Implementer requests its own review.",
     )
 }
 
@@ -2101,6 +2125,15 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
 /// builtin records from user-edited ones.
 fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     let mut published = legacy_builtin_team_custom_agents();
+    for mut agent in builtin_custom_agents() {
+        agent.instructions = match agent.id.0.as_str() {
+            PROJECT_MANAGER_CUSTOM_AGENT_ID => Some(superseded_project_manager_v3_instructions()),
+            IMPLEMENTER_CUSTOM_AGENT_ID => Some(superseded_implementer_v1_instructions()),
+            LANDER_CUSTOM_AGENT_ID => Some(superseded_lander_v1_instructions()),
+            _ => continue,
+        };
+        published.push(agent);
+    }
     for mut agent in builtin_custom_agents() {
         agent.instructions = match agent.id.0.as_str() {
             TEAM_LEAD_CUSTOM_AGENT_ID => Some(superseded_orchestrator_v11_instructions()),

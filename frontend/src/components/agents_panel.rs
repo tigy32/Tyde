@@ -7112,6 +7112,201 @@ mod wasm_tests {
             .collect()
     }
 
+    #[wasm_bindgen_test]
+    async fn server_project_entry_moves_the_visible_chat_into_its_workbench() {
+        use crate::components::center_zone::CenterZone;
+
+        install_send_stub_with_dialog_ok();
+        let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        storage.remove_item("tyde-composer-draft").unwrap();
+        let container = make_container();
+        let state = make_app_state("local");
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        let mut workbench = project_info("local", "workbench", "Task workbench", 1);
+        workbench.project.source = ProjectSource::GitWorkbench {
+            parent_project_id: ProjectId("source".to_owned()),
+            branch: protocol::GitBranchName("task".to_owned()),
+            roots: vec![protocol::WorkbenchRoot {
+                parent_root: ProjectRootPath("/tmp/source".to_owned()),
+                worktree_root: ProjectRootPath("/tmp/source--task".to_owned()),
+            }],
+        };
+        state.projects.set(vec![
+            project_info("local", "source", "Source project", 0),
+            workbench,
+        ]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "worker",
+            "Task worker",
+            true,
+            Some("source"),
+            None,
+        );
+        for (id, name, project) in [
+            ("source-note", "Source notes", "source"),
+            ("workbench-note", "Workbench notes", "workbench"),
+        ] {
+            push_agent_with_scope(&state, "local", id, name, true, Some(project), None);
+        }
+        apply_show_all_projects(&state);
+        CenterWorkspaceWidth::forget_measurement();
+        let mounted = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            mounted.install_browser_effects();
+            view! { <AgentsPanel /> <CenterZone /> }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        for id in ["workbench-note", "source-note"] {
+            agent_card_el(&container, id).click();
+            for _ in 0..8 {
+                next_tick().await;
+            }
+        }
+        agent_card_el(&container, "worker").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        state
+            .composer_untracked()
+            .text
+            .set("Keep my draft while entering".to_owned());
+        let before = agent_card_el(&container, "worker")
+            .closest("[data-project-key]")
+            .unwrap()
+            .unwrap();
+        assert!(before.text_content().unwrap().contains("Source project"));
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Source notes']")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Workbench notes']")
+                .unwrap()
+                .is_none()
+        );
+        let payload = protocol::AgentStartPayload {
+            swarm_membership: None,
+            agent_id: AgentId("worker".to_owned()),
+            name: "Task worker".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: vec!["/tmp/source--task".to_owned()],
+            project_id: Some(ProjectId("workbench".to_owned())),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            workflow: None,
+            created_at_ms: 0,
+        };
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/agent/worker/inst".to_owned()),
+            FrameKind::AgentProjectChanged,
+            0,
+            &payload,
+        );
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        let after = agent_card_el(&container, "worker")
+            .closest("[data-project-key]")
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.text_content().unwrap().contains("Task workbench"),
+            "the same agent must now be rendered under its assigned workbench"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='Task worker']")
+                .unwrap()
+                .is_some(),
+            "the conversation stays open after server entry"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Workbench notes']")
+                .unwrap()
+                .is_some(),
+            "entry must restore the destination workspace's other tabs"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Source notes']")
+                .unwrap()
+                .is_none(),
+            "the source workspace's unrelated tabs must not follow the moved chat"
+        );
+        let inputs = container.query_selector_all("textarea").unwrap();
+        assert!(
+            (0..inputs.length()).any(|index| inputs
+                .item(index)
+                .unwrap()
+                .dyn_into::<web_sys::HtmlTextAreaElement>()
+                .unwrap()
+                .value()
+                == "Keep my draft while entering"),
+            "entering preserves the user's visible draft"
+        );
+        agent_card_el(&container, "source-note").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='Source notes']")
+                .unwrap()
+                .is_some()
+        );
+        for label in ["Task worker", "Workbench notes"] {
+            assert!(
+                container
+                    .query_selector(&format!("[role='tab'][aria-label='{label}']"))
+                    .unwrap()
+                    .is_none(),
+                "moved and destination chats must not remain in the source workspace"
+            );
+        }
+        agent_card_el(&container, "worker").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='Task worker']")
+                .unwrap()
+                .is_some()
+        );
+        let inputs = container.query_selector_all("textarea").unwrap();
+        assert!(
+            (0..inputs.length()).any(|index| inputs
+                .item(index)
+                .unwrap()
+                .dyn_into::<web_sys::HtmlTextAreaElement>()
+                .unwrap()
+                .value()
+                == "Keep my draft while entering"),
+            "the moved draft must also survive returning to its workspace"
+        );
+        drop(_handle);
+        container.remove();
+        storage.remove_item("tyde-composer-draft").unwrap();
+    }
+
     /// Clicking an agent that belongs to a different project than the active one
     /// switches the active project to the agent's project FIRST, then opens its
     /// chat tab — so the tab lands in the agent's project center zone instead of

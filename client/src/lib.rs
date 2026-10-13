@@ -1620,7 +1620,7 @@ impl Connection {
                         envelope.stream
                     );
                 }
-                FrameKind::AgentStart => {
+                FrameKind::AgentStart | FrameKind::AgentProjectChanged => {
                     let payload: AgentStartPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                     let stream_parts = parse_agent_stream(&envelope.stream);
