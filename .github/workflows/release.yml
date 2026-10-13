@@ -360,6 +360,20 @@ jobs:
           # MSI rejects semver prerelease labels; stable Windows builds still use all bundles.
           args: ${{ matrix.tauri-args }}${{ matrix.platform == 'windows-latest' && contains(env.RELEASE_TAG, '-') && ' --bundles nsis' || '' }}
 
+      - name: Smoke test Windows desktop startup
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: tools/smoke_windows_release.ps1 -Binary "target/${{ matrix.rust-target }}/release/tyde.exe" -ExpectedVersion "$env:RELEASE_TAG" -LogDirectory "$env:RUNNER_TEMP/windows-startup"
+
+      - name: Retain Windows startup logs
+        if: always() && matrix.platform == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-release
+          path: ${{ runner.temp }}/windows-startup/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Package Linux headless Tyde binary
         if: startsWith(matrix.platform, 'ubuntu')
         shell: bash

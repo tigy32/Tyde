@@ -127,3 +127,8 @@ jobs:
       - name: Compile and link native Tauri frontend
         working-directory: frontend/tauri-shell
         run: npx --prefix ../.. tauri build --target ${{ matrix.rust-target }} --no-bundle
+
+      - name: Smoke test Windows desktop startup
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: tools/smoke_windows_release.ps1 -Binary "target/${{ matrix.rust-target }}/release/tyde.exe" -ExpectedVersion (Get-Content package.json | ConvertFrom-Json).version -LogDirectory "$env:RUNNER_TEMP/windows-startup"

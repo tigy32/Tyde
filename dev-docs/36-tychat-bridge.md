@@ -69,7 +69,11 @@ Bot credentials, private keys, owner pin and cursors are serialized SDK
 `BotState`, kept opaque outside the bridge. They are never settings,
 bootstrap payloads, diagnostics or Debug output. Storage uses the same
 `atomic_write_owner_only`/`enforce_owner_only_file` boundary as mobile pairings,
-with 0600 permissions, beside the host stores. Fingerprints are public and are
+with owner-only permissions, beside the host stores: mode 0600 on Unix, or a
+protected Windows DACL granting only the current user full control. Windows
+temporary secret files receive this ACL at creation, before any secret bytes
+are written; existing stores and the process lock are secured on load.
+Fingerprints are public and are
 published separately. The SDK owns their format (24 base64url characters in six
 groups of four); the host re-derives them from `BotState` on load, so journals
 holding the older 60-digit form show the current format after upgrade. Pairing codes are transient commands, never persisted.

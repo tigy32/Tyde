@@ -486,6 +486,115 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
 }
 
 #[tokio::test]
+async fn private_journal_creation_replacement_and_unpair_survive_restart() {
+    let mut fixture = configured().await;
+    let (_, agent) = pair(&mut fixture).await;
+    let (paired_client, paired_bootstrap) = fixture::connect_host(fixture.tychat_host()).await;
+    drop(paired_client);
+    let paired = paired_bootstrap.tychat;
+    assert!(paired.agent_id.as_ref() == Some(&agent.new_agent.agent_id));
+    assert!(paired.settings_application == TychatSettingsApplication::Live);
+    assert!(paired.fingerprints.is_some());
+
+    fixture
+        .client
+        .tychat_command(TychatCommandPayload::ResetAgent)
+        .await
+        .unwrap();
+    let replaced: TychatStatePayload = fixture
+        .next_frame_matching("reset replaces the existing private journal", |frame| {
+            frame.kind == FrameKind::TychatState
+                && frame
+                    .parse_payload::<TychatStatePayload>()
+                    .is_ok_and(|state| {
+                        state.agent_id.is_some()
+                            && state.agent_id != paired.agent_id
+                            && state.settings_application == TychatSettingsApplication::Live
+                    })
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert!(
+        replaced.fingerprints == paired.fingerprints,
+        "reset preserves the paired identity while replacing the journal"
+    );
+    let (reset_client, reset_bootstrap) = fixture::connect_host(fixture.tychat_host()).await;
+    drop(reset_client);
+    let replacement_session = reset_bootstrap
+        .agents
+        .iter()
+        .find(|agent| Some(&agent.agent_id) == replaced.agent_id.as_ref())
+        .unwrap()
+        .session_id
+        .clone()
+        .unwrap();
+
+    let bootstrap = fixture.restart_host().await;
+    let resumed = if bootstrap.tychat.agent_id.is_some()
+        && bootstrap.tychat.settings_application == TychatSettingsApplication::Live
+    {
+        bootstrap.tychat
+    } else {
+        fixture
+            .next_frame_matching(
+                "replacement journal reloads through the protocol",
+                |frame| {
+                    frame.kind == FrameKind::TychatState
+                        && frame
+                            .parse_payload::<TychatStatePayload>()
+                            .is_ok_and(|state| {
+                                state.agent_id.is_some()
+                                    && state.settings_application == TychatSettingsApplication::Live
+                            })
+                },
+            )
+            .await
+            .parse_payload()
+            .unwrap()
+    };
+    assert!(
+        resumed.fingerprints == paired.fingerprints,
+        "a new host reloads the durable pairing rather than losing it"
+    );
+    let (resumed_client, resumed_bootstrap) = fixture::connect_host(fixture.tychat_host()).await;
+    drop(resumed_client);
+    let resumed_session = resumed_bootstrap
+        .agents
+        .iter()
+        .find(|agent| Some(&agent.agent_id) == resumed.agent_id.as_ref())
+        .unwrap()
+        .session_id
+        .as_ref()
+        .unwrap();
+    assert!(
+        resumed_session == &replacement_session,
+        "a new host reloads the replacement session, not the original session"
+    );
+
+    fixture
+        .client
+        .tychat_command(TychatCommandPayload::Unpair)
+        .await
+        .unwrap();
+    let unpaired: TychatStatePayload = fixture
+        .next_frame_matching("unpair replaces the private journal", |frame| {
+            frame.kind == FrameKind::TychatState
+                && frame
+                    .parse_payload::<TychatStatePayload>()
+                    .is_ok_and(|state| state.status == TychatBridgeStatus::Unpaired)
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert!(unpaired.fingerprints.is_none() && unpaired.agent_id.is_none());
+    let bootstrap = fixture.restart_host().await;
+    assert!(bootstrap.tychat.status == TychatBridgeStatus::Unpaired);
+    assert!(bootstrap.tychat.fingerprints.is_none() && bootstrap.tychat.agent_id.is_none());
+    assert!(bootstrap.agents.is_empty());
+}
+
+#[tokio::test]
 async fn always_steer_and_outbox_survive_restart() {
     let mut fixture = configured().await;
     let gate = MockGateHandle::new();
