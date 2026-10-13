@@ -8402,6 +8402,12 @@ pub struct ImageData {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputImageData {
+    pub name: String,
+    pub image: ImageData,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStartData {
     pub agent: String,

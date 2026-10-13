@@ -1,4 +1,6 @@
 mod bridge;
+#[cfg(desktop)]
+mod desktop_images;
 mod dev_host;
 mod devtools;
 mod host_bridge_uds;
@@ -1064,6 +1066,47 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn read_input_image_paths(
+    paths: Vec<std::path::PathBuf>,
+) -> Result<Vec<Result<protocol::InputImageData, String>>, String> {
+    #[cfg(desktop)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            paths.into_iter().map(desktop_images::read_path).collect()
+        })
+        .await
+        .map_err(|error| format!("Image file reader failed: {error}"))
+    }
+    #[cfg(mobile)]
+    {
+        drop(paths);
+        Err("Native image files are unavailable on mobile".to_owned())
+    }
+}
+
+#[tauri::command]
+async fn read_clipboard_image(
+    app: tauri::AppHandle,
+) -> Result<Option<protocol::ImageData>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        desktop_images::read_clipboard(app).await
+    }
+    #[cfg(all(desktop, not(target_os = "linux")))]
+    {
+        drop(app);
+        tauri::async_runtime::spawn_blocking(desktop_images::read_clipboard)
+            .await
+            .map_err(|error| format!("Clipboard image reader failed: {error}"))?
+    }
+    #[cfg(mobile)]
+    {
+        drop(app);
+        Err("Native clipboard images are unavailable on mobile".to_owned())
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn production_invoke_handler<R, F>(
     other_handler: F,
@@ -1119,7 +1162,9 @@ macro_rules! other_production_invoke_handler {
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
-            open_external_url
+            open_external_url,
+            read_input_image_paths,
+            read_clipboard_image
         ]
     };
 }
@@ -1146,7 +1191,9 @@ macro_rules! other_production_invoke_handler {
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
-            open_external_url
+            open_external_url,
+            read_input_image_paths,
+            read_clipboard_image
         ]
     };
 }
@@ -1337,6 +1384,42 @@ pub fn run() {
                     );
                 }
             }
+            #[cfg(target_os = "linux")]
+            WindowEvent::DragDrop(event) => {
+                use host_config::{DesktopClientPoint, DesktopFileDragEvent};
+                use tauri::{DragDropEvent, Emitter};
+
+                // Wry passes GTK widget coordinates unchanged, despite naming
+                // them PhysicalPosition. They are already webview-client units.
+                let point = |position: &tauri::PhysicalPosition<f64>| DesktopClientPoint {
+                    x: position.x,
+                    y: position.y,
+                };
+                let event = match event {
+                    DragDropEvent::Enter { position, .. } => DesktopFileDragEvent::Enter {
+                        position: point(position),
+                    },
+                    DragDropEvent::Over { position } => DesktopFileDragEvent::Over {
+                        position: point(position),
+                    },
+                    DragDropEvent::Leave => DesktopFileDragEvent::Leave,
+                    DragDropEvent::Drop { position, paths } => DesktopFileDragEvent::Drop {
+                        position: point(position),
+                        paths: paths.clone(),
+                    },
+                    _ => {
+                        tracing::error!("Unsupported native file drag event");
+                        return;
+                    }
+                };
+                if let Err(error) = window.emit_to(
+                    tauri::EventTarget::labeled(window.label()),
+                    "tyde://desktop-file-drag",
+                    event,
+                ) {
+                    tracing::error!("Native file drag delivery failed: {error}");
+                }
+            }
             WindowEvent::CloseRequested { api, .. } => {
                 if quit_confirmation_for_window.is_confirmed_exit() {
                     return;
@@ -1450,6 +1533,17 @@ pub fn run() {
         }
     });
 
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    let context = {
+        let mut context = context;
+        // WebKitGTK withholds external FileList data; use its native file drag source.
+        for window in &mut context.config_mut().app.windows {
+            window.drag_drop_enabled = true;
+        }
+        context
+    };
+
     let app = builder
         .setup(move |app| {
             tracing::info!("setup: spawning host and router");
@@ -1512,7 +1606,7 @@ pub fn run() {
         .invoke_handler(production_invoke_handler::<tauri::Wry, _>(
             other_production_invoke_handler!(),
         ))
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build desktop shell");
 
     app.run(move |app, event| {

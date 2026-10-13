@@ -26,6 +26,28 @@ use std::str::FromStr;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DesktopClientPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DesktopFileDragEvent {
+    Enter {
+        position: DesktopClientPoint,
+    },
+    Over {
+        position: DesktopClientPoint,
+    },
+    Leave,
+    Drop {
+        position: DesktopClientPoint,
+        paths: Vec<std::path::PathBuf>,
+    },
+}
+
 /// Identifier for the always-present local embedded host.
 pub const LOCAL_HOST_ID: &str = "local";
 

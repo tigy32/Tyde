@@ -796,6 +796,46 @@ explicitly rather than inferring it from the idle-agent cases above.
     the composer sends normally rather than queueing, and no stale stream makes
     any surface return to Thinking.
 
+### Native Ubuntu image input
+
+Exercise native input, not JavaScript-created `DataTransfer` fixtures: those
+fixtures expose files that WebKitGTK can withhold from real input.
+
+1. Start a disposable dev instance, select its project, and open an empty chat
+   on an image-capable backend. Verify **More send actions → Attach image** is
+   available without draft text. Use the native file chooser to select a PNG;
+   verify its preview and that selecting the same file again works.
+2. Copy image pixels from a native application or screenshot utility, focus
+   the composer, and paste with Ctrl+V. Verify a decoded preview, not merely a
+   paste event. Also paste ordinary text and verify native text insertion is
+   unchanged.
+3. Drag a real PNG from a native file manager into the composer. Verify the
+   hover affordance, one preview per file, and a cleared hover state after
+   leaving or dropping. Drop outside the composer and verify no attachment.
+   Check internal text drags still work.
+4. Send the collected images in one bounded turn on the cheapest capable
+   model. Verify backend receipt, the rendered image count, and replay after
+   reloading. Check explicit rejection for unsupported backends and invalid
+   files; do not treat a disappearing attachment as successful delivery.
+5. Stop the instance and verify its disposable stores were removed.
+
+For isolated Ubuntu/X11 QA, a GTK drag source advertising `text/uri-list` and
+`Gtk.Clipboard.set_image` exercise actual platform input. Drive them with
+native mouse/keyboard events on the dev instance's display. Do not use DOM
+file injection as the native reproduction. On Wayland, clipboard ingestion
+must use the webview's active GDK display, not an independently selected X11
+or data-control clipboard.
+
+Reproduction evidence for the desktop attachment fix (Ubuntu 26.04.1,
+WebKitGTK 2.52.6): two clean pre-fix instances received trusted image-paste
+events with no types/files, and native file drops advertised URI-list/HTML
+but exposed no files or readable URI. Neither created a preview. The fixed
+instance decoded clipboard, drop, and native-picker images at 32×32 pixels;
+plain-text paste remained intact. One Claude Haiku turn received all three
+images and identified their count and color; all three decoded images and the
+answer survived reload without visible errors. This is scoped image-input QA,
+not certification of every backend scenario.
+
 ## 15. Presentation, accessibility, and performance audit
 
 1. Repeat representative baseline, tool, task, and child states at narrow and

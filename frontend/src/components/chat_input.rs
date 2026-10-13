@@ -828,6 +828,43 @@ pub(crate) async fn read_image_file(file: web_sys::File) -> Result<PendingImage,
     })
 }
 
+fn validate_image_input(
+    state: &AppState,
+    composer: &ComposerHandle,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    attachment_error: RwSignal<Option<String>>,
+) -> bool {
+    let backend = selected_backend_kind(state, composer, agent_ref);
+    if !backend.is_some_and(BackendKind::supports_image_input) {
+        let backend_name = backend
+            .map(|backend| format!("{backend:?}"))
+            .unwrap_or_else(|| "selected backend".to_owned());
+        attachment_error.try_set(Some(format!("{backend_name} does not support image input")));
+        return false;
+    }
+    attachment_error.try_set(None);
+    true
+}
+
+fn attach_read_images(
+    results: Vec<Result<PendingImage, String>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+    attachment_error: RwSignal<Option<String>>,
+) {
+    let mut added = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(image) => added.push(image),
+            Err(error) => errors.push(error),
+        }
+    }
+    if !added.is_empty() {
+        pending_images.try_update(|images| images.extend(added));
+    }
+    attachment_error.try_set((!errors.is_empty()).then(|| errors.join(" ")));
+}
+
 fn attach_image_files(
     files: Vec<web_sys::File>,
     state: AppState,
@@ -836,37 +873,15 @@ fn attach_image_files(
     pending_images: RwSignal<Vec<PendingImage>>,
     attachment_error: RwSignal<Option<String>>,
 ) {
-    if !selected_backend_kind(&state, &composer, agent_ref)
-        .map(BackendKind::supports_image_input)
-        .unwrap_or(false)
-    {
-        let backend_name = selected_backend_kind(&state, &composer, agent_ref)
-            .map(|backend| format!("{backend:?}"))
-            .unwrap_or_else(|| "selected backend".to_string());
-        attachment_error.set(Some(format!("{backend_name} does not support image input")));
+    if !validate_image_input(&state, &composer, agent_ref, attachment_error) {
         return;
     }
-
-    attachment_error.set(None);
     spawn_local(async move {
-        let mut added_images = Vec::new();
-        let mut errors = Vec::new();
+        let mut results = Vec::new();
         for file in files {
-            match read_image_file(file).await {
-                Ok(image) => added_images.push(image),
-                Err(err) => errors.push(err),
-            }
+            results.push(read_image_file(file).await);
         }
-
-        if !added_images.is_empty() {
-            pending_images.update(|images| images.extend(added_images));
-        }
-
-        if errors.is_empty() {
-            attachment_error.set(None);
-        } else {
-            attachment_error.set(Some(errors.join(" ")));
-        }
+        attach_read_images(results, pending_images, attachment_error);
     });
 }
 
@@ -937,6 +952,8 @@ pub fn ChatInput(
             });
         }
     });
+    let image_input_ref = NodeRef::<leptos::html::Input>::new();
+    let input_area_ref = NodeRef::<leptos::html::Div>::new();
     let pending_images = RwSignal::new(Vec::<PendingImage>::new());
     let attachment_error = RwSignal::new(None::<String>);
     let drag_depth = RwSignal::new(0u32);
@@ -1046,8 +1063,18 @@ pub fn ChatInput(
                 .goal_capabilities
                 .with(|map| map.get(&agent.agent_id).is_some_and(|caps| caps.set))
     });
+    let attachment_state = state.clone();
+    let attachment_composer = composer.clone();
+    let can_attach = Memo::new(move |_| {
+        !is_readonly.get()
+            && selected_backend_kind_tracked(&attachment_state, &attachment_composer, agent_ref)
+                .is_some_and(BackendKind::supports_image_input)
+    });
     let menu_has_items = Memo::new(move |_| {
-        can_set_goal.get() || can_btw.get() || (can_interrupt() && is_steer.get())
+        can_attach.get()
+            || can_set_goal.get()
+            || can_btw.get()
+            || (can_interrupt() && is_steer.get())
     });
     let menu_open = RwSignal::new(false);
     // Auto-dismiss a stale-open menu when its items disappear.
@@ -1198,6 +1225,7 @@ pub fn ChatInput(
             // Explicit chord — always acts, overriding the submit-on-Enter
             // toggle. ui_mode.0 is `send_enabled` (connected + has input).
             ev.prevent_default();
+            menu_open.set(false);
             if ev.shift_key() {
                 // Cmd/Ctrl+Shift+Enter → Fork + send, when available.
                 if can_btw.get_untracked() {
@@ -1240,6 +1268,7 @@ pub fn ChatInput(
         if !ev.shift_key() {
             ev.prevent_default();
             if submit_on_enter_mode() {
+                menu_open.set(false);
                 submit_chat_input(
                     &on_keydown_state,
                     &on_keydown_composer,
@@ -1385,6 +1414,135 @@ pub fn ChatInput(
         });
     };
 
+    let picker_state = state.clone();
+    let picker_composer = composer.clone();
+    let on_images_chosen = move |event: web_sys::Event| {
+        let input = event_target::<web_sys::HtmlInputElement>(&event);
+        let files = input.files().map(|files| {
+            (0..files.length())
+                .filter_map(|index| files.get(index))
+                .collect::<Vec<_>>()
+        });
+        input.set_value("");
+        if let Some(files) = files.filter(|files| !files.is_empty())
+            && !is_readonly.get_untracked()
+        {
+            attach_image_files(
+                files,
+                picker_state.clone(),
+                picker_composer.clone(),
+                agent_ref,
+                pending_images,
+                attachment_error,
+            );
+        }
+    };
+    let on_attach_image = move |_| {
+        menu_open.set(false);
+        if can_attach.get_untracked()
+            && let Some(input) = image_input_ref.get_untracked()
+        {
+            input.click();
+        }
+    };
+
+    let native_listener = StoredValue::new_local(None::<crate::bridge::UnlistenHandle>);
+    let native_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cleanup_active = native_active.clone();
+    on_cleanup(move || {
+        cleanup_active.store(false, std::sync::atomic::Ordering::Relaxed);
+        native_listener.update_value(|listener| {
+            if let Some(listener) = listener.take() {
+                listener.remove();
+            }
+        });
+    });
+    let native_state = state.clone();
+    let native_composer = composer.clone();
+    spawn_local(async move {
+        let callback_active = native_active.clone();
+        let listener = crate::bridge::listen_desktop_file_drag(move |event| {
+            use host_config::DesktopFileDragEvent;
+
+            if !callback_active.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    attachment_error.set(Some(error));
+                    return;
+                }
+            };
+            let contains = |point: host_config::DesktopClientPoint| {
+                input_area_ref
+                    .try_get_untracked()
+                    .flatten()
+                    .is_some_and(|area| {
+                        let rect = area.get_bounding_client_rect();
+                        point.x >= rect.left()
+                            && point.x < rect.right()
+                            && point.y >= rect.top()
+                            && point.y < rect.bottom()
+                    })
+                    && !is_readonly.get_untracked()
+            };
+            match event {
+                DesktopFileDragEvent::Enter { position }
+                | DesktopFileDragEvent::Over { position } => {
+                    drag_depth.set(u32::from(contains(position)));
+                }
+                DesktopFileDragEvent::Leave => drag_depth.set(0),
+                DesktopFileDragEvent::Drop { position, paths } => {
+                    drag_depth.set(0);
+                    if !contains(position) {
+                        return;
+                    }
+                    if !validate_image_input(
+                        &native_state,
+                        &native_composer,
+                        agent_ref,
+                        attachment_error,
+                    ) {
+                        return;
+                    }
+                    spawn_local(async move {
+                        match crate::bridge::read_input_image_paths(paths).await {
+                            Ok(images) => attach_read_images(
+                                images
+                                    .into_iter()
+                                    .map(|result| {
+                                        result.map(|image| PendingImage {
+                                            name: image.name,
+                                            media_type: image.image.media_type,
+                                            data: image.image.data,
+                                        })
+                                    })
+                                    .collect(),
+                                pending_images,
+                                attachment_error,
+                            ),
+                            Err(error) => {
+                                attachment_error.try_set(Some(error));
+                            }
+                        }
+                    });
+                }
+            }
+        })
+        .await;
+        match listener {
+            Ok(listener) if native_active.load(std::sync::atomic::Ordering::Relaxed) => {
+                native_listener.set_value(Some(listener))
+            }
+            Ok(listener) => listener.remove(),
+            Err(error) if native_active.load(std::sync::atomic::Ordering::Relaxed) => {
+                attachment_error.set(Some(error))
+            }
+            Err(_) => {}
+        }
+    });
+
     let on_dragenter_error = attachment_error;
     let on_dragenter_depth = drag_depth;
     let on_dragenter = move |ev: web_sys::DragEvent| {
@@ -1450,6 +1608,40 @@ pub fn ChatInput(
         };
         let files = clipboard_image_files(&data_transfer);
         if files.is_empty() {
+            // WebKitGTK's trusted paste event omits all clipboard image data.
+            // The native clipboard owns opaque offers; text stays browser-owned.
+            if data_transfer.types().length() != 0 || is_readonly.get_untracked() {
+                return;
+            }
+            ev.prevent_default();
+            let state = on_paste_state.clone();
+            let composer = on_paste_composer.clone();
+            spawn_local(async move {
+                let result = crate::bridge::read_clipboard_image().await;
+                if on_paste_images.try_with_untracked(|_| ()).is_none() {
+                    return;
+                }
+                match result {
+                    Ok(Some(image)) => {
+                        if !validate_image_input(&state, &composer, agent_ref, on_paste_error) {
+                            return;
+                        }
+                        attach_read_images(
+                            vec![Ok(PendingImage {
+                                name: "Pasted image".to_owned(),
+                                media_type: image.media_type,
+                                data: image.data,
+                            })],
+                            on_paste_images,
+                            on_paste_error,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        on_paste_error.try_set(Some(error));
+                    }
+                }
+            });
             return;
         }
 
@@ -1556,6 +1748,7 @@ pub fn ChatInput(
             on:dragenter=on_dragenter
             on:dragover=on_dragover
             on:dragleave=on_dragleave
+            node_ref=input_area_ref
             on:drop=on_drop
         >
             <Show when=is_thinking>
@@ -1594,6 +1787,14 @@ pub fn ChatInput(
                 </div>
             </Show>
 
+            <input
+                type="file"
+                accept="image/*"
+                multiple=true
+                style="display:none"
+                node_ref=image_input_ref
+                on:change=on_images_chosen
+            />
             <Show when=move || !pending_images.get().is_empty()>
                 <div class="chat-attachment-bar">
                     {move || {
@@ -1841,6 +2042,17 @@ pub fn ChatInput(
                             aria-label="Send actions"
                             data-test="chat-send-menu"
                         >
+                            <Show when=move || can_attach.get()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-test="chat-send-menu-attach"
+                                    on:click=on_attach_image
+                                >
+                                    <span class="chat-send-menu-label">"Attach image"</span>
+                                </button>
+                            </Show>
                             <Show when=move || can_set_goal.get()>
                                 <button type="button" class="chat-send-menu-item" role="menuitem" data-test="chat-send-menu-goal" on:click=move |_| on_menu_goal.run(())>
                                     <span class="chat-send-menu-label">"Send as goal"</span>
@@ -1987,6 +2199,20 @@ mod wasm_tests {
         js_sys::Reflect::set(&tauri, &"core".into(), &core).unwrap();
         js_sys::Reflect::set(&window, &"__TAURI__".into(), &tauri).unwrap();
         invoke.forget();
+        js_sys::eval(
+            r#"
+            window.__desktop_drag_listeners = [];
+            window.__TAURI__.event = {
+                listen: (name, callback) => {
+                    const entries = window.__desktop_drag_listeners;
+                    const entry = {name, callback};
+                    entries.push(entry);
+                    return Promise.resolve(() => entries.splice(entries.indexOf(entry), 1));
+                }
+            };
+        "#,
+        )
+        .unwrap();
     }
 
     /// Connect the active chat tab to a single live agent and optionally seed a
@@ -2484,6 +2710,42 @@ mod wasm_tests {
         target.dispatch_event(&event).unwrap()
     }
 
+    fn stub_native_images() {
+        js_sys::eval(r#"
+            window.__native_image_reads = [];
+            window.__native_clipboard_failure = false;
+            window.__native_path_failure = false;
+            const original = window.__TAURI__.core.invoke;
+            window.__TAURI__.core.invoke = (command, args) => {
+                if (command === 'read_clipboard_image') {
+                    window.__native_image_reads.push(command);
+                    if (window.__native_clipboard_failure) return Promise.reject('Clipboard image read failed');
+                    return Promise.resolve({media_type:'image/png',data:'AQID'});
+                }
+                if (command === 'read_input_image_paths') {
+                    window.__native_image_reads.push(command);
+                    return Promise.resolve(window.__native_path_failure
+                        ? [{Err:'Dropped file is not an image'}]
+                        : [{Ok:{name:'linux-drop.png',image:{media_type:'image/png',data:'AQID'}}}]);
+                }
+                return original(command, args);
+            };
+        "#).unwrap();
+    }
+
+    fn native_drag(event: host_config::DesktopFileDragEvent) {
+        let event = serde_wasm_bindgen::to_value(&event).unwrap();
+        let callback = js_sys::Function::new_with_args(
+            "payload",
+            r#"
+            for (const entry of window.__desktop_drag_listeners) {
+                if (entry.name === 'tyde://desktop-file-drag') entry.callback({payload});
+            }
+        "#,
+        );
+        callback.call1(&JsValue::NULL, &event).unwrap();
+    }
+
     fn send_message_payloads(calls: &js_sys::Array) -> Vec<JsonValue> {
         calls
             .iter()
@@ -2502,9 +2764,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 1: Idle + empty ──────────────────────────────────────
-    // Primary "Send" disabled; caret visible but disabled; no dropdown items.
+    // Primary "Send" disabled; image attachment remains available.
     #[wasm_bindgen_test]
-    async fn idle_empty_send_disabled_caret_disabled_no_menu() {
+    async fn idle_empty_send_disabled_attachment_available() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -2523,8 +2785,8 @@ mod wasm_tests {
 
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled when no menu items"
+            !c.has_attribute("disabled"),
+            "an empty draft still offers image attachment"
         );
 
         assert!(
@@ -2617,9 +2879,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 2: Idle + input, no session ──────────────────────────
-    // Primary "Send" enabled; caret visible but disabled; no dropdown.
+    // Primary "Send" enabled; image attachment is available without a session.
     #[wasm_bindgen_test]
-    async fn idle_input_no_session_send_enabled_caret_disabled() {
+    async fn idle_input_no_session_send_enabled_attachment_available() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -2638,8 +2900,8 @@ mod wasm_tests {
 
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled with no menu items (no session)"
+            !c.has_attribute("disabled"),
+            "image attachment does not require a session"
         );
     }
 
@@ -2824,8 +3086,8 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Fork + send".to_owned()],
-            "a fatal actor offers no Steer or Cancel action"
+            vec!["Attach image".to_owned(), "Fork + send".to_owned()],
+            "a fatal actor retains attachments and Fork but offers no Steer or Cancel action"
         );
 
         dispatch_keydown(&textarea(&container), "Enter", true, false);
@@ -2839,6 +3101,10 @@ mod wasm_tests {
 
         dispatch_keydown(&textarea(&container), "Enter", true, true);
         next_tick().await;
+        assert!(
+            query(&container, "[data-test='chat-send-menu']").is_none(),
+            "keyboard Fork + send must dismiss the menu even though attachment remains available"
+        );
         assert_eq!(
             state.composer_untracked().text.get_untracked(),
             "",
@@ -2855,9 +3121,11 @@ mod wasm_tests {
             agents[0].session_id = None;
         });
         next_tick().await;
-        assert!(
-            caret(&container).has_attribute("disabled"),
-            "without a session the composer must direct recovery to Resume or New Chat"
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Attach image"],
+            "without a session, attachments remain editable but Fork + send stays unavailable"
         );
         assert_eq!(
             primary(&container)
@@ -2930,9 +3198,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 3: Idle + input + session ────────────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Fork + send" only.
+    // Primary "Send" enabled; dropdown offers attachments and Fork + send.
     #[wasm_bindgen_test]
-    async fn idle_input_with_session_send_enabled_menu_fork_send_only() {
+    async fn idle_input_with_session_send_enabled_attachment_and_fork() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -2958,15 +3226,15 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Fork + send".to_owned()],
-            "idle+session menu must be exactly 'Fork + send'"
+            vec!["Attach image".to_owned(), "Fork + send".to_owned()],
+            "idle+session menu offers attachment and Fork + send"
         );
     }
 
     // ── State matrix row 4: Thinking + empty ─────────────────────────────────
-    // Primary "Cancel" enabled; caret visible but disabled; no dropdown.
+    // Primary "Cancel" enabled; attachments remain available while thinking.
     #[wasm_bindgen_test]
-    async fn thinking_empty_primary_cancel_caret_disabled() {
+    async fn thinking_empty_primary_cancel_attachment_available() {
         let container = make_styled_container();
         let state = AppState::new();
         configure(&state, false, true, "");
@@ -3013,8 +3281,8 @@ mod wasm_tests {
 
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled when no menu items (thinking+empty)"
+            !c.has_attribute("disabled"),
+            "image attachment stays available during a running turn"
         );
 
         let composer = query(&container, ".chat-input-area").expect("composer");
@@ -3193,11 +3461,12 @@ mod wasm_tests {
         assert_eq!(
             menu_item_texts(&container),
             vec![
+                "Attach image".to_owned(),
                 "Cancel + send".to_owned(),
                 "Steer".to_owned(),
                 "Cancel".to_owned()
             ],
-            "thinking+input menu must be exactly Cancel + send, Steer, Cancel"
+            "thinking+input menu offers attachment, Cancel + send, Steer, Cancel"
         );
     }
 
@@ -3226,12 +3495,13 @@ mod wasm_tests {
         assert_eq!(
             menu_item_texts(&container),
             vec![
+                "Attach image".to_owned(),
                 "Cancel + send".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
                 "Cancel".to_owned(),
             ],
-            "thinking+session+input menu must be Cancel + send, Steer, Fork + send, Cancel"
+            "thinking+session+input menu includes attachment and all existing send actions"
         );
     }
 
@@ -3358,7 +3628,152 @@ mod wasm_tests {
             "the sent attachment must clear from the composer"
         );
 
+        stub_native_images();
+        let bounds = composer.get_bounding_client_rect();
+        let inside = host_config::DesktopClientPoint {
+            x: bounds.left() + 2.0,
+            y: bounds.top() + 2.0,
+        };
+        native_drag(host_config::DesktopFileDragEvent::Enter { position: inside });
+        next_tick().await;
+        assert_eq!(
+            query(&container, ".chat-input-drop-copy")
+                .unwrap()
+                .text_content()
+                .unwrap(),
+            "Drop images to attach"
+        );
+        native_drag(host_config::DesktopFileDragEvent::Over {
+            position: host_config::DesktopClientPoint {
+                x: bounds.right() + 10.0,
+                y: inside.y,
+            },
+        });
+        next_tick().await;
+        assert!(query(&container, ".chat-input-drop-overlay").is_none());
+        native_drag(host_config::DesktopFileDragEvent::Drop {
+            position: host_config::DesktopClientPoint {
+                x: bounds.right() + 10.0,
+                y: inside.y,
+            },
+            paths: vec!["/fixture/image.png".into()],
+        });
+        next_tick().await;
+        let reads: js_sys::Array = js_sys::eval("window.__native_image_reads")
+            .unwrap()
+            .unchecked_into();
+        assert_eq!(
+            reads.length(),
+            0,
+            "a drop outside the owning composer must not read or attach files"
+        );
+        native_drag(host_config::DesktopFileDragEvent::Drop {
+            position: inside,
+            paths: vec!["/fixture/image.png".into()],
+        });
+        next_tick().await;
+        let preview =
+            query(&container, ".chat-attachment-thumb").expect("native Linux drop must attach");
+        assert_eq!(
+            preview.get_attribute("alt").as_deref(),
+            Some("linux-drop.png")
+        );
+        primary(&container)
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[1]["images"][0]["data"], "AQID");
+        js_sys::eval("window.__native_path_failure = true").unwrap();
+        native_drag(host_config::DesktopFileDragEvent::Drop {
+            position: inside,
+            paths: vec!["/fixture/document.txt".into()],
+        });
+        next_tick().await;
+        assert!(query(&container, ".chat-attachment-bar").is_none());
+        assert_eq!(
+            query(&container, ".chat-input-error")
+                .unwrap()
+                .text_content()
+                .unwrap(),
+            "Dropped file is not an image"
+        );
+        native_drag(host_config::DesktopFileDragEvent::Leave);
         outside.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn desktop_attachment_picker_is_available_without_text() {
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        let calls = stub_send_recording();
+        let mount_state = state.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert!(primary(&container).has_attribute("disabled"));
+        assert!(
+            !caret(&container).has_attribute("disabled"),
+            "an empty desktop draft must offer image attachment in the send chevron"
+        );
+        open_menu(&container).await;
+        assert_eq!(menu_item_texts(&container), vec!["Attach image"]);
+        let attach =
+            query(&container, "[data-test='chat-send-menu-attach']").expect("attachment menu item");
+        let picker = query(&container, "input[type='file']").expect("desktop image picker");
+        assert_eq!(picker.get_attribute("accept").as_deref(), Some("image/*"));
+        assert!(picker.has_attribute("multiple"));
+        let picker_clicks = Rc::new(std::cell::Cell::new(0));
+        let clicks = picker_clicks.clone();
+        let on_click = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            clicks.set(clicks.get() + 1);
+        });
+        picker
+            .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
+            .unwrap();
+        attach.dyn_into::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        assert_eq!(picker_clicks.get(), 1, "Attach image must open the picker");
+        assert!(query(&container, "[data-test='chat-send-menu']").is_none());
+
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(&[1u8, 2, 3][..]));
+        let options = js_sys::Object::new();
+        js_sys::Reflect::set(&options, &"type".into(), &"image/png".into()).unwrap();
+        let ctor = js_sys::Reflect::get(&js_sys::global(), &"File".into()).unwrap();
+        let ctor: js_sys::Function = ctor.unchecked_into();
+        let file = js_sys::Reflect::construct(
+            &ctor,
+            &js_sys::Array::of3(&parts, &"picked.png".into(), &options),
+        )
+        .unwrap()
+        .unchecked_into::<web_sys::File>();
+        let transfer = web_sys::DataTransfer::new().unwrap();
+        transfer.items().add_with_file(&file).unwrap();
+        js_sys::Reflect::set(&picker, &"files".into(), &transfer.files().unwrap()).unwrap();
+        picker
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let preview = query(&container, ".chat-attachment-thumb").expect("selected image preview");
+        assert_eq!(preview.get_attribute("alt").as_deref(), Some("picked.png"));
+        assert!(!primary(&container).has_attribute("disabled"));
+        primary(&container)
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["images"][0]["data"], "AQID");
     }
 
     #[wasm_bindgen_test]
@@ -3450,6 +3865,35 @@ mod wasm_tests {
         assert_eq!(
             images[1].get("data").and_then(JsonValue::as_str),
             Some("BAUG")
+        );
+
+        stub_native_images();
+        assert!(!dispatch_paste(&textarea(&container), &[], None));
+        next_tick().await;
+        let preview = query(&container, ".chat-attachment-thumb")
+            .expect("an opaque native clipboard image must render a preview");
+        assert_eq!(
+            preview.get_attribute("alt").as_deref(),
+            Some("Pasted image")
+        );
+        primary(&container)
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[1]["images"][0]["data"], "AQID");
+        js_sys::eval("window.__native_clipboard_failure = true").unwrap();
+        assert!(!dispatch_paste(&textarea(&container), &[], None));
+        next_tick().await;
+        assert!(query(&container, ".chat-attachment-bar").is_none());
+        assert_eq!(
+            query(&container, ".chat-input-error")
+                .unwrap()
+                .text_content()
+                .unwrap(),
+            "Clipboard image read failed"
         );
     }
 

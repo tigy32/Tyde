@@ -7,11 +7,11 @@ use wasm_bindgen_futures::JsFuture;
 // Host-config types are defined once in the `host-config` crate and shared
 // verbatim with the Tauri shell. Re-export them for downstream modules.
 pub use host_config::{
-    ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
-    HostLifecycleEvent, HostLineEvent, HostRecoveryEvent, HostTransportConfig, HostWarningEvent,
-    RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
-    RemoteHostLifecycleStep, RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
-    TydeReleaseVersion, UpsertConfiguredHostRequest,
+    ConfiguredHost, ConfiguredHostStore, DesktopFileDragEvent, HostDisconnectedEvent,
+    HostErrorEvent, HostIdRequest, HostLifecycleEvent, HostLineEvent, HostRecoveryEvent,
+    HostTransportConfig, HostWarningEvent, RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot,
+    RemoteHostLifecycleStatus, RemoteHostLifecycleStep, RemoteTydeRunningState,
+    SendHostLineRequest, SetSelectedHostRequest, TydeReleaseVersion, UpsertConfiguredHostRequest,
 };
 
 // --- Tauri JS bindings ---
@@ -312,6 +312,40 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(())
+}
+
+pub async fn read_clipboard_image() -> Result<Option<protocol::ImageData>, String> {
+    let value = tauri_invoke("read_clipboard_image", JsValue::NULL)
+        .await
+        .map_err(|error| tauri_error_message("read_clipboard_image", error))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
+}
+
+pub async fn read_input_image_paths(
+    paths: Vec<std::path::PathBuf>,
+) -> Result<Vec<Result<protocol::InputImageData, String>>, String> {
+    #[derive(Serialize)]
+    struct Args {
+        paths: Vec<std::path::PathBuf>,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { paths }).map_err(|error| error.to_string())?;
+    let value = tauri_invoke("read_input_image_paths", args)
+        .await
+        .map_err(|error| tauri_error_message("read_input_image_paths", error))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
+}
+
+pub async fn listen_desktop_file_drag(
+    callback: impl Fn(Result<DesktopFileDragEvent, String>) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event("tyde://desktop-file-drag", move |value: JsValue| {
+        callback(
+            serde_wasm_bindgen::from_value::<TauriEvent<DesktopFileDragEvent>>(value)
+                .map(|event| event.payload)
+                .map_err(|error| format!("Invalid desktop file drag event: {error}")),
+        );
+    })
+    .await
 }
 
 pub async fn write_clipboard_text(text: &str) -> Result<(), String> {
