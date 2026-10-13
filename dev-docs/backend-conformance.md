@@ -122,6 +122,85 @@ controls, and `Idle` without the attention label. The instance attested
 `storesEphemeral: true` and was stopped afterward. This is targeted DOM QA,
 not a screenshot, multi-client, or full-backend certification claim.
 
+## Experimental Codex questions retain the native turn
+
+Codex 0.162.1's experimental `request_user_input` sends `isBlocking: false`
+in Default mode and `true` in Plan mode. The native handler awaits a user
+response in both modes; the flag controls the native UI's auto-resolution
+policy, not whether the RPC releases the provider turn. Mapping Default
+requests to `UserQuestionMode::NonBlocking` left ordinary follow-ups queued
+without the server's blocking-question cancellation path.
+
+The adapter now emits `Blocking` for these pending native RPCs and closes the
+question's response before publishing paused typing. The native RPC's item
+identity also owns its raw declaration, preventing a duplicate generic tool
+from remaining open when typing pauses. Genuine
+`request_user_input_async` message questions remain `NonBlocking`; native
+answers, explicit cancellation, and question-tool opt-in remain unchanged.
+Content-free routing diagnostics retain pending counts and the provider flag.
+
+`real_user_question` runs the same answer/cancel/unrelated-follow-up flow on
+every question-capable backend, including the ordinary Codex question path.
+Codex additionally runs that oracle with the
+experimental native tool enabled in Default and Plan profiles, forwarding
+provider responses unchanged and requiring native flag evidence. A
+nonblocking question must finish its asking turn before the paused-typing and
+response-closure assertions, and before the unrelated message is sent; a
+blocking question is interrupted first, as in the server's ordinary
+human-input path. The complete flow must emit no protocol violations. The
+follow-up must succeed and the old question must have
+exactly one cancelled completion, never an implicit answer. Its completion
+belongs to the earlier question request, not a tool newly started by the
+follow-up. Existing protocol queue regressions cover that server dispatch.
+
+Unfixed Default-profile coverage failed with a real native false flag and an
+unclosed question response in 14.62 seconds. Fixed native Default and Plan
+flows passed in 47.40 and 46.79 seconds, using GPT-6 Luna and GPT-5.6 Luna at
+low reasoning. The unchanged Codex async superseding-input case passed in
+20.86 seconds on GPT-6 Astra.
+
+The extended question flow also passed on Claude, Hermes, and Antigravity.
+Some subsequent native runs failed to issue the required request: the model
+attempted to invoke the built-in control tool inside `exec`, where it is not
+exported, and one claimed it was unavailable. The Codex-only prompt now
+requires direct invocation and states that the experimental tool remains
+enabled after cancellation. The oracle still requires real native requests
+and never accepts an ordinary text question.
+
+The Default native profile uses GPT-6 Astra after GPT-6 Luna failed to issue
+the required native request. Plan retains GPT-5.6 Luna. Async questions
+may arrive while their provider is still finishing the asking turn: a real
+Antigravity run remained active after the fixture's initial ten-second drain.
+The common flow now awaits the canonical idle event for nonblocking questions
+before asserting paused typing and a closed response; neither assertion was
+loosened.
+
+Stricter UI QA exposed a second projection defect: the native question's raw
+declaration survived as an uncompleted foreground tool. The strengthened
+real-provider flow reproduced three `idle_with_foreground_tool` violations
+and failed without explicit native identity binding in 51.98 seconds. This
+regression uses unmodified provider output, not a synthetic event fixture.
+With identity binding, the strengthened native Default flow passed on GPT-6
+Astra in 53.92 seconds and Plan passed on GPT-5.6 Luna in 49.61 seconds, each
+with three real native requests and no protocol violations.
+
+Targeted rendered-UI QA used an ephemeral desktop instance and GPT-6 Luna,
+with experimental settings confined to temporary project configuration. A
+real false-flag request showed answer controls and `Needs your answer`.
+Sending unrelated text with Enter cancelled the question, rendered the new
+reply, retired answer controls, cleared the queue, and restored Send. A
+subsequent pending question survived reload and accepted a question-card
+answer; another accepted explicit Cancel. The instance and its stores were
+removed. Screenshots and a second client are unavailable in this debug
+launcher; this is targeted DOM QA, not full-backend certification.
+
+After identity binding, a fresh ephemeral instance on GPT-6 Astra confirmed
+the real Default-mode false flag and exactly one matching raw declaration.
+Enter on unrelated chat input cancelled the answer controls, rendered the
+new assistant reply, cleared the question attention and queue, and restored
+Send with no error cards. A new draft enabled Send normally. The instance,
+its stores, and the temporary experimental configuration were removed.
+
 ## Antigravity questions are nonblocking
 
 Headless `agy` (checked on 1.2.11) cannot hold `ask_question` for a human:

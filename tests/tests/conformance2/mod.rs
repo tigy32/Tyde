@@ -16,7 +16,15 @@ use tyde_agent_adapter::BackendCapability;
 
 pub const SCRATCH_DIR: &str = "scratch";
 
-pub async fn real_blocking_question_profile_child<B: Backend>(host: &Harness<B>) {
+pub enum NativeQuestionProfile {
+    Default,
+    Plan,
+}
+
+pub async fn real_native_question_profile_child<B: Backend>(
+    host: &Harness<B>,
+    mode: NativeQuestionProfile,
+) {
     if std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_some() {
         return;
     }
@@ -27,6 +35,10 @@ pub async fn real_blocking_question_profile_child<B: Backend>(host: &Harness<B>)
         .arg(script)
         .arg(std::env::current_exe().expect("conformance executable"))
         .arg(&host.test_name)
+        .arg(match mode {
+            NativeQuestionProfile::Default => "default",
+            NativeQuestionProfile::Plan => "plan",
+        })
         .status()
         .await
         .expect("run real provider blocking-question profile");
@@ -929,6 +941,13 @@ impl Question {
 
     pub fn question(&self) -> &AskUserQuestion {
         &self.question
+    }
+
+    pub fn mode(&self) -> protocol::UserQuestionMode {
+        match self.request.tool_type {
+            ToolRequestType::AskUserQuestion { mode, .. } => mode,
+            _ => unreachable!("question fixture requires a user question"),
+        }
     }
 
     /// Chosen from what the provider actually offered rather than from the

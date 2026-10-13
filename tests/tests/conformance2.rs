@@ -101,9 +101,17 @@ macro_rules! conformance2_scenario {
                                         let result = std::panic::AssertUnwindSafe(async {
                                             super::$scenario(&mut harness).await;
                                             if stringify!($name) == "codex"
+                                                && stringify!($scenario) == "real_user_question"
+                                                && std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_none()
+                                            {
+                                                for mode in [NativeQuestionProfile::Default, NativeQuestionProfile::Plan] {
+                                                    real_native_question_profile_child(&harness, mode).await;
+                                                }
+                                            }
+                                            if stringify!($name) == "codex"
                                                 && stringify!($scenario).starts_with("real_excludes_ask_user_tools")
                                             {
-                                                real_blocking_question_profile_child(&harness).await;
+                                                real_native_question_profile_child(&harness, NativeQuestionProfile::Plan).await;
                                             }
                                         })
                                         .catch_unwind()
@@ -151,7 +159,8 @@ macro_rules! conformance2_scenario {
                     Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
                 } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question") {
                     // Luna exposes only the blocking tool; Astra exposes async questions.
-                    Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
+                    let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-astra".to_owned());
+                    Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
                 } else { Profile::codex() }
             );
             provider!(
@@ -4660,11 +4669,30 @@ conformance2_scenario!(
 );
 
 async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
+    let question_prompt = if host.backend() == BackendKind::Codex
+        && std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_some()
+    {
+        "This is a new independent choice; previous answers do not apply. Use the \
+         built-in experimental request_user_input tool directly, not request_user_input_async, to ask \
+         Which label? with exactly two option labels ALPHA and BETA. This tool is \
+         enabled in both Default and Plan modes in this profile, including after \
+         cancellation. Do not invoke exec or tools.request_user_input: the built-in \
+         control tool is not exported inside exec. Invoke it now; do not substitute an ordinary text question \
+         or claim it is unavailable without invoking it. Ask once and \
+         wait for my answer without guessing or running other tools. After I answer, \
+         reply with my complete selected label verbatim. Do not create a file."
+            .to_owned()
+    } else {
+        question_prompt::<B>()
+    };
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    let asked = ask_question(host, &agent, &question_prompt::<B>()).await;
+    let mut asked = ask_question(host, &agent, &question_prompt).await;
+    if asked.mode() == protocol::UserQuestionMode::NonBlocking {
+        wait_for_unanswered_question_idle(host, &mut asked).await;
+    }
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
     assert_eq!(
@@ -4693,7 +4721,7 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     // Second question, abandoned rather than answered. Cancelling is
     // the user's escape hatch from an interactive tool, and it is the
     // one path where a card and a turn can be terminalized out of step.
-    let abandoned = ask_question(host, &agent, &question_prompt::<B>()).await;
+    let abandoned = ask_question(host, &agent, &question_prompt).await;
     assert_question_shape(&abandoned);
     let cancelled = cancel_question(host).await;
     assert_no_error_message(&format!("{:?} question cancel", host.backend()), &cancelled);
@@ -4716,7 +4744,55 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let recovered = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&recovered);
 
+    let mut superseded = ask_question(host, &agent, &question_prompt).await;
+    assert_question_waits_for_an_answer(&superseded);
+    let withdrawn = match superseded.mode() {
+        protocol::UserQuestionMode::Blocking => cancel_question(host).await,
+        protocol::UserQuestionMode::NonBlocking => {
+            wait_for_unanswered_question_idle(host, &mut superseded).await;
+            Vec::new()
+        }
+    };
+    let followup_prompt = launch_prompt();
+    assert!(
+        matches!(
+            try_send_prompt(host, &agent, &followup_prompt).await,
+            server::backend::SendOutcome::Accepted
+        ),
+        "a completed or cancelled question must release the unrelated follow-up"
+    );
+    let followup = collect_turn(host, &agent, &followup_prompt).await;
+    assert_ready_handshake(&followup);
+    let mut withdrawn = withdrawn;
+    withdrawn.extend(followup.events().iter().cloned());
+    let completions = withdrawn
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == superseded.tool_call_id() =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "unrelated input must withdraw the question exactly once"
+    );
+    assert!(
+        matches!(
+            completions[0].outcome,
+            ToolExecutionOutcome::Cancelled { .. }
+        ),
+        "unrelated chat input must cancel the question rather than answer it"
+    );
     assert_universal_contract(&[launched, recovered]);
+    assert!(
+        host.protocol_violations().is_empty(),
+        "question answer, cancellation and follow-up must preserve the chat protocol"
+    );
 
     assert_clean_close(host, &agent).await;
 }
@@ -4806,6 +4882,7 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     );
     let recovered = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&recovered);
+
     assert_universal_contract(&[launched, recovered]);
     assert_clean_close(host, &agent).await;
 }

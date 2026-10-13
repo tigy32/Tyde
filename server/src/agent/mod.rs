@@ -7139,6 +7139,17 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                         _ => None,
                                     };
+                                    if !is_tool_response && !pending_tool_response_ids.is_empty() {
+                                        tracing::info!(
+                                            pending_responses = pending_tool_response_ids.len(),
+                                            in_turn,
+                                            usage_paused,
+                                            compacting = context_compaction.is_some(),
+                                            human_input = matches!(msg.origin, None | Some(MessageOrigin::User)),
+                                            supersedes_blocking_question,
+                                            "Routing input while a user response is pending"
+                                        );
+                                    }
                                     if !is_tool_response {
                                         status_handle
                                             .update(|status| {

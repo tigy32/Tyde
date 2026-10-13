@@ -1,4 +1,4 @@
-"""Run the same real-provider oracle with Codex's native blocking Plan tool."""
+"""Run the same real-provider oracle with Codex's native question tool."""
 
 import json
 import os
@@ -33,8 +33,11 @@ def proxy():
                 request = json.loads(line)
                 if request.get("method") == "turn/start":
                     request["params"]["collaborationMode"] = {
-                        "mode": "plan",
-                        "settings": {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+                        "mode": os.environ["TYDE_NATIVE_QUESTION_MODE"],
+                        "settings": {
+                            "model": os.environ["TYDE_CODEX_TEST_MODEL"],
+                            "reasoning_effort": "low",
+                        },
                     }
                     line = (json.dumps(request) + "\n").encode()
                 child.stdin.write(line)
@@ -51,7 +54,7 @@ def proxy():
             if event.get("method") == "item/tool/requestUserInput":
                 with open(os.environ["TYDE_BLOCKING_QUESTION_PROOF"], "a") as proof:
                     proof.write(json.dumps({
-                        "blocking": event.get("params", {}).get("isBlocking", True),
+                        "blocking": event["params"]["isBlocking"],
                     }) + "\n")
             # Never invent or change provider responses or events.
             sys.stdout.buffer.write(line)
@@ -83,15 +86,20 @@ def run():
     shell.write_text('#!/bin/sh\nexec /bin/bash --noprofile --norc "$@"\n')
     shell.chmod(0o700)
     proof = root / "proof.jsonl"
+    mode = sys.argv[3] if len(sys.argv) > 3 else "plan"
+    if mode not in ("default", "plan"):
+        raise ValueError("native question profile must be default or plan")
+    model = "gpt-6-astra" if mode == "default" else "gpt-5.6-luna"
     env = dict(
         os.environ,
         PATH=str(binary_dir) + os.pathsep + os.environ["PATH"],
         SHELL=str(shell),
         TYDE_REAL_CODEX_EXECUTABLE=real,
         TYDE_BLOCKING_QUESTION_PROOF=str(proof),
-        TYDE_CODEX_TEST_MODEL="gpt-5.6-luna",
+        TYDE_CODEX_TEST_MODEL=model,
+        TYDE_NATIVE_QUESTION_MODE=mode,
     )
-    print("Real blocking-question evidence:", root, flush=True)
+    print("Real native-question evidence:", mode, root, flush=True)
     with (root / "run.log").open("w") as output:
         result = subprocess.run(
             [sys.argv[1], "--exact", sys.argv[2], "--ignored", "--nocapture"],
@@ -100,8 +108,10 @@ def run():
     if not proof.exists():
         raise RuntimeError("real provider never requested blocking user input")
     records = [json.loads(line) for line in proof.read_text().splitlines()]
-    assert any(record["blocking"] for record in records), "blocking positive control missing"
-    print("Real blocking question count:", sum(bool(r["blocking"]) for r in records), flush=True)
+    expected_blocking = mode == "plan"
+    assert any(record["blocking"] == expected_blocking for record in records), \
+        "native question profile positive control missing"
+    print("Real native question count:", len(records), flush=True)
     for line in (root / "run.log").read_text(errors="replace").splitlines():
         if line.startswith("test result:"):
             print(line, flush=True)

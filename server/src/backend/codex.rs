@@ -3797,11 +3797,20 @@ impl CodexResponseSplitter {
         tool_name: &str,
         arguments: Value,
         tool_type: Value,
+        native_provider_item_id: Option<&str>,
     ) -> Option<u32> {
         // Opens the response rather than requiring one: a resumed thread gets no
         // raw events, so nothing else has opened it, and bailing here is what
         // sent every tool down the one-card-per-tool path.
         self.ensure_open(turn_id)?;
+        if let Some(item_id) = native_provider_item_id {
+            self.typed_owned_call_ids.insert(item_id.to_owned());
+            if let Some(owner) = self.claim_raw_tool_owner(item_id, None)
+                && let Some(call_id) = owner.provider_call_id
+            {
+                self.typed_owned_call_ids.insert(call_id);
+            }
+        }
         let response = self.open.as_mut().expect("open Codex response");
         if response.turn_id == "turn"
             && let Some(turn_id) = turn_id
@@ -3810,14 +3819,27 @@ impl CodexResponseSplitter {
         }
         let content_offset = u32::try_from(response.text.chars().count()).unwrap_or(u32::MAX);
         // Async questions belong to a message, not a concurrently executing tool item.
-        let (provider_item_id, provider_call_id) = if tool_name == "request_user_input_async" {
-            (None, None)
-        } else {
-            (
+        let (provider_item_id, provider_call_id) = match native_provider_item_id {
+            Some(item_id) => (Some(item_id.to_owned()), None),
+            None if tool_name == "request_user_input_async" => (None, None),
+            None => (
                 response.pending_typed_tool_item_id.clone(),
                 response.pending_typed_tool_call_id.clone(),
-            )
+            ),
         };
+        if native_provider_item_id.is_some() {
+            tracing::info!(
+                raw_matches = response
+                    .raw_tool_requests
+                    .iter()
+                    .filter(|raw| {
+                        raw.provider_item_id == provider_item_id
+                            || raw.provider_call_id == provider_item_id
+                    })
+                    .count(),
+                "Binding a native Codex question to its provider tool identity"
+            );
+        }
         response.raw_tool_requests.retain(|raw| {
             let raw_item_id = raw.provider_item_id.as_deref().unwrap_or_default();
             let typed_matches_raw_item = provider_item_id.as_ref().is_some_and(|typed_item_id| {
@@ -9760,6 +9782,7 @@ impl CodexInner {
                     &suppressed_owner.tool_name,
                     suppressed_owner.arguments.clone(),
                     suppressed_owner.tool_type.clone(),
+                    None,
                 )
                 .await;
             if !buffered {
@@ -10209,6 +10232,7 @@ impl CodexInner {
         tool_name: &str,
         arguments: Value,
         tool_type: Value,
+        native_provider_item_id: Option<&str>,
     ) -> bool {
         let Some((emitter, model)) = self.response_projection_target(thread_id).await else {
             return false;
@@ -10244,6 +10268,7 @@ impl CodexInner {
                         tool_name,
                         arguments,
                         tool_type,
+                        native_provider_item_id,
                     )
                 })
         };
@@ -10757,6 +10782,7 @@ impl CodexInner {
                             "exec_command",
                             call.arguments,
                             tool_type,
+                            None,
                         )
                         .await
                     {
@@ -13218,6 +13244,7 @@ impl CodexInner {
                 tool_name,
                 request.arguments.clone(),
                 request.tool_type.clone(),
+                request.native_provider_item_id.as_deref(),
             )
             .await
         {
@@ -14716,14 +14743,12 @@ impl CodexInner {
                         multi_select: false,
                     })
                     .collect::<Vec<_>>();
-                let mode = if request.is_blocking {
-                    protocol::UserQuestionMode::Blocking
-                } else {
-                    protocol::UserQuestionMode::NonBlocking
-                };
+                // Native isBlocking controls client auto-resolution. The RPC
+                // still holds this tool's turn until answered or interrupted.
                 tracing::info!(
                     question_count = questions.len(),
-                    blocking = request.is_blocking,
+                    native_is_blocking = request.is_blocking,
+                    waiting_for_response = true,
                     "Codex projecting native user-input questions"
                 );
                 {
@@ -14737,18 +14762,24 @@ impl CodexInner {
                     });
                 }
 
-                self.emitter.typing_status_changed(false);
                 self.track_tool_requests(std::iter::once(tool_call_id.clone()))
                     .await;
                 self.emit_tool_request(
                     &tool_call_id,
                     "request_user_input",
-                    CodexToolRequest::typed(
-                        json!({ "questions": params["questions"] }),
-                        json!(protocol::ToolRequestType::AskUserQuestion { questions, mode }),
-                    ),
+                    CodexToolRequest {
+                        arguments: json!({ "questions": params["questions"] }),
+                        tool_type: json!(protocol::ToolRequestType::AskUserQuestion {
+                            questions,
+                            mode: protocol::UserQuestionMode::Blocking,
+                        }),
+                        native_provider_item_id: Some(request.item_id),
+                    },
                 )
                 .await;
+                self.finalize_strict_response(params, CodexResponseEnd::Completed)
+                    .await;
+                self.emitter.typing_status_changed(false);
             }
             "mcpServer/elicitation/request" => {
                 let result = codex_mcp_elicitation_result(params);
@@ -16998,6 +17029,7 @@ impl CodexInner {
                 tool_name,
                 request.arguments.clone(),
                 request.tool_type.clone(),
+                request.native_provider_item_id.as_deref(),
             )
             .await
         {
@@ -17941,6 +17973,7 @@ struct CodexToolRequest {
     arguments: Value,
     /// A serialized [`ToolRequestType`].
     tool_type: Value,
+    native_provider_item_id: Option<String>,
 }
 
 impl CodexToolRequest {
@@ -17950,6 +17983,7 @@ impl CodexToolRequest {
         Self {
             tool_type: json!({ "kind": "Other", "args": arguments.clone() }),
             arguments,
+            native_provider_item_id: None,
         }
     }
 
@@ -17960,6 +17994,7 @@ impl CodexToolRequest {
         Self {
             arguments,
             tool_type,
+            native_provider_item_id: None,
         }
     }
 
