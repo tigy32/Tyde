@@ -16,15 +16,14 @@ use crate::components::swarm_view::{lifecycle_label, member_is_working, open_swa
 use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, sort_project_infos,
+    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, agent_ui_project_id,
+    sort_project_infos,
 };
 
-/// Pure predicate used by the Agents panel filter memo. Extracted so the
-/// filter behavior can be unit-tested without a Leptos runtime.
-pub fn agent_passes_filters(
+fn agent_passes_filters(
     agent: &AgentInfo,
     filters: &AgentsPanelFilters,
-    active_project: Option<&ActiveProjectRef>,
+    matches_project: bool,
     streaming: &HashMap<AgentId, StreamingState>,
     turn_active: &HashMap<AgentId, bool>,
     awaiting_user: &HashSet<AgentId>,
@@ -45,16 +44,8 @@ pub fn agent_passes_filters(
             return false;
         }
     }
-    if !filters.show_other_projects {
-        let matches = match active_project {
-            None => agent.project_id.is_none(),
-            Some(ap) => {
-                agent.host_id == ap.host_id && agent.project_id.as_ref() == Some(&ap.project_id)
-            }
-        };
-        if !matches {
-            return false;
-        }
+    if !filters.show_other_projects && !matches_project {
+        return false;
     }
     if !lowercase_query.is_empty() && !agent.name.to_lowercase().contains(lowercase_query) {
         return false;
@@ -67,6 +58,7 @@ fn swarm_passes_filters(
     swarm: &Swarm,
     filters: &AgentsPanelFilters,
     active_project: Option<&ActiveProjectRef>,
+    projects: &[ProjectInfo],
     lowercase_query: &str,
 ) -> bool {
     if filters.hide_inactive && swarm_working_count(swarm) == 0 {
@@ -74,7 +66,9 @@ fn swarm_passes_filters(
     }
     if !filters.show_other_projects
         && !active_project.is_some_and(|ap| {
-            ap.host_id == host_id && ap.project_id == swarm.constraints.project_id
+            ap.host_id == host_id
+                && agent_ui_project_id(projects, host_id, Some(&ap.project_id))
+                    == agent_ui_project_id(projects, host_id, Some(&swarm.constraints.project_id))
         })
     {
         return false;
@@ -703,7 +697,10 @@ fn build_sidebar_sections(
     let mut keyed_swarms = Vec::new();
     for swarm in swarms {
         keyed_swarms.push((
-            leaf_for(swarm.host_id.clone(), Some(swarm.project_id.clone())),
+            leaf_for(
+                swarm.host_id.clone(),
+                agent_ui_project_id(&projects, &swarm.host_id, Some(&swarm.project_id)).cloned(),
+            ),
             swarm,
         ));
     }
@@ -712,7 +709,12 @@ fn build_sidebar_sections(
         keyed_groups.push((
             leaf_for(
                 group.parent.host_id.clone(),
-                group.parent.project_id.clone(),
+                agent_ui_project_id(
+                    &projects,
+                    &group.parent.host_id,
+                    group.parent.project_id.as_ref(),
+                )
+                .cloned(),
             ),
             group,
         ));
@@ -1340,6 +1342,7 @@ pub fn AgentsPanel() -> impl IntoView {
     let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
         let active_project = filter_state.active_project.get();
+        let projects = filter_state.projects.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
 
@@ -1360,7 +1363,21 @@ pub fn AgentsPanel() -> impl IntoView {
                                     && agent_passes_filters(
                                         a,
                                         &filters,
-                                        active_project.as_ref(),
+                                        match active_project.as_ref() {
+                                            None => a.project_id.is_none(),
+                                            Some(ap) => {
+                                                a.host_id == ap.host_id
+                                                    && agent_ui_project_id(
+                                                        &projects,
+                                                        &a.host_id,
+                                                        a.project_id.as_ref(),
+                                                    ) == agent_ui_project_id(
+                                                        &projects,
+                                                        &ap.host_id,
+                                                        Some(&ap.project_id),
+                                                    )
+                                            }
+                                        },
                                         streaming_map,
                                         turn_active_map,
                                         awaiting_user,
@@ -1378,6 +1395,7 @@ pub fn AgentsPanel() -> impl IntoView {
     let swarm_filter_state = state.clone();
     let filtered_swarms = Memo::new(move |_| {
         let active_project = swarm_filter_state.active_project.get();
+        let projects = swarm_filter_state.projects.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
         swarm_filter_state.swarms.with(|by_host| {
@@ -1385,7 +1403,14 @@ pub fn AgentsPanel() -> impl IntoView {
                 .iter()
                 .flat_map(|(host_id, swarms)| swarms.values().map(move |swarm| (host_id, swarm)))
                 .filter(|(host_id, swarm)| {
-                    swarm_passes_filters(host_id, swarm, &filters, active_project.as_ref(), &query)
+                    swarm_passes_filters(
+                        host_id,
+                        swarm,
+                        &filters,
+                        active_project.as_ref(),
+                        &projects,
+                        &query,
+                    )
                 })
                 .map(|(host_id, swarm)| {
                     (
@@ -3979,7 +4004,7 @@ mod wasm_tests {
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
 
-        let _handle = mount_panel(&container, state);
+        let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
@@ -4013,6 +4038,100 @@ mod wasm_tests {
         assert!(text_position(&text, "Project: Beta Project") < text_position(&text, "Beta Agent"));
         assert!(text_position(&text, "Beta Agent") < text_position(&text, "Host: Remote Host"));
         assert!(text_position(&text, "Host: Remote Host") < text_position(&text, "Gamma Agent"));
+
+        state.projects.update(|projects| {
+            for id in ["alpha-workbench", "alpha-workbench-two"] {
+                let mut workbench = project_info("local", id, id, 2);
+                workbench.project.source = ProjectSource::GitWorkbench {
+                    parent_project_id: ProjectId("alpha".to_owned()),
+                    branch: protocol::GitBranchName(id.to_owned()),
+                    roots: vec![protocol::WorkbenchRoot {
+                        parent_root: ProjectRootPath("/tmp/alpha".to_owned()),
+                        worktree_root: ProjectRootPath(format!("/tmp/{id}")),
+                    }],
+                };
+                projects.push(workbench);
+            }
+            projects.push(project_info(
+                "remote",
+                "alpha-workbench",
+                "Remote Collision",
+                1,
+            ));
+        });
+        push_agent_with_scope(
+            &state,
+            "local",
+            "workbench-agent",
+            "Workbench Agent",
+            true,
+            Some("alpha-workbench"),
+            None,
+        );
+        push_agent_with_scope(
+            &state,
+            "remote",
+            "remote-collision",
+            "Remote Collision Agent",
+            true,
+            Some("alpha-workbench"),
+            None,
+        );
+        state.agents.update(|agents| {
+            let moved = agents
+                .iter_mut()
+                .find(|agent| agent.agent_id.0 == "parent-alpha")
+                .unwrap();
+            moved.project_id = Some(ProjectId("alpha-workbench-two".to_owned()));
+            moved.workspace_roots = vec!["/tmp/alpha-workbench-two".to_owned()];
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Project: alpha-workbench"),
+            "workbench agents must not create separate project headings"
+        );
+        let alpha = container
+            .query_selector("[data-project-key='local:alpha']")
+            .unwrap()
+            .unwrap();
+        let alpha_text = alpha.text_content().unwrap_or_default();
+        for name in ["Parent Alpha Agent", "Child Alpha Agent", "Workbench Agent"] {
+            assert!(
+                alpha_text.contains(name),
+                "the parent project must contain {name}"
+            );
+        }
+        assert!(!alpha_text.contains("Remote Collision Agent"));
+        assert!(text.contains("Project: Remote Collision"));
+
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
+        state.agents_view_preferences.set(preferences);
+        for selected in ["alpha", "alpha-workbench", "alpha-workbench-two"] {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "local".to_owned(),
+                project_id: ProjectId(selected.to_owned()),
+            }));
+            for _ in 0..4 {
+                next_tick().await;
+            }
+            let text = container.text_content().unwrap_or_default();
+            for name in ["Parent Alpha Agent", "Child Alpha Agent", "Workbench Agent"] {
+                assert!(
+                    text.contains(name),
+                    "selecting {selected} must keep {name} visible"
+                );
+            }
+            for name in ["Beta Agent", "Gamma Agent", "Remote Collision Agent"] {
+                assert!(
+                    !text.contains(name),
+                    "selecting {selected} must exclude {name}"
+                );
+            }
+        }
     }
 
     /// Parent/child sub-agent nesting remains inside the host/project leaf:
@@ -4370,6 +4489,66 @@ mod wasm_tests {
             }),
             "clicking the swarm row opens the swarm"
         );
+        state.projects.update(|projects| {
+            for id in ["bamboo-bench", "bamboo-sibling"] {
+                let mut workbench = project_info("local", id, id, 2);
+                workbench.project.source = ProjectSource::GitWorkbench {
+                    parent_project_id: ProjectId("bamboo".to_owned()),
+                    branch: protocol::GitBranchName(id.to_owned()),
+                    roots: vec![],
+                };
+                projects.push(workbench);
+            }
+            projects.push(project_info("remote", "bamboo-bench", "Remote bench", 0));
+        });
+        set_swarm(&|swarm| swarm.constraints.project_id = ProjectId("bamboo-bench".to_owned()));
+        state.swarms.update(|by_host| {
+            let mut remote = by_host["local"][&SwarmId("bamboo-swarm".to_owned())].clone();
+            remote.name = "Remote Crew".to_owned();
+            by_host.insert(
+                "remote".to_owned(),
+                HashMap::from([(remote.id.clone(), remote)]),
+            );
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let bamboo = container
+            .query_selector("[data-project-key='local:bamboo']")
+            .unwrap()
+            .unwrap();
+        assert!(bamboo.text_content().unwrap().contains("Bamboo Crew"));
+        assert!(!bamboo.text_content().unwrap().contains("Remote Crew"));
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Project: bamboo-bench")
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Project: Remote bench")
+        );
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
+        state.agents_view_preferences.set(preferences);
+        for selected in ["bamboo", "bamboo-bench", "bamboo-sibling"] {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "local".to_owned(),
+                project_id: ProjectId(selected.to_owned()),
+            }));
+            for _ in 0..4 {
+                next_tick().await;
+            }
+            let text = container.text_content().unwrap();
+            assert!(
+                text.contains("Project: Bamboo Project") && text.contains("Bamboo Crew"),
+                "parent and sibling selections retain the swarm under its parent"
+            );
+            assert!(!text.contains("Normal Agent") && !text.contains("Remote Crew"));
+        }
     }
 
     #[wasm_bindgen_test]
@@ -7226,9 +7405,27 @@ mod wasm_tests {
             .closest("[data-project-key]")
             .unwrap()
             .unwrap();
-        assert!(
-            after.text_content().unwrap().contains("Task workbench"),
-            "the same agent must now be rendered under its assigned workbench"
+        // Entry still changes the working project, but agent-list headings
+        // deliberately stay on the parent rather than the workbench name.
+        let grouped_text = after.text_content().unwrap();
+        for name in [
+            "Source project",
+            "Task worker",
+            "Source notes",
+            "Workbench notes",
+        ] {
+            assert!(
+                grouped_text.contains(name),
+                "the parent group must include {name}"
+            );
+        }
+        assert!(!grouped_text.contains("Task workbench"));
+        assert_eq!(
+            container
+                .query_selector_all("[data-project-key]")
+                .unwrap()
+                .length(),
+            1
         );
         assert!(
             container
@@ -7290,6 +7487,20 @@ mod wasm_tests {
                 .query_selector("[role='tab'][aria-selected='true'][aria-label='Task worker']")
                 .unwrap()
                 .is_some()
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Workbench notes']")
+                .unwrap()
+                .is_some(),
+            "opening the parent-grouped worker restores its workbench's tabs"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Source notes']")
+                .unwrap()
+                .is_none(),
+            "opening the parent-grouped worker must not keep the parent workspace active"
         );
         let inputs = container.query_selector_all("textarea").unwrap();
         assert!(

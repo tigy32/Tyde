@@ -3144,6 +3144,24 @@ pub struct ProjectInfo {
     pub project: Project,
 }
 
+// Agent-list presentation follows the explicit workbench parent, without
+// changing the agent's project/workspace used by navigation and commands.
+pub fn agent_ui_project_id<'a>(
+    projects: &'a [ProjectInfo],
+    host_id: &str,
+    project_id: Option<&'a ProjectId>,
+) -> Option<&'a ProjectId> {
+    for project in projects {
+        if project.host_id == host_id
+            && Some(&project.project.id) == project_id
+            && let Some(parent) = project.project.parent_project_id()
+        {
+            return Some(parent);
+        }
+    }
+    project_id
+}
+
 pub fn root_display_name(root: &ProjectRootPath) -> String {
     display_path_name(&root.0)
 }

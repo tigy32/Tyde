@@ -16,7 +16,7 @@ use crate::components::agents_panel::{
     DerivedAgentState, backend_class, backend_label, derive_agent_state_with_background,
     relative_time, status_class, status_icon, status_label,
 };
-use crate::state::{AgentInfo, AgentMonitorKey, AppState, ProjectInfo};
+use crate::state::{AgentInfo, AgentMonitorKey, AppState, ProjectInfo, agent_ui_project_id};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DropPlacement {
@@ -203,17 +203,23 @@ pub(crate) fn agent_passes_view_filters(
     status: DerivedAgentState,
     filters: &AgentsViewFilters,
     query_lc: &str,
+    projects: &[ProjectInfo],
 ) -> bool {
     if !filters.host_ids.is_empty() && !filters.host_ids.iter().any(|id| id.0 == agent.host_id) {
         return false;
     }
     if !filters.project_ids.is_empty() {
-        let matches = agent.project_id.as_ref().is_some_and(|project_id| {
-            filters
-                .project_ids
-                .iter()
-                .any(|filter| filter.host_id.0 == agent.host_id && &filter.project_id == project_id)
-        });
+        let matches = agent_ui_project_id(projects, &agent.host_id, agent.project_id.as_ref())
+            .is_some_and(|project_id| {
+                filters.project_ids.iter().any(|filter| {
+                    filter.host_id.0 == agent.host_id
+                        && agent_ui_project_id(
+                            projects,
+                            &filter.host_id.0,
+                            Some(&filter.project_id),
+                        ) == Some(project_id)
+                })
+            });
         if !matches {
             return false;
         }
@@ -474,7 +480,8 @@ fn host_label(host_labels: &HashMap<String, String>, host_id: &str) -> String {
 }
 
 fn project_label(projects: &[ProjectInfo], agent: &AgentInfo) -> String {
-    let Some(project_id) = agent.project_id.as_ref() else {
+    let Some(project_id) = agent_ui_project_id(projects, &agent.host_id, agent.project_id.as_ref())
+    else {
         return "No project".to_owned();
     };
     projects
@@ -977,7 +984,7 @@ pub fn AgentMonitorView() -> impl IntoView {
         let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
         for agent in agents.iter() {
             let status = derive_agent_state_with_background(&rows_state, agent);
-            if !agent_passes_view_filters(agent, status, &preferences.filters, &query) {
+            if !agent_passes_view_filters(agent, status, &preferences.filters, &query, &projects) {
                 continue;
             }
             let target = agent_annotation_target(agent);
@@ -1787,7 +1794,14 @@ fn HostProjectFilters() -> impl IntoView {
     let host_state = state.clone();
     let hosts = move || host_state.configured_hosts.get();
     let project_state = state.clone();
-    let projects = move || project_state.projects.get();
+    let projects = move || {
+        project_state
+            .projects
+            .get()
+            .into_iter()
+            .filter(|project| !project.project.is_workbench())
+            .collect::<Vec<_>>()
+    };
 
     let host_chip_state = state.clone();
     let project_chip_state = state.clone();
@@ -1849,19 +1863,34 @@ fn HostProjectFilters() -> impl IntoView {
                     let chip_state = project_chip_state.clone();
                     let active_host = host_id.clone();
                     let active_project = project_id.clone();
+                    let active_state = chip_state.clone();
                     let active = move || {
-                        prefs.get().filters.project_ids.iter().any(|filter| {
-                            filter.host_id.0 == active_host && filter.project_id == active_project
+                        active_state.projects.with(|projects| {
+                            prefs.get().filters.project_ids.iter().any(|filter| {
+                                filter.host_id.0 == active_host
+                                    && agent_ui_project_id(projects, &filter.host_id.0, Some(&filter.project_id))
+                                        == Some(&active_project)
+                            })
                         })
                     };
                     let on_click = move |_| {
                         let prefs = chip_state.effective_agents_view_preferences();
                         let mut filters = prefs.filters.clone();
-                        let value = AgentProjectFilter {
-                            host_id: HostFilterId(host_id.clone()),
-                            project_id: project_id.clone(),
-                        };
-                        filters.project_ids = toggle_in_vec(&filters.project_ids, &value);
+                        chip_state.projects.with_untracked(|projects| {
+                            let matches = |filter: &AgentProjectFilter| {
+                                filter.host_id.0 == host_id
+                                    && agent_ui_project_id(projects, &filter.host_id.0, Some(&filter.project_id))
+                                        == Some(&project_id)
+                            };
+                            if filters.project_ids.iter().any(matches) {
+                                filters.project_ids.retain(|filter| !matches(filter));
+                            } else {
+                                filters.project_ids.push(AgentProjectFilter {
+                                    host_id: HostFilterId(host_id.clone()),
+                                    project_id: project_id.clone(),
+                                });
+                            }
+                        });
                         let active = active_view_after_query_edit(
                             &chip_state,
                             &filters,
@@ -3097,6 +3126,144 @@ mod wasm_tests {
         };
         assert!(headers.contains(&"Claude".to_owned()));
         assert!(headers.contains(&"Codex".to_owned()));
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_grouping_and_filters_keep_workbench_agents_together() {
+        use protocol::{GitBranchName, Project, ProjectRootPath, ProjectSource, WorkbenchRoot};
+        install_send_stub();
+        let project = |id: &str, name: &str, parent: Option<&str>| ProjectInfo {
+            host_id: HOST.to_owned(),
+            project: Project {
+                id: ProjectId(id.to_owned()),
+                name: name.to_owned(),
+                sort_order: 0,
+                source: match parent {
+                    None => ProjectSource::Standalone { roots: vec![] },
+                    Some(parent) => ProjectSource::GitWorkbench {
+                        parent_project_id: ProjectId(parent.to_owned()),
+                        branch: GitBranchName(id.to_owned()),
+                        roots: vec![WorkbenchRoot {
+                            parent_root: ProjectRootPath("/tmp/parent".to_owned()),
+                            worktree_root: ProjectRootPath(format!("/tmp/{id}")),
+                        }],
+                    },
+                },
+            },
+        };
+        let mut agents = vec![
+            agent("parent", 100, false),
+            agent("bench", 200, false),
+            agent("sibling", 300, false),
+            agent("other", 400, false),
+        ];
+        for (agent, project) in agents
+            .iter_mut()
+            .zip(["parent", "bench", "sibling", "other"])
+        {
+            agent.project_id = Some(ProjectId(project.to_owned()));
+            agent.workspace_roots = vec![format!("/tmp/{project}")];
+        }
+        let state = primed_state(
+            agents,
+            AgentsViewPreferences {
+                group_mode: AgentGroupMode::Project,
+                ..Default::default()
+            },
+        );
+        state.projects.set(vec![
+            project("parent", "Parent Project", None),
+            project("bench", "Workbench One", Some("parent")),
+            project("sibling", "Workbench Two", Some("parent")),
+            project("other", "Other Project", None),
+        ]);
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+        assert_eq!(
+            group_headers(&container),
+            vec!["Other Project", "Parent Project"]
+        );
+        let chips = chip_texts(
+            &container,
+            "[data-test='agent-monitor-project-filters'] button",
+        );
+        assert_eq!(chips, vec!["Parent Project", "Other Project"]);
+        let buttons = container
+            .query_selector_all("[data-test='agent-monitor-project-filters'] button")
+            .unwrap();
+        buttons
+            .item(0)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let mut names = rendered_names(&container);
+        names.sort();
+        assert_eq!(names, vec!["bench", "parent", "sibling"]);
+        assert_eq!(group_headers(&container), vec!["Parent Project"]);
+        state.agents.update(|agents| {
+            let moved = agents
+                .iter_mut()
+                .find(|agent| agent.name == "parent")
+                .unwrap();
+            moved.project_id = Some(ProjectId("bench".to_owned()));
+            moved.workspace_roots = vec!["/tmp/bench".to_owned()];
+        });
+        next_tick().await;
+        let mut names = rendered_names(&container);
+        names.sort();
+        assert_eq!(names, vec!["bench", "parent", "sibling"]);
+        assert_eq!(group_headers(&container), vec!["Parent Project"]);
+        for stored_ids in [vec!["bench"], vec!["parent", "bench", "sibling"]] {
+            state.apply_agents_view_snapshot(
+                HOST,
+                snapshot(AgentsViewPreferences {
+                    group_mode: AgentGroupMode::Project,
+                    filters: AgentsViewFilters {
+                        project_ids: stored_ids
+                            .into_iter()
+                            .map(|id| AgentProjectFilter {
+                                host_id: HostFilterId(HOST.to_owned()),
+                                project_id: ProjectId(id.to_owned()),
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+            next_tick().await;
+            let mut names = rendered_names(&container);
+            names.sort();
+            assert_eq!(names, vec!["bench", "parent", "sibling"]);
+            let buttons = container
+                .query_selector_all("[data-test='agent-monitor-project-filters'] button")
+                .unwrap();
+            buttons
+                .item(0)
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            let mut names = rendered_names(&container);
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["bench", "other", "parent", "sibling"],
+                "the visible parent control must clear persisted workbench-family filters"
+            );
+            assert_eq!(
+                group_headers(&container),
+                vec!["Other Project", "Parent Project"]
+            );
+        }
     }
 
     // ── Smart View switcher (Phase 2a) ──────────────────────────────────────
