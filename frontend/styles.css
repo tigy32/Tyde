@@ -17018,6 +17018,114 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
     max-width: 640px;
 }
 
+.settings-dots .settings-panel-header {
+    flex-wrap: wrap;
+}
+
+.settings-dots .settings-status-chip {
+    padding: var(--space-1) var(--space-2);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 999px;
+    white-space: nowrap;
+}
+
+.settings-dots-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    margin-bottom: var(--space-4);
+}
+
+.settings-dots-card .settings-section-title,
+.settings-dots-card .settings-description,
+.settings-dots-card .settings-tychat-problem {
+    margin: 0;
+}
+
+.settings-dots-enable {
+    align-items: center;
+}
+
+.settings-dots-enable .settings-description {
+    margin-top: var(--space-1);
+}
+
+.settings-dots-pairing {
+    border-top: 2px solid var(--accent-primary);
+}
+
+.settings-dots-steps {
+    display: grid;
+    gap: var(--space-3);
+    padding: 0;
+    list-style: none;
+    counter-reset: dots-step;
+}
+
+.settings-dots-steps li {
+    display: grid;
+    grid-template-columns: var(--space-5) minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-3);
+    counter-increment: dots-step;
+}
+
+.settings-dots-steps li::before {
+    content: counter(dots-step);
+    display: grid;
+    place-items: center;
+    width: var(--space-5);
+    height: var(--space-5);
+    border-radius: 50%;
+    background: var(--accent-subtle);
+    color: var(--accent-link);
+    font-weight: 600;
+}
+
+.settings-dots-field {
+    display: grid;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.settings-dots-field .settings-label {
+    margin: 0;
+}
+
+.settings-dots-endpoint {
+    font-family: var(--font-mono);
+    font-size: 0.923rem;
+    color: var(--text-primary);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+.settings-dots-code {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    min-height: 38px;
+    letter-spacing: 0.12em;
+}
+
+.settings-dots-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.settings-dots-disclosure {
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border-primary);
+}
+
+.settings-dots-disclosure .settings-description {
+    margin: var(--space-2) 0 0;
+}
+
 .settings-tychat-problem {
     margin: 0 0 var(--space-4);
     padding: var(--space-2) var(--space-3);

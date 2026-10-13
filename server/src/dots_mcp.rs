@@ -190,7 +190,7 @@ impl ServerHandler for DotsMcpServer {
             .chatgpt_dots_enabled
         {
             return Err(ErrorData::invalid_request(
-                "ChatGPT Dots is disabled on this host",
+                "Remote MCP is disabled on this host",
                 None,
             ));
         }

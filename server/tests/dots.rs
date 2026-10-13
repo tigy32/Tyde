@@ -589,10 +589,11 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         "The connected transport must reach the independent host enforcement boundary"
     );
     let guarded: serde_json::Value = guarded.json().await.unwrap();
+    // Remote MCP is the renamed public error; keep the transport and no-spawn guards.
     assert!(
         guarded["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("ChatGPT Dots is disabled")),
+            .is_some_and(|message| message.contains("Remote MCP is disabled")),
         "Committed disabled settings must reject the MCP operation before transport teardown"
     );
     fixture::assert_no_interesting_frame_on(

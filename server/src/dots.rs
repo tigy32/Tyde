@@ -15,7 +15,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const SERVICE_ORIGIN: &str = "https://tyde-dots.crystal-depths.workers.dev";
+pub(crate) const SERVICE_ORIGIN: &str = "https://mcp.tycode.dev";
 
 #[derive(Clone)]
 pub(crate) struct DotsHandle {

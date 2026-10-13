@@ -27,7 +27,7 @@ test("Real worker isolates paired hosts and enforces OAuth lifetime and revocati
     const discovery = await (await request("/.well-known/oauth-authorization-server")).json();
     assert.equal(discovery.issuer, origin);
     assert.deepEqual(discovery.code_challenge_methods_supported, ["S256"]);
-    assert.equal((await post("/oauth/register", { redirect_uris: ["https://attacker.invalid/callback"] })).status, 400);
+    assert.equal((await post("/oauth/register", { redirect_uris: ["http://attacker.invalid/callback"] })).status, 400);
     const callback = "https://chatgpt.com/connector_platform_oauth_redirect";
     const client = await (await post("/oauth/register", { redirect_uris: [callback], token_endpoint_auth_method: "none" })).json();
     const hosts = [];
@@ -45,9 +45,67 @@ test("Real worker isolates paired hosts and enforces OAuth lifetime and revocati
     const verifier = random();
     const challenge = createHash("sha256").update(verifier).digest("base64url");
     const auth = { client_id: client.client_id, redirect_uri: callback, resource: `${origin}/mcp`, response_type: "code", code_challenge_method: "S256", code_challenge: challenge, scope: "tyde:control", state: random() };
-    const page = await (await request(`/oauth/authorize?${new URLSearchParams(auth)}`)).text();
+    const authorizationResponse = await request(`/oauth/authorize?${new URLSearchParams(auth)}`);
+    assert.equal(authorizationResponse.status, 200);
+    assert.ok(/^text\/html(?:;|$)/i.test(authorizationResponse.headers.get("Content-Type")), "Authorization is delivered as HTML");
+    assert.deepEqual(authorizationResponse.headers.get("Cache-Control").split(",").map(value => value.trim()), ["no-store", "no-transform"], "Consent stays private and blocks Cloudflare edge analytics injection");
+    const page = await authorizationResponse.text();
+    const attribute = (tag, name) => {
+      const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i").exec(tag);
+      return match?.[1] ?? match?.[2];
+    };
+    const text = markup => markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    const authorizationForm = /<form\b([^>]*)>([\s\S]*?)<\/form>/i.exec(page);
+    assert.ok(authorizationForm, "Authorization page supplies a form");
+    assert.equal(attribute(authorizationForm[1], "method")?.toLowerCase(), "post", "Authorization uses POST");
+    assert.equal(attribute(authorizationForm[1], "action"), "/oauth/authorize");
+    const pairingInput = [...authorizationForm[2].matchAll(/<input\b[^>]*>/gi)]
+      .map(match => match[0]).find(tag => attribute(tag, "name") === "pairing_code");
+    assert.ok(pairingInput, "Authorization form accepts the pairing code");
+    const pairingId = attribute(pairingInput, "id");
+    const pairingLabel = [...authorizationForm[2].matchAll(/<label\b([^>]*)>([\s\S]*?)<\/label>/gi)]
+      .find(([, tag, contents]) => contents.includes(pairingInput) || (pairingId && attribute(tag, "for") === pairingId));
+    assert.ok(pairingLabel && /pairing\s+code/i.test(text(pairingLabel[2])), "Pairing code has an associated, readable label");
+    const authorizeButton = [...authorizationForm[2].matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/gi)]
+      .find(([, tag, contents]) => attribute(tag, "type")?.toLowerCase() === "submit" && /authorize\s+chatgpt/i.test(text(contents)));
+    assert.ok(authorizeButton, "Authorization form has an Authorize ChatGPT submit button");
+    const disclosure = text(page);
+    assert.ok(/ChatGPT and your dot access to this host's projects and agents/i.test(disclosure), "Disclosure identifies who gains host access");
+    assert.ok(/modify\s+files/i.test(disclosure), "Disclosure includes file modification access");
+    assert.ok(/configured\s+providers/i.test(disclosure), "Disclosure includes configured provider access");
+    assert.ok(/only connect a host you control/i.test(disclosure), "Disclosure retains the host ownership warning");
+
+    const stylesheet = [...page.matchAll(/<link\b[^>]*>/gi)]
+      .map(match => match[0]).find(tag => attribute(tag, "rel")?.toLowerCase().split(/\s+/).includes("stylesheet"));
+    assert.ok(stylesheet, "Authorization page links its stylesheet");
+    const stylesheetUrl = new URL(attribute(stylesheet, "href"), origin);
+    assert.equal(stylesheetUrl.origin, origin, "Authorization stylesheet is same-origin");
+    assert.equal(stylesheetUrl.pathname, "/oauth/style.css");
+    const stylesheetResponse = await request(`${stylesheetUrl.pathname}${stylesheetUrl.search}`);
+    assert.equal(stylesheetResponse.status, 200, "The linked stylesheet is served over real HTTP");
+    assert.ok(/^text\/css(?:;|$)/i.test(stylesheetResponse.headers.get("Content-Type")), "The stylesheet is delivered as CSS");
+    assert.ok((await stylesheetResponse.text()).trim().length > 0, "The stylesheet is not empty");
+    const csp = authorizationResponse.headers.get("Content-Security-Policy");
+    assert.ok(csp, "Authorization page retains its security policy");
+    const directives = new Map(csp.split(";").map(directive => directive.trim().split(/\s+/)).filter(([name]) => name)
+      .map(([name, ...sources]) => [name, sources]));
+    assert.deepEqual(directives.get("default-src"), ["'none'"]);
+    assert.deepEqual(directives.get("style-src"), ["'self'"], "CSP permits only same-origin stylesheets");
+    assert.deepEqual(directives.get("form-action"), ["'self'", "https://chatgpt.com"], "CSP permits the registered callback redirect, not arbitrary destinations");
+    assert.equal(authorizationResponse.headers.get("Referrer-Policy"), "same-origin", "Same-origin referrers retain a real browser POST Origin without leaking authorization URLs to the client");
+    assert.deepEqual(directives.get("frame-ancestors"), ["'none'"], "The authorization page cannot be framed");
+    assert.equal(csp.includes("'unsafe-inline'"), false, "Styling must not allow inline code");
+    for (const directive of ["script-src", "script-src-elem", "script-src-attr", "frame-src", "child-src"]) {
+      if (directives.has(directive)) assert.deepEqual(directives.get(directive), ["'none'"], `${directive} remains blocked`);
+    }
+    if (directives.has("style-src-elem")) assert.deepEqual(directives.get("style-src-elem"), ["'self'"]);
+    if (directives.has("style-src-attr")) assert.deepEqual(directives.get("style-src-attr"), ["'none'"]);
     const transaction = /name="transaction" value="([a-f0-9]+)"/.exec(page)?.[1];
     assert.ok(transaction, "Authorization page supplies a transaction");
+    for (const badOrigin of ["null", "https://attacker.invalid"]) {
+      const rejected = await request("/oauth/authorize", { method: "POST", redirect: "manual", headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: badOrigin }, body: new URLSearchParams({ transaction, pairing_code: hosts[0].pairing_code }) });
+      assert.equal(rejected.status, 403, "Null or foreign browser origins cannot authorize a host");
+    }
     assert.equal((await form("/oauth/authorize", { transaction, pairing_code: random() })).status, 400);
     const accepted = await form("/oauth/authorize", { transaction, pairing_code: hosts[0].pairing_code });
     assert.equal(accepted.status, 302);
@@ -89,6 +147,56 @@ test("Real worker isolates paired hosts and enforces OAuth lifetime and revocati
     assert.equal((await request("/mcp", { method: "POST", headers: { Authorization: `Bearer ${tokens.access_token}` }, body: "{}" })).status, 401);
     assert.equal((await request("/mcp", { method: "POST", headers: { Authorization: `Bearer ${current.access_token}` }, body: "{}" })).status, 401, "Revocation invalidates the current access token");
     assert.equal((await form("/oauth/token", { ...refresh, refresh_token: current.refresh_token })).status, 400, "Revocation invalidates the current refresh token");
+
+    for (const redirect of ["javascript:alert(1)", "https://user:pass@mcp-client.example/callback", "https://mcp-client.example/callback#fragment", "http://127.0.0.1:8123/callback"]) {
+      assert.equal((await post("/oauth/register", { redirect_uris: [redirect] })).status, 400, "Unsafe callbacks and undeclared native callbacks are rejected");
+    }
+    for (const redirect of ["http://attacker.invalid/callback", "http://192.168.1.5:8123/callback", "http://localhost.attacker.invalid/callback"]) {
+      assert.equal((await post("/oauth/register", { redirect_uris: [redirect], application_type: "native" })).status, 400, "Declared native clients cannot send authorization codes over non-loopback HTTP");
+    }
+    assert.equal((await post("/oauth/register", { redirect_uris: ["http://127.0.0.1:8123/callback"], application_type: "web" })).status, 400);
+    const genericCallback = "https://mcp-client.example/callback?workspace=browser-flow";
+    const differentCallback = new URL(genericCallback);
+    differentCallback.pathname += "/other";
+    for (const [redirect_uri, application_type] of [[genericCallback, "web"], ["http://127.0.0.1:8123/callback", "native"], ["http://[::1]:8123/callback", "native"]]) {
+      assert.equal((await post("/oauth/register", { redirect_uris: [redirect_uri], application_type, token_endpoint_auth_method: "none" })).status, 201, "HTTPS clients and explicit native loopback clients can register");
+    }
+    const genericClient = await (await post("/oauth/register", { redirect_uris: [genericCallback], token_endpoint_auth_method: "none" })).json();
+    const genericAuth = { ...auth, client_id: genericClient.client_id, redirect_uri: genericCallback, state: random() };
+    const genericAuthorize = parameters => request(`/oauth/authorize?${new URLSearchParams(parameters)}`);
+    assert.equal((await genericAuthorize({ ...genericAuth, redirect_uri: differentCallback.href })).status, 400, "Even a valid HTTPS callback must match its registered URI exactly");
+    const genericResponse = await genericAuthorize(genericAuth);
+    assert.equal(genericResponse.status, 200);
+    assert.ok(genericResponse.headers.get("Content-Security-Policy").includes("form-action 'self' https://mcp-client.example;"), "Only the registered client's callback origin is permitted");
+    const genericPage = await genericResponse.text();
+    assert.ok(/Authorize MCP client/.test(genericPage), "Non-ChatGPT clients receive honest consent labeling");
+    assert.ok(genericPage.includes("https://mcp-client.example"), "Consent exposes the actual callback origin");
+    const genericTransaction = /name="transaction" value="([a-f0-9]+)"/.exec(genericPage)[1];
+    const genericApproved = await form("/oauth/authorize", { transaction: genericTransaction, pairing_code: hosts[1].pairing_code });
+    assert.equal(genericApproved.status, 302);
+    const genericRedirect = new URL(genericApproved.headers.get("Location"));
+    assert.equal(genericRedirect.origin, new URL(genericCallback).origin);
+    assert.equal(genericRedirect.pathname, new URL(genericCallback).pathname, "Authorization returns to the exact registered callback handler");
+    for (const [name, value] of new URL(genericCallback).searchParams) {
+      assert.equal(genericRedirect.searchParams.get(name), value, "Registered client query parameters survive authorization");
+    }
+    assert.ok(genericRedirect.searchParams.get("state") === genericAuth.state, "The generic client receives its original OAuth state");
+    const genericExchange = { ...exchange, code: genericRedirect.searchParams.get("code"), client_id: genericClient.client_id, redirect_uri: genericCallback };
+    assert.equal((await form("/oauth/token", { ...genericExchange, redirect_uri: differentCallback.href })).status, 400, "Callback binding is enforced again during exchange");
+    assert.equal((await form("/oauth/token", { ...genericExchange, client_id: client.client_id })).status, 400, "A ChatGPT client cannot redeem another client's authorization");
+    const genericTokenResponse = await form("/oauth/token", genericExchange);
+    assert.equal(genericTokenResponse.status, 200, "A generic client exchanges its own authorization code");
+    const genericTokens = await genericTokenResponse.json();
+    assert.ok(genericTokens.access_token, "A generic MCP client receives its own grant");
+    hosts[1].socket.addEventListener("message", event => {
+      const frame = Relay.decode(event.data);
+      if (Relay.isRequest(frame)) hosts[1].socket.send(Relay.response(JSON.stringify({ relay: "second-host" }), 200, frame.transport_id));
+    });
+    const genericResult = await request("/mcp", { method: "POST", headers: { Authorization: `Bearer ${genericTokens.access_token}` }, body: "{}" });
+    assert.equal(genericResult.status, 200);
+    assert.deepEqual(await genericResult.json(), { relay: "second-host" });
+    assert.equal((await request(`/hosts/${hosts[1].host_id}`, { method: "DELETE", headers: { Authorization: `Bearer ${hosts[1].host_key}` } })).status, 200);
+    assert.equal((await request("/mcp", { method: "POST", headers: { Authorization: `Bearer ${genericTokens.access_token}` }, body: "{}" })).status, 401, "Generic client grants are revoked at the same host boundary");
 
     let offset = 0;
     const advance = async milliseconds => {

@@ -3,18 +3,102 @@ import { Relay, HostRegistration } from "./codec.mjs";
 
 const SCOPE = "tyde:control";
 const MAX_BODY = 262144;
+const OAUTH_STYLE = `
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, sans-serif;
+  color: #e8e8e8;
+  background: #121212;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 48px 24px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.oauth-page { width: 100%; max-width: 600px; min-width: 0; }
+.oauth-brand { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
+.oauth-wordmark { color: #fff; font-size: 26px; font-weight: 700; letter-spacing: -0.04em; }
+.oauth-integration { padding: 4px 10px; border: 1px solid #333; border-radius: 999px; color: #a0a0a0; font-size: 12px; }
+.oauth-card { padding: 32px; background: #1a1a1a; border: 1px solid #333; border-top: 2px solid #007acc; border-radius: 12px; }
+h1 { margin: 0 0 12px; font-size: 28px; font-weight: 650; line-height: 1.25; letter-spacing: -0.025em; }
+p { margin: 0; }
+.oauth-intro { color: #a0a0a0; }
+.oauth-intro strong { color: #e8e8e8; font-weight: 500; }
+.oauth-client { display: grid; gap: 4px; margin-top: 20px; color: #a0a0a0; font-size: 12px; }
+.oauth-client strong { color: #e8e8e8; }
+.oauth-client code { overflow-wrap: anywhere; color: #c8c8c8; font-size: 12px; }
+form { display: grid; gap: 24px; margin-top: 28px; }
+.oauth-field { display: grid; gap: 8px; min-width: 0; }
+label { font-weight: 600; }
+input[name="pairing_code"] {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 52px;
+  padding: 12px 16px;
+  border: 1px solid #444;
+  border-radius: 6px;
+  background: #121212;
+  color: #e8e8e8;
+  font: inherit;
+  font-size: 16px;
+  letter-spacing: 0.12em;
+}
+input[name="pairing_code"]:focus { border-color: #569cd6; }
+input:focus-visible, button:focus-visible { outline: 2px solid #569cd6; outline-offset: 3px; }
+.oauth-hint { color: #a0a0a0; font-size: 12px; line-height: 1.5; }
+.oauth-permissions { padding: 16px; background: #242424; border: 1px solid #333; border-radius: 8px; font-size: 13px; }
+.oauth-permissions h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+.oauth-permissions p { color: #a0a0a0; }
+.oauth-permissions .oauth-warning { margin-top: 8px; color: #e8c56a; font-weight: 500; }
+button {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 20px;
+  border: 1px solid #007acc;
+  border-radius: 6px;
+  background: #007acc;
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover { background: #1a8ad4; border-color: #1a8ad4; }
+button:active { background: #0066ad; }
+.oauth-return { margin-top: -12px; text-align: center; }
+.oauth-privacy { margin-top: 20px; padding: 0 4px; color: #a0a0a0; font-size: 12px; line-height: 1.6; }
+@media (max-width: 480px) {
+  body { padding: 28px 16px; }
+  .oauth-brand { margin-bottom: 20px; }
+  .oauth-card { padding: 24px 20px; }
+  h1 { font-size: 25px; }
+  form { gap: 20px; margin-top: 24px; }
+  .oauth-permissions { padding: 14px; }
+}
+`;
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), {
-  status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers },
+  status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-transform", ...headers },
 });
 const random = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, "0")).join("");
 const hash = async value => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))), b => b.toString(16).padStart(2, "0")).join("");
 const pkce = async value => btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 const escape = value => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
-const callbackAllowed = value => {
+const chatgptCallback = url => url.origin === "https://chatgpt.com" && !url.search && !url.hash &&
+  (url.pathname === "/connector_platform_oauth_redirect" || /^\/connector\/oauth\/[A-Za-z0-9_-]+$/.test(url.pathname));
+const callbackAllowed = (value, applicationType) => {
+  if (typeof value !== "string" || value.length > 2048) return false;
   try {
     const url = new URL(value);
-    return url.origin === "https://chatgpt.com" && !url.search && !url.hash &&
-      (url.pathname === "/connector_platform_oauth_redirect" || /^\/connector\/oauth\/[A-Za-z0-9_-]+$/.test(url.pathname));
+    if (url.username || url.password || url.hash) return false;
+    return url.protocol === "https:" || (applicationType === "native" && url.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
   } catch { return false; }
 };
 
@@ -61,6 +145,9 @@ export class DotsBroker extends DurableObject {
     if (this.env.TEST_TIME_OFFSET !== undefined && !["127.0.0.1", "localhost"].includes(url.hostname)) throw new Error("Test clock is not available on a public origin");
     const now = this.time();
     if (url.pathname === "/healthz") return json({ status: "ok" });
+    if (url.pathname === "/oauth/style.css" && request.method === "GET") {
+      return new Response(OAUTH_STYLE, { headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-store, no-transform", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'" } });
+    }
     if (url.pathname === "/.well-known/oauth-protected-resource" || url.pathname === "/.well-known/oauth-protected-resource/mcp") {
       return json({ resource, authorization_servers: [origin], scopes_supported: [SCOPE] });
     }
@@ -74,7 +161,8 @@ export class DotsBroker extends DurableObject {
       if (!await this.rate(request, 30)) return json({ error: "rate_limited" }, 429);
       const input = JSON.parse(await body(request));
       if (!Array.isArray(input.redirect_uris) || !input.redirect_uris.length || input.redirect_uris.length > 4 ||
-          !input.redirect_uris.every(callbackAllowed) || (input.token_endpoint_auth_method && input.token_endpoint_auth_method !== "none")) {
+          !input.redirect_uris.every(value => callbackAllowed(value, input.application_type)) ||
+          (input.application_type !== undefined && !["web", "native"].includes(input.application_type)) || (input.token_endpoint_auth_method && input.token_endpoint_auth_method !== "none")) {
         return json({ error: "invalid_client_metadata" }, 400);
       }
       const client_id = random();
@@ -132,11 +220,52 @@ export class DotsBroker extends DurableObject {
         if (!client || !client.redirect_uris.includes(p.redirect_uri) || p.resource !== resource ||
             p.response_type !== "code" || p.code_challenge_method !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(p.code_challenge || "") ||
             (p.scope && p.scope !== SCOPE) || !p.state || p.state.length > 4096) return json({ error: "invalid_request" }, 400);
+        const callback = new URL(p.redirect_uri);
+        const chatgpt = chatgptCallback(callback);
+        const clientLabel = chatgpt ? "ChatGPT" : "MCP client";
         const transaction = random();
         await this.ctx.storage.put(`authorize:${transaction}`, { ...p, expires: now + 600000 });
         await this.scheduleCleanup();
-        const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Connect Tyde to ChatGPT</title></head><body><main><h1>Connect your Tyde host</h1><p>In Tyde, open Settings → Integrations → ChatGPT Dots and copy the pairing code.</p><p>Authorizing gives ChatGPT and your dot access to this host's projects and agents. They can start agents that modify files and use your configured providers. Only connect a host you control.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction" value="${escape(transaction)}"><label>Pairing code <input name="pairing_code" type="password" required autocomplete="off" maxlength="64"></label><button type="submit">Authorize ChatGPT</button></form></main></body></html>`;
-        return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" } });
+        const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connect Tyde remote MCP</title>
+  <link rel="stylesheet" href="/oauth/style.css">
+</head>
+<body>
+  <main class="oauth-page">
+    <header class="oauth-brand">
+      <span class="oauth-wordmark">Tyde</span>
+      <span class="oauth-integration">Remote MCP</span>
+    </header>
+    <section class="oauth-card" aria-labelledby="oauth-title">
+      <h1 id="oauth-title">Connect your Tyde host</h1>
+      <p class="oauth-intro">In Tyde, open <strong>Settings → Integrations → Remote MCP</strong> and copy the pairing code.</p>
+      <p class="oauth-client">Requested by <strong>${clientLabel}</strong><code>${escape(callback.origin)}</code></p>
+      <form method="post" action="/oauth/authorize">
+        <input type="hidden" name="transaction" value="${escape(transaction)}">
+        <div class="oauth-field">
+          <label for="pairing-code">Pairing code</label>
+          <input id="pairing-code" name="pairing_code" type="password" required autocomplete="off" maxlength="64" aria-describedby="pairing-hint">
+          <p id="pairing-hint" class="oauth-hint">Paste your one-time code here, not into a chat. It expires after 10 minutes.</p>
+        </div>
+        <aside class="oauth-permissions" aria-labelledby="permissions-title">
+          <h2 id="permissions-title">What you’re authorizing</h2>
+          <p>Authorizing gives ${chatgpt ? 'ChatGPT and your dot' : 'this MCP client'} access to this host's projects and agents. They can start agents that modify files and use your configured providers.</p>
+          <p class="oauth-warning">Only connect a host you control.</p>
+        </aside>
+        <button type="submit">Authorize ${clientLabel}</button>
+        <p class="oauth-hint oauth-return">You’ll return to ${clientLabel} after authorizing.</p>
+      </form>
+    </section>
+    <p class="oauth-privacy">TLS protects data in transit. The Tyde relay and your connected app can read tool inputs and results; this is not end-to-end encrypted.</p>
+  </main>
+</body>
+</html>`;
+        // no-referrer makes form POSTs send Origin: null; CSP must also permit the registered callback redirect.
+        return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-transform", "Referrer-Policy": "same-origin", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": `default-src 'none'; style-src 'self'; form-action 'self' ${callback.origin}; frame-ancestors 'none'; base-uri 'none'` } });
       }
       if (request.method === "POST") {
         if (request.headers.get("Origin") !== origin) return json({ error: "invalid_origin" }, 403);
@@ -164,7 +293,7 @@ export class DotsBroker extends DurableObject {
         redirect.searchParams.set("code", code);
         redirect.searchParams.set("state", pending.state);
         redirect.searchParams.set("iss", origin);
-        return new Response(null, { status: 302, headers: { Location: redirect.href, "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" } });
+        return new Response(null, { status: 302, headers: { Location: redirect.href, "Cache-Control": "no-store, no-transform", "Referrer-Policy": "no-referrer" } });
       }
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
@@ -221,7 +350,7 @@ export class DotsBroker extends DurableObject {
     }
     clearTimeout(pending.timer);
     this.pending.delete(frame.transport_id);
-    pending.resolve(new Response(frame.body || null, { status: frame.status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }));
+    pending.resolve(new Response(frame.body || null, { status: frame.status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-transform" } }));
   }
 
   webSocketClose(socket) { this.disconnected(socket); }

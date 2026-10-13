@@ -450,7 +450,7 @@ impl SettingsTab {
             Self::Skills => "Skills",
             Self::CodeIntelligence => "Code Intelligence",
             Self::Voice => "Voice",
-            Self::ChatgptDots => "ChatGPT Dots",
+            Self::ChatgptDots => "Remote MCP",
             Self::Tychat => "Tychat",
             Self::Mobile => "Mobile",
             Self::Debug => "Debug",
@@ -688,6 +688,9 @@ impl SettingsTab {
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
             Self::ChatgptDots => &[
                 "Integrations",
+                "Remote MCP",
+                "MCP",
+                "Enable remote MCP",
                 "ChatGPT",
                 "Dots",
                 "Pair",
@@ -9903,6 +9906,11 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn integrations_render_dots_host_truth_and_keep_tychat_grouped() {
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
         let calls = install_settings_send_stub();
         let state = AppState::new();
         install_launch_profile_host(&state, Vec::new());
@@ -9929,16 +9937,46 @@ mod wasm_tests {
         assert!(
             groups.iter().any(|text| text.contains("Integrations")
                 && text.contains("Tychat")
-                && text.contains("ChatGPT Dots")),
-            "Both integrations must appear together under the visible Integrations heading"
+                && text.contains("Remote MCP")),
+            "Tychat and Remote MCP must remain together under Integrations"
         );
-        click_tab(&container, "ChatGPT Dots");
+        let search: web_sys::HtmlInputElement = container
+            .query_selector(".settings-search-input")
+            .unwrap()
+            .expect("settings search input must render")
+            .dyn_into()
+            .unwrap();
+        search.set_value("mcp");
+        dispatch_event_from_js(&search, "input", None);
+        next_tick().await;
+        let filtered_groups = container.query_selector_all(".settings-nav-group").unwrap();
+        let filtered_group_text = (0..filtered_groups.length())
+            .map(|i| filtered_groups.item(i).unwrap().text_content().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            filtered_group_text
+                .iter()
+                .any(|text| text.contains("Integrations") && text.contains("Remote MCP")),
+            "Searching MCP must keep Remote MCP visible under Integrations"
+        );
+        assert!(
+            find_button_by_text(&container, "Remote MCP").is_some(),
+            "Searching MCP must show the Remote MCP navigation item"
+        );
+        click_tab(&container, "Remote MCP");
         next_tick().await;
         assert!(
             container
                 .text_content()
                 .unwrap()
                 .contains("Awaiting pairing")
+        );
+        let setup_copy = container.text_content().unwrap_or_default();
+        assert!(
+            setup_copy.contains("Connect an MCP client")
+                && setup_copy.contains("Add custom MCP server")
+                && setup_copy.contains("automatic registration"),
+            "Remote MCP setup must include generic and ChatGPT-specific instructions"
         );
         let bootstrap_code: web_sys::HtmlInputElement = container
             .query_selector("#dots-pairing-code")
@@ -9950,15 +9988,265 @@ mod wasm_tests {
             bootstrap_code.value() == "bootstrap-code",
             "Initial bootstrap must render its nondefault pairing code without a live DotsState frame"
         );
-        let bootstrap_url: web_sys::HtmlInputElement = container
+        assert_eq!(
+            bootstrap_code.type_(),
+            "password",
+            "The pairing code must remain masked in the setup card"
+        );
+        let assert_layout = |pairing: bool| {
+            let title = container.query_selector("h2").unwrap().unwrap();
+            let page = title.parent_element().unwrap().parent_element().unwrap();
+            let bounds = page.get_bounding_client_rect();
+            let fieldsets = page.query_selector_all("fieldset").unwrap();
+            for index in 0..fieldsets.length() {
+                let fieldset: web_sys::Element = fieldsets.item(index).unwrap().dyn_into().unwrap();
+                let computed = window.get_computed_style(&fieldset).unwrap().unwrap();
+                for edge in ["top", "right", "bottom", "left"] {
+                    assert_eq!(
+                        computed
+                            .get_property_value(&format!("border-{edge}-width"))
+                            .unwrap(),
+                        "0px",
+                        "The enable control must not display the browser's raw fieldset border"
+                    );
+                }
+            }
+            let controls = page
+                .query_selector_all("section, button, [role='status'], label[for], h2")
+                .unwrap();
+            for index in 0..controls.length() {
+                let control: HtmlElement = controls.item(index).unwrap().dyn_into().unwrap();
+                let rect = control.get_bounding_client_rect();
+                assert!(
+                    rect.width() > 0.0 && rect.height() > 0.0,
+                    "Dots headings, labels, status and actions must remain visible"
+                );
+                assert!(
+                    rect.left() >= bounds.left() - 1.0 && rect.right() <= bounds.right() + 1.0,
+                    "Dots controls must not be clipped at either desktop width"
+                );
+                if control.tag_name() == "BUTTON" {
+                    assert!(
+                        rect.height() >= 30.0 && rect.width() >= 44.0,
+                        "Actions must retain a usable click target"
+                    );
+                }
+            }
+            let enable_label = page
+                .query_selector("label[for='dots-enabled']")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                enable_label.text_content().unwrap().trim(),
+                "Enable remote MCP",
+                "The enable switch must keep its accessible label"
+            );
+            let inputs = page.query_selector_all("input").unwrap();
+            let input_id_types = (0..inputs.length().min(12))
+                .filter_map(|index| {
+                    let input = inputs.item(index)?.dyn_into::<web_sys::Element>().ok()?;
+                    Some((input.id(), input.get_attribute("type").unwrap_or_default()))
+                })
+                .collect::<Vec<_>>();
+            let checkbox_count = page
+                .query_selector_all("input[type='checkbox']")
+                .unwrap()
+                .length();
+            let dom_diagnostic = format!(
+                "pairing={pairing} title_is_remote_mcp={} page_tag={} page_class={:?} checkbox_count={} inputs(id,type)={input_id_types:?}",
+                title
+                    .text_content()
+                    .is_some_and(|text| text.trim() == "Remote MCP"),
+                page.tag_name(),
+                page.get_attribute("class").unwrap_or_default(),
+                checkbox_count,
+            );
+            eprintln!("DOTS mounted layout diagnostic {dom_diagnostic}");
+            let toggle_input = page
+                .query_selector("#dots-enabled")
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("Missing #dots-enabled in mounted layout; {dom_diagnostic}")
+                });
+            let toggle = toggle_input
+                .closest("label")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                toggle.width() >= 30.0
+                    && toggle.height() >= 20.0
+                    && toggle.left() >= bounds.left()
+                    && toggle.right() <= bounds.right(),
+                "The visible enable switch must remain usable and inside the page"
+            );
+            assert!(
+                page.scroll_width() <= page.client_width(),
+                "The Dots page must not require horizontal scrolling"
+            );
+            if !pairing {
+                return;
+            }
+            let url: HtmlElement = page
+                .query_selector("#dots-server-url")
+                .unwrap()
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            // The readonly input looked configurable. Static text preserves
+            // the exact host-provided URL without presenting an editable setting.
+            assert!(
+                url.tag_name() != "INPUT"
+                    && url.tag_name() != "TEXTAREA"
+                    && !url.is_content_editable()
+                    && url
+                        .query_selector("input, textarea, [contenteditable='true']")
+                        .unwrap()
+                        .is_none(),
+                "The fixed service URL must be static text, not a configuration field"
+            );
+            assert_eq!(
+                window
+                    .get_computed_style(&url)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("user-select")
+                    .unwrap(),
+                "text",
+                "The fixed URL must remain selectable for setup"
+            );
+            let card = url.closest("section").unwrap().unwrap();
+            let card_bounds = card.get_bounding_client_rect();
+            let computed = window.get_computed_style(&card).unwrap().unwrap();
+            let pixels = |property| -> f64 {
+                computed
+                    .get_property_value(property)
+                    .unwrap()
+                    .trim_end_matches("px")
+                    .parse()
+                    .unwrap()
+            };
+            let left = card_bounds.left() + pixels("border-left-width") + pixels("padding-left");
+            let right =
+                card_bounds.right() - pixels("border-right-width") - pixels("padding-right");
+            for id in ["dots-server-url", "dots-pairing-code"] {
+                let control = page.query_selector(&format!("#{id}")).unwrap().unwrap();
+                let rect = control.get_bounding_client_rect();
+                log::info!(
+                    "Dots desktop layout page_width={} field={} width={} available={}",
+                    bounds.width(),
+                    id,
+                    rect.width(),
+                    right - left
+                );
+                assert!(
+                    (rect.left() - left).abs() <= 1.0 && (rect.right() - right).abs() <= 1.0,
+                    "The URL and pairing code must use the available card width, not a default input width"
+                );
+            }
+            assert!(
+                url.scroll_width() <= url.client_width(),
+                "The fixed URL must wrap instead of clipping its visible text"
+            );
+            let heading = card
+                .query_selector("h3")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            let top = card_bounds.top() + pixels("border-top-width") + pixels("padding-top");
+            assert!(
+                (heading.top() - top).abs() <= 1.0,
+                "The pairing heading must not add a second oversized top margin inside its card"
+            );
+            let code_label = card
+                .query_selector("label[for='dots-pairing-code']")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                code_label.text_content().unwrap().trim(),
+                "One-time pairing code",
+                "The generated code must keep its accessible label"
+            );
+            let code = card.query_selector("#dots-pairing-code").unwrap().unwrap();
+            let label_bounds = code_label.get_bounding_client_rect();
+            let code_bounds = code.get_bounding_client_rect();
+            let url_bounds = url.get_bounding_client_rect();
+            assert!(
+                label_bounds.top() - url_bounds.bottom() >= 8.0
+                    && label_bounds.top() - url_bounds.bottom() <= 32.0
+                    && code_bounds.top() - label_bounds.bottom() >= 4.0
+                    && code_bounds.top() - label_bounds.bottom() <= 12.0
+                    && code_bounds.height() >= 30.0,
+                "The URL, code label and code must have clear, compact spacing without overlap"
+            );
+            let buttons = card.query_selector_all("button").unwrap();
+            assert_eq!(
+                buttons.length(),
+                3,
+                "Pairing must retain both copy actions and new-code recovery"
+            );
+            let action = |index| -> web_sys::DomRect {
+                buttons
+                    .item(index)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap()
+                    .get_bounding_client_rect()
+            };
+            let mut previous = action(0);
+            for index in 1..buttons.length() {
+                let current = action(index);
+                let gap = if (previous.top() - current.top()).abs() <= 1.0 {
+                    current.left() - previous.right()
+                } else {
+                    current.top() - previous.bottom()
+                };
+                assert!(
+                    (8.0..=24.0).contains(&gap),
+                    "Setup actions must have a visible gap whether side by side or wrapped"
+                );
+                previous = current;
+            }
+        };
+        for width in [1024, 760] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            assert!(
+                (container
+                    .first_element_child()
+                    .unwrap()
+                    .get_bounding_client_rect()
+                    .width()
+                    - f64::from(width))
+                .abs()
+                    <= 1.0,
+                "The real settings overlay must use the desktop size under test"
+            );
+            assert_layout(true);
+        }
+        container.style().set_property("width", "1024px").unwrap();
+        next_tick().await;
+        let bootstrap_url: HtmlElement = container
             .query_selector("#dots-server-url")
             .unwrap()
             .unwrap()
             .dyn_into()
             .unwrap();
         assert!(
-            bootstrap_url.value() == "https://bootstrap.example/mcp",
+            bootstrap_url.text_content().as_deref() == Some("https://bootstrap.example/mcp"),
             "Initial MCP URL must come from HostBootstrap"
+        );
+        click_tab(&container, "Copy server URL");
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Server URL copied"),
+            "A successful explicit URL copy must provide visible confirmation"
         );
         crate::dispatch::dispatch_envelope(
             &state,
@@ -9998,7 +10286,7 @@ mod wasm_tests {
         });
         let snapshot = protocol::DotsStatePayload {
             status: protocol::DotsConnectionStatus::AwaitingPairing,
-            mcp_url: Some("https://dots.example/mcp".into()),
+            mcp_url: Some("https://mcp.tycode.dev/mcp".into()),
             pairing_code: Some("test-code".into()),
         };
         crate::dispatch::dispatch_envelope(
@@ -10029,6 +10317,177 @@ mod wasm_tests {
             code.value() == "test-code",
             "Pairing code must come from the selected host's event"
         );
+        assert!(
+            container
+                .query_selector("#dots-server-url")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref()
+                == Some("https://mcp.tycode.dev/mcp"),
+            "The visible fixed URL must update from the selected host's live event"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Copy server URL"),
+            "A new server-emitted URL must clear stale copy confirmation"
+        );
+        js_sys::eval(
+            r#"
+                window.__test_original_invoke = window.__TAURI__.core.invoke;
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    if (cmd === "plugin:clipboard-manager|write_text") {
+                        return Promise.reject(new Error("clipboard unavailable"));
+                    }
+                    return Promise.resolve();
+                };
+            "#,
+        )
+        .unwrap();
+        let opens_before_copy_failure = calls
+            .iter()
+            .filter_map(|entry| entry.dyn_into::<js_sys::Array>().ok())
+            .filter(|entry| entry.get(0).as_string().as_deref() == Some("open_external_url"))
+            .count();
+        click_tab(&container, "Open ChatGPT");
+        next_tick().await;
+        next_tick().await;
+        let copy_error = container
+            .query_selector("[role='alert']")
+            .unwrap()
+            .expect("clipboard failure must be announced visibly");
+        assert!(
+            copy_error.text_content().unwrap_or_default().contains(
+                "Could not copy the server URL. Copy it manually before opening ChatGPT."
+            ),
+            "Open ChatGPT must explain when its required URL copy fails"
+        );
+        let opens_after_copy_failure = calls
+            .iter()
+            .filter_map(|entry| entry.dyn_into::<js_sys::Array>().ok())
+            .filter(|entry| entry.get(0).as_string().as_deref() == Some("open_external_url"))
+            .count();
+        assert_eq!(
+            opens_after_copy_failure, opens_before_copy_failure,
+            "ChatGPT must not open when copying the current server URL fails"
+        );
+        container
+            .query_selector("button[aria-label='Dismiss notice']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        js_sys::eval(
+            "window.__TAURI__.core.invoke = window.__test_original_invoke; delete window.__test_original_invoke;",
+        )
+        .unwrap();
+        next_tick().await;
+
+        let open_action_start = calls.length() as usize;
+        click_tab(&container, "Open ChatGPT");
+        next_tick().await;
+        let open_action_requests = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if index < open_action_start {
+                    return None;
+                }
+                let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                let command = entry.get(0).as_string()?;
+                if command != "plugin:clipboard-manager|write_text"
+                    && command != "open_external_url"
+                {
+                    return None;
+                }
+                let args = serde_json::from_str::<Value>(&entry.get(1).as_string()?).ok()?;
+                Some((command, args))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            open_action_requests,
+            vec![
+                (
+                    "plugin:clipboard-manager|write_text".to_owned(),
+                    serde_json::json!({"text": "https://mcp.tycode.dev/mcp"})
+                ),
+                (
+                    "open_external_url".to_owned(),
+                    serde_json::json!({
+                        "url": "https://chatgpt.com/plugins?directoryTab=personal"
+                    })
+                )
+            ],
+            "Open ChatGPT must copy the current server URL before opening the personal plugin directory"
+        );
+        let explicit_copy_start = calls.length() as usize;
+        click_tab(&container, "Copy server URL");
+        next_tick().await;
+        click_tab(&container, "Copy pairing code");
+        next_tick().await;
+        let copied_texts = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if index < explicit_copy_start {
+                    return None;
+                }
+                let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                if entry.get(0).as_string().as_deref()
+                    != Some("plugin:clipboard-manager|write_text")
+                {
+                    return None;
+                }
+                let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
+                args.get("text")?.as_str().map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let pairing_code_value = code.value();
+        assert!(
+            copied_texts.len() == 2
+                && copied_texts[0] == "https://mcp.tycode.dev/mcp"
+                && copied_texts[1].as_str() == pairing_code_value.as_str(),
+            "Both copy actions must send the displayed URL and masked pairing code to the native clipboard"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Server URL copied")
+                && container
+                    .text_content()
+                    .unwrap()
+                    .contains("Pairing code copied"),
+            "Successful explicit copies must be visibly confirmed"
+        );
+        let replacement_snapshot = protocol::DotsStatePayload {
+            status: protocol::DotsConnectionStatus::AwaitingPairing,
+            mcp_url: snapshot.mcp_url.clone(),
+            pairing_code: Some("replacement-test-code".into()),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".into()),
+                FrameKind::DotsState,
+                1,
+                &replacement_snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let refreshed_copy_labels = container.text_content().unwrap();
+        assert!(
+            refreshed_copy_labels.contains("Server URL copied")
+                && refreshed_copy_labels.contains("Copy pairing code")
+                && !refreshed_copy_labels.contains("Pairing code copied"),
+            "A new server-emitted code must clear only its stale copy confirmation"
+        );
         let snapshot = protocol::DotsStatePayload {
             status: protocol::DotsConnectionStatus::Connected,
             mcp_url: snapshot.mcp_url,
@@ -10040,7 +10499,7 @@ mod wasm_tests {
             protocol::Envelope::from_payload(
                 protocol::StreamPath("/host/host-lp".into()),
                 FrameKind::DotsState,
-                1,
+                2,
                 &snapshot,
             )
             .unwrap(),
@@ -10050,7 +10509,7 @@ mod wasm_tests {
             container
                 .text_content()
                 .unwrap()
-                .contains("Disconnect ChatGPT")
+                .contains("Revoke remote MCP access")
         );
         assert!(
             container
@@ -10059,6 +10518,14 @@ mod wasm_tests {
                 .is_none(),
             "Consumed pairing code must no longer be rendered"
         );
+        for width in [1024, 760] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            assert_layout(false);
+        }
 
         let commands = || {
             calls
@@ -10089,7 +10556,7 @@ mod wasm_tests {
                     seq,
                     &protocol::DotsStatePayload {
                         status,
-                        mcp_url: Some("https://dots.example/mcp".into()),
+                        mcp_url: Some("https://mcp.tycode.dev/mcp".into()),
                         pairing_code: Some("new-test-code".into()),
                     },
                 )
@@ -10100,7 +10567,7 @@ mod wasm_tests {
             protocol::DotsConnectionStatus::Failed {
                 reason: "Connection interrupted".into(),
             },
-            2,
+            3,
         );
         next_tick().await;
         assert!(
@@ -10109,13 +10576,14 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Connection interrupted")
         );
+        assert_layout(false);
         click_tab(&container, "Retry");
         next_tick().await;
         assert!(matches!(
             commands().as_slice(),
             [protocol::DotsCommandPayload::Retry]
         ));
-        publish(protocol::DotsConnectionStatus::AwaitingPairing, 3);
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 4);
         next_tick().await;
         click_tab(&container, "New pairing code");
         next_tick().await;
@@ -10126,10 +10594,10 @@ mod wasm_tests {
                 protocol::DotsCommandPayload::Retry
             ]
         ));
-        publish(protocol::DotsConnectionStatus::Connected, 4);
+        publish(protocol::DotsConnectionStatus::Connected, 5);
         next_tick().await;
         js_sys::eval(r#"window.__dots_confirm_answer = 'Cancel'; const dotsOriginalInvoke = window.__TAURI__.core.invoke; window.__TAURI__.core.invoke = function(cmd, args) { if (cmd === 'plugin:dialog|message') { window.__test_send_calls.push([cmd, JSON.stringify(args)]); return Promise.resolve(window.__dots_confirm_answer); } return dotsOriginalInvoke(cmd, args); };"#).unwrap();
-        click_tab(&container, "Disconnect ChatGPT");
+        click_tab(&container, "Revoke remote MCP access");
         next_tick().await;
         next_tick().await;
         assert_eq!(
@@ -10139,14 +10607,14 @@ mod wasm_tests {
         );
         assert!(container.text_content().unwrap().contains("Connected"));
         js_sys::eval("window.__dots_confirm_answer = 'Ok'").unwrap();
-        click_tab(&container, "Disconnect ChatGPT");
+        click_tab(&container, "Revoke remote MCP access");
         next_tick().await;
         next_tick().await;
         assert!(matches!(
             commands().last(),
             Some(protocol::DotsCommandPayload::Disconnect)
         ));
-        publish(protocol::DotsConnectionStatus::AwaitingPairing, 5);
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 6);
         next_tick().await;
         assert!(
             container
@@ -10156,6 +10624,7 @@ mod wasm_tests {
         );
         drop(handle);
         container.remove();
+        style.remove();
     }
 
     #[wasm_bindgen_test]
@@ -10539,7 +11008,7 @@ mod wasm_tests {
     /// `Event::new` does not carry the `key` property our handler
     /// reads — building the event in JS sidesteps both limitations.
     fn dispatch_event_from_js(input: &web_sys::HtmlInputElement, kind: &str, key: Option<&str>) {
-        // The id must be unique per dispatch, and cleared after use. A fixed
+        // The temporary id must be unique and the original restored afterward. A fixed
         // id resolves `getElementById` to the FIRST tagged element in the
         // document, so a second dispatch in the same test (or a panel leaked
         // by an earlier panicked test — wasm panics skip destructors) would
@@ -10550,6 +11019,11 @@ mod wasm_tests {
             std::sync::atomic::AtomicUsize::new(0);
         let seq = DISPATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("__tyde_dispatch_target_{kind}_{seq}");
+        let original_id = input.get_attribute("id");
+        let restore_id = match original_id {
+            Some(original) => format!("el.setAttribute('id', {original:?});"),
+            None => "el.removeAttribute('id');".to_owned(),
+        };
         input.set_id(&id);
         let key_part = key.map(|k| format!(", key: {k:?}")).unwrap_or_default();
         let code = format!(
@@ -10563,8 +11037,7 @@ mod wasm_tests {
                 }} else {{
                     ev = new Event({kind:?}, {{ bubbles: true, cancelable: true }});
                 }}
-                el.dispatchEvent(ev);
-                el.removeAttribute('id');
+                try {{ el.dispatchEvent(ev); }} finally {{ {restore_id} }}
             }})();
             "#
         );
