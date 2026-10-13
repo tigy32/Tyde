@@ -59,6 +59,7 @@ pub(super) fn start_mock_command_loop(
         user_bubbles,
         held_user_bubbles: None,
         slash_commands,
+        native_child_idle_gate: launch_script.native_child_idle_gate,
         phase: TurnPhase::Idle,
         end_before_steer: false,
         pending_async_questions: HashSet::new(),
@@ -120,6 +121,7 @@ struct MockActor {
     user_bubbles: bool,
     held_user_bubbles: Option<Vec<crate::backend::BackendEvent>>,
     slash_commands: Option<Vec<protocol::SlashCommand>>,
+    native_child_idle_gate: Option<MockGate>,
     phase: TurnPhase,
     end_before_steer: bool,
     pending_async_questions: HashSet<String>,
@@ -236,7 +238,7 @@ impl MockActor {
                             );
                         }
                         MockCommand::EmitBusySelfTurn => self.handle_busy_self_turn(control).await,
-                        MockCommand::Interrupt => self.handle_interrupt(),
+                        MockCommand::Interrupt => self.handle_interrupt(control).await,
                     };
                     if !alive {
                         return;
@@ -488,7 +490,7 @@ impl MockActor {
         self.run_turn(turn, &message, control).await
     }
 
-    fn handle_interrupt(&mut self) -> bool {
+    async fn handle_interrupt(&mut self, control: &mut ControlPlane) -> bool {
         self.requests.push(MockRequest::Interrupt);
         // Like the real backends, an interrupt ends the wait on an open
         // question without answering it; the agent actor owns retiring it.
@@ -506,6 +508,10 @@ impl MockActor {
         }
         self.pending_async_questions.clear();
         emit::cancel_live_native_children(&self.active_subagents);
+        if let Some(gate) = self.native_child_idle_gate.clone() {
+            self.park_at_gate(&gate, control).await;
+        }
+        emit::idle_live_native_children(&self.active_subagents);
         let _ = self.events_tx.send_event(emit::cancelled(
             "mock backend interrupted held turn".to_owned(),
         ));

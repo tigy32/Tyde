@@ -2860,13 +2860,174 @@ async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
     )
     .await;
 
+    async fn assert_working_with_queue(
+        fixture: &mut Fixture,
+        agent: &fixture::TestAgent,
+        expected_messages: &[&str],
+    ) {
+        let env = fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "queued input behind authoritative backend work",
+            |env| {
+                if env.stream != agent.stream {
+                    return false;
+                }
+                match env.kind {
+                    FrameKind::ChatEvent => {
+                        let event: ChatEvent = env.parse_payload().expect("parse live event");
+                        assert!(
+                            !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                            "diagnostic events must not fabricate backend idle"
+                        );
+                        false
+                    }
+                    FrameKind::AgentActivityChanged => {
+                        let state: protocol::AgentActivityChangedPayload =
+                            env.parse_payload().expect("parse live activity");
+                        assert_eq!(
+                            state.activity,
+                            protocol::AgentActivity::Thinking,
+                            "the agent must remain working until backend idle"
+                        );
+                        false
+                    }
+                    FrameKind::QueuedMessages => env
+                        .parse_payload::<protocol::QueuedMessagesPayload>()
+                        .is_ok_and(|queue| queue.messages.len() == expected_messages.len()),
+                    _ => false,
+                }
+            },
+        )
+        .await;
+        let queue: protocol::QueuedMessagesPayload = env.parse_payload().expect("parse queue");
+        assert!(
+            queue
+                .messages
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .eq(expected_messages.iter().copied()),
+            "queued input must retain its delivery order"
+        );
+        let (mut other, bootstrap) = fixture.connect_with_bootstrap().await;
+        let other_agent = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
+        let state = expect_raw_agent_bootstrap_on_stream(
+            &mut other,
+            &other_agent.instance_stream,
+            "working agent replay",
+        )
+        .await;
+        assert_eq!(state.activity, protocol::AgentActivity::Thinking);
+        assert!(
+            state.events.iter().any(|event| matches!(
+                event,
+                AgentBootstrapEvent::QueuedMessages(queue)
+                    if queue.messages.len() == expected_messages.len()
+            )),
+            "a reconnecting client must see the same pending input"
+        );
+    }
+
+    // The old fixture expected invented idle after an error card or a failed
+    // tool. The documented contract requires backend idle; both scenarios now
+    // hold continuing work behind gates and assert that no idle is invented.
+    for failed_tool in [true, false] {
+        let diagnostic_gate = MockGateHandle::new();
+        let idle_gate = MockGateHandle::new();
+        let turn = if failed_tool {
+            MockTurn::tool_failure_then_text("continued after failed tool", &diagnostic_gate)
+        } else {
+            MockTurn::error_before_typing(
+                "mock backend diagnostic before typing",
+                "continued after error card",
+                &diagnostic_gate,
+            )
+        }
+        .with_gate_before_idle(&idle_gate);
+        fixture
+            .mock(&agent)
+            .await
+            .enqueue_all([turn, MockTurn::echo(), MockTurn::echo()])
+            .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "trigger diagnostic".to_owned())
+            .await
+            .expect("send diagnostic trigger");
+        diagnostic_gate.wait_until_entered().await;
+        let event = fixture
+            .next_chat_event_matching(&agent, "backend diagnostic", |event| {
+                if failed_tool {
+                    matches!(event, ChatEvent::ToolExecutionCompleted(_))
+                } else {
+                    matches!(event, ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error))
+                }
+            })
+            .await;
+        if let ChatEvent::ToolExecutionCompleted(completion) = event {
+            assert!(fixture::tool_completion_failed(&completion));
+            assert!(
+                matches!(&completion.outcome,
+                ToolExecutionOutcome::Failed { details: Some(details), .. }
+                    if details.contains("history did not contain a tool_result")),
+                "the regression must exercise the misleading diagnostic phrase"
+            );
+        }
+        fixture
+            .client
+            .send_message(&agent.stream, "first queued input".to_owned())
+            .await
+            .expect("queue first follow-up");
+        assert_working_with_queue(&mut fixture, &agent, &["first queued input"]).await;
+
+        diagnostic_gate.release_one();
+        idle_gate.wait_until_entered().await;
+        let expected_reply = if failed_tool {
+            "continued after failed tool"
+        } else {
+            "continued after error card"
+        };
+        fixture
+            .next_chat_event_matching(&agent, "continuing backend response", |event| {
+                assert!(
+                    !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                    "a failed tool or an error card cannot end continuing work"
+                );
+                matches!(event, ChatEvent::StreamEnd(end) if end.message.content == expected_reply)
+            })
+            .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "second queued input".to_owned())
+            .await
+            .expect("queue follow-up after model response");
+        assert_working_with_queue(
+            &mut fixture,
+            &agent,
+            &["first queued input", "second queued input"],
+        )
+        .await;
+        idle_gate.release_one();
+        let event = fixture
+            .next_chat_event_matching(&agent, "backend idle", |_| true)
+            .await;
+        assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+        for reply in ["first queued input", "second queued input"] {
+            expect_strict_mock_turn(
+                &mut fixture.client,
+                &agent.stream,
+                &format!("mock backend response to: {reply}"),
+            )
+            .await;
+        }
+    }
+
+    let idle_gate = MockGateHandle::new();
     fixture
         .mock(&agent)
         .await
         .enqueue_all([
-            MockTurn::error_card("mock backend emitted error without idle"),
-            MockTurn::echo(),
-            MockTurn::tool_failure_without_idle(),
+            MockTurn::cancelled("mock cancellation").with_gate_before_idle(&idle_gate),
             MockTurn::echo(),
             MockTurn::text_with_mid_turn_error(
                 "mock backend response to: mid-turn error",
@@ -2875,93 +3036,32 @@ async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
             MockTurn::echo(),
         ])
         .await;
-
     fixture
         .client
-        .send_message(&agent.stream, "trigger backend error".to_owned())
+        .send_message(&agent.stream, "trigger cancellation".to_owned())
         .await
-        .expect("send backend error trigger failed");
-    let event = fixture
-        .next_chat_event_matching(&agent, "MessageAdded(Error)", |event| {
-            matches!(
-                event,
-                ChatEvent::MessageAdded(message)
-                    if matches!(message.sender, MessageSender::Error)
-            )
+        .expect("send cancellation trigger");
+    idle_gate.wait_until_entered().await;
+    fixture
+        .next_chat_event_matching(&agent, "cancellation before backend idle", |event| {
+            matches!(event, ChatEvent::OperationCancelled(_))
         })
         .await;
-    let ChatEvent::MessageAdded(message) = event else {
-        unreachable!("matched MessageAdded above");
-    };
-    assert!(
-        message
-            .content
-            .contains("mock backend emitted error without idle"),
-        "unexpected error message on {}: {}",
-        agent.stream,
-        message.content
-    );
-    let event = fixture
-        .next_chat_event_matching(&agent, "TypingStatusChanged(false)", |_| true)
-        .await;
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-
     fixture
         .client
-        .send_message(&agent.stream, "after backend error".to_owned())
+        .send_message(&agent.stream, "after cancellation".to_owned())
         .await
-        .expect("send follow-up failed");
+        .expect("queue cancellation follow-up");
+    assert_working_with_queue(&mut fixture, &agent, &["after cancellation"]).await;
+    idle_gate.release_one();
+    let event = fixture
+        .next_chat_event_matching(&agent, "cancelled backend idle", |_| true)
+        .await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
     expect_strict_mock_turn(
         &mut fixture.client,
         &agent.stream,
-        "mock backend response to: after backend error",
-    )
-    .await;
-
-    fixture
-        .client
-        .send_message(&agent.stream, "trigger backend tool failure".to_owned())
-        .await
-        .expect("send backend tool failure trigger failed");
-    let event = fixture
-        .next_chat_event_matching(&agent, "ToolExecutionCompleted", |event| {
-            matches!(event, ChatEvent::ToolExecutionCompleted(_))
-        })
-        .await;
-    let ChatEvent::ToolExecutionCompleted(completion) = event else {
-        unreachable!("matched ToolExecutionCompleted above");
-    };
-    assert!(
-        fixture::tool_completion_failed(&completion),
-        "expected failed tool completion on {}, got {completion:?}",
-        agent.stream
-    );
-    let error = match &completion.outcome {
-        ToolExecutionOutcome::Failed {
-            message, details, ..
-        } => details.as_deref().unwrap_or(message),
-        ToolExecutionOutcome::Cancelled { message } => message,
-        ToolExecutionOutcome::Succeeded { .. } => "",
-    };
-    assert!(
-        error.contains("history did not contain a tool_result"),
-        "unexpected tool completion error on {}: {error}",
-        agent.stream
-    );
-    let event = fixture
-        .next_chat_event_matching(&agent, "TypingStatusChanged(false)", |_| true)
-        .await;
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-
-    fixture
-        .client
-        .send_message(&agent.stream, "after backend tool failure".to_owned())
-        .await
-        .expect("send tool-failure follow-up failed");
-    expect_strict_mock_turn(
-        &mut fixture.client,
-        &agent.stream,
-        "mock backend response to: after backend tool failure",
+        "mock backend response to: after cancellation",
     )
     .await;
 
@@ -7151,6 +7251,7 @@ async fn parked_backend_native_child_replays_to_late_clients_and_rejects_interru
 #[tokio::test]
 async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle() {
     let mut fixture = Fixture::new().await;
+    let idle_gate = MockGateHandle::new();
     fixture
         .host_for_test()
         .set_session_schema_ready_for_test(BackendKind::Codex)
@@ -7162,7 +7263,8 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
                 "mock backend held response to: parent",
                 "mock-live-native-child",
                 "live native child task",
-            )),
+            ))
+            .with_native_child_idle_gate(&idle_gate),
         )
         .await;
     fixture
@@ -7230,14 +7332,47 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
             .expect("child StreamEnd"),
         ChatEvent::StreamEnd(_)
     ));
-    expect_operation_cancelled_on_stream(
+    // The shared cancellation helper also waits for idle, which this gate
+    // deliberately holds until after the activity assertions.
+    eprintln!("Native child lifecycle regression: waiting for cancellation before held idle");
+    fixture::next_chat_event_matching_on(
         &mut fixture.client,
         &child.instance_stream,
-        "Parent agent turn ended",
+        "native child cancellation before held idle",
+        |event| {
+            if let ChatEvent::OperationCancelled(data) = event {
+                assert!(data.message.contains("Parent agent turn ended"));
+                true
+            } else {
+                assert!(!matches!(event, ChatEvent::TypingStatusChanged(false)));
+                false
+            }
+        },
     )
     .await;
 
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    idle_gate.wait_until_entered().await;
+    eprintln!("Native child lifecycle regression: backend idle held");
+    let agents = mcp_list_agents(&caller).await;
+    assert_eq!(
+        mcp_listed_agent(&agents, &child.agent_id)
+            .get("status")
+            .and_then(Value::as_str),
+        Some("thinking"),
+        "native child cancellation must not claim idle before the backend marker"
+    );
+    let (mut working_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let working_child = bootstrapped_agent(&bootstrap, &child.agent_id);
+    let working = expect_raw_agent_bootstrap_on_stream(
+        &mut working_client,
+        &working_child.instance_stream,
+        "native child awaiting backend idle",
+    )
+    .await;
+    assert_eq!(working.activity, protocol::AgentActivity::Thinking);
+    idle_gate.release_one();
+    expect_typing_false_on_stream(&mut fixture.client, &child.instance_stream).await;
     wait_for_agent_control_status(&caller, &child.agent_id, "idle").await;
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
@@ -7248,6 +7383,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
         "late child bootstrap",
     )
     .await;
+    assert_eq!(replay.activity, protocol::AgentActivity::Idle);
     let replayed_chat = replay
         .events
         .iter()

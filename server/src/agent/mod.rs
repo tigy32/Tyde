@@ -6043,7 +6043,6 @@ pub(crate) fn spawn_agent_actor(
                     // authoritative clock lives here and not in the scheduler.
                     last_backend_event_at = Some(Instant::now());
                     let mut real_idle_transition = false;
-                    let mut synthesize_idle_after_error = false;
                     snapshot_viewed_image(
                         &mut event,
                         &open_tool_requests,
@@ -6067,37 +6066,8 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                             if matches!(message.sender, MessageSender::Error) {
-                                let diagnostic_mid_turn = in_turn && backend_typing;
-                                let error_ends_turn = in_turn
-                                    && pending_tool_response_ids.is_empty()
-                                    && !backend_typing;
-                                if diagnostic_mid_turn {
-                                    tracing::info!(
-                                        agent_id = %current_start.agent_id,
-                                        "backend error event during open turn treated as diagnostic"
-                                    );
-                                }
-                                if error_ends_turn {
-                                    tracing::warn!(
-                                        agent_id = %current_start.agent_id,
-                                        "backend error event ended active turn without idle marker"
-                                    );
-                                    real_idle_transition = true;
-                                    synthesize_idle_after_error = true;
-                                    in_turn = false;
-                                    idle_transition_armed = false;
-                                }
                                 let msg = message.content.clone();
                                 status_handle.update(|s| {
-                                    // A mid-turn diagnostic leaves the turn
-                                    // running; reporting it as completed would
-                                    // contradict is_thinking.
-                                    if !diagnostic_mid_turn {
-                                        s.turn_completed = true;
-                                    }
-                                    if error_ends_turn {
-                                        s.is_thinking = false;
-                                    }
                                     s.last_error = Some(msg);
                                     s.activity_counter = s.activity_counter.saturating_add(1);
                                 }).await;
@@ -6136,7 +6106,6 @@ pub(crate) fn spawn_agent_actor(
                             }
                             active_stream_text.clear();
                             status_handle.update(|s| {
-                                s.turn_completed = true;
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -6195,7 +6164,9 @@ pub(crate) fn spawn_agent_actor(
                             );
                             status_handle.update(|s| {
                                 s.is_thinking = visibly_busy;
-                                if completed_by_idle {
+                                if typing {
+                                    s.turn_completed = false;
+                                } else if completed_by_idle {
                                     s.turn_completed = true;
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -6232,10 +6203,14 @@ pub(crate) fn spawn_agent_actor(
                                 compaction.error = Some("compaction summary turn was cancelled".to_owned());
                             }
                             status_handle.update(|s| {
+                                // Clearing a blocking wait exposes the last
+                                // backend activity, not newly started work.
+                                if s.blocked_on_user_response {
+                                    s.is_thinking = backend_typing;
+                                    s.turn_completed = !backend_typing;
+                                }
                                 s.pending_user_response = None;
                                 s.blocked_on_user_response = false;
-                                s.is_thinking = false;
-                                s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -6308,26 +6283,6 @@ pub(crate) fn spawn_agent_actor(
                             if completed_pending_response && !blocked_on_user && in_turn {
                                 idle_transition_armed = true;
                             }
-                            let interrupted_tool_ends_turn = !completed_pending_response
-                                && in_turn
-                                && !blocked_on_user
-                                && interrupted_tool_completion(completion);
-                            if interrupted_tool_ends_turn {
-                                tracing::warn!(
-                                    agent_id = %current_start.agent_id,
-                                    tool_call_id = %completion.tool_call_id,
-                                    "interrupted tool completion ended active turn without idle marker"
-                                );
-                                real_idle_transition = true;
-                                synthesize_idle_after_error = true;
-                                in_turn = false;
-                                idle_transition_armed = false;
-                                // This terminal marker stands in for the idle
-                                // event the backend never sent; treat the
-                                // backend as no longer typing so a later
-                                // error-without-idle can still end its turn.
-                                backend_typing = false;
-                            }
                             status_handle.update(|s| {
                                 s.blocked_on_user_response = blocked_on_user;
                                 if completed_pending_response && pending_tool_response_ids.is_empty() {
@@ -6336,11 +6291,6 @@ pub(crate) fn spawn_agent_actor(
                                 if completed_pending_response && in_turn {
                                     s.turn_completed = false;
                                     s.is_thinking = backend_typing || completed_response_blocks_turn;
-                                }
-                                if interrupted_tool_ends_turn {
-                                    s.turn_completed = true;
-                                    s.is_thinking = false;
-                                    s.last_error = tool_completion_error(completion);
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -6398,22 +6348,6 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
-                    if synthesize_idle_after_error {
-                        // The turn is over just as if the backend had gone
-                        // idle, so a restart has nothing left to continue.
-                        if !status_handle.pending_restart_continuation() {
-                            status_handle.persist_recovery(None).await;
-                        }
-                        append_chat_event(
-                            &canonical_stream,
-                            &mut event_log,
-                            &mut subscribers,
-                            &mut replay_state,
-                            &ChatEvent::TypingStatusChanged(false),
-                        )
-                        .await;
-                    }
-
                     if current_start.origin == protocol::AgentOrigin::Tychat && real_idle_transition
                         && let Some(turn) = tychat_turn.take()
                     {
@@ -10266,7 +10200,6 @@ pub(crate) fn spawn_relay_agent_actor(
                             if matches!(message.sender, MessageSender::Error) {
                                 let msg = message.content.clone();
                                 status_handle.update(|s| {
-                                    s.turn_completed = true;
                                     s.last_error = Some(msg);
                                     s.activity_counter = s.activity_counter.saturating_add(1);
                                 }).await;
@@ -10278,7 +10211,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::StreamStart(_) => {
                             active_stream_text.clear();
-                            in_turn = true;
                             status_handle.update(|s| {
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -10288,7 +10220,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         ChatEvent::StreamEnd(_) => {
                             active_stream_text.clear();
                             status_handle.update(|s| {
-                                s.turn_completed = true;
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -10312,8 +10243,6 @@ pub(crate) fn spawn_relay_agent_actor(
                             status_handle.update(|s| {
                                 s.pending_user_response = None;
                                 s.blocked_on_user_response = false;
-                                s.is_thinking = false;
-                                s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -12490,27 +12419,6 @@ async fn persist_agent_session(
             }
         }),
     )
-}
-
-fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool {
-    const CLAUDE_MISSING_TOOL_RESULT: &str = "history did not contain a tool_result";
-
-    matches!(
-        &completion.outcome,
-        ToolExecutionOutcome::Failed { message, details, .. }
-            if message.contains(CLAUDE_MISSING_TOOL_RESULT)
-                || details.as_deref().is_some_and(|details| {
-                    details.contains(CLAUDE_MISSING_TOOL_RESULT)
-                })
-    )
-}
-
-fn tool_completion_error(completion: &ToolExecutionCompletedData) -> Option<String> {
-    match &completion.outcome {
-        ToolExecutionOutcome::Succeeded { .. } => None,
-        ToolExecutionOutcome::Failed { message, .. }
-        | ToolExecutionOutcome::Cancelled { message } => Some(message.clone()),
-    }
 }
 
 async fn append_event<T: serde::Serialize>(

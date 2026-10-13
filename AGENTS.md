@@ -12,6 +12,12 @@ lookups, inferred semantics, or parallel state. If required state is missing,
 fix its server/protocol source. Passing tests does not excuse an architecture
 violation. Check every fix against `dev-docs/01-philosophy.md` before landing.
 
+`TypingStatusChanged(bool)` is the sole working/idle authority. All
+provider-specific behavior belongs behind `Backend`; never infer lifecycle
+from errors, tool results, or history above it. Reproduce backend contract
+violations in real conformance and fix the adapter, not shared server/UI
+workarounds.
+
 ## Branch hygiene: never develop on `main`
 
 `main` is always kept clean. **Do not do active development directly against

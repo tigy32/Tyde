@@ -522,7 +522,7 @@ pub(super) fn running_command_frames(
 
 /// Commands a response issued before the backend dropped that response
 /// without ending it: one still running, one the backend reports finishing.
-/// `Interrupted` ends the turn with a Claude interrupted-tool completion, and
+/// `Interrupted` ends the turn with a failed-tool completion and backend idle,
 /// `Replaced` opens the next response before reporting the finish.
 pub(super) fn abandoned_response_command_frames(
     running_id: &str,
@@ -547,14 +547,14 @@ pub(super) fn abandoned_response_command_frames(
         command(finished_id),
     ];
     match abandon {
-        AbandonedResponse::Interrupted => frames.push(tool_completed(ToolExecutionCompletedData {
+        AbandonedResponse::Interrupted => frames.extend([tool_completed(ToolExecutionCompletedData {
             tool_call_id: finished_id.to_owned(),
             outcome: ToolExecutionOutcome::Failed {
                 message: "Tool execution was interrupted".to_owned(),
                 details: Some("Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned()),
                 normalization_failure: None,
             },
-        })),
+        }), typing(false)]),
         AbandonedResponse::Replaced => frames.extend([
             stream_start("mock", Some(MOCK_MODEL.to_owned())),
             tool_completed(ToolExecutionCompletedData {
@@ -578,7 +578,7 @@ pub(super) fn abandoned_response_command_frames(
     frames
 }
 
-pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<BackendEvent> {
+pub(super) fn failed_tool_frames(tool_call_id: &str) -> Vec<BackendEvent> {
     vec![
         typing(true),
         stream_start("mock", Some(MOCK_MODEL.to_owned())),
@@ -714,6 +714,11 @@ pub(super) fn cancel_live_native_children(active_subagents: &[SubAgentHandle]) {
             .send(ChatEvent::OperationCancelled(OperationCancelledData {
                 message: "Parent agent turn ended before the sub-agent completed".to_owned(),
             }));
+    }
+}
+
+pub(super) fn idle_live_native_children(active_subagents: &[SubAgentHandle]) {
+    for child in active_subagents {
         let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(false));
     }
 }

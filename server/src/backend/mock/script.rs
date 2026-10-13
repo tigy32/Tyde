@@ -47,6 +47,7 @@ pub struct MockScript {
     pub(super) resume_replay: Option<MockResumeReplay>,
     pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
+    pub(super) native_child_idle_gate: Option<MockGate>,
     /// Parks every follow-up message before the provider accepts it.
     pub(super) send_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
@@ -138,6 +139,11 @@ impl MockScript {
 
     pub fn with_shutdown_gate(mut self, gate: &MockGateHandle) -> Self {
         self.shutdown_gate = Some(gate.gate());
+        self
+    }
+
+    pub fn with_native_child_idle_gate(mut self, gate: &MockGateHandle) -> Self {
+        self.native_child_idle_gate = Some(gate.gate());
         self
     }
 
@@ -671,7 +677,24 @@ impl MockTurn {
     }
 
     pub fn error_card(message: impl Into<String>) -> Self {
-        Self::done(vec![MockStep::emit(emit::error_card(&message.into()))])
+        Self::done(vec![
+            MockStep::emit(emit::typing(true)),
+            MockStep::emit(emit::error_card(&message.into())),
+            MockStep::emit(emit::typing(false)),
+        ])
+    }
+
+    pub fn error_before_typing(
+        message: impl Into<String>,
+        text: impl Into<String>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        let mut steps = vec![
+            MockStep::emit(emit::error_card(&message.into())),
+            MockStep::Gate(gate.gate()),
+        ];
+        steps.extend(text_steps(text.into(), TextShape::default()));
+        Self::done(steps)
     }
 
     pub fn cancelled(message: impl Into<String>) -> Self {
@@ -682,13 +705,22 @@ impl MockTurn {
         ])
     }
 
-    pub fn tool_failure_without_idle() -> Self {
-        Self::done(
-            emit::tool_failure_without_idle_frames("mock-failed-tool")
-                .into_iter()
-                .map(MockStep::emit)
-                .collect(),
-        )
+    pub fn tool_failure_then_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
+        let mut steps = emit::failed_tool_frames("mock-failed-tool")
+            .into_iter()
+            .map(MockStep::emit)
+            .collect::<Vec<_>>();
+        steps.push(MockStep::Gate(gate.gate()));
+        let text = text.into();
+        steps.extend([
+            MockStep::emit(emit::stream_delta(text.clone())),
+            MockStep::emit(emit::stream_end(emit::mock_assistant_message(
+                Some(ChatMessageId(Uuid::new_v4().to_string())),
+                text,
+            ))),
+            MockStep::emit(emit::typing(false)),
+        ]);
+        Self::done(steps)
     }
 
     pub fn codex_internal_error_tail() -> Self {
@@ -748,6 +780,19 @@ impl MockTurn {
 
     pub fn with_duplicate_idle(self) -> Self {
         self.with_appended_steps(vec![MockStep::emit(emit::typing(false))])
+    }
+
+    pub fn with_gate_before_idle(mut self, gate: &MockGateHandle) -> Self {
+        let MockTurnBody::Steps(steps) = &mut self.body else {
+            panic!("idle gate requires a frozen turn");
+        };
+        let position = steps
+            .iter()
+            .rposition(|step| matches!(step, MockStep::Emit(event)
+                if matches!(&**event, BackendEvent::Chat(protocol::ChatEvent::TypingStatusChanged(false)))))
+            .expect("idle gate requires a backend idle marker");
+        steps.insert(position, MockStep::Gate(gate.gate()));
+        self
     }
 
     pub fn with_active_idle_cycle(self) -> Self {
