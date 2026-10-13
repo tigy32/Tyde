@@ -126,6 +126,9 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     );
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Miniflare can reset a pooled socket during transport teardown.
+        // Each revocation probe must reach the worker's HTTP denial boundary.
+        .pool_max_idle_per_host(0)
         .build()
         .unwrap();
     let callback = "https://chatgpt.com/connector_platform_oauth_redirect";

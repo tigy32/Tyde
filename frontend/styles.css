@@ -473,13 +473,24 @@ details summary:focus:not(:focus-visible) {
     border-color: var(--border-primary);
 }
 
+.center-host-select,
+.browser-host-select,
+.session-setting-select {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 12px 12px;
+}
+
 .center-host-select {
     height: 26px;
-    padding: 0 8px;
+    padding: 0 28px 0 8px;
     font-size: 0.846rem;
     font-weight: 500;
     color: var(--text-secondary);
-    background: transparent;
+    background-color: var(--surface-2);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     cursor: pointer;
@@ -489,7 +500,7 @@ details summary:focus:not(:focus-visible) {
 
 .center-host-select:hover {
     color: var(--text-bright);
-    background: var(--surface-hover);
+    background-color: var(--surface-3);
 }
 
 .new-chat-btn {
@@ -1193,14 +1204,8 @@ details summary:focus:not(:focus-visible) {
 }
 
 .browser-host-select {
-    appearance: none;
-    -webkit-appearance: none;
     padding: 5px 28px 5px 10px;
-    background: var(--surface-2);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 12px 12px;
+    background-color: var(--surface-2);
     color: var(--text-primary);
     border: 1px solid var(--border-secondary);
     border-radius: 4px;
@@ -12336,10 +12341,10 @@ math merror {
     font-size: 0.82rem;
     font-family: var(--font-sans);
     color: var(--text-primary);
-    background: var(--surface-2);
+    background-color: var(--surface-2);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
-    padding: 2px 6px;
+    padding: 2px 28px 2px 6px;
     outline: none;
     cursor: pointer;
 }

@@ -2453,6 +2453,30 @@ mod wasm_tests {
             "the default active tab renders Home, got {:?}",
             text_of(&mount)
         );
+
+        let host = query(&container, "select[aria-label='Host for new chats']")
+            .expect("Home offers the host picker");
+        assert_eq!(
+            computed(&host, "appearance"),
+            "none",
+            "the host picker must not use the glossy platform control"
+        );
+        assert!(
+            computed(&host, "background-image").starts_with("url("),
+            "the flat host picker still needs a visible dropdown chevron"
+        );
+        assert!(
+            computed(&host, "padding-right")
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+                >= 24.0,
+            "the host name must not overlap the dropdown chevron"
+        );
+        assert!(host.get_bounding_client_rect().height() >= MIN_TARGET_SIZE);
+        host.focus().unwrap();
+        assert_eq!(computed(&host, "outline-style"), "solid");
+        assert_eq!(computed(&host, "outline-width"), "2px");
     }
 
     /// The active tab decides what the user sees and is marked in the strip;

@@ -1973,6 +1973,10 @@ mod wasm_tests {
     async fn running_agent_settings_use_the_agent_schema_not_the_host_catalog() {
         install_send_stub();
         let container = make_container();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        container.append_child(&style).unwrap();
         let host_id = "h-agent-schema";
         let state = make_state_for_backend(host_id, "root", false, BackendKind::Hermes);
         state.session_schemas.update(|map| {
@@ -2011,6 +2015,38 @@ mod wasm_tests {
             .click();
         for _ in 0..4 {
             next_tick().await;
+        }
+
+        for label in ["profile", "model", "reasoning_effort"] {
+            let select = setting_row_select(&container, label);
+            let computed = web_sys::window()
+                .unwrap()
+                .get_computed_style(&select)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                computed.get_property_value("appearance").unwrap(),
+                "none",
+                "session dropdowns must not use the glossy platform control"
+            );
+            assert!(
+                computed
+                    .get_property_value("background-image")
+                    .unwrap()
+                    .starts_with("url("),
+                "flat session dropdowns still need a visible chevron"
+            );
+            assert!(
+                computed
+                    .get_property_value("padding-right")
+                    .unwrap()
+                    .trim_end_matches("px")
+                    .parse::<f64>()
+                    .unwrap()
+                    >= 24.0,
+                "setting values must not overlap the dropdown chevron"
+            );
+            assert!(select.get_bounding_client_rect().height() > 0.0);
         }
 
         let effort = setting_row_select(&container, "reasoning_effort");
