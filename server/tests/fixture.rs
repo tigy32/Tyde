@@ -553,6 +553,35 @@ impl Fixture {
             .expect("agent-control connection should bootstrap")
     }
 
+    // Every integration binary compiles the fixture; review startup uses this boundary.
+    #[allow(dead_code)]
+    pub async fn connect_fresh_host_from_sync_thread(
+        &self,
+    ) -> (client::Connection, server::HostHandle) {
+        let session_path = self.session_store_path();
+        let project_path = self.project_store_path();
+        let settings_path = self.settings_store_path();
+        let config = self.fresh_host_runtime_config();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("tyde-sync-host-init".to_owned())
+            .spawn(move || {
+                let _ = reply.send(server::spawn_host_with_mock_backend_and_runtime_config(
+                    session_path,
+                    project_path,
+                    settings_path,
+                    config,
+                ));
+            })
+            .expect("spawn synchronous host initialization thread");
+        let host = response
+            .await
+            .expect("synchronous host initialization reply")
+            .expect("initialize host outside Tokio with persisted projects");
+        let (client, _) = connect_client_with_bootstrap(host.clone()).await;
+        (client, host)
+    }
+
     #[allow(dead_code)]
     pub async fn connect_fresh_host(&self) -> client::Connection {
         let host = server::spawn_host_with_mock_backend_and_runtime_config(

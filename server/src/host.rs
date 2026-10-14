@@ -139,11 +139,11 @@ use crate::project_stream::{
     SearchSummary, build_dir_listing, commit, discard_file, read_diff, root_is_git_repository,
     search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
-use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::reviewer::{
     ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
     prepare_reviewer_context,
 };
+use crate::review::state::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::{
     ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_selection,
     review_stream_path,
@@ -418,6 +418,8 @@ pub struct HostRuntimeConfig {
     /// Parks reviewer startup while its review actor awaits the spawn reply.
     #[cfg(feature = "test-support")]
     pub review_ai_spawn_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    pub review_delivery_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     /// Overrides how long a restored agent may take to start once activated
     /// before its startup fails and releases its parent.
     #[cfg(feature = "test-support")]
@@ -467,6 +469,8 @@ impl Default for HostRuntimeConfig {
             restoration_complete_test_gate: None,
             #[cfg(feature = "test-support")]
             review_ai_spawn_test_gate: None,
+            #[cfg(feature = "test-support")]
+            review_delivery_test_gate: None,
             #[cfg(feature = "test-support")]
             restored_agent_startup_timeout: None,
             #[cfg(feature = "test-support")]
@@ -13398,16 +13402,10 @@ impl HostHandle {
             {
                 Some(readiness) => readiness,
                 None => {
-                    let summaries = state
-                        .review_registry
-                        .summaries(project_id.clone())
-                        .await
-                        .map_err(|error| project_command_error(operation, error))?;
                     let response = handle
                         .begin_add_subscriber(
                             connection_host_stream.clone(),
                             project_output_stream.clone(),
-                            summaries,
                             project_files,
                         )
                         .map_err(|error| project_command_error(operation, error))?;
@@ -14263,12 +14261,7 @@ impl HostHandle {
             }
         }
         review_registry
-            .action(
-                review_id,
-                payload,
-                connection_host_stream.clone(),
-                review_output_stream,
-            )
+            .action(review_id, payload, connection_host_stream.clone())
             .await
             .map_err(|error| {
                 AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
@@ -14606,48 +14599,6 @@ impl HostHandle {
             session_id = %session_id,
             "legacy submitted review redelivery is disabled for inline reviews"
         );
-    }
-
-    async fn emit_review_list_changed(&self, project_id: ProjectId) {
-        let (registry, handle) = {
-            let mut state = self.state.lock().await;
-            let registry = state.review_registry.clone();
-            let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        error = %error,
-                        "failed to ensure project actor for review list update"
-                    );
-                    return;
-                }
-            };
-            (registry, handle)
-        };
-        let summaries = match registry.summaries(project_id.clone()).await {
-            Ok(summaries) => summaries,
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to build review summaries"
-                );
-                return;
-            }
-        };
-        if let Err(error) = handle
-            .emit_project_event(protocol::ProjectEventPayload::ReviewListChanged {
-                reviews: summaries,
-            })
-            .await
-        {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "failed to emit review list update"
-            );
-        }
     }
 
     pub(crate) async fn agent_review_handle(
@@ -15992,7 +15943,7 @@ fn spawn_host_inner(
     let workflow_locations = workflow_catalog_locations(&initial_projects);
     let workflow_watch_targets = workflow_watch_dirs(&initial_projects);
     let workflow_run_store = WorkflowRunStore::load(paths.workflow_runs)?;
-    let review_store = ReviewStore::load(paths.review)?;
+    let review_routes = session_store.initialize_reviews(&paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let agents_view_preferences_store = runtime_config
         .agents_view_preferences_primary
@@ -16061,15 +16012,35 @@ fn spawn_host_inner(
     let mobile_access = MobileAccessHandle::new(mobile_access_tx.clone());
     let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
     let (review_ai_spawn_tx, review_ai_spawn_rx) = mpsc::channel::<ReviewAiSpawnRequest>(16);
-    let (review_project_update_tx, review_project_update_rx) =
-        mpsc::unbounded_channel::<ProjectId>();
+    let session_store = Arc::new(SessionStoreHandle::new(session_store));
+    let review_store = ReviewStore::new(Arc::clone(&session_store));
     let review_registry = ReviewRegistry::spawn(
         review_store,
-        Arc::clone(&project_store),
+        review_routes,
         review_delivery_tx,
         review_ai_spawn_tx,
-        review_project_update_tx,
-    )?;
+    );
+    let project_watcher = crate::project_watch::SharedProjectWatcher::default();
+    let mut project_streams = HashMap::new();
+    for project in &initial_projects {
+        let subscription = spawn_project_subscription(
+            project_watcher.clone(),
+            Arc::clone(&project_store),
+            project.clone(),
+            review_registry.clone(),
+            {
+                #[cfg(feature = "test-support")]
+                {
+                    runtime_config.force_project_watch_limit
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    false
+                }
+            },
+        )?;
+        project_streams.insert(project.id.clone(), subscription);
+    }
     let debug_mcp = match crate::debug_mcp::start_server(runtime_config.debug_mcp_bind_addr) {
         Ok(handle) => handle,
         Err(err) if runtime_config.debug_mcp_bind_addr.is_none() => {
@@ -16145,7 +16116,7 @@ fn spawn_host_inner(
             settings_store: Arc::new(Mutex::new(settings_store)),
             agents_view_preferences_store: agents_view_preferences_store
                 .map(|store| Arc::new(Mutex::new(store))),
-            session_store: Arc::new(SessionStoreHandle::new(session_store)),
+            session_store,
             transcript_store,
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
             mcp_server_store: Arc::new(Mutex::new(mcp_server_store)),
@@ -16243,8 +16214,8 @@ fn spawn_host_inner(
             restore_marker_withdraw_test_gate: None,
             agent_restoration_failures: Vec::new(),
             host_streams: HashMap::new(),
-            project_streams: HashMap::new(),
-            project_watcher: crate::project_watch::SharedProjectWatcher::default(),
+            project_streams,
+            project_watcher,
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             workbench_parent_locks: HashMap::new(),
@@ -16413,14 +16384,18 @@ fn spawn_host_inner(
 
     swarms::spawn_swarm_dispatch_task(host.clone(), swarm_dispatch_rx);
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
-    spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
+    spawn_host_review_delivery_task(
+        host.clone(),
+        review_delivery_rx,
+        #[cfg(feature = "test-support")]
+        runtime_config.review_delivery_test_gate.clone(),
+    );
     spawn_host_review_ai_task(
         host.clone(),
         review_ai_spawn_rx,
         #[cfg(feature = "test-support")]
         runtime_config.review_ai_spawn_test_gate,
     );
-    spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
     spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
     spawn_task_token_usage_task(host.clone());
@@ -18131,9 +18106,14 @@ fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
 fn spawn_host_review_delivery_task(
     host: HostHandle,
     mut rx: mpsc::Receiver<ReviewDeliveryRequest>,
+    #[cfg(feature = "test-support")] gate: Option<Arc<SpawnOperationTestGateInner>>,
 ) {
     let worker = async move {
         while let Some(request) = rx.recv().await {
+            #[cfg(feature = "test-support")]
+            if let Some(gate) = &gate {
+                wait_for_spawn_operation_test_gate_inner(gate).await;
+            }
             let review_id = request.review_id.clone();
             let project_id = request.project_id.clone();
             let message_len = request.payload.message.len();
@@ -18191,8 +18171,29 @@ fn spawn_host_review_ai_task(
             if let Some(gate) = &gate {
                 wait_for_spawn_operation_test_gate_inner(gate).await;
             }
-            let result = host.spawn_ai_reviewers(&request).await;
-            let _ = request.reply.send(result);
+            let host = host.clone();
+            tokio::spawn(async move {
+                let result = if request.cancellation.is_cancelled() {
+                    Err("Review startup was cancelled".to_owned())
+                } else {
+                    host.spawn_ai_reviewers(&request).await
+                };
+                let agents = result
+                    .as_ref()
+                    .map(|(_, reviewers)| {
+                        reviewers
+                            .iter()
+                            .filter_map(|reviewer| reviewer.agent_id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let _ = request.reply.send(result);
+                if !request.accepted.await.unwrap_or(false) {
+                    for agent_id in agents {
+                        host.close_agent(&agent_id).await;
+                    }
+                }
+            });
         }
     };
 
@@ -18211,33 +18212,6 @@ fn spawn_host_review_ai_task(
             runtime.block_on(worker);
         })
         .expect("failed to spawn review AI worker thread");
-}
-
-fn spawn_host_review_project_update_task(
-    host: HostHandle,
-    mut rx: mpsc::UnboundedReceiver<ProjectId>,
-) {
-    let worker = async move {
-        while let Some(project_id) = rx.recv().await {
-            host.emit_review_list_changed(project_id).await;
-        }
-    };
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(worker);
-        return;
-    }
-
-    std::thread::Builder::new()
-        .name("tyde-review-projects".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build review project update runtime");
-            runtime.block_on(worker);
-        })
-        .expect("failed to spawn review project update worker thread");
 }
 
 fn spawn_host_workflow_catalog_task(
@@ -20490,14 +20464,19 @@ async fn ensure_project_actor(
         subscription.task.abort();
     }
 
+    let project = state
+        .project_store
+        .lock()
+        .await
+        .get(&project_id)
+        .ok_or_else(|| format!("unknown project {project_id}"))?;
     let subscription = spawn_project_subscription(
         state.project_watcher.clone(),
         Arc::clone(&state.project_store),
-        project_id.clone(),
+        project,
         state.review_registry.clone(),
         state.force_project_watch_limit,
-    )
-    .await?;
+    )?;
     let handle = subscription.handle.clone();
     state.project_streams.insert(project_id, subscription);
     Ok(handle)
@@ -20515,14 +20494,9 @@ async fn subscribe_host_to_project(
         .stream
         .with_path(project_stream_path(&project_id));
     let project_files = subscriber.project_files;
-    let summaries = state.review_registry.summaries(project_id.clone()).await?;
     let handle = ensure_project_actor(state, project_id.clone()).await?;
-    let response = handle.begin_add_subscriber(
-        host_path.clone(),
-        project_output_stream,
-        summaries,
-        project_files,
-    )?;
+    let response =
+        handle.begin_add_subscriber(host_path.clone(), project_output_stream, project_files)?;
     // The observer polls a stored clone; registration must not await it.
     drop(track_project_subscription(
         state, host_path, project_id, response,
@@ -20567,11 +20541,8 @@ async fn emit_review_list_changed_for_project(
     state: &mut HostState,
     project_id: ProjectId,
 ) -> Result<(), String> {
-    let summaries = state.review_registry.summaries(project_id.clone()).await?;
     let handle = ensure_project_actor(state, project_id).await?;
-    handle
-        .emit_project_event(protocol::ProjectEventPayload::ReviewListChanged { reviews: summaries })
-        .await
+    handle.emit_review_list_changed()
 }
 
 /// Which post-commit refreshes a settings apply must trigger. The legacy

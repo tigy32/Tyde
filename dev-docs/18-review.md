@@ -323,9 +323,29 @@ are impossible, but file-level `ReviewAnchor::File` comments are valid.
 
 ### Registry
 
-`ReviewRegistry` owns review actors and enforces workspace singleton semantics
-per `ProjectId`. Project summaries first ensure the implicit active workspace
-draft exists for the project, then return exactly one workspace summary.
+The project-stream actor owns the project's review records and subscribers.
+There are no review actors. It creates the implicit workspace draft when the
+project is initialized and derives bootstrap and live summaries from its own
+state. A workbench starts with its own empty draft. `ReviewRegistry` is only a
+routing directory for project handles and review ids; it never awaits a project
+operation while processing its mailbox. Review ownership outlives subscriptions;
+file-tree initialization starts on the first subscriber, and periodic git
+polling requires a subscriber.
+
+Reviewer startup and feedback delivery run in host workers and return typed
+completion messages to the project. Snapshots remain available while either is
+pending. Feedback mutations queue during delivery so successful submission
+clears the delivered feedback before later edits are applied. Startup results
+are matched to the pending operation; cancelled or deleted owners do not accept
+late results, and the worker closes reviewers whose startup was not accepted.
+
+Reviews are rows in the existing session SQLite database, indexed by
+`project_id`. Reads select one project's rows; writes update one review row and
+project deletion removes its rows transactionally. Storage runs on the existing
+blocking database workers. The synchronous connection lock never crosses an
+async wait. `reviews.json` is imported once in a transaction and then ignored;
+its legacy path override controls only the import source. Live diff payloads
+remain transient and are not persisted.
 
 When legacy records are loaded:
 
@@ -342,9 +362,9 @@ per-root drafts into the active workspace review.
 
 ### Diff refresh and stale anchors
 
-Review actors refresh `diffs` from every project root's staged and unstaged diff on full
+The project owner refreshes review `diffs` from every project root's staged and unstaged diff on full
 subscribe and before mutating/submitting/starting AI review. After each refresh
-the actor checks every comment and suggestion location against the refreshed
+the project checks every comment and suggestion location against the refreshed
 workspace diff:
 
 - valid location => `anchor_status = Current`

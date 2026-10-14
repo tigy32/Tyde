@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Component, Path};
-use std::sync::Arc;
 use std::time::Instant;
 
 use protocol::{
@@ -16,13 +15,13 @@ use protocol::{
     ReviewSuggestionState, ReviewSummaryScope, ReviewTarget, SendMessagePayload, StreamPath,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::now_ms;
 use crate::project_stream::{committed_range_commit_count, read_diff, root_is_git_repository};
 use crate::review::bundle::ReviewFeedbackBundle;
-use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
 use crate::stream::Stream;
 
@@ -74,6 +73,8 @@ pub(crate) struct ReviewAiSpawnRequest {
     pub requested_by: Option<AgentId>,
     pub reply:
         oneshot::Sender<Result<(protocol::ReviewMode, Vec<protocol::ReviewReviewerRun>), String>>,
+    pub accepted: oneshot::Receiver<bool>,
+    pub cancellation: CancellationToken,
 }
 
 pub(crate) type AiSuggestionResult = Result<ReviewSuggestionId, ReviewErrorPayload>;
@@ -101,9 +102,6 @@ pub(crate) enum ReviewCommand {
         include_diffs: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    Unsubscribe {
-        conn: ConnectionId,
-    },
     Action {
         action: ReviewActionPayload,
         conn: ConnectionId,
@@ -128,71 +126,29 @@ pub(crate) enum ReviewCommand {
     Snapshot {
         reply: oneshot::Sender<Review>,
     },
+    AiStarted {
+        operation: Uuid,
+        result: Result<(protocol::ReviewMode, Vec<protocol::ReviewReviewerRun>), String>,
+    },
+    Delivered {
+        operation: Uuid,
+        result: ReviewDeliveryOutcome,
+    },
 }
 
-pub(crate) fn spawn_review_actor(
-    review: Review,
+pub(crate) struct ReviewState {
+    pub(crate) review: Review,
     store: ReviewStore,
-    project_store: Arc<Mutex<ProjectStore>>,
-    delivery_tx: mpsc::Sender<ReviewDeliveryRequest>,
-    ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
-    project_update_tx: mpsc::UnboundedSender<protocol::ProjectId>,
-) -> crate::review::ReviewHandle {
-    let (tx, rx) = mpsc::channel(64);
-    let (changes, changes_rx) = watch::channel(());
-    let handle = crate::review::ReviewHandle {
-        tx,
-        changes: changes_rx,
-    };
-    let actor_handle = handle.clone();
-    spawn_review_task("tyde-review-actor", async move {
-        let mut actor = ReviewActor {
-            review,
-            store,
-            project_store,
-            subscribers: HashMap::new(),
-            delivery_tx,
-            ai_spawn_tx,
-            project_update_tx,
-            handle: actor_handle,
-            changes,
-        };
-        actor.run(rx).await;
-    });
-    handle
-}
-
-fn spawn_review_task<F>(name: &'static str, future: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(future);
-        return;
-    }
-
-    std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build review actor runtime");
-            runtime.block_on(future);
-        })
-        .expect("failed to spawn review actor thread");
-}
-
-struct ReviewActor {
-    review: Review,
-    store: ReviewStore,
-    project_store: Arc<Mutex<ProjectStore>>,
     subscribers: HashMap<ConnectionId, ReviewSubscriber>,
     delivery_tx: mpsc::Sender<ReviewDeliveryRequest>,
     ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
-    project_update_tx: mpsc::UnboundedSender<protocol::ProjectId>,
-    handle: crate::review::ReviewHandle,
+    pub(crate) handle: crate::review::ReviewHandle,
     changes: watch::Sender<()>,
+    changed: bool,
+    pending_ai: Option<PendingAiStartup>,
+    pending_delivery: Option<(Uuid, ConnectionId)>,
+    deferred: VecDeque<ReviewCommand>,
+    early_exits: Vec<(AgentId, Result<(), String>)>,
 }
 
 #[derive(Clone)]
@@ -201,97 +157,182 @@ struct ReviewSubscriber {
     include_diffs: bool,
 }
 
-impl ReviewActor {
-    async fn run(&mut self, mut rx: mpsc::Receiver<ReviewCommand>) {
-        while let Some(command) = rx.recv().await {
-            match command {
-                ReviewCommand::AgentRequest {
-                    mode,
-                    caller,
-                    scope,
-                    reply,
-                } => {
-                    let rounds = self.review.ai_reviewer.rounds.len();
-                    self.start_ai_review(
-                        ReviewLaunchOptions {
-                            mode,
-                            backend_kind: None,
-                            cost_hint: None,
-                            instructions: None,
-                        },
-                        scope,
-                        StreamPath(format!("/review-request/{}", caller.0)),
-                        Some(caller),
-                    )
-                    .await;
-                    let result = if self.review.ai_reviewer.rounds.len() > rounds {
-                        Ok(self.review.clone())
-                    } else {
-                        Err(self.review.ai_reviewer.error.clone().unwrap_or_else(|| "Review did not start: check for an active review or an empty/invalid diff scope".to_owned()))
-                    };
-                    let _ = reply.send(result);
-                }
-                ReviewCommand::EditFinding {
-                    suggestion_id,
-                    body,
-                    reply,
-                } => {
-                    let result = self.edit_finding(suggestion_id, body).await;
-                    let _ = reply.send(result);
-                }
-                ReviewCommand::Disposition {
-                    suggestion_id,
-                    reason,
-                    reply,
-                } => {
-                    let result = self.record_disposition(suggestion_id, reason).await;
-                    let _ = reply.send(result);
-                }
+struct PendingAiStartup {
+    operation: Uuid,
+    conn: ConnectionId,
+    snapshot_id: String,
+    scope: protocol::ReviewAiScope,
+    requested_by: Option<AgentId>,
+    reply: Option<oneshot::Sender<Result<Review, String>>>,
+    accepted: Option<oneshot::Sender<bool>>,
+    cancellation: CancellationToken,
+}
 
-                ReviewCommand::Subscribe {
-                    conn,
-                    stream,
-                    include_diffs,
-                    reply,
-                } => {
-                    let result = self.subscribe(conn, stream, include_diffs).await;
-                    let _ = reply.send(result);
-                }
-                ReviewCommand::Unsubscribe { conn } => {
-                    self.subscribers.remove(&conn);
-                }
-                ReviewCommand::Action { action, conn } => {
-                    self.handle_action(action, conn).await;
-                }
-                ReviewCommand::AiSuggestion { suggestion, reply } => {
-                    let result = self.handle_ai_suggestion(suggestion).await;
-                    let _ = reply.send(result);
-                }
-                ReviewCommand::AiReviewerExited { agent_id, result } => {
-                    self.handle_ai_reviewer_exited(agent_id, result).await;
-                }
-                ReviewCommand::BundleConsumed {
-                    target_agent_id,
-                    at_ms,
-                } => {
-                    self.handle_bundle_consumed(target_agent_id, at_ms).await;
-                }
-                ReviewCommand::ResetForCleanWorkingTree => {
-                    self.reset_for_clean_working_tree(None).await;
-                }
-                ReviewCommand::InternalError { message, context } => {
-                    self.send_error(None, ReviewErrorCode::Internal, message, false, context)
-                        .await;
-                }
-                ReviewCommand::Snapshot { reply } => {
-                    let _ = reply.send(self.review.clone());
+impl Drop for PendingAiStartup {
+    fn drop(&mut self) {
+        if self.accepted.is_some() {
+            self.cancellation.cancel();
+        }
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err("Review startup was cancelled".to_owned()));
+        }
+    }
+}
+
+impl ReviewState {
+    pub(crate) fn new(
+        review: Review,
+        store: ReviewStore,
+        delivery_tx: mpsc::Sender<ReviewDeliveryRequest>,
+        ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
+        tx: mpsc::UnboundedSender<(ReviewId, ReviewCommand)>,
+    ) -> Self {
+        let (changes, receiver) = watch::channel(());
+        let handle = crate::review::ReviewHandle {
+            tx,
+            review_id: review.id.clone(),
+            changes: receiver,
+        };
+        Self {
+            review,
+            store,
+            subscribers: HashMap::new(),
+            delivery_tx,
+            ai_spawn_tx,
+            handle,
+            changes,
+            changed: false,
+            pending_ai: None,
+            pending_delivery: None,
+            deferred: VecDeque::new(),
+            early_exits: Vec::new(),
+        }
+    }
+
+    pub(crate) fn unsubscribe(&mut self, conn: &ConnectionId) {
+        self.subscribers.remove(conn);
+    }
+
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    pub(crate) async fn handle_command(&mut self, project: &Project, command: ReviewCommand) {
+        if self.pending_delivery.is_some()
+            && !matches!(
+                command,
+                ReviewCommand::Snapshot { .. }
+                    | ReviewCommand::Subscribe { .. }
+                    | ReviewCommand::Delivered { .. }
+                    | ReviewCommand::InternalError { .. }
+            )
+        {
+            self.deferred.push_back(command);
+            return;
+        }
+        match command {
+            ReviewCommand::AgentRequest {
+                mode,
+                caller,
+                scope,
+                reply,
+            } => {
+                let already_pending = self.pending_ai.is_some();
+                self.start_ai_review(
+                    project,
+                    ReviewLaunchOptions {
+                        mode,
+                        backend_kind: None,
+                        cost_hint: None,
+                        instructions: None,
+                    },
+                    scope,
+                    StreamPath(format!("/review-request/{}", caller.0)),
+                    Some(caller),
+                )
+                .await;
+                if !already_pending && let Some(pending) = self.pending_ai.as_mut() {
+                    pending.reply = Some(reply);
+                } else {
+                    let _ = reply.send(Err("Review did not start: check for an active review or an empty/invalid diff scope".to_owned()));
                 }
             }
+            ReviewCommand::EditFinding {
+                suggestion_id,
+                body,
+                reply,
+            } => {
+                let result = self.edit_finding(suggestion_id, body).await;
+                let _ = reply.send(result);
+            }
+            ReviewCommand::Disposition {
+                suggestion_id,
+                reason,
+                reply,
+            } => {
+                let result = self.record_disposition(suggestion_id, reason).await;
+                let _ = reply.send(result);
+            }
+
+            ReviewCommand::Subscribe {
+                conn,
+                stream,
+                include_diffs,
+                reply,
+            } => {
+                let result = self.subscribe(project, conn, stream, include_diffs).await;
+                let _ = reply.send(result);
+            }
+            ReviewCommand::Action { action, conn } => {
+                self.handle_action(project, action, conn).await;
+            }
+            ReviewCommand::AiSuggestion { suggestion, reply } => {
+                let result = self.handle_ai_suggestion(project, suggestion).await;
+                let _ = reply.send(result);
+            }
+            ReviewCommand::AiReviewerExited { agent_id, result } => {
+                if self.pending_ai.is_some() {
+                    self.early_exits.push((agent_id, result));
+                } else {
+                    self.handle_ai_reviewer_exited(agent_id, result).await;
+                }
+            }
+            ReviewCommand::BundleConsumed {
+                target_agent_id,
+                at_ms,
+            } => {
+                self.handle_bundle_consumed(target_agent_id, at_ms).await;
+            }
+            ReviewCommand::ResetForCleanWorkingTree => {
+                self.reset_for_clean_working_tree(None).await;
+            }
+            ReviewCommand::InternalError { message, context } => {
+                self.send_error(None, ReviewErrorCode::Internal, message, false, context)
+                    .await;
+            }
+            ReviewCommand::Snapshot { reply } => {
+                let _ = reply.send(self.review.clone());
+            }
+            ReviewCommand::AiStarted { operation, result } => {
+                self.complete_ai_startup(operation, result).await;
+            }
+            ReviewCommand::Delivered { operation, result } => {
+                self.complete_delivery(operation, result).await;
+            }
+        }
+    }
+
+    pub(crate) fn next_deferred(&mut self) -> Option<ReviewCommand> {
+        if self.pending_delivery.is_none() {
+            self.deferred.pop_front()
+        } else {
+            None
         }
     }
 
     async fn subscribe(
         &mut self,
+        project: &Project,
         conn: ConnectionId,
         stream: Stream,
         include_diffs: bool,
@@ -311,7 +352,8 @@ impl ReviewActor {
             "subscribing review stream"
         );
         if effective_include_diffs {
-            self.refresh_diffs().await?;
+            self.refresh_diffs_inner(project, self.pending_delivery.is_some())
+                .await?;
         }
         let payload = serde_json::to_value(ReviewBootstrapPayload {
             review: review_for_subscriber(&self.review, effective_include_diffs),
@@ -337,7 +379,12 @@ impl ReviewActor {
         Ok(())
     }
 
-    async fn handle_action(&mut self, action: ReviewActionPayload, conn: ConnectionId) {
+    async fn handle_action(
+        &mut self,
+        project: &Project,
+        action: ReviewActionPayload,
+        conn: ConnectionId,
+    ) {
         let action_kind = action.kind_name();
         if !self.subscribers.contains_key(&conn) {
             tracing::warn!(
@@ -350,6 +397,14 @@ impl ReviewActor {
         }
         match action {
             ReviewActionPayload::StopAiReview => {
+                if let Some(mut pending) = self.pending_ai.take() {
+                    pending.cancellation.cancel();
+                    if let Some(reply) = pending.reply.take() {
+                        let _ = reply.send(Err("Review cancelled by user".to_owned()));
+                    }
+                    self.early_exits.clear();
+                    return;
+                }
                 if self.review.ai_reviewer.status != ReviewAiReviewerStatus::Running {
                     return;
                 }
@@ -373,7 +428,7 @@ impl ReviewActor {
             }
 
             ReviewActionPayload::AddComment { location, body } => {
-                self.add_comment(location, body, conn).await;
+                self.add_comment(project, location, body, conn).await;
             }
             ReviewActionPayload::UpdateComment { comment_id, body } => {
                 self.update_comment(comment_id, body, conn).await;
@@ -385,7 +440,8 @@ impl ReviewActor {
                 suggestion_id,
                 edit,
             } => {
-                self.accept_suggestion(suggestion_id, edit, conn).await;
+                self.accept_suggestion(project, suggestion_id, edit, conn)
+                    .await;
             }
             ReviewActionPayload::RejectSuggestion { suggestion_id } => {
                 self.reject_suggestion(suggestion_id, conn).await;
@@ -398,6 +454,7 @@ impl ReviewActor {
                 scope,
             } => {
                 self.start_ai_review(
+                    project,
                     ReviewLaunchOptions {
                         mode,
                         backend_kind,
@@ -411,7 +468,7 @@ impl ReviewActor {
                 .await;
             }
             ReviewActionPayload::Submit { target } => {
-                self.submit(target, conn).await;
+                self.submit(project, target, conn).await;
             }
             ReviewActionPayload::ClearComments => {
                 self.clear_comments(conn).await;
@@ -424,6 +481,7 @@ impl ReviewActor {
 
     async fn add_comment(
         &mut self,
+        project: &Project,
         mut location: ReviewLocation,
         body: String,
         conn: ConnectionId,
@@ -444,7 +502,7 @@ impl ReviewActor {
             return;
         }
         let preserve_clean = !matches!(location.target, ReviewTarget::UnstagedDiff);
-        if let Err(message) = self.refresh_diffs_inner(preserve_clean).await {
+        if let Err(message) = self.refresh_diffs_inner(project, preserve_clean).await {
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::GitFailed,
@@ -457,7 +515,7 @@ impl ReviewActor {
         }
         if let ReviewTarget::CommittedDiff { base_oid, tip_oid } = &location.target
             && let Err(message) = self
-                .ensure_committed_diff(&location.root, base_oid, tip_oid)
+                .ensure_committed_diff(project, &location.root, base_oid, tip_oid)
                 .await
         {
             self.send_error(
@@ -473,7 +531,7 @@ impl ReviewActor {
         let previous = self.review.clone();
         if matches!(location.target, ReviewTarget::RegularFile { .. })
             && !self
-                .freeze_regular_file(&mut location, &conn, context.clone())
+                .freeze_regular_file(project, &mut location, &conn, context.clone())
                 .await
         {
             return;
@@ -630,6 +688,7 @@ impl ReviewActor {
 
     async fn accept_suggestion(
         &mut self,
+        project: &Project,
         suggestion_id: ReviewSuggestionId,
         edit: Option<String>,
         conn: ConnectionId,
@@ -671,7 +730,7 @@ impl ReviewActor {
             return;
         }
         if !self
-            .refresh_diffs_or_error(Some(&conn), context.clone())
+            .refresh_diffs_or_error(project, Some(&conn), context.clone())
             .await
         {
             return;
@@ -811,6 +870,7 @@ impl ReviewActor {
 
     async fn start_ai_review(
         &mut self,
+        project: &Project,
         options: ReviewLaunchOptions,
         scope: protocol::ReviewAiScope,
         conn: ConnectionId,
@@ -853,10 +913,12 @@ impl ReviewActor {
         if !self.ensure_draft(&conn, context.clone()).await {
             return;
         }
-        if matches!(
-            self.review.ai_reviewer.status,
-            ReviewAiReviewerStatus::Running
-        ) {
+        if self.pending_ai.is_some()
+            || matches!(
+                self.review.ai_reviewer.status,
+                ReviewAiReviewerStatus::Running
+            )
+        {
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::ReviewerAlreadyRunning,
@@ -868,7 +930,7 @@ impl ReviewActor {
             return;
         }
         if !self
-            .refresh_diffs_or_error(Some(&conn), context.clone())
+            .refresh_diffs_or_error(project, Some(&conn), context.clone())
             .await
         {
             return;
@@ -886,7 +948,10 @@ impl ReviewActor {
                 base_oid,
                 tip_oid,
             } => {
-                if let Err(message) = self.ensure_committed_diff(root, base_oid, tip_oid).await {
+                if let Err(message) = self
+                    .ensure_committed_diff(project, root, base_oid, tip_oid)
+                    .await
+                {
                     self.send_error(
                         Some(&conn),
                         ReviewErrorCode::InvalidLocation,
@@ -934,6 +999,9 @@ impl ReviewActor {
         review_for_prompt.diffs = prompt_diffs;
 
         let (reply, response) = oneshot::channel();
+        let (accepted, acceptance) = oneshot::channel();
+        let operation = Uuid::new_v4();
+        let cancellation = CancellationToken::new();
         let snapshot_id = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&review_for_prompt.diffs).expect("diffs serialize"))
@@ -950,48 +1018,69 @@ impl ReviewActor {
             review_handle: self.handle.clone(),
             requested_by: requested_by.clone(),
             reply,
+            accepted: acceptance,
+            cancellation: cancellation.clone(),
         };
-        let spawn_wait_started = Instant::now();
-        tracing::debug!(
-            review_id = %self.review.id,
-            backend_kind = ?backend_kind,
-            "requesting AI reviewer spawn"
-        );
-        if self.ai_spawn_tx.send(request).await.is_err() {
-            tracing::warn!(
-                review_id = %self.review.id,
-                backend_kind = ?backend_kind,
-                "AI reviewer spawn channel unavailable"
-            );
-            self.send_error(
-                Some(&conn),
-                ReviewErrorCode::ReviewerBackendUnsupported,
-                "AI reviewer spawn path is unavailable".to_owned(),
-                false,
-                context,
-            )
-            .await;
+        self.pending_ai = Some(PendingAiStartup {
+            operation,
+            conn,
+            snapshot_id,
+            scope,
+            requested_by,
+            reply: None,
+            accepted: Some(accepted),
+            cancellation,
+        });
+        let tx = self.ai_spawn_tx.clone();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let result = if tx.send(request).await.is_err() {
+                Err("AI reviewer spawn path is unavailable".to_owned())
+            } else {
+                response
+                    .await
+                    .unwrap_or_else(|_| Err("AI reviewer spawn task stopped".to_owned()))
+            };
+            let _ = handle.send(ReviewCommand::AiStarted { operation, result });
+        });
+    }
+
+    async fn complete_ai_startup(
+        &mut self,
+        operation: Uuid,
+        result: Result<(protocol::ReviewMode, Vec<protocol::ReviewReviewerRun>), String>,
+    ) {
+        if !self
+            .pending_ai
+            .as_ref()
+            .is_some_and(|pending| pending.operation == operation)
+        {
             return;
         }
-
-        match response.await {
-            Ok(Ok((mode, reviewers))) => {
+        let mut pending = self
+            .pending_ai
+            .take()
+            .expect("startup operation matched above");
+        let conn = pending.conn.clone();
+        let context = ReviewErrorContext::StartAiReview;
+        let succeeded = result.is_ok();
+        match result {
+            Ok((mode, reviewers)) => {
                 let agent_id = reviewers.iter().find_map(|r| r.agent_id.clone());
                 tracing::info!(
                     review_id = %self.review.id,
                     reviewer_agent_id = ?agent_id,
-                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
                     "AI reviewer spawn succeeded"
                 );
                 let previous = self.review.clone();
                 let mut rounds = self.review.ai_reviewer.rounds.clone();
                 rounds.push(protocol::ReviewRound {
                     mode: Some(mode),
-                    snapshot_id,
+                    snapshot_id: pending.snapshot_id.clone(),
                     id: Uuid::new_v4().to_string(),
-                    scope: scope.clone(),
+                    scope: pending.scope.clone(),
                     started_at_ms: now_ms(),
-                    requested_by,
+                    requested_by: pending.requested_by.clone(),
                     reviewers,
                     dispositions: Default::default(),
                     delivery_error: None,
@@ -1001,11 +1090,14 @@ impl ReviewActor {
                     status: ReviewAiReviewerStatus::Running,
                     agent_id,
                     error: None,
-                    scope: scope.clone(),
+                    scope: pending.scope.clone(),
                 };
                 self.review.updated_at_ms = now_ms();
                 if !self.persist_or_revert(previous, Some(&conn), context).await {
                     return;
+                }
+                if let Some(accepted) = pending.accepted.take() {
+                    let _ = accepted.send(true);
                 }
                 self.broadcast(ReviewEventPayload::AiReviewerChanged {
                     state: self.review.ai_reviewer.clone(),
@@ -1013,11 +1105,9 @@ impl ReviewActor {
                 .await;
                 self.finish_review_round().await;
             }
-            Ok(Err(message)) => {
+            Err(message) => {
                 tracing::warn!(
                     review_id = %self.review.id,
-                    backend_kind = ?backend_kind,
-                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
                     error_len = message.len(),
                     "AI reviewer spawn failed"
                 );
@@ -1027,7 +1117,7 @@ impl ReviewActor {
                     status: ReviewAiReviewerStatus::Failed,
                     agent_id: None,
                     error: Some(message.clone()),
-                    scope: scope.clone(),
+                    scope: pending.scope.clone(),
                 };
                 self.review.updated_at_ms = now_ms();
                 if self
@@ -1048,26 +1138,27 @@ impl ReviewActor {
                 )
                 .await;
             }
-            Err(_) => {
-                tracing::warn!(
-                    review_id = %self.review.id,
-                    backend_kind = ?backend_kind,
-                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
-                    "AI reviewer spawn response dropped"
-                );
-                self.send_error(
-                    Some(&conn),
-                    ReviewErrorCode::ReviewerBackendUnsupported,
-                    "AI reviewer spawn task stopped".to_owned(),
-                    false,
-                    context,
-                )
-                .await;
-            }
+        }
+        let early_exits = std::mem::take(&mut self.early_exits);
+        for (agent_id, result) in early_exits {
+            self.handle_ai_reviewer_exited(agent_id, result).await;
+        }
+        if let Some(reply) = pending.reply.take() {
+            let result = if succeeded {
+                Ok(self.review.clone())
+            } else {
+                Err(self
+                    .review
+                    .ai_reviewer
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "AI reviewer did not start".to_owned()))
+            };
+            let _ = reply.send(result);
         }
     }
 
-    async fn submit(&mut self, target: ReviewSubmitTarget, conn: ConnectionId) {
+    async fn submit(&mut self, project: &Project, target: ReviewSubmitTarget, conn: ConnectionId) {
         let context = ReviewErrorContext::Submit;
         tracing::info!(
             review_id = %self.review.id,
@@ -1108,7 +1199,7 @@ impl ReviewActor {
             return;
         }
         if !self
-            .refresh_diffs_or_error(Some(&conn), context.clone())
+            .refresh_diffs_or_error(project, Some(&conn), context.clone())
             .await
         {
             tracing::warn!(
@@ -1184,6 +1275,7 @@ impl ReviewActor {
         };
 
         let (reply, response) = oneshot::channel();
+        let operation = Uuid::new_v4();
         let request = ReviewDeliveryRequest {
             review_id: self.review.id.clone(),
             project_id: self.review.project_id.clone(),
@@ -1191,30 +1283,36 @@ impl ReviewActor {
             payload,
             reply,
         };
-        tracing::info!(
-            review_id = %self.review.id,
-            project_id = %self.review.project_id,
-            "requesting review delivery"
-        );
-        if self.delivery_tx.send(request).await.is_err() {
-            tracing::warn!(
-                review_id = %self.review.id,
-                project_id = %self.review.project_id,
-                "review delivery channel unavailable"
-            );
-            self.send_error(
-                Some(&conn),
-                ReviewErrorCode::InvalidSubmitTarget,
-                "review delivery task stopped".to_owned(),
-                false,
-                context,
-            )
-            .await;
+        self.pending_delivery = Some((operation, conn));
+        let tx = self.delivery_tx.clone();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let result = if tx.send(request).await.is_err() {
+                ReviewDeliveryOutcome::Failed("review delivery task stopped".to_owned())
+            } else {
+                response.await.unwrap_or_else(|_| {
+                    ReviewDeliveryOutcome::Failed("review delivery task stopped".to_owned())
+                })
+            };
+            let _ = handle.send(ReviewCommand::Delivered { operation, result });
+        });
+    }
+
+    async fn complete_delivery(&mut self, operation: Uuid, result: ReviewDeliveryOutcome) {
+        if !self
+            .pending_delivery
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == operation)
+        {
             return;
         }
-
-        match response.await {
-            Ok(ReviewDeliveryOutcome::Delivered { target_agent_id }) => {
+        let (_, conn) = self
+            .pending_delivery
+            .take()
+            .expect("delivery operation matched above");
+        let context = ReviewErrorContext::Submit;
+        match result {
+            ReviewDeliveryOutcome::Delivered { target_agent_id } => {
                 tracing::info!(
                     review_id = %self.review.id,
                     target_agent_id = %target_agent_id,
@@ -1223,7 +1321,7 @@ impl ReviewActor {
                 );
                 self.clear_review_state(false, Some(&conn), context).await;
             }
-            Ok(ReviewDeliveryOutcome::Offline) => {
+            ReviewDeliveryOutcome::Offline => {
                 tracing::info!(
                     review_id = %self.review.id,
                     project_id = %self.review.project_id,
@@ -1239,7 +1337,7 @@ impl ReviewActor {
                 )
                 .await;
             }
-            Ok(ReviewDeliveryOutcome::Failed(message)) => {
+            ReviewDeliveryOutcome::Failed(message) => {
                 tracing::warn!(
                     review_id = %self.review.id,
                     project_id = %self.review.project_id,
@@ -1251,21 +1349,6 @@ impl ReviewActor {
                     Some(&conn),
                     ReviewErrorCode::InvalidSubmitTarget,
                     message,
-                    false,
-                    context,
-                )
-                .await;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    review_id = %self.review.id,
-                    project_id = %self.review.project_id,
-                    "review delivery response dropped"
-                );
-                self.send_error(
-                    Some(&conn),
-                    ReviewErrorCode::InvalidSubmitTarget,
-                    "review delivery task dropped response".to_owned(),
                     false,
                     context,
                 )
@@ -1311,6 +1394,7 @@ impl ReviewActor {
 
     async fn handle_ai_suggestion(
         &mut self,
+        project: &Project,
         mut suggestion: ReviewSuggestedComment,
     ) -> AiSuggestionResult {
         let context = ReviewErrorContext::StartAiReview;
@@ -1383,7 +1467,7 @@ impl ReviewActor {
             .await;
             return Err(error);
         }
-        if let Err(message) = self.refresh_diffs().await {
+        if let Err(message) = self.refresh_diffs(project).await {
             let error = review_error(ReviewErrorCode::GitFailed, message, false, context);
             self.broadcast(ReviewEventPayload::Error {
                 error: error.clone(),
@@ -1393,7 +1477,7 @@ impl ReviewActor {
         }
         if let ReviewTarget::CommittedDiff { base_oid, tip_oid } = &suggestion.location.target
             && let Err(message) = self
-                .ensure_committed_diff(&suggestion.location.root, base_oid, tip_oid)
+                .ensure_committed_diff(project, &suggestion.location.root, base_oid, tip_oid)
                 .await
         {
             let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
@@ -1404,35 +1488,17 @@ impl ReviewActor {
             return Err(error);
         }
         let previous = self.review.clone();
-        if matches!(suggestion.location.target, ReviewTarget::RegularFile { .. }) {
-            let project = {
-                let store = self.project_store.lock().await;
-                store.get(&self.review.project_id)
-            };
-            let Some(project) = project else {
-                let error = review_error(
-                    ReviewErrorCode::InvalidLocation,
-                    format!("unknown project {}", self.review.project_id),
-                    false,
-                    context,
-                );
-                self.broadcast(ReviewEventPayload::Error {
-                    error: error.clone(),
-                })
-                .await;
-                return Err(error);
-            };
-            if let Err(message) =
-                freeze_regular_file_in_review(&mut self.review, &project, &mut suggestion.location)
-            {
-                self.review = previous;
-                let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
-                self.broadcast(ReviewEventPayload::Error {
-                    error: error.clone(),
-                })
-                .await;
-                return Err(error);
-            }
+        if matches!(suggestion.location.target, ReviewTarget::RegularFile { .. })
+            && let Err(message) =
+                freeze_regular_file_in_review(&mut self.review, project, &mut suggestion.location)
+        {
+            self.review = previous;
+            let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
+            self.broadcast(ReviewEventPayload::Error {
+                error: error.clone(),
+            })
+            .await;
+            return Err(error);
         }
         if let Err(message) = validate_location(&self.review, &suggestion.location) {
             self.review = previous;
@@ -1782,6 +1848,8 @@ impl ReviewActor {
         conn: Option<&ConnectionId>,
         context: ReviewErrorContext,
     ) -> bool {
+        self.pending_ai.take();
+        self.early_exits.clear();
         let previous = self.review.clone();
         self.review.status = ReviewStatus::Draft;
         self.review.comments.clear();
@@ -1829,10 +1897,11 @@ impl ReviewActor {
 
     async fn refresh_diffs_or_error(
         &mut self,
+        project: &Project,
         conn: Option<&ConnectionId>,
         context: ReviewErrorContext,
     ) -> bool {
-        match self.refresh_diffs().await {
+        match self.refresh_diffs(project).await {
             Ok(()) => true,
             Err(message) => {
                 self.send_error(conn, ReviewErrorCode::GitFailed, message, false, context)
@@ -1842,11 +1911,15 @@ impl ReviewActor {
         }
     }
 
-    async fn refresh_diffs(&mut self) -> Result<(), String> {
-        self.refresh_diffs_inner(false).await
+    async fn refresh_diffs(&mut self, project: &Project) -> Result<(), String> {
+        self.refresh_diffs_inner(project, false).await
     }
 
-    async fn refresh_diffs_inner(&mut self, preserve_clean: bool) -> Result<(), String> {
+    async fn refresh_diffs_inner(
+        &mut self,
+        project: &Project,
+        preserve_clean: bool,
+    ) -> Result<(), String> {
         let started = Instant::now();
         tracing::debug!(
             review_id = %self.review.id,
@@ -1854,24 +1927,7 @@ impl ReviewActor {
             selection_kind = self.review.selection.kind_name(),
             "refreshing review diffs"
         );
-        let project = {
-            let store = self.project_store.lock().await;
-            match store.get(&self.review.project_id) {
-                Some(project) => project,
-                None => {
-                    let message = format!("unknown project {}", self.review.project_id);
-                    tracing::warn!(
-                        review_id = %self.review.id,
-                        project_id = %self.review.project_id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        error_len = message.len(),
-                        "failed to refresh review diffs"
-                    );
-                    return Err(message);
-                }
-            }
-        };
-        match read_review_diffs(&project, &self.review.selection) {
+        match read_review_diffs(project, &self.review.selection) {
             Ok(mut diffs) => {
                 if !matches!(
                     self.review.selection,
@@ -1896,7 +1952,7 @@ impl ReviewActor {
                     return Ok(());
                 }
                 let mut anchor_updates = refresh_anchor_statuses(&mut self.review);
-                let regular_updates = self.refresh_regular_file_snapshots(&project);
+                let regular_updates = self.refresh_regular_file_snapshots(project);
                 anchor_updates.comments.extend(regular_updates.comments);
                 anchor_updates
                     .suggestions
@@ -1904,7 +1960,7 @@ impl ReviewActor {
                 let pruned_snapshots = prune_file_snapshots(&mut self.review);
                 if anchor_updates.has_changes() || pruned_snapshots {
                     self.review.updated_at_ms = now_ms();
-                    if let Err(error) = self.store.upsert(self.review.clone()) {
+                    if let Err(error) = self.store.upsert(self.review.clone()).await {
                         self.review = previous;
                         return Err(error);
                     }
@@ -1949,26 +2005,12 @@ impl ReviewActor {
 
     async fn freeze_regular_file(
         &mut self,
+        project: &Project,
         location: &mut ReviewLocation,
         conn: &ConnectionId,
         context: ReviewErrorContext,
     ) -> bool {
-        let project = {
-            let store = self.project_store.lock().await;
-            store.get(&self.review.project_id)
-        };
-        let Some(project) = project else {
-            self.send_error(
-                Some(conn),
-                ReviewErrorCode::InvalidLocation,
-                format!("unknown project {}", self.review.project_id),
-                false,
-                context,
-            )
-            .await;
-            return false;
-        };
-        if let Err(message) = freeze_regular_file_in_review(&mut self.review, &project, location) {
+        if let Err(message) = freeze_regular_file_in_review(&mut self.review, project, location) {
             self.send_error(
                 Some(conn),
                 ReviewErrorCode::InvalidLocation,
@@ -2013,6 +2055,7 @@ impl ReviewActor {
     /// root, exactly as the git panel offers them. Idempotent.
     async fn ensure_committed_diff(
         &mut self,
+        project: &Project,
         root: &ProjectRootPath,
         base_oid: &str,
         tip_oid: &str,
@@ -2025,15 +2068,9 @@ impl ReviewActor {
         {
             return Ok(());
         }
-        let project = {
-            let store = self.project_store.lock().await;
-            store
-                .get(&self.review.project_id)
-                .ok_or_else(|| format!("unknown project {}", self.review.project_id))?
-        };
-        committed_range_commit_count(&project, root, base_oid, tip_oid)?;
+        committed_range_commit_count(project, root, base_oid, tip_oid)?;
         let diff = read_diff(
-            &project,
+            project,
             ProjectReadDiffPayload {
                 request_id: None,
                 root: root.clone(),
@@ -2078,7 +2115,7 @@ impl ReviewActor {
         conn: Option<&ConnectionId>,
         context: ReviewErrorContext,
     ) -> bool {
-        match self.store.upsert(self.review.clone()) {
+        match self.store.upsert(self.review.clone()).await {
             Ok(()) => true,
             Err(message) => {
                 self.review = previous;
@@ -2217,8 +2254,8 @@ impl ReviewActor {
             })
     }
 
-    fn notify_project_changed(&self) {
-        let _ = self.project_update_tx.send(self.review.project_id.clone());
+    fn notify_project_changed(&mut self) {
+        self.changed = true;
     }
 }
 

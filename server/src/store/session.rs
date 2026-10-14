@@ -210,7 +210,7 @@ pub struct SessionRecord {
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,
-    writer: Mutex<Connection>,
+    pub(super) writer: Mutex<Connection>,
 }
 
 impl SessionStore {
@@ -1106,7 +1106,7 @@ impl SessionStore {
         Ok(result)
     }
 
-    fn reader(&self) -> Result<Connection, String> {
+    pub(super) fn reader(&self) -> Result<Connection, String> {
         let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql_error)?;
         connection
@@ -1181,7 +1181,7 @@ impl SessionStoreHandle {
         self.run(Arc::clone(&self.writers), operation).await
     }
 
-    async fn read<T, F>(&self, operation: F) -> Result<T, String>
+    pub(crate) async fn read<T, F>(&self, operation: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,

@@ -28,7 +28,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 
-use crate::review::ReviewRegistryHandle;
+use crate::review::state::ReviewCommand;
+use crate::review::{ProjectReviews, RegistryCommand, ReviewRegistryHandle};
 use crate::store::project::ProjectStore;
 use crate::stream::Stream;
 
@@ -186,10 +187,11 @@ pub(crate) struct ProjectStreamHandle {
 }
 
 enum ProjectStreamCommand {
+    ReviewRegistry(RegistryCommand),
+    EmitReviewListChanged,
     AddSubscriber {
         host_path: StreamPath,
         stream: Stream,
-        review_summaries: Vec<ReviewSummary>,
         file_delivery: ProjectFileDelivery,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -203,10 +205,6 @@ enum ProjectStreamCommand {
         host_path: StreamPath,
         key: ProjectDiffRequestKey,
         context_mode: DiffContextMode,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    EmitProjectEvent {
-        payload: ProjectEventPayload,
         reply: oneshot::Sender<Result<(), String>>,
     },
     UpdateCodeIntelProviderStatus {
@@ -270,11 +268,22 @@ impl PendingProjectUpdate {
 }
 
 impl ProjectStreamHandle {
+    pub(crate) fn route_review_registry(&self, command: RegistryCommand) -> Result<(), String> {
+        self.tx
+            .send(ProjectStreamCommand::ReviewRegistry(command))
+            .map_err(|_| "project review owner stopped".to_owned())
+    }
+
+    pub(crate) fn emit_review_list_changed(&self) -> Result<(), String> {
+        self.tx
+            .send(ProjectStreamCommand::EmitReviewListChanged)
+            .map_err(|_| "project review owner stopped".to_owned())
+    }
+
     pub(crate) fn begin_add_subscriber(
         &self,
         host_path: StreamPath,
         stream: Stream,
-        review_summaries: Vec<ReviewSummary>,
         file_delivery: ProjectFileDelivery,
     ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (reply, response) = oneshot::channel();
@@ -282,7 +291,6 @@ impl ProjectStreamHandle {
             .send(ProjectStreamCommand::AddSubscriber {
                 host_path,
                 stream,
-                review_summaries,
                 file_delivery,
                 reply,
             })
@@ -320,19 +328,6 @@ impl ProjectStreamHandle {
                 context_mode,
                 reply,
             })
-            .map_err(|_| "project stream subscription stopped".to_owned())?;
-        response
-            .await
-            .map_err(|_| "project stream subscription stopped".to_owned())?
-    }
-
-    pub(crate) async fn emit_project_event(
-        &self,
-        payload: ProjectEventPayload,
-    ) -> Result<(), String> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(ProjectStreamCommand::EmitProjectEvent { payload, reply })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -411,39 +406,82 @@ impl ProjectStreamHandle {
     }
 }
 
-pub(crate) async fn spawn_project_subscription(
+pub(crate) fn spawn_project_subscription(
     shared_watcher: SharedProjectWatcher,
     project_store: Arc<Mutex<ProjectStore>>,
-    project_id: ProjectId,
+    project: Project,
     review_registry: ReviewRegistryHandle,
     force_watch_limit: bool,
 ) -> Result<ProjectStreamSubscription, String> {
-    let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
-    let snapshot = background_project_read(&project, "initialize", initialize_snapshot).await?;
-    let watched_roots = watchable_roots(&project);
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (review_tx, review_rx) = mpsc::unbounded_channel();
     let handle = ProjectStreamHandle { tx: command_tx };
-
-    let task = tokio::spawn(async move {
+    review_registry.register_project(project.id.clone(), handle.clone())?;
+    let snapshot = ProjectSnapshotState {
+        file_entries: BTreeMap::new(),
+        git_status: None,
+        diff_context_modes: HashMap::new(),
+        code_intel_overview: initial_code_intel_overview(project.root_paths()),
+    };
+    let task = spawn_project_task(async move {
         run_project_subscription(
             shared_watcher,
             project_store,
-            project_id,
+            project.id.clone(),
             project,
             snapshot,
             None,
-            watched_roots,
+            Vec::new(),
             watch_tx,
             watch_rx,
             force_watch_limit,
             command_rx,
             review_registry,
+            review_tx,
+            review_rx,
         )
         .await;
-    });
-
+    })?;
     Ok(ProjectStreamSubscription { task, handle })
+}
+
+fn spawn_project_task(
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<JoinHandle<()>, String> {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        return Ok(runtime.spawn(future));
+    }
+    let (task_tx, task_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("tyde-project".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = task_tx.send(Err(format!("create project runtime: {error}")));
+                    return;
+                }
+            };
+            let (done_tx, done_rx) = oneshot::channel();
+            let task = runtime.spawn(async move {
+                future.await;
+                let _ = done_tx.send(());
+            });
+            if task_tx.send(Ok(task)).is_err() {
+                return;
+            }
+            runtime.block_on(async {
+                let _ = done_rx.await;
+            });
+        })
+        .map_err(|error| format!("spawn project runtime thread: {error}"))?;
+    task_rx
+        .recv()
+        .map_err(|error| format!("receive project task: {error}"))?
 }
 
 fn start_project_watcher(
@@ -566,7 +604,18 @@ async fn run_project_subscription(
     force_watch_limit: bool,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
     review_registry: ReviewRegistryHandle,
+    review_tx: mpsc::UnboundedSender<(protocol::ReviewId, ReviewCommand)>,
+    mut review_rx: mpsc::UnboundedReceiver<(protocol::ReviewId, ReviewCommand)>,
 ) {
+    let mut reviews = match ProjectReviews::load(&project, review_registry, review_tx).await {
+        Ok(reviews) => reviews,
+        Err(error) => {
+            tracing::error!(%project_id, %error, "failed to load project review state");
+            return;
+        }
+    };
+    let mut snapshot_initialized = false;
+    let mut emit_reviews = false;
     let mut subscribers = HashMap::<StreamPath, ProjectSubscriber>::new();
     // Centralized per-file version counter. The single bump point
     // (`bump_file_version`) is funneled here from every source: file reads,
@@ -586,13 +635,8 @@ async fn run_project_subscription(
     // on every event.
     let mut watcher_roots = WatcherRootPaths::new(project.root_paths());
     let mut pending_update = PendingProjectUpdate::default();
-    let mut watcher_ready_rx = start_project_watcher(
-        shared_watcher.clone(),
-        watched_roots.clone(),
-        watch_tx.clone(),
-        force_watch_limit,
-    );
-    let mut watcher_initializing = true;
+    let (_, mut watcher_ready_rx) = mpsc::unbounded_channel();
+    let mut watcher_initializing = false;
     let mut watcher_retry = Instant::now();
     let mut watcher_warning = None::<String>;
     let mut file_warning = None::<String>;
@@ -610,13 +654,37 @@ async fn run_project_subscription(
     git_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if reviews.take_changed() || emit_reviews {
+            emit_reviews = false;
+            let payload = ProjectEventPayload::ReviewListChanged {
+                reviews: reviews.summaries(),
+            };
+            if let Err(error) =
+                fan_out_payload(&mut subscribers, FrameKind::ProjectEvent, &payload).await
+            {
+                tracing::warn!(%project_id, %error, "failed to emit project review summaries");
+            }
+        }
         tokio::select! {
+            Some((review_id, command)) = review_rx.recv() => {
+                reviews.handle_command(&project, review_id, command).await;
+            }
             maybe_command = command_rx.recv() => {
                 let Some(command) = maybe_command else {
                     return;
                 };
                 match command {
-                    ProjectStreamCommand::AddSubscriber { host_path, stream, review_summaries, file_delivery, reply } => {
+                    ProjectStreamCommand::ReviewRegistry(command) => {
+                        reviews.handle_registry(&project, command).await;
+                    }
+                    ProjectStreamCommand::EmitReviewListChanged => { emit_reviews = true; }
+                    ProjectStreamCommand::AddSubscriber { host_path, stream, file_delivery, reply } => {
+                        if !snapshot_initialized {
+                            match background_project_read(&project, "initialize", initialize_snapshot).await {
+                                Ok(initial) => { snapshot = initial; snapshot_initialized = true; }
+                                Err(error) => { let _ = reply.send(Err(error)); continue; }
+                            }
+                        }
                         use std::collections::hash_map::Entry;
                         match subscribers.entry(host_path.clone()) {
                             Entry::Occupied(mut e) => {
@@ -628,7 +696,7 @@ async fn run_project_subscription(
                                 e.insert(ProjectSubscriber { stream: stream.clone(), file_delivery });
                             }
                         }
-                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, review_summaries, file_delivery).await;
+                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, reviews.summaries(), file_delivery).await;
                         if result.is_err() {
                             subscribers.remove(&host_path);
                             snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
@@ -684,10 +752,6 @@ async fn run_project_subscription(
                         diff_request_generation += 1;
                         snapshot.diff_context_modes.insert((host_path, key), RememberedDiffContext { context_mode, generation: diff_request_generation });
                         let _ = reply.send(Ok(()));
-                    }
-                    ProjectStreamCommand::EmitProjectEvent { payload, reply } => {
-                        let result = broadcast_project_event(&mut subscribers, &payload).await;
-                        let _ = reply.send(result);
                     }
                     ProjectStreamCommand::UpdateCodeIntelProviderStatus { root, status } => {
                         let provider = status.provider.clone();
@@ -776,7 +840,7 @@ async fn run_project_subscription(
                     }
                 }
             }
-            _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing => {
+            _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing && !subscribers.is_empty() => {
                 tracing::debug!(%project_id, "retrying project filesystem watcher initialization");
                 watched_roots = watchable_roots(&project);
                 watcher_ready_rx = start_project_watcher(shared_watcher.clone(), watched_roots.clone(), watch_tx.clone(), force_watch_limit);
@@ -942,7 +1006,7 @@ async fn run_project_subscription(
                     }
                 }
             }
-            _ = git_poll.tick(), if !debounce_active && git_tasks.is_empty() && !pending_git.requested => {
+            _ = git_poll.tick(), if !subscribers.is_empty() && !debounce_active && git_tasks.is_empty() && !pending_git.requested => {
                 pending_git.request(git_warning.is_some(), git_warning.is_some());
             }
             _ = sleep_until(if pending_git.full {
@@ -1010,10 +1074,10 @@ async fn run_project_subscription(
                 }
                 let result = match completed.result {
                     Ok(refresh) => apply_git_refresh(
-                        &project_id,
                         &mut snapshot,
                         &mut subscribers,
-                        &review_registry,
+                        &mut reviews,
+                        &project,
                         refresh,
                         completed.request.full,
                     ).await,
@@ -1143,17 +1207,17 @@ fn read_git_refresh(
 }
 
 async fn apply_git_refresh(
-    project_id: &ProjectId,
     snapshot: &mut ProjectSnapshotState,
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
-    review_registry: &ReviewRegistryHandle,
+    reviews: &mut ProjectReviews,
+    project: &Project,
     refresh: GitRefresh,
     full: bool,
 ) -> Result<(), String> {
     if full || snapshot.git_status.as_ref() != Some(&refresh.serialized_status) {
         snapshot.git_status = Some(refresh.serialized_status);
         fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &refresh.status).await?;
-        reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &refresh.status).await;
+        reset_reviews_for_clean_unstaged_roots(reviews, project, &refresh.status).await;
     }
     for diff in refresh.diffs {
         if snapshot
@@ -1688,8 +1752,8 @@ fn full_file_list_from_raw(
 }
 
 async fn reset_reviews_for_clean_unstaged_roots(
-    review_registry: &ReviewRegistryHandle,
-    project_id: &ProjectId,
+    reviews: &mut ProjectReviews,
+    project: &Project,
     git_status: &ProjectGitStatusPayload,
 ) {
     let roots = git_status
@@ -1698,18 +1762,8 @@ async fn reset_reviews_for_clean_unstaged_roots(
         .filter(|root| root_unstaged_changes_are_clean(root))
         .map(|root| root.root.clone())
         .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return;
-    }
-    if let Err(error) = review_registry
-        .reset_project_roots_for_clean_unstaged(project_id.clone(), roots)
-        .await
-    {
-        tracing::warn!(
-            project_id = %project_id,
-            error = %error,
-            "failed to reset reviews after clean unstaged git status"
-        );
+    if !roots.is_empty() {
+        reviews.reset_clean_roots(project, &roots).await;
     }
 }
 

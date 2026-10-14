@@ -1,6 +1,10 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+
+use super::session::{SessionStore, SessionStoreHandle};
 
 use protocol::{
     AgentId, ProjectGitDiffPayload, ProjectId, Review, ReviewAiReviewerState, ReviewComment,
@@ -118,30 +122,14 @@ impl LegacyReviewOrigin {
     }
 }
 
-#[derive(Debug)]
-struct ReadStore {
-    records: HashMap<ReviewId, Review>,
-    migrated: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct ReviewStore {
-    path: PathBuf,
+    sessions: Arc<SessionStoreHandle>,
 }
 
 impl ReviewStore {
-    pub fn load(path: PathBuf) -> Result<Self, String> {
-        let loaded = Self::read_store_from_disk(&path)?;
-        let store = Self { path };
-        if loaded.migrated
-            || loaded
-                .records
-                .values()
-                .any(|review| !review.diffs.is_empty())
-        {
-            store.save(&loaded.records)?;
-        }
-        Ok(store)
+    pub(crate) fn new(sessions: Arc<SessionStoreHandle>) -> Self {
+        Self { sessions }
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -151,127 +139,193 @@ impl ReviewStore {
                 return Ok(PathBuf::from(trimmed));
             }
         }
-
         Ok(crate::paths::home_dir()?.join(".tyde").join("reviews.json"))
     }
 
-    pub fn list(&self) -> Result<Vec<Review>, String> {
-        let records = Self::read_from_disk(&self.path)?;
-        let mut out: Vec<_> = records.into_values().collect();
-        out.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-                .then_with(|| left.id.0.cmp(&right.id.0))
-        });
-        Ok(out)
+    pub(crate) async fn list_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Review>, String> {
+        let project_id = project_id.clone();
+        self.sessions
+            .read(move |store| store.reviews_for_project(&project_id))
+            .await
     }
 
-    pub fn get(&self, id: &ReviewId) -> Result<Option<Review>, String> {
-        Ok(Self::read_from_disk(&self.path)?.get(id).cloned())
+    pub(crate) async fn upsert(&self, mut review: Review) -> Result<(), String> {
+        review.diffs.clear();
+        self.sessions
+            .call(move |store| store.upsert_review(review))
+            .await
     }
 
-    pub fn upsert(&self, review: Review) -> Result<(), String> {
-        self.read_modify_write(|records| {
-            records.insert(review.id.clone(), review);
-        })
+    pub(crate) async fn delete_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ReviewId>, String> {
+        let project_id = project_id.clone();
+        self.sessions
+            .call(move |store| store.delete_reviews_for_project(&project_id))
+            .await
     }
+}
 
-    /// Deletes every persisted review referencing `project_id` and returns
-    /// the ids of the removed reviews. Used when a project or workbench is
-    /// deleted so the store does not accumulate orphaned records.
-    pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<ReviewId>, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
-        let removed = records
-            .iter()
-            .filter(|(_, review)| &review.project_id == project_id)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        if removed.is_empty() {
-            return Ok(removed);
-        }
-        for id in &removed {
-            records.remove(id);
-        }
-        self.save(&records)?;
-        Ok(removed)
-    }
-
-    fn read_modify_write<F>(&self, update: F) -> Result<(), String>
-    where
-        F: FnOnce(&mut HashMap<ReviewId, Review>),
-    {
-        let mut records = Self::read_from_disk(&self.path)?;
-        update(&mut records);
-        self.save(&records)
-    }
-
-    fn read_from_disk(path: &Path) -> Result<HashMap<ReviewId, Review>, String> {
-        Ok(Self::read_store_from_disk(path)?.records)
-    }
-
-    fn read_store_from_disk(path: &Path) -> Result<ReadStore, String> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
-                .map(|store| {
-                    let mut migrated = false;
-                    let records = store
-                        .records
-                        .into_iter()
-                        .map(|(id, record)| {
-                            let (review, record_migrated) = record.into_review();
-                            migrated |= record_migrated;
-                            (id, review)
-                        })
-                        .collect();
-                    ReadStore { records, migrated }
-                })
-                .map_err(|err| format!("Failed to parse review store {}: {err}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ReadStore {
-                records: HashMap::new(),
-                migrated: false,
-            }),
-            Err(err) => Err(format!(
-                "Failed to read review store {}: {err}",
-                path.display()
-            )),
-        }
-    }
-
-    fn save(&self, records: &HashMap<ReviewId, Review>) -> Result<(), String> {
-        let mut compact_records = records.clone();
-        for review in compact_records.values_mut() {
-            review.diffs.clear();
-        }
-        let json = serde_json::to_string_pretty(&StoreFile {
-            records: compact_records
-                .into_iter()
-                .map(|(id, review)| (id, StoredReview::Current(review)))
-                .collect(),
-        })
-        .map_err(|err| format!("Failed to serialize review store: {err}"))?;
-
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| format!("Review store path has no parent: {}", self.path.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create review store directory: {err}"))?;
-
-        let tmp_path = self.path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|err| format!("Failed to create temp review store file: {err}"))?;
-        file.write_all(json.as_bytes())
-            .map_err(|err| format!("Failed to write temp review store file: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("Failed to sync temp review store file: {err}"))?;
-        std::fs::rename(&tmp_path, &self.path).map_err(|err| {
-            format!(
-                "Failed to atomically replace review store {}: {err}",
-                self.path.display()
+impl SessionStore {
+    pub(crate) fn initialize_reviews(
+        &self,
+        legacy_path: &Path,
+    ) -> Result<Vec<(ReviewId, ProjectId)>, String> {
+        let mut connection = self
+            .writer
+            .lock()
+            .map_err(|_| "review database writer poisoned")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin review migration: {error}"))?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS reviews (
+                id TEXT PRIMARY KEY NOT NULL,
+                project_id TEXT NOT NULL,
+                record TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS reviews_by_project ON reviews(project_id);
+             CREATE TABLE IF NOT EXISTS review_migrations (name TEXT PRIMARY KEY NOT NULL);",
             )
-        })?;
+            .map_err(|error| format!("initialize review schema: {error}"))?;
+        let imported = transaction
+            .query_row(
+                "SELECT name FROM review_migrations WHERE name = 'reviews_json'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read review migration: {error}"))?
+            .is_some();
+        if !imported {
+            match std::fs::read_to_string(legacy_path) {
+                Ok(contents) => {
+                    let legacy: StoreFile = serde_json::from_str(&contents).map_err(|error| {
+                        format!(
+                            "parse legacy review store {}: {error}",
+                            legacy_path.display()
+                        )
+                    })?;
+                    for (id, stored) in legacy.records {
+                        let (mut review, _) = stored.into_review();
+                        if review.id != id {
+                            return Err("legacy review key does not match its record id".to_owned());
+                        }
+                        review.diffs.clear();
+                        let record = serde_json::to_string(&review)
+                            .map_err(|error| format!("encode migrated review: {error}"))?;
+                        transaction
+                            .execute(
+                                "INSERT INTO reviews(id, project_id, record) VALUES (?1, ?2, ?3)
+                             ON CONFLICT(id) DO NOTHING",
+                                params![review.id.0, review.project_id.0, record],
+                            )
+                            .map_err(|error| format!("import legacy review: {error}"))?;
+                    }
+                    transaction
+                        .execute(
+                            "INSERT INTO review_migrations(name) VALUES ('reviews_json')",
+                            [],
+                        )
+                        .map_err(|error| format!("record review migration: {error}"))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "read legacy review store {}: {error}",
+                        legacy_path.display()
+                    ));
+                }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit review migration: {error}"))?;
+        let mut statement = connection
+            .prepare("SELECT id, project_id FROM reviews")
+            .map_err(|error| format!("read review ownership: {error}"))?;
+        statement
+            .query_map([], |row| {
+                Ok((ReviewId(row.get(0)?), ProjectId(row.get(1)?)))
+            })
+            .map_err(|error| format!("read review ownership: {error}"))?
+            .map(|row| row.map_err(|error| format!("decode review ownership: {error}")))
+            .collect()
+    }
+
+    fn reviews_for_project(&self, project_id: &ProjectId) -> Result<Vec<Review>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare("SELECT record FROM reviews WHERE project_id = ?1")
+            .map_err(|error| format!("query project reviews: {error}"))?;
+        let rows = statement
+            .query_map([&project_id.0], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("read project reviews: {error}"))?;
+        rows.map(|row| {
+            let record = row.map_err(|error| format!("read review record: {error}"))?;
+            let review: Review = serde_json::from_str(&record)
+                .map_err(|error| format!("decode review record: {error}"))?;
+            if &review.project_id != project_id {
+                return Err("review database ownership does not match its record".to_owned());
+            }
+            Ok(review)
+        })
+        .collect()
+    }
+
+    fn upsert_review(&self, review: Review) -> Result<(), String> {
+        let record =
+            serde_json::to_string(&review).map_err(|error| format!("encode review: {error}"))?;
+        let connection = self
+            .writer
+            .lock()
+            .map_err(|_| "review database writer poisoned")?;
+        let changed = connection
+            .execute(
+                "INSERT INTO reviews(id, project_id, record) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET record = excluded.record
+             WHERE reviews.project_id = excluded.project_id",
+                params![review.id.0, review.project_id.0, record],
+            )
+            .map_err(|error| format!("persist review: {error}"))?;
+        if changed != 1 {
+            return Err("cannot change a review's project owner".to_owned());
+        }
         Ok(())
+    }
+
+    fn delete_reviews_for_project(&self, project_id: &ProjectId) -> Result<Vec<ReviewId>, String> {
+        let mut connection = self
+            .writer
+            .lock()
+            .map_err(|_| "review database writer poisoned")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin project review deletion: {error}"))?;
+        let removed = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM reviews WHERE project_id = ?1")
+                .map_err(|error| format!("query deleted reviews: {error}"))?;
+            statement
+                .query_map([&project_id.0], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("read deleted reviews: {error}"))?
+                .map(|row| {
+                    row.map(ReviewId)
+                        .map_err(|error| format!("decode deleted review id: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction
+            .execute("DELETE FROM reviews WHERE project_id = ?1", [&project_id.0])
+            .map_err(|error| format!("delete project reviews: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit project review deletion: {error}"))?;
+        Ok(removed)
     }
 }

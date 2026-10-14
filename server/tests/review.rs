@@ -2659,7 +2659,7 @@ async fn create_review_with_untracked_binary_and_nested_repo_allows_file_comment
 }
 
 #[tokio::test]
-async fn project_review_queries_ignore_an_unrelated_review_awaiting_startup() {
+async fn project_reviews_stay_responsive_during_reviewer_startup() {
     let startup = server::new_spawn_operation_test_gate();
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
         review_ai_spawn_test_gate: Some(startup.shared()),
@@ -2667,10 +2667,16 @@ async fn project_review_queries_ignore_an_unrelated_review_awaiting_startup() {
     })
     .await;
     let reviewer_reservation = fixture
-        .reserve_next_mock_launch(
-            "AI Review",
-            MockScript::one(MockTurn::held_text("Reviewer waits for cancellation")),
-        )
+        .reserve_mock_launches(vec![
+            (
+                "AI Review".to_owned(),
+                MockScript::one(MockTurn::held_text("Reviewer waits for cancellation")),
+            ),
+            (
+                "Review Origin".to_owned(),
+                MockScript::new().with_unbounded_echo(),
+            ),
+        ])
         .await;
     let root = tempfile::tempdir().expect("project isolation repositories");
     let repo_a = root.path().join("project-a");
@@ -2726,8 +2732,94 @@ async fn project_review_queries_ignore_an_unrelated_review_awaiting_startup() {
         .expect("start review in project A");
     startup.wait_until_entered().await;
 
-    // A cannot answer snapshots until startup is released below. These real
-    // protocol operations must finish without ever asking A for a snapshot.
+    let pending_snapshot = subscribe_review(client, &review_a.id).await;
+    assert_eq!(pending_snapshot.project_id, project_a.id);
+    client
+        .review_action(
+            &review_a.id,
+            ReviewActionPayload::AddComment {
+                location: new_line_location(&pending_snapshot),
+                body: "Project A remains editable during startup".to_owned(),
+            },
+        )
+        .await
+        .expect("comment while reviewer startup waits");
+    next_frame_matching_on(client, "project A comment during startup", |env| {
+        env.stream.0 == format!("/review/{}", review_a.id.0)
+            && env.kind == FrameKind::ReviewEvent
+            && matches!(
+                env.parse_payload::<ReviewEventPayload>(),
+                Ok(ReviewEventPayload::CommentUpsert { .. })
+            )
+    })
+    .await;
+    client
+        .review_create(
+            &project_a.id,
+            ReviewCreatePayload {
+                request_id: None,
+                selection: review_a.selection.clone(),
+            },
+        )
+        .await
+        .expect("reuse pending project's review");
+    let reused_a =
+        expect_review_bootstrap(client, "pending project's review remains readable").await;
+    assert_eq!(reused_a.id, review_a.id);
+    assert_eq!(reused_a.comments.len(), 1);
+    client
+        .project_read_file(
+            &project_a.id,
+            protocol::ProjectReadFilePayload {
+                path: protocol::ProjectPath {
+                    root: protocol::ProjectRootPath(repo_a.to_string_lossy().into_owned()),
+                    relative_path: "src/lib.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("read file while startup waits");
+    next_frame_matching_on(client, "project file during review startup", |env| {
+        env.kind == FrameKind::ProjectFileContents
+    })
+    .await;
+    let (origin, _) = spawn_idle_project_agent(client, &project_a).await;
+    client
+        .send_message(
+            &origin.instance_stream,
+            "Continue while the reviewer is starting".to_owned(),
+        )
+        .await
+        .expect("message another agent while reviewer startup waits");
+    fixture::finish_turn_on(client, &origin.instance_stream).await;
+    close_agent_and_wait(client, &origin.instance_stream).await;
+    client
+        .workbench_create(protocol::WorkbenchCreatePayload {
+            parent_project_id: project_a.id.clone(),
+            branch: protocol::GitBranchName("pending-parent".to_owned()),
+            name: "Workbench of pending project".to_owned(),
+        })
+        .await
+        .expect("create workbench from pending project");
+    let child_a = expect_project(client, "pending project's workbench").await;
+    let child_a_bootstrap = expect_project_bootstrap(client, &child_a).await;
+    let child_a_review = subscribe_review(client, &child_a_bootstrap.review_summaries[0].id).await;
+    assert_eq!(child_a_review.project_id, child_a.id);
+    assert!(child_a_review.comments.is_empty());
+    assert_ne!(child_a_review.id, review_a.id);
+    client
+        .workbench_remove(protocol::WorkbenchRemovePayload {
+            id: child_a.id.clone(),
+            force: false,
+        })
+        .await
+        .expect("remove pending project's workbench");
+    next_frame_matching_on(client, "pending project's child removed", |env| {
+        env.kind == FrameKind::ProjectNotify
+            && matches!(env.parse_payload::<ProjectNotifyPayload>(),
+            Ok(ProjectNotifyPayload::Delete { project }) if project.id == child_a.id)
+    })
+    .await;
     client
         .workbench_create(protocol::WorkbenchCreatePayload {
             parent_project_id: project_b.id.clone(),
@@ -2822,19 +2914,130 @@ async fn project_review_queries_ignore_an_unrelated_review_awaiting_startup() {
     let reviewer = reviewer.expect("project A reviewer");
     assert_eq!(reviewer.project_id, Some(project_a.id.clone()));
     close_agent_and_wait(client, &reviewer.instance_stream).await;
+    let completed = subscribe_review(client, &review_a.id).await;
+    assert_eq!(
+        completed.comments.len(),
+        1,
+        "startup completion preserves edits made while it waited"
+    );
     drop(reviewer_reservation);
+    let next_reviewer = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::held_text(
+                "Replacement reviewer waits for cancellation",
+            )),
+        )
+        .await;
+    let client = &mut fixture.client;
+    client
+        .review_action(
+            &review_a.id,
+            ReviewActionPayload::StartAiReview {
+                mode: None,
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .expect("start reviewer that will be cancelled before launch");
+    startup.wait_until_entered().await;
+    client
+        .review_action(&review_a.id, ReviewActionPayload::ClearComments)
+        .await
+        .expect("clear while reviewer startup is pending");
+    next_frame_matching_on(client, "clear cancels pending reviewer", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(),
+            Ok(ReviewEventPayload::Cleared { review }) if review.id == review_a.id && review.comments.is_empty())
+    }).await;
+    startup.release_one();
+    client
+        .review_action(
+            &review_a.id,
+            ReviewActionPayload::StartAiReview {
+                mode: None,
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .expect("start again after cancelling pending reviewer");
+    startup.wait_until_entered().await;
+    startup.release_one();
+    let mut replacement = None;
+    let mut replacement_running = false;
+    next_frame_matching_on(client, "replacement reviewer starts", |env| {
+        match env.kind {
+            FrameKind::NewAgent => {
+                assert!(
+                    replacement.is_none(),
+                    "cancelled startup must not publish an extra reviewer"
+                );
+                replacement = Some(
+                    env.parse_payload::<NewAgentPayload>()
+                        .expect("replacement reviewer"),
+                );
+            }
+            FrameKind::ReviewEvent => {
+                if let ReviewEventPayload::AiReviewerChanged { state } =
+                    env.parse_payload().expect("review event")
+                {
+                    assert_ne!(state.status, ReviewAiReviewerStatus::Failed);
+                    replacement_running |= state.status == ReviewAiReviewerStatus::Running;
+                }
+            }
+            _ => {}
+        }
+        replacement.is_some() && replacement_running
+    })
+    .await;
+    close_agent_and_wait(
+        client,
+        &replacement.expect("replacement reviewer").instance_stream,
+    )
+    .await;
+    drop(next_reviewer);
     fixture.restart_host().await;
 
     let restored_a = subscribe_review(&mut fixture.client, &review_a.id).await;
     let restored_b = subscribe_review(&mut fixture.client, &review_b.id).await;
     assert_eq!(restored_a.project_id, project_a.id);
+    assert!(restored_a.comments.is_empty());
     assert_eq!(restored_b.project_id, project_b.id);
     assert_ne!(restored_a.id, restored_b.id);
+    assert!(
+        !fixture.store_dir().join("reviews.json").exists(),
+        "new reviews use the database"
+    );
+    let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+        &fixture.session_store_path(),
+    ))
+    .expect("open durable review database");
+    let deleted: u32 = database
+        .query_row(
+            "SELECT COUNT(*) FROM reviews WHERE project_id IN (?1, ?2)",
+            rusqlite::params![child_a.id.0, workbench.id.0],
+            |row| row.get(0),
+        )
+        .expect("read deleted project review rows");
+    assert_eq!(
+        deleted, 0,
+        "deleting workbenches deletes their persisted reviews"
+    );
 }
 
 #[tokio::test]
 async fn submitted_review_sends_rendered_markdown_to_origin() {
-    let fixture = Fixture::new().await;
+    let delivery = server::new_spawn_operation_test_gate();
+    let fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        review_delivery_test_gate: Some(delivery.shared()),
+        ..Default::default()
+    })
+    .await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("review-root");
@@ -2888,7 +3091,32 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
         .await
         .expect("submit review");
 
+    delivery.wait_until_entered().await;
+    let pending = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(
+        pending.comments.len(),
+        1,
+        "pending delivery remains readable"
+    );
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::AddComment {
+                location: location.clone(),
+                body: "Feedback written during delivery".to_owned(),
+            },
+        )
+        .await
+        .expect("queue feedback while delivery waits");
+    let still_pending = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(
+        still_pending.comments.len(),
+        1,
+        "queued edits wait until delivery finishes"
+    );
+    delivery.release_one();
     let mut saw_cleared = false;
+    let mut saw_queued_comment = false;
     let mut delivered_message = None;
     next_frame_matching_on(&mut client, "rendered review delivery", |env| {
         match env.kind {
@@ -2897,6 +3125,14 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
                     assert_eq!(cleared.id, review.id);
                     assert!(cleared.comments.is_empty());
                     saw_cleared = true;
+                }
+                ReviewEventPayload::CommentUpsert { comment } => {
+                    assert!(
+                        saw_cleared,
+                        "delivered feedback clears before queued edits are applied"
+                    );
+                    assert_eq!(comment.body, "Feedback written during delivery");
+                    saw_queued_comment = true;
                 }
                 other => panic!("unexpected review event while waiting for delivery: {other:?}"),
             },
@@ -2918,10 +3154,16 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
             }
             _ => {}
         }
-        saw_cleared && delivered_message.is_some()
+        saw_cleared && saw_queued_comment && delivered_message.is_some()
     })
     .await;
 
+    let next_draft = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(next_draft.comments.len(), 1);
+    assert_eq!(
+        next_draft.comments[0].body,
+        "Feedback written during delivery"
+    );
     let delivered_message = delivered_message.expect("review message should be delivered");
     let prompt_start = delivered_message
         .find("The user completed a review with 1 comment.")
@@ -4063,6 +4305,28 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
             other => panic!("unexpected review id {other}"),
         }
     }
+    fs::write(
+        &reviews_path,
+        b"obsolete legacy content is deliberately invalid",
+    )
+    .expect("replace obsolete legacy source");
+    let (mut reopened, sync_host) = fixture.connect_fresh_host_from_sync_thread().await;
+    let durable = subscribe_review(&mut reopened, &protocol::ReviewId(DRAFT_ID.to_owned())).await;
+    assert_eq!(durable.project_id, project.id);
+    assert_eq!(durable.status, ReviewStatus::Draft);
+    let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+        &fixture.session_store_path(),
+    ))
+    .expect("open migrated review database");
+    let migrated: u32 = database
+        .query_row(
+            "SELECT COUNT(*) FROM reviews WHERE id IN (?1, ?2, ?3, ?4)",
+            rusqlite::params![DRAFT_ID, SUBMITTED_ID, CONSUMED_ID, CANCELLED_ID],
+            |row| row.get(0),
+        )
+        .expect("count durable legacy review rows");
+    assert_eq!(migrated, 4);
+    sync_host.hard_stop_for_conformance().await;
 }
 
 #[tokio::test]
