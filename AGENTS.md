@@ -12,6 +12,11 @@ lookups, inferred semantics, or parallel state. If required state is missing,
 fix its server/protocol source. Passing tests does not excuse an architecture
 violation. Check every fix against `dev-docs/01-philosophy.md` before landing.
 
+**No async locks.** Use actor-owned state and typed channels instead of async
+mutexes or read/write locks. Remove existing async locks from changed behavior;
+do not substitute blocking locks in async code. Never hold a lock across
+`.await` or create cyclic actor request/reply dependencies.
+
 `TypingStatusChanged(bool)` is the sole working/idle authority. All
 provider-specific behavior belongs behind `Backend`; never infer lifecycle
 from errors, tool results, or history above it. Reproduce backend contract
