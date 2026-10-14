@@ -2659,6 +2659,180 @@ async fn create_review_with_untracked_binary_and_nested_repo_allows_file_comment
 }
 
 #[tokio::test]
+async fn project_review_queries_ignore_an_unrelated_review_awaiting_startup() {
+    let startup = server::new_spawn_operation_test_gate();
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        review_ai_spawn_test_gate: Some(startup.shared()),
+        ..Default::default()
+    })
+    .await;
+    let reviewer_reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::held_text("Reviewer waits for cancellation")),
+        )
+        .await;
+    let root = tempfile::tempdir().expect("project isolation repositories");
+    let repo_a = root.path().join("project-a");
+    let repo_b = root.path().join("project-b");
+    for repo in [&repo_a, &repo_b] {
+        fs::create_dir_all(repo).expect("create project repository");
+        seed_repo(repo);
+    }
+
+    let client = &mut fixture.client;
+    set_default_backend(client, BackendKind::Claude).await;
+    let project_a = create_project(client, &repo_a).await;
+    let bootstrap_a = expect_project_bootstrap(client, &project_a).await;
+    let review_a = subscribe_review(client, &bootstrap_a.review_summaries[0].id).await;
+    let project_b = create_project(client, &repo_b).await;
+    let bootstrap_b = expect_project_bootstrap(client, &project_b).await;
+    let review_b = subscribe_review(client, &bootstrap_b.review_summaries[0].id).await;
+    client
+        .review_action(
+            &review_b.id,
+            ReviewActionPayload::AddComment {
+                location: new_line_location(&review_b),
+                body: "Only project B owns this comment".to_owned(),
+            },
+        )
+        .await
+        .expect("comment on project B");
+    next_frame_matching_on(client, "project B comment summary", |env| {
+        env.stream.0 == project_stream(&project_b)
+            && env.kind == FrameKind::ProjectEvent
+            && matches!(
+                env.parse_payload::<ProjectEventPayload>(),
+                Ok(ProjectEventPayload::ReviewListChanged { reviews })
+                    if reviews.len() == 1
+                        && reviews[0].id == review_b.id
+                        && reviews[0].user_comment_count == 1
+            )
+    })
+    .await;
+
+    client
+        .review_action(
+            &review_a.id,
+            ReviewActionPayload::StartAiReview {
+                mode: None,
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .expect("start review in project A");
+    startup.wait_until_entered().await;
+
+    // A cannot answer snapshots until startup is released below. These real
+    // protocol operations must finish without ever asking A for a snapshot.
+    client
+        .workbench_create(protocol::WorkbenchCreatePayload {
+            parent_project_id: project_b.id.clone(),
+            branch: protocol::GitBranchName("review-isolation".to_owned()),
+            name: "Independent workbench".to_owned(),
+        })
+        .await
+        .expect("create workbench while unrelated review waits");
+    let workbench = expect_project(client, "independent workbench created").await;
+    let bootstrap = expect_project_bootstrap(client, &workbench).await;
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    let workbench_review_id = &bootstrap.review_summaries[0].id;
+    assert_ne!(workbench_review_id, &review_a.id);
+    assert_ne!(workbench_review_id, &review_b.id);
+    let workbench_review = subscribe_review(client, workbench_review_id).await;
+    assert_eq!(workbench_review.project_id, workbench.id);
+    assert!(workbench_review.comments.is_empty());
+
+    client
+        .review_create(
+            &project_b.id,
+            ReviewCreatePayload {
+                request_id: None,
+                selection: review_b.selection.clone(),
+            },
+        )
+        .await
+        .expect("reuse project B workspace review");
+    let reused = expect_review_bootstrap(client, "project B workspace review reused").await;
+    assert_eq!(reused.id, review_b.id);
+    assert_eq!(reused.project_id, project_b.id);
+    assert_eq!(reused.comments.len(), 1);
+    let root_b = repo_b.to_string_lossy();
+    let root_review = create_review_for_root(client, &project_b, &root_b).await;
+    assert_eq!(root_review.project_id, project_b.id);
+    let reused_root = create_review_for_root(client, &project_b, &root_b).await;
+    assert_eq!(reused_root.id, root_review.id);
+
+    git(&repo_b, &["add", "src/lib.rs"]);
+    next_frame_matching_on(client, "project B review cleared independently", |env| {
+        env.kind == FrameKind::ReviewEvent
+            && matches!(
+                env.parse_payload::<ReviewEventPayload>(),
+                Ok(ReviewEventPayload::Cleared { review })
+                    if review.id == review_b.id && review.comments.is_empty()
+            )
+    })
+    .await;
+    client
+        .workbench_remove(protocol::WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+            force: false,
+        })
+        .await
+        .expect("remove independent workbench");
+    next_frame_matching_on(client, "independent workbench removed", |env| {
+        env.kind == FrameKind::ProjectNotify
+            && matches!(
+                env.parse_payload::<ProjectNotifyPayload>(),
+                Ok(ProjectNotifyPayload::Delete { project }) if project.id == workbench.id
+            )
+    })
+    .await;
+
+    startup.release_one();
+    let mut reviewer = None;
+    let mut running = false;
+    next_frame_matching_on(client, "project A reviewer starts after release", |env| {
+        match env.kind {
+            FrameKind::NewAgent => {
+                reviewer = Some(env.parse_payload::<NewAgentPayload>().expect("reviewer"));
+            }
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
+                ReviewEventPayload::AiReviewerChanged { state } => {
+                    assert_ne!(
+                        state.status,
+                        ReviewAiReviewerStatus::Failed,
+                        "reviewer must start after the gate is released"
+                    );
+                    running |= state.status == ReviewAiReviewerStatus::Running;
+                }
+                ReviewEventPayload::Error { error } => {
+                    panic!("reviewer startup rejected: {}", error.message);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        reviewer.is_some() && running
+    })
+    .await;
+    let reviewer = reviewer.expect("project A reviewer");
+    assert_eq!(reviewer.project_id, Some(project_a.id.clone()));
+    close_agent_and_wait(client, &reviewer.instance_stream).await;
+    drop(reviewer_reservation);
+    fixture.restart_host().await;
+
+    let restored_a = subscribe_review(&mut fixture.client, &review_a.id).await;
+    let restored_b = subscribe_review(&mut fixture.client, &review_b.id).await;
+    assert_eq!(restored_a.project_id, project_a.id);
+    assert_eq!(restored_b.project_id, project_b.id);
+    assert_ne!(restored_a.id, restored_b.id);
+}
+
+#[tokio::test]
 async fn submitted_review_sends_rendered_markdown_to_origin() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;

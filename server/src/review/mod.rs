@@ -265,7 +265,7 @@ impl ReviewRegistry {
         ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
         project_update_tx: mpsc::UnboundedSender<ProjectId>,
     ) -> Result<ReviewRegistryHandle, String> {
-        let mut handles = HashMap::new();
+        let mut project_reviews = HashMap::<ProjectId, HashMap<ReviewId, ReviewHandle>>::new();
         let mut rehydrated = Vec::new();
         for mut review in store.list()? {
             let mut changed = reset_running_ai_reviewer(&mut review);
@@ -281,14 +281,17 @@ impl ReviewRegistry {
                 ai_spawn_tx.clone(),
                 project_update_tx.clone(),
             );
-            handles.insert(review.id.clone(), handle);
+            project_reviews
+                .entry(review.project_id.clone())
+                .or_default()
+                .insert(review.id.clone(), handle);
             rehydrated.push(review.id);
         }
         tracing::info!(review_count = rehydrated.len(), "rehydrated reviews");
 
         let (tx, rx) = mpsc::channel(64);
         let registry = ReviewRegistryActor {
-            handles,
+            project_reviews,
             store,
             project_store,
             delivery_tx,
@@ -506,7 +509,7 @@ impl ReviewRegistryHandle {
 }
 
 struct ReviewRegistryActor {
-    handles: HashMap<ReviewId, ReviewHandle>,
+    project_reviews: HashMap<ProjectId, HashMap<ReviewId, ReviewHandle>>,
     store: ReviewStore,
     project_store: Arc<Mutex<ProjectStore>>,
     delivery_tx: mpsc::Sender<ReviewDeliveryRequest>,
@@ -520,8 +523,7 @@ impl ReviewRegistryActor {
             match command {
                 RegistryCommand::Handle { review_id, reply } => {
                     let _ = reply.send(
-                        self.handles
-                            .get(&review_id)
+                        self.review_handle(&review_id)
                             .cloned()
                             .ok_or_else(|| "Unknown review".to_owned()),
                     );
@@ -532,7 +534,11 @@ impl ReviewRegistryActor {
                     let _ = reply.send(result);
                 }
                 RegistryCommand::UnsubscribeAll { conn } => {
-                    let handles = self.handles.values().cloned().collect::<Vec<_>>();
+                    let handles = self
+                        .project_reviews
+                        .values()
+                        .flat_map(|reviews| reviews.values().cloned())
+                        .collect::<Vec<_>>();
                     for handle in handles {
                         handle.unsubscribe(conn.clone()).await;
                     }
@@ -562,7 +568,7 @@ impl ReviewRegistryActor {
                     suggestion,
                     reply,
                 } => {
-                    let result = match self.handles.get(&review_id) {
+                    let result = match self.review_handle(&review_id) {
                         Some(handle) => handle.ai_suggestion(suggestion).await,
                         None => Err(format!("unknown review {}", review_id)),
                     };
@@ -574,7 +580,7 @@ impl ReviewRegistryActor {
                     at_ms,
                     reply,
                 } => {
-                    let result = match self.handles.get(&review_id) {
+                    let result = match self.review_handle(&review_id) {
                         Some(handle) => handle.bundle_consumed(target_agent_id, at_ms).await,
                         None => Err(format!("unknown review {}", review_id)),
                     };
@@ -586,7 +592,7 @@ impl ReviewRegistryActor {
                     context,
                     reply,
                 } => {
-                    let result = match self.handles.get(&review_id) {
+                    let result = match self.review_handle(&review_id) {
                         Some(handle) => handle.internal_error(message, context).await,
                         None => Err(format!("unknown review {}", review_id)),
                     };
@@ -612,6 +618,20 @@ impl ReviewRegistryActor {
                 }
             }
         }
+    }
+
+    fn review_handle(&self, review_id: &ReviewId) -> Option<&ReviewHandle> {
+        self.project_reviews
+            .values()
+            .find_map(|reviews| reviews.get(review_id))
+    }
+
+    fn handles_for_project(&self, project_id: &ProjectId) -> Vec<ReviewHandle> {
+        self.project_reviews
+            .get(project_id)
+            .into_iter()
+            .flat_map(|reviews| reviews.values().cloned())
+            .collect()
     }
 
     async fn create(&mut self, request: ReviewCreateRequest) -> Result<ReviewId, String> {
@@ -673,7 +693,10 @@ impl ReviewRegistryActor {
             self.ai_spawn_tx.clone(),
             self.project_update_tx.clone(),
         );
-        self.handles.insert(review_id.clone(), handle);
+        self.project_reviews
+            .entry(request.project_id.clone())
+            .or_default()
+            .insert(review_id.clone(), handle);
         let _ = self.project_update_tx.send(request.project_id);
         Ok(review_id)
     }
@@ -682,12 +705,11 @@ impl ReviewRegistryActor {
         &self,
         project_id: &ProjectId,
     ) -> Result<Option<ReviewId>, String> {
-        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let handles = self.handles_for_project(project_id);
         let mut drafts = Vec::new();
         for handle in handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == *project_id
-                && matches!(snapshot.status, ReviewStatus::Draft)
+            if matches!(snapshot.status, ReviewStatus::Draft)
                 && active_review_selection(&snapshot.selection)
             {
                 drafts.push(snapshot);
@@ -702,12 +724,11 @@ impl ReviewRegistryActor {
         project_id: &ProjectId,
         root: &ProjectRootPath,
     ) -> Result<Option<ReviewId>, String> {
-        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let handles = self.handles_for_project(project_id);
         let mut drafts = Vec::new();
         for handle in handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == *project_id
-                && matches!(snapshot.status, ReviewStatus::Draft)
+            if matches!(snapshot.status, ReviewStatus::Draft)
                 && active_review_root(&snapshot).as_ref() == Some(root)
             {
                 drafts.push(snapshot);
@@ -725,8 +746,7 @@ impl ReviewRegistryActor {
         include_diffs: bool,
     ) -> Result<(), String> {
         let handle = self
-            .handles
-            .get(&review_id)
+            .review_handle(&review_id)
             .ok_or_else(|| format!("unknown review {}", review_id))?;
         handle.subscribe(conn, stream, include_diffs).await
     }
@@ -739,8 +759,7 @@ impl ReviewRegistryActor {
         _stream: Stream,
     ) -> Result<(), String> {
         let handle = self
-            .handles
-            .get(&review_id)
+            .review_handle(&review_id)
             .cloned()
             .ok_or_else(|| format!("unknown review {}", review_id))?;
         handle.action(action, conn).await
@@ -750,12 +769,11 @@ impl ReviewRegistryActor {
         let project = self.load_project(&project_id).await?;
         self.ensure_active_review_for_project(&project).await?;
 
-        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let handles = self.handles_for_project(&project_id);
         let mut drafts = Vec::new();
         for handle in &handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == project_id
-                && matches!(snapshot.status, ReviewStatus::Draft)
+            if matches!(snapshot.status, ReviewStatus::Draft)
                 && active_review_selection(&snapshot.selection)
             {
                 drafts.push(snapshot);
@@ -782,11 +800,10 @@ impl ReviewRegistryActor {
         if !all_roots_clean {
             return Ok(());
         }
-        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let handles = self.handles_for_project(&project_id);
         for handle in handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == project_id
-                && matches!(snapshot.status, ReviewStatus::Draft)
+            if matches!(snapshot.status, ReviewStatus::Draft)
                 && active_review_selection(&snapshot.selection)
             {
                 handle.reset_for_clean_working_tree().await?;
@@ -797,9 +814,7 @@ impl ReviewRegistryActor {
 
     fn delete_for_project(&mut self, project_id: &ProjectId) -> Result<Vec<ReviewId>, String> {
         let removed = self.store.delete_for_project(project_id)?;
-        for review_id in &removed {
-            self.handles.remove(review_id);
-        }
+        self.project_reviews.remove(project_id);
         Ok(removed)
     }
 

@@ -415,6 +415,9 @@ pub struct HostRuntimeConfig {
     /// can assert on what the pass did without waiting a fixed time for it.
     #[cfg(feature = "test-support")]
     pub restoration_complete_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    /// Parks reviewer startup while its review actor awaits the spawn reply.
+    #[cfg(feature = "test-support")]
+    pub review_ai_spawn_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     /// Overrides how long a restored agent may take to start once activated
     /// before its startup fails and releases its parent.
     #[cfg(feature = "test-support")]
@@ -462,6 +465,8 @@ impl Default for HostRuntimeConfig {
             restoration_snapshot_test_gate: None,
             #[cfg(feature = "test-support")]
             restoration_complete_test_gate: None,
+            #[cfg(feature = "test-support")]
+            review_ai_spawn_test_gate: None,
             #[cfg(feature = "test-support")]
             restored_agent_startup_timeout: None,
             #[cfg(feature = "test-support")]
@@ -1721,9 +1726,7 @@ impl InstalledSpawnOperationTestGate {
         self.inner.panic_on_release.store(true, Ordering::SeqCst);
     }
 
-    /// The gate itself, for the one hook that has to be in place before the
-    /// host exists: restoration starts during host construction, so its gate
-    /// arrives through `HostRuntimeConfig` rather than being installed after.
+    /// Share a gate supplied through `HostRuntimeConfig` before host startup.
     pub fn shared(&self) -> Arc<SpawnOperationTestGateInner> {
         Arc::clone(&self.inner)
     }
@@ -16411,7 +16414,12 @@ fn spawn_host_inner(
     swarms::spawn_swarm_dispatch_task(host.clone(), swarm_dispatch_rx);
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
     spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
-    spawn_host_review_ai_task(host.clone(), review_ai_spawn_rx);
+    spawn_host_review_ai_task(
+        host.clone(),
+        review_ai_spawn_rx,
+        #[cfg(feature = "test-support")]
+        runtime_config.review_ai_spawn_test_gate,
+    );
     spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
     spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
@@ -18172,9 +18180,17 @@ fn spawn_host_review_delivery_task(
         .expect("failed to spawn review delivery worker thread");
 }
 
-fn spawn_host_review_ai_task(host: HostHandle, mut rx: mpsc::Receiver<ReviewAiSpawnRequest>) {
+fn spawn_host_review_ai_task(
+    host: HostHandle,
+    mut rx: mpsc::Receiver<ReviewAiSpawnRequest>,
+    #[cfg(feature = "test-support")] gate: Option<Arc<SpawnOperationTestGateInner>>,
+) {
     let worker = async move {
         while let Some(request) = rx.recv().await {
+            #[cfg(feature = "test-support")]
+            if let Some(gate) = &gate {
+                wait_for_spawn_operation_test_gate_inner(gate).await;
+            }
             let result = host.spawn_ai_reviewers(&request).await;
             let _ = request.reply.send(result);
         }
