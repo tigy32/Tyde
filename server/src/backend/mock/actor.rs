@@ -19,9 +19,11 @@ use super::script::{MockPendingTool, MockScript, MockStep, MockTurn, MockTurnFin
 
 pub(super) struct MockLoopConfig {
     pub(super) initial_message: Option<String>,
+    pub(super) initial_origin: Option<protocol::MessageOrigin>,
     pub(super) user_bubbles_from_history: bool,
     pub(super) agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
     pub(super) tychat_mcp: Option<MockAgentControlAwaitMcp>,
+    pub(super) config_mcp: Option<MockAgentControlAwaitMcp>,
     pub(super) launch_script: MockScript,
 }
 
@@ -36,9 +38,11 @@ pub(super) fn start_mock_command_loop(
 ) {
     let MockLoopConfig {
         initial_message,
+        initial_origin,
         user_bubbles_from_history,
         agent_control_await_mcp,
         tychat_mcp,
+        config_mcp,
         launch_script,
     } = config;
     let script = VecDeque::from(launch_script.turns);
@@ -52,9 +56,11 @@ pub(super) fn start_mock_command_loop(
         subagent_emitter,
         agent_control_await_mcp,
         tychat_mcp,
+        config_mcp,
         active_subagents: Vec::new(),
         workspace_relocation_results: VecDeque::new(),
         initial_message,
+        initial_origin,
         script,
         unbounded_echo,
         user_bubbles,
@@ -115,9 +121,11 @@ struct MockActor {
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
     tychat_mcp: Option<MockAgentControlAwaitMcp>,
+    config_mcp: Option<MockAgentControlAwaitMcp>,
     active_subagents: Vec<SubAgentHandle>,
     workspace_relocation_results: VecDeque<Result<(), crate::backend::WorkspaceRelocationError>>,
     initial_message: Option<String>,
+    initial_origin: Option<protocol::MessageOrigin>,
     script: VecDeque<MockTurn>,
     unbounded_echo: bool,
     user_bubbles: bool,
@@ -181,7 +189,8 @@ impl MockActor {
                 message: initial_message.clone(),
             });
             let compact = initial_message.trim() == "/compact";
-            if self.user_bubbles && !compact && !self.emit_user_bubble(&initial_message, None) {
+            let origin = self.initial_origin.take();
+            if self.user_bubbles && !compact && !self.emit_user_bubble(&initial_message, origin) {
                 return;
             }
             let turn = if compact {
@@ -625,6 +634,9 @@ impl MockActor {
                     step,
                 )
                 .await
+            }
+            MockStep::TydePermissions => {
+                emit::tyde_permissions(&self.events_tx, self.config_mcp.as_ref()).await
             }
             MockStep::TychatSend(text) => {
                 emit::tychat_send(self.tychat_mcp.as_ref(), text).await;

@@ -1268,7 +1268,7 @@ impl KiroInner {
                     }
                 }
                 if origin != Some(protocol::MessageOrigin::HostRestart) {
-                    self.emit_user_message_added(&message, images.as_deref());
+                    self.emit_user_message_added(&message, images.as_deref(), origin);
                 }
                 self.emitter.typing_status_changed(true);
 
@@ -4642,7 +4642,12 @@ impl KiroInner {
         }
     }
 
-    fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
+    fn emit_user_message_added(
+        &self,
+        content: &str,
+        images: Option<&[ImageAttachment]>,
+        origin: Option<protocol::MessageOrigin>,
+    ) {
         let image_payload = images.map(|images| {
             images
                 .iter()
@@ -4652,7 +4657,7 @@ impl KiroInner {
                 })
                 .collect::<Vec<_>>()
         });
-        self.emitter.user_message(content, image_payload, None);
+        self.emitter.user_message(content, image_payload, origin);
     }
 }
 
@@ -6854,6 +6859,7 @@ impl Backend for KiroBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
+        let initial_origin = initial_input.origin;
         let initial_message = initial_input.message;
         let initial_images = protocol_images_to_attachments(initial_input.images);
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
@@ -6936,7 +6942,7 @@ impl Backend for KiroBackend {
             crate::backend::subprocess::spawn(async move {
                 if let Err(err) = initial_handle
                     .execute(SessionCommand::SendMessage {
-                        origin: None,
+                        origin: initial_origin,
                         message: initial_message,
                         images: initial_images,
                     })

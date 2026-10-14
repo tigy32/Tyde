@@ -2194,6 +2194,7 @@ mod wasm_tests {
 
     fn gate_test_agent(started: bool) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: "local".to_owned(),
             agent_id: AgentId("voice-agent".to_owned()),
             name: "Voice agent".to_owned(),

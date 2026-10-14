@@ -696,11 +696,19 @@ pub async fn spawn_agent_at_roots<B: Backend>(
     roots: Vec<String>,
     prompt: &str,
 ) -> Agent {
+    spawn_agent_with_payload(host, roots, user_message(prompt)).await
+}
+
+pub async fn spawn_agent_with_payload<B: Backend>(
+    host: &mut Harness<B>,
+    roots: Vec<String>,
+    input: SendMessagePayload,
+) -> Agent {
     assert!(
         host.backend.is_none(),
         "close the previous session before spawning"
     );
-    let (backend, events) = B::spawn(roots, host.config.clone(), user_message(prompt))
+    let (backend, events) = B::spawn(roots, host.config.clone(), input)
         .await
         .expect("spawn through Backend trait");
     let session_id = backend.session_id();

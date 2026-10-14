@@ -65,6 +65,14 @@ async fn pair(fixture: &mut Fixture) -> (TychatPairingId, TestAgent) {
         },
     )
     .await;
+    assert_eq!(new_agent.tyde_permissions, AgentTydePermissions::Root);
+    assert_eq!(
+        start
+            .parse_payload::<AgentStartPayload>()
+            .unwrap()
+            .tyde_permissions,
+        AgentTydePermissions::Root
+    );
     let agent = TestAgent {
         stream: start.stream,
         new_agent,
@@ -180,6 +188,40 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
     assert_eq!(
         server::backend::mock::session_startup_mcp_servers(&original).unwrap(),
         operator_tools
+    );
+
+    let caller = fixture
+        .agent_control_caller(&agent.new_agent.agent_id)
+        .await;
+    let response = reqwest::Client::new()
+        .post(fixture.config_mcp_http_url().await)
+        .header("Authorization", caller.authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .json(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"tyde_config_get_permissions","arguments":{}}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("MCP response data"),
+    )
+    .unwrap();
+    let guide: serde_json::Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(guide["tyde_permissions"], "root");
+    assert!(
+        guide["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("any Tyde control")
     );
 
     let invalid = fixture
@@ -434,13 +476,41 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         fresh != vec![original.clone()],
         "reset creates a fresh backend session"
     );
+    // All controlled agents now have config MCP, so tool presence cannot
+    // identify the selected preset. Assert the typed selection and the actual
+    // startup instructions echoed through a subsequent protocol-visible turn.
+    let (mut reset_client, reset_snapshot) = fixture.connect_with_bootstrap().await;
+    let reset_agent = &reset_snapshot.agents[0];
+    assert_eq!(
+        reset_agent.custom_agent_id,
+        Some(CustomAgentId("tyde-default".to_owned())),
+        "reset preserves the explicit staged agent selection"
+    );
+    assert_eq!(reset_agent.tyde_permissions, AgentTydePermissions::Root);
+    fixture::next_frame_matching_on(&mut reset_client, "reset agent attached", |env| {
+        env.stream == reset_agent.instance_stream && env.kind == FrameKind::AgentBootstrap
+    })
+    .await;
+    reset_client
+        .send_message(
+            &reset_agent.instance_stream,
+            "Inspect reset startup".to_owned(),
+        )
+        .await
+        .unwrap();
+    let turn = fixture::finish_turn_on(&mut reset_client, &reset_agent.instance_stream).await;
+    let reply = turn
+        .chat_events()
+        .into_iter()
+        .find_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .expect("reset startup reply");
+    assert!(reply.contains("[startup_mcp_servers:"));
     assert!(
-        !server::backend::mock::session_startup_mcp_servers(&fresh[0])
-            .unwrap()
-            .contains(&"tyde-config(http)".to_owned())
-            && !server::backend::mock::session_instructions(&fresh[0])
-                .is_some_and(|instructions| instructions.contains("top-level coordinator")),
-        "reset starts the staged custom agent instead of the Operator"
+        !reply.contains("[instructions:"),
+        "Default must not retain the Operator's custom instructions"
     );
     fixture
         .client

@@ -411,11 +411,20 @@ other than the caller itself, including other top-level agents. Unknown targets
 and self-targets are rejected. Close and debug-read never take `global`; they
 stay child- or report-scoped.
 
-Global scope belongs only to top-level agents (no `parent_agent_id`). A
-sub-agent may spawn, message, await, read, list, and close only its own
-children, and it reports to its parent solely by finishing its turn. Its
-`tools/list` omits every `global` property, and any `global: true` call from it,
-including spawn and workbench listing, is rejected with an authorization error.
+Ordinary child agents retain the existing child-scoped MCP surface: their
+`tools/list` omits `global`, and global calls are rejected. Explicitly assigning
+Orchestrator or Root enables global tools even when the caller has a parent.
+Parentless agents, including human-created and agent-created roots, default
+to Agent role guidance: control own children, do not send unsolicited updates
+to peers or parents, and report results by completing the turn. Being a root
+in the hierarchy is not the Root permission role.
+
+Tyde permissions are advisory behavior, not a security boundary. The
+configuration MCP reports the current human-assigned role and supplies its
+guidance. Orchestrator may add steering, agent presets, and review aspects;
+only Root guidance permits editing/removing existing configuration or changing
+other Tyde controls. API access outside this surface can bypass the guidance.
+New agents never inherit an Orchestrator or Root role from their parent.
 
 #### `tyde_read_agent`
 

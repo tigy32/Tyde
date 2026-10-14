@@ -658,6 +658,7 @@ pub(crate) enum InitialAgentAliasPersistence {
 }
 
 pub(crate) struct ResolvedSpawnRequest {
+    pub tyde_permissions: protocol::AgentTydePermissions,
     pub restoration: Option<Arc<RestorationAdmission>>,
     pub name: String,
     pub origin: AgentOrigin,
@@ -723,6 +724,7 @@ impl AgentStartupFailure {
 
 pub(crate) struct RelaySpawnRequest {
     pub name: String,
+    pub input_origin: protocol::MessageOrigin,
     pub origin: AgentOrigin,
     pub custom_agent_id: Option<CustomAgentId>,
     pub parent_agent_id: AgentId,
@@ -782,6 +784,7 @@ impl AgentRegistry {
                 AGENT_CONTROL_MCP_SERVER_NAME
                     | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
                     | TYCHAT_MCP_SERVER_NAME
+                    | "tyde-config"
                     | REVIEW_FEEDBACK_MCP_SERVER_NAME
                     | WORKFLOW_PROGRESS_MCP_SERVER_NAME
             ) {
@@ -795,6 +798,7 @@ impl AgentRegistry {
                 AGENT_CONTROL_MCP_SERVER_NAME
                     | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
                     | TYCHAT_MCP_SERVER_NAME
+                    | "tyde-config"
             ) {
                 headers.insert(
                     axum::http::header::AUTHORIZATION.as_str().to_owned(),
@@ -808,6 +812,7 @@ impl AgentRegistry {
             }
         }
         let start = AgentStartPayload {
+            tyde_permissions: request.tyde_permissions,
             swarm_membership: request.resolved_spawn_config.swarm_membership.clone(),
             agent_id: agent_id.clone(),
             name: request.name.clone(),
@@ -865,6 +870,7 @@ impl AgentRegistry {
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         let start = AgentStartPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: agent_id.clone(),
             name: request.name.clone(),
@@ -886,6 +892,7 @@ impl AgentRegistry {
         let handle = spawn_relay_agent_actor(
             agent_id.clone(),
             start.clone(),
+            request.input_origin,
             receivers,
             runtime,
             request.session_id,

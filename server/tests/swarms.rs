@@ -10438,7 +10438,8 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
     assert!(scenario.pending.iter().any(|envelope|
         envelope.kind == FrameKind::ChatEvent && envelope.stream == ordinary.instance_stream
             && matches!(envelope.parse_payload::<protocol::ChatEvent>().expect("parse visible ordinary supervision"),
-                protocol::ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::User)
+                protocol::ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::System)
+                    && message.origin == Some(protocol::MessageOrigin::Supervisor)
                     && message.content.starts_with(protocol::SUPERVISOR_MESSAGE_PREFIX))),
         "the ordinary supervised continuation must also be visible over the real protocol");
     assert_eq!(

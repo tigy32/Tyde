@@ -1717,6 +1717,7 @@ mod wasm_tests {
         crate::dispatch::prime_host_for_tests(&state, host_id);
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: AgentId(agent_id.to_owned()),
                 name: "Root".to_owned(),
@@ -2712,6 +2713,7 @@ mod wasm_tests {
         // An unrelated agent spawning on the same host notifies the vec too.
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: "h-task-churn".to_owned(),
                 agent_id: AgentId("bystander".to_owned()),
                 name: "Bystander".to_owned(),

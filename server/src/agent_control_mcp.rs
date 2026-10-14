@@ -55,6 +55,22 @@ use crate::team_registry::team_preset_catalog;
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
 pub const AGENT_CONTROL_MCP_SERVER_NAME: &str = "tyde-agent-control";
 pub const AGENT_CONTROL_AWAIT_MCP_SERVER_NAME: &str = "tyde-agent-await";
+pub(crate) fn tyde_permissions_guidance(role: protocol::AgentTydePermissions) -> &'static str {
+    match role {
+        protocol::AgentTydePermissions::Agent => {
+            "Tyde permissions: Agent. Control only your own sub-agents. Assigned team reports count as owned sub-agents. Do not message or interrupt peers or parents, coordinate their builds or commits, or change Tyde configuration. Report results by finishing your turn; your parent reads or awaits them. Human-created does not mean Orchestrator. Do not promote yourself or another agent unless the human explicitly asks."
+        }
+        protocol::AgentTydePermissions::Orchestrator => {
+            "Tyde permissions: Tyde Orchestrator. You may control any agent on this Tyde host, and add new steering, agent presets, or review aspects for self-improvement. Never edit or remove existing steering, presets, aspects, or other Tyde settings, including remote access, authentication, or host pairing. Do not promote yourself or another agent unless the human explicitly asks. New children default to Agent."
+        }
+        protocol::AgentTydePermissions::Root => {
+            "Tyde permissions: Root. You may use any Tyde control, including editing and removing steering, review aspects, agent presets, and other configuration, to carry out the human's request. Read current state before changing it and report what changed. New children default to Agent; do not change their role unless the human explicitly asks."
+        }
+    }
+}
+
+pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.";
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 const AWAIT_TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -146,6 +162,13 @@ impl AgentControlCredentialAuthority {
 }
 
 impl AgentControlMcpHandle {
+    pub(crate) fn authenticate(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<AgentId>, String> {
+        authenticated_caller_from_parts(&self.credentials, parts)
+    }
+
     pub(crate) fn disabled() -> Self {
         Self {
             url: String::new(),
@@ -652,6 +675,7 @@ pub(crate) struct AgentOverview {
     name: String,
     backend_kind: BackendKind,
     origin: AgentOrigin,
+    tyde_permissions: protocol::AgentTydePermissions,
     status: AgentControlStatus,
     workspace_roots: Vec<String>,
     parent_agent_id: Option<String>,
@@ -911,20 +935,24 @@ async fn authorize_direct_children(
     Ok(())
 }
 
-/// Global scope lets an agent reach peers and its own ancestors. A sub-agent
-/// reports to its parent only by finishing its turn, so only parentless
-/// agents may opt in.
 async fn require_top_level_caller(host: &HostHandle, caller: &AgentId) -> Result<(), String> {
-    if caller_is_subagent(host, caller).await {
-        return Err("authorization: global=true is only available to top-level agents; a sub-agent may manage only its own children and reports to its parent by finishing its turn".to_owned());
+    if caller_is_subagent(host, caller).await? {
+        return Err("authorization: global=true is only available to top-level agents; ordinary sub-agents manage only their own children; explicitly assigned Orchestrator or Root roles can use global tools".to_owned());
     }
     Ok(())
 }
 
-async fn caller_is_subagent(host: &HostHandle, caller: &AgentId) -> bool {
-    host.agent_handle(caller)
+async fn caller_is_subagent(host: &HostHandle, caller: &AgentId) -> Result<bool, String> {
+    let handle = host
+        .agent_handle(caller)
         .await
-        .is_some_and(|handle| handle.snapshot().parent_agent_id.is_some())
+        .ok_or_else(|| "authorization: caller is no longer live".to_owned())?;
+    let start = handle.snapshot();
+    let restricted = start.parent_agent_id.is_some()
+        && start.tyde_permissions == protocol::AgentTydePermissions::Agent;
+    tracing::debug!(origin = ?start.origin, has_parent = start.parent_agent_id.is_some(), restricted,
+        "Evaluating global agent-control authority");
+    Ok(restricted)
 }
 
 async fn authorize_global_targets(
@@ -1200,6 +1228,10 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
+        let message_origin = match self.host.agent_message_origin(&caller).await {
+            Ok(origin) => origin,
+            Err(error) => return Ok(err_text(error)),
+        };
         let global = input.global;
         let request = SpawnRequestInput::from(input);
         let result = if global {
@@ -1211,9 +1243,9 @@ impl TydeAgentControlMcpServer {
                     "parent_agent_id cannot be combined with global=true",
                 ));
             }
-            do_spawn_agent(&self.host, request, None).await
+            do_spawn_agent(&self.host, request, None, message_origin).await
         } else {
-            do_spawn_agent(&self.host, request, Some(caller)).await
+            do_spawn_agent(&self.host, request, Some(caller), message_origin).await
         };
         match result {
             Ok(result) => ok_json(result),
@@ -1514,7 +1546,19 @@ impl TydeAgentControlMcpServer {
             }
             released.await;
         }
-        match do_send_message(&self.host, &agent_id, input.message, input.interrupt).await {
+        let origin = match self.host.agent_message_origin(&request_agent_id).await {
+            Ok(origin) => origin,
+            Err(error) => return Ok(err_text(error)),
+        };
+        match do_send_message(
+            &self.host,
+            &agent_id,
+            input.message,
+            input.interrupt,
+            origin,
+        )
+        .await
+        {
             Ok(()) => ok_json(json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
@@ -1960,7 +2004,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition, which closes them in the user's review, and request another round after fixes. Review configuration is managed by the user or the Tyde Operator, not by coding agents."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition, which closes them in the user's review, and request another round after fixes. Read your current Tyde permissions with tyde_config_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
             }
             AgentControlMcpSurface::Await => {
                 "Long-running tools for awaiting direct child agents and requested review rounds. tyde_await_review waits for all reviewers in the specified round; use tyde_get_review on the control server to read findings."
@@ -1991,7 +2035,9 @@ impl ServerHandler for TydeAgentControlMcpServer {
                             .is_swarm_agent(&caller)
                             .await
                             .map_err(|error| McpError::internal_error(error.message, None))?,
-                        caller_is_subagent(&self.host, &caller).await,
+                        caller_is_subagent(&self.host, &caller)
+                            .await
+                            .map_err(|error| McpError::internal_error(error, None))?,
                     ),
                     Ok(None) => (false, false),
                     Err(error) => return Err(McpError::invalid_params(error, None)),
@@ -2329,6 +2375,7 @@ pub(crate) async fn do_spawn_agent(
     host: &HostHandle,
     mut input: SpawnRequestInput,
     request_agent_id: Option<AgentId>,
+    message_origin: protocol::MessageOrigin,
 ) -> Result<SpawnAgentResult, String> {
     if input.workspace_roots.iter().any(|r| r.trim().is_empty()) {
         return Err("workspace_roots must not contain empty values".to_string());
@@ -2454,7 +2501,7 @@ pub(crate) async fn do_spawn_agent(
     };
 
     let agent_id = host
-        .spawn_agent_from_agent_control(payload, caller_agent_id.as_ref())
+        .spawn_agent_from_agent_control(payload, caller_agent_id.as_ref(), message_origin)
         .await?;
     let agent_status = host
         .agent_status_snapshot(&agent_id)
@@ -2765,6 +2812,7 @@ pub(crate) async fn do_send_message(
     agent_id: &AgentId,
     message: String,
     interrupt: bool,
+    origin: protocol::MessageOrigin,
 ) -> Result<(), String> {
     let handle = host
         .agent_handle(agent_id)
@@ -2774,7 +2822,7 @@ pub(crate) async fn do_send_message(
     let payload = SendMessagePayload {
         message,
         images: None,
-        origin: Some(protocol::MessageOrigin::AgentControl),
+        origin: Some(origin),
         tool_response: None,
     };
     if interrupt {
@@ -2965,6 +3013,7 @@ pub(crate) async fn do_list_agents(
             name: start.name,
             backend_kind: start.backend_kind,
             origin: start.origin,
+            tyde_permissions: start.tyde_permissions,
             status: status.status(),
             workspace_roots: start.workspace_roots,
             parent_agent_id: start.parent_agent_id.map(|id| id.0),

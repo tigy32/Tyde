@@ -22427,7 +22427,7 @@ impl CodexBackend {
                 crate::backend::subprocess::spawn(async move {
                     let result = initial_turn_handle
                         .execute(SessionCommand::SendMessage {
-                            origin: None,
+                            origin: initial_input.origin,
                             message: initial_input.message,
                             images,
                         })

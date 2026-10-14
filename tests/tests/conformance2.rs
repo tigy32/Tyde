@@ -173,7 +173,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group"
+                    "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -3235,6 +3235,67 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+async fn real_input_origins<B: Backend>(host: &mut Harness<B>) {
+    let origin = protocol::MessageOrigin::Agent {
+        agent_id: Some(AgentId("conformance-parent".to_owned())),
+        name: "Delegating agent".to_owned(),
+    };
+    let prompt = "Do not use tools. Reply exactly ORIGIN_READY.";
+    let mut input = user_message(prompt);
+    input.origin = Some(origin.clone());
+    let agent = spawn_agent_with_payload(host, host.workspace_roots(), input).await;
+    let initial = collect_turn(host, &agent, prompt).await;
+    assert_final_text_contains(&initial, "ORIGIN_READY");
+    let messages = initial.user_messages().collect::<Vec<_>>();
+    assert_eq!(
+        messages.len(),
+        1,
+        "Initial input must have one canonical message"
+    );
+    assert!(
+        messages[0].content == prompt && messages[0].origin == Some(origin),
+        "Spawn must preserve exact input and authenticated agent origin"
+    );
+
+    let prompt = "Do not use tools. Reply exactly SYSTEM_READY.";
+    let mut input = user_message(prompt);
+    input.origin = Some(protocol::MessageOrigin::System);
+    assert!(
+        matches!(
+            try_deliver_message(host, &agent, input, false).await,
+            server::backend::SendOutcome::Accepted
+        ),
+        "System input must be accepted"
+    );
+    let system = collect_turn(host, &agent, prompt).await;
+    assert_final_text_contains(&system, "SYSTEM_READY");
+    let messages = system.user_messages().collect::<Vec<_>>();
+    assert_eq!(
+        messages.len(),
+        1,
+        "System follow-up must have one canonical message"
+    );
+    assert!(
+        messages[0].content == prompt
+            && messages[0].origin == Some(protocol::MessageOrigin::System),
+        "Follow-up must preserve exact input and system origin"
+    );
+    let human = ask(host, &agent, "Do not use tools. Reply exactly HUMAN_READY.").await;
+    assert_final_text_contains(&human, "HUMAN_READY");
+    let messages = human.user_messages().collect::<Vec<_>>();
+    assert_eq!(
+        messages.len(),
+        1,
+        "Human follow-up must have one canonical message"
+    );
+    assert!(
+        messages[0].origin.is_none(),
+        "Actual human input must remain untagged"
+    );
+    assert_universal_contract(&[initial, system, human]);
+    assert_clean_close(host, &agent).await;
+}
+
 const STEER_PROOF_FILE: &str = "steer_proof.txt";
 const STEER_IDLE_SETTLE: Duration = Duration::from_secs(5);
 
@@ -5903,6 +5964,7 @@ conformance2_scenario!(
     [BackendCapability::YieldsRunningCommands]
 );
 conformance2_scenario!(real_mid_turn_steering, [BackendCapability::MidTurnSteering]);
+conformance2_scenario!(real_input_origins, []);
 conformance2_scenario!(
     real_interrupt_after_background_response,
     [

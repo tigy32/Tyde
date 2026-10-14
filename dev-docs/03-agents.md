@@ -1524,3 +1524,46 @@ implementation. Hard termination (`CloseAgent` / `shutdown`) is separate.
 
 Already handled — `ChatEvent::StreamReasoningDelta` is part of the carried-
 forward `ChatEvent` enum.
+
+
+## Message provenance and Tyde permissions
+
+The server projects input provenance into `MessageSender` before publishing
+or saving a chat event. Human input remains `User`; delegated messages carry
+`MessageOrigin::Agent` with the sender's identity and render as
+`MessageSender::Agent`. Tyde-owned notices, including workbench entry and
+restart continuations, render as `System`. Replay preserves the same typed
+classification; the UI never classifies messages by their text.
+
+`SetAgentTydePermissions` selects `Agent`, `Orchestrator`, or `Root`. The actor
+persists the role with the session and emits `AgentTydePermissionsChanged`;
+`AgentStart` and `NewAgent` carry current state for eager and lazy clients.
+The header offers an icon-only, monochrome menu titled **Tyde permissions**.
+The sidebar renders the same role icon without policy prose or badges.
+
+- **Agent:** control own sub-agents, not peers or parents. Finish the task so
+  the parent can read or await results instead of unsolicited status updates.
+- **Tyde Orchestrator:** control any agent and add new steering, agent presets,
+  or review aspects for self-improvement. Never edit or remove existing
+  configuration, or change remote access, authentication, or host pairing.
+- **Root:** use every Tyde control, including editing and removing existing
+  configuration, when carrying out the human's request.
+
+New agents default to Agent, including human-created roots, agent-created
+parentless roots, and children of Root. Selecting the built-in Tyde Operator
+as a new human chat explicitly starts Root. Saved roles survive resume.
+Role assignment is separate from creation provenance and parent ownership.
+The MCP configuration surface reports the current role from the server and
+returns its guidance with tool results. Injected startup MCP credentials bind
+those reports and message attribution to the actual caller, not a supplied
+sender name. The external Operator controller retains its existing authority.
+
+These are **soft behavioral roles**, not an OS security sandbox. Existing
+lifecycle, credential, swarm, and child-scope contracts still apply; an
+explicit Orchestrator or Root may use global agent-control from a child.
+Roles do not block incoming messages, prune queues, disable supervision, or
+cancel running work. Changing a role does not inject a chat message, steer a
+turn, write a steering entry, or modify AGENTS.md. The model reads current
+role guidance through MCP before taking Tyde actions; API access outside this
+surface can bypass an advisory role. The earlier human-only lock prototype
+was replaced by this design, not retained as an additional security control.

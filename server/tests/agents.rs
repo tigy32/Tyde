@@ -1210,6 +1210,7 @@ async fn expect_native_child_prompt_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
     expected_prompt: &str,
+    parent: &NewAgentPayload,
 ) {
     let env = expect_chat_event_on_stream(client, stream, "native child prompt").await;
     let event: ChatEvent = env.parse_payload().expect("parse native child prompt");
@@ -1217,10 +1218,11 @@ async fn expect_native_child_prompt_on_stream(
         matches!(
             event,
             ChatEvent::MessageAdded(ref message)
-                if matches!(message.sender, MessageSender::User)
+                if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
+                    && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &parent.agent_id)
                     && message.content == expected_prompt
         ),
-        "expected native child prompt {expected_prompt:?} on {stream}, got {event:?}"
+        "native child input must preserve the task and identify its parent, never the human"
     );
 }
 
@@ -1911,6 +1913,7 @@ async fn spawn_parent_with_native_child(
         &mut fixture.client,
         &child_new.instance_stream,
         "parent prompt",
+        &parent_new,
     )
     .await;
     expect_turn_on_stream(
@@ -2130,6 +2133,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         &mut fixture.client,
         &child_new.instance_stream,
         "parent prompt",
+        &parent_new,
     )
     .await;
     let child_end = expect_completed_turn_on_stream(
@@ -4591,10 +4595,102 @@ async fn agent_control_spawns_children_by_custom_agent_type() {
         .expect("spawn typed parent failed");
     let env = expect_next_event(&mut fixture.client, "typed parent NewAgent").await;
     let parent_new: NewAgentPayload = env.parse_payload().expect("parse typed parent NewAgent");
-    let _ = expect_next_event(&mut fixture.client, "typed parent AgentStart").await;
+    let parent_start = expect_next_event(&mut fixture.client, "typed parent AgentStart").await;
+    assert_eq!(
+        parent_start
+            .parse_payload::<AgentStartPayload>()
+            .unwrap()
+            .tyde_permissions,
+        protocol::AgentTydePermissions::Agent
+    );
     drop(reservation);
     parent_gate.wait_until_entered().await;
     let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+
+    assert_eq!(
+        parent_new.tyde_permissions,
+        protocol::AgentTydePermissions::Agent,
+        "Human-created ordinary agents are not automatically orchestrators"
+    );
+    let (operator, operator_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("human-operator".to_owned()),
+            custom_agent_id: Some(protocol::CustomAgentId("tyde-help".to_owned())),
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/human-operator".to_owned()],
+                prompt: "Inspect Tyde configuration".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    assert_eq!(
+        operator.new_agent.tyde_permissions,
+        protocol::AgentTydePermissions::Root
+    );
+    assert_eq!(
+        operator_start.tyde_permissions,
+        protocol::AgentTydePermissions::Root
+    );
+    fixture.finish_turn(&operator).await;
+    for (agent_id, expected) in [
+        (&parent_new.agent_id, "agent"),
+        (&operator.new_agent.agent_id, "root"),
+    ] {
+        let mut config = fixture.agent_control_caller(agent_id).await;
+        config.url = fixture.config_mcp_http_url().await;
+        let guide = mcp_success_json(
+            &mcp_tool_call_as(&config, false, "tyde_config_get_permissions", json!({})).await,
+        );
+        assert_eq!(guide["tyde_permissions"], expected);
+        assert!(
+            guide["guidance"]
+                .as_str()
+                .unwrap()
+                .contains(if expected == "root" {
+                    "any Tyde control"
+                } else {
+                    "own sub-agents"
+                })
+        );
+    }
+
+    fixture.client.close_agent(&operator.stream).await.unwrap();
+    fixture
+        .next_frame_matching("human-selected Operator closed", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == operator.new_agent.agent_id)
+        })
+        .await;
+    let (restored_operator, restored_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: operator_start.session_id.unwrap(),
+                prompt: None,
+            },
+        })
+        .await;
+    assert_eq!(
+        restored_operator.new_agent.tyde_permissions,
+        protocol::AgentTydePermissions::Root
+    );
+    assert_eq!(
+        restored_start.tyde_permissions,
+        protocol::AgentTydePermissions::Root,
+        "Initial Operator authority, not only a later role assignment, survives saved-session resume"
+    );
 
     let options = mcp_list_launch_options(&caller).await;
     let offered = options["custom_agents"]
@@ -5372,6 +5468,31 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     .await;
     drop(reservation);
 
+    let spawned_root = mcp_spawn_agent_as(
+        &caller_a,
+        json!({
+            "workspace_roots": ["/tmp/credential-agent-root"],
+            "prompt": "work independently", "backend_kind": "claude",
+            "name": "agent-spawned-root", "global": true
+        }),
+    )
+    .await;
+    let spawned_root_caller = fixture.agent_control_caller(&spawned_root).await;
+    let mut root_config = spawned_root_caller.clone();
+    root_config.url = fixture.host_for_test().config_mcp_url_for_test().await;
+    let guide = mcp_tool_call_as(
+        &root_config,
+        false,
+        "tyde_config_get_permissions",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        mcp_success_json(&guide)["tyde_permissions"],
+        "agent",
+        "Parentless agent-created roots still default to ordinary Agent guidance"
+    );
+
     // A sub-agent reports to its parent by finishing its turn: global scope is
     // neither advertised to it nor honored, so it cannot reach its parent or
     // peers, while it still manages its own children.
@@ -5380,6 +5501,8 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         (&caller_a, true, true),
         (&child_caller, false, false),
         (&child_caller, true, false),
+        (&spawned_root_caller, false, true),
+        (&spawned_root_caller, true, true),
     ] {
         let url = if await_surface {
             &caller.await_url
@@ -5452,6 +5575,117 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         );
         assert!(mcp_result_text(&response).contains("only available to top-level agents"));
     }
+    eprintln!("Role credential flow: reconnecting observer");
+    let (mut role_client, role_snapshot) = fixture.connect_with_bootstrap().await;
+    let role_stream = role_snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == child_a)
+        .unwrap()
+        .instance_stream
+        .clone();
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut role_client,
+        &role_stream,
+        "role observer attached",
+    )
+    .await;
+    assert!(replay.events.iter().any(|event| matches!(event,
+        AgentBootstrapEvent::AgentStart(start) if start.tyde_permissions == protocol::AgentTydePermissions::Agent)));
+    eprintln!("Role credential flow: observer attached");
+    for access in [
+        protocol::AgentTydePermissions::Orchestrator,
+        protocol::AgentTydePermissions::Root,
+    ] {
+        role_client
+            .set_agent_tyde_permissions(&role_stream, access)
+            .await
+            .unwrap();
+        eprintln!("Role credential flow: waiting for promoted state");
+        fixture::next_frame_matching_on(&mut role_client, "promoted child role", |env| {
+            env.stream == role_stream && env.kind == FrameKind::AgentTydePermissionsChanged
+        })
+        .await;
+        for await_surface in [false, true] {
+            let url = if await_surface {
+                &child_caller.await_url
+            } else {
+                &child_caller.url
+            };
+            let catalog = post_json_with_headers(
+                url,
+                &[("Authorization", &child_caller.authorization)],
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+            )
+            .await;
+            assert!(
+                catalog["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["inputSchema"]["properties"].get("global").is_some()),
+                "Explicitly promoted children advertise global controls"
+            );
+        }
+        let listed = mcp_success_json(
+            &mcp_tool_call_as(
+                &child_caller,
+                false,
+                "tyde_list_agents",
+                json!({"global":true}),
+            )
+            .await,
+        );
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["agent_id"] == parent_a.agent_id.0)
+        );
+        let read = mcp_tool_call_as(
+            &child_caller,
+            false,
+            "tyde_read_agent",
+            json!({"agent_id":parent_a.agent_id.0,"global":true}),
+        )
+        .await;
+        assert!(
+            !mcp_result_is_error(&read),
+            "Promoted child can read its parent"
+        );
+        eprintln!("Role credential flow: promoted global await");
+        let ready = mcp_success_json(
+            &mcp_tool_call_as(
+                &child_caller,
+                true,
+                "tyde_await_agents",
+                json!({"agent_ids":[child_b.0],"global":true}),
+            )
+            .await,
+        );
+        assert_eq!(ready["ready"][0]["status"], "idle");
+    }
+    role_client
+        .set_agent_tyde_permissions(&role_stream, protocol::AgentTydePermissions::Agent)
+        .await
+        .unwrap();
+    fixture::next_frame_matching_on(&mut role_client, "child demoted", |env| {
+        env.stream == role_stream && env.kind == FrameKind::AgentTydePermissionsChanged
+    })
+    .await;
+    let denied = mcp_tool_call_as(
+        &child_caller,
+        false,
+        "tyde_read_agent",
+        json!({"agent_id":parent_a.agent_id.0,"global":true}),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&denied),
+        "Demotion restores the child scope contract"
+    );
+
     let child_listed = mcp_list_agents(&child_caller).await;
     assert_eq!(
         child_listed
@@ -6183,7 +6417,8 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         let idle_gate = MockGateHandle::new();
         // A gate services fixture controls, not backend interrupt commands, so
         // the turn the redirect cancels is a held one.
-        let mut script = MockScript::one(MockTurn::held_text("initial reply"));
+        let mut script =
+            MockScript::one(MockTurn::held_text("initial reply").with_tyde_permissions_probe());
         if !native_steering {
             script = script
                 .then(MockTurn::held_text("first follow-up reply"))
@@ -6192,7 +6427,10 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         let mut script = script
             .then(MockTurn::gated_text("redirect reply", &redirect_gate))
             .then(MockTurn::text("queued reply"))
-            .then(MockTurn::gated_text("idle redirect reply", &idle_gate))
+            .then(
+                MockTurn::gated_text("idle redirect reply", &idle_gate)
+                    .with_tyde_permissions_probe(),
+            )
             .with_user_bubbles();
         if native_steering {
             script = script.with_mid_turn_steering();
@@ -6214,6 +6452,40 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         let child_new =
             expect_replayed_new_agent(&mut fixture.client, &child, "interrupt child").await;
         let stream = &child_new.instance_stream;
+        assert_eq!(
+            child_new.tyde_permissions,
+            protocol::AgentTydePermissions::Agent
+        );
+        let mut config_caller = fixture.agent_control_caller(&child_new.agent_id).await;
+        config_caller.url = fixture.host_for_test().config_mcp_url_for_test().await;
+        let guide = mcp_tool_call_as(
+            &config_caller,
+            false,
+            "tyde_config_get_permissions",
+            json!({}),
+        )
+        .await;
+        let guide = mcp_success_json(&guide);
+        assert_eq!(guide["tyde_permissions"], "agent");
+        assert!(
+            guide["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("Do not message or interrupt peers or parents")
+        );
+
+        let probe = fixture::next_chat_event_matching_on(&mut fixture.client, stream, "startup credential role", |event| {
+            matches!(event, ChatEvent::StreamEnd(end) if serde_json::from_str::<Value>(&end.message.content).is_ok())
+        }).await;
+        let ChatEvent::StreamEnd(probe) = probe else {
+            unreachable!()
+        };
+        let probe: Value = serde_json::from_str(&probe.message.content).unwrap();
+        assert_eq!(
+            probe["tyde_permissions"], "agent",
+            "The provisioned startup MCP credential must not be anonymous Root"
+        );
+
         fixture::next_chat_event_matching_on(
             &mut fixture.client,
             stream,
@@ -6221,6 +6493,55 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
             |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "initial reply"),
         )
         .await;
+
+        for immediate in [false, true] {
+            for origin in [
+                protocol::MessageOrigin::Agent {
+                    agent_id: Some(parent.agent_id.clone()),
+                    name: parent.name.clone(),
+                },
+                protocol::MessageOrigin::System,
+            ] {
+                let payload = SendMessagePayload {
+                    message: "reserved-origin-probe".to_owned(),
+                    images: None,
+                    origin: Some(origin),
+                    tool_response: None,
+                };
+                if immediate {
+                    fixture
+                        .client
+                        .steer_message_payload(stream, payload)
+                        .await
+                        .unwrap();
+                } else {
+                    fixture
+                        .client
+                        .send_message_payload(stream, payload)
+                        .await
+                        .unwrap();
+                }
+                let error = fixture::next_frame_matching_on(&mut fixture.client, "reserved sender rejected", |env| {
+                    if env.stream == *stream && env.kind == FrameKind::ChatEvent {
+                        assert!(!matches!(env.parse_payload::<ChatEvent>().unwrap(),
+                            ChatEvent::MessageAdded(message) if message.content == "reserved-origin-probe"),
+                            "Rejected provenance must never be delivered");
+                    }
+                    if env.stream == *stream && env.kind == FrameKind::QueuedMessages {
+                        assert!(env.parse_payload::<protocol::QueuedMessagesPayload>().unwrap().messages.is_empty(),
+                            "Rejected provenance must never be queued");
+                    }
+                    env.kind == FrameKind::CommandError
+                }).await;
+                assert!(
+                    error
+                        .parse_payload::<CommandErrorPayload>()
+                        .unwrap()
+                        .message
+                        .contains("reserved for the server")
+                );
+            }
+        }
 
         for (expected, arguments) in [
             (
@@ -6250,7 +6571,8 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
                 match event {
                     ChatEvent::OperationCancelled(_) => cancellations += 1,
                     ChatEvent::MessageAdded(message)
-                        if matches!(message.sender, MessageSender::User)
+                        if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
+                            && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &parent.agent_id)
                             && message.content == expected =>
                     {
                         break;
@@ -6296,6 +6618,236 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         )
         .await;
 
+        let (mut lazy, lazy_snapshot) = fixture::connect_mobile_client_with_bootstrap(
+            fixture.host_for_test(),
+            "permissions-observer",
+        )
+        .await;
+        let lazy_stream = lazy_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == child)
+            .unwrap()
+            .instance_stream
+            .clone();
+        let mut created_steering = None;
+        let mut unrelated_steering = None;
+        for access in [
+            protocol::AgentTydePermissions::Orchestrator,
+            protocol::AgentTydePermissions::Root,
+        ] {
+            let steering_before = mcp_success_json(
+                &mcp_tool_call_as(
+                    &config_caller,
+                    false,
+                    "tyde_config_list_steering",
+                    json!({}),
+                )
+                .await,
+            );
+            fixture
+                .client
+                .set_agent_tyde_permissions(stream, access)
+                .await
+                .expect("assign Tyde permissions");
+            fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "Tyde role updated without steering",
+                |env| {
+                    if env.stream == *stream && env.kind == FrameKind::ChatEvent {
+                        assert!(
+                            !matches!(
+                                env.parse_payload::<ChatEvent>().unwrap(),
+                                ChatEvent::OperationCancelled(_) | ChatEvent::MessageAdded(_)
+                            ),
+                            "Role changes must not inject messages or cancel the current turn"
+                        );
+                    }
+                    env.stream == *stream
+                        && env.kind == FrameKind::AgentTydePermissionsChanged
+                        && env
+                            .parse_payload::<protocol::AgentTydePermissionsChangedPayload>()
+                            .is_ok_and(|update| update.access == access)
+                },
+            )
+            .await;
+            let update = fixture::next_frame_matching_on(
+                &mut lazy,
+                "permission update on the correct lazy-client stream",
+                |env| {
+                    env.kind == FrameKind::AgentTydePermissionsChanged
+                        && env
+                            .parse_payload::<protocol::AgentTydePermissionsChangedPayload>()
+                            .is_ok_and(|payload| {
+                                payload.agent_id == child && payload.access == access
+                            })
+                },
+            )
+            .await;
+            if access == protocol::AgentTydePermissions::Orchestrator {
+                assert!(
+                    update.stream.0.starts_with("/host/"),
+                    "Unattached subscribers receive role state on the host stream"
+                );
+                fixture::send_load_agent_on(&mut lazy, &lazy_stream).await;
+                let loaded = expect_raw_agent_bootstrap_on_stream(
+                    &mut lazy,
+                    &lazy_stream,
+                    "role state at lazy attach",
+                )
+                .await;
+                assert!(loaded.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.tyde_permissions == access)));
+            } else {
+                assert_eq!(
+                    update.stream, lazy_stream,
+                    "Attached subscribers receive the actor event, not another host notification"
+                );
+            }
+            let steering_after = mcp_success_json(
+                &mcp_tool_call_as(
+                    &config_caller,
+                    false,
+                    "tyde_config_list_steering",
+                    json!({}),
+                )
+                .await,
+            );
+            assert_eq!(
+                steering_before, steering_after,
+                "Role assignment must not create or edit steering entries"
+            );
+            if access == protocol::AgentTydePermissions::Orchestrator {
+                let before = mcp_success_json(
+                    &mcp_tool_call_as(&config_caller, false, "tyde_config_get_settings", json!({}))
+                        .await,
+                );
+                let added = mcp_success_json(&mcp_tool_call_as(&config_caller, false, "tyde_config_upsert_steering", json!({"title":"Review final diff", "content":"Read the completed diff before reporting results."})).await);
+                fixture::next_frame_matching_on(&mut fixture.client, "added steering is published", |env| env.kind == FrameKind::SteeringNotify && env.parse_payload::<protocol::SteeringNotifyPayload>().is_ok_and(|notify| matches!(notify, protocol::SteeringNotifyPayload::Upsert { steering } if serde_json::to_value(&steering.id).unwrap() == added["id"]))).await;
+                let steering = mcp_success_json(
+                    &mcp_tool_call_as(
+                        &config_caller,
+                        false,
+                        "tyde_config_list_steering",
+                        json!({}),
+                    )
+                    .await,
+                );
+                assert!(
+                    steering
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["id"] == added["id"])
+                );
+                created_steering = Some(added["id"].clone());
+                let unrelated = mcp_success_json(&mcp_tool_call_as(&config_caller, false, "tyde_config_upsert_steering",
+                    json!({"title":"Keep guidance", "content":"Preserve this unrelated entry."})).await);
+                unrelated_steering = Some(unrelated.clone());
+                fixture::next_frame_matching_on(&mut fixture.client, "unrelated guidance published", |env| env.kind == FrameKind::SteeringNotify
+                    && env.parse_payload::<protocol::SteeringNotifyPayload>().is_ok_and(|notify| matches!(notify,
+                        protocol::SteeringNotifyPayload::Upsert { steering } if serde_json::to_value(&steering.id).unwrap() == unrelated["id"]))).await;
+                let added_aspect = mcp_success_json(&mcp_tool_call_as(&config_caller, false, "tyde_config_upsert_review_aspect", json!({"aspect":{"name":"Ownership clarity", "description":"Check typed ownership", "instructions":"Verify explicit owners at boundaries.", "enabled":true}})).await);
+                let after = mcp_success_json(
+                    &mcp_tool_call_as(&config_caller, false, "tyde_config_get_settings", json!({}))
+                        .await,
+                );
+                assert!(
+                    after["review"]["aspects"]
+                        .get(added_aspect["aspect_id"].as_str().unwrap())
+                        .is_some()
+                );
+                for key in [
+                    "enable_mobile_connections",
+                    "enabled_backends",
+                    "tyde_agent_control_mcp_enabled",
+                    "tyde_debug_mcp_enabled",
+                ] {
+                    assert_eq!(
+                        before[key], after[key],
+                        "Adding improvement guidance must leave host access settings untouched"
+                    );
+                }
+            }
+            if access == protocol::AgentTydePermissions::Root {
+                let id = created_steering.as_ref().unwrap();
+                let unrelated = unrelated_steering.as_ref().unwrap();
+                let updated = mcp_success_json(&mcp_tool_call_as(&config_caller, false, "tyde_config_upsert_steering",
+                    json!({"steering_id":id, "title":"Review final changes", "content":"Updated review guidance."})).await);
+                assert_eq!(&updated["id"], id);
+                fixture::next_frame_matching_on(&mut fixture.client, "Root steering update published", |env| env.kind == FrameKind::SteeringNotify
+                    && env.parse_payload::<protocol::SteeringNotifyPayload>().is_ok_and(|notify| matches!(notify,
+                        protocol::SteeringNotifyPayload::Upsert { steering } if serde_json::to_value(&steering).unwrap() == updated))).await;
+                let entries = mcp_success_json(
+                    &mcp_tool_call_as(
+                        &config_caller,
+                        false,
+                        "tyde_config_list_steering",
+                        json!({}),
+                    )
+                    .await,
+                );
+                assert_eq!(
+                    entries
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|entry| &entry["id"] == id)
+                        .collect::<Vec<_>>(),
+                    vec![&updated]
+                );
+                assert!(entries.as_array().unwrap().contains(unrelated));
+                let deleted = mcp_success_json(
+                    &mcp_tool_call_as(
+                        &config_caller,
+                        false,
+                        "tyde_config_delete_steering",
+                        json!({"steering_id":id}),
+                    )
+                    .await,
+                );
+                assert_eq!(deleted["deleted"], true);
+                fixture::next_frame_matching_on(&mut fixture.client, "Root steering deletion published", |env| env.kind == FrameKind::SteeringNotify
+                    && env.parse_payload::<protocol::SteeringNotifyPayload>().is_ok_and(|notify| matches!(notify,
+                        protocol::SteeringNotifyPayload::Delete { id: deleted_id } if serde_json::to_value(&deleted_id).unwrap() == *id))).await;
+                let entries = mcp_success_json(
+                    &mcp_tool_call_as(
+                        &config_caller,
+                        false,
+                        "tyde_config_list_steering",
+                        json!({}),
+                    )
+                    .await,
+                );
+                assert!(
+                    !entries
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| &entry["id"] == id)
+                );
+                assert!(entries.as_array().unwrap().contains(unrelated));
+            }
+            let guide = mcp_tool_call_as(
+                &config_caller,
+                false,
+                "tyde_config_get_permissions",
+                json!({}),
+            )
+            .await;
+            let guide = mcp_success_json(&guide);
+            assert_eq!(
+                guide["tyde_permissions"],
+                serde_json::to_value(access).unwrap()
+            );
+            assert!(guide["guidance"].as_str().unwrap().contains(
+                if access == protocol::AgentTydePermissions::Orchestrator {
+                    "Never edit or remove existing"
+                } else {
+                    "any Tyde control"
+                }
+            ));
+        }
+
         let redirected = mcp_tool_call_as(
             &caller,
             false,
@@ -6323,7 +6875,9 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
             "redirected input",
             |event| {
                 matches!(event, ChatEvent::MessageAdded(message)
-                if matches!(message.sender, MessageSender::User) && message.content == "redirect now")
+                if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
+                    && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &parent.agent_id)
+                    && message.content == "redirect now")
             },
         )
         .await;
@@ -6389,6 +6943,16 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
             !mcp_result_is_error(&idle),
             "idle interrupt must start a turn"
         );
+        let probe = fixture::next_chat_event_matching_on(&mut fixture.client, stream, "startup credential observes role update", |event| {
+            matches!(event, ChatEvent::StreamEnd(end) if serde_json::from_str::<Value>(&end.message.content).is_ok())
+        }).await;
+        let ChatEvent::StreamEnd(probe) = probe else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&probe.message.content).unwrap()["tyde_permissions"],
+            "root"
+        );
         idle_gate.wait_until_entered().await;
         let await_idle = mcp_await_agent(&caller, &child);
         tokio::pin!(await_idle);
@@ -6408,7 +6972,77 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         )
         .await;
         assert!(mcp_success_json(&read)["output"]["text"].as_str() == Some("idle redirect reply"));
+        let (mut observer, snapshot) = fixture.connect_with_bootstrap().await;
+        let restored = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == child)
+            .unwrap();
+        assert_eq!(
+            restored.tyde_permissions,
+            protocol::AgentTydePermissions::Root
+        );
+        let replay = expect_raw_agent_bootstrap_on_stream(
+            &mut observer,
+            &restored.instance_stream,
+            "role replay",
+        )
+        .await;
+        assert!(replay.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.tyde_permissions == protocol::AgentTydePermissions::Root)));
+        assert!(replay.events.iter().any(|event| matches!(event, AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name) && message.content == "redirect now")));
+        let root_caller = fixture.agent_control_caller(&child).await;
+        let descendant = mcp_spawn_agent_as(
+            &root_caller,
+            json!({"prompt":"small child task", "name":"root-child", "backend_kind":"claude", "workspace_roots":["/tmp/interrupt-grandchild"]}),
+        )
+        .await;
+        let descendant = expect_replayed_new_agent(
+            &mut fixture.client,
+            &descendant,
+            "Root child is still Agent",
+        )
+        .await;
+        assert_eq!(
+            descendant.tyde_permissions,
+            protocol::AgentTydePermissions::Agent,
+            "Root authority is not inherited"
+        );
+        let saved_session = restored.session_id.clone().unwrap();
         fixture.mock_by_id(&child).await.assert_clean().await;
+        fixture
+            .client
+            .close_agent(stream)
+            .await
+            .expect("close saved role");
+        fixture::next_frame_matching_on(&mut fixture.client, "role session closed", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|event| event.agent_id == child)
+        })
+        .await;
+        let (resumed, resumed_start) = fixture
+            .spawn_with(SpawnAgentPayload {
+                name: None,
+                custom_agent_id: None,
+                project_id: None,
+                parent_agent_id: Some(parent.agent_id.clone()),
+                params: SpawnAgentParams::Resume {
+                    session_id: saved_session,
+                    prompt: None,
+                },
+            })
+            .await;
+        assert_eq!(
+            resumed_start.tyde_permissions,
+            protocol::AgentTydePermissions::Root
+        );
+        assert_eq!(
+            resumed.new_agent.tyde_permissions,
+            protocol::AgentTydePermissions::Root
+        );
+
+        fixture.mock(&resumed).await.assert_clean().await;
     }
 }
 
@@ -7194,6 +7828,7 @@ async fn parked_backend_native_child_replays_to_late_clients_and_rejects_interru
         &mut fixture.client,
         &child_new.instance_stream,
         "parent prompt",
+        &parent_new,
     )
     .await;
     expect_turn_on_stream(
@@ -7308,6 +7943,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
         &mut fixture.client,
         &child.instance_stream,
         "live native child task",
+        &parent,
     )
     .await;
     for context in ["child typing", "child stream start", "child stream delta"] {
@@ -8410,10 +9046,10 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
 
     let mock_turn_text = |prompt: &str| {
         format!(
-            "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] \
+            "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), tyde-config(http)] \
              [builtin_steering: {}] mock backend response to: {prompt}",
             // The mock's startup summary renders newlines as literal \n.
-            server::backend::AGENT_CONTROL_SPAWN_STEERING.replace('\n', "\\n")
+            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )
     };
     let expected = [
@@ -10784,7 +11420,9 @@ async fn help_controls_top_level_agents_across_projects() {
     )
     .await;
     fixture::next_chat_event_matching_on(&mut fixture.client, &new.instance_stream, "Help default redirect", |event| {
-        matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) && message.content == "Continue without plan approval")
+        matches!(event, ChatEvent::MessageAdded(message) if matches!(&message.sender, MessageSender::Agent { agent } if agent == "Operator")
+            && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: None, name }) if name == "Operator")
+            && message.content == "Continue without plan approval")
     }).await;
     let listed = config_agent_tool(&url, "tyde_config_list_agents", json!({})).await;
     assert!(
@@ -10821,7 +11459,9 @@ async fn help_controls_top_level_agents_across_projects() {
     assert!(!mcp_result_is_error(&redirected));
     redirect_gate.wait_until_entered().await;
     fixture::next_chat_event_matching_on(&mut fixture.client, &new.instance_stream, "Help redirect", |event| {
-        matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) && message.content == "Redirect now")
+        matches!(event, ChatEvent::MessageAdded(message) if matches!(&message.sender, MessageSender::Agent { agent } if agent == "Operator")
+            && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: None, name }) if name == "Operator")
+            && message.content == "Redirect now")
     }).await;
     redirect_gate.release_one();
     fixture::next_chat_event_matching_on(
@@ -10936,4 +11576,68 @@ async fn help_controls_top_level_agents_across_projects() {
             "Invalid target/input must fail visibly"
         );
     }
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Authenticated config root",
+            MockScript::one(MockTurn::text("authenticated launch reply"))
+                .then(MockTurn::text("authenticated follow-up reply"))
+                .with_user_bubbles(),
+        )
+        .await;
+    let mut config = ordinary.clone();
+    config.url = url.clone();
+    let created = mcp_success_json(
+        &mcp_tool_call_as(
+            &config,
+            false,
+            "tyde_config_spawn_agent",
+            json!({"project_id":project.id.0, "prompt":"Authenticated configuration launch",
+            "name":"Authenticated config root", "backend_kind":"claude"}),
+        )
+        .await,
+    );
+    drop(reservation);
+    let target_id = protocol::AgentId(created["agent_id"].as_str().unwrap().to_owned());
+    let target = expect_replayed_new_agent(
+        &mut fixture.client,
+        &target_id,
+        "authenticated config publication",
+    )
+    .await;
+    for (task, follow_up) in [
+        ("Authenticated configuration launch", false),
+        ("Authenticated configuration follow-up", true),
+    ] {
+        if follow_up {
+            let sent = mcp_tool_call_as(
+                &config,
+                false,
+                "tyde_config_send_agent_message",
+                json!({"agent_id":target_id.0,"message":task}),
+            )
+            .await;
+            assert!(!mcp_result_is_error(&sent));
+        }
+        let input = fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            &target.instance_stream,
+            "authenticated config identity",
+            |event| matches!(event, ChatEvent::MessageAdded(message) if message.content == task),
+        )
+        .await;
+        assert!(
+            matches!(input, ChatEvent::MessageAdded(message)
+            if matches!(&message.sender, MessageSender::Agent {agent} if agent == &existing.name)
+                && matches!(&message.origin, Some(protocol::MessageOrigin::Agent {agent_id:Some(id),name}) if id == &existing.agent_id && name == &existing.name)),
+            "Authenticated config calls must not fall through to anonymous Operator"
+        );
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            &target.instance_stream,
+            "authenticated config idle",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+    }
+    fixture.mock_by_id(&target_id).await.assert_clean().await;
 }

@@ -1827,6 +1827,8 @@ fn render_agent_tree_group(
     group: AgentTreeGroup,
     interactions: AgentsPanelInteractions,
 ) -> AnyView {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_tests::trace_sidebar_stack("tree group", std::ptr::addr_of!(state) as usize);
     let parent = group.parent;
     let children = group.children;
     let parent_id = parent.agent_id.clone();
@@ -1925,12 +1927,15 @@ fn parent_agent_project_ref(state: &AppState, agent: &AgentInfo) -> Option<Activ
     })
 }
 
+// Erase the large view before recursive groups retain it on the Wasm stack.
 fn agent_card(
     state: AppState,
     agent: AgentInfo,
     child_count: usize,
     interactions: AgentsPanelInteractions,
-) -> impl IntoView {
+) -> AnyView {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_tests::trace_sidebar_stack("agent card", std::ptr::addr_of!(state) as usize);
     let moving_project = RwSignal::new(false);
     let move_project_agent = agent.clone();
     let move_project_state = state.clone();
@@ -2257,6 +2262,19 @@ fn agent_card(
     let details_name = name.clone();
     let details_host = agent.host_id.clone();
     let details_workspace = agent.workspace_roots.join(" · ");
+    let role_target = agent_chat_ref(&agent);
+    let role_agents = state.agents;
+    let tyde_permissions = Signal::derive(move || {
+        role_agents.with(|agents| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent.host_id == role_target.host_id && agent.agent_id == role_target.agent_id
+                })
+                .map(|agent| agent.tyde_permissions)
+                .unwrap_or_default()
+        })
+    });
 
     view! {
         <div
@@ -2434,6 +2452,10 @@ fn agent_card(
                     }
                 })}
                 </div>
+                <span class="agent-tyde-permissions" title=move || format!("Tyde permissions: {}", tyde_permissions.get().label())
+                    aria-label=move || format!("Tyde permissions: {}", tyde_permissions.get().label())>
+                    <crate::components::chat_view::TydePermissionsIcon permissions=tyde_permissions />
+                </span>
                 <Show when=move || show_backend_labels.get()>
                     <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
                 </Show>
@@ -2643,6 +2665,7 @@ fn agent_card(
             </CardContextMenu>
         </div>
     }
+    .into_any()
 }
 
 #[component]
@@ -3136,6 +3159,7 @@ mod wasm_tests {
     ) {
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: AgentId(agent_id.to_owned()),
                 name: name.to_owned(),
@@ -3350,6 +3374,89 @@ mod wasm_tests {
             provide_context(state_for_mount.clone());
             view! { <AgentsPanel /> }
         })
+    }
+
+    #[wasm_bindgen_test]
+    async fn sidebar_tyde_permissions_react_on_the_same_row_without_crossing_hosts() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let state = make_app_state("local");
+        crate::dispatch::prime_host_for_tests(&state, "local");
+        crate::dispatch::prime_host_for_tests(&state, "remote");
+        state.configured_hosts.set(vec![
+            configured_host("local", "Local Host"),
+            configured_host("remote", "Remote Host"),
+        ]);
+        push_agent(
+            &state,
+            "local",
+            "same-lock-agent",
+            "Local locked agent",
+            true,
+        );
+        push_agent(
+            &state,
+            "remote",
+            "same-lock-agent",
+            "Remote unlocked agent",
+            true,
+        );
+        state
+            .agents
+            .update(|agents| agents[0].tyde_permissions = protocol::AgentTydePermissions::Root);
+        let container = make_container();
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
+        let indicator = |host: &str| {
+            container
+                .query_selector(&format!(
+                    "[data-host-id='{host}'] [aria-label^='Tyde permissions:']"
+                ))
+                .unwrap()
+        };
+        let role = |host: &str| {
+            indicator(host)
+                .unwrap()
+                .get_attribute("aria-label")
+                .unwrap()
+        };
+        assert_eq!(role("local"), "Tyde permissions: Root");
+        assert_eq!(role("remote"), "Tyde permissions: Agent");
+        assert!(
+            indicator("local")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        let apply = |host: &str, seq, access| {
+            dispatch_frame(
+                &state,
+                host,
+                StreamPath(format!("/host/{host}")),
+                FrameKind::AgentTydePermissionsChanged,
+                seq,
+                &protocol::AgentTydePermissionsChangedPayload {
+                    agent_id: AgentId("same-lock-agent".to_owned()),
+                    access,
+                },
+            )
+        };
+        apply("local", 0, protocol::AgentTydePermissions::Orchestrator);
+        next_tick().await;
+        assert_eq!(role("local"), "Tyde permissions: Tyde Orchestrator");
+        assert_eq!(role("remote"), "Tyde permissions: Agent");
+        apply("remote", 0, protocol::AgentTydePermissions::Root);
+        next_tick().await;
+        assert_eq!(role("remote"), "Tyde permissions: Root");
+        apply("local", 1, protocol::AgentTydePermissions::Agent);
+        next_tick().await;
+        assert_eq!(role("local"), "Tyde permissions: Agent");
+        assert_eq!(
+            role("remote"),
+            "Tyde permissions: Root",
+            "Changing another host must not change this row"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -4171,10 +4278,52 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen::prelude::wasm_bindgen(
+        inline_js = r#"export function trace_sidebar_mount(callback) { const limit = Error.stackTraceLimit; Error.stackTraceLimit = 80; try { callback(); } catch (error) { document.getElementById('output').textContent += '\nSidebar mount exception: ' + error.stack + '\n'; throw error; } finally { Error.stackTraceLimit = limit; } }"#
+    )]
+    extern "C" {
+        fn trace_sidebar_mount(callback: &js_sys::Function);
+    }
+
+    thread_local! {
+        static TRACE_SIDEBAR_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn trace_sidebar_stack(phase: &str, address: usize) {
+        if !TRACE_SIDEBAR_STACK.with(|enabled| enabled.get()) {
+            return;
+        }
+        let output = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("output")
+            .unwrap();
+        output.set_text_content(Some(&format!(
+            "{}Sidebar stack phase: {phase}, address: {address}\n",
+            output.text_content().unwrap()
+        )));
+    }
+
     #[wasm_bindgen_test]
     async fn sidebar_keeps_children_nested_across_project_and_group_boundaries() {
+        TRACE_SIDEBAR_STACK.with(|enabled| enabled.set(true));
+        let trace = |phase: &str| {
+            let output = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .get_element_by_id("output")
+                .unwrap();
+            output.set_text_content(Some(&format!(
+                "{}Sidebar nesting DOM phase: {phase}\n",
+                output.text_content().unwrap()
+            )));
+        };
+        trace("starting");
         let mut failures = Vec::new();
         for scope in ["another project", "no project", "parent custom group"] {
+            trace(scope);
             let container = make_container();
             let state = make_app_state("local");
             seed_sidebar_group_fixture(&state);
@@ -4197,18 +4346,30 @@ mod wasm_tests {
                 );
             }
 
+            trace("fixture prepared");
             CenterWorkspaceWidth::forget_measurement();
+            trace("measurement forgotten");
             let mounted_state = state.clone();
-            let handle = mount_to(container.clone(), move || {
-                provide_context(mounted_state.clone());
-                view! {
-                    <style>{include_str!("../../styles.css")}</style>
-                    <AgentsPanel />
-                }
+            let mounted_container = container.clone();
+            let mount_result = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let result = mount_result.clone();
+            let mount = wasm_bindgen::closure::Closure::once(move || {
+                let handle = mount_to(mounted_container, move || {
+                    provide_context(mounted_state.clone());
+                    view! {
+                        <style>{include_str!("../../styles.css")}</style>
+                        <AgentsPanel />
+                    }
+                });
+                *result.borrow_mut() = Some(handle);
             });
+            trace_sidebar_mount(mount.as_ref().unchecked_ref());
+            let handle = mount_result.borrow_mut().take().unwrap();
+            trace("mounted, awaiting ticks");
             for _ in 0..4 {
                 next_tick().await;
             }
+            trace("mount ticks completed");
 
             let parent = agent_card_el(&container, "parent-alpha");
             let names = container.query_selector_all(".agent-card-name").unwrap();
@@ -4241,7 +4402,9 @@ mod wasm_tests {
                 ));
             }
             if let Some(toggle) = toggle {
+                trace("collapsing parent");
                 toggle.dyn_into::<HtmlElement>().unwrap().click();
+                trace("parent clicked");
                 for _ in 0..4 {
                     next_tick().await;
                 }
@@ -4252,9 +4415,13 @@ mod wasm_tests {
                 );
                 assert!(parent.get_bounding_client_rect().height() > 0.0);
             }
+            trace("dropping mount");
             drop(handle);
+            trace("mount dropped");
             container.remove();
         }
+        trace("all scopes completed");
+        TRACE_SIDEBAR_STACK.with(|enabled| enabled.set(false));
         assert!(
             failures.is_empty(),
             "Owned children must not become root cards at sidebar boundaries: {failures:?}"
@@ -5840,6 +6007,7 @@ mod wasm_tests {
             .find(|(kind, _, _)| kind == "agent_move")
             .unwrap();
         let start = protocol::AgentStartPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: AgentId("move-me".to_owned()),
             name: "Moving agent".to_owned(),
@@ -5979,6 +6147,7 @@ mod wasm_tests {
                 request_id: payload["request_id"].as_str().unwrap().to_owned(),
                 agent_id: AgentId("move-me".to_owned()),
                 result: Ok(protocol::AgentStartPayload {
+                    tyde_permissions: Default::default(),
                     swarm_membership: None,
                     project_id: None,
                     ..start
@@ -6186,6 +6355,7 @@ mod wasm_tests {
             FrameKind::NewAgent,
             host_seq,
             &NewAgentPayload {
+                tyde_permissions: Default::default(),
                 swarm_membership: None,
                 agent_id: AgentId(agent_id.to_owned()),
                 name: name.to_owned(),
@@ -6214,6 +6384,7 @@ mod wasm_tests {
             host_id,
             &agent_stream(agent_id),
             &protocol::AgentStartPayload {
+                tyde_permissions: Default::default(),
                 swarm_membership: None,
                 agent_id: AgentId(agent_id.to_owned()),
                 name: name.to_owned(),
@@ -6669,6 +6840,7 @@ mod wasm_tests {
         state.finish_compaction_success(
             &AgentId("a-old".to_owned()),
             &AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: "h-clean".to_owned(),
                 agent_id: AgentId("a-new".to_owned()),
                 name: "New".to_owned(),
@@ -6697,6 +6869,7 @@ mod wasm_tests {
         state.finish_compaction_success(
             &AgentId("a-old".to_owned()),
             &AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: "h-clean".to_owned(),
                 agent_id: AgentId("a-new".to_owned()),
                 name: "New".to_owned(),
@@ -7187,22 +7360,40 @@ mod wasm_tests {
     /// same value so it stays after the overlay is dropped.
     #[wasm_bindgen_test]
     async fn sidebar_hide_inactive_persists_across_project_switch_and_snapshot() {
+        let trace = |phase: &str| {
+            let output = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .get_element_by_id("output")
+                .unwrap();
+            output.set_text_content(Some(&format!(
+                "{}Sidebar pin DOM phase: {phase}\n",
+                output.text_content().unwrap()
+            )));
+        };
+        trace("starting");
         let _calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = primed_sidebar_state(AgentsSidebarPreferences::default());
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
+        trace("mounted");
         assert!(!button_active(&container, "Hide inactive"));
 
+        trace("clicking selector");
         filter_button(&container, "Hide inactive").click();
+        trace("selector clicked");
         next_tick().await;
         assert!(
             button_active(&container, "Hide inactive"),
             "overlay reflects hide_inactive immediately"
         );
 
+        trace("overlay rendered");
         // Switch project: the selector is server-owned, not project-local, so it
         // stays pinned.
+        trace("switching project");
         state.active_project.set(Some(ActiveProjectRef {
             host_id: "local".to_owned(),
             project_id: ProjectId("p1".to_owned()),
@@ -7213,6 +7404,7 @@ mod wasm_tests {
             "pinned hide_inactive survives a project switch"
         );
 
+        trace("project switch rendered");
         // Authoritative snapshot confirms the value and drops the overlay.
         state.apply_agents_view_snapshot(
             "local",
@@ -7221,7 +7413,9 @@ mod wasm_tests {
                 ..Default::default()
             }),
         );
+        trace("snapshot applied");
         next_tick().await;
+        trace("snapshot rendered");
         assert!(
             button_active(&container, "Hide inactive"),
             "server snapshot keeps hide_inactive after the overlay is reconciled"
@@ -7374,6 +7568,7 @@ mod wasm_tests {
                 .is_none()
         );
         let payload = protocol::AgentStartPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: AgentId("worker".to_owned()),
             name: "Task worker".to_owned(),

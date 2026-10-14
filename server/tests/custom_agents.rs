@@ -1321,7 +1321,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
     assert_eq!(agent_start.custom_agent_id, Some(custom_agent.id.clone()));
 
     let text = expect_turn_text(&mut fixture.client, "customized turn").await;
-    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), docs-server(stdio)]"));
+    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), tyde-config(http), docs-server(stdio)]"));
     assert!(text.contains("[instructions: reviewer instructions]"));
     // Claude discovers skills natively, so the custom agent's selection must
     // reach the backend by name while its body stays on disk until invoked.
@@ -1394,7 +1394,7 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     assert_eq!(agent_start.custom_agent_id, None);
 
     let text = expect_turn_text(&mut fixture.client, "default turn").await;
-    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), docs-server(stdio)]"));
+    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), tyde-config(http), docs-server(stdio)]"));
     // The Default agent still resolves every installed skill; Claude receives
     // them as names it can discover on demand, not as inlined bodies.
     assert!(text.contains("[skills: lint, qa]"));
@@ -1805,7 +1805,7 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
         text.contains(&format!(
             "[builtin_steering: {}]",
             // The mock's startup summary renders newlines as literal \n.
-            server::backend::AGENT_CONTROL_SPAWN_STEERING.replace('\n', "\\n")
+            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )),
         "spawn config lost the agent-control steering: {text}"
     );

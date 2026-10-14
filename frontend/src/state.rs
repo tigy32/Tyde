@@ -83,6 +83,7 @@ pub enum NativeSettingsSaveState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
+    pub tyde_permissions: protocol::AgentTydePermissions,
     pub host_id: String,
     pub agent_id: AgentId,
     pub name: String,

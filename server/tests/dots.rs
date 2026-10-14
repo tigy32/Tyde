@@ -377,11 +377,19 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         options["structuredContent"]["result"]["default_launch_profile_id"] != "claude:dots",
         "The selected profile is not the host default"
     );
+    let launch = fixture
+        .reserve_next_mock_launch(
+            "Dots worker",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::echo())
+                .with_user_bubbles(),
+        )
+        .await;
     let spawned = rpc(&http, &origin, token, "tools/call", json!({"name":"tyde_spawn_agent", "arguments":{"project_id":discovered["id"], "prompt":"Reply with a short greeting", "name":"Dots worker", "launch_profile_id":"claude:dots"}})).await;
     assert!(
         spawned["isError"] != true,
         "Agent must launch through production control path"
     );
+    drop(launch);
     let agent_id = spawned["structuredContent"]["result"]["agent_id"]
         .as_str()
         .expect("Spawn returns explicit agent identity");
@@ -422,6 +430,10 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             && settings.values.0.get("effort") == Some(&SessionSettingValue::String("high".into())),
         "The client must receive the selected profile's effective model and effort"
     );
+    fixture.next_chat_event_matching(&remote, "ChatGPT launch identity", |event| matches!(event,
+        ChatEvent::MessageAdded(message) if message.content == "Reply with a short greeting"
+            && matches!(&message.sender, MessageSender::Agent {agent} if agent == "ChatGPT")
+            && matches!(&message.origin, Some(MessageOrigin::Agent {agent_id:None,name}) if name == "ChatGPT"))).await;
     let remote_reply = fixture
         .next_chat_event_matching(&remote, "Remote launch completes", |event| {
             matches!(event, ChatEvent::StreamEnd(_))
@@ -565,7 +577,9 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     let mut cancelled = false;
     fixture.next_chat_event_matching(&held, "Steering visible to the client", |event| {
         cancelled |= matches!(event, ChatEvent::OperationCancelled(_));
-        matches!(event, ChatEvent::MessageAdded(message) if message.content == "Steer this held turn")
+        matches!(event, ChatEvent::MessageAdded(message) if message.content == "Steer this held turn"
+            && matches!(&message.sender, MessageSender::Agent {agent} if agent == "ChatGPT")
+            && matches!(&message.origin, Some(MessageOrigin::Agent {agent_id:None,name}) if name == "ChatGPT"))
     }).await;
     assert!(!cancelled, "Steering must preserve the current turn");
     let interrupted = rpc(
@@ -611,6 +625,10 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             matches!(event, ChatEvent::OperationCancelled(_))
         })
         .await;
+    fixture.next_chat_event_matching(&held, "ChatGPT interrupt-and-send identity", |event| matches!(event,
+        ChatEvent::MessageAdded(message) if message.content == "Reply to the replacement task"
+            && matches!(&message.sender, MessageSender::Agent {agent} if agent == "ChatGPT")
+            && matches!(&message.origin, Some(MessageOrigin::Agent {agent_id:None,name}) if name == "ChatGPT"))).await;
     let replacement = fixture.next_chat_event_matching(&held, "Replacement reply reaches the client", |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content.contains("Reply to the replacement task"))).await;
     fixture
         .next_chat_event_matching(&held, "Replacement finishes", |event| {

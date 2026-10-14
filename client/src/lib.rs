@@ -1134,6 +1134,27 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn set_agent_tyde_permissions(
+        &mut self,
+        stream: &StreamPath,
+        access: protocol::AgentTydePermissions,
+    ) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("message access on unknown agent stream");
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::SetAgentTydePermissions,
+            seq,
+            &protocol::SetAgentTydePermissionsPayload { access },
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn set_agent_name(
         &mut self,
         stream: &StreamPath,
@@ -1577,6 +1598,10 @@ impl Connection {
                     let _: protocol::types::AgentMoveResultPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::AgentTydePermissionsChanged => {
+                    let _: protocol::AgentTydePermissionsChangedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::AgentTurnStateNotify => {
                     let _: AgentTurnStateNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1648,6 +1673,14 @@ impl Connection {
                         self.outgoing_seq.contains_key(&envelope.stream),
                         "AgentError on stream {} before NewAgent",
                         envelope.stream
+                    );
+                }
+                FrameKind::AgentTydePermissionsChanged => {
+                    let payload: protocol::AgentTydePermissionsChangedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    assert!(
+                        payload.agent_id == parse_agent_stream(&envelope.stream).agent_id,
+                        "Message access must target the agent on its stream"
                     );
                 }
                 FrameKind::AgentRenamed => {

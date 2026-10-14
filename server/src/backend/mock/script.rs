@@ -359,6 +359,14 @@ impl MockTurn {
         Self::done(steps)
     }
 
+    pub fn with_tyde_permissions_probe(mut self) -> Self {
+        let MockTurnBody::Steps(steps) = &mut self.body else {
+            panic!("permission probe requires a scripted text turn");
+        };
+        steps.insert(1, MockStep::TydePermissions);
+        self
+    }
+
     pub fn text_after_gate(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         let mut steps = vec![MockStep::Gate(gate.gate())];
         steps.extend(text_steps(text.into(), TextShape::default()));
@@ -1086,6 +1094,7 @@ pub(super) enum MockStep {
     SpawnNativeChild(MockNativeChild),
     AgentControlAwait(MockAgentControlAwait),
     TychatSend(String),
+    TydePermissions,
 }
 
 impl MockStep {

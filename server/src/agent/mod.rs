@@ -375,6 +375,10 @@ enum RunningTurnRedirect {
 }
 
 enum AgentCommand {
+    SetTydePermissions {
+        access: protocol::AgentTydePermissions,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     TychatDeliver {
         message: protocol::TychatOwnerMessage,
         after_interrupt: bool,
@@ -1578,6 +1582,19 @@ impl AgentHandle {
             .enqueue_delivery(input, redirect)
             .map_err(|error| error.to_string())?;
         receipt.wait().await.map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn set_tyde_permissions(
+        &self,
+        access: protocol::AgentTydePermissions,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::SetTydePermissions { access, reply })
+            .map_err(|_| "Agent is no longer running".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Agent did not acknowledge the Tyde permissions".to_owned())?
     }
 
     fn enqueue_delivery(
@@ -3555,6 +3572,7 @@ pub(crate) fn spawn_agent_actor(
                                 reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
                         }
                         AgentCommand::Interrupt { reply } => {
+
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
                                 ?backend_kind,
@@ -3646,6 +3664,9 @@ pub(crate) fn spawn_agent_actor(
                                 "Wait until the agent is ready before moving it".to_owned(),
                             ));
                         }
+                        AgentCommand::SetTydePermissions { reply, .. } => {
+                            let _ = reply.send(Err("Wait until the agent has started before changing its Tyde permissions".to_owned()));
+                        }
                         command @ AgentCommand::SetName { .. } => {
                             pending_name_commands.push_back(command);
                             #[cfg(feature = "test-support")]
@@ -3707,6 +3728,7 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::DeliverMessage { input, redirect, reply } => {
+
                             if matches!(
                                 redirect,
                                 RunningTurnRedirect::IdleOnly | RunningTurnRedirect::SwarmWake
@@ -4295,7 +4317,7 @@ pub(crate) fn spawn_agent_actor(
                         pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                             message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
                                 movement.project_id, current_start.workspace_roots.join(", ")),
-                            images: None, origin: Some(MessageOrigin::AgentControl), tool_response: None,
+                            images: None, origin: Some(MessageOrigin::System), tool_response: None,
                         }));
                     }
                     Err(ProjectMoveFailure::Rejected(message) | ProjectMoveFailure::Unreconciled(message)) => {
@@ -4313,7 +4335,7 @@ pub(crate) fn spawn_agent_actor(
                         } else {
                             pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                                 message: "Tyde could not enter the destination project. Your project and workspace are unchanged. Report the entry failure; do not edit outside your assigned project.".to_owned(),
-                                images: None, origin: Some(MessageOrigin::AgentControl), tool_response: None,
+                                images: None, origin: Some(MessageOrigin::System), tool_response: None,
                             }));
                         }
                     }
@@ -6492,9 +6514,10 @@ pub(crate) fn spawn_agent_actor(
                         let queued = queue
                             .pop_front()
                             .expect("queue reported non-empty but pop_front returned None");
+
                         let review_origin = match queued.origin.as_ref() {
                             Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
-                            Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                            Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Agent { .. }) | Some(MessageOrigin::System) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                         };
                         if let Some(review_id) = review_origin.as_ref() {
                             tracing::info!(
@@ -6673,6 +6696,7 @@ pub(crate) fn spawn_agent_actor(
                             redirect: delivery_redirect,
                             reply,
                         } => {
+
                             let refused = match delivery_redirect {
                                 RunningTurnRedirect::IdleOnly => in_turn || resume_replay_gate_pending || usage_paused || !queue.is_empty(),
                                 RunningTurnRedirect::SwarmWake => resume_replay_gate_pending || usage_paused || !queue.is_empty(),
@@ -6957,6 +6981,7 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_NOT_ACKNOWLEDGED.to_owned())));
                         }
                         AgentCommand::SendInput(input) => {
+
                             if resume_replay_gate_pending {
                                 // Accepted, not rejected: the resume barrier is
                                 // transient and the message is dispatched once
@@ -7089,13 +7114,13 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Agent { .. }) | Some(MessageOrigin::System) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let message_len = msg.message.len();
                                     let images_count = msg.images.as_ref().map_or(0, Vec::len);
                                     let review_origin_for_queue = match msg.origin.clone() {
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
-                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Agent { .. }) | Some(MessageOrigin::System) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let stale_tool_response = matches!(
                                         msg.tool_response.as_ref(),
@@ -7656,7 +7681,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Agent { .. }) | Some(MessageOrigin::System) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     status_handle
                                         .update(|status| {
@@ -7973,7 +7998,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::Tychat { .. }) | Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Agent { .. }) | Some(MessageOrigin::System) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     if let Some(review_id) = review_origin.as_ref() {
                                         tracing::info!(
@@ -9345,6 +9370,20 @@ pub(crate) fn spawn_agent_actor(
                             };
                             let _ = reply.send(result);
                         }
+                        AgentCommand::SetTydePermissions { access, reply } => {
+                            let result = if !matches!(lifecycle, ActorLifecycle::Running) {
+                                Err("Agent is not running".to_owned())
+                            } else {
+                                apply_agent_tyde_permissions(AgentTydePermissionsContext {
+                                    current_start: &mut current_start,
+                                    start_tx: &start_tx,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                    session_store: &session_store,
+                                }, access).await
+                            };
+                            let _ = reply.send(result);
+                        }
             AgentCommand::SetName {
                             name,
                             persistence,
@@ -9474,6 +9513,7 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
+
                             if scheduled_project_move.take().is_some() {
                                 append_event(&canonical_stream, &mut event_log, &mut subscribers,
                                     FrameKind::AgentError, &AgentErrorPayload {
@@ -9944,6 +9984,7 @@ pub(crate) struct RelayAgentRuntimeResources {
 pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
+    input_origin: MessageOrigin,
     receivers: RelayEventReceivers,
     runtime: RelayAgentRuntimeResources,
     session_id: SessionId,
@@ -10177,6 +10218,12 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
 
+                    if let ChatEvent::MessageAdded(message) = &mut event
+                        && matches!(message.sender, MessageSender::User)
+                        && message.origin.is_none()
+                    {
+                        message.origin = Some(input_origin.clone());
+                    }
                     snapshot_viewed_image(
                         &mut event,
                         &open_tool_requests,
@@ -10407,7 +10454,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             // active for a message it would never run.
                             let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_RELAY.to_owned())));
                         }
-                        AgentCommand::Interrupt { reply } => {
+                        AgentCommand::Interrupt { reply, .. } => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
                             append_event(
                                 &canonical_stream,
@@ -10421,6 +10468,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::ScheduleProjectMove { reply, .. } => { let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned())); }
                         AgentCommand::MoveToProject { reply, .. } => { let _ = reply.send(Err("This agent cannot move in its current state".to_owned())); }
+            AgentCommand::SetTydePermissions { reply, .. } => {
+                let _ = reply.send(Err("This agent cannot change its Tyde permissions in its current state".to_owned()));
+            }
             AgentCommand::SetName {
                             name,
                             persistence,
@@ -10927,6 +10977,74 @@ impl AgentDeliveryReceipt {
             ))
         })
     }
+}
+
+fn nonhuman_input_sender(origin: Option<&MessageOrigin>) -> Option<MessageSender> {
+    match origin {
+        Some(MessageOrigin::Agent { name, .. }) => Some(MessageSender::Agent {
+            agent: name.clone(),
+        }),
+        Some(
+            MessageOrigin::AgentControl
+            | MessageOrigin::System
+            | MessageOrigin::Review { .. }
+            | MessageOrigin::Supervisor
+            | MessageOrigin::HostRestart,
+        ) => Some(MessageSender::System),
+        Some(MessageOrigin::User | MessageOrigin::Tychat { .. }) | None => None,
+    }
+}
+
+fn project_input_sender(event: &mut ChatEvent) {
+    if let ChatEvent::MessageAdded(message) = event
+        && matches!(message.sender, MessageSender::User)
+        && let Some(sender) = nonhuman_input_sender(message.origin.as_ref())
+    {
+        message.sender = sender;
+    }
+}
+
+struct AgentTydePermissionsContext<'a> {
+    current_start: &'a mut AgentStartPayload,
+    start_tx: &'a watch::Sender<AgentStartPayload>,
+    event_log: &'a mut AgentEventLog,
+    subscribers: &'a mut Vec<Stream>,
+    session_store: &'a Arc<SessionStoreHandle>,
+}
+
+async fn apply_agent_tyde_permissions(
+    context: AgentTydePermissionsContext<'_>,
+    access: protocol::AgentTydePermissions,
+) -> Result<(), String> {
+    if context.current_start.tyde_permissions == access {
+        return Ok(());
+    }
+    let session_id = context
+        .current_start
+        .session_id
+        .clone()
+        .ok_or_else(|| "Agent has no saved session for Tyde permissions".to_owned())?;
+    run_session_store_io(context.session_store, move |store| {
+        store.update(&session_id, |record| record.tyde_permissions = access)
+    })
+    .await?;
+    context.current_start.tyde_permissions = access;
+    overwrite_agent_start_payload(context.event_log, context.current_start);
+    context.start_tx.send_replace(context.current_start.clone());
+    broadcast_live_event(
+        context.subscribers,
+        FrameKind::AgentTydePermissionsChanged,
+        &protocol::AgentTydePermissionsChangedPayload {
+            agent_id: context.current_start.agent_id.clone(),
+            access,
+        },
+    )
+    .await;
+    tracing::info!(
+        ?access,
+        "Agent Tyde permissions changed without injecting input"
+    );
+    Ok(())
 }
 
 /// Rejection reasons for an acknowledged [`AgentCommand::DeliverMessage`].
@@ -11490,6 +11608,11 @@ async fn park_terminal_agent(
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
+            AgentCommand::SetTydePermissions { reply, .. } => {
+                let _ = reply.send(Err(
+                    "This agent cannot change its Tyde permissions in its current state".to_owned(),
+                ));
+            }
             AgentCommand::SetName {
                 name,
                 persistence,
@@ -11658,7 +11781,7 @@ async fn park_terminal_agent(
                     DELIVERY_REJECTED_TERMINAL.to_owned(),
                 )));
             }
-            AgentCommand::Interrupt { reply } => {
+            AgentCommand::Interrupt { reply, .. } => {
                 let _ = reply.send(InterruptOutcome::NotRunning);
             }
             #[cfg(feature = "test-support")]
@@ -11707,6 +11830,11 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
+            }
+            AgentCommand::SetTydePermissions { reply, .. } => {
+                let _ = reply.send(Err(
+                    "This agent cannot change its Tyde permissions in its current state".to_owned(),
+                ));
             }
             AgentCommand::SetName {
                 name,
@@ -11882,7 +12010,7 @@ async fn park_relay_terminal_agent(
                     DELIVERY_REJECTED_TERMINAL.to_owned(),
                 )));
             }
-            AgentCommand::Interrupt { reply } => {
+            AgentCommand::Interrupt { reply, .. } => {
                 let payload = relay_input_rejected_payload(&current_start.agent_id);
                 append_event(
                     canonical_stream,
@@ -12096,7 +12224,7 @@ fn internal_compaction_input(message: String) -> SendMessagePayload {
     SendMessagePayload {
         message,
         images: None,
-        origin: None,
+        origin: Some(MessageOrigin::System),
         tool_response: None,
     }
 }
@@ -12216,6 +12344,7 @@ fn startup_reservation(
         },
     };
     crate::store::session::StartupReservation {
+        input_origin: first_input.origin.clone(),
         swarm_membership: start.swarm_membership.clone(),
         agent_id: start.agent_id.clone(),
         spawn: protocol::SpawnAgentPayload {
@@ -12379,6 +12508,14 @@ async fn persist_agent_session(
                 current_start.swarm_membership.clone(),
             )
             .await?;
+        let saved_session = session_id.clone();
+        let permissions = current_start.tyde_permissions;
+        run_session_store_io(session_store, move |store| {
+            store.update(&saved_session, |record| {
+                record.tyde_permissions = permissions
+            })
+        })
+        .await?;
         store
             .set_access_mode(session_id, resolved_spawn_config.access_mode)
             .await?;
@@ -12615,6 +12752,18 @@ async fn append_chat_event_with_transcript_metadata(
     transcript_metadata: Option<(BackendKind, &EventStream)>,
     event: &ChatEvent,
 ) {
+    let projected = match event {
+        ChatEvent::MessageAdded(message)
+            if matches!(message.sender, MessageSender::User)
+                && nonhuman_input_sender(message.origin.as_ref()).is_some() =>
+        {
+            let mut projected = event.clone();
+            project_input_sender(&mut projected);
+            std::borrow::Cow::Owned(projected)
+        }
+        _ => std::borrow::Cow::Borrowed(event),
+    };
+    let event = projected.as_ref();
     let replay_len_before = event_log.len();
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
     let persistence = if event_log.len() == replay_len_before
@@ -14209,6 +14358,7 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
             let sender = match &message.sender {
                 MessageSender::User => "User",
                 MessageSender::System => "System",
+                MessageSender::Agent { .. } => "Agent",
                 MessageSender::Warning => "Warning",
                 MessageSender::Error => "Error",
                 MessageSender::Assistant { .. } => "Assistant",
@@ -15674,6 +15824,7 @@ fn project_session_history_entries(
     let mut events = Vec::new();
     for (sequence, mut event) in entries {
         project_legacy_native_collaboration_event(&mut event);
+        project_input_sender(&mut event);
         match event {
             ChatEvent::MessageMetadataUpdated(update) => {
                 if !fold_message_metadata_update_into_history_events(&mut events, &update) {

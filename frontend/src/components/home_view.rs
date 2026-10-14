@@ -395,6 +395,7 @@ mod wasm_tests {
     fn add_agent(state: &AppState, host_id: &str) {
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: AgentId("a-1".to_owned()),
                 name: "agent".to_owned(),

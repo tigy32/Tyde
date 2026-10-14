@@ -1732,6 +1732,7 @@ mod wasm_tests {
             let agent_id = AgentId("codex-agent".to_owned());
             state.agents.update(|agents| {
                 agents.push(crate::state::AgentInfo {
+                    tyde_permissions: Default::default(),
                     host_id: "host-a".to_owned(),
                     agent_id: AgentId("claude-agent".to_owned()),
                     name: "Claude collision".to_owned(),
@@ -1751,6 +1752,7 @@ mod wasm_tests {
                     activity_summary: Default::default(),
                 });
                 agents.push(crate::state::AgentInfo {
+                    tyde_permissions: Default::default(),
                     host_id: "host-a".to_owned(),
                     agent_id: agent_id.clone(),
                     name: "Codex chat".to_owned(),
@@ -1808,6 +1810,7 @@ mod wasm_tests {
             });
             state.agents.update(|agents| {
                 agents.push(crate::state::AgentInfo {
+                    tyde_permissions: Default::default(),
                     host_id: "host-a".to_owned(),
                     agent_id: AgentId("terminated-agent".to_owned()),
                     name: "Terminated chat".to_owned(),

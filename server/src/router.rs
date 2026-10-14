@@ -618,6 +618,8 @@ pub(crate) async fn route_client_envelope(
                     Some(
                         protocol::MessageOrigin::HostRestart
                             | protocol::MessageOrigin::Tychat { .. }
+                            | protocol::MessageOrigin::Agent { .. }
+                            | protocol::MessageOrigin::System
                     )
                 ) {
                     return Err(AppError::invalid(
@@ -645,6 +647,8 @@ pub(crate) async fn route_client_envelope(
                     Some(
                         protocol::MessageOrigin::HostRestart
                             | protocol::MessageOrigin::Tychat { .. }
+                            | protocol::MessageOrigin::Agent { .. }
+                            | protocol::MessageOrigin::System
                     )
                 ) {
                     return Err(AppError::invalid(
@@ -720,6 +724,14 @@ pub(crate) async fn route_client_envelope(
                     host_output_stream,
                 )
                 .await;
+            }
+            FrameKind::SetAgentTydePermissions => {
+                let agent_id = parse_agent_id(&envelope.stream)?;
+                let payload: protocol::SetAgentTydePermissionsPayload =
+                    parse_payload(&envelope, "set_agent_tyde_permissions")?;
+                host.set_agent_tyde_permissions(&agent_id, payload.access)
+                    .await
+                    .map_err(|error| AppError::invalid("set_agent_tyde_permissions", error))?;
             }
             FrameKind::SetAgentName => {
                 let stream_path = envelope.stream.clone();

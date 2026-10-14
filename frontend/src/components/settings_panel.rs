@@ -15549,6 +15549,7 @@ mod wasm_tests {
             project: project.clone(),
         }]);
         state.agents.set(vec![AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: "manual-host".into(),
             agent_id: protocol::AgentId("manual-agent".into()),
             name: "Remote worker".into(),

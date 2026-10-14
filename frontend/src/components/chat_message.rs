@@ -228,6 +228,13 @@ pub fn ChatMessageView(
                 true,
                 false,
             ),
+            MessageSender::Agent { agent } => (
+                "chat-card chat-card-agent".to_owned(),
+                format!("{agent} · Agent"),
+                false,
+                false,
+                false,
+            ),
             MessageSender::System => (
                 "chat-card chat-card-system".to_owned(),
                 "System".to_owned(),
@@ -1382,6 +1389,66 @@ mod wasm_tests {
             "long user bubble must respect the 85% width limit; bubble {}px, card {}px",
             long_rect.width(),
             long_card_rect.width(),
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn incoming_agent_and_system_messages_never_render_as_you() {
+        ensure_styles_loaded();
+        let mut entry = user_msg("Ready for review.");
+        entry.message.sender = MessageSender::Agent {
+            agent: "UI worker".to_owned(),
+        };
+        entry.message.origin = Some(protocol::MessageOrigin::Agent {
+            agent_id: Some(protocol::AgentId("worker".to_owned())),
+            name: "UI worker".to_owned(),
+        });
+        let agent = mount_message(entry);
+        let mut entry = user_msg("Workspace changed");
+        entry.message.sender = MessageSender::System;
+        entry.message.origin = Some(protocol::MessageOrigin::System);
+        let system = mount_message(entry);
+        let human = mount_message(user_msg("Ready for review."));
+        next_tick().await;
+        let sender = |container: &HtmlElement| {
+            container
+                .query_selector(".chat-card-sender")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+        };
+        assert_eq!(sender(&agent), "UI worker · Agent");
+        assert_eq!(sender(&system), "System");
+        assert_eq!(sender(&human), "You");
+        let agent_row = agent.query_selector(".chat-card").unwrap().unwrap();
+        let row_bounds = agent_row.get_bounding_client_rect();
+        let viewport = agent.get_bounding_client_rect();
+        assert!(
+            row_bounds.width() >= viewport.width() - 2.0,
+            "Agent input fills the transcript row"
+        );
+        let human_body = human.query_selector(".chat-card-body").unwrap().unwrap();
+        let window = web_sys::window().unwrap();
+        let agent_background = window
+            .get_computed_style(&agent_row)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        let human_background = window
+            .get_computed_style(&human_body)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        assert_ne!(
+            agent_background, human_background,
+            "Agent input cannot use the human-message colour"
+        );
+        assert!(
+            agent_row.query_selector("img").unwrap().is_none(),
+            "No sender avatar"
         );
     }
 

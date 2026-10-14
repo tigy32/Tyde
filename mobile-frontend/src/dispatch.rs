@@ -4129,6 +4129,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 0,
                 &protocol::NewAgentPayload {
+                    tyde_permissions: Default::default(),
                     swarm_membership: None,
                     agent_id: old_agent_id.clone(),
                     name: "Old".to_owned(),
@@ -4189,6 +4190,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 1,
                 &protocol::NewAgentPayload {
+                    tyde_permissions: Default::default(),
                     swarm_membership: None,
                     agent_id: new_agent_id.clone(),
                     name: "Replacement".to_owned(),
@@ -4415,6 +4417,7 @@ mod wasm_tests {
             sort_order: 0,
         };
         let agent_payload = protocol::NewAgentPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: AgentId("a-1".to_owned()),
             name: "Agent One".to_owned(),
@@ -4637,6 +4640,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 0,
                 &protocol::NewAgentPayload {
+                    tyde_permissions: Default::default(),
                     swarm_membership: None,
                     agent_id: agent_id.clone(),
                     name: "Agent One".to_owned(),
@@ -4660,6 +4664,7 @@ mod wasm_tests {
         );
 
         let agent_start = protocol::AgentStartPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: agent_id.clone(),
             name: "Agent One".to_owned(),
@@ -4755,6 +4760,7 @@ mod wasm_tests {
                 FrameKind::NewAgent,
                 seq,
                 &protocol::NewAgentPayload {
+                    tyde_permissions: Default::default(),
                     swarm_membership: None,
                     agent_id: AgentId(agent_id.to_owned()),
                     name: "Agent One".to_owned(),

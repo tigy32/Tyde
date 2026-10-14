@@ -2821,6 +2821,7 @@ mod wasm_tests {
 
     fn agent(name: &str, created_at_ms: u64, fatal: bool) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: HOST.to_owned(),
             agent_id: AgentId(format!("agent-{name}")),
             name: name.to_owned(),

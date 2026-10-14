@@ -605,6 +605,9 @@ impl ProtocolValidator {
                     envelope.stream
                 ),
             )),
+            FrameKind::AgentTydePermissionsChanged => parse_host_payload::<crate::AgentTydePermissionsChangedPayload>(
+                self, envelope, "AgentTydePermissionsChanged",
+            ),
             FrameKind::AgentTurnStateNotify => parse_host_payload::<AgentTurnStateNotifyPayload>(
                 self,
                 envelope,
@@ -1317,6 +1320,36 @@ impl ProtocolValidator {
                         format!("failed to parse AgentActivityChanged payload: {error}"),
                     )
                 })?;
+            }
+            FrameKind::SetAgentTydePermissions => {
+                let _: crate::SetAgentTydePermissionsPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse message access payload: {error}"),
+                        )
+                    })?;
+            }
+            FrameKind::AgentTydePermissionsChanged => {
+                let payload: crate::AgentTydePermissionsChangedPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse message access payload: {error}"),
+                        )
+                    })?;
+                if !state.saw_agent_start || payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        "Message access must target the started agent on this stream".to_owned(),
+                    ));
+                }
             }
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}

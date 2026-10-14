@@ -103,6 +103,8 @@ pub(crate) struct SessionRestoreState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StartupReservation {
     #[serde(default)]
+    pub input_origin: Option<protocol::MessageOrigin>,
+    #[serde(default)]
     pub swarm_membership: Option<protocol::SwarmMembership>,
     pub agent_id: protocol::AgentId,
     pub spawn: protocol::SpawnAgentPayload,
@@ -142,6 +144,8 @@ impl TurnRecovery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub tyde_permissions: protocol::AgentTydePermissions,
     #[serde(default)]
     pub origin: Option<protocol::AgentOrigin>,
     #[serde(default)]
@@ -372,6 +376,7 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    tyde_permissions: Default::default(),
                     origin: None,
                     swarm_membership: swarm_membership.clone(),
                     turn_recovery: None,

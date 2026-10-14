@@ -1952,7 +1952,8 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         .reserve_next_mock_launch(
             "Entering worker",
             MockScript::one(MockTurn::gated_text("Finishing the parent turn", &initial))
-                .with_shutdown_gate(&shutdown),
+                .with_shutdown_gate(&shutdown)
+                .with_user_bubbles(),
         )
         .await;
     let (agent, start) = fixture
@@ -2060,6 +2061,17 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     assert_eq!(saved.workspace_roots, roots);
     continued.release_one();
     let continuation = fixture.finish_turn(&agent).await;
+    assert!(
+        continuation
+            .chat_events()
+            .iter()
+            .any(|event| matches!(event,
+        protocol::ChatEvent::MessageAdded(message)
+            if matches!(message.sender, protocol::MessageSender::System)
+                && message.origin == Some(protocol::MessageOrigin::System))),
+        "Workbench entry continuation is a Tyde system message, not human input"
+    );
+
     assert!(
         continuation
             .chat_events()

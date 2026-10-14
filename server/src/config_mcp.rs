@@ -1,9 +1,9 @@
 //! Built-in `tyde-config` MCP server.
 //!
 //! Exposes host configuration — settings, custom agents, skills, MCP servers,
-//! backend setup status, and host-wide agent lifecycle — as MCP tools. Attached only to spawns of the
-//! builtin Tyde Operator so a user can ask it to inspect and change Tyde
-//! configuration directly. All mutations go through the same `HostHandle`
+//! backend setup status, and host-wide agent lifecycle — as MCP tools. Agents
+//! receive human-assigned role guidance through this surface; roles are advisory
+//! rather than an operating-system security boundary. All mutations go through the same `HostHandle`
 //! methods the protocol handlers use, so connected clients see changes
 //! immediately via the usual notify fan-out.
 
@@ -18,6 +18,7 @@ use protocol::{
     McpServerUpsertPayload, McpTransportConfig, SettingExpectation, SettingOp, SettingsWriteId,
     SettingsWritePayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
 };
+use rmcp::handler::server::tool::Extension;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -288,6 +289,21 @@ struct SendAgentMessageToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct UpsertSteeringToolInput {
+    steering_id: Option<String>,
+    title: String,
+    content: String,
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SteeringIdToolInput {
+    steering_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SettingsWriteToolInput {
     setting: SettingInput,
 }
@@ -453,6 +469,90 @@ where
 #[tool_router]
 impl TydeConfigMcpServer {
     #[tool(
+        description = "Read your human-assigned Tyde permissions and current role guidance before using Tyde controls. Role guidance is not a steering entry and does not interrupt a turn."
+    )]
+    async fn tyde_config_get_permissions(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let caller = self.host.config_mcp_caller(&parts).await?;
+            let role = self.host.tyde_permissions_for_caller(caller.as_ref()).await?;
+            Ok::<_, String>(json!({"tyde_permissions": role, "guidance": crate::agent_control_mcp::tyde_permissions_guidance(role)}))
+        }.await;
+        match result {
+            Ok(value) => ok_json(value),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "List existing steering guidance. Orchestrators may add new entries but must not edit or remove existing ones; Root may maintain any entry."
+    )]
+    async fn tyde_config_list_steering(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.host.list_steering().await {
+            Ok(value) => ok_json(value),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Add new steering for self-improvement, or maintain an existing entry as Root. Omit steering_id to add. Orchestrator must never replace an existing entry. Scope is host, or a project_id. Does not steer or interrupt a live conversation."
+    )]
+    async fn tyde_config_upsert_steering(
+        &self,
+        Parameters(input): Parameters<UpsertSteeringToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let steering = protocol::Steering {
+            id: protocol::SteeringId(
+                input
+                    .steering_id
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            ),
+            title: input.title,
+            content: input.content,
+            scope: input
+                .project_id
+                .map_or(protocol::SteeringScope::Host, |id| {
+                    protocol::SteeringScope::Project(protocol::ProjectId(id))
+                }),
+        };
+        match self
+            .host
+            .upsert_steering(protocol::SteeringUpsertPayload {
+                steering: steering.clone(),
+            })
+            .await
+        {
+            Ok(()) => ok_json(steering),
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
+        description = "Remove an existing steering entry. Only Root role guidance permits removal; Orchestrator adds only. Does not interrupt a live conversation."
+    )]
+    async fn tyde_config_delete_steering(
+        &self,
+        Parameters(input): Parameters<SteeringIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .host
+            .delete_steering(protocol::SteeringDeletePayload {
+                id: protocol::SteeringId(input.steering_id),
+            })
+            .await
+        {
+            Ok(()) => ok_json(json!({"deleted": true})),
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
         description = "List all projects and workbenches on this Tyde host. Use their exact project IDs when creating top-level agents."
     )]
     async fn tyde_config_list_projects(
@@ -496,8 +596,21 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_spawn_agent(
         &self,
+        Extension(parts): Extension<axum::http::request::Parts>,
         Parameters(input): Parameters<SpawnAgentToolInput>,
     ) -> Result<CallToolResult, McpError> {
+        let message_origin = match self.host.config_mcp_caller(&parts).await {
+            Ok(Some(caller)) => match self.host.agent_message_origin(&caller).await {
+                Ok(origin) => origin,
+                Err(error) => return Ok(err_text(error)),
+            },
+            Ok(None) => protocol::MessageOrigin::Agent {
+                agent_id: None,
+                name: "Operator".to_owned(),
+            },
+            Err(error) => return Ok(err_text(error)),
+        };
+
         let request = SpawnRequestInput {
             workspace_roots: input.workspace_roots,
             prompt: input.prompt,
@@ -510,7 +623,7 @@ impl TydeConfigMcpServer {
             access_mode: input.access_mode,
             custom_agent_id: input.custom_agent_id,
         };
-        match do_spawn_agent(&self.host, request, None).await {
+        match do_spawn_agent(&self.host, request, None, message_origin).await {
             Ok(agent) => ok_json(agent),
             Err(error) => Ok(err_text(error)),
         }
@@ -521,8 +634,21 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_send_agent_message(
         &self,
+        Extension(parts): Extension<axum::http::request::Parts>,
         Parameters(input): Parameters<SendAgentMessageToolInput>,
     ) -> Result<CallToolResult, McpError> {
+        let message_origin = match self.host.config_mcp_caller(&parts).await {
+            Ok(Some(caller)) => match self.host.agent_message_origin(&caller).await {
+                Ok(origin) => origin,
+                Err(error) => return Ok(err_text(error)),
+            },
+            Ok(None) => protocol::MessageOrigin::Agent {
+                agent_id: None,
+                name: "Operator".to_owned(),
+            },
+            Err(error) => return Ok(err_text(error)),
+        };
+
         let agent_id = match parse_agent_id(&input.agent_id) {
             Ok(id) => id,
             Err(error) => return Ok(err_text(error)),
@@ -530,7 +656,15 @@ impl TydeConfigMcpServer {
         if input.message.trim().is_empty() {
             return Ok(err_text("message must not be empty"));
         }
-        match do_send_message(&self.host, &agent_id, input.message, input.interrupt).await {
+        match do_send_message(
+            &self.host,
+            &agent_id,
+            input.message,
+            input.interrupt,
+            message_origin,
+        )
+        .await
+        {
             Ok(()) => ok_json(json!({"agent_id": agent_id, "accepted": true})),
             Err(error) => Ok(err_text(error)),
         }
@@ -952,7 +1086,7 @@ impl ServerHandler for TydeConfigMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, check backend setup status, and create/list/message/close live agents across all projects on this host. Global agent tools are distinct from custom-agent templates; ordinary agent-control remains child-scoped. Read current state before changing it, and tell the user exactly what changed."
+                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, check backend setup status, and create/list/message/close live agents across all projects on this host. Global agent tools are distinct from custom-agent templates; Call tyde_config_get_permissions before controlling Tyde and obey the human-assigned role: Agent controls own sub-agents, Orchestrator controls any agent and adds new steering or review aspects, Root may edit or remove anything in Tyde. Roles are behavioral guidance, not a security sandbox. Read current state before changing it, and tell the user exactly what changed."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -977,8 +1111,28 @@ impl ServerHandler for TydeConfigMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let context = ToolCallContext::new(self, request, context);
-        self.tool_router.call(context).await
+        let parts = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .ok_or_else(|| McpError::invalid_params("Missing request context", None))?;
+        let caller = self
+            .host
+            .config_mcp_caller(parts)
+            .await
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut result = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await?;
+        let role = self
+            .host
+            .tyde_permissions_for_caller(caller.as_ref())
+            .await
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        result.content.push(Content::text(
+            crate::agent_control_mcp::tyde_permissions_guidance(role),
+        ));
+        Ok(result)
     }
 }
 

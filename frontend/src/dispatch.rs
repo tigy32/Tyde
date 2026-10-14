@@ -1211,6 +1211,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 let fp_custom_agent_id = payload.custom_agent_id.clone();
                 let fp_backend_kind = payload.backend_kind;
                 let info = AgentInfo {
+                    tyde_permissions: payload.tyde_permissions,
                     host_id: host_id.to_string(),
                     agent_id: payload.agent_id,
                     name: payload.name,
@@ -1377,6 +1378,12 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.name,
                     payload.backend_kind
                 );
+                apply_agent_tyde_permissions(
+                    state,
+                    host_id,
+                    &payload.agent_id,
+                    payload.tyde_permissions,
+                );
                 apply_agent_started(state, host_id, &payload.agent_id, payload.session_id);
             }
             Err(error) => report_dispatch_error(
@@ -1413,6 +1420,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse agent move result: {error}"),
+                ),
+            }
+        }
+        FrameKind::AgentTydePermissionsChanged => {
+            match envelope.parse_payload::<protocol::AgentTydePermissionsChangedPayload>() {
+                Ok(payload) => {
+                    apply_agent_tyde_permissions(state, host_id, &payload.agent_id, payload.access)
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_tyde_permissions_changed payload: {error}"),
                 ),
             }
         }
@@ -4501,6 +4522,22 @@ fn resolve_agent_id(state: &AppState, host_id: &str, stream: &StreamPath) -> Opt
     })
 }
 
+fn apply_agent_tyde_permissions(
+    state: &AppState,
+    host_id: &str,
+    agent_id: &AgentId,
+    access: protocol::AgentTydePermissions,
+) {
+    state.agents.update(|agents| {
+        if let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == *agent_id)
+        {
+            agent.tyde_permissions = access;
+        }
+    });
+}
+
 fn apply_agent_started(
     state: &AppState,
     host_id: &str,
@@ -7231,6 +7268,7 @@ fn set_agent_activity(state: &AppState, agent_id: &AgentId, activity: protocol::
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
     let started = payload.session_id.is_some();
     AgentInfo {
+        tyde_permissions: payload.tyde_permissions,
         host_id: host_id.to_string(),
         agent_id: payload.agent_id,
         name: payload.name,
@@ -7340,6 +7378,7 @@ fn apply_agent_bootstrap(
     for event in payload.events {
         match event {
             AgentBootstrapEvent::AgentStart(inner) => {
+                apply_agent_tyde_permissions(state, host_id, &agent_id, inner.tyde_permissions);
                 apply_agent_started(state, host_id, &agent_id, inner.session_id);
             }
             AgentBootstrapEvent::AgentError(inner) => {
@@ -7715,6 +7754,7 @@ pub(crate) mod restore_fixtures {
         session: Option<&str>,
     ) -> NewAgentPayload {
         NewAgentPayload {
+            tyde_permissions: Default::default(),
             swarm_membership: None,
             agent_id: AgentId(agent.to_owned()),
             name: format!("Agent {agent}"),
@@ -9565,6 +9605,7 @@ mod wasm_tests {
         let stream = StreamPath("/agent/history-malformed-agent/inst".to_owned());
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: agent_id.clone(),
                 name: "History malformed".to_owned(),

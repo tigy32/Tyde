@@ -102,6 +102,10 @@ impl DotsMcpServer {
                     custom_agent_id: None,
                 },
                 None,
+                protocol::MessageOrigin::Agent {
+                    agent_id: None,
+                    name: "ChatGPT".to_owned(),
+                },
             )
             .await,
         )
@@ -160,6 +164,10 @@ impl DotsMcpServer {
                 &input.agent_id,
                 input.message,
                 input.interrupt,
+                protocol::MessageOrigin::Agent {
+                    agent_id: None,
+                    name: "ChatGPT".to_owned(),
+                },
             )
             .await,
         )

@@ -184,6 +184,9 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
             protocol::MessageSender::Assistant { agent } => {
                 ("assistant", "chat-message-assistant", agent.clone())
             }
+            protocol::MessageSender::Agent { agent } => {
+                ("agent", "chat-message-agent", format!("{agent} · Agent"))
+            }
             protocol::MessageSender::System => {
                 ("system", "chat-message-system", "System".to_string())
             }
@@ -490,6 +493,30 @@ mod wasm_tests {
     /// default: the turn + cumulative scopes live behind the tap-to-expand and
     /// are not rendered (not just hidden) while collapsed, so the wide
     /// cumulative figure can never dominate the row.
+    #[wasm_bindgen_test]
+    async fn mobile_input_origins_keep_agent_and_system_names_distinct_from_you() {
+        let mut agent = assistant_entry(None);
+        agent.message.sender = MessageSender::Agent {
+            agent: "UI worker".to_owned(),
+        };
+        let mut system = assistant_entry(None);
+        system.message.sender = MessageSender::System;
+        let mut human = assistant_entry(None);
+        human.message.sender = MessageSender::User;
+        let agent = mount(agent);
+        let system = mount(system);
+        let human = mount(human);
+        next_tick().await;
+        for (container, sender) in [
+            (agent, "UI worker · Agent"),
+            (system, "System"),
+            (human, "You"),
+        ] {
+            let label = container.query_selector(".sender-name").unwrap().unwrap();
+            assert_eq!(label.text_content().unwrap(), sender);
+        }
+    }
+
     #[wasm_bindgen_test]
     async fn mobile_chat_shows_request_only_by_default() {
         let entry = assistant_entry(Some(

@@ -1047,6 +1047,7 @@ struct Supervisor {
 struct InitialTurn {
     provider_message: String,
     user_message: String,
+    origin: Option<protocol::MessageOrigin>,
 }
 
 impl Supervisor {
@@ -1069,7 +1070,7 @@ impl Supervisor {
                 .start_turn(
                     &mut process,
                     &turn.provider_message,
-                    Some(&turn.user_message),
+                    Some((&turn.user_message, turn.origin)),
                 )
                 .await
         {
@@ -1283,7 +1284,7 @@ impl Supervisor {
                 // bubble — the card the user acted on is the record of it.
                 let echo = payload.tool_response.is_none()
                     && payload.origin != Some(protocol::MessageOrigin::HostRestart);
-                let echoed = echo.then_some(payload.message.as_str());
+                let echoed = echo.then_some((payload.message.as_str(), payload.origin));
                 let accepted = self.start_turn(process, &payload.message, echoed).await;
                 if accepted {
                     self.withdraw_questions(&superseded);
@@ -1382,7 +1383,7 @@ impl Supervisor {
         &mut self,
         process: &mut AgyProcess,
         message: &str,
-        echoed_user_message: Option<&str>,
+        echoed_user_message: Option<(&str, Option<protocol::MessageOrigin>)>,
     ) -> bool {
         if self.relaunch_before_next_turn
             && let Err(err) = self.relaunch(process).await
@@ -1402,8 +1403,8 @@ impl Supervisor {
             TranscriptReader::new(&self.brain_dir, &process.conversation_id),
             self.cumulative,
         ));
-        if let Some(user_message) = echoed_user_message {
-            self.inner.emitter.user_message(user_message, None, None);
+        if let Some((user_message, origin)) = echoed_user_message {
+            self.inner.emitter.user_message(user_message, None, origin);
         }
         self.inner.emitter.typing_status_changed(true);
         let message = super::workspace_prompt(message, Some(&self.launch.workspace_roots));
@@ -3081,6 +3082,7 @@ impl AntigravityBackend {
             InitialTurn {
                 provider_message,
                 user_message,
+                origin: input.origin,
             }
         });
 

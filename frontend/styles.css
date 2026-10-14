@@ -3088,6 +3088,41 @@ kbd {
     font-size: 0.9em;
 }
 
+.chat-card-agent {
+    background: color-mix(in srgb, var(--success) 6%, var(--surface-1));
+    border-left: 2px solid var(--success);
+}
+
+.chat-tyde-permissions-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    padding: 6px;
+    width: 28px;
+    height: 28px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.chat-tyde-permissions-toggle:hover:not(:disabled) {
+    background: var(--surface-hover);
+}
+
+.chat-tyde-permissions-toggle:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.agent-tyde-permissions {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
 /* --- System / Warning / Error --- */
 .chat-card-system {
     background: transparent;
@@ -17216,3 +17251,13 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .settings-tychat-footer > .settings-btn {
     margin-left: auto;
 }
+
+.chat-tyde-permissions { position: relative; display: inline-flex; }
+.tyde-permissions-dismiss { position: fixed; inset: 0; border: 0; background: transparent; cursor: default; z-index: 100; }
+.tyde-permissions-menu { position: absolute; top: calc(100% + 6px); right: 0; width: 350px; max-width: calc(100vw - 24px); z-index: 101; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 6px; padding: 8px; box-shadow: 0 5px 16px #0005; }
+.tyde-permissions-heading { color: var(--text-secondary); font-size: 12px; padding: 5px 8px 10px; border-bottom: 1px solid var(--border-primary); }
+.tyde-permissions-menu [role="menuitemradio"] { width: 100%; display: flex; align-items: center; gap: 12px; border: none; background: transparent; color: var(--text-primary); text-align: left; padding: 12px 8px; cursor: pointer; border-radius: 3px; }
+.tyde-permissions-menu [role="menuitemradio"]:hover, .tyde-permissions-menu [role="menuitemradio"]:focus-visible { background: var(--surface-hover); }
+.tyde-permissions-copy { display: flex; flex-direction: column; gap: 4px; flex: 1; font-size: 13px; }
+.tyde-permissions-copy small { color: var(--text-secondary); font-size: 12px; line-height: 1.4; white-space: pre-line; }
+.tyde-permissions-check { width: 14px; color: var(--text-secondary); }

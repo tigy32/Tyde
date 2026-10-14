@@ -3102,6 +3102,7 @@ impl HostHandle {
             };
             let instance_stream = new_instance_stream(&start.agent_id);
             let new_agent = NewAgentPayload {
+                tyde_permissions: start.tyde_permissions,
                 swarm_membership: start.swarm_membership.clone(),
                 agent_id: start.agent_id.clone(),
                 name: start.name.clone(),
@@ -4731,6 +4732,7 @@ impl HostHandle {
         }
         let SpawnAgentContext {
             mut origin,
+            input_origin,
             resolved_spawn_config_override,
             team_context,
             swarm_binding,
@@ -5091,6 +5093,7 @@ impl HostHandle {
                     }
                 };
                 ResolvedSpawnRequest {
+                    tyde_permissions: Default::default(),
                     restoration: restoration.clone(),
                     name: resolved_name,
                     origin,
@@ -5140,6 +5143,7 @@ impl HostHandle {
                     });
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            tyde_permissions: Default::default(),
                             restoration: restoration.clone(),
                             name: resolved_name,
                             origin,
@@ -5196,6 +5200,7 @@ impl HostHandle {
                     });
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            tyde_permissions: Default::default(),
                             restoration: restoration.clone(),
                             name: resolved_name,
                             origin,
@@ -5425,6 +5430,7 @@ impl HostHandle {
                     .join("; ");
                 let combined_startup_warning = (!warnings.is_empty()).then_some(warnings);
                 ResolvedSpawnRequest {
+                    tyde_permissions: record.tyde_permissions,
                     restoration: restoration.clone(),
                     name: resolved_name,
                     origin,
@@ -5488,6 +5494,7 @@ impl HostHandle {
                     resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            tyde_permissions: Default::default(),
                             restoration: restoration.clone(),
                             name: resolved_name,
                             origin: AgentOrigin::User,
@@ -5749,6 +5756,7 @@ impl HostHandle {
                     }
                 };
                 ResolvedSpawnRequest {
+                    tyde_permissions: Default::default(),
                     restoration: restoration.clone(),
                     name: resolved_name,
                     origin: AgentOrigin::User,
@@ -5789,6 +5797,37 @@ impl HostHandle {
         };
 
         let mut request = self.apply_complexity_tier_settings(request).await;
+        if request.resume_session_id.is_none()
+            && request.fork_from_session_id.is_none()
+            && (origin == AgentOrigin::Tychat
+                || (origin == AgentOrigin::User
+                    && request.custom_agent_id.as_ref().is_some_and(|id| {
+                        id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID
+                    })))
+        {
+            request.tyde_permissions = protocol::AgentTydePermissions::Root;
+        }
+        if request
+            .resolved_spawn_config
+            .mcp_servers
+            .iter()
+            .any(|server| server.name == "tyde-config")
+        {
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str("\n\n");
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str(crate::agent_control_mcp::TYDE_PERMISSIONS_INSTRUCTIONS);
+        }
+        if let Some(input) = request.initial_input.as_mut() {
+            input.origin = input_origin.or_else(|| {
+                (!matches!(origin, AgentOrigin::User | AgentOrigin::Tychat))
+                    .then_some(protocol::MessageOrigin::System)
+            });
+        }
         if origin == AgentOrigin::Tychat {
             request.origin = origin;
             request.name = "Tychat agent".into();
@@ -8120,6 +8159,7 @@ impl HostHandle {
                     &registry,
                     &plan,
                     SpawnAgentParams::Resume { session_id, prompt },
+                    protocol::MessageOrigin::User,
                 )
                 .await
                 .map_err(|error| team_member_activation_error(OPERATION, error))
@@ -8175,6 +8215,7 @@ impl HostHandle {
                         access_mode: Default::default(),
                         session_settings: None,
                     },
+                    protocol::MessageOrigin::User,
                 )
                 .await
                 .map_err(|error| team_member_activation_error(OPERATION, error))
@@ -8196,10 +8237,11 @@ impl HostHandle {
                 .map_err(|error| error.to_string())?;
             let registry = state.team_registry.clone();
             let plan = registry
-                .plan_message_member(caller_agent_id, member_id.clone())
+                .plan_message_member(caller_agent_id.clone(), member_id.clone())
                 .await?;
             (registry, plan)
         };
+        let message_origin = self.agent_message_origin(&caller_agent_id).await?;
         match plan.activation.clone() {
             TeamMemberActivation::Reuse { agent_id } => {
                 self.message_bound_team_member(
@@ -8209,7 +8251,7 @@ impl HostHandle {
                     SendMessagePayload {
                         message,
                         images,
-                        origin: Some(protocol::MessageOrigin::AgentControl),
+                        origin: Some(message_origin),
                         tool_response: None,
                     },
                 )
@@ -8228,6 +8270,7 @@ impl HostHandle {
                         session_id,
                         prompt: Some(message),
                     },
+                    message_origin,
                 )
                 .await
             }
@@ -8272,6 +8315,7 @@ impl HostHandle {
                         access_mode: Default::default(),
                         session_settings: None,
                     },
+                    message_origin,
                 )
                 .await
             }
@@ -8296,12 +8340,14 @@ impl HostHandle {
             .await
             .map(|status| status.is_active() || status.blocked_on_user_response)
             .unwrap_or(false);
-        let events = registry
-            .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
-            .await?;
-        self.fan_out_team_registry_events(events).await;
-        let sent = handle.send_input(AgentInput::SendMessage(payload)).await;
-        if !sent {
+        if let Err(error) = handle.deliver_message(payload).await {
+            if self
+                .agent_status_snapshot(&agent_id)
+                .await
+                .is_some_and(|status| !status.terminated)
+            {
+                return Err(error);
+            }
             let events = registry
                 .record_binding_failure(plan.member.id.clone())
                 .await?;
@@ -8311,6 +8357,10 @@ impl HostHandle {
                 plan.member.id
             ));
         }
+        let events = registry
+            .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
+            .await?;
+        self.fan_out_team_registry_events(events).await;
         Ok(TeamMemberMessageOutcome {
             member_id: plan.member.id.clone(),
             agent_id,
@@ -8323,6 +8373,7 @@ impl HostHandle {
         registry: &TeamRegistryHandle,
         plan: &TeamMessagePlan,
         params: SpawnAgentParams,
+        input_origin: protocol::MessageOrigin,
     ) -> Result<TeamMemberMessageOutcome, String> {
         let clear_session_on_failure = matches!(&params, SpawnAgentParams::Resume { .. });
         let payload = SpawnAgentPayload {
@@ -8337,6 +8388,7 @@ impl HostHandle {
                 payload,
                 SpawnAgentContext {
                     origin: AgentOrigin::TeamMember,
+                    input_origin: Some(input_origin),
                     team_context: Some(TeamSpawnContext {
                         team_id: plan.team.id.clone(),
                         team_member_id: plan.member.id.clone(),
@@ -10516,6 +10568,95 @@ impl HostHandle {
             .map_err(|_| AppError::internal("fetch_session_history", anyhow!("stream closed")))
     }
 
+    pub(crate) async fn config_mcp_caller(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<AgentId>, String> {
+        self.state
+            .lock()
+            .await
+            .agent_control_mcp
+            .authenticate(parts)
+    }
+
+    pub(crate) async fn tyde_permissions_for_caller(
+        &self,
+        caller: Option<&AgentId>,
+    ) -> Result<protocol::AgentTydePermissions, String> {
+        match caller {
+            Some(id) => self
+                .agent_handle(id)
+                .await
+                .map(|handle| handle.snapshot().tyde_permissions)
+                .ok_or_else(|| "Tyde permission caller is no longer live".to_owned()),
+            None => Ok(protocol::AgentTydePermissions::Root),
+        }
+    }
+
+    pub(crate) async fn list_steering(&self) -> Result<Vec<protocol::Steering>, String> {
+        self.state.lock().await.steering_store.lock().await.list()
+    }
+
+    pub(crate) async fn agent_message_origin(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<protocol::MessageOrigin, String> {
+        let handle = self
+            .agent_handle(agent_id)
+            .await
+            .ok_or_else(|| "Message sender is no longer live".to_owned())?;
+        let start = handle.snapshot();
+        Ok(protocol::MessageOrigin::Agent {
+            agent_id: Some(start.agent_id),
+            name: start.name,
+        })
+    }
+
+    pub(crate) async fn set_agent_tyde_permissions(
+        &self,
+        agent_id: &AgentId,
+        access: protocol::AgentTydePermissions,
+    ) -> Result<(), String> {
+        let handle = self
+            .agent_handle(agent_id)
+            .await
+            .ok_or_else(|| "Agent is no longer live".to_owned())?;
+        handle.set_tyde_permissions(access).await?;
+        let mut state = self.state.lock().await;
+        let payload = protocol::AgentTydePermissionsChangedPayload {
+            agent_id: agent_id.clone(),
+            access: handle.snapshot().tyde_permissions,
+        };
+        let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+        let prefix = format!("/agent/{agent_id}/");
+        let mut dead_paths = Vec::new();
+        for (path, subscriber) in state.host_streams.iter_mut() {
+            let Some(stream) = subscriber
+                .known_agent_streams
+                .iter()
+                .find(|stream| stream.0.starts_with(&prefix))
+            else {
+                continue;
+            };
+            if subscriber.attached_agent_streams.contains(stream) {
+                continue;
+            }
+            if emit_or_queue_host_frame(
+                subscriber,
+                FrameKind::AgentTydePermissionsChanged,
+                payload.clone(),
+            )
+            .is_err()
+            {
+                dead_paths.push(path.clone());
+            }
+        }
+        for path in dead_paths {
+            state.host_streams.remove(&path);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
         let (agent_handle, agent_control_mcp) = {
             let state = self.state.lock().await;
@@ -11552,6 +11693,7 @@ impl HostHandle {
         &self,
         mut payload: SpawnAgentPayload,
         caller_agent_id: Option<&AgentId>,
+        input_origin: protocol::MessageOrigin,
     ) -> Result<AgentId, String> {
         if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
             if self
@@ -11670,11 +11812,14 @@ impl HostHandle {
                 payload.parent_agent_id = Some(caller_agent_id.clone());
             }
             let agent_id = self
-                .spawn_agent_with_origin_and_config(
+                .spawn_agent_with_origin_config_and_team(
                     payload,
-                    AgentOrigin::Workflow,
-                    None,
-                    Some(workflow.clone()),
+                    SpawnAgentContext {
+                        origin: AgentOrigin::Workflow,
+                        input_origin: Some(input_origin),
+                        workflow: Some(workflow.clone()),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -11683,9 +11828,16 @@ impl HostHandle {
             return Ok(agent_id);
         }
 
-        self.spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
-            .await
-            .map_err(|error| error.to_string())
+        self.spawn_agent_with_origin_config_and_team(
+            payload,
+            SpawnAgentContext {
+                origin: AgentOrigin::AgentControl,
+                input_origin: Some(input_origin),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn resolve_spawn_workspace_roots(
@@ -12148,6 +12300,7 @@ impl HostHandle {
             resolved_spawn_config.unwrap_or_else(|_| ResolvedSpawnConfig::failed_startup());
         resolved_spawn_config.access_mode = definition.summary.coordinator.access_mode;
         let request = ResolvedSpawnRequest {
+            tyde_permissions: Default::default(),
             restoration: None,
             name: format!("Workflow: {}", definition.summary.name),
             origin: AgentOrigin::Workflow,
@@ -12885,6 +13038,10 @@ impl HostHandle {
         let relay_request = RelaySpawnRequest {
             name: request.name.clone(),
             origin: AgentOrigin::BackendNative,
+            input_origin: protocol::MessageOrigin::Agent {
+                agent_id: Some(parent_start.agent_id.clone()),
+                name: parent_start.name.clone(),
+            },
             custom_agent_id: parent_start.custom_agent_id.clone(),
             workflow: None,
             parent_agent_id: parent_start.agent_id.clone(),
@@ -14395,6 +14552,7 @@ impl HostHandle {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "Review Feedback".to_owned());
         let request = ResolvedSpawnRequest {
+            tyde_permissions: Default::default(),
             restoration: None,
             name: name.clone(),
             origin: protocol::AgentOrigin::AgentControl,
@@ -16286,6 +16444,7 @@ fn spawn_host_inner(
 /// Everything a spawn needs beyond the request itself.
 struct SpawnAgentContext {
     origin: AgentOrigin,
+    input_origin: Option<protocol::MessageOrigin>,
     resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
     team_context: Option<TeamSpawnContext>,
     swarm_binding: Option<(SwarmId, SwarmMemberId, SwarmWorkspacePolicy)>,
@@ -16303,6 +16462,7 @@ impl Default for SpawnAgentContext {
     fn default() -> Self {
         Self {
             origin: AgentOrigin::User,
+            input_origin: None,
             resolved_spawn_config_override: None,
             team_context: None,
             swarm_binding: None,
@@ -16818,6 +16978,7 @@ impl HostHandle {
                     spawn,
                     SpawnAgentContext {
                         origin: reservation.origin,
+                        input_origin: reservation.input_origin,
                         workflow: reservation.workflow,
                         restoration: Some(restoration.clone()),
                         ..Default::default()
@@ -18126,23 +18287,6 @@ pub(crate) fn startup_mcp_servers_for_settings(
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
 
-    // The builtin Tyde Operator gets the host-configuration tools; no other
-    // agent does.
-    if custom_agent_id
-        .is_some_and(|id| id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID)
-        && !config_mcp.url.is_empty()
-    {
-        servers.push(StartupMcpServer {
-            name: "tyde-config".to_string(),
-            supports_parallel_tool_calls: false,
-            transport: StartupMcpTransport::Http {
-                url: config_mcp.url.clone(),
-                headers: HashMap::new(),
-                bearer_token_env_var: None,
-            },
-        });
-    }
-
     if settings.tyde_debug_mcp_enabled {
         let mut headers = HashMap::new();
         if let Some(repo_root) = workspace_roots
@@ -18190,6 +18334,23 @@ pub(crate) fn startup_mcp_servers_for_settings(
             supports_parallel_tool_calls: true,
             transport: StartupMcpTransport::Http {
                 url: agent_control_mcp.await_url.clone(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        });
+    }
+
+    if ((settings.tyde_agent_control_mcp_enabled
+        && agent_depth < settings.tyde_agent_control_max_depth)
+        || custom_agent_id
+            .is_some_and(|id| id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID))
+        && !config_mcp.url.is_empty()
+    {
+        servers.push(StartupMcpServer {
+            name: "tyde-config".to_string(),
+            supports_parallel_tool_calls: false,
+            transport: StartupMcpTransport::Http {
+                url: config_mcp.url.clone(),
                 headers: HashMap::new(),
                 bearer_token_env_var: None,
             },
@@ -19109,6 +19270,7 @@ fn emit_new_agent_for_stream(
     activity: AgentActivity,
 ) -> Result<Option<DeferredAgentAttachment>, StreamClosed> {
     let new_agent = NewAgentPayload {
+        tyde_permissions: start.tyde_permissions,
         swarm_membership: start.swarm_membership.clone(),
         agent_id: start.agent_id.clone(),
         name: start.name.clone(),

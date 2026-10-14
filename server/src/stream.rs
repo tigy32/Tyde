@@ -705,6 +705,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::AgentActivitySummary
         | FrameKind::AgentActivityStats
         | FrameKind::AgentActivityChanged
+        | FrameKind::AgentTydePermissionsChanged
         | FrameKind::AgentBackgroundWorkNotify
         | FrameKind::AgentTurnStateNotify
         | FrameKind::TaskTokenUsage
@@ -791,6 +792,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::CancelBackgroundTask
         | FrameKind::SendQueuedMessageNow
         | FrameKind::SetAgentName
+        | FrameKind::SetAgentTydePermissions
         | FrameKind::AgentCompact
         | FrameKind::Interrupt
         | FrameKind::CloseAgent

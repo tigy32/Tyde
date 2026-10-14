@@ -1975,6 +1975,7 @@ mod live_card_wasm_tests {
 
     fn agent_info(id: &str, name: &str, started: bool) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: "host-1".to_owned(),
             agent_id: AgentId(id.to_owned()),
             name: name.to_owned(),

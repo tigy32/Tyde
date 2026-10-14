@@ -172,6 +172,7 @@ mod wasm_tests {
 
     fn child_agent(agent_id: &str, name: &str) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: "host-1".to_owned(),
             agent_id: AgentId(agent_id.to_owned()),
             name: name.to_owned(),

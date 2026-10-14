@@ -3098,6 +3098,7 @@ mod wasm_tests {
         // instance_stream from state.agents — install one.
         state.agents.update(|agents| {
             agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: bound_agent_id.clone(),
                 name: "Manager Agent".to_owned(),
@@ -5735,6 +5736,7 @@ mod wasm_tests {
         });
         state.agents.update(|agents| {
             agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: mgr_agent_id.clone(),
                 name: "Manager Agent".to_owned(),
@@ -5754,6 +5756,7 @@ mod wasm_tests {
                 activity_summary: Default::default(),
             });
             agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: rep_agent_id.clone(),
                 name: "Reporter Agent".to_owned(),
@@ -5994,6 +5997,7 @@ mod wasm_tests {
         let push_agent = |agent_id: &AgentId, stream: &str| {
             state.agents.update(|agents| {
                 agents.push(crate::state::AgentInfo {
+                    tyde_permissions: Default::default(),
                     host_id: host_id.to_owned(),
                     agent_id: agent_id.clone(),
                     name: "Agent".to_owned(),
@@ -6145,6 +6149,7 @@ mod wasm_tests {
         });
         state.agents.update(|agents| {
             agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: mgr_agent_id.clone(),
                 name: "Manager Agent".to_owned(),
@@ -6170,6 +6175,7 @@ mod wasm_tests {
         let rep_agent_id = AgentId("a-rep".to_owned());
         state.agents.update(|agents| {
             agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.to_owned(),
                 agent_id: rep_agent_id.clone(),
                 name: "Reporter Agent".to_owned(),

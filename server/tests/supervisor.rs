@@ -157,7 +157,8 @@ fn is_supervisor_kick(env: &Envelope, stream: &StreamPath) -> bool {
     matches!(
         chat_event_on(env, stream),
         Some(ChatEvent::MessageAdded(message))
-            if matches!(message.sender, MessageSender::User)
+            if matches!(message.sender, MessageSender::System)
+                && message.origin == Some(protocol::MessageOrigin::Supervisor)
                 && message.content.starts_with(SUPERVISOR_MESSAGE_PREFIX)
     )
 }
@@ -627,60 +628,101 @@ async fn transient_supervisor_failure_and_closed_agent_remain_silent() {
 #[tokio::test]
 async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
     let mut fixture = Fixture::new().await;
+    let sender = fixture
+        .spawn("task-sender", "hello __mock_supervisor_done__")
+        .await;
+    fixture.finish_turn(&sender).await;
+    let caller = fixture
+        .agent_control_caller(&sender.new_agent.agent_id)
+        .await;
 
     apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
     apply_supervisor_setting(&mut fixture, "/supervisor/max_kicks_per_task", 1, 3_u32).await;
 
     let agent = spawn_supervised_agent(&mut fixture, "supervised-error-agent", false).await;
     let agent_stream = agent.instance_stream.clone();
-    fixture
-        .mock_by_id(&agent.agent_id)
-        .await
-        .enqueue(MockTurn::error_card(
-            "mock backend emitted error without idle",
-        ))
-        .await;
-    fixture
-        .client
-        .send_message(&agent_stream, "trigger backend error".to_owned())
-        .await
-        .expect("send backend error trigger failed");
-
-    // The supervisor sees the error, kicks the agent, and the kick runs a
-    // real turn (the mock echoes the kick text back).
-    let stream = agent_stream.clone();
-    wait_for_envelope(
-        &mut fixture.client,
-        SUPERVISION_WAIT,
-        "supervisor kick message",
-        |env| is_supervisor_kick(env, &stream),
-    )
-    .await;
-    let stream = agent_stream.clone();
-    wait_for_envelope(
-        &mut fixture.client,
-        SUPERVISION_WAIT,
-        "turn started by the supervisor kick",
-        |env| {
-            is_assistant_message_containing(
-                env,
-                &stream,
-                &format!("mock backend response to: {SUPERVISOR_MESSAGE_PREFIX}"),
+    for task in [
+        "trigger backend error",
+        "new delegated task after exhausted budget",
+    ] {
+        fixture
+            .mock_by_id(&agent.agent_id)
+            .await
+            .enqueue(MockTurn::error_card(
+                "mock backend emitted error without idle",
+            ))
+            .await;
+        let response = reqwest::Client::new()
+            .post(&caller.url)
+            .header("Authorization", &caller.authorization)
+            .header("Accept", "application/json, text/event-stream")
+            .json(
+                &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"tyde_send_agent_message","arguments":{"agent_id":agent.agent_id,
+                    "message":task,"global":true}}}),
             )
-        },
-    )
-    .await;
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(
+            response
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        let input = fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            &agent_stream,
+            "supervised delegated task",
+            |event| matches!(event, ChatEvent::MessageAdded(message) if message.content == task),
+        )
+        .await;
+        assert!(matches!(input, ChatEvent::MessageAdded(message)
+            if matches!(&message.sender, MessageSender::Agent {agent} if agent == &sender.new_agent.name)
+                && matches!(&message.origin, Some(protocol::MessageOrigin::Agent {agent_id:Some(id),name})
+                    if id == &sender.new_agent.agent_id && name == &sender.new_agent.name)));
 
-    // The error is still the latest signal after the kicked turn, so the
-    // supervisor would kick again — but max_kicks_per_task=1 forbids it.
-    let stream = agent_stream.clone();
-    assert_no_envelope(
-        &mut fixture.client,
-        QUIET_WAIT,
-        "second supervisor kick beyond the budget",
-        |env| is_supervisor_kick(env, &stream),
-    )
-    .await;
+        // The supervisor sees the error, kicks the agent, and the kick runs a
+        // real turn (the mock echoes the kick text back).
+        let stream = agent_stream.clone();
+        wait_for_envelope(
+            &mut fixture.client,
+            SUPERVISION_WAIT,
+            "supervisor kick message",
+            |env| is_supervisor_kick(env, &stream),
+        )
+        .await;
+        let stream = agent_stream.clone();
+        wait_for_envelope(
+            &mut fixture.client,
+            SUPERVISION_WAIT,
+            "turn started by the supervisor kick",
+            |env| {
+                is_assistant_message_containing(
+                    env,
+                    &stream,
+                    &format!("mock backend response to: {SUPERVISOR_MESSAGE_PREFIX}"),
+                )
+            },
+        )
+        .await;
+
+        // The error is still the latest signal after the kicked turn, so the
+        // supervisor would kick again — but max_kicks_per_task=1 forbids it.
+        let stream = agent_stream.clone();
+        assert_no_envelope(
+            &mut fixture.client,
+            QUIET_WAIT,
+            "second supervisor kick beyond the budget",
+            |env| is_supervisor_kick(env, &stream),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

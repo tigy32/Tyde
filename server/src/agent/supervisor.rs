@@ -78,10 +78,10 @@ impl SupervisionFailure {
 /// the supervision worker can never desync it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SupervisionContextSnapshot {
-    /// Content of the most recent real user message (supervisor kicks are
-    /// excluded — they carry [`SUPERVISOR_MESSAGE_PREFIX`]).
+    /// Most recent human or delegated task instructions. Server notices and
+    /// typed supervisor follow-ups do not replace the task.
     pub last_user_message: Option<String>,
-    /// Count of real user messages in the whole log. A freshly compacted
+    /// Count of human or delegated instructions. A freshly compacted
     /// replacement agent has exactly one (its bootstrap summary prompt).
     pub user_message_count: u32,
     /// Consecutive supervisor kicks since the last real user message.
@@ -184,26 +184,28 @@ fn observe_message(
     message: &ChatMessage,
 ) {
     match &message.sender {
-        MessageSender::User => {
-            if let Some(kick) = message.content.strip_prefix(SUPERVISOR_MESSAGE_PREFIX) {
-                snapshot.kicks_since_user_message =
-                    snapshot.kicks_since_user_message.saturating_add(1);
-                snapshot.last_kick_message = Some(kick.to_owned());
-                // The reply belonging to the previous kick is not this kick's
-                // reply; the next assistant message is.
-                snapshot.last_reply_to_kick = None;
-            } else {
-                snapshot.last_user_message = Some(message.content.clone());
-                snapshot.user_message_count = snapshot.user_message_count.saturating_add(1);
-                snapshot.kicks_since_user_message = 0;
-                snapshot.last_error_since_user_message = None;
-                snapshot.last_kick_message = None;
-                snapshot.last_reply_to_kick = None;
-                snapshot.auto_compaction_blocked_until_real_user = false;
-                snapshot.supervision_verdict_dormant_until_real_user = false;
-            }
-            // Any new message (real or kick) supersedes an earlier cancel:
-            // work is running again on purpose.
+        MessageSender::System if message.origin == Some(protocol::MessageOrigin::Supervisor) => {
+            snapshot.kicks_since_user_message = snapshot.kicks_since_user_message.saturating_add(1);
+            snapshot.last_kick_message = Some(
+                message
+                    .content
+                    .trim_start_matches(SUPERVISOR_MESSAGE_PREFIX)
+                    .to_owned(),
+            );
+            snapshot.last_reply_to_kick = None;
+            snapshot.cancelled_since_user_message = false;
+            snapshot.stall_interrupt_awaiting_cancel = false;
+            snapshot.last_turn_was_stall_interrupted = false;
+        }
+        MessageSender::User | MessageSender::Agent { .. } => {
+            snapshot.last_user_message = Some(message.content.clone());
+            snapshot.user_message_count = snapshot.user_message_count.saturating_add(1);
+            snapshot.kicks_since_user_message = 0;
+            snapshot.last_error_since_user_message = None;
+            snapshot.last_kick_message = None;
+            snapshot.last_reply_to_kick = None;
+            snapshot.auto_compaction_blocked_until_real_user = false;
+            snapshot.supervision_verdict_dormant_until_real_user = false;
             snapshot.cancelled_since_user_message = false;
             snapshot.stall_interrupt_awaiting_cancel = false;
             snapshot.last_turn_was_stall_interrupted = false;

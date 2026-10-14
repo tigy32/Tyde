@@ -2631,6 +2631,7 @@ mod wasm_tests {
 
     fn make_agent(name: &str, agent_id: &str, project: Option<&str>) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: "h1".to_owned(),
             agent_id: AgentId(agent_id.to_owned()),
             name: name.to_owned(),

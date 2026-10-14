@@ -967,6 +967,7 @@ pub fn ChatView(
                         <ToolOutputModeToggle />
                     </Show>
                     <ReviewChangesButton agent_ref=agent_ref />
+                    <AgentTydePermissionsMenu agent_ref=agent_ref />
                 </div>
                 <TaskListView
                     agent_id=Signal::derive(move || {
@@ -1662,6 +1663,89 @@ fn ContextCompactionBanner(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl In
 /// than scanned as a metric.
 fn compaction_elapsed_text(seconds: u32) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+#[component]
+pub(crate) fn TydePermissionsIcon(
+    permissions: Signal<protocol::AgentTydePermissions>,
+) -> impl IntoView {
+    view! {
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+            stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d=move || match permissions.get() {
+                protocol::AgentTydePermissions::Agent => "M8 2h4v4H8z M2 14h4v4H2z M14 14h4v4h-4z M10 6v4H4v4 M10 10h6v4",
+                protocol::AgentTydePermissions::Orchestrator => "M8 8h4v4H8z M8 1h4v3H8z M1 14h3v3H1z M16 14h3v3h-3z M10 4v4 M8 12l-4 2 M12 12l4 2",
+                protocol::AgentTydePermissions::Root => "M8 2h4l1 3 3 1 2 3-2 3-3 1-1 3H8l-1-3-3-1-2-3 2-3 3-1z M10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6",
+            } />
+        </svg>
+    }
+}
+
+#[component]
+fn AgentTydePermissionsMenu(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let agents = state.agents;
+    let agent = Memo::new(move |_| {
+        let target = agent_ref.get()?;
+        agents.with(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.host_id == target.host_id && agent.agent_id == target.agent_id)
+                .cloned()
+        })
+    });
+    let permissions = Signal::derive(move || {
+        agent
+            .get()
+            .map(|agent| agent.tyde_permissions)
+            .unwrap_or_default()
+    });
+    let open = RwSignal::new(false);
+    let target = Memo::new(move |_| agent_ref.get());
+    Effect::new(move || {
+        // Read the lazy memo so it subscribes to pane identity changes.
+        target.with(|_| open.set(false));
+    });
+    view! {
+        <Show when=move || agent.get().is_some_and(|agent| agent.origin != protocol::AgentOrigin::BackendNative)>
+            <div class="chat-tyde-permissions" on:keydown=move |event: web_sys::KeyboardEvent| {
+                if event.key() == "Escape" { open.set(false); event.stop_propagation(); }
+            }>
+                <button type="button" class="chat-tyde-permissions-toggle" aria-label="Tyde permissions"
+                    aria-haspopup="menu" aria-expanded=move || open.get().to_string()
+                    title=move || format!("Tyde permissions: {}", permissions.get().label())
+                    disabled=move || agent.get().is_none_or(|agent| !agent.started || agent.fatal_error.is_some())
+                    on:click=move |_| open.update(|value| *value = !*value)>
+                    <TydePermissionsIcon permissions=permissions />
+                </button>
+                <Show when=move || open.get()>
+                    <button type="button" class="tyde-permissions-dismiss" aria-label="Close Tyde permissions"
+                        tabindex="-1" on:click=move |_| open.set(false) />
+                    <div class="tyde-permissions-menu" role="menu" aria-label="Tyde permissions">
+                        <div class="tyde-permissions-heading">"Tyde permissions"</div>
+                        {[protocol::AgentTydePermissions::Agent, protocol::AgentTydePermissions::Orchestrator, protocol::AgentTydePermissions::Root]
+                            .into_iter().map(|access| view! {
+                                <button type="button" role="menuitemradio" aria-checked=move || (permissions.get() == access).to_string()
+                                    on:click=move |_| {
+                                        let Some(agent) = agent.get_untracked() else { return; };
+                                        open.set(false);
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            if let Err(error) = send_frame(&agent.host_id, agent.instance_stream, protocol::FrameKind::SetAgentTydePermissions,
+                                                &protocol::SetAgentTydePermissionsPayload { access }).await {
+                                                crate::notices::report_agent_error(&ActiveAgentRef { host_id: agent.host_id, agent_id: agent.agent_id }, &error);
+                                            }
+                                        });
+                                    }>
+                                    <TydePermissionsIcon permissions=Signal::derive(move || access) />
+                                    <span class="tyde-permissions-copy"><span>{access.label()}</span><small>{access.control_description()}</small></span>
+                                    <span class="tyde-permissions-check" aria-hidden="true">{move || if permissions.get() == access { "✓" } else { "" }}</span>
+                                </button>
+                            }).collect_view()}
+                    </div>
+                </Show>
+            </div>
+        </Show>
+    }
 }
 
 /// Cycle button for the global tool-output verbosity setting. Lives on the
@@ -2831,6 +2915,7 @@ mod wasm_tests {
             let state = AppState::new();
             state.agents.update(|agents| {
                 agents.push(AgentInfo {
+                    tyde_permissions: Default::default(),
                     host_id: host_for_mount.clone(),
                     agent_id: agent_id_for_mount.clone(),
                     name: "Manager A".to_owned(),
@@ -2930,6 +3015,7 @@ mod wasm_tests {
 
     fn make_target_agent(host_id: &str, agent_id: &str, project_id: Option<&str>) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: host_id.to_owned(),
             agent_id: AgentId(agent_id.to_owned()),
             name: agent_id.to_owned(),
@@ -2948,6 +3034,316 @@ mod wasm_tests {
             fatal_error: None,
             activity_summary: Default::default(),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn tyde_permissions_menu_is_icon_only_server_driven_and_targets_its_pane() {
+        ensure_styles_loaded();
+        let trace = |phase: &str| {
+            let output = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .get_element_by_id("output")
+                .unwrap();
+            output.set_text_content(Some(&format!(
+                "{}Tyde role DOM phase: {phase}\n",
+                output.text_content().unwrap()
+            )));
+        };
+        struct BridgeFixture;
+        impl Drop for BridgeFixture {
+            fn drop(&mut self) {
+                js_sys::eval("window.__TAURI__ = window.__rolePrevious; delete window.__rolePrevious; delete window.__roleFrames;").unwrap();
+            }
+        }
+        js_sys::eval(r#"window.__rolePrevious = window.__TAURI__; window.__roleFrames = [];
+            window.__TAURI__ = { core: { invoke: (cmd,args) => {
+                if(cmd === 'send_host_line') { const frame = JSON.parse(args.line); if(frame.kind === 'set_agent_tyde_permissions') window.__roleFrames.push({host:args.hostId,frame}); }
+                return Promise.resolve();
+            } } };"#).unwrap();
+        let _bridge = BridgeFixture;
+        let selected = RwSignal::new(Some(ActiveAgentRef {
+            host_id: "role-host-a".to_owned(),
+            agent_id: AgentId("same-agent".to_owned()),
+        }));
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mounted = slot.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            for (host, access) in [
+                ("role-host-a", protocol::AgentTydePermissions::Root),
+                ("role-host-b", protocol::AgentTydePermissions::Agent),
+            ] {
+                crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |bootstrap| {
+                    bootstrap.agents.push(protocol::NewAgentPayload {
+                        swarm_membership: None,
+                        agent_id: AgentId("same-agent".to_owned()),
+                        name: "same-agent".to_owned(),
+                        origin: AgentOrigin::User,
+                        tyde_permissions: access,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        workspace_roots: Vec::new(),
+                        custom_agent_id: None,
+                        team_id: None,
+                        team_member_id: None,
+                        project_id: None,
+                        parent_agent_id: None,
+                        session_id: Some(protocol::SessionId("saved-role-session".to_owned())),
+                        workflow: None,
+                        created_at_ms: 0,
+                        instance_stream: StreamPath("/agent/same-agent".to_owned()),
+                        activity_summary: Default::default(),
+                        activity: protocol::AgentActivity::Idle,
+                    });
+                });
+            }
+            mounted.borrow_mut().replace(state.clone());
+            provide_context(state);
+            let target = Memo::new(move |_| selected.get());
+            view! { <AgentTydePermissionsMenu agent_ref=target.into() /> }
+        });
+        next_tick().await;
+        let state = slot.borrow_mut().take().unwrap();
+        let button: HtmlElement = container
+            .query_selector("button[aria-label='Tyde permissions']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        trace(&format!(
+            "mounted; title={:?}; disabled={:?}",
+            button.get_attribute("title"),
+            button.get_attribute("disabled")
+        ));
+        assert!(button.text_content().unwrap().trim().is_empty());
+        let style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&button)
+            .unwrap()
+            .unwrap();
+        trace(&format!(
+            "style; background={}; border={}",
+            style.get_property_value("background-color").unwrap(),
+            style.get_property_value("border-top-width").unwrap()
+        ));
+        assert_eq!(
+            style.get_property_value("background-color").unwrap(),
+            "rgba(0, 0, 0, 0)"
+        );
+        assert_eq!(style.get_property_value("border-top-width").unwrap(), "0px");
+        let neutral = style.get_property_value("color").unwrap();
+        let choice = |label: &str| -> HtmlElement {
+            let choices = container
+                .query_selector_all("[role='menuitemradio']")
+                .unwrap();
+            (0..choices.length())
+                .map(|i| choices.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
+                .find(|item| item.text_content().unwrap().starts_with(label))
+                .unwrap()
+        };
+        let frame = |index: usize| -> serde_json::Value {
+            serde_wasm_bindgen::from_value(
+                js_sys::eval(&format!("window.__roleFrames[{index}]")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            button.get_attribute("title").unwrap(),
+            "Tyde permissions: Root",
+            "Saved host descriptors render their non-default role before live updates"
+        );
+        button.click();
+        next_tick().await;
+        assert_eq!(
+            choice("Root").get_attribute("aria-checked").unwrap(),
+            "true"
+        );
+        let reload = |access| {
+            crate::dispatch::prime_agent_stream_for_tests(
+                &state,
+                "role-host-a",
+                &StreamPath("/agent/same-agent".to_owned()),
+                &protocol::AgentStartPayload {
+                    swarm_membership: None,
+                    agent_id: AgentId("same-agent".to_owned()),
+                    name: "same-agent".to_owned(),
+                    origin: AgentOrigin::User,
+                    tyde_permissions: access,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    workspace_roots: Vec::new(),
+                    custom_agent_id: None,
+                    team_id: None,
+                    team_member_id: None,
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: Some(protocol::SessionId("saved-role-session".to_owned())),
+                    workflow: None,
+                    created_at_ms: 0,
+                },
+            );
+        };
+        reload(protocol::AgentTydePermissions::Orchestrator);
+        next_tick().await;
+        trace(&format!(
+            "Orchestrator bootstrap; title={:?}; open={:?}",
+            button.get_attribute("title"),
+            button.get_attribute("aria-expanded")
+        ));
+        assert_eq!(
+            button.get_attribute("title").unwrap(),
+            "Tyde permissions: Tyde Orchestrator"
+        );
+        assert_eq!(
+            choice("Tyde Orchestrator")
+                .get_attribute("aria-checked")
+                .unwrap(),
+            "true",
+            "Attached reload/resume bootstrap overrides the earlier host descriptor"
+        );
+        reload(protocol::AgentTydePermissions::Agent);
+        next_tick().await;
+        trace("Agent bootstrap complete");
+        assert_eq!(
+            choice("Agent").get_attribute("aria-checked").unwrap(),
+            "true"
+        );
+        button.click();
+        next_tick().await;
+        let apply = |host: &str, seq, access| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                host,
+                protocol::Envelope::from_payload(
+                    StreamPath(format!("/host/{host}")),
+                    protocol::FrameKind::AgentTydePermissionsChanged,
+                    seq,
+                    &protocol::AgentTydePermissionsChangedPayload {
+                        agent_id: AgentId("same-agent".to_owned()),
+                        access,
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        button.click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all("[role='menuitemradio']")
+                .unwrap()
+                .length(),
+            3
+        );
+        for text in [
+            "Tyde permissions",
+            "Control own sub-agents",
+            "Add new steering and review aspects",
+            "Control any agent + anything in Tyde",
+        ] {
+            assert!(container.text_content().unwrap().contains(text));
+        }
+        choice("Tyde Orchestrator").click();
+        next_tick().await;
+        trace(&format!(
+            "first selection; sent count={:?}",
+            js_sys::eval("window.__roleFrames.length").unwrap().as_f64()
+        ));
+        assert_eq!(frame(0)["host"], "role-host-a");
+        assert_eq!(frame(0)["frame"]["stream"], "/agent/same-agent");
+        assert_eq!(frame(0)["frame"]["payload"]["access"], "orchestrator");
+        button.click();
+        next_tick().await;
+        assert_eq!(
+            choice("Agent").get_attribute("aria-checked").unwrap(),
+            "true",
+            "No optimistic authority change"
+        );
+        apply(
+            "role-host-a",
+            0,
+            protocol::AgentTydePermissions::Orchestrator,
+        );
+        next_tick().await;
+        assert_eq!(
+            choice("Tyde Orchestrator")
+                .get_attribute("aria-checked")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&button)
+                .unwrap()
+                .unwrap()
+                .get_property_value("color")
+                .unwrap(),
+            neutral
+        );
+        trace("live Orchestrator verified; switching hosts");
+        selected.set(Some(ActiveAgentRef {
+            host_id: "role-host-b".to_owned(),
+            agent_id: AgentId("same-agent".to_owned()),
+        }));
+        next_tick().await;
+        trace(&format!(
+            "switched pane; title={:?}; open={:?}",
+            button.get_attribute("title"),
+            button.get_attribute("aria-expanded")
+        ));
+        assert_eq!(button.get_attribute("aria-expanded").unwrap(), "false");
+        assert_eq!(
+            button.get_attribute("title").unwrap(),
+            "Tyde permissions: Agent"
+        );
+        button.click();
+        next_tick().await;
+        choice("Root").click();
+        next_tick().await;
+        trace("second host selection");
+        assert_eq!(frame(1)["host"], "role-host-b");
+        assert_eq!(frame(1)["frame"]["payload"]["access"], "root");
+        apply("role-host-b", 0, protocol::AgentTydePermissions::Root);
+        next_tick().await;
+        assert_eq!(
+            button.get_attribute("title").unwrap(),
+            "Tyde permissions: Root"
+        );
+        selected.set(Some(ActiveAgentRef {
+            host_id: "role-host-a".to_owned(),
+            agent_id: AgentId("same-agent".to_owned()),
+        }));
+        next_tick().await;
+        assert_eq!(
+            button.get_attribute("title").unwrap(),
+            "Tyde permissions: Tyde Orchestrator"
+        );
+        button.click();
+        next_tick().await;
+        trace("demotion selection");
+        choice("Agent").click();
+        next_tick().await;
+        assert_eq!(frame(2)["frame"]["payload"]["access"], "agent");
+        apply("role-host-a", 1, protocol::AgentTydePermissions::Agent);
+        next_tick().await;
+        button.click();
+        next_tick().await;
+        let init = web_sys::KeyboardEventInit::new();
+        trace("escape dismissal");
+        init.set_key("Escape");
+        init.set_bubbles(true);
+        button
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                    .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        assert_eq!(button.get_attribute("aria-expanded").unwrap(), "false");
     }
 
     #[wasm_bindgen_test]

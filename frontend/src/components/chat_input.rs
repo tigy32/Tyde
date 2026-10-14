@@ -2222,6 +2222,7 @@ mod wasm_tests {
         stub_send_host_line();
         let agent_id = AgentId(AGENT.to_owned());
         state.agents.set(vec![AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: HOST.to_owned(),
             agent_id: agent_id.clone(),
             name: "Agent".to_owned(),
@@ -3147,6 +3148,7 @@ mod wasm_tests {
         let agent_b_id = AgentId("agent-2".to_owned());
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: HOST.to_owned(),
                 agent_id: agent_b_id.clone(),
                 name: "Agent B".to_owned(),

@@ -1318,7 +1318,8 @@ async fn team_describe_includes_default_agent_member() {
             ))
             .then(server::backend::mock::MockTurn::text(
                 "team answer continuation",
-            )),
+            ))
+            .with_user_bubbles(),
         )
         .await;
     fixture
@@ -1383,6 +1384,11 @@ async fn team_describe_includes_default_agent_member() {
         .await
         .parse_payload()
         .expect("team bootstrap");
+    assert!(bootstrap.events.iter().any(|event| matches!(event,
+        AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::MessageAdded(message))
+            if message.content == "Ask asynchronously" && matches!(message.sender, protocol::MessageSender::User)
+                && matches!(message.origin, Some(protocol::MessageOrigin::User)))),
+        "Human activation must remain human input, unlike manager delegation");
     let request = bootstrap
         .events
         .iter()
@@ -2576,12 +2582,25 @@ async fn manager_awaits_and_reads_report_answer() {
     let other_manager_agent_id =
         activate_team_member(&mut fixture.client, &other_manager, "other manager agent").await;
 
+    let (name_observer, snapshot) = fixture.connect_with_bootstrap().await;
+    let manager_name = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == manager_agent_id)
+        .unwrap()
+        .name
+        .clone();
+    drop(name_observer);
     let reservation = fixture
         .reserve_next_mock_launch(
             "report",
             server::backend::mock::MockScript::one(server::backend::mock::MockTurn::text(
                 "report verdict: GREEN",
-            )),
+            ))
+            .then(server::backend::mock::MockTurn::text(
+                "reused report verdict",
+            ))
+            .with_user_bubbles(),
         )
         .await;
     let delegated = call_agent_control_tool_json(
@@ -2597,6 +2616,20 @@ async fn manager_awaits_and_reads_report_answer() {
         .expect("team_message_member returns the report agent_id")
         .to_owned();
 
+    let report_new = fixture
+        .next_frame_matching("delegated report publication", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.agent_id.0 == report_agent_id)
+        })
+        .await;
+    let report_new: NewAgentPayload = report_new.parse_payload().unwrap();
+    let input = fixture::next_chat_event_matching_on(&mut fixture.client, &report_new.instance_stream, "delegated report identity", |event|
+        matches!(event, protocol::ChatEvent::MessageAdded(message) if message.content == "Review the change")).await;
+    assert!(matches!(input, protocol::ChatEvent::MessageAdded(message)
+        if matches!(&message.sender, protocol::MessageSender::Agent {agent} if agent == &manager_name)
+            && matches!(&message.origin, Some(protocol::MessageOrigin::Agent {agent_id:Some(id), name}) if id == &manager_agent_id && name == &manager_name)));
     let awaited = tool_result_json(
         &call_agent_control_tool(
             &fixture,
@@ -2684,5 +2717,67 @@ async fn manager_awaits_and_reads_report_answer() {
             tool_result_text(&result).contains("authorization:"),
             "{tool} must fail authorization: {result:?}"
         );
+    }
+    for (task, resume) in [
+        ("Review the follow-up", false),
+        ("Review after resume", true),
+    ] {
+        if resume {
+            fixture
+                .client
+                .close_agent(&report_new.instance_stream)
+                .await
+                .unwrap();
+            fixture
+                .next_frame_matching("park report before resume", |env| {
+                    env.kind == FrameKind::AgentClosed
+                        && env
+                            .parse_payload::<protocol::AgentClosedPayload>()
+                            .is_ok_and(|closed| closed.agent_id == report_new.agent_id)
+                })
+                .await;
+        }
+        let delivered = call_agent_control_tool_json(
+            &fixture,
+            &manager_agent_id,
+            "tyde_team_message_member",
+            json!({"member_id":report.id, "message":task}),
+        )
+        .await;
+        let current_id = AgentId(delivered["agent_id"].as_str().unwrap().to_owned());
+        if !resume {
+            assert_eq!(current_id, report_new.agent_id);
+        }
+        let stream = if resume {
+            fixture
+                .next_frame_matching("resumed report publication", |env| {
+                    env.kind == FrameKind::NewAgent
+                        && env
+                            .parse_payload::<NewAgentPayload>()
+                            .is_ok_and(|agent| agent.agent_id == current_id)
+                })
+                .await
+                .parse_payload::<NewAgentPayload>()
+                .unwrap()
+                .instance_stream
+        } else {
+            report_new.instance_stream.clone()
+        };
+        let input = fixture::next_chat_event_matching_on(&mut fixture.client, &stream, "team follow-up identity", |event|
+            matches!(event, protocol::ChatEvent::MessageAdded(message) if message.content == task)).await;
+        assert!(matches!(input, protocol::ChatEvent::MessageAdded(message)
+            if matches!(&message.sender, protocol::MessageSender::Agent {agent} if agent == &manager_name)
+                && matches!(&message.origin, Some(protocol::MessageOrigin::Agent {agent_id:Some(id),name}) if id == &manager_agent_id && name == &manager_name)));
+        let awaited = tool_result_json(
+            &call_agent_control_tool(
+                &fixture,
+                &manager_agent_id,
+                true,
+                "tyde_await_agents",
+                json!({"agent_ids":[current_id]}),
+            )
+            .await,
+        );
+        assert_eq!(awaited["ready"][0]["status"], "idle");
     }
 }

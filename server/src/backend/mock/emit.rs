@@ -874,6 +874,42 @@ pub(super) async fn agent_control_await(
     )))
 }
 
+pub(super) async fn tyde_permissions(
+    events: &MockEventSender,
+    config: Option<&MockAgentControlAwaitMcp>,
+) -> bool {
+    let result = async {
+        let config = config.ok_or_else(|| "startup config MCP missing".to_owned())?;
+        let response = post_mcp_json(
+            config,
+            &json!({"jsonrpc":"2.0", "id":"mock-role", "method":"tools/call",
+            "params":{"name":"tyde_config_get_permissions","arguments":{}}}),
+        )
+        .await?;
+        if response.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
+            return Err("startup config permission call rejected".to_owned());
+        }
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "startup config permission result missing".to_owned())?;
+        serde_json::from_str::<Value>(text)
+            .map_err(|_| "startup config permission result invalid".to_owned())
+    }
+    .await;
+    let body = match result {
+        Ok(value) => value,
+        Err(error) => json!({"error":error}),
+    };
+    let text = body.to_string();
+    events.send_event(stream_start("mock", Some(MOCK_MODEL.to_owned())))
+        && events.send_event(stream_delta(text.clone()))
+        && events.send_event(stream_end(mock_assistant_message(
+            Some(ChatMessageId(Uuid::new_v4().to_string())),
+            text,
+        )))
+}
+
 pub(super) async fn tychat_send(config: Option<&MockAgentControlAwaitMcp>, text: String) {
     let Some(config) = config else {
         tracing::error!("mock backend has no tyde-tychat MCP server");

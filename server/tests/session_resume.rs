@@ -4011,6 +4011,55 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
         journal.display()
     );
 
+    let legacy_inputs = [
+        (
+            "legacy delegated task",
+            Some(protocol::MessageOrigin::AgentControl),
+            protocol::MessageSender::System,
+        ),
+        (
+            "legacy automated kick",
+            Some(protocol::MessageOrigin::Supervisor),
+            protocol::MessageSender::System,
+        ),
+        (
+            "legacy genuine human input",
+            None,
+            protocol::MessageSender::User,
+        ),
+    ];
+    let mut record: serde_json::Value = serde_json::from_str(intact_lines.last().unwrap()).unwrap();
+    let sequence = record["sequence"].as_u64().unwrap();
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        for (index, (content, origin, _sender)) in legacy_inputs.iter().enumerate() {
+            record["sequence"] = serde_json::json!(sequence + index as u64 + 1);
+            record["event_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+            record["visibility"] = serde_json::json!("visible");
+            record["provider_identity"] = serde_json::Value::Null;
+            record["event"] =
+                serde_json::to_value(ChatEvent::MessageAdded(protocol::ChatMessage {
+                    origin: origin.clone(),
+                    message_id: Some(protocol::ChatMessageId(uuid::Uuid::new_v4().to_string())),
+                    timestamp: 1,
+                    sender: protocol::MessageSender::User,
+                    content: (*content).to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }))
+                .unwrap();
+            writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+        }
+    }
+    let intact_lines = journal_lines(&journal);
     // Exactly what a full disk leaves behind: the leading bytes of a record,
     // with no terminator and no way to finish it. The session id inside it is a
     // sentinel, because every intact record opens with the same field and the
@@ -4054,13 +4103,41 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse resumed AgentBootstrap");
 
     // The history written before the tear is what the tear must not cost.
-    assert_bootstrap_tail_messages(&payload, &["hello"]);
+    assert_bootstrap_tail_messages(
+        &payload,
+        &[
+            "hello",
+            "legacy delegated task",
+            "legacy automated kick",
+            "legacy genuine human input",
+        ],
+    );
+    for (content, origin, sender) in &legacy_inputs {
+        assert!(payload.events.iter().any(|event| matches!(event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                if message.content == *content && message.origin == *origin && matches!((&message.sender, sender), (protocol::MessageSender::System, protocol::MessageSender::System) | (protocol::MessageSender::User, protocol::MessageSender::User)))),
+            "Saved bootstrap must classify old automated input without changing genuine human input or content");
+    }
 
     expect_turn(
         &mut fixture.client,
         "mock backend response to: after resume",
     )
     .await;
+
+    let page = fetch_history_page(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        resumed.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    for (content, origin, sender) in &legacy_inputs {
+        assert!(page.events.iter().any(|event| matches!(event, ChatEvent::MessageAdded(message)
+            if message.content == *content && message.origin == *origin && matches!((&message.sender, sender), (protocol::MessageSender::System, protocol::MessageSender::System) | (protocol::MessageSender::User, protocol::MessageSender::User)))),
+            "Paged history must preserve the same legacy provenance projection as bootstrap");
+    }
 
     // Appending behind torn bytes would bury every later record where no
     // reader can reach it, so the damage has to be gone.
@@ -4147,10 +4224,22 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
             "expected {turn:?} exactly once after the repair, got {contents:?}"
         );
     }
+    // The fixture now also contains three legacy inputs. Preserve the exact
+    // two-turn contract and require each added input once, with no extras.
+    for (content, _, _) in &legacy_inputs {
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|value| value.as_str() == *content)
+                .count(),
+            1,
+            "Each legacy input must survive repair exactly once"
+        );
+    }
     assert_eq!(
         contents.len(),
-        2,
-        "the repaired journal must replay both turns and nothing besides: {contents:?}"
+        2 + legacy_inputs.len(),
+        "Repair must replay exactly the original two turns and the added legacy inputs"
     );
 }
 

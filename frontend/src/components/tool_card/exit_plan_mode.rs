@@ -383,6 +383,7 @@ mod wasm_tests {
         let agent_id = AgentId("agent-1".to_owned());
         state.agents.update(|agents| {
             agents.push(AgentInfo {
+                tyde_permissions: Default::default(),
                 host_id: host_id.clone(),
                 agent_id: agent_id.clone(),
                 name: "Claude".to_owned(),
@@ -422,6 +423,7 @@ mod wasm_tests {
 
     fn agent_info(agent_ref: ActiveAgentRef, stream: &str) -> AgentInfo {
         AgentInfo {
+            tyde_permissions: Default::default(),
             host_id: agent_ref.host_id,
             agent_id: agent_ref.agent_id,
             name: "Agent".to_owned(),

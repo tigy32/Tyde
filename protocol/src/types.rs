@@ -1025,6 +1025,7 @@ pub enum FrameKind {
     CancelBackgroundTask,
     SendQueuedMessageNow,
     SetAgentName,
+    SetAgentTydePermissions,
     AgentCompact,
     Interrupt,
     CloseAgent,
@@ -1140,6 +1141,7 @@ pub enum FrameKind {
     TaskTokenUsage,
     AgentStart,
     AgentRenamed,
+    AgentTydePermissionsChanged,
     AgentCompactNotify,
     ContextCompactionNotify,
     ContextCompactionCapability,
@@ -1246,6 +1248,7 @@ impl fmt::Display for FrameKind {
             Self::CancelBackgroundTask => f.write_str("cancel_background_task"),
             Self::SendQueuedMessageNow => f.write_str("send_queued_message_now"),
             Self::SetAgentName => f.write_str("set_agent_name"),
+            Self::SetAgentTydePermissions => f.write_str("set_agent_tyde_permissions"),
             Self::AgentCompact => f.write_str("agent_compact"),
             Self::Interrupt => f.write_str("interrupt"),
             Self::CloseAgent => f.write_str("close_agent"),
@@ -1356,6 +1359,7 @@ impl fmt::Display for FrameKind {
             Self::TaskTokenUsage => f.write_str("task_token_usage"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
+            Self::AgentTydePermissionsChanged => f.write_str("agent_tyde_permissions_changed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
             Self::ContextCompactionNotify => f.write_str("context_compaction_notify"),
             Self::ContextCompactionCapability => f.write_str("context_compaction_capability"),
@@ -3540,6 +3544,11 @@ pub enum MessageOrigin {
     },
     User,
     AgentControl,
+    Agent {
+        agent_id: Option<AgentId>,
+        name: String,
+    },
+    System,
     Review {
         review_id: ReviewId,
     },
@@ -4426,6 +4435,8 @@ pub struct AgentStartPayload {
     pub agent_id: AgentId,
     pub name: String,
     pub origin: AgentOrigin,
+    #[serde(default)]
+    pub tyde_permissions: AgentTydePermissions,
     pub backend_kind: BackendKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile_id: Option<LaunchProfileId>,
@@ -4457,6 +4468,43 @@ pub struct AgentMoveResultPayload {
     pub request_id: String,
     pub agent_id: AgentId,
     pub result: Result<AgentStartPayload, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTydePermissions {
+    #[default]
+    Agent,
+    Orchestrator,
+    Root,
+}
+
+impl AgentTydePermissions {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "Agent",
+            Self::Orchestrator => "Tyde Orchestrator",
+            Self::Root => "Root",
+        }
+    }
+    pub const fn control_description(self) -> &'static str {
+        match self {
+            Self::Agent => "Control own sub-agents",
+            Self::Orchestrator => "Control any agent\nAdd new steering and review aspects",
+            Self::Root => "Control any agent + anything in Tyde",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetAgentTydePermissionsPayload {
+    pub access: AgentTydePermissions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTydePermissionsChangedPayload {
+    pub agent_id: AgentId,
+    pub access: AgentTydePermissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4782,6 +4830,8 @@ pub struct NewAgentPayload {
     pub agent_id: AgentId,
     pub name: String,
     pub origin: AgentOrigin,
+    #[serde(default)]
+    pub tyde_permissions: AgentTydePermissions,
     pub backend_kind: BackendKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile_id: Option<LaunchProfileId>,
@@ -8184,6 +8234,7 @@ pub enum MessageSender {
     Warning,
     Error,
     Assistant { agent: String },
+    Agent { agent: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
