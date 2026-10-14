@@ -80,7 +80,6 @@ pub fn take_duplicate_tool_completion_count(agent_id: &AgentId) -> u64 {
 }
 
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
-const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a close waits for an interrupted turn to reach idle before it
 /// tears the actor down anyway.
 ///
@@ -3932,7 +3931,6 @@ pub(crate) fn spawn_agent_actor(
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = is_resume;
-        let resume_replay_deadline = tokio::time::Instant::now() + RESUME_REPLAY_BARRIER_TIMEOUT;
         let mut deferred_resume_events = VecDeque::new();
         let mut resume_replay_boundary: Option<Result<(), String>> = None;
         let mut resume_live_turn_seen = false;
@@ -5098,24 +5096,6 @@ pub(crate) fn spawn_agent_actor(
                             Some(event) => event,
                             None => BackendEvent::ResumeReplayComplete(result.clone()),
                         })
-                    } else if resume_replay_gate_pending {
-                        match tokio::time::timeout_at(
-                            resume_replay_deadline,
-                            events.recv_backend(),
-                        ).await {
-                            Ok(event) if tokio::time::Instant::now() < resume_replay_deadline => event,
-                            _ => {
-                                tracing::warn!(
-                                    deferred_events = deferred_resume_events.len(),
-                                    resume_live_turn_seen,
-                                    "resume replay deadline expired before boundary"
-                                );
-                                Some(BackendEvent::ResumeReplayComplete(Err(format!(
-                                    "timed out after {}s waiting for resume replay to complete",
-                                    RESUME_REPLAY_BARRIER_TIMEOUT.as_secs(),
-                                ))))
-                            }
-                        }
                     } else {
                         events.recv_backend().await
                     }

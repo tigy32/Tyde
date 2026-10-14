@@ -18,6 +18,9 @@ from errors, tool results, or history above it. Reproduce backend contract
 violations in real conformance and fix the adapter, not shared server/UI
 workarounds.
 
+Never impose arbitrary timeouts on local work; wait for completion,
+cancellation, or a real error.
+
 ## Branch hygiene: never develop on `main`
 
 `main` is always kept clean. **Do not do active development directly against

@@ -2902,21 +2902,21 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
 }
 
 #[tokio::test]
-async fn resume_replay_deadline_rejects_ready_history_and_late_boundary() {
-    for late_boundary in [true, false] {
+async fn resume_replay_waits_for_boundary_without_local_deadline() {
+    for history_bursts in [true, false] {
         let mut fixture = Fixture::new().await;
         let replay = server::backend::mock::MockResumeReplay::default();
         let source = fixture
             .spawn_scripted(
-                "replay deadline",
+                "delayed replay",
                 MockScript::one(MockTurn::text("completed history"))
                     .with_controlled_resume_replay(&replay),
             )
             .await;
         fixture.finish_turn(&source).await;
         let restarted = fixture.restart_host().await;
-        let restored_id = if let Some(agent) = restarted.agents.first() {
-            agent.agent_id.clone()
+        let restored = if let Some(agent) = restarted.agents.first() {
+            agent.clone()
         } else {
             fixture::next_frame_matching_on(&mut fixture.client, "restored NewAgent", |env| {
                 env.kind == FrameKind::NewAgent
@@ -2924,62 +2924,71 @@ async fn resume_replay_deadline_rejects_ready_history_and_late_boundary() {
             .await
             .parse_payload::<NewAgentPayload>()
             .expect("parse restored NewAgent")
-            .agent_id
         };
         replay.wait_until_started().await;
-        fixture.mock_by_id(&restored_id).await;
+        fixture.mock_by_id(&restored.agent_id).await;
 
         tokio::time::pause();
 
-        // Each burst stays ready across the clock advance. A late marker behind
-        // the final burst must not turn an expired replay into a successful attach.
+        // Slow replay is not a backend failure. Exercise both ready history
+        // and quiet gaps beyond the removed 30s cutoff without a wall-clock wait.
         for _ in 0..2 {
-            replay.history_batch(8);
+            if history_bursts {
+                replay.history_batch(8);
+            }
             tokio::time::advance(Duration::from_secs(10)).await;
-            fixture.mock_by_id(&restored_id).await;
+            fixture.mock_by_id(&restored.agent_id).await;
         }
-        replay.history_batch(8);
-        if late_boundary {
-            replay.complete();
+        if history_bursts {
+            replay.history_batch(8);
         }
-        tokio::time::advance(Duration::from_secs(11)).await;
+        replay.complete();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::time::resume();
+
         let env = fixture::next_frame_matching_on(
             &mut fixture.client,
-            "expired replay eager bootstrap",
-            |env| env.kind == FrameKind::AgentBootstrap,
+            "delayed replay eager bootstrap",
+            |env| env.kind == FrameKind::AgentBootstrap && env.stream == restored.instance_stream,
         )
         .await;
         let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-        let error = bootstrap.events.iter().find_map(|event| match event {
-            AgentBootstrapEvent::AgentError(error) => Some(error),
-            _ => None,
-        });
         assert!(
-            error.is_some(),
-            "ready replay history and a late boundary must not bypass the 30s deadline"
-        );
-        let error = error.expect("fatal replay timeout");
-        assert!(error.fatal);
-        assert_eq!(error.code, protocol::AgentErrorCode::BackendFailed);
-        assert_eq!(
-            error.message,
-            "failed to resume agent history before live replay boundary: timed out after 30s waiting for resume replay to complete"
+            !bootstrap
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentBootstrapEvent::AgentError(_))),
+            "elapsed local replay time must not produce a backend failure"
         );
         assert_bootstrap_has_no_prior_history_indicator(&bootstrap);
-        // The fatal bootstrap retains the saved authoritative StreamEnd.
-        // Require that completed turn, not the unfinished provider replay.
         let messages = bootstrap_message_contents(&bootstrap);
         assert_eq!(messages.len(), 1, "only the saved turn belongs in history");
-        assert_eq!(
-            messages[0], "completed history",
-            "saved history must survive timeout"
+        assert!(
+            messages[0] == "completed history",
+            "saved history must survive delayed replay"
         );
         assert_eq!(
             bootstrap.activity,
             protocol::AgentActivity::Idle,
-            "timed-out replay must not be running"
+            "completed replay must not fabricate a running turn"
         );
-        tokio::time::resume();
+
+        fixture
+            .mock_by_id(&restored.agent_id)
+            .await
+            .enqueue(MockTurn::text("follow-up response"))
+            .await;
+        fixture
+            .client
+            .send_message(&restored.instance_stream, "follow-up".to_owned())
+            .await
+            .expect("send after delayed replay");
+        expect_turn_on_stream(
+            &mut fixture.client,
+            &restored.instance_stream,
+            "follow-up response",
+        )
+        .await;
     }
 }
 
