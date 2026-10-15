@@ -251,9 +251,11 @@ remote roots; SSH sessions cannot be relocated through this operation.
 
 See `backend-conformance.md` for real-provider verification, models, and
 limitations. ACP providers must advertise `session/load`. Claude requires a
-persistent session and a destination trusted by the native CLI;
-its trust-required response is returned as an error without asserting user
-consent. Its native setter also refreshes destination project configuration
+persistent session. Tyde projects are trusted: the adapter passes native
+`trust_accepted` with `trusted_directory` pinned to the validated canonical
+root. The CLI still validates the destination and its permission rules; a
+changed canonical destination is rejected without granting trust to it.
+Its native setter also refreshes destination project configuration
 and relocates the transcript. Hermes waits up to ten seconds for native
 post-turn cleanup when its cwd setter explicitly reports busy without mutation.
 Codex supplies runtime roots on thread creation and stages them in the live
@@ -299,11 +301,10 @@ that flow with two destination roots for every relocating backend and checks
 that it declares `SetMultipleWorkspaceRoots`.
 The scenarios never give the model the destination paths or file contents.
 They require checking runtime cwd before writing; all filesystem assertions
-remain identical across providers. Claude can use a disposable config via
-`TYDE_CONFORMANCE_CLAUDE_FIXTURE_CONFIG` and matching `CLAUDE_CONFIG_DIR`.
-That directory must contain `.claude.json` and a `tyde-conformance-fixture`
-marker. The shared setup trusts only its newly created fixture roots in that
-isolated config; it never changes the user's normal project trust settings.
+remain identical across providers. Every flow creates fresh destination
+directories without pre-trusting them or editing provider configuration.
+Workspace trust must be handled by the production backend adapter, not by
+conformance setup.
 
 The host `AgentMove` operation resolves every destination project root and
 serializes relocation through the agent actor. It rejects active turns,

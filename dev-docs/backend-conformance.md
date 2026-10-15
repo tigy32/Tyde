@@ -92,6 +92,15 @@ identical for all seven `SetWorkspaceRoots` providers, including those without
 background-task support. The completion-overlap flow also uses FIFO handshakes,
 so correctness does not depend on model latency or host load.
 
+The relocation flows use fresh destinations without provider-specific trust
+setup. The previous `trust_fixture_workspace` helper seeded Claude's native
+trust config and masked failure to enter a new project. With that helper
+removed, `real_workspace_relocation::claude` reproduced the native
+`needs_trust` rejection at `Backend::set_workspace_roots`. The Claude adapter
+now supplies native trust consent pinned to the validated canonical root,
+under Tyde's policy that its projects are trusted. Conformance must not seed
+that consent on the adapter's behalf.
+
 ## Typed input origins
 
 `real_mid_turn_steering` passes distinct `MessageOrigin::Tychat` identities in

@@ -3379,7 +3379,6 @@ conformance2_scenario!(
 async fn real_workspace_move_after_background_completion<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let memory = unique_payload();
-    trust_fixture_workspace(&workspace);
     for name in ["relocation-release", "relocation-completed"] {
         let status = std::process::Command::new("mkfifo")
             .arg(workspace.join(name))
@@ -3430,7 +3429,6 @@ async fn real_workspace_move_after_background_completion<B: Backend>(host: &mut 
         "background command must still be running"
     );
     let destination = tempfile::tempdir().expect("relocation destination");
-    trust_fixture_workspace(destination.path());
     let roots = vec![destination.path().to_str().unwrap().to_owned()];
     assert!(
         matches!(
@@ -10424,7 +10422,6 @@ async fn real_multiple_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
 }
 
 async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count: usize) {
-    trust_fixture_workspace(host.workspace());
     let destination = tempfile::Builder::new()
         .prefix("tyde-relocation-")
         .tempdir_in("/tmp")
@@ -10434,7 +10431,6 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
     for index in 0..root_count {
         let root = destination.path().join(format!("root-{index}"));
         std::fs::create_dir(&root).expect("create destination root");
-        trust_fixture_workspace(&root);
         let content = unique_payload();
         std::fs::write(root.join("relocation-source.txt"), &content).expect("seed destination");
         roots.push(root.to_str().expect("UTF-8 root").to_owned());

@@ -2248,28 +2248,6 @@ pub async fn set_session_setting<B: Backend>(
     .await
 }
 
-pub fn trust_fixture_workspace(path: &Path) {
-    let Ok(config_dir) = std::env::var("TYDE_CONFORMANCE_CLAUDE_FIXTURE_CONFIG") else {
-        return;
-    };
-    let config_dir = Path::new(&config_dir);
-    assert!(config_dir.join("tyde-conformance-fixture").is_file());
-    assert_eq!(
-        std::env::var("CLAUDE_CONFIG_DIR").unwrap(),
-        config_dir.to_str().unwrap()
-    );
-    let config_path = config_dir.join(".claude.json");
-    let mut config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&config_path).expect("isolated Claude fixture config"),
-    )
-    .expect("Claude fixture config JSON");
-    let root = path.canonicalize().expect("fixture workspace");
-    config["projects"][root.to_str().unwrap()] =
-        serde_json::json!({"hasTrustDialogAccepted": true});
-    std::fs::write(config_path, serde_json::to_vec(&config).unwrap())
-        .expect("trust disposable fixture workspace");
-}
-
 pub async fn set_workspace_roots<B: Backend>(
     host: &mut Harness<B>,
     roots: Vec<String>,

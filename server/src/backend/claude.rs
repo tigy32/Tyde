@@ -15861,12 +15861,20 @@ impl Backend for ClaudeBackend {
                 request_id.clone(),
                 json!({
                     "type": "control_request", "request_id": request_id,
-                    "request": {"subtype": "set_cwd", "path": cwd},
+                    // Tyde projects are trusted; pin consent to the validated canonical root.
+                    "request": {
+                        "subtype": "set_cwd", "path": cwd,
+                        "trust_accepted": true, "trusted_directory": cwd,
+                    },
                 }),
                 CLAUDE_CONTROL_RESPONSE_TIMEOUT,
             )
             .await
             .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
+        tracing::info!(
+            status = response.get("status").and_then(|status| status.as_str()),
+            "Claude answered trusted workspace relocation"
+        );
         let mut state = inner.state.lock().await;
         match response.get("status").and_then(Value::as_str) {
             Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
@@ -15881,8 +15889,7 @@ impl Backend for ClaudeBackend {
             }
             Some("needs_trust") => {
                 return Err(super::WorkspaceRelocationError::Rejected(format!(
-                    "Claude requires the user to trust destination {} before changing workspace roots",
-                    response.get("directory").unwrap_or(&Value::Null)
+                    "Claude did not accept trust for the validated workspace destination: {response}"
                 )));
             }
             Some("rejected") => {
