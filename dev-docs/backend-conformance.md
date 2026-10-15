@@ -1204,6 +1204,14 @@ native catalogue: this subscription grants Wonder 1.0 and Spark 1.2/1.3,
 with no separate Wonder Full catalogue entry. No unlisted model is advertised
 or substituted.
 
+Home conversations have no selected project roots. Muse maps this explicit
+startup mode to `~/.tyde/muse/no-root`, using the same Tyde-owned working
+directory convention as the other adapters. Project roots still go through
+the existing strict validation. `real_home_conversation` exercises native
+command execution before and after resuming with an empty project-root list;
+the original adapter fails immediately at startup with the relocation-only
+empty-root validation error.
+
 Stable MSP transcript items omit pre-tool commentary. Native experimental
 log paging also rejects retained omission markers. The adapter therefore
 uses one ordered native session ledger for provider response ownership,

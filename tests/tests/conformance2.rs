@@ -9938,6 +9938,66 @@ conformance2_scenario!(
 );
 
 const DELETED_MARKER: &str = "TYDE_DELETED";
+async fn real_home_conversation<B: Backend>(host: &mut Harness<B>) {
+    let proof = host.workspace().join("home-cwd.txt");
+    let prompt = format!(
+        "This is a Home conversation with no project selected. Run this exact shell command \
+         once without changing directory or specifying a tool working directory: \
+         `pwd > {}; printf TYDE_READY`. Then reply with exactly TYDE_READY. Do not inspect \
+         any other files or directories.",
+        proof.display()
+    );
+    let agent = spawn_agent_at_roots(host, Vec::new(), &prompt).await;
+    let launched = collect_turn(host, &agent, &prompt).await;
+    assert_ready_handshake(&launched);
+    assert_every_request_was_declared(&launched);
+    assert_every_request_completed_exactly_once(&launched);
+    assert_streams_are_balanced(&launched);
+    assert_no_error_message("Home startup", launched.events());
+    assert!(
+        launched
+            .tool_requests()
+            .any(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. })),
+        "Home must execute a real command in its native default working directory"
+    );
+    let cwd = std::fs::read_to_string(&proof).expect("Home command must record its native cwd");
+    let cwd = Path::new(cwd.trim());
+    assert!(
+        cwd.is_absolute() && cwd.is_dir(),
+        "Home requires a usable native cwd"
+    );
+    assert!(
+        cwd != host.workspace(),
+        "Home must not acquire the fixture project root"
+    );
+    assert!(
+        cwd != std::env::current_dir().expect("application cwd"),
+        "Home must not inherit the application checkout"
+    );
+    assert!(
+        cwd != Path::new(&std::env::var("HOME").expect("test home")),
+        "Home must not grant the entire user home as its workspace"
+    );
+
+    host.shutdown().await;
+    let resumed = resume_agent_at_roots(host, Vec::new(), &agent.session_id).await;
+    std::fs::remove_file(&proof).expect("remove the first cwd proof before resuming");
+    let continued = ask(host, &resumed, &prompt).await;
+    assert_ready_handshake(&continued);
+    assert_every_request_was_declared(&continued);
+    assert_every_request_completed_exactly_once(&continued);
+    assert_streams_are_balanced(&continued);
+    assert_no_error_message("Home resume", continued.events());
+    let resumed_cwd =
+        std::fs::read_to_string(&proof).expect("resumed Home must execute a fresh command");
+    assert!(
+        Path::new(resumed_cwd.trim()) == cwd,
+        "Home resume must retain its native working directory"
+    );
+}
+
+conformance2_scenario!(real_home_conversation, [BackendCapability::ResumeSession]);
+
 async fn real_conversation<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let payload = unique_payload();

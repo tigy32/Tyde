@@ -61,7 +61,18 @@ impl MuseBackend {
                     .to_owned(),
             );
         }
-        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        tracing::debug!(
+            root_count = workspace_roots.len(),
+            resuming = source.is_some(),
+            fork,
+            "Muse resolving startup workspace"
+        );
+        let roots = if workspace_roots.is_empty() {
+            vec![super::tyde_owned_no_root_cwd("muse")?]
+        } else {
+            workspace_roots
+        };
+        let roots = super::validate_local_workspace_roots(roots)?;
         let cwd = roots
             .first()
             .ok_or("Muse requires a workspace root")?
