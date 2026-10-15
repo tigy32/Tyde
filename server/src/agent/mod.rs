@@ -7171,6 +7171,7 @@ pub(crate) fn spawn_agent_actor(
                                                 (
                                                     protocol::SendMessageToolResponse::AskUserQuestion {
                                                         answer,
+                                                        structured_answers: None,
                                                         ..
                                                     },
                                                     protocol::ToolRequestType::AskUserQuestion { .. },
@@ -7187,6 +7188,16 @@ pub(crate) fn spawn_agent_actor(
                                                 ) => Some(
                                                     "Plan approval cannot include rejection feedback",
                                                 ),
+                                                (
+                                                    protocol::SendMessageToolResponse::AskUserQuestion { structured_answers: Some(answers), .. },
+                                                    protocol::ToolRequestType::AskUserQuestion { questions, .. },
+                                                ) => {
+                                                    let valid = answers.len() == questions.len() && questions.iter().all(|question| {
+                                                        let matches = answers.iter().filter(|answer| question.id.as_ref() == Some(&answer.question_id)).collect::<Vec<_>>();
+                                                        matches.len() == 1 && question.validate_structured_answer(matches[0]).is_ok()
+                                                    });
+                                                    (!valid).then_some("Structured answer does not satisfy the pending questions")
+                                                },
                                                 (
                                                     protocol::SendMessageToolResponse::AskUserQuestion { .. },
                                                     protocol::ToolRequestType::AskUserQuestion { .. },
@@ -11491,6 +11502,7 @@ async fn terminalize_open_tool(
             message: message.to_owned(),
             details: Some(message.to_owned()),
             normalization_failure: None,
+            result: None,
         },
         LiveActivityTerminalStatus::Stopped => ToolExecutionOutcome::Cancelled {
             message: message.to_owned(),

@@ -254,6 +254,7 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Hermes => "backend-badge hermes",
         protocol::BackendKind::Grok => "backend-badge grok",
         protocol::BackendKind::Opencode => "backend-badge opencode",
+        protocol::BackendKind::Muse => "backend-badge muse",
     }
 }
 
@@ -261,7 +262,7 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
 /// alphabetical. Alphabetical order buried the two backends in daily use under
 /// ones that are rarely picked, on every list the user chooses from. This is
 /// the single source of that order; lists that need one sort by it.
-pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 7] = [
+pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 8] = [
     protocol::BackendKind::Codex,
     protocol::BackendKind::Claude,
     protocol::BackendKind::Hermes,
@@ -269,6 +270,7 @@ pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 7] = [
     protocol::BackendKind::Kiro,
     protocol::BackendKind::Grok,
     protocol::BackendKind::Opencode,
+    protocol::BackendKind::Muse,
 ];
 
 /// Position in `BACKENDS_BY_PREFERENCE`, for use as a sort key.
@@ -289,6 +291,7 @@ pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Hermes => "Hermes",
         protocol::BackendKind::Grok => "Grok",
         protocol::BackendKind::Opencode => "OpenCode",
+        protocol::BackendKind::Muse => "Muse",
     }
 }
 
@@ -4285,6 +4288,26 @@ mod wasm_tests {
         fn trace_sidebar_mount(callback: &js_sys::Function);
     }
 
+    #[wasm_bindgen::prelude::wasm_bindgen(
+        inline_js = r#"export function trace_project_entry_errors() {
+            const report = event => {
+                const error = event.error || event.reason;
+                const output = document.getElementById('output');
+                output.textContent += '\nProject-entry browser exception: ' +
+                    (error && error.stack ? error.stack : event.type) + '\n';
+            };
+            window.addEventListener('error', report);
+            window.addEventListener('unhandledrejection', report);
+            return () => {
+                window.removeEventListener('error', report);
+                window.removeEventListener('unhandledrejection', report);
+            };
+        }"#
+    )]
+    extern "C" {
+        fn trace_project_entry_errors() -> js_sys::Function;
+    }
+
     thread_local! {
         static TRACE_SIDEBAR_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -7489,6 +7512,20 @@ mod wasm_tests {
     async fn server_project_entry_moves_the_visible_chat_into_its_workbench() {
         use crate::components::center_zone::CenterZone;
 
+        let trace = |phase: &str| {
+            let output = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .get_element_by_id("output")
+                .unwrap();
+            output.set_text_content(Some(&format!(
+                "{}Project-entry DOM phase: {phase}\n",
+                output.text_content().unwrap()
+            )));
+        };
+        trace("starting");
+        let remove_error_trace = trace_project_entry_errors();
         install_send_stub_with_dialog_ok();
         let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
         storage.remove_item("tyde-composer-draft").unwrap();
@@ -7526,30 +7563,51 @@ mod wasm_tests {
             push_agent_with_scope(&state, "local", id, name, true, Some(project), None);
         }
         apply_show_all_projects(&state);
+        trace("fixture prepared");
         CenterWorkspaceWidth::forget_measurement();
         let mounted = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(mounted.clone());
-            mounted.install_browser_effects();
-            view! { <AgentsPanel /> <CenterZone /> }
+        let mounted_container = container.clone();
+        let mount_result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result = mount_result.clone();
+        let mount = wasm_bindgen::closure::Closure::once(move || {
+            trace("mount entered");
+            let handle = mount_to(mounted_container, move || {
+                provide_context(mounted.clone());
+                trace("installing browser effects");
+                mounted.install_browser_effects();
+                trace("constructing sidebar and workspace views");
+                view! { <AgentsPanel /> <CenterZone /> }
+            });
+            trace("mount returned");
+            *result.borrow_mut() = Some(handle);
         });
+        trace_sidebar_mount(mount.as_ref().unchecked_ref());
+        let _handle = mount_result.borrow_mut().take().unwrap();
         for _ in 0..4 {
             next_tick().await;
         }
+        trace("mount ticks completed");
         for id in ["workbench-note", "source-note"] {
+            trace("opening remembered chat");
             agent_card_el(&container, id).click();
+            trace("remembered-chat click returned");
             for _ in 0..8 {
                 next_tick().await;
             }
+            trace("remembered-chat ticks completed");
         }
+        trace("opening conversation before entry");
         agent_card_el(&container, "worker").click();
+        trace("conversation click returned");
         for _ in 0..8 {
             next_tick().await;
         }
+        trace("conversation ticks completed");
         state
             .composer_untracked()
             .text
             .set("Keep my draft while entering".to_owned());
+        trace("draft set");
         let before = agent_card_el(&container, "worker")
             .closest("[data-project-key]")
             .unwrap()
@@ -7585,6 +7643,7 @@ mod wasm_tests {
             workflow: None,
             created_at_ms: 0,
         };
+        trace("dispatching project assignment");
         dispatch_frame(
             &state,
             "local",
@@ -7593,9 +7652,11 @@ mod wasm_tests {
             0,
             &payload,
         );
+        trace("assignment dispatch returned");
         for _ in 0..8 {
             next_tick().await;
         }
+        trace("assignment ticks completed");
         let after = agent_card_el(&container, "worker")
             .closest("[data-project-key]")
             .unwrap()
@@ -7654,10 +7715,13 @@ mod wasm_tests {
                 == "Keep my draft while entering"),
             "entering preserves the user's visible draft"
         );
+        trace("destination assertions completed; returning to source");
         agent_card_el(&container, "source-note").click();
+        trace("return-to-source click returned");
         for _ in 0..8 {
             next_tick().await;
         }
+        trace("return-to-source ticks completed");
         assert!(
             container
                 .query_selector("[role='tab'][aria-selected='true'][aria-label='Source notes']")
@@ -7673,10 +7737,13 @@ mod wasm_tests {
                 "moved and destination chats must not remain in the source workspace"
             );
         }
+        trace("source assertions completed; reopening moved conversation");
         agent_card_el(&container, "worker").click();
+        trace("reopen click returned");
         for _ in 0..8 {
             next_tick().await;
         }
+        trace("reopen ticks completed");
         assert!(
             container
                 .query_selector("[role='tab'][aria-selected='true'][aria-label='Task worker']")
@@ -7708,9 +7775,15 @@ mod wasm_tests {
                 == "Keep my draft while entering"),
             "the moved draft must also survive returning to its workspace"
         );
+        trace("all assertions completed; dropping mount");
         drop(_handle);
+        trace("mount dropped");
         container.remove();
         storage.remove_item("tyde-composer-draft").unwrap();
+        remove_error_trace
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+        trace("cleanup completed");
     }
 
     /// Clicking an agent that belongs to a different project than the active one

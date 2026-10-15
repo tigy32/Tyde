@@ -513,6 +513,30 @@ fn empty_contents(
     }
 }
 
+pub(crate) async fn discover_tool_names(
+    server: &BridgeServerConfig,
+) -> Result<Vec<String>, String> {
+    let mut client = connect(server).await.map_err(|_| {
+        "Cannot connect to the configured MCP server for native tool-policy discovery".to_owned()
+    })?;
+    let names = client
+        .peer()
+        .list_all_tools()
+        .await
+        .map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect()
+        })
+        .map_err(|_| "Cannot list the configured MCP server's native tools".to_owned());
+    client
+        .close()
+        .await
+        .map_err(|_| "Cannot close the MCP tool-policy discovery connection".to_owned())?;
+    names
+}
+
 async fn connect(server: &BridgeServerConfig) -> Result<RunningService<RoleClient, ()>, String> {
     match &server.transport {
         BridgeTransport::Http { url, headers } => {

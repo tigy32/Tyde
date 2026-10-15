@@ -448,6 +448,7 @@ impl MockActor {
         if let protocol::SendMessageToolResponse::AskUserQuestion {
             tool_call_id,
             answer,
+            structured_answers,
         } = &tool_response
         {
             if !self.pending_async_questions.remove(tool_call_id) {
@@ -463,8 +464,13 @@ impl MockActor {
                     protocol::ToolExecutionCompletedData {
                         tool_call_id: tool_call_id.clone(),
                         outcome: protocol::ToolExecutionOutcome::Succeeded {
-                            result: protocol::ToolExecutionResult::Other {
-                                result: serde_json::json!({"answered": true}),
+                            result: match structured_answers {
+                                Some(answers) => protocol::ToolExecutionResult::AskUserQuestion {
+                                    answers: answers.clone(),
+                                },
+                                None => protocol::ToolExecutionResult::Other {
+                                    result: serde_json::json!({"answered": true}),
+                                },
                             },
                         },
                     },

@@ -5052,6 +5052,8 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
             protocol::SendMessageToolResponse::AskUserQuestion {
                 tool_call_id: tool_call_id.to_owned(),
                 answer: "Rust".to_owned(),
+
+                structured_answers: None,
             }
         };
         let restored_stream = restored_stream.expect("relaunched agent stream");

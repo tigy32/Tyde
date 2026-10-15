@@ -4821,6 +4821,7 @@ fn kiro_tool_execution_outcome(
             message: error.unwrap_or_else(|| "Tool execution failed".to_string()),
             details: (!result.is_null()).then(|| result.to_string()),
             normalization_failure: None,
+            result: None,
         }
     }
 }

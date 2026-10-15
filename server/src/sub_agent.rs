@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use protocol::{
     AgentId, BackendCapacityState, BackendKind, ChatEvent, ModelRequestTokenUsage, SessionId,
@@ -23,6 +24,8 @@ pub struct SubAgentHandle {
     /// metadata may replace an initial generic name through this channel.
     /// Host applies it as a generated alias, so an explicit user rename wins.
     pub name_update_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Descendants are registered under this child, not the outer host parent.
+    pub subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
 }
 
 pub(crate) fn child_name_is_better(current: &str, candidate: &str) -> bool {
@@ -69,6 +72,8 @@ pub(crate) type HostSubAgentSpawnTx = mpsc::UnboundedSender<HostSubAgentSpawnReq
 pub(crate) type HostSubAgentSpawnRx = mpsc::UnboundedReceiver<HostSubAgentSpawnRequest>;
 
 pub(crate) struct HostSubAgentSpawnRequest {
+    pub spawn_tx: HostSubAgentSpawnTx,
+    pub capacity_tx: crate::host::HostCapacityTx,
     pub parent_agent_id: AgentId,
     pub workspace_roots: Vec<String>,
     pub tool_use_id: String,

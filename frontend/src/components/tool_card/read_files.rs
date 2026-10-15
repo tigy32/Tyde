@@ -98,13 +98,15 @@ fn render_result(files: &[protocol::FileInfo], mode: ToolOutputMode) -> impl Int
         <div class="tool-result-file-list">
             {visible.into_iter().map(|f| {
                 let display = short_path(&f.path);
-                let size = format_bytes(f.bytes);
+                let size = f.bytes.map(format_bytes);
                 view! {
                     <div class="tool-result-file">
                         <span class="tool-result-file-icon">"\u{1f4c4}"</span>
                         <span class="tool-result-file-path">{display}</span>
-                        <span class="tool-result-file-sep">"\u{b7}"</span>
-                        <span class="tool-result-file-size">{size}</span>
+                        {size.map(|size| view! {
+                            <span class="tool-result-file-sep">"\u{b7}"</span>
+                            <span class="tool-result-file-size">{size}</span>
+                        })}
                     </div>
                 }
             }).collect::<Vec<_>>()}
@@ -136,9 +138,27 @@ mod wasm_tests {
             files: (0..n)
                 .map(|i| FileInfo {
                     path: format!("/p/file{i}.rs"),
-                    bytes: 1024,
+                    bytes: (i % 2 == 0).then_some(1024),
                 })
                 .collect(),
+        }
+    }
+
+    fn assert_optional_sizes(container: &web_sys::HtmlElement, expected_rows: usize) {
+        let rows = container.query_selector_all(".tool-result-file").unwrap();
+        assert_eq!(rows.length() as usize, expected_rows);
+        for i in 0..expected_rows {
+            let row = rows.get(i as u32).unwrap();
+            let body = row.text_content().unwrap();
+            let path_row = format!("\u{1f4c4}\u{2026}/p/file{i}.rs");
+            if i % 2 == 0 {
+                assert_eq!(body, format!("{path_row}\u{b7}1.0KB"));
+            } else {
+                assert_eq!(
+                    body, path_row,
+                    "an absent size keeps the path without a separator, guessed size or prose"
+                );
+            }
         }
     }
 
@@ -157,6 +177,7 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), 3);
         assert!(!text(&container).contains("more"));
+        assert_optional_sizes(&container, 3);
     }
 
     #[wasm_bindgen_test]
@@ -174,5 +195,6 @@ mod wasm_tests {
         let container = mount(move || render(&req(20), Some(&r), ToolOutputMode::Full));
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), 20);
+        assert_optional_sizes(&container, 20);
     }
 }

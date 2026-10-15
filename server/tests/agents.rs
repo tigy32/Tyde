@@ -1847,6 +1847,7 @@ async fn spawn_user_child(
 
 async fn spawn_parent_with_native_child(
     fixture: &mut Fixture,
+    with_grandchild: bool,
 ) -> (
     NewAgentPayload,
     AgentStartPayload,
@@ -1856,10 +1857,18 @@ async fn spawn_parent_with_native_child(
     let reservation = fixture
         .reserve_next_mock_launch(
             "parent-with-native-child",
-            MockScript::one(
+            MockScript::one(if with_grandchild {
                 MockTurn::text("mock backend response to: parent prompt")
-                    .with_native_child("mock-native-child", "parent prompt"),
-            ),
+                    .with_native_child_and_grandchild(
+                        "mock-native-child",
+                        "parent prompt",
+                        "mock-native-grandchild",
+                        "grandchild task",
+                    )
+            } else {
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_native_child("mock-native-child", "parent prompt")
+            }),
         )
         .await;
     fixture
@@ -3180,7 +3189,7 @@ async fn close_agent_recursively_closes_descendants_first() {
     let mut fixture = Fixture::new().await;
 
     let (parent_new, _parent_start, relay_child_new, _relay_child_start) =
-        spawn_parent_with_native_child(&mut fixture).await;
+        spawn_parent_with_native_child(&mut fixture, false).await;
     let user_child_new = spawn_user_child(
         &mut fixture.client,
         &parent_new.agent_id,
@@ -3870,7 +3879,29 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
 
 #[tokio::test]
 async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier() {
-    let mut fixture = Fixture::new().await;
+    eprintln!("MCP LAUNCH ROUTING phase=fixture-start");
+    // Mock execution does not supply dynamic discovery. Without this fixture
+    // catalog Muse fails startup before the reserved turn can run.
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        mock_backend_discovery: [(
+            BackendKind::Muse,
+            server::backend::mock::MockDiscovery::new(vec![Ok(
+                server::backend::BackendDiscovery {
+                    schema: protocol::SessionSettingsSchema {
+                        backend_kind: BackendKind::Muse,
+                        fields: Vec::new(),
+                        model_resolutions: Default::default(),
+                    },
+                    launch_profiles: Vec::new(),
+                },
+            )]),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    })
+    .await;
+    eprintln!("MCP LAUNCH ROUTING phase=fixture-ready");
     let write_id = fixture
         .client
         .replace_setting(
@@ -3883,6 +3914,7 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
     expect_settings_write_applied(&mut fixture.client, &write_id, "enable Claude").await;
 
     let parent = spawn_agent_control_parent(&mut fixture, "launch-profile-parent").await;
+    eprintln!("MCP LAUNCH ROUTING phase=parent-ready");
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let base_url = fixture.agent_control_http_url().await;
     let options = mcp_list_launch_options(&caller).await;
@@ -4030,9 +4062,23 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
         .as_object()
         .expect("spawn input properties");
     assert!(properties.contains_key("backend_kind"));
+    assert!(
+        properties["backend_kind"]
+            .to_string()
+            .contains("#/$defs/BackendKindInput"),
+        "the advertised backend selector must reference the typed backend enum"
+    );
+    assert!(
+        spawn_tool["inputSchema"]["$defs"]["BackendKindInput"]["enum"]
+            .as_array()
+            .expect("advertised backend choices")
+            .contains(&json!("muse")),
+        "MCP callers must be offered Muse, not forced to select another provider"
+    );
     assert!(properties.contains_key("launch_profile_id"));
     assert!(!properties.contains_key("session_settings"));
     assert!(!properties.contains_key("cost_hint"));
+    eprintln!("MCP LAUNCH ROUTING phase=spawn-schema-verified");
 
     let agent_ids_before = fixture.agent_ids().await;
     let response = mcp_tool_call_as(
@@ -4094,6 +4140,7 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
             .contains_key("cost_hint")
     );
 
+    eprintln!("MCP LAUNCH ROUTING phase=tier-child-spawn");
     let agent_id = mcp_spawn_agent_as(
         &caller,
         json!({
@@ -4107,6 +4154,128 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
     .await;
     let awaited = mcp_await_agent(&caller, &agent_id).await;
     assert_await_result_ready(&awaited, &agent_id, "idle");
+    eprintln!("MCP LAUNCH ROUTING phase=tier-child-idle");
+
+    let config_url = fixture.config_mcp_http_url().await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-enable");
+    let enabled = config_agent_tool(
+        &config_url,
+        "tyde_config_set_setting",
+        json!({
+            "setting": {
+                "setting": "enabled_backends",
+                "enabled_backends": ["claude", "muse"]
+            }
+        }),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&enabled));
+    eprintln!("MCP LAUNCH ROUTING phase=muse-settings-accepted");
+    let mut received_settings = false;
+    let mut received_catalog = false;
+    let mut received_muse_schema = false;
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "MCP-enabled Muse settings, schema and launch catalog",
+        |env| {
+            if env.kind == FrameKind::SessionSchemas {
+                let payload: protocol::SessionSchemasPayload = env.parse_payload().expect("session schemas");
+                for schema in payload.schemas {
+                    match schema {
+                        protocol::SessionSchemaEntry::Ready { schema } if schema.backend_kind == BackendKind::Muse => {
+                            eprintln!("MCP LAUNCH ROUTING phase=muse-schema state=ready");
+                            received_muse_schema = true;
+                        },
+                        protocol::SessionSchemaEntry::Pending { backend_kind: BackendKind::Muse } => {
+                            eprintln!("MCP LAUNCH ROUTING phase=muse-schema state=pending");
+                        },
+                        protocol::SessionSchemaEntry::Unavailable { backend_kind: BackendKind::Muse, .. } => {
+                            panic!("MCP LAUNCH ROUTING phase=muse-schema state=unavailable: simulation discovery must be configured");
+                        },
+                        _ => {},
+                    }
+                }
+            }
+            received_settings |= env.kind == FrameKind::HostSettings
+                && env
+                    .parse_payload::<HostSettingsPayload>()
+                    .is_ok_and(|payload| {
+                        payload.settings.enabled_backends
+                            == vec![BackendKind::Claude, BackendKind::Muse]
+                    });
+            received_catalog |= env.kind == FrameKind::LaunchProfileCatalogNotify
+                && env.parse_payload::<LaunchProfileCatalogPayload>().is_ok_and(|payload| {
+                    payload.catalog.entries.iter().any(|entry| {
+                        matches!(entry, protocol::LaunchProfileEntry::Ready { profile }
+                            if profile.id.0 == "muse:default" && profile.backend_kind == BackendKind::Muse)
+                    })
+                });
+            received_settings && received_catalog && received_muse_schema
+        },
+    )
+    .await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-settings-schema-and-catalog-observed");
+    let options = mcp_list_launch_options(&caller).await;
+    assert!(
+        options["launch_profiles"]
+            .as_array()
+            .expect("current MCP launch choices")
+            .iter()
+            .any(|profile| profile["id"] == "muse:default" && profile["backend_kind"] == "muse")
+    );
+
+    let gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "mcp-muse-child",
+            MockScript::one(MockTurn::text_after_gate("Muse-routed mock child", &gate)),
+        )
+        .await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-child-spawn");
+    let child_id = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-muse"],
+            "prompt": "exercise explicit Muse routing",
+            "backend_kind": "muse",
+            "name": "mcp-muse-child"
+        }),
+    )
+    .await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-child-spawn-accepted");
+    drop(reservation);
+    let child =
+        expect_replayed_new_agent(&mut fixture.client, &child_id, "MCP Muse child NewAgent").await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-child-advertised");
+    assert_eq!(child.backend_kind, BackendKind::Muse);
+    assert_eq!(child.parent_agent_id.as_ref(), Some(&parent.agent_id));
+    assert_eq!(child.origin, AgentOrigin::AgentControl);
+    assert!(
+        child.launch_profile_id.is_none(),
+        "an explicit backend-only launch must stay backend-only"
+    );
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "MCP Muse child AgentStart",
+    )
+    .await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-child-start-observed");
+    assert_eq!(start.backend_kind, BackendKind::Muse);
+    assert_eq!(start.parent_agent_id.as_ref(), Some(&parent.agent_id));
+    assert_eq!(start.launch_profile_id, child.launch_profile_id);
+    gate.release_one();
+    eprintln!("MCP LAUNCH ROUTING phase=muse-script-turn-wait");
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &child.instance_stream,
+        "Muse-routed mock child",
+    )
+    .await;
+    eprintln!("MCP LAUNCH ROUTING phase=muse-script-turn-complete");
+    let awaited = mcp_await_agent(&caller, &child_id).await;
+    assert_await_result_ready(&awaited, &child_id, "idle");
+    eprintln!("MCP LAUNCH ROUTING phase=muse-child-idle");
 }
 
 /// An explicitly configured Hermes launch profile becomes Ready after the
@@ -7507,8 +7676,119 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
 async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     let mut fixture = Fixture::new().await;
 
-    let (parent_new, _parent_start, child_new, child_start) =
-        spawn_parent_with_native_child(&mut fixture).await;
+    let (parent_new, parent_start, child_new, child_start) =
+        spawn_parent_with_native_child(&mut fixture, true).await;
+
+    let host_stream = single_host_stream(&fixture.client);
+    let grandchild_new: NewAgentPayload = loop {
+        if let Some(env) =
+            pop_pending_agent_event(&fixture.client, &host_stream, FrameKind::NewAgent)
+        {
+            break env
+                .parse_payload()
+                .expect("parse pending native grandchild NewAgent");
+        }
+        let env = expect_next_event(&mut fixture.client, "native grandchild NewAgent").await;
+        assert!(
+            !matches!(env.kind, FrameKind::AgentError | FrameKind::AgentClosed),
+            "native grandchild registration must not fail or close an agent"
+        );
+        if env.kind == FrameKind::ChatEvent {
+            assert!(
+                !matches!(env.parse_payload::<ChatEvent>().expect("parse native subtree event"),
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)),
+                "native grandchild registration must not produce an error card"
+            );
+        }
+        if env.kind == FrameKind::NewAgent {
+            break env
+                .parse_payload()
+                .expect("parse native grandchild NewAgent");
+        }
+        push_pending_agent_event(&fixture.client, env);
+    };
+    assert!(
+        grandchild_new.parent_agent_id.as_ref() == Some(&child_new.agent_id),
+        "native grandchild NewAgent must identify its immediate parent, not the root"
+    );
+    let grandchild_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &grandchild_new.instance_stream,
+        "native grandchild AgentStart",
+    )
+    .await;
+    assert_eq!(grandchild_new.origin, AgentOrigin::BackendNative);
+    assert_eq!(grandchild_start.origin, AgentOrigin::BackendNative);
+    assert!(
+        grandchild_start.parent_agent_id.as_ref() == Some(&child_new.agent_id),
+        "native grandchild AgentStart must identify its immediate parent"
+    );
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &grandchild_new.instance_stream,
+        "grandchild task",
+        &child_new,
+    )
+    .await;
+    let grandchild_end = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &grandchild_new.instance_stream,
+        "mock native child response to: grandchild task",
+    )
+    .await;
+    assert_known_turn_usage(&grandchild_end.message.token_usage, 33, 33);
+    let sessions = [
+        parent_start.session_id.as_ref(),
+        child_start.session_id.as_ref(),
+        grandchild_start.session_id.as_ref(),
+    ];
+    assert!(
+        sessions.iter().all(Option::is_some)
+            && sessions
+                .iter()
+                .enumerate()
+                .all(|(index, session)| !sessions[..index].contains(session)),
+        "each native tree node must retain its own distinct session binding"
+    );
+
+    for (parent, child, prompt) in [
+        (&parent_new, &child_new, "parent prompt"),
+        (&child_new, &grandchild_new, "grandchild task"),
+    ] {
+        let request =
+            expect_tool_request_on_stream(&mut fixture.client, &parent.instance_stream, "Task")
+                .await;
+        assert!(
+            matches!(&request.tool_type, ToolRequestType::AgentSpawn {
+            prompt: Some(task), name: Some(name), execution_mode: protocol::AgentExecutionMode::Background,
+        } if task == prompt && name == &child.name),
+            "each spawn tool request must belong to its immediate parent's stream"
+        );
+        loop {
+            let env = expect_chat_event_on_stream(
+                &mut fixture.client,
+                &parent.instance_stream,
+                "native descendant tool link",
+            )
+            .await;
+            let event: ChatEvent = env
+                .parse_payload()
+                .expect("parse native descendant tool link");
+            if let ChatEvent::ToolProgress(progress) = event {
+                assert!(
+                    progress.tool_call_id == request.tool_call_id,
+                    "native descendant progress must decorate its own spawn request"
+                );
+                assert!(
+                    matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(link)
+                    if link.agent_id == child.agent_id && link.agent_name == child.name
+                        && link.completed && link.status == protocol::SubAgentProgressStatus::Completed),
+                    "spawn tool card must link to the child registered by the server"
+                );
+                break;
+            }
+        }
+    }
 
     expect_no_event(
         &mut fixture.client,
@@ -7543,8 +7823,23 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         Some(parent_new.agent_id.0.as_str())
     );
 
-    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    let replayed_child_new = bootstrapped_agent(&bootstrap, &child_new.agent_id);
+    let child_caller = fixture.agent_control_caller(&child_new.agent_id).await;
+    let child_listed = mcp_list_agents(&child_caller).await;
+    assert_eq!(
+        child_listed.as_array().map(Vec::len),
+        Some(1),
+        "native child's control scope must contain only its own descendant"
+    );
+    assert!(
+        mcp_listed_agent(&child_listed, &grandchild_new.agent_id)
+            .get("parent_agent_id")
+            .and_then(Value::as_str)
+            == Some(child_new.agent_id.0.as_str()),
+        "caller-scoped listing must preserve the grandchild's immediate parent"
+    );
+
+    let (mut late_client, eager_bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_child_new = bootstrapped_agent(&eager_bootstrap, &child_new.agent_id);
     assert_eq!(replayed_child_new.origin, AgentOrigin::BackendNative);
     assert_eq!(
         replayed_child_new.parent_agent_id.as_ref(),
@@ -7570,6 +7865,148 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         "mock native child response to: parent prompt",
     )
     .await;
+
+    let (mut observer, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "native-tree-observer",
+    )
+    .await;
+    let root = bootstrapped_agent(&bootstrap, &parent_new.agent_id);
+    assert!(
+        root.parent_agent_id.is_none(),
+        "native descendants must not reparent the root"
+    );
+    assert_eq!(root.origin, AgentOrigin::User);
+    // Lazy mobile bootstraps omit rollups; use the eager subscriber's usage snapshot.
+    let usage = eager_bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent_new.agent_id)
+        .expect("native tree task usage in host bootstrap");
+    assert_known_task_status(&usage.total.status);
+    assert_known_task_scope(&usage.self_usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(usage.descendant_count, 2);
+    assert_eq!(
+        usage.descendant_usage.usage.total_tokens,
+        MOCK_NATIVE_CHILD_TOKEN_TOTAL + 33
+    );
+    assert_eq!(
+        usage.total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL + MOCK_NATIVE_CHILD_TOKEN_TOTAL + 33
+    );
+    assert_eq!(usage.breakdown.len(), 3);
+
+    for (agent, parent, depth, own_usage, response, task) in [
+        (
+            &parent_new,
+            None,
+            0,
+            MOCK_TURN_TOKEN_TOTAL,
+            "mock backend response to: parent prompt",
+            Some((&child_new, "parent prompt")),
+        ),
+        (
+            &child_new,
+            Some(&parent_new),
+            1,
+            MOCK_NATIVE_CHILD_TOKEN_TOTAL,
+            "mock native child response to: parent prompt",
+            Some((&grandchild_new, "grandchild task")),
+        ),
+        (
+            &grandchild_new,
+            Some(&child_new),
+            2,
+            33,
+            "mock native child response to: grandchild task",
+            None,
+        ),
+    ] {
+        let descriptor = bootstrapped_agent(&bootstrap, &agent.agent_id);
+        assert!(
+            descriptor.parent_agent_id.as_ref() == parent.map(|entry| &entry.agent_id),
+            "replayed native tree must preserve immediate parent identities"
+        );
+        let entry = usage
+            .breakdown
+            .iter()
+            .find(|entry| entry.agent_id == agent.agent_id)
+            .expect("native tree usage entry");
+        assert_eq!(entry.depth, depth);
+        assert!(
+            entry.parent_agent_id.as_ref() == parent.map(|entry| &entry.agent_id),
+            "task usage must attribute each node to its immediate parent"
+        );
+        assert_known_task_scope(&entry.usage, own_usage);
+
+        fixture::send_load_agent_on(&mut observer, &descriptor.instance_stream).await;
+        let replay: AgentBootstrapPayload =
+            fixture::next_frame_matching_on(&mut observer, "native tree agent replay", |env| {
+                env.kind == FrameKind::AgentBootstrap && env.stream == descriptor.instance_stream
+            })
+            .await
+            .parse_payload()
+            .expect("parse native tree agent replay");
+        let messages = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                    if matches!(message.sender, MessageSender::Assistant { .. }) =>
+                {
+                    Some(message)
+                }
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => Some(&end.message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages.len(),
+            1,
+            "each transcript must contain only its own assistant response"
+        );
+        assert!(
+            messages[0].content == response,
+            "native descendant output must not bleed into an ancestor or sibling transcript"
+        );
+        assert_known_turn_usage(&messages[0].token_usage, own_usage, own_usage);
+        if let Some(parent) = parent {
+            assert!(replay.events.iter().any(|event| matches!(event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                    if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
+                        && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. })
+                            if id == &parent.agent_id))),
+                "descendant transcript must attribute its input to the immediate parent");
+        }
+        let requests = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(request)) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests.len(),
+            usize::from(task.is_some()),
+            "spawn tool requests must not leak from descendants into an ancestor transcript"
+        );
+        if let Some((child, prompt)) = task {
+            assert!(
+                matches!(&requests[0].tool_type, ToolRequestType::AgentSpawn { prompt: Some(actual), .. }
+                if actual == prompt),
+                "replayed spawn card must retain its own task"
+            );
+            assert!(
+                replay.events.iter().any(|event| matches!(event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+                    if progress.tool_call_id == requests[0].tool_call_id
+                        && matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(link)
+                            if link.agent_id == child.agent_id))),
+                "replayed spawn card must link only to the immediate child"
+            );
+        }
+    }
 }
 
 /// A backend-native relay child accepts no direct input of any kind: a
@@ -7582,7 +8019,7 @@ async fn backend_native_child_rejects_direct_input_and_resume() {
     let mut fixture = Fixture::new().await;
 
     let (parent, _parent_start, child, _child_start) =
-        spawn_parent_with_native_child(&mut fixture).await;
+        spawn_parent_with_native_child(&mut fixture, false).await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let initially_ready = mcp_await_agent(&caller, &child.agent_id).await;
     assert_eq!(initially_ready["ready"][0]["status"], "idle");

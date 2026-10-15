@@ -402,6 +402,7 @@ impl MockTurn {
                 busy_native_child: Some(MockNativeChild {
                     name: child_name.into(),
                     prompt: child_prompt.into(),
+                    grandchild: None,
                     lifecycle: MockChildLifecycle::CompleteAndRetain,
                 }),
                 gate: Some(gate.gate()),
@@ -569,6 +570,7 @@ impl MockTurn {
         steps.push(MockStep::SpawnNativeChild(MockNativeChild {
             name: child_name.into(),
             prompt: child_prompt.into(),
+            grandchild: None,
             lifecycle: MockChildLifecycle::LiveUntilInterrupt,
         }));
         Self::held(steps, true)
@@ -587,6 +589,7 @@ impl MockTurn {
                         question: "Choose a color".to_owned(),
                         header: None,
                         options: Vec::new(),
+                        answer_schema: None,
                         multi_select: false,
                     }],
                 },
@@ -615,6 +618,35 @@ impl MockTurn {
             gate_before_completion: None,
             gate_after_completion: None,
         });
+        turn
+    }
+
+    pub fn structured_question_request(
+        tool_call_id: &str,
+        questions: Vec<protocol::AskUserQuestion>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        let mut turn = Self::blocking_question_request(tool_call_id, gate);
+        let MockTurnBody::Steps(steps) = &mut turn.body else {
+            unreachable!("blocking question turn has steps");
+        };
+        let request = steps
+            .iter_mut()
+            .find_map(|step| match step {
+                MockStep::Emit(event) => match &mut **event {
+                    BackendEvent::Chat(protocol::ChatEvent::ToolRequest(request)) => Some(request),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("blocking question turn has a request");
+        let protocol::ToolRequestType::AskUserQuestion {
+            questions: pending, ..
+        } = &mut request.tool_type
+        else {
+            unreachable!("blocking question turn asks a question");
+        };
+        *pending = questions;
         turn
     }
 
@@ -828,7 +860,26 @@ impl MockTurn {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             name: child_name.into(),
             prompt: child_prompt.into(),
+            grandchild: None,
             lifecycle: MockChildLifecycle::CompleteAndRetain,
+        })])
+    }
+
+    pub fn with_native_child_and_grandchild(
+        self,
+        child_name: impl Into<String>,
+        child_prompt: impl Into<String>,
+        grandchild_name: impl Into<String>,
+        grandchild_prompt: impl Into<String>,
+    ) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            name: child_name.into(),
+            prompt: child_prompt.into(),
+            lifecycle: MockChildLifecycle::CompleteAndRetain,
+            grandchild: Some(MockNativeGrandchild {
+                name: grandchild_name.into(),
+                prompt: grandchild_prompt.into(),
+            }),
         })])
     }
 
@@ -840,6 +891,7 @@ impl MockTurn {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             name: child_name.into(),
             prompt: child_prompt.into(),
+            grandchild: None,
             lifecycle: MockChildLifecycle::CompleteAndDrop,
         })])
     }
@@ -1123,6 +1175,13 @@ pub(super) struct MockNativeChild {
     pub(super) name: String,
     pub(super) prompt: String,
     pub(super) lifecycle: MockChildLifecycle,
+    pub(super) grandchild: Option<MockNativeGrandchild>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MockNativeGrandchild {
+    pub(super) name: String,
+    pub(super) prompt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -669,9 +669,11 @@ PY
 # JS-side stack frames lose Rust source mapping, and those already printed as
 # wasm function offsets.
 #
-# Scoped to this script so native builds keep full debug info. An explicit
-# RUSTFLAGS from the environment wins, so a debugging session can opt back in.
-export RUSTFLAGS="${RUSTFLAGS:--C debuginfo=0}"
+# Scoped to this script so native builds keep their debug info. Cargo treats
+# RUSTFLAGS as a replacement for target rustflags, including the configured
+# WASM stack size. Profile defaults keep those flags and explicit user settings.
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG-0}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG-0}"
 
 export WASM_BINDGEN_TEST_TIMEOUT=18446744073709551615
 

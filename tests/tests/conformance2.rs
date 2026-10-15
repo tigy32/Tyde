@@ -68,6 +68,7 @@ macro_rules! conformance2_scenario {
             use super::*;
             fn eligible<B: Backend>() -> bool {
                 let required: &[BackendCapability] = &[$($requirement),*];
+                B::capabilities().validate().expect("backend capability declaration must be consistent");
                 let native_skills = stringify!($scenario) != "real_skills"
                     || B::skill_delivery() == server::backend::SkillDelivery::NativeDiscovery;
                 let eligible = native_skills && required.iter().all(|capability| B::capabilities().contains(*capability));
@@ -157,7 +158,7 @@ macro_rules! conformance2_scenario {
                 } else if stringify!($scenario).starts_with("real_excludes_ask_user_tools") {
                     let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-astra".to_owned());
                     Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
-                } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question") {
+                } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question") {
                     // Luna exposes only the blocking tool; Astra exposes async questions.
                     let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-astra".to_owned());
                     Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
@@ -173,7 +174,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins"
+                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -194,9 +195,17 @@ macro_rules! conformance2_scenario {
                 )
             );
             provider!(
+                muse,
+                server::backend::muse::MuseBackend,
+                {
+                    let model = std::env::var("TYDE_MUSE_TEST_MODEL").unwrap_or_else(|_| "muse-spark-1.3".to_owned());
+                    Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
+                }
+            );
+            provider!(
                 opencode,
                 server::backend::opencode::OpencodeBackend,
-                if matches!(stringify!($scenario), "real_image_input" | "real_mcp_image_result") {
+                if matches!(stringify!($scenario), "real_image_input" | "real_image_input_history" | "real_mcp_image_result" | "real_mcp_image_lifecycle" | "real_mcp_image_text_fidelity") {
                     // Big Pickle, the default, declares no image input.
                     Profile::new(
                         &["opencode/mimo-v2.6-flash-free"],
@@ -1777,7 +1786,7 @@ conformance2_scenario!(
     [BackendCapability::GenericGenerateImage]
 );
 
-async fn real_image_input<B: Backend>(host: &mut Harness<B>) {
+async fn prepare_image_input<B: Backend>(host: &mut Harness<B>) -> (Agent, Turn, Turn, ImageData) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
@@ -1799,7 +1808,7 @@ async fn real_image_input<B: Backend>(host: &mut Harness<B>) {
     });
     assert_eq!(
         echoed.cloned(),
-        Some(vec![image]),
+        Some(vec![image.clone()]),
         "{}: the user-visible message did not retain the submitted image",
         viewed.label()
     );
@@ -1817,9 +1826,46 @@ async fn real_image_input<B: Backend>(host: &mut Harness<B>) {
         viewed.label()
     );
 
-    let turns = [launched, viewed];
-    assert_universal_contract(&turns);
+    (agent, launched, viewed, image)
+}
+
+async fn real_image_input<B: Backend>(host: &mut Harness<B>) {
+    let (agent, launched, viewed, _) = prepare_image_input(host).await;
+    assert_universal_contract(&[launched, viewed]);
     assert_clean_close(host, &agent).await;
+}
+
+async fn real_image_input_history<B: Backend>(host: &mut Harness<B>) {
+    let (agent, launched, viewed, image) = prepare_image_input(host).await;
+    assert_universal_contract(&[launched, viewed]);
+    assert_clean_close(host, &agent).await;
+    let stored = stored_session(host).await;
+    let resumed = resume_agent(host, &stored.id).await;
+    let images = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) => {
+                message.images.as_ref()
+            }
+            _ => None,
+        })
+        .filter(|images| !images.is_empty())
+        .collect::<Vec<_>>();
+    tracing::debug!(image_messages = images.len(), "User image replay inventory");
+    assert!(
+        matches!(images.as_slice(), [actual] if **actual == vec![image]),
+        "resumed user image history must retain exactly one message with the original pixels and media type"
+    );
+    let continued = ask(
+        host,
+        &resumed,
+        "Reply with exactly CONTINUED and no other text. Do not use any tools.",
+    )
+    .await;
+    assert_final_text_contains(&continued, "CONTINUED");
+    assert_universal_contract(&[continued]);
+    assert_clean_close(host, &resumed).await;
 }
 
 async fn real_watched_command_shows_every_interaction<B: Backend>(host: &mut Harness<B>) {
@@ -1909,7 +1955,7 @@ async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
     // the first turn's evidence.
     let single = unique_payload();
     let before_single = mcp_journal(&journal).len();
-    let called = ask(host, &agent, mcp_probe_prompt(&single)).await;
+    let called = ask(host, &agent, mcp_probe_prompt(host.backend(), &single)).await;
     assert_mcp_calls_reached_the_server(&called, &journal, before_single, &[&single]);
     assert_mcp_results_came_back(&called, &[&single]);
     assert_final_text_contains(&called, &format!("{MCP_RESULT_PREFIX}{single}"));
@@ -1917,7 +1963,12 @@ async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
 
     let (first, second) = (unique_payload(), unique_payload());
     let before_twice = mcp_journal(&journal).len();
-    let twice = ask(host, &agent, mcp_probe_twice_prompt(&first, &second)).await;
+    let twice = ask(
+        host,
+        &agent,
+        mcp_probe_twice_prompt(host.backend(), &first, &second),
+    )
+    .await;
     assert_mcp_calls_reached_the_server(&twice, &journal, before_twice, &[&first, &second]);
     assert_mcp_results_came_back(&twice, &[&first, &second]);
     assert_final_text_contains(&twice, &format!("{MCP_RESULT_PREFIX}{first}"));
@@ -1932,7 +1983,12 @@ async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
     // and the same assertions; Hermes is the one that emits the
     // additional security advisory.
     let before_risk = mcp_journal(&journal).len();
-    let risk = ask(host, &agent, mcp_probe_prompt(MCP_RISK_VALUE)).await;
+    let risk = ask(
+        host,
+        &agent,
+        mcp_probe_prompt(host.backend(), MCP_RISK_VALUE),
+    )
+    .await;
     assert_mcp_calls_reached_the_server(&risk, &journal, before_risk, &[MCP_RISK_VALUE]);
     assert_mcp_results_came_back(&risk, &[MCP_RISK_RESULT]);
     assert_no_error_message(&risk.label(), risk.events());
@@ -1962,14 +2018,14 @@ async fn real_mcp_error_result<B: Backend>(host: &mut Harness<B>) {
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    // A server-reported isError must reach the stream as the canonical MCP
-    // failure, not as a successful result missing its flag.
+    // A server-reported error must remain failed and retain its actual output,
+    // whether the provider exposes canonical MCP blocks or native content.
     let failed = ask(
         host,
         &agent,
         format!(
             "{} If it reports an error, do not call it again; reply with the error text.",
-            mcp_probe_prompt(MCP_ERROR_VALUE)
+            mcp_probe_prompt(host.backend(), MCP_ERROR_VALUE)
         ),
     )
     .await;
@@ -2005,7 +2061,7 @@ async fn real_mcp_slow_server_is_not_reported_unavailable<B: Backend>(host: &mut
 
     let value = unique_payload();
     let before = mcp_journal(&journal).len();
-    let called = ask(host, &agent, mcp_probe_prompt(&value)).await;
+    let called = ask(host, &agent, mcp_probe_prompt(host.backend(), &value)).await;
     assert_mcp_server_was_reachable(&called, &journal, before, &value);
 
     // Last, and reading the whole session rather than either turn: the
@@ -2018,12 +2074,55 @@ async fn real_mcp_slow_server_is_not_reported_unavailable<B: Backend>(host: &mut
     assert_clean_close(host, &agent).await;
 }
 
-async fn real_mcp_image_result<B: Backend>(host: &mut Harness<B>) {
+enum McpImageProbe {
+    Identify,
+    Retain,
+    TextFidelity,
+}
+
+async fn prepare_mcp_image_probe<B: Backend>(
+    host: &mut Harness<B>,
+    probe: McpImageProbe,
+) -> (
+    Agent,
+    Turn,
+    Turn,
+    std::path::PathBuf,
+    String,
+    (ToolExecutionResult, String),
+) {
     let probe_dir = host.workspace().join(MCP_PROBE_DIR);
     std::fs::create_dir_all(&probe_dir).expect("create MCP probe directory");
     let script = probe_dir.join("image_probe.py");
     let journal = probe_dir.join("image_calls.jsonl");
-    std::fs::write(&script, mcp_image_probe_script()).expect("write MCP image probe server");
+    let server_text = match probe {
+        McpImageProbe::TextFidelity => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(VALID_IMAGE_PNG_BASE64)
+                .expect("decode image fixture")
+                .len();
+            format!(
+                "Image follows.\n[MCP image content: media_type=image/png, bytes={bytes}]\nThis annotation is part of the server's own text."
+            )
+        }
+        McpImageProbe::Identify => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(VALID_IMAGE_PNG_BASE64)
+                .expect("decode image fixture")
+                .len();
+            let begin = unique_payload();
+            let end = unique_payload();
+            format!(
+                "Image follows.\n{begin}\n[MCP image content: media_type=image/png, bytes={bytes}]\n{end}\nThe delimited line belongs to the server's original text."
+            )
+        }
+        McpImageProbe::Retain => "Image follows.".to_owned(),
+    };
+    std::fs::write(
+        &script,
+        mcp_image_probe_script(&server_text, matches!(probe, McpImageProbe::Identify)),
+    )
+    .expect("write MCP image probe server");
     install_mcp_server(
         host,
         MCP_SERVER_NAME,
@@ -2039,18 +2138,25 @@ async fn real_mcp_image_result<B: Backend>(host: &mut Harness<B>) {
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    let viewed = ask(
-        host,
-        &agent,
-        format!(
+    let prompt = match probe {
+        McpImageProbe::Identify => format!(
             "Call the MCP tool whose name ends in `{MCP_IMAGE_TOOL_NAME}` exactly once. It returns \
              an image of three equal vertical solid-color bands. Do not use any other tool and do \
              not guess: the colors are only in the returned pixels. Then reply with exactly their \
              lowercase CSS color names from left to right, separated by colons. Your entire \
              reply must be only those three names joined by colons, with no other words."
         ),
-    )
-    .await;
+        McpImageProbe::Retain => format!(
+            "Call the MCP tool whose name ends in `{MCP_IMAGE_TOOL_NAME}` exactly once, and no other tools. \
+             Retain its image for a later question. Do not inspect, describe, or reason about its colors now. \
+             Reply with exactly STORED and no other text."
+        ),
+        McpImageProbe::TextFidelity => format!(
+            "Call the MCP tool whose name ends in `{MCP_IMAGE_TOOL_NAME}` exactly once, and no other tools. \
+             Acknowledge receipt of its text and image with exactly STORED. Do not inspect its pixels."
+        ),
+    };
+    let viewed = ask(host, &agent, prompt).await;
 
     assert_eq!(
         mcp_journal(&journal).len(),
@@ -2084,80 +2190,509 @@ async fn real_mcp_image_result<B: Backend>(host: &mut Harness<B>) {
             viewed.completion_summaries()
         )
     };
-    let ToolExecutionOutcome::Succeeded {
-        result: ToolExecutionResult::Other { result },
+    let expected_result = match (&probe, &completion.outcome) {
+        (
+            McpImageProbe::Identify | McpImageProbe::Retain,
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::NativeContent { text, images },
+            },
+        ) => {
+            // Native presentation text is not canonical MCP block metadata.
+            // The strict fidelity probe must still use the original oracle below.
+            assert_native_mcp_image_payload(text, images, &server_text);
+            ToolExecutionResult::NativeContent {
+                text: text.clone(),
+                images: images.clone(),
+            }
+        }
+        _ => {
+            let ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other { result },
+            } = &completion.outcome
+            else {
+                panic!(
+                    "{}: the image tool must complete as a successful generic MCP result",
+                    viewed.label()
+                )
+            };
+            let mcp: rmcp::model::CallToolResult =
+                serde_json::from_value(result.clone()).unwrap_or_else(|error| {
+                    panic!(
+                        "{}: the image result is not a canonical MCP CallToolResult (error category: {:?})",
+                        viewed.label(),
+                        error.classify()
+                    )
+                });
+            assert_eq!(
+                mcp.is_error,
+                Some(false),
+                "{}: a successful MCP call must keep isError false",
+                viewed.label()
+            );
+            // Claude's native transcript may add a source-path text annotation; text
+            // can never stand in for the pixels or the server's own text block.
+            let mut images = Vec::new();
+            let mut texts = Vec::new();
+            for content in &mcp.content {
+                match &content.raw {
+                    rmcp::model::RawContent::Image(image) => images.push(image),
+                    rmcp::model::RawContent::Text(text) => texts.push(text.text.as_str()),
+                    _ => panic!(
+                        "{}: the image result carries an unexpected content kind",
+                        viewed.label()
+                    ),
+                }
+            }
+            assert!(
+                images.len() == 1
+                    && images[0].data == VALID_IMAGE_PNG_BASE64
+                    && images[0].mime_type == "image/png",
+                "{}: the canonical result must carry exactly the returned pixels as one typed MCP \
+                 image block; found {} image block(s)",
+                viewed.label(),
+                images.len()
+            );
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| **text == server_text.as_str())
+                    .count(),
+                1,
+                "{}: the server's own text block must survive beside the image",
+                viewed.label()
+            );
+            ToolExecutionResult::Other {
+                result: result.clone(),
+            }
+        }
+    };
+    match probe {
+        McpImageProbe::Identify => {
+            assert_eq!(
+                viewed
+                    .final_text()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace("fuchsia", "magenta")
+                    .replace("aqua", "cyan"),
+                IMAGE_ANSWER,
+                "{}: the model did not see the pixels the MCP tool returned; CSS synonyms \
+         fuchsia/magenta (#ff00ff) and aqua/cyan (#00ffff) are canonicalized",
+                viewed.label()
+            );
+        }
+        McpImageProbe::Retain => {
+            assert!(
+                viewed.final_text().trim() == "STORED",
+                "image context seed must only acknowledge storage"
+            );
+            let visible_text = viewed
+                .assistant_messages()
+                .flat_map(|message| {
+                    std::iter::once(message.content.as_str()).chain(
+                        message
+                            .reasoning
+                            .as_ref()
+                            .map(|reasoning| reasoning.text.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            assert!(
+                ["magenta", "fuchsia", "cyan", "aqua", "yellow"]
+                    .iter()
+                    .all(|color| !visible_text.contains(color)),
+                "image context seed must not disclose a later queried pixel property in text or reasoning"
+            );
+        }
+        McpImageProbe::TextFidelity => {
+            assert!(
+                viewed.final_text().trim() == "STORED",
+                "MCP text-fidelity probe must acknowledge the single result"
+            );
+        }
+    }
+    assert_no_error_message(&viewed.label(), viewed.events());
+
+    let image_call = completion.tool_call_id.clone();
+    (
+        agent,
+        launched,
+        viewed,
+        journal,
+        image_call,
+        (expected_result, server_text),
+    )
+}
+
+async fn real_mcp_image_result<B: Backend>(host: &mut Harness<B>) {
+    let (agent, launched, viewed, journal, image_call, (_, server_text)) =
+        prepare_mcp_image_probe(host, McpImageProbe::Identify).await;
+    let image_tool_name = viewed
+        .declared_name(&image_call)
+        .expect("the successful image call must retain its exact native tool name")
+        .to_owned();
+    let failed = ask(
+        host,
+        &agent,
+        format!(
+            "Call the same MCP tool whose name ends in `{MCP_IMAGE_TOOL_NAME}` exactly once with \
+             fail set to true. The server intentionally returns its image and text as a native \
+             tool error. Do not retry, use another tool, or report that it succeeded. After the \
+             native result, acknowledge the error without making another call."
+        ),
+    )
+    .await;
+    let served = mcp_journal(&journal);
+    eprintln!(
+        "REAL MCP IMAGE JOURNAL calls={} fail_true_calls={} last_fail_true={}",
+        served.len(),
+        served
+            .iter()
+            .filter(|call| call.get("fail").and_then(Value::as_bool) == Some(true))
+            .count(),
+        served
+            .last()
+            .and_then(|call| call.get("fail"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    );
+    assert!(
+        served.len() == 2
+            && served[1].get("fail").and_then(Value::as_bool) == Some(true)
+            && served
+                .iter()
+                .filter(|call| call.get("fail").and_then(Value::as_bool) == Some(true))
+                .count()
+                == 1,
+        "the failed-image probe must actually reach the same real server once with its error flag"
+    );
+    assert_failed_mcp_image_result(
+        &failed,
+        &image_tool_name,
+        &server_text,
+        host.declares(BackendCapability::McpErrorImageResults),
+    );
+    assert_universal_contract(&[launched, viewed, failed]);
+    assert_clean_close(host, &agent).await;
+}
+
+fn mcp_image_diagnostic(data: &str, media_type: &str) -> Value {
+    let decoded_bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(bytes) => Some(bytes.len()),
+        Err(_) => None,
+    };
+    serde_json::json!({
+        "media_type": match media_type {
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif" => media_type,
+            _ => "other",
+        },
+        "encoded_bytes": data.len(),
+        "decoded_bytes": decoded_bytes,
+        "matches_expected_encoding": data == VALID_IMAGE_PNG_BASE64,
+    })
+}
+
+fn assert_native_mcp_image_payload(text: &str, images: &[ImageData], server_text: &str) {
+    eprintln!(
+        "REAL MCP NATIVE IMAGE RESULT text_bytes={} images={}",
+        text.len(),
+        Value::Array(
+            images
+                .iter()
+                .map(|image| mcp_image_diagnostic(&image.data, &image.media_type))
+                .collect()
+        )
+    );
+    assert!(
+        images.len() == 1
+            && images[0].data == VALID_IMAGE_PNG_BASE64
+            && images[0].media_type == "image/png",
+        "the native image result must retain exactly one image with the original pixels and media type"
+    );
+    assert!(
+        !server_text.is_empty(),
+        "the real server text fixture must not be empty"
+    );
+    let original_lines = server_text.split('\n').collect::<Vec<_>>();
+    let native_lines = text.split('\n').collect::<Vec<_>>();
+    assert_eq!(
+        native_lines
+            .windows(original_lines.len())
+            .filter(|lines| *lines == original_lines.as_slice())
+            .count(),
+        1,
+        "the native image result must retain the entire original server block as one exact whole-line sequence"
+    );
+}
+
+fn assert_failed_mcp_image_result(
+    turn: &Turn,
+    image_tool_name: &str,
+    server_text: &str,
+    retains_error_images: bool,
+) {
+    let image_tool = |id: &str| turn.declared_name(id) == Some(image_tool_name);
+    let all_requests = turn.tool_requests().collect::<Vec<_>>();
+    let requests = all_requests
+        .iter()
+        .copied()
+        .filter(|request| image_tool(&request.tool_call_id))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "REAL MCP IMAGE ERROR requests={} image_requests={} completions={} request_kinds={:?}",
+        all_requests.len(),
+        requests.len(),
+        turn.tool_completions().count(),
+        all_requests
+            .iter()
+            .map(|request| tool_kind(request))
+            .collect::<Vec<_>>()
+    );
+    // Native code-mode execution can wrap the MCP call in an outer exec card.
+    // The universal contract still validates every request and completion.
+    let [request] = requests.as_slice() else {
+        panic!("the failed-image probe needs exactly one matching real MCP image request");
+    };
+    assert!(
+        matches!(request.tool_type, ToolRequestType::Other { .. }),
+        "the native failure must belong to the same real generic MCP image tool"
+    );
+    let completions = turn
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == request.tool_call_id)
+        .collect::<Vec<_>>();
+    let [completion] = completions.as_slice() else {
+        panic!("the failed-image probe needs exactly one completion for its matching MCP request");
+    };
+    assert!(
+        completion.tool_call_id == request.tool_call_id,
+        "the failed image must complete its own observed call"
+    );
+    let ToolExecutionOutcome::Failed {
+        message,
+        details,
+        normalization_failure,
+        result,
     } = &completion.outcome
     else {
-        panic!(
-            "{}: the image tool must complete as a successful generic MCP result: {:?}",
-            viewed.label(),
-            completion.outcome
-        )
+        panic!("a real server image error must remain failed, never succeeded or cancelled");
     };
-    let mcp: rmcp::model::CallToolResult =
-        serde_json::from_value(result.clone()).unwrap_or_else(|error| {
+    assert!(
+        !message.is_empty() && normalization_failure.is_none(),
+        "the real image failure must retain a native reason, not an invented normalization error"
+    );
+    assert!(
+        !server_text.is_empty(),
+        "the real server text fixture must not be empty"
+    );
+    let mut value = match result {
+        Some(ToolExecutionResult::NativeContent { text, images }) => {
+            eprintln!(
+                "REAL MCP NATIVE IMAGE RESULT text_bytes={} images={}",
+                text.len(),
+                Value::Array(
+                    images
+                        .iter()
+                        .map(|image| mcp_image_diagnostic(&image.data, &image.media_type))
+                        .collect()
+                )
+            );
+            // The native error prefixes the first line, but the entire original
+            // server block must still occur once with every character unchanged.
+            assert_eq!(
+                text.matches(server_text).count(),
+                1,
+                "the native image failure must retain the complete unchanged server text block once"
+            );
+            if retains_error_images {
+                assert!(
+                    images.len() == 1
+                        && images[0].data == VALID_IMAGE_PNG_BASE64
+                        && images[0].media_type == "image/png",
+                    "the native image failure must retain exactly one image with the original pixels and media type"
+                );
+            }
+            return;
+        }
+        Some(ToolExecutionResult::Other { result }) => result.clone(),
+        Some(_) => panic!("the third-party image failure has unrelated typed output"),
+        None => serde_json::from_str::<Value>(
+            details
+                .as_deref()
+                .expect("the canonical image failure must retain its result"),
+        )
+        .unwrap_or_else(|error| {
             panic!(
-                "{}: the image result is not a canonical MCP CallToolResult: {error}",
-                viewed.label()
+                "the canonical image failure details are invalid JSON (category: {:?})",
+                error.classify()
+            )
+        }),
+    };
+    if let Some(inner) = value.get("detailed_message").and_then(Value::as_str) {
+        value = serde_json::from_str(inner).unwrap_or_else(|error| {
+            panic!(
+                "the detailed image failure is invalid JSON (category: {:?})",
+                error.classify()
             )
         });
-    assert_eq!(
-        mcp.is_error,
-        Some(false),
-        "{}: a successful MCP call must keep isError false",
-        viewed.label()
+    }
+    let mcp: rmcp::model::CallToolResult = serde_json::from_value(value).unwrap_or_else(|error| {
+        panic!(
+            "the image failure must retain a canonical result (category: {:?})",
+            error.classify()
+        )
+    });
+    assert!(
+        mcp.is_error == Some(true),
+        "the canonical image failure must retain the real server error flag"
     );
-    // Claude's native transcript may add a source-path text annotation; text
-    // can never stand in for the pixels or the server's own text block.
     let mut images = Vec::new();
     let mut texts = Vec::new();
     for content in &mcp.content {
         match &content.raw {
             rmcp::model::RawContent::Image(image) => images.push(image),
             rmcp::model::RawContent::Text(text) => texts.push(text.text.as_str()),
-            other => panic!(
-                "{}: the image result carries unexpected content: {other:?}",
-                viewed.label()
-            ),
+            _ => panic!("the failed image result carries an unexpected content kind"),
         }
     }
-    assert!(
-        images.len() == 1
-            && images[0].data == VALID_IMAGE_PNG_BASE64
-            && images[0].mime_type == "image/png",
-        "{}: the canonical result must carry exactly the returned pixels as one typed MCP \
-         image block; found {} image block(s)",
-        viewed.label(),
-        images.len()
+    eprintln!(
+        "REAL MCP CANONICAL IMAGE ERROR is_error={:?} text_blocks={} images={}",
+        mcp.is_error,
+        texts.len(),
+        Value::Array(
+            images
+                .iter()
+                .map(|image| mcp_image_diagnostic(&image.data, &image.mime_type))
+                .collect()
+        )
     );
+    if retains_error_images {
+        assert!(
+            images.len() == 1
+                && images[0].data == VALID_IMAGE_PNG_BASE64
+                && images[0].mime_type == "image/png",
+            "the canonical image failure must retain exactly one image with the original pixels and media type"
+        );
+    }
     assert_eq!(
-        texts
-            .iter()
-            .filter(|text| **text == "Image follows.")
-            .count(),
+        texts.iter().filter(|text| **text == server_text).count(),
         1,
-        "{}: the server's own text block must survive beside the image",
-        viewed.label()
+        "the canonical image failure must retain the complete original server text block once"
     );
-    assert_eq!(
-        viewed
-            .final_text()
-            .trim()
-            .to_ascii_lowercase()
-            .replace("fuchsia", "magenta")
-            .replace("aqua", "cyan"),
-        IMAGE_ANSWER,
-        "{}: the model did not see the pixels the MCP tool returned; CSS synonyms \
-         fuchsia/magenta (#ff00ff) and aqua/cyan (#00ffff) are canonicalized",
-        viewed.label()
-    );
-    assert_no_error_message(&viewed.label(), viewed.events());
+}
 
+async fn real_mcp_image_text_fidelity<B: Backend>(host: &mut Harness<B>) {
+    let (agent, launched, viewed, _, _, _) =
+        prepare_mcp_image_probe(host, McpImageProbe::TextFidelity).await;
     assert_universal_contract(&[launched, viewed]);
     assert_clean_close(host, &agent).await;
 }
 
-fn mcp_image_probe_script() -> String {
+async fn real_mcp_image_lifecycle<B: Backend>(host: &mut Harness<B>) {
+    let (agent, launched, viewed, journal, image_call, (expected_result, _)) =
+        prepare_mcp_image_probe(host, McpImageProbe::Retain).await;
+    assert_universal_contract(&[launched, viewed]);
+    assert_clean_close(host, &agent).await;
+    let stored = stored_session(host).await;
+    let recall = "Look at the image returned by the previous MCP call. Without using any tool or reading any file, reply with exactly the lowercase CSS color names of its three bands from left to right, separated by colons, and no other text.";
+    let forked = fork_agent(host, &stored.id, recall).await;
+    let recalled = collect_turn(host, &forked, recall).await;
+    assert!(
+        forked.session_id != stored.id,
+        "image-context fork must be an independent native session"
+    );
+    assert_eq!(
+        recalled.tool_requests().count(),
+        0,
+        "forked image recall must use inherited native model context"
+    );
+    assert!(
+        recalled
+            .final_text()
+            .trim()
+            .to_ascii_lowercase()
+            .replace("fuchsia", "magenta")
+            .replace("aqua", "cyan")
+            == IMAGE_ANSWER,
+        "forked model context must retain the MCP pixels"
+    );
+    assert_eq!(
+        mcp_journal(&journal).len(),
+        1,
+        "resume and fork must not repeat the original image tool call"
+    );
+    assert_universal_contract(&[recalled]);
+    assert_clean_close(host, &forked).await;
+    let resumed = resume_agent(host, &stored.id).await;
+    let replayed = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == image_call =>
+            {
+                Some(&completion.outcome)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        matching_completions = replayed.len(),
+        replayed_tool_requests = resumed
+            .replayed_history
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
+            .count(),
+        replayed_tool_completions = resumed
+            .replayed_history
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::ToolExecutionCompleted(_)))
+            .count(),
+        "MCP image lifecycle replay inventory"
+    );
+    assert!(
+        matches!(replayed.as_slice(), [ToolExecutionOutcome::Succeeded { result }] if *result == expected_result),
+        "MCP image replay must retain exactly one successful completion with the original typed pixels, text, and result metadata"
+    );
+    let recalled = ask(host, &resumed, recall).await;
+    assert_eq!(
+        recalled.tool_requests().count(),
+        0,
+        "image recall must use retained native model context"
+    );
+    assert!(
+        recalled
+            .final_text()
+            .trim()
+            .to_ascii_lowercase()
+            .replace("fuchsia", "magenta")
+            .replace("aqua", "cyan")
+            == IMAGE_ANSWER,
+        "resumed model context must retain the MCP pixels"
+    );
+    assert_eq!(
+        mcp_journal(&journal).len(),
+        1,
+        "resume and fork must not repeat the original image tool call"
+    );
+    assert_universal_contract(&[recalled]);
+    assert_clean_close(host, &resumed).await;
+}
+
+fn mcp_image_probe_script(server_text: &str, enable_error: bool) -> String {
+    let input_properties = if enable_error {
+        serde_json::json!({"fail": {"type": "boolean"}}).to_string()
+    } else {
+        "{}".to_owned()
+    };
+    let is_error = if enable_error {
+        "request.get(\"params\", {}).get(\"arguments\", {}).get(\"fail\") is True"
+    } else {
+        "False"
+    };
+    let server_text = serde_json::to_string(server_text).expect("encode MCP text fixture");
     format!(
         r#"import json, sys
 
@@ -2175,12 +2710,12 @@ for line in sys.stdin:
     if method == "initialize":
         result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}}}, "serverInfo": {{"name": "{MCP_SERVER_NAME}", "version": "1"}}}}
     elif method == "tools/list":
-        result = {{"tools": [{{"name": "{MCP_IMAGE_TOOL_NAME}", "description": "Return an image to look at", "inputSchema": {{"type": "object", "properties": {{}}, "additionalProperties": False}}}}]}}
+        result = {{"tools": [{{"name": "{MCP_IMAGE_TOOL_NAME}", "description": "Return an image to look at", "inputSchema": {{"type": "object", "properties": {input_properties}, "additionalProperties": False}}}}]}}
     elif method == "tools/call":
         with open(journal, "a") as handle:
             handle.write(json.dumps(request.get("params", {{}}).get("arguments", {{}}), sort_keys=True) + "\n")
             handle.flush()
-        result = {{"content": [{{"type": "text", "text": "Image follows."}}, {{"type": "image", "data": "{VALID_IMAGE_PNG_BASE64}", "mimeType": "image/png"}}], "isError": False}}
+        result = {{"content": [{{"type": "text", "text": {server_text}}}, {{"type": "image", "data": "{VALID_IMAGE_PNG_BASE64}", "mimeType": "image/png"}}], "isError": {is_error}}}
     else:
         result = {{}}
     print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
@@ -2191,6 +2726,7 @@ for line in sys.stdin:
 fn mcp_probe_script() -> String {
     format!(
         r#"import json, sys, time
+from pathlib import Path
 
 journal = sys.argv[1]
 
@@ -2199,6 +2735,15 @@ journal = sys.argv[1]
 # and the server stays in whatever "still connecting" state the backend uses.
 if len(sys.argv) > 2:
     time.sleep(float(sys.argv[2]))
+
+if len(sys.argv) > 3:
+    delay = Path(sys.argv[3])
+    if delay.exists():
+        seconds = float(delay.read_text())
+        delay.unlink()
+        started = time.monotonic()
+        time.sleep(seconds)
+        Path(sys.argv[4]).write_text(json.dumps({{"held_seconds": time.monotonic() - started}}))
 
 for line in sys.stdin:
     line = line.strip()
@@ -2231,7 +2776,23 @@ for line in sys.stdin:
     )
 }
 
-fn mcp_probe_prompt(value: &str) -> String {
+fn mcp_probe_prompt(backend: BackendKind, value: &str) -> String {
+    if backend == BackendKind::Hermes {
+        let name = format!(
+            "mcp__{}__{MCP_TOOL_NAME}",
+            server::mcp_bridge::MANAGED_SERVER_NAME
+        );
+        let call = serde_json::json!({"name": name, "arguments": {"value": value}});
+        return format!(
+            "Call configured MCP server `{MCP_SERVER_NAME}` tool `{MCP_TOOL_NAME}` exactly once \
+             through Hermes's `tool_call` broker using this complete outer JSON object: {call}. \
+             The broker's `name` is a string and `arguments` must be the shown JSON object \
+             containing the required string `value`: not {{}}, not a JSON-encoded string, and \
+             not a `value` field beside `name`. Do not use any other execution tool, and do not \
+             answer from memory — the underlying MCP call must actually be made. Then reply \
+             with the tool's exact text result and nothing else."
+        );
+    }
     format!(
         "Call the MCP tool whose name ends in `{MCP_TOOL_NAME}`, exactly once, passing \
          exactly {value} as its `value` argument. Do not use any other tool, and do not answer \
@@ -2240,7 +2801,25 @@ fn mcp_probe_prompt(value: &str) -> String {
     )
 }
 
-fn mcp_probe_twice_prompt(first: &str, second: &str) -> String {
+fn mcp_probe_twice_prompt(backend: BackendKind, first: &str, second: &str) -> String {
+    if backend == BackendKind::Hermes {
+        let name = format!(
+            "mcp__{}__{MCP_TOOL_NAME}",
+            server::mcp_bridge::MANAGED_SERVER_NAME
+        );
+        let first_call = serde_json::json!({"name": name, "arguments": {"value": first}});
+        let second_call = serde_json::json!({"name": name, "arguments": {"value": second}});
+        return format!(
+            "Call configured MCP server `{MCP_SERVER_NAME}` tool `{MCP_TOOL_NAME}` exactly twice \
+             through Hermes's `tool_call` broker. Use two separate calls with these complete \
+             outer JSON objects: first {first_call}, then {second_call}. For each call, the \
+             broker's `name` is a string and `arguments` must be the shown JSON object \
+             containing the required string `value`: not {{}}, not a JSON-encoded string, and \
+             not a `value` field beside `name`. Do not combine the calls, use any other execution \
+             tool, or answer from memory — both underlying MCP calls must actually be made. \
+             Then reply with both text results separated by a single space, and nothing else."
+        );
+    }
     format!(
         "Call the MCP tool whose name ends in `{MCP_TOOL_NAME}` exactly twice in this turn: once \
          passing {first} as its `value` argument, and once passing {second}. Use a separate tool \
@@ -2317,12 +2896,10 @@ fn assert_mcp_calls_reached_the_server(
         requests.len(),
         served.len(),
         "{}: the MCP server served {} call(s) but the stream carried {} probe card(s). Fewer \
-         cards than calls means a tool ran invisibly; more means a card was invented. Served: \
-         {served:?}; cards this turn: {:?}",
+         cards than calls means a tool ran invisibly; more means a card was invented.",
         turn.label(),
         served.len(),
-        requests.len(),
-        turn.tool_request_names()
+        requests.len()
     );
 
     // `served` and `requests` are both empty when the model simply never called
@@ -2336,11 +2913,11 @@ fn assert_mcp_calls_reached_the_server(
     // fabricated the result text instead of calling it.
     assert!(
         expected.is_empty() || !served.is_empty(),
-        "{}: the MCP server was never called, so nothing arrived to compare against {expected:?}. \
+        "{}: the MCP server was never called, so nothing arrived to compare against {} expected value(s). \
          The tool call did not happen — this is not an argument-marshalling failure. Check whether \
-         the model declined to call an exposed tool before suspecting Tyde. Cards this turn: {:?}",
+         the model declined to call an exposed tool before suspecting Tyde.",
         turn.label(),
-        turn.tool_request_names()
+        expected.len()
     );
 
     let mut served_values: Vec<String> = served
@@ -2355,9 +2932,8 @@ fn assert_mcp_calls_reached_the_server(
     let mut wanted: Vec<String> = expected.iter().map(|value| (*value).to_owned()).collect();
     served_values.sort();
     wanted.sort();
-    assert_eq!(
-        served_values,
-        wanted,
+    assert!(
+        served_values == wanted,
         "{}: the values that arrived at the MCP server are not the ones the prompt dictated. \
          Either the model passed something else, or Tyde altered the arguments in transit.",
         turn.label()
@@ -2391,9 +2967,8 @@ fn assert_mcp_calls_reached_the_server(
     // same value cannot pass by each finding *a* matching call: that is exactly
     // what one card's arguments copied onto its sibling looks like, and it is
     // the shape a reader would trust the rendered card over the truth on.
-    assert_eq!(
-        carded_values,
-        served_values,
+    assert!(
+        carded_values == served_values,
         "{}: the values the cards render are not the values the server received. The UI is \
          showing calls that did not happen as they were drawn.",
         turn.label()
@@ -2467,34 +3042,66 @@ fn assert_mcp_error_came_back(turn: &Turn) {
         .collect();
     let [completion] = completions.as_slice() else {
         panic!(
-            "{}: expected one failed probe completion: {:?}",
+            "{}: expected one failed probe completion, found {}",
             turn.label(),
-            turn.completion_summaries()
+            completions.len()
         )
     };
     let ToolExecutionOutcome::Failed {
-        details: Some(details),
-        ..
+        message,
+        details,
+        normalization_failure,
+        result,
     } = &completion.outcome
     else {
         panic!(
-            "{}: an MCP isError result must complete as a failure carrying the canonical \
-             result: {:?}",
-            turn.label(),
-            completion.outcome
+            "{}: the MCP error must remain a failed tool completion",
+            turn.label()
         )
     };
-    let mut value: Value = serde_json::from_str(details)
-        .unwrap_or_else(|error| panic!("{}: failure details are not JSON: {error}", turn.label()));
+    let mut value = match result {
+        Some(ToolExecutionResult::NativeContent { text, images }) => {
+            // Native output has no canonical MCP envelope to parse or reconstruct.
+            assert!(
+                !message.is_empty() && normalization_failure.is_none() && images.is_empty(),
+                "the native text-only MCP error must retain its failure reason without a normalization error or invented images"
+            );
+            assert_eq!(
+                text.matches(MCP_ERROR_TEXT).count(),
+                1,
+                "the typed native failure must retain the server's exact error text once"
+            );
+            return;
+        }
+        Some(ToolExecutionResult::Other { result }) => result.clone(),
+        Some(_) => panic!("the third-party MCP failure has an unrelated typed output"),
+        None => serde_json::from_str(
+            details
+                .as_deref()
+                .expect("canonical MCP failure must retain its result details"),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}: canonical failure details are not JSON (error category: {:?})",
+                turn.label(),
+                error.classify()
+            )
+        }),
+    };
     if let Some(inner) = value.get("detailed_message").and_then(Value::as_str) {
         value = serde_json::from_str(inner).unwrap_or_else(|error| {
-            panic!("{}: detailed failure is not JSON: {error}", turn.label())
+            panic!(
+                "{}: detailed failure is not JSON (error category: {:?})",
+                turn.label(),
+                error.classify()
+            )
         });
     }
     let mcp: rmcp::model::CallToolResult = serde_json::from_value(value).unwrap_or_else(|error| {
         panic!(
-            "{}: the failure does not carry a canonical MCP CallToolResult: {error}",
-            turn.label()
+            "{}: the failure does not carry a canonical MCP CallToolResult (error category: {:?})",
+            turn.label(),
+            error.classify()
         )
     });
     assert_eq!(
@@ -2524,30 +3131,33 @@ fn assert_mcp_results_came_back(turn: &Turn, expected: &[&str]) {
     assert_eq!(
         completions.len(),
         expected.len(),
-        "{}: expected {} probe completion(s), found {}: {:?}",
+        "{}: expected {} probe completion(s), found {}",
         turn.label(),
         expected.len(),
-        completions.len(),
-        turn.completion_summaries()
+        completions.len()
     );
     let mut rendered = Vec::new();
     for completion in completions {
         let ToolExecutionOutcome::Succeeded { result } = &completion.outcome else {
             panic!(
-                "{}: MCP call {:?} did not succeed: {:?}",
-                turn.label(),
-                completion.tool_call_id,
-                completion.outcome
-            )
-        };
-        let ToolExecutionResult::Other { result } = result else {
-            panic!(
-                "{}: the MCP result was normalized into a typed variant that a third-party tool \
-                 has no meaning for: {result:?}",
+                "{}: the MCP probe did not complete successfully",
                 turn.label()
             )
         };
-        rendered.push(result.to_string());
+        rendered.push(match result {
+            ToolExecutionResult::Other { result } => result.to_string(),
+            ToolExecutionResult::NativeContent { text, images } => {
+                assert!(
+                    images.is_empty(),
+                    "the text-only MCP probe must not acquire unrelated native images"
+                );
+                text.clone()
+            }
+            _ => panic!(
+                "{}: the third-party MCP result has an unrelated typed projection",
+                turn.label()
+            ),
+        });
     }
 
     // Each expected payload has to appear behind exactly one card, not merely
@@ -2562,15 +3172,22 @@ fn assert_mcp_results_came_back(turn: &Turn, expected: &[&str]) {
         assert_eq!(
             carrying,
             1,
-            "{}: {} card(s) carry {MCP_RESULT_PREFIX}{value}, expected exactly 1. Zero means the \
-             canonical result lost the server's own payload; more than one means a payload was \
-             copied across cards. Results: {rendered:?}",
+            "{}: {} cards carry the expected server payload, expected exactly one; zero means \
+             content was lost and more than one means it was copied across cards",
             turn.label(),
             carrying
         );
     }
 }
 conformance2_scenario!(real_image_input, [BackendCapability::ImageInput]);
+conformance2_scenario!(
+    real_image_input_history,
+    [
+        BackendCapability::ImageInput,
+        BackendCapability::ResumeSession
+    ]
+);
+
 conformance2_scenario!(
     real_watched_command_shows_every_interaction,
     [
@@ -2583,7 +3200,25 @@ conformance2_scenario!(
     real_mcp_image_result,
     [
         BackendCapability::StartupMcpServers,
-        BackendCapability::McpImageResults
+        BackendCapability::McpImageResults,
+        BackendCapability::McpErrorResults,
+    ]
+);
+conformance2_scenario!(
+    real_mcp_image_text_fidelity,
+    [
+        BackendCapability::StartupMcpServers,
+        BackendCapability::McpImageResults,
+        BackendCapability::McpOriginalContentFidelity,
+    ]
+);
+conformance2_scenario!(
+    real_mcp_image_lifecycle,
+    [
+        BackendCapability::StartupMcpServers,
+        BackendCapability::McpImageResults,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession
     ]
 );
 conformance2_scenario!(
@@ -3169,7 +3804,12 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     assert_cancelled_command_really_stopped(&mid_tool, &proof);
 
     let follow_up_payload = unique_payload();
-    let follow_up_tool = ask(host, &agent, write_prompt(&workspace, &follow_up_payload)).await;
+    let follow_up_tool = ask(
+        host,
+        &agent,
+        write_prompt(&workspace, &follow_up_payload, host.backend()),
+    )
+    .await;
     assert_wrote_file(&follow_up_tool, host.workspace(), &follow_up_payload);
 
     let mut turns = vec![after_stream, after_tool, follow_up_tool];
@@ -3225,8 +3865,8 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
         turns.push(after_background);
     } else {
         eprintln!(
-            "COVERAGE: {:?} does not declare BackgroundTasks, so this run asserts nothing \
-             about interrupting a turn while detached work is in flight",
+            "COVERAGE: {:?} does not declare BackgroundTasks; \
+             this flow makes no detached-command survival claim",
             host.backend()
         );
     }
@@ -3639,6 +4279,937 @@ conformance2_scenario!(
     ]
 );
 
+async fn assert_native_question_exclusion<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    turn: Turn,
+    restricted_tools: &BTreeMap<String, protocol::NativeToolKind>,
+    unrestricted_count: usize,
+    phase: &str,
+) {
+    assert_ready_handshake(&turn);
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("question-restricted native catalog must be observable");
+    assert_native_catalog_owner(&catalog, agent, host.backend());
+    let observed = catalog
+        .tools
+        .iter()
+        .map(|tool| (tool.name.clone(), tool.kind))
+        .collect::<BTreeMap<_, _>>();
+    eprintln!(
+        "REAL NATIVE QUESTION CATALOG phase={phase} unrestricted={} restricted={} observed={}",
+        unrestricted_count,
+        restricted_tools.len(),
+        observed.len()
+    );
+    assert!(
+        &observed == restricted_tools,
+        "question-only exclusion must remove exactly native questions and retain every unrelated tool and classification"
+    );
+    assert!(
+        turn.events().iter().all(|event| !matches!(event,
+            ChatEvent::ToolRequest(request)
+                if matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. })
+        )),
+        "catalog-only exclusion control must not invoke a native question"
+    );
+    assert_ordinary_tools_preserved(host, agent).await;
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, agent).await;
+}
+
+async fn real_native_question_exclusion_isolation<B: Backend>(host: &mut Harness<B>) {
+    let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+    std::fs::create_dir_all(&probe_dir).expect("create question-policy MCP directory");
+    let script = probe_dir.join("probe.py");
+    let journal = probe_dir.join("calls.jsonl");
+    std::fs::write(&script, mcp_probe_script()).expect("write question-policy MCP server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let root = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &root, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("native question policies require a provider-confirmed catalog");
+    assert_native_catalog_owner(&catalog, &root, host.backend());
+    let questions = catalog
+        .tools
+        .iter()
+        .filter(|tool| {
+            tool.kind
+                == protocol::NativeToolKind::Controlled {
+                    category: protocol::ToolCategory::AskUser,
+                }
+        })
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !questions.is_empty()
+            && catalog
+                .tools
+                .iter()
+                .any(|tool| tool.kind == protocol::NativeToolKind::SessionControl)
+            && catalog
+                .tools
+                .iter()
+                .any(|tool| tool.name.contains(MCP_TOOL_NAME)),
+        "positive catalog must include native questions, session controls, and MCP tools"
+    );
+    let unrestricted_tools = catalog
+        .tools
+        .iter()
+        .map(|tool| (tool.name.clone(), tool.kind))
+        .collect::<BTreeMap<_, _>>();
+    let restricted_tools = unrestricted_tools
+        .iter()
+        .filter(|(name, _)| !questions.contains(name))
+        .map(|(name, kind)| (name.clone(), *kind))
+        .collect::<BTreeMap<_, _>>();
+    eprintln!(
+        "REAL NATIVE QUESTION CATALOG phase=unrestricted tools={} questions={}",
+        unrestricted_tools.len(),
+        questions.len()
+    );
+    assert_universal_contract(&[launched]);
+    assert_clean_close(host, &root).await;
+
+    for (phase, policy, categories, reopen_policy) in [
+        (
+            "category",
+            protocol::ToolPolicy::Unrestricted,
+            vec![protocol::ToolCategory::AskUser],
+            protocol::ToolPolicy::Unrestricted,
+        ),
+        (
+            "deny_list",
+            protocol::ToolPolicy::DenyList { tools: questions },
+            Vec::new(),
+            protocol::ToolPolicy::Unrestricted,
+        ),
+        (
+            "empty_deny_list",
+            protocol::ToolPolicy::DenyList { tools: Vec::new() },
+            vec![protocol::ToolCategory::AskUser],
+            protocol::ToolPolicy::DenyList { tools: Vec::new() },
+        ),
+    ] {
+        B::validate_tool_policy(&policy).expect("native question-only policy must be supported");
+        B::validate_tool_categories(&categories)
+            .expect("native question-category exclusion must be supported");
+        host.config.resolved_spawn_config.tool_policy = policy;
+        host.config.resolved_spawn_config.excluded_tool_categories = categories;
+        let restricted = spawn_agent(host, &launch_prompt()).await;
+        let launched = collect_turn(host, &restricted, &launch_prompt()).await;
+        let session_id = restricted.session_id.clone();
+        assert_native_question_exclusion(
+            host,
+            &restricted,
+            launched,
+            &restricted_tools,
+            unrestricted_tools.len(),
+            phase,
+        )
+        .await;
+
+        let forked = fork_agent(host, &session_id, &launch_prompt()).await;
+        assert!(
+            forked.session_id != session_id,
+            "restricted fork must own a distinct native session rather than reuse its source"
+        );
+        let launched = collect_turn(host, &forked, &launch_prompt()).await;
+        assert_native_question_exclusion(
+            host,
+            &forked,
+            launched,
+            &restricted_tools,
+            unrestricted_tools.len(),
+            &format!("{phase}_forked"),
+        )
+        .await;
+
+        let resumed = resume_agent(host, &session_id).await;
+        assert!(
+            resumed.session_id == session_id,
+            "resuming the restricted source must preserve its independent native identity"
+        );
+        let launched = ask(host, &resumed, &launch_prompt()).await;
+        assert_native_question_exclusion(
+            host,
+            &resumed,
+            launched,
+            &restricted_tools,
+            unrestricted_tools.len(),
+            &format!("{phase}_resumed"),
+        )
+        .await;
+
+        host.config.resolved_spawn_config.tool_policy = reopen_policy;
+        host.config
+            .resolved_spawn_config
+            .excluded_tool_categories
+            .clear();
+        let reopened = resume_agent(host, &session_id).await;
+        let asked = ask_question(host, &reopened, excluded_question_prompt::<B>()).await;
+        assert_question_shape(&asked);
+        let cancelled = cancel_question(host).await;
+        assert_no_error_message("reopened question-enabled session", &cancelled);
+        let catalog = host
+            .native_tool_catalog()
+            .await
+            .expect("question-enabled reopen must expose its native catalog");
+        assert_native_catalog_owner(&catalog, &reopened, host.backend());
+        let observed = catalog
+            .tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool.kind))
+            .collect::<BTreeMap<_, _>>();
+        eprintln!(
+            "REAL NATIVE QUESTION CATALOG phase={phase}_reopened expected={} observed={}",
+            unrestricted_tools.len(),
+            observed.len()
+        );
+        assert!(
+            observed == unrestricted_tools,
+            "question-enabled reopen must restore exactly the default catalog without leaking the restricted host capability"
+        );
+        assert_clean_close(host, &reopened).await;
+    }
+}
+
+conformance2_scenario!(
+    real_native_question_exclusion_isolation,
+    [
+        BackendCapability::NativeToolPolicies,
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession,
+        BackendCapability::StartupMcpServers
+    ]
+);
+
+async fn assert_native_prestart_rejection<B: Backend>(
+    host: &Harness<B>,
+    config: server::backend::BackendSpawnConfig,
+    expected: Option<&str>,
+) {
+    match B::spawn(
+        host.workspace_roots(),
+        config,
+        user_message(&launch_prompt()),
+    )
+    .await
+    {
+        Err(error) => assert!(
+            !error.is_empty() && expected.is_none_or(|guard| error == guard),
+            "the direct Backend must reject with its pre-start admission guard, not a later native startup failure"
+        ),
+        Ok((backend, events)) => {
+            backend.shutdown().await;
+            drop(events);
+            panic!("an unsupported native configuration reached successful backend startup");
+        }
+    }
+    eprintln!(
+        "REAL NATIVE POLICY ADMISSION rejected=true expected_guard_matched={}",
+        expected.is_some()
+    );
+}
+
+async fn real_native_tool_policies<B: Backend>(host: &mut Harness<B>) {
+    let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+    std::fs::create_dir_all(&probe_dir).expect("create policy MCP probe directory");
+    let script = probe_dir.join("probe.py");
+    let journal = probe_dir.join("calls.jsonl");
+    std::fs::write(&script, mcp_probe_script()).expect("write policy MCP probe server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let root = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &root, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let value = unique_payload();
+    let mcp = ask(host, &root, mcp_probe_prompt(host.backend(), &value)).await;
+    assert_mcp_calls_reached_the_server(&mcp, &journal, 0, &[&value]);
+    assert_mcp_results_came_back(&mcp, &[&value]);
+    let mcp_name = mcp
+        .tool_declarations()
+        .find(|call| call.name.contains(MCP_TOOL_NAME))
+        .expect("unrestricted MCP positive control has a native declaration")
+        .name
+        .clone();
+    let asked = ask_question(host, &root, excluded_question_prompt::<B>()).await;
+    assert_question_shape(&asked);
+    let cancelled = cancel_question(host).await;
+    assert_no_error_message("unrestricted policy control", &cancelled);
+    let read = ask(host, &root, "Read README.txt using your dedicated file-reading tool, not a shell or delegation, and report its complete contents.").await;
+    assert_final_text_contains(&read, "tyde conformance workspace");
+    let request = read
+        .tool_requests()
+        .find(|request| matches!(request.tool_type, ToolRequestType::ReadFiles { .. }))
+        .expect("unrestricted dedicated file-read positive control");
+    let read_name = read
+        .tool_declarations()
+        .find(|call| call.tool_call_id == request.tool_call_id)
+        .expect("file read retains its native declaration")
+        .name
+        .clone();
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("exclusive native policies require a provider-confirmed catalog");
+    assert_native_catalog_owner(&catalog, &root, host.backend());
+    let questions = catalog
+        .tools
+        .iter()
+        .filter(|tool| {
+            tool.kind
+                == protocol::NativeToolKind::Controlled {
+                    category: protocol::ToolCategory::AskUser,
+                }
+        })
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !questions.is_empty(),
+        "unrestricted native catalog must contain the proven question tool"
+    );
+    let unrestricted_tools = catalog
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let default_only = catalog
+        .tools
+        .iter()
+        .filter(|tool| tool.selection == protocol::NativeToolSelection::DefaultOnly)
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let allowed_session_tools = catalog
+        .tools
+        .iter()
+        .filter(|tool| {
+            tool.kind == protocol::NativeToolKind::SessionControl
+                && matches!(
+                    tool.selection,
+                    protocol::NativeToolSelection::NamedSelectable
+                        | protocol::NativeToolSelection::NamedWithoutMcp
+                )
+        })
+        .map(|tool| tool.name.clone())
+        .chain(std::iter::once(read_name.clone()))
+        .collect::<Vec<_>>();
+    let empty_error =
+        B::validate_tool_policy(&protocol::ToolPolicy::AllowList { tools: Vec::new() })
+            .expect_err("an unverified empty named toolset must reject admission");
+    for (policy, categories) in [
+        (
+            protocol::ToolPolicy::AllowList {
+                tools: questions.clone(),
+            },
+            vec![protocol::ToolCategory::AskUser],
+        ),
+        (
+            protocol::ToolPolicy::DenyList {
+                tools: unrestricted_tools.iter().cloned().collect(),
+            },
+            Vec::new(),
+        ),
+    ] {
+        B::validate_tool_policy(&policy)
+            .expect("the intrinsic policy must be valid before its effective set becomes empty");
+        B::validate_tool_categories(&categories)
+            .expect("the category exclusion itself must be valid");
+        let mut config = host.config.clone();
+        config.resolved_spawn_config.tool_policy = policy;
+        config.resolved_spawn_config.excluded_tool_categories = categories;
+        assert_native_prestart_rejection(host, config, Some(&empty_error)).await;
+    }
+    assert!(
+        allowed_session_tools.len() > 1,
+        "the accepted allow-list control must include selectable native session controls"
+    );
+    eprintln!(
+        "REAL NATIVE POLICY SELECTORS catalog={} default_only={} allowed_with_controls={}",
+        unrestricted_tools.len(),
+        default_only.len(),
+        allowed_session_tools.len()
+    );
+    if !default_only.is_empty() {
+        for policy in [
+            protocol::ToolPolicy::AllowList {
+                tools: unrestricted_tools.iter().cloned().collect(),
+            },
+            protocol::ToolPolicy::DenyList {
+                tools: questions
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(mcp_name.clone()))
+                    .collect(),
+            },
+        ]
+        .into_iter()
+        .chain(
+            default_only
+                .iter()
+                .cloned()
+                .map(|name| protocol::ToolPolicy::AllowList { tools: vec![name] }),
+        )
+        .chain(default_only.iter().map(|retained| {
+            protocol::ToolPolicy::DenyList {
+                tools: default_only
+                    .iter()
+                    .filter(|name| *name != retained)
+                    .cloned()
+                    .chain(questions.iter().cloned())
+                    .chain(std::iter::once(mcp_name.clone()))
+                    .collect(),
+            }
+        })) {
+            let expected = B::validate_tool_policy(&policy)
+                .expect_err("default-only catalog entries cannot be silently selected or dropped");
+            let mut config = host.config.clone();
+            config.resolved_spawn_config.tool_policy = policy;
+            assert_native_prestart_rejection(host, config, Some(&expected)).await;
+        }
+    }
+    let mut config = host.config.clone();
+    config.resolved_spawn_config.tool_policy = protocol::ToolPolicy::DenyList {
+        tools: default_only
+            .iter()
+            .cloned()
+            .chain(std::iter::once(format!(
+                "{mcp_name}__unregistered_selector"
+            )))
+            .collect(),
+    };
+    assert_native_prestart_rejection(host, config, None).await;
+    let mut config = host.config.clone();
+    config.resolved_spawn_config.tool_policy = protocol::ToolPolicy::AllowList {
+        tools: vec![format!("{mcp_name}__unregistered_selector")],
+    };
+    assert_native_prestart_rejection(host, config, None).await;
+    let unverified_policy = protocol::ToolPolicy::AllowList {
+        tools: vec![format!("{read_name}__unregistered_selector")],
+    };
+    let expected = B::validate_tool_policy(&unverified_policy)
+        .expect_err("an unverified native selector must not be admitted");
+    let mut config = host.config.clone();
+    config.resolved_spawn_config.tool_policy = unverified_policy;
+    assert_native_prestart_rejection(host, config, Some(&expected)).await;
+    if !host.declares(BackendCapability::EnforcedReadOnly) {
+        let expected = B::validate_access_mode(protocol::BackendAccessMode::EnforcedReadOnly)
+            .expect_err("an unclaimed enforced-read-only mode must reject admission");
+        let mut config = host.config.clone();
+        config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+        assert_native_prestart_rejection(host, config, Some(&expected)).await;
+    }
+    let invalid_prompt = format!(
+        "Run one native argument-validation probe. Invoke the native {read_name} tool exactly once with the argument object {{}} and no properties. Do not add a path, choose a default, use another tool, repair the arguments, or retry the call. We intentionally want the native validator's rejection. After the native result, reply exactly REJECTED if the call was rejected; otherwise reply exactly NOT_REJECTED. Do not read any file."
+    );
+    let invalid = ask(host, &root, &invalid_prompt).await;
+    assert!(
+        invalid.final_text().trim() == "REJECTED",
+        "the native validator must reject the intentionally incomplete invocation"
+    );
+    let declarations = invalid.tool_declarations().collect::<Vec<_>>();
+    assert!(
+        matches!(declarations.as_slice(), [call] if call.name == read_name && call.arguments == serde_json::json!({})),
+        "the native validation probe must actually declare one empty argument object without repair or retry"
+    );
+    let requests = invalid.tool_requests().collect::<Vec<_>>();
+    assert!(
+        matches!(requests.as_slice(), [request] if request.tool_call_id == declarations[0].tool_call_id
+            && matches!(&request.tool_type, ToolRequestType::Other { args } if *args == serde_json::json!({}))),
+        "the rejected native call must keep its exact raw arguments in one canonical request"
+    );
+    let invalid_call = declarations[0].tool_call_id.clone();
+    let completions = invalid.tool_completions().collect::<Vec<_>>();
+    assert!(
+        matches!(completions.as_slice(), [completion] if completion.tool_call_id == invalid_call
+            && matches!(&completion.outcome, ToolExecutionOutcome::Failed { message, normalization_failure: None, .. } if !message.is_empty())),
+        "native argument validation must retain one actual failure, not close the conversation or invent a successful result"
+    );
+    let native_failure = completions[0].outcome.clone();
+    assert!(
+        matches!(&native_failure, ToolExecutionOutcome::Failed { message, .. }
+            if message.to_ascii_lowercase().contains("path")
+                && ["missing", "required", "argument", "validation"].iter()
+                    .any(|marker| message.to_ascii_lowercase().contains(marker))),
+        "the native failure must actually reject the missing file-path argument, not unrelated execution"
+    );
+    let recovered = ask(
+        host,
+        &root,
+        "Without using any tool, reply with exactly PROBE_OK.",
+    )
+    .await;
+    assert!(
+        recovered.final_text().trim() == "PROBE_OK" && recovered.tool_requests().next().is_none(),
+        "a native validation failure must leave the same conversation able to answer normally"
+    );
+    let retry_contents = unique_payload();
+    std::fs::write(
+        host.workspace().join("README.txt"),
+        format!("tyde conformance workspace\n{retry_contents}\n"),
+    )
+    .expect("refresh the real file before retrying its native read");
+    let retry = ask(host, &root, format!("Use the native {read_name} tool exactly once to read README.txt with its required path argument and report its complete contents. Do not use any other tool.")).await;
+    assert!(
+        retry.final_text().contains("tyde conformance workspace")
+            && retry.final_text().contains(&retry_contents)
+            && retry.tool_requests().count() == 1
+            && retry
+                .tool_requests()
+                .any(|request| matches!(request.tool_type, ToolRequestType::ReadFiles { .. }))
+            && matches!(retry.tool_completions().collect::<Vec<_>>().as_slice(), [completion]
+                if matches!(completion.outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ReadFiles { .. } })),
+        "a later valid invocation must still perform its real file read after native argument rejection"
+    );
+    assert_universal_contract(&[invalid, recovered, retry]);
+    assert_universal_contract(&[launched, mcp, read]);
+    close_agent(host, &root).await;
+    let resumed = resume_agent(host, &root.session_id).await;
+    let replayed_declarations = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message) => Some(message),
+            ChatEvent::StreamEnd(end) => Some(&end.message),
+            _ => None,
+        })
+        .flat_map(|message| &message.tool_calls)
+        .filter(|call| call.tool_call_id == invalid_call)
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(replayed_declarations.as_slice(), [call] if call.name == read_name && call.arguments == serde_json::json!({})),
+        "native history must retain exactly one original declaration with its missing argument, not a repaired invocation"
+    );
+    let replayed_requests = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request) if request.tool_call_id == invalid_call => {
+                Some(request)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(replayed_requests.as_slice(), [request]
+            if matches!(&request.tool_type, ToolRequestType::Other { args } if *args == serde_json::json!({}))),
+        "replay must retain exactly one rejected request with its original empty arguments"
+    );
+    let replayed_completions = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == invalid_call =>
+            {
+                Some(&completion.outcome)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(replayed_completions.as_slice(), [outcome] if **outcome == native_failure),
+        "replay must retain the native rejection exactly once with its actual failure reason"
+    );
+    assert_no_error_message(
+        "replayed native argument rejection",
+        &resumed.replayed_history,
+    );
+    let continued = ask(host, &resumed, &launch_prompt()).await;
+    assert_ready_handshake(&continued);
+    assert_universal_contract(&[continued]);
+    assert_clean_close(host, &resumed).await;
+    let allowed = vec![read_name.clone(), mcp_name.clone()];
+    let policy = protocol::ToolPolicy::AllowList {
+        tools: allowed.clone(),
+    };
+    B::validate_tool_policy(&policy).expect("a configured native MCP selector must be admitted");
+    host.config.resolved_spawn_config.tool_policy = policy;
+    let restricted = spawn_agent(host, excluded_question_prompt::<B>()).await;
+    let turn = collect_turn(host, &restricted, excluded_question_prompt::<B>()).await;
+    assert_question_excluded(&turn);
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("an explicit MCP allow list must expose its actual catalog");
+    assert_native_catalog_owner(&catalog, &restricted, host.backend());
+    let observed = catalog
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        observed == allowed.into_iter().collect(),
+        "the accepted MCP allow list must preserve exactly its named native file and configured MCP tools"
+    );
+    let value = unique_payload();
+    let before = mcp_journal(&journal).len();
+    let mcp = ask(host, &restricted, mcp_probe_prompt(host.backend(), &value)).await;
+    assert_mcp_calls_reached_the_server(&mcp, &journal, before, &[&value]);
+    assert_mcp_results_came_back(&mcp, &[&value]);
+    assert_final_text_contains(&mcp, &format!("{MCP_RESULT_PREFIX}{value}"));
+    assert_ordinary_tools_preserved(host, &restricted).await;
+    assert_universal_contract(&[turn, mcp]);
+    assert_clean_close(host, &restricted).await;
+    for policy in [
+        protocol::ToolPolicy::AllowList {
+            tools: vec![read_name.clone()],
+        },
+        protocol::ToolPolicy::AllowList {
+            tools: allowed_session_tools,
+        },
+        protocol::ToolPolicy::DenyList {
+            tools: questions
+                .iter()
+                .cloned()
+                .chain(std::iter::once(mcp_name.clone()))
+                .chain(default_only.iter().cloned())
+                .collect(),
+        },
+    ] {
+        B::validate_tool_policy(&policy).expect("declared native policy enforcement");
+        host.config.resolved_spawn_config.tool_policy = policy.clone();
+        let restricted = spawn_agent(host, excluded_question_prompt::<B>()).await;
+        let turn = collect_turn(host, &restricted, excluded_question_prompt::<B>()).await;
+        assert_question_excluded(&turn);
+        let catalog = host
+            .native_tool_catalog()
+            .await
+            .expect("restricted native catalog must be observable");
+        assert_native_catalog_owner(&catalog, &restricted, host.backend());
+        assert!(
+            catalog.tools.iter().any(|tool| tool.name == read_name),
+            "native policy must retain the proven allowed file tool"
+        );
+        let observed_tools = catalog
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if let protocol::ToolPolicy::AllowList { tools } = &policy {
+            assert!(
+                observed_tools == tools.iter().cloned().collect(),
+                "allow list must retain every explicitly allowed tool and expose no additional native tool"
+            );
+        } else if let protocol::ToolPolicy::DenyList { tools } = &policy {
+            assert!(
+                observed_tools
+                    == unrestricted_tools
+                        .iter()
+                        .filter(|name| !tools.contains(name))
+                        .cloned()
+                        .collect(),
+                "denying unrelated native tools must preserve every other unrestricted tool, including session controls"
+            );
+        }
+        let value = unique_payload();
+        let before = mcp_journal(&journal).len();
+        let mcp = ask(host, &restricted, mcp_probe_prompt(host.backend(), &value)).await;
+        // Muse serve ignores managed PreToolUse hooks (hook/list is empty and
+        // real calls execute). Native catalogue exclusion must enforce both policies.
+        assert_eq!(
+            mcp_journal(&journal).len(),
+            before,
+            "excluded MCP tool must never reach its server"
+        );
+        assert!(
+            mcp.tool_declarations().all(|call| call.name != mcp_name),
+            "excluded MCP tool must not be declared"
+        );
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .all(|tool| !questions.contains(&tool.name) && tool.name != mcp_name),
+            "native policy must remove the denied question and MCP tools"
+        );
+        assert!(
+            turn.tool_declarations()
+                .all(|call| !questions.contains(&call.name)),
+            "excluded native question tool must not be declared"
+        );
+        assert_universal_contract(&[mcp]);
+        assert_ordinary_tools_preserved(host, &restricted).await;
+        assert_universal_contract(&[turn]);
+        assert_clean_close(host, &restricted).await;
+    }
+    host.config.resolved_spawn_config.tool_policy = protocol::ToolPolicy::Unrestricted;
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AskUser];
+    let excluded = spawn_agent(host, excluded_question_prompt::<B>()).await;
+    let turn = collect_turn(host, &excluded, excluded_question_prompt::<B>()).await;
+    assert_question_excluded(&turn);
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("question-category exclusion must retain its native catalog");
+    assert_native_catalog_owner(&catalog, &excluded, host.backend());
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            == unrestricted_tools
+                .iter()
+                .filter(|name| !questions.contains(name))
+                .cloned()
+                .collect(),
+        "excluding questions must preserve every unrelated native tool, including session controls and MCP tools"
+    );
+    assert_ordinary_tools_preserved(host, &excluded).await;
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, &excluded).await;
+}
+
+async fn real_native_local_work_waits_for_completion<B: Backend>(host: &mut Harness<B>) {
+    use sha2::{Digest, Sha256};
+
+    let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+    std::fs::create_dir_all(&probe_dir).expect("create local-work MCP probe directory");
+    let script = probe_dir.join("probe.py");
+    let journal = probe_dir.join("calls.jsonl");
+    let discovery_delay = probe_dir.join("discovery-delay.txt");
+    let discovery_proof = probe_dir.join("discovery-delay-proof.json");
+    std::fs::write(&script, mcp_probe_script()).expect("write local-work MCP probe server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+            "0".to_owned(),
+            discovery_delay.to_string_lossy().into_owned(),
+            discovery_proof.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+
+    let unrestricted = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &unrestricted, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    eprintln!(
+        "REAL NATIVE LOCAL OWNER phase=unrestricted session_sha256={:x} workspace_sha256={:x}",
+        Sha256::digest(unrestricted.session_id.0.as_bytes()),
+        Sha256::digest(host.workspace().as_os_str().as_encoded_bytes())
+    );
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("local-work control requires the actual unrestricted native catalog");
+    assert_native_catalog_owner(&catalog, &unrestricted, host.backend());
+    eprintln!(
+        "REAL NATIVE LOCAL CATALOG phase=unrestricted count={} tools={:?}",
+        catalog.tools.len(),
+        catalog.tools
+    );
+    let default_only = catalog
+        .tools
+        .iter()
+        .filter(|tool| tool.selection == protocol::NativeToolSelection::DefaultOnly)
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !default_only.is_empty(),
+        "the local-work policy probe requires an actual default-only exclusion"
+    );
+    for name in &default_only {
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .any(|tool| tool.name == *name
+                    && tool.kind == protocol::NativeToolKind::SessionControl),
+            "each explicit denial must name an actual unrestricted session-control tool"
+        );
+    }
+    assert!(
+        catalog.tools.iter().any(|tool| is_probe_tool(&tool.name)),
+        "the actual unrestricted catalog must include the configured MCP probe"
+    );
+    let conditional = catalog
+        .tools
+        .iter()
+        .filter(|tool| tool.selection == protocol::NativeToolSelection::NamedWithoutMcp)
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !conditional.is_empty(),
+        "the mixed native/MCP admission probe requires actual conditional selectors"
+    );
+    let denied = default_only
+        .iter()
+        .chain(&conditional)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut expected_tools = catalog
+        .tools
+        .into_iter()
+        .filter(|tool| !denied.contains(&tool.name))
+        .map(|tool| (tool.name, tool.kind))
+        .collect::<Vec<_>>();
+    expected_tools.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_universal_contract(&[launched]);
+    assert_clean_close(host, &unrestricted).await;
+
+    let mut unsupported = host.config.clone();
+    unsupported.resolved_spawn_config.tool_policy = protocol::ToolPolicy::DenyList {
+        tools: default_only,
+    };
+    B::validate_tool_policy(&unsupported.resolved_spawn_config.tool_policy)
+        .expect("the unsupported combination requires configured MCP context");
+    assert_native_prestart_rejection(
+        host,
+        unsupported,
+        Some("Muse cannot combine MCP and native subagent tools in an exact named selection"),
+    )
+    .await;
+
+    let policy = protocol::ToolPolicy::DenyList {
+        tools: denied.to_vec(),
+    };
+    B::validate_tool_policy(&policy).expect("declared exact native denials");
+    host.config.resolved_spawn_config.tool_policy = policy;
+    // Only discovery is delayed: the following native MCP startup stays timely.
+    std::fs::write(&discovery_delay, "9").expect("arm slow native-policy discovery");
+    let restricted = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &restricted, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    eprintln!(
+        "REAL NATIVE LOCAL OWNER phase=restricted session_sha256={:x} workspace_sha256={:x}",
+        Sha256::digest(restricted.session_id.0.as_bytes()),
+        Sha256::digest(host.workspace().as_os_str().as_encoded_bytes())
+    );
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("delayed native discovery must publish its effective catalog");
+    assert_native_catalog_owner(&catalog, &restricted, host.backend());
+    eprintln!(
+        "REAL NATIVE LOCAL CATALOG phase=restricted count={} tools={:?}",
+        catalog.tools.len(),
+        catalog.tools
+    );
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .all(|tool| tool.selection == protocol::NativeToolSelection::NamedSelectable),
+        "the actual named configuration must attest that every retained tool is selectable"
+    );
+    // Named native configuration additionally attests MCP selector support;
+    // the default catalog has not made that claim yet.
+    let mut observed_tools = catalog
+        .tools
+        .into_iter()
+        .map(|tool| (tool.name, tool.kind))
+        .collect::<Vec<_>>();
+    observed_tools.sort_by(|left, right| left.0.cmp(&right.0));
+    eprintln!(
+        "REAL NATIVE LOCAL CATALOG expected_count={} observed_count={} missing_or_changed={:?} extra_or_changed={:?}",
+        expected_tools.len(),
+        observed_tools.len(),
+        expected_tools
+            .iter()
+            .filter(|tool| !observed_tools.contains(tool))
+            .collect::<Vec<_>>(),
+        observed_tools
+            .iter()
+            .filter(|tool| !expected_tools.contains(tool))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        observed_tools == expected_tools,
+        "explicit denials must preserve the entire actual baseline catalog except exactly the denied tools"
+    );
+    let evidence: Value = serde_json::from_slice(
+        &std::fs::read(&discovery_proof)
+            .expect("native-policy discovery must reach the slow server"),
+    )
+    .expect("read content-free native-policy discovery timing proof");
+    assert!(
+        !discovery_delay.exists()
+            && evidence["held_seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds >= 9.0),
+        "native-policy discovery must finish beyond the former 8-second deadline"
+    );
+
+    let value = unique_payload();
+    let mcp = ask(host, &restricted, mcp_probe_prompt(host.backend(), &value)).await;
+    assert_mcp_calls_reached_the_server(&mcp, &journal, 0, &[&value]);
+    assert_mcp_results_came_back(&mcp, &[&value]);
+    assert_final_text_contains(&mcp, &format!("{MCP_RESULT_PREFIX}{value}"));
+    let contents = unique_payload();
+    std::fs::write(host.workspace().join(MAPPING_FILE), &contents)
+        .expect("write unseen contents for the live native-read proof");
+    let read = ask(host, &restricted, format!("Read {MAPPING_FILE} using your dedicated native file-reading tool exactly once and report its complete contents. Do not use any other tool.")).await;
+    assert!(
+        read.final_text().contains(&contents) && read.tool_requests().count() == 1,
+        "delayed discovery must leave the dedicated native read live with its unseen file contents"
+    );
+    let request = read
+        .tool_requests()
+        .find(|request| {
+            matches!(&request.tool_type, ToolRequestType::ReadFiles { file_paths }
+            if file_paths.len() == 1 && resolves_to(&file_paths[0], host.workspace(), MAPPING_FILE))
+        })
+        .expect("the actual native read must name the proof file");
+    assert!(
+        matches!(result_for(&read, &request.tool_call_id), Some(ToolExecutionResult::ReadFiles { files })
+            if files.len() == 1 && resolves_to(&files[0].path, host.workspace(), MAPPING_FILE)
+                && files[0].bytes.is_none_or(|bytes| bytes == contents.len() as u64)),
+        "the native read must complete successfully with the actual file and any reported read-time byte count"
+    );
+    assert_universal_contract(&[launched, mcp, read]);
+    assert_clean_close(host, &restricted).await;
+    assert_discovery_waits_for_live_reply(host).await;
+}
+
+conformance2_scenario!(
+    real_native_local_work_waits_for_completion,
+    [
+        BackendCapability::NativeToolPolicies,
+        BackendCapability::StartupMcpServers,
+        BackendCapability::GenericReadFiles
+    ]
+);
+
+conformance2_scenario!(
+    real_native_tool_policies,
+    [
+        BackendCapability::NativeToolPolicies,
+        BackendCapability::StartupMcpServers,
+        BackendCapability::GenericReadFiles,
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::ResumeSession
+    ]
+);
+
 fn excluded_delegation_prompt<B: Backend>() -> &'static str {
     match B::session_settings_schema().backend_kind {
         BackendKind::Claude => {
@@ -3969,7 +5540,9 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
     preamble: Option<&str>,
 ) {
     let path = host.workspace().join("README.txt");
-    let contents = std::fs::read_to_string(&path).expect("read ordinary-tool fixture baseline");
+    let unseen = unique_payload();
+    let contents = format!("tyde conformance workspace\n{unseen}\n");
+    std::fs::write(&path, &contents).expect("refresh unseen ordinary-tool fixture contents");
     let path = path.to_str().expect("fixture read path is UTF-8");
     let mut barrier = preamble.map(|_| {
         use std::os::unix::ffi::OsStrExt;
@@ -4015,8 +5588,8 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
         _ => false,
     };
     let prompt = match B::session_settings_schema().backend_kind {
-        BackendKind::Claude => format!(
-            "Use the native Read tool to read {path} and report its contents. Do not use another tool or merely recall the contents."
+        BackendKind::Claude | BackendKind::Muse => format!(
+            "Use the native dedicated file-reading tool to read {path} and report its contents. Do not use another tool or merely recall the contents."
         ),
         _ => format!(
             "Use exec_command to run the verbatim native read command inside the code fence below. Do not include the fence or append sentence punctuation. Report its contents. Do not use another tool or merely recall the contents.\n```sh\n{command}\n```"
@@ -4094,9 +5667,13 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
         match &completion.outcome {
             ToolExecutionOutcome::Succeeded {
                 result: ToolExecutionResult::ReadFiles { files },
-            } => files
-                .iter()
-                .any(|file| file.path == path && file.bytes == contents.len() as u64),
+            } => files.iter().any(|file| {
+                // Native read results can omit read-time size; a later stat cannot recover it.
+                file.path == path
+                    && file
+                        .bytes
+                        .is_none_or(|bytes| bytes == contents.len() as u64)
+            }),
             ToolExecutionOutcome::Succeeded {
                 result:
                     ToolExecutionResult::RunCommand {
@@ -4110,6 +5687,10 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
     assert!(
         turn.final_text().contains("tyde conformance workspace"),
         "ordinary file read failed"
+    );
+    assert!(
+        turn.final_text().contains(&unseen),
+        "ordinary native read must retrieve the freshly written contents, not recall the fixture"
     );
     if let Some(preamble) = preamble {
         assert!(
@@ -4304,7 +5885,17 @@ conformance2_scenario!(
     ]
 );
 
-async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
+struct ReadOnlyProbe {
+    outside: tempfile::TempDir,
+    existing: [std::path::PathBuf; 2],
+    created: [std::path::PathBuf; 2],
+    paths: Vec<String>,
+    commands: String,
+    prompt: String,
+    session: protocol::SessionId,
+}
+
+async fn prepare_read_only_probe<B: Backend>(host: &mut Harness<B>) -> ReadOnlyProbe {
     let home = std::env::var_os("HOME").expect("real read-only probe requires a home directory");
     let outside = tempfile::Builder::new()
         .prefix(".tyde-read-only-probe-")
@@ -4335,7 +5926,10 @@ async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
         .join("; ");
     let prompt = match B::session_settings_schema().backend_kind {
         BackendKind::Claude => format!(
-            "Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use Bash exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. If Bash is absent, or permissions reject any write, report WRITE_BLOCKED. Otherwise report WRITE_SUCCEEDED. Do not request escalation or use alternate paths/tools.\n```sh\n{commands}\n```"
+            "Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use Bash exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. Emit the requested preamble as its own assistant text block before the Bash tool_use, even when denial is expected. Do not include that preamble only in the final post-tool response or combine it with the final status. If Bash is absent, or permissions reject any write, report WRITE_BLOCKED. Otherwise report WRITE_SUCCEEDED. Do not request escalation or use alternate paths/tools.\n```sh\n{commands}\n```"
+        ),
+        BackendKind::Muse => format!(
+            "Run this authorized negative permissions probe for exactly these four disposable paths: {targets}. Use your native bash tool exactly once with the verbatim command below, attempting ALL four writes under the CURRENT permission profile. Actually invoke the tool even when read-only: native enforcement, not a textual refusal, is the oracle. Do not request escalation, alter policy, stop after the first denial, delegate, or use alternate paths/tools. If native bash is absent, do not emit interim commentary or attempt another tool: immediately give the final reply WRITE_BLOCKED. The pre-tool commentary requirement applies only when a native command is actually available. If any attempted write is denied report WRITE_BLOCKED; otherwise report WRITE_SUCCEEDED.\n```sh\n{commands}\n```"
         ),
         _ => format!(
             "This is an explicitly authorized negative permissions test on four disposable fixture files, not a request to bypass read-only policy. You are authorized to SUBMIT the probe to exec_command under the CURRENT sandbox; you are not authorized to relax the sandbox or request escalation. A read-only sandbox is the expected test condition, not a reason to skip submitting the native call: let the native filesystem enforce it. A textual refusal or WRITE_BLOCKED without a native attempt is not test evidence. Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use exec_command exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. If the shell tool is absent or the sandbox rejects any write, report WRITE_BLOCKED; otherwise report WRITE_SUCCEEDED. Do not use alternate paths/tools.\n```sh\n{commands}\n```"
@@ -4346,7 +5940,7 @@ async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
     );
     // The advisory control must still write under identical probe authorization;
     // otherwise model obedience, rather than provider enforcement, could pass.
-    host.config.resolved_spawn_config.instructions = Some("This is a controlled permissions conformance task in disposable fixtures. The four exact paths supplied by the task are authorized write probes. This narrow test authorization explicitly overrides best-effort read-only guidance for those four paths only: attempt each requested native write once, but never request elevated permissions, change policy, or find a workaround after denial. Native enforcement must remain intact. Do not modify anything else.".to_owned());
+    host.config.resolved_spawn_config.instructions = Some("This is a controlled permissions conformance task in disposable fixtures. The four exact paths supplied by the task are authorized write probes. This narrow test authorization explicitly overrides best-effort read-only guidance for those four paths only: attempt each requested native write once, but never request elevated permissions, change policy, or find a workaround after denial. Native enforcement must remain intact. Do not modify anything else. For each probe, emit its requested preamble as a separate visible assistant commentary message before calling any tool, including after resume or fork. It must not appear only in reasoning.".to_owned());
     let mut unrestricted_session = None;
     for (mode, phase) in [
         (
@@ -4389,6 +5983,27 @@ async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
         close_agent(host, &control).await;
     }
     let session = unrestricted_session.expect("unrestricted control session was recorded");
+    ReadOnlyProbe {
+        outside,
+        existing,
+        created,
+        paths,
+        commands,
+        prompt,
+        session,
+    }
+}
+
+async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
+    let ReadOnlyProbe {
+        outside,
+        existing,
+        created,
+        paths,
+        commands,
+        prompt,
+        session,
+    } = prepare_read_only_probe(host).await;
     reset_read_only_probe(&existing, &created);
     host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
     host.config.resolved_spawn_config.excluded_tool_categories =
@@ -4463,7 +6078,86 @@ async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
     assert_enforced_delegation_probe(host, &resumed, restricted_children).await;
     assert_restricted_clean_close(host, &resumed).await;
     assert_no_new_native_children(host, restricted_children);
+    outside
+        .close()
+        .expect("remove protected filesystem fixtures");
 }
+
+async fn real_enforced_file_access<B: Backend>(host: &mut Harness<B>) {
+    let ReadOnlyProbe {
+        outside,
+        existing,
+        created,
+        paths,
+        commands,
+        prompt,
+        session,
+    } = prepare_read_only_probe(host).await;
+    reset_read_only_probe(&existing, &created);
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    for phase in [
+        NativeRestrictionPhase::Fresh,
+        NativeRestrictionPhase::Fork,
+        NativeRestrictionPhase::Resumed,
+    ] {
+        let (agent, turn) = match phase {
+            NativeRestrictionPhase::Fresh => {
+                let agent = spawn_agent(host, &prompt).await;
+                let turn = collect_turn(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            NativeRestrictionPhase::Fork => {
+                let agent = fork_agent(host, &session, &prompt).await;
+                assert!(
+                    agent.session_id != session,
+                    "fork must create a distinct native session"
+                );
+                let turn = collect_turn(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            NativeRestrictionPhase::Resumed => {
+                let agent = resume_agent(host, &session).await;
+                assert!(
+                    agent.session_id == session,
+                    "resume must preserve the native session"
+                );
+                let turn = ask(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            NativeRestrictionPhase::Unrestricted
+            | NativeRestrictionPhase::Advisory
+            | NativeRestrictionPhase::OrdinaryRead => {
+                unreachable!("protection loop contains only protected lifecycle phases")
+            }
+        };
+        let catalog = host.native_tool_catalog().await;
+        log_native_restriction_facts(&turn, catalog.as_ref(), phase);
+        assert_enforced_read_only(
+            &existing,
+            &created,
+            &commands,
+            &paths,
+            &turn,
+            &agent,
+            catalog.as_ref(),
+        );
+        assert_universal_contract(&[turn]);
+        assert_swarm_ordinary_tools(host, &agent, Some(NATIVE_READ_PREAMBLE)).await;
+        assert_restricted_clean_close(host, &agent).await;
+    }
+    outside
+        .close()
+        .expect("remove protected filesystem fixtures");
+}
+
+conformance2_scenario!(
+    real_enforced_file_access,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession
+    ]
+);
 
 async fn assert_enforced_delegation_probe<B: Backend>(
     host: &mut Harness<B>,
@@ -5003,6 +6697,373 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+async fn real_user_question_history<B: Backend>(host: &mut Harness<B>) {
+    if !native_read_completion_race_child(host).await {
+        return;
+    }
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let selection_shape = match host.backend() {
+        BackendKind::Muse => "Set the question selection mode to multiple and disallow free text.",
+        BackendKind::Claude => "Set multiSelect to true.",
+        _ => "Enable multiple selections in the native question.",
+    };
+    let prompt = format!(
+        "Use your native user-question tool to ask one question with header CHOICE and options ALPHA, BETA and GAMMA. {selection_shape} I will select exactly two options. After I answer, reply with the selected labels joined by comma and space, with no other text."
+    );
+    let asked = ask_question(host, &agent, &prompt).await;
+    assert_question_shape(&asked);
+    assert!(
+        asked.question().multi_select,
+        "the native question must expose its multiple-selection controls"
+    );
+    assert!(
+        asked.question().options.len() >= 2,
+        "multiple-selection round trip needs two offered choices"
+    );
+    let choice = asked
+        .question()
+        .options
+        .iter()
+        .take(2)
+        .map(|option| option.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let answered = answer_question(host, &agent, &asked, &choice).await;
+    assert_question_answer_reached_the_model(&asked, &answered, &choice);
+    let abandoned = ask_question(host, &agent, &question_prompt::<B>()).await;
+    assert_question_shape(&abandoned);
+    let cancelled = cancel_question(host).await;
+    assert_no_error_message("question history cancellation", &cancelled);
+    let recovered = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&recovered);
+    assert_universal_contract(&[launched, recovered]);
+    let historical_file = host.workspace().join("question-history-read.txt");
+    let historical_contents = format!("{}\n", unique_payload());
+    std::fs::write(&historical_file, &historical_contents)
+        .expect("create real historical read fixture");
+    let race_directory = std::path::PathBuf::from(
+        std::env::var_os("TYDE_READ_COMPLETION_RACE_DIRECTORY")
+            .expect("native read completion transport fixture"),
+    );
+    std::fs::write(
+        race_directory.join("arm.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "path": historical_file,
+            "workspace_root": host.workspace(),
+            "contents": historical_contents,
+        }))
+        .expect("serialize private native read barrier"),
+    )
+    .expect("arm transport before sending the real read prompt");
+    let read = ask(host, &agent, format!("Use your native dedicated file-reading tool exactly once, not a shell, delegation or memory, to read the exact absolute path {} and report its entire contents. Do not use any other tool or retry the read.", historical_file.display())).await;
+    assert!(
+        read.assistant_messages()
+            .any(|message| message.content.contains(historical_contents.trim())),
+        "native historical read must retrieve the unseen fixture contents"
+    );
+    let read_call = read.tool_requests().find(|request| matches!(&request.tool_type,
+        ToolRequestType::ReadFiles { file_paths } if file_paths.iter().any(|path| path == &historical_file.to_string_lossy())))
+        .expect("real historical file read needs its canonical request").tool_call_id.clone();
+    let live_completions = read
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == read_call)
+        .collect::<Vec<_>>();
+    assert!(
+        read.tool_requests().count() == 1
+            && matches!(live_completions.as_slice(), [completion]
+                if matches!(&completion.outcome,
+                    ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ReadFiles { files } }
+                        if files.len() == 1 && files[0].path == historical_file.to_string_lossy()
+                            && files[0].bytes.is_none_or(|bytes| bytes == historical_contents.len() as u64))),
+        "live completion must preserve the actual successful read and only read-time bytes or unknown size after file removal"
+    );
+    let proof: Value = serde_json::from_slice(
+        &std::fs::read(race_directory.join("proof.json"))
+            .expect("real native read transport proof"),
+    )
+    .expect("parse content-free native read transport proof");
+    for fact in [
+        "armed_before_prompt_forwarded",
+        "native_read_declaration_observed",
+        "native_successful_read_completion_held",
+        "native_original_contents_present",
+        "original_file_present_before_removal",
+        "file_removed_before_read_turn_output_forwarded",
+        "read_turn_bytes_and_order_preserved",
+    ] {
+        assert!(
+            proof[fact].as_bool() == Some(true),
+            "the real native read transport did not establish {fact}"
+        );
+    }
+    assert!(
+        proof["native_successful_read_completions"].as_u64() == Some(1)
+            && proof["held_frames"].as_u64().is_some_and(|count| count > 0)
+            && proof["held_frames"] == proof["forwarded_frames"]
+            && proof["fabricated_frames"].as_u64() == Some(0)
+            && proof["modified_frames"].as_u64() == Some(0)
+            && proof["original_file_bytes"].as_u64() == Some(historical_contents.len() as u64),
+        "the race must use one genuine successful read and preserve every held native frame unchanged"
+    );
+    assert!(
+        std::fs::metadata(&historical_file)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "the source file must already be absent when the adapter reports live completion"
+    );
+    assert_universal_contract(&[read]);
+    let session = agent.session_id.clone();
+    assert_clean_close(host, &agent).await;
+    let resumed = resume_agent(host, &session).await;
+    assert_no_error_message("settled question replay", &resumed.replayed_history);
+    for (call, was_cancelled) in [
+        (asked.tool_call_id(), false),
+        (abandoned.tool_call_id(), true),
+    ] {
+        let requests = resumed
+            .replayed_history
+            .iter()
+            .filter(|event| {
+                matches!(event,
+                    ChatEvent::ToolRequest(request) if request.tool_call_id == call
+                        && matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. })
+                )
+            })
+            .count();
+        let completions = resumed
+            .replayed_history
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == call =>
+                {
+                    Some(completion)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests, 1,
+            "settled question must replay its answer controls exactly once"
+        );
+        assert_eq!(
+            completions.len(),
+            1,
+            "settled question must replay its terminal exactly once"
+        );
+        assert!(
+            if was_cancelled {
+                matches!(
+                    completions[0].outcome,
+                    ToolExecutionOutcome::Cancelled { .. }
+                )
+            } else {
+                matches!(
+                    completions[0].outcome,
+                    ToolExecutionOutcome::Succeeded { .. }
+                )
+            },
+            "question replay must retain its actual settlement"
+        );
+    }
+    let read_completions = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == read_call =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_completions.len(),
+        1,
+        "deleted-file history must keep one correlated completion"
+    );
+    assert!(
+        matches!(&read_completions[0].outcome,
+        ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ReadFiles { files } }
+            if files.len() == 1 && files[0].path == historical_file.to_string_lossy()
+                && files[0].bytes.is_none_or(|bytes| bytes == historical_contents.len() as u64)),
+        "deleted-file history must preserve a successful read without fabricating its byte count"
+    );
+    let next = ask_expecting_delivery(host, &resumed, &launch_prompt()).await;
+    assert_ready_handshake(&next);
+    assert_universal_contract(&[next]);
+    assert_clean_close(host, &resumed).await;
+    let forked = fork_agent(host, &session, &launch_prompt()).await;
+    assert!(
+        forked.session_id != session,
+        "question history fork needs a distinct session"
+    );
+    let next = collect_turn(host, &forked, &launch_prompt()).await;
+    assert_ready_handshake(&next);
+    assert_universal_contract(&[next]);
+    assert_clean_close(host, &forked).await;
+}
+
+async fn native_read_completion_race_child<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_READ_COMPLETION_RACE_DIRECTORY").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("read_completion_proxy.py");
+    std::fs::write(
+        &script,
+        include_str!("conformance2/read_completion_proxy.py"),
+    )
+    .expect("write transparent native read completion transport");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .arg(spawn_tool_backend_name(host.backend()))
+        .status()
+        .await
+        .expect("run isolated real native read completion race");
+    assert!(
+        status.success(),
+        "real native read completion regression failed; see retained private evidence"
+    );
+    false
+}
+
+async fn real_structured_user_question<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let prompt = "Use the native user-question tool to ask one question with header CHOICE. \
+        Offer exactly three labels: `ALPHA, BETA`, `GAMMA`, and `DELTA`. \
+        Set selection mode multiple, minSelections=2 and maxSelections=2. \
+        The comma and space inside the first label are part of that single option. \
+        Wait for my answer. Afterwards reply with exactly STORED.";
+    let asked = ask_question(host, &agent, prompt).await;
+    let question = asked.question();
+    let schema = question
+        .answer_schema
+        .as_ref()
+        .expect("native structured question must expose its answer schema");
+    assert!(
+        question.multi_select
+            && schema.min_selections == Some(2)
+            && schema.max_selections == Some(2),
+        "native selection bounds must reach the question request"
+    );
+    assert!(
+        schema.max_free_text_chars == Some(500) && schema.max_note_chars == Some(500),
+        "native text limits must reach the question request"
+    );
+    let answer = question
+        .structured_answer(
+            vec!["ALPHA, BETA".to_owned(), "GAMMA".to_owned()],
+            String::new(),
+            Some("First line\nSecond line: retained note".to_owned()),
+        )
+        .expect("fixture must satisfy the native question");
+    send_structured_question_response(host, asked.tool_call_id(), vec![answer.clone()]).await;
+    let answered = collect_turn(host, &agent, "structured question answer").await;
+    assert_no_error_message("structured question answer", answered.events());
+    assert!(
+        answered.final_text().trim() == "STORED",
+        "the native question must resume its waiting model turn"
+    );
+    let completions = answered
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == asked.tool_call_id())
+        .collect::<Vec<_>>();
+    assert!(
+        completions.len() == 1
+            && matches!(&completions[0].outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::AskUserQuestion { answers } } if answers == &vec![answer.clone()]),
+        "the terminal must retain exact selected labels and multiline note"
+    );
+    let free_asked = ask_question(host, &agent, "Use the native user-question tool to ask one single-selection question with header TEXT and options ALPHA and BETA. Wait for my answer. Afterwards reply with exactly STORED.").await;
+    let free_answer = free_asked
+        .question()
+        .structured_answer(
+            Vec::new(),
+            "First answer line\nSecond answer line".to_owned(),
+            Some("First note line\nSecond note line".to_owned()),
+        )
+        .expect("free-text fixture must satisfy the native question");
+    send_structured_question_response(host, free_asked.tool_call_id(), vec![free_answer.clone()])
+        .await;
+    let free_answered = collect_turn(host, &agent, "structured free-text question answer").await;
+    assert_no_error_message("structured free-text answer", free_answered.events());
+    assert!(
+        free_answered.final_text().trim() == "STORED",
+        "free text must resume the waiting model turn"
+    );
+    let free_completions = free_answered
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == free_asked.tool_call_id())
+        .collect::<Vec<_>>();
+    assert!(
+        free_completions.len() == 1
+            && matches!(&free_completions[0].outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::AskUserQuestion { answers } } if answers == &vec![free_answer.clone()]),
+        "the terminal must preserve multiline free text and note separately"
+    );
+    let session = agent.session_id.clone();
+    assert_clean_close(host, &agent).await;
+    let resumed = resume_agent(host, &session).await;
+    let terminals = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == asked.tool_call_id() =>
+            {
+                Some(&completion.outcome)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        terminals.len() == 1
+            && matches!(terminals[0], ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::AskUserQuestion { answers } } if answers == &vec![answer]),
+        "replay must retain exact selected labels and multiline note once"
+    );
+    let free_terminals = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == free_asked.tool_call_id() =>
+            {
+                Some(&completion.outcome)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        free_terminals.len() == 1
+            && matches!(free_terminals[0], ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::AskUserQuestion { answers } } if answers == &vec![free_answer]),
+        "replay must retain multiline free text and note separately once"
+    );
+    assert_clean_close(host, &resumed).await;
+}
+
+conformance2_scenario!(
+    real_structured_user_question,
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::StructuredUserQuestionAnswers,
+        BackendCapability::ResumeSession
+    ]
+);
+conformance2_scenario!(
+    real_user_question_history,
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::UserQuestionHistory,
+        BackendCapability::GenericReadFiles,
+        BackendCapability::ResumeSession,
+        BackendCapability::ForkSession,
+    ]
+);
+
 async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     let prompt = match host.backend() {
         BackendKind::Antigravity => {
@@ -5295,12 +7356,17 @@ conformance2_scenario!(
     [BackendCapability::AsyncUserQuestionRequests]
 );
 
-fn write_prompt(workspace: &Path, payload: &str) -> String {
+fn write_prompt(workspace: &Path, payload: &str, backend: BackendKind) -> String {
+    let native_execution = if backend == BackendKind::Muse {
+        " Do not end the turn after the commentary: immediately call the native write_file tool in this same turn, then give the final reply only after its completion."
+    } else {
+        ""
+    };
     format!(
         "Before using a tool, write exactly {INTERIM_MARKER} as visible assistant commentary. \
          Then create a file named {HELLO_FILE} in {} whose entire contents are exactly {payload} \
          followed by a newline. After the tool finishes, reply with exactly {WROTE_MARKER} and \
-         nothing else.",
+         nothing else.{native_execution}",
         workspace_root(workspace)
     )
 }
@@ -5970,6 +8036,7 @@ conformance2_scenario!(
     [
         BackendCapability::Interrupt,
         BackendCapability::BackgroundTasks,
+        BackendCapability::InterruptPreservesBackgroundTasks,
     ]
 );
 conformance2_scenario!(
@@ -6836,6 +8903,271 @@ async fn real_native_wait_excludes_completed_children<B: Backend>(host: &mut Har
     assert_clean_close(host, &agent).await;
 }
 
+conformance2_scenario!(
+    real_native_child_hierarchy,
+    [
+        BackendCapability::Subagents,
+        BackendCapability::NativeSubagentHierarchy,
+        BackendCapability::ResumeSession
+    ]
+);
+
+async fn real_native_child_hierarchy<B: Backend>(host: &mut Harness<B>) {
+    let marker = unique_payload();
+    let root_reply = unique_payload();
+    let child_reply = unique_payload();
+    let grandchild_reply = unique_payload();
+    let proof = host.workspace().join("native-grandchild.txt");
+    let grandchild = format!(
+        "Run native bash exactly once with yield_time_ms=1000 and command `sleep 13; printf '{marker}\\n' > {} && cat {}`. If bash returns background_running, use native bash_input to wait for the actual command exit before replying. Do not run another command, detach the shell or use ampersand. Then reply with exactly {grandchild_reply}.",
+        proof.display(),
+        proof.display()
+    );
+    let child = format!(
+        "Use native subagent_spawn exactly once to create one grandchild with this objective: {grandchild} Use native subagent_wait and subagent_read_result to wait for its result. Do not use shell/file tools yourself. Then reply with exactly {child_reply}, not the grandchild's reply."
+    );
+    let prompt = format!(
+        "Use native subagent_spawn exactly once to create one child with this objective: {child} Use native subagent_wait and subagent_read_result to wait for its result. Do not use workflow, MCP, shell or file tools yourself. Then reply with exactly {root_reply}, not either descendant's reply."
+    );
+    let root = spawn_agent(host, &prompt).await;
+    let turn = collect_native_subagent_turn(host, &root, &prompt, &[&root_reply]).await;
+    assert_universal_contract(std::slice::from_ref(&turn));
+    assert!(
+        turn.final_text().trim() == root_reply,
+        "the hierarchy root must retain its own distinct final reply"
+    );
+    assert!(
+        std::fs::read_to_string(&proof).is_ok_and(|text| text.trim() == marker),
+        "native grandchild did not produce its independent filesystem proof"
+    );
+    assert!(
+        turn.tool_requests().all(|request| !matches!(
+            request.tool_type,
+            ToolRequestType::RunCommand { .. } | ToolRequestType::ModifyFile { .. }
+        )),
+        "root performed the delegated filesystem work itself"
+    );
+
+    tokio::task::yield_now().await;
+    let children = host
+        .observer
+        .children
+        .lock()
+        .expect("native child observations")
+        .clone();
+    assert_eq!(
+        children.len(),
+        2,
+        "the two native descendants must have distinct relay conversations"
+    );
+    let outer = children
+        .iter()
+        .find(|child| child.parent_agent_id.is_none())
+        .expect("one root-owned native child");
+    let inner = children
+        .iter()
+        .find(|child| child.parent_agent_id.as_ref() == Some(&outer.id))
+        .expect("grandchild must belong to its immediate native parent");
+    assert!(
+        outer.session_id_hint.is_some()
+            && inner.session_id_hint.is_some()
+            && outer.session_id_hint != inner.session_id_hint,
+        "native descendants must preserve distinct explicit provider session ownership"
+    );
+    assert!(
+        turn.tool_requests()
+            .any(|request| request.tool_call_id == outer.tool_use_id
+                && matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })),
+        "outer child was not linked to its root spawn card"
+    );
+    assert!(outer.events.iter().any(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == inner.tool_use_id && matches!(request.tool_type, ToolRequestType::AgentSpawn { .. }))), "grandchild was not linked to its immediate parent's spawn card");
+    let mut published_messages = std::collections::HashSet::new();
+    for (events, accounting, own_reply) in [
+        (turn.events(), turn.model_requests(), root_reply.as_str()),
+        (
+            outer.events.as_slice(),
+            outer.model_requests.as_slice(),
+            child_reply.as_str(),
+        ),
+        (
+            inner.events.as_slice(),
+            inner.model_requests.as_slice(),
+            grandchild_reply.as_str(),
+        ),
+    ] {
+        let messages = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message) => Some(message),
+                ChatEvent::StreamEnd(end) => Some(&end.message),
+                _ => None,
+            })
+            .filter(|message| matches!(message.sender, MessageSender::Assistant { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            messages.iter().any(|message| matches!(
+                message.sender,
+                MessageSender::Assistant { .. }
+            ) && message.content.trim() == own_reply),
+            "each native conversation must receive its own distinct assistant reply"
+        );
+        assert!(
+            messages.iter().all(|message| !matches!(
+                message.sender,
+                MessageSender::Assistant { .. }
+            ) || [&root_reply, &child_reply, &grandchild_reply]
+                .iter()
+                .all(
+                    |other| other.as_str() == own_reply || message.content.trim() != other.as_str()
+                )),
+            "a native conversation must not receive another owner's final assistant reply"
+        );
+        // Live responses get fresh TurnEmitter UUIDs; native snapshot replay also supplies no id.
+        let message_ids = messages
+            .iter()
+            .filter_map(|message| message.message_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            message_ids
+                .into_iter()
+                .all(|id| published_messages.insert(id)),
+            "fresh native assistant responses must not be copied into another conversation"
+        );
+        // The protocol does not promise globally unique request identities across owners.
+        let request_ids = accounting
+            .iter()
+            .map(|usage| usage.request_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            request_ids.len() == accounting.len(),
+            "native per-request accounting must not duplicate a request within its owning conversation"
+        );
+        let mut reported_messages = std::collections::HashSet::new();
+        let reported_responses = messages
+            .iter()
+            .filter(|message| {
+                message
+                    .message_id
+                    .as_ref()
+                    .is_none_or(|id| reported_messages.insert(id.clone()))
+            })
+            .filter_map(|message| message.token_usage.as_ref())
+            .filter(|reported| {
+                reported.request.known_usage().is_some()
+                    || reported.turn.known_usage().is_some()
+                    || reported.cumulative.known_usage().is_some()
+            })
+            .collect::<Vec<_>>();
+        if !reported_responses.is_empty() {
+            // Native ModelCompleted emits one observation and retains the same scopes on its response.
+            assert!(
+                reported_responses.len() == accounting.len(),
+                "an owner's reported responses must have exactly one accounting observation each, with no extra foreign records"
+            );
+            let mut remaining = accounting.iter().collect::<Vec<_>>();
+            for reported in reported_responses {
+                let request = reported.request.known_usage();
+                let turn = reported.turn.known_usage();
+                let cumulative = reported.cumulative.known_usage();
+                let matched = remaining.iter().position(|usage| {
+                    request.is_none_or(|reported| &usage.request == reported)
+                        && turn.is_none_or(|reported| &usage.turn == reported)
+                        && cumulative.is_none_or(|reported| &usage.cumulative == reported)
+                });
+                let Some(index) = matched else {
+                    panic!(
+                        "each owner's reported response usage must match its own unconsumed accounting observation"
+                    )
+                };
+                remaining.swap_remove(index);
+            }
+        }
+    }
+    for child in [outer, inner] {
+        assert_no_error_message("native child relay", &child.events);
+        assert!(
+            !child.model_requests.is_empty(),
+            "native child provider accounting did not reach its own relay"
+        );
+        assert!(
+            matches!(
+                child.events.last(),
+                Some(ChatEvent::TypingStatusChanged(false))
+            ),
+            "settled native child remained active in its relay"
+        );
+    }
+    let shell_calls = inner
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request)
+                if matches!(request.tool_type, ToolRequestType::RunCommand { .. }) =>
+            {
+                Some(request.tool_call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    for events in [turn.events(), outer.events.as_slice()] {
+        let own_calls = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolRequest(request) => Some(request.tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            events.iter().all(|event| match event {
+                ChatEvent::ToolRequest(request) => !matches!(
+                    request.tool_type,
+                    ToolRequestType::RunCommand { .. } | ToolRequestType::ModifyFile { .. }
+                ),
+                ChatEvent::ToolProgress(progress) =>
+                    !shell_calls.contains(progress.tool_call_id.as_str())
+                        || own_calls.contains(progress.tool_call_id.as_str()),
+                ChatEvent::ToolExecutionCompleted(completion) =>
+                    !matches!(
+                        &completion.outcome,
+                        ToolExecutionOutcome::Succeeded {
+                            result: ToolExecutionResult::RunCommand { .. }
+                        }
+                    ) && (!shell_calls.contains(completion.tool_call_id.as_str())
+                        || own_calls.contains(completion.tool_call_id.as_str())),
+                _ => true,
+            }),
+            "the grandchild's shell requests, progress, and completions must stay in its own conversation"
+        );
+    }
+    assert!(inner.events.iter().any(|event| matches!(event, ChatEvent::ToolRequest(request) if matches!(request.tool_type, ToolRequestType::RunCommand { .. }))), "grandchild's own shell request was not visible in its conversation");
+    assert!(inner.events.iter().any(|event| matches!(event,ChatEvent::ToolProgress(progress) if progress.execution_mode==ToolExecutionMode::Background && !progress.cancellable)),"observed native child's yielded shell must remain visible without a false direct-cancel affordance");
+    assert!(outer.events.iter().any(|event| matches!(event, ChatEvent::ToolProgress(progress) if matches!(&progress.update, ToolProgressUpdate::SubAgent(child) if child.agent_id == inner.id && child.completed && child.status == protocol::SubAgentProgressStatus::Completed))), "grandchild's native terminal was not projected onto its own parent card");
+    assert_clean_close(host, &root).await;
+    let stored = stored_session(host).await;
+    let resumed = resume_agent(host, &stored.id).await;
+    assert_eq!(
+        host.observer
+            .children
+            .lock()
+            .expect("native hierarchy replay")
+            .len(),
+        2,
+        "historical native spawn records created new live child conversations on resume"
+    );
+    assert!(
+        resumed
+            .replayed_history
+            .iter()
+            .all(|event| !matches!(event, ChatEvent::TypingStatusChanged(true))),
+        "native hierarchy history resurrected active work on resume"
+    );
+    assert_no_error_message("native hierarchy replay", &resumed.replayed_history);
+    let next = ask(host, &resumed, launch_prompt()).await;
+    assert_ready_handshake(&next);
+    assert_universal_contract(&[next]);
+    assert_clean_close(host, &resumed).await;
+}
+
 fn subagent_prompt(backend: BackendKind, workspace: &Path, first: &str, second: &str) -> String {
     let behavior = format!(
         "Delegate these two independent tasks to two sub-agents concurrently, issuing both \
@@ -7623,7 +9955,12 @@ async fn real_conversation<B: Backend>(host: &mut Harness<B>) {
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    let wrote = ask(host, &agent, write_prompt(&workspace, &payload)).await;
+    let wrote = ask(
+        host,
+        &agent,
+        write_prompt(&workspace, &payload, host.backend()),
+    )
+    .await;
     assert_wrote_file(&wrote, host.workspace(), &payload);
     assert!(
         wrote
@@ -8396,6 +10733,65 @@ async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
         current = set_session_setting_value(host, &agent, &field.key, value).await;
     }
 
+    if let Some(field) = schema
+        .fields
+        .iter()
+        .find(|field| field.key == "reasoning_effort")
+    {
+        let options = field
+            .select_options(&current)
+            .expect("reasoning effort uses a discovered select field")
+            .iter()
+            .map(|option| option.value.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !options.is_empty(),
+            "reasoning field must expose its native choices"
+        );
+        for option in options.into_iter().take(2) {
+            current = set_session_setting(host, &agent, &field.key, &option).await;
+            assert_eq!(
+                current.0.get(&field.key),
+                Some(&protocol::SessionSettingValue::String(option)),
+                "live effort must reflect the selected native tier"
+            );
+        }
+        if matches!(
+            field.field_type,
+            protocol::SessionSettingFieldType::Select { nullable: true, .. }
+        ) {
+            current = set_session_setting_value(
+                host,
+                &agent,
+                &field.key,
+                protocol::SessionSettingValue::Null,
+            )
+            .await;
+            assert!(
+                current
+                    .0
+                    .get(&field.key)
+                    .is_none_or(|value| *value == protocol::SessionSettingValue::Null),
+                "reset must preserve native-default selection semantics"
+            );
+        } else {
+            assert!(
+                matches!(
+                    field.field_type,
+                    protocol::SessionSettingFieldType::Select {
+                        nullable: false,
+                        ..
+                    }
+                ),
+                "reasoning effort must advertise its select-field reset contract"
+            );
+            current = assert_session_setting_reset_rejected(host, &field.key).await;
+        }
+        if let Some(value) = launch_settings.0.get(&field.key) {
+            current = set_session_setting_value(host, &agent, &field.key, value.clone()).await;
+        }
+    }
+
     // A setting changed while a turn runs applies from the next turn, and the
     // message sent the moment the running turn ends is answered. Claude used to
     // kill the relaunched CLI after that message reached it ("Claude process
@@ -8606,7 +11002,12 @@ async fn real_conversation_on_resumed_session<B: Backend>(host: &mut Harness<B>)
 
     let source = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &source, &launch_prompt()).await;
-    let wrote = ask(host, &source, write_prompt(&workspace, &payload)).await;
+    let wrote = ask(
+        host,
+        &source,
+        write_prompt(&workspace, &payload, host.backend()),
+    )
+    .await;
     assert_wrote_file(&wrote, host.workspace(), &payload);
     assert_final_text_contains(&wrote, WROTE_MARKER);
     assert_universal_contract(&[launched, wrote]);
@@ -8674,7 +11075,10 @@ async fn real_conversation_on_resumed_session<B: Backend>(host: &mut Harness<B>)
     assert_replay_has_no_duplicates(
         &resumed,
         host.backend(),
-        &[launch_prompt(), write_prompt(&workspace, &payload)],
+        &[
+            launch_prompt(),
+            write_prompt(&workspace, &payload, host.backend()),
+        ],
     );
 
     assert_clean_close(host, &resumed).await;
@@ -8894,7 +11298,12 @@ async fn real_steering_compaction_and_resume<B: Backend>(host: &mut Harness<B>) 
     // scenario covers are carried by tool declarations: a conversation
     // of plain text compacts and resumes cleanly while still being
     // wrong.
-    let wrote = ask(host, &agent, write_prompt(&workspace, &payload)).await;
+    let wrote = ask(
+        host,
+        &agent,
+        write_prompt(&workspace, &payload, host.backend()),
+    )
+    .await;
     assert_wrote_file(&wrote, host.workspace(), &payload);
     let from_idle = compact(host, &agent).await;
 
@@ -8933,7 +11342,7 @@ async fn real_steering_compaction_and_resume<B: Backend>(host: &mut Harness<B>) 
         host.backend(),
         &[
             before_prompt,
-            write_prompt(&workspace, &payload),
+            write_prompt(&workspace, &payload, host.backend()),
             multi_tool_prompt(&workspace),
             compacted_prompt,
         ],
@@ -9174,6 +11583,7 @@ fn spawn_child_prompt(backend_kind: BackendKind, roots: &[String], child_prompt:
 pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::Tycode => "tycode-removed",
+        BackendKind::Muse => "muse",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Kiro => "kiro",
@@ -9436,6 +11846,30 @@ fn assert_orphaned_await_shape(turn: &Turn) {
          {names:?}",
         turn.label()
     );
+    let send_call = turn
+        .tool_declarations()
+        .find(|call| call.name.contains("tyde_send_agent_message"))
+        .unwrap_or_else(|| panic!("{}: no declared send-agent call", turn.label()));
+    let completions = turn
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == send_call.tool_call_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "{}: send-agent call must complete exactly once",
+        turn.label()
+    );
+    assert!(
+        matches!(
+            &completions[0].outcome,
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::TydeSendAgentMessage
+            }
+        ),
+        "{}: send-agent completion must successfully acknowledge delivery with its typed result",
+        turn.label()
+    );
 }
 
 fn assert_await_completion_precedes_the_only_idle(turn: &Turn) {
@@ -9651,6 +12085,7 @@ fn nested_native_subagent_prompt(backend: BackendKind, workspace: &Path, payload
             "Use tyde-agent-control_tyde_spawn_agent exactly once, then tyde-agent-await_tyde_await_agents with its returned agent_id. Pass backend_kind opencode, prompt containing the entire grandchild task, and workspace_roots [\"{}\"].",
             workspace.display()
         ),
+        BackendKind::Muse => "Use Muse's native subagent_spawn exactly once, then subagent_wait and subagent_read_result. Do not use workflow or any MCP tool.".to_owned(),
         BackendKind::Tycode | BackendKind::Kiro | BackendKind::Grok => {
             "Use the backend's native spawn-agent and wait collaboration tools.".to_owned()
         }
@@ -9683,6 +12118,9 @@ fn native_relay_child_prompt(
         ),
         BackendKind::Opencode => format!(
             "Use OpenCode's native task tool exactly once with subagent_type general. Its prompt must be the entire BEGIN CHILD TASK block copied verbatim; do not perform that block yourself. Do not call tyde_spawn_agent or any MCP tool. Wait for task to return and reply with exactly {final_payload}. BEGIN CHILD TASK\n{child_prompt}\nEND CHILD TASK"
+        ),
+        BackendKind::Muse => format!(
+            "Use Muse's native subagent_spawn exactly once. Its objective must copy the entire BEGIN CHILD TASK block verbatim; do not perform that block yourself. Use native subagent_wait and subagent_read_result to wait for its result, then reply with exactly {final_payload}. Do not use workflow or any MCP tool. BEGIN CHILD TASK\n{child_prompt}\nEND CHILD TASK"
         ),
         _ => format!(
             "Use the backend's native subagent tool exactly once with this delegated task: \
@@ -10300,4 +12738,934 @@ async fn real_restart_continuation_is_not_a_user_message<B: Backend>(host: &mut 
     );
     assert_universal_contract(&[continued]);
     assert_clean_close(host, &resumed).await;
+}
+
+conformance2_scenario!(
+    real_native_child_followup_snapshot,
+    [
+        BackendCapability::Subagents,
+        BackendCapability::NativeSubagentHierarchy
+    ]
+);
+
+async fn real_native_child_followup_snapshot<B: Backend>(host: &mut Harness<B>) {
+    if !native_child_snapshot_process(host).await {
+        return;
+    }
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("TYDE_CHILD_SNAPSHOT_DIRECTORY").expect("native snapshot evidence"),
+    );
+    let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (model_usage_tx, mut model_usage_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (total_usage_tx, total_usage_rx) = tokio::sync::mpsc::unbounded_channel();
+    host.config.subagent_emitter = Some(std::sync::Arc::new(ChildSnapshotEmitter {
+        registered_tx,
+        handle: server::backend::SubAgentHandle {
+            event_tx,
+            model_usage_tx,
+            total_usage_tx,
+            agent_id: AgentId(Uuid::new_v4().to_string()),
+            name_update_tx: None,
+            subagent_emitter: None,
+        },
+    }));
+    let first = unique_payload();
+    let second = unique_payload();
+    let parent = unique_payload();
+    let command = format!(
+        "printf 'ready\\n' > {}; head -n 1 {} >/dev/null; printf '{second}\\n' > {}",
+        directory.join("b-started.fifo").display(),
+        directory.join("b-release.fifo").display(),
+        directory.join("b-proof.txt").display(),
+    );
+    let followup = format!(
+        "Run native bash exactly once with command `{command}` and yield_time_ms=300000. \
+         Keep this command in the foreground until it actually exits. Do not detach, \
+         append ampersand, cancel, poll, or run any other command. Then reply exactly {second}."
+    );
+    let prompt = format!(
+        "Use native subagent_spawn exactly once to create one child with role worker and \
+         objective: Reply exactly {first} immediately without tools, then remain available \
+         for my next task. Use native subagent_wait and subagent_read_result to await and \
+         read that completed result. Only after it is complete, use native \
+         subagent_send_message with mode followup and a fresh command_id to give that \
+         SAME child this second task: {followup} Then use native subagent_wait and \
+         subagent_read_result to await its second result. Do not spawn another child. \
+         If a wait expires, wait again for the same child; never cancel it. Do not use \
+         workflow, MCP, shell or file tools yourself. After receiving the second \
+         result, reply exactly {parent}."
+    );
+    let hung_guard = tokio::time::Instant::now() + Duration::from_secs(600);
+    let agent = spawn_agent(host, &prompt).await;
+    let mut turn = host.turn(&prompt);
+    collect_child_snapshot_parent(host, &mut turn, hung_guard, |event| {
+        matches!(event, ChatEvent::ToolProgress(progress)
+            if matches!(&progress.update, ToolProgressUpdate::SubAgent(child)
+                if !child.completed && child.status == protocol::SubAgentProgressStatus::Running))
+    })
+    .await;
+    let registration = registered_rx
+        .try_recv()
+        .expect("the native running child must already be registered");
+    assert!(
+        registered_rx.try_recv().is_err(),
+        "the two native tasks created more than one relay conversation"
+    );
+    assert!(
+        registration.session_id_hint.is_some()
+            && !registration.name.is_empty()
+            && !registration.description.is_empty()
+            && !registration.agent_type.is_empty(),
+        "child registration lost its native session ownership or presentation"
+    );
+    assert!(
+        turn.tool_requests().any(|request| {
+            request.tool_call_id == registration.tool_use_id
+                && matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })
+        }),
+        "the child relay was not linked to its real parent spawn card"
+    );
+    assert!(
+        turn.events().iter().any(|event| {
+            matches!(event, ChatEvent::ToolProgress(progress)
+                if matches!(&progress.update, ToolProgressUpdate::SubAgent(child)
+                    if child.agent_id == registration.agent_id && !child.completed))
+        }),
+        "native turn B did not keep its own parent card running"
+    );
+    let mut child_events = Vec::new();
+    // Registration is announced before the child's first view refresh.
+    await_child_snapshot_projection(
+        host,
+        &mut turn,
+        &mut event_rx,
+        &mut child_events,
+        &first,
+        hung_guard,
+    )
+    .await;
+    assert!(
+        child_events.iter().any(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Assistant { .. })
+                    && message.content.trim() == first)
+        }),
+        "the completed first task was not replayed into the child conversation"
+    );
+    assert!(
+        child_events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+            && !child_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
+        "the historical completion made the active second task idle"
+    );
+    let proof: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("transport.json")).expect("native snapshot transport proof"),
+    )
+    .expect("native snapshot proof JSON");
+    assert!(
+        proof["first_child_read_after_b_gate"] == true
+            && proof["historical_completion_attested"] == true
+            && proof["distinct_later_turn_active"] == true
+            && proof["snapshot_reached"] == true
+            && proof["native_turn_starts"] == 2
+            && proof["native_turn_completions"] == 1,
+        "the real native snapshot did not establish completed A followed by active B"
+    );
+    let before_release = child_events.len();
+    release_native_snapshot_child(&directory.join("b-release.fifo"));
+    collect_child_snapshot_parent(host, &mut turn, hung_guard, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    loop {
+        let event = event_rx
+            .recv()
+            .await
+            .expect("native child relay closed before its actual terminal");
+        let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+        child_events.push(event);
+        if idle {
+            break;
+        }
+    }
+    assert!(
+        !child_events.iter().any(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error))
+        }),
+        "the native followup failed its child conversation"
+    );
+    let stream_end = child_events
+        .iter()
+        .position(|event| {
+            matches!(event, ChatEvent::StreamEnd(end) if end.message.content.trim() == second)
+        })
+        .expect("native task B must stream its actual final reply");
+    let stream_start = child_events[..stream_end]
+        .iter()
+        .rposition(|event| matches!(event, ChatEvent::StreamStart(_)))
+        .expect("native task B must have a matching live response start");
+    // A snapshot may hand off an already-open response before the FIFO release.
+    assert!(
+        before_release <= stream_end
+            && stream_start < stream_end
+            && stream_end < child_events.len() - 1
+            && child_events[stream_start + 1..stream_end].iter().any(
+                |event| matches!(event, ChatEvent::StreamDelta(delta) if !delta.text.is_empty())
+            )
+            && matches!(
+                child_events.last(),
+                Some(ChatEvent::TypingStatusChanged(false))
+            ),
+        "native task B lost its live response to genuine-terminal-idle ordering"
+    );
+    assert!(
+        std::fs::read_to_string(directory.join("b-proof.txt"))
+            .is_ok_and(|contents| contents.trim() == second),
+        "the same native child's second task did not actually finish"
+    );
+    assert!(
+        turn.assistant_messages()
+            .any(|message| message.content.trim() == parent),
+        "the native parent did not receive the second child result"
+    );
+    assert!(
+        turn.events().iter().any(|event| {
+            matches!(event, ChatEvent::ToolProgress(progress)
+                if matches!(&progress.update, ToolProgressUpdate::SubAgent(child)
+                    if child.agent_id == registration.agent_id && child.completed
+                        && child.status == protocol::SubAgentProgressStatus::Completed))
+        }),
+        "the second task's real terminal did not settle its own parent card"
+    );
+    assert!(
+        registered_rx.try_recv().is_err(),
+        "native followup created a replacement child conversation"
+    );
+    assert!(
+        model_usage_rx.try_recv().is_ok(),
+        "native child accounting did not reach its real relay"
+    );
+    let terminal_proof: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("transport.json")).expect("native terminal transport proof"),
+    )
+    .expect("native terminal proof JSON");
+    assert!(
+        terminal_proof["native_b_terminal_seen"] == true
+            && terminal_proof["native_b_completed"] == true,
+        "child idle did not follow the second task's real native completion"
+    );
+    eprintln!(
+        "Native child followup lifecycle: historical_reply=true live_second_reply=true terminal_idle=true"
+    );
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, &agent).await;
+    drop(total_usage_rx);
+}
+
+async fn await_child_snapshot_projection<B: Backend>(
+    host: &mut Harness<B>,
+    turn: &mut Turn,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
+    child_events: &mut Vec<ChatEvent>,
+    first: &str,
+    hung_guard: tokio::time::Instant,
+) {
+    loop {
+        let historical_reply = child_events.iter().any(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Assistant { .. })
+                    && message.content.trim() == first)
+        });
+        let active = child_events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true)));
+        if historical_reply && active {
+            return;
+        }
+        tokio::select! {
+            event = event_rx.recv() => {
+                let event = event.expect("native child relay closed during snapshot projection");
+                assert!(
+                    !matches!(&event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Error)),
+                    "native child failed while projecting its snapshot"
+                );
+                assert!(
+                    !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                    "native child went idle before its unfinished second task was released"
+                );
+                child_events.push(event);
+            }
+            event = host.next_chat(hung_guard) => {
+                let event = event.expect("native snapshot case exceeded its ten-minute hung guard");
+                assert!(
+                    !matches!(&event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Error)),
+                    "native parent failed while awaiting the child's snapshot projection"
+                );
+                assert!(
+                    !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                    "native parent went idle before the child's snapshot projection arrived"
+                );
+                turn.events.push(event);
+            }
+        }
+    }
+}
+
+async fn collect_child_snapshot_parent<B: Backend>(
+    host: &mut Harness<B>,
+    turn: &mut Turn,
+    hung_guard: tokio::time::Instant,
+    mut stop: impl FnMut(&ChatEvent) -> bool,
+) {
+    loop {
+        let event = host
+            .next_chat(hung_guard)
+            .await
+            .expect("the native snapshot case exceeded its ten-minute hung guard");
+        assert!(
+            !matches!(&event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error)),
+            "the native parent failed while relaying the child's followup"
+        );
+        let finished = stop(&event);
+        assert!(
+            !matches!(event, ChatEvent::TypingStatusChanged(false)) || finished,
+            "the native parent went idle before the second child task was observable"
+        );
+        turn.events.push(event);
+        if finished {
+            return;
+        }
+    }
+}
+
+async fn native_child_snapshot_process<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_CHILD_SNAPSHOT_DIRECTORY").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("child_snapshot_proxy.py");
+    std::fs::write(
+        &script,
+        include_str!("conformance2/child_snapshot_proxy.py"),
+    )
+    .expect("write transparent native snapshot transport");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .arg(spawn_tool_backend_name(host.backend()))
+        .status()
+        .await
+        .expect("run isolated native child snapshot case");
+    assert!(
+        status.success(),
+        "real native child snapshot regression failed; see retained private evidence"
+    );
+    false
+}
+
+fn release_native_snapshot_child(path: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .expect("open the real child's release FIFO")
+        .write_all(b"release\n")
+        .expect("release the real native child");
+}
+
+struct ChildSnapshotRegistration {
+    tool_use_id: String,
+    name: String,
+    description: String,
+    agent_type: String,
+    session_id_hint: Option<SessionId>,
+    agent_id: AgentId,
+}
+
+struct ChildSnapshotEmitter {
+    registered_tx: tokio::sync::mpsc::UnboundedSender<ChildSnapshotRegistration>,
+    handle: server::backend::SubAgentHandle,
+}
+
+impl server::backend::SubAgentEmitter for ChildSnapshotEmitter {
+    fn on_subagent_spawned(
+        &self,
+        tool_use_id: String,
+        name: String,
+        description: String,
+        agent_type: String,
+        session_id_hint: Option<SessionId>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<server::backend::SubAgentHandle, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.registered_tx
+                .send(ChildSnapshotRegistration {
+                    tool_use_id,
+                    name,
+                    description,
+                    agent_type,
+                    session_id_hint,
+                    agent_id: self.handle.agent_id.clone(),
+                })
+                .map_err(|_| "native child registration consumer closed".to_owned())?;
+            Ok(self.handle.clone())
+        })
+    }
+}
+
+conformance2_scenario!(
+    real_slow_native_compaction,
+    [
+        BackendCapability::CompactionReported,
+        BackendCapability::DurableCompactionLedger
+    ]
+);
+
+async fn real_slow_native_compaction<B: Backend>(host: &mut Harness<B>) {
+    if !slow_native_compaction_process(host).await {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(600), slow_native_compaction_flow(host))
+        .await
+        .expect("the slow native compaction case exceeded its ten-minute hung guard");
+}
+
+async fn slow_native_compaction_flow<B: Backend>(host: &mut Harness<B>) {
+    use server::backend::compaction::{
+        BackendCompactionDispatchState, BackendCompactionFailureKind,
+        BackendCompactionMutationState, BackendCompactionTerminalEvidence,
+    };
+
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("TYDE_SLOW_COMPACTION_DIRECTORY")
+            .expect("slow native compaction evidence directory"),
+    );
+    let hung_guard = tokio::time::Instant::now() + Duration::from_secs(600);
+    let prompt = format!(
+        "Disposable compaction fixture context; do not repeat it: {}\n\n{}",
+        "retain the preceding conversation accurately. ".repeat(1024),
+        launch_prompt(),
+    );
+    let agent = spawn_agent(host, &prompt).await;
+    let launched = collect_slow_compaction_turn(host, &prompt, hung_guard).await;
+    assert!(
+        launched.final_text().trim() == READY_MARKER,
+        "the native compaction fixture did not finish its actual initial turn"
+    );
+    let payload = unique_payload();
+    let workspace = host.workspace().to_path_buf();
+    let write = write_prompt(&workspace, &payload, host.backend());
+    assert!(
+        matches!(
+            try_send_prompt(host, &agent, &write).await,
+            server::backend::SendOutcome::Accepted
+        ),
+        "the native compaction fixture rejected its real file-write turn"
+    );
+    let wrote = collect_slow_compaction_turn(host, &write, hung_guard).await;
+    assert!(
+        std::fs::read_to_string(workspace.join(HELLO_FILE))
+            .is_ok_and(|contents| contents.trim() == payload),
+        "the native compaction fixture did not actually write its file"
+    );
+    let started = tokio::time::Instant::now();
+    let compacted = compact(host, &agent).await;
+    let terminal = &compacted.terminal;
+    eprintln!(
+        "Slow native compaction terminal: accepted={} completed={} success={} timed_out={}",
+        terminal.dispatch == BackendCompactionDispatchState::Accepted,
+        terminal.mutation == BackendCompactionMutationState::Completed,
+        terminal.outcome.is_ok(),
+        terminal
+            .outcome
+            .as_ref()
+            .is_err_and(|failure| failure.kind == BackendCompactionFailureKind::TimedOut),
+    );
+    assert!(
+        terminal.outcome.is_ok()
+            && terminal.dispatch == BackendCompactionDispatchState::Accepted
+            && terminal.mutation == BackendCompactionMutationState::Completed
+            && terminal.provider_session_id.as_ref() == Some(&agent.session_id)
+            && !matches!(
+                terminal.evidence,
+                BackendCompactionTerminalEvidence::None
+                    | BackendCompactionTerminalEvidence::DispatchUncertain
+            ),
+        "the admitted native compaction lost its durable completion across the old local cutoff"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(305),
+        "the actual compaction terminal arrived before the required delayed native delivery"
+    );
+    assert!(
+        !compacted.events().iter().any(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error))
+        }),
+        "the slow native compaction failed its live conversation"
+    );
+    assert!(
+        matches!(compacted.observations.as_slice(), [observation]
+            if observation.provider_session_id == terminal.provider_session_id
+                && observation.metrics == terminal.metrics),
+        "one durable compaction must produce exactly one matching native observation"
+    );
+    let proof: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("transport.json"))
+            .expect("slow native compaction transport proof"),
+    )
+    .expect("slow native compaction proof JSON");
+    for fact in [
+        "admission_ack_passed_before_release",
+        "durable_outcome_before_release",
+        "durable_outcome_unchanged",
+        "durable_target_matches_outcome",
+        "durable_install_matches_outcome",
+        "native_completed",
+        "native_terminal_notification_held",
+        "notifications_released",
+        "notification_bytes_and_order_preserved",
+    ] {
+        assert!(
+            proof[fact] == true,
+            "the real slow-compaction transport omitted a required attestation: {fact}"
+        );
+    }
+    assert!(
+        proof["compaction_dispatches"] == 1
+            && proof["admission_to_release_ms"]
+                .as_u64()
+                .is_some_and(|milliseconds| milliseconds >= 305_000)
+            && proof["notifications_held"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && proof["notifications_held"] == proof["notifications_forwarded"]
+            && terminal.metrics.before_tokens == proof["native_before_tokens"].as_u64()
+            && terminal.metrics.after_tokens == proof["native_after_tokens"].as_u64(),
+        "the adapter terminal must retain its delayed actual native installation and transport"
+    );
+    let read = read_prompt(&workspace);
+    assert!(
+        matches!(
+            try_send_prompt(host, &agent, &read).await,
+            server::backend::SendOutcome::Accepted
+        ),
+        "the same native conversation rejected its post-compaction followup"
+    );
+    let followed = collect_slow_compaction_turn(host, &read, hung_guard).await;
+    assert!(
+        followed.final_text().trim() == payload,
+        "the same native conversation could not read its real file after delayed compaction"
+    );
+    eprintln!(
+        "Slow native compaction lifecycle: admission_only=true durable_after_cutoff=true followup=true"
+    );
+    assert_universal_contract(&[launched, wrote, followed]);
+    assert_clean_close(host, &agent).await;
+}
+
+async fn collect_slow_compaction_turn<B: Backend>(
+    host: &mut Harness<B>,
+    prompt: &str,
+    hung_guard: tokio::time::Instant,
+) -> Turn {
+    let mut turn = host.turn(prompt);
+    loop {
+        let event = host
+            .next_chat(hung_guard)
+            .await
+            .expect("the slow native compaction case exceeded its ten-minute hung guard");
+        assert!(
+            !matches!(&event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error)),
+            "the native compaction fixture emitted a real backend error"
+        );
+        let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+        turn.events.push(event);
+        if idle {
+            return turn;
+        }
+    }
+}
+
+async fn slow_native_compaction_process<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_SLOW_COMPACTION_DIRECTORY").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("slow_compaction_proxy.py");
+    std::fs::write(
+        &script,
+        include_str!("conformance2/slow_compaction_proxy.py"),
+    )
+    .expect("write transparent slow native compaction transport");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .arg(spawn_tool_backend_name(host.backend()))
+        .status()
+        .await
+        .expect("run isolated slow native compaction case");
+    assert!(
+        status.success(),
+        "real slow native compaction regression failed; see retained private evidence"
+    );
+    false
+}
+
+conformance2_scenario!(
+    real_interrupt_cancels_owned_background_command,
+    [
+        BackendCapability::Interrupt,
+        BackendCapability::BackgroundTasks,
+        BackendCapability::InterruptCancelsOwnedBackgroundCommands,
+        BackendCapability::ResumeSession,
+    ]
+);
+
+async fn real_interrupt_cancels_owned_background_command<B: Backend>(host: &mut Harness<B>) {
+    tokio::time::timeout(
+        Duration::from_secs(600),
+        owned_background_interruption_flow(host),
+    )
+    .await
+    .expect("owned background interruption exceeded its ten-minute individual hung guard");
+}
+
+async fn owned_background_interruption_flow<B: Backend>(host: &mut Harness<B>) {
+    use tokio::io::AsyncReadExt;
+
+    let workspace = host.workspace().to_path_buf();
+    let script = workspace.join("owned_background_command.py");
+    std::fs::write(
+        &script,
+        include_str!("conformance2/owned_background_command.py"),
+    )
+    .expect("write the real command and process-exit observer");
+    let address = workspace.join("owned-command.sock");
+    let proof = workspace.join("owned-command-completed.txt");
+    let listener = tokio::net::UnixListener::bind(&address).expect("bind owned command handshake");
+    let command = format!(
+        "python3 '{}' worker '{}' '{}'",
+        script.display(),
+        address.display(),
+        proof.display()
+    );
+    let launch = match host.backend() {
+        BackendKind::Muse => format!(
+            "Call native bash exactly once with command `{command}` and yield_time_ms=1000."
+        ),
+        _ => format!(
+            "Run exactly this command once with your native background command facility: \
+             `{command}`. Return control while it is still running."
+        ),
+    };
+    let prompt = format!(
+        "{launch} Do not append &, detach, alter the script, poll, wait for, stop, or rerun \
+         the command, and do not use any other tool. Immediately after that tool yields \
+         the running command, continue in this same turn: {}",
+        long_answer_prompt()
+    );
+    let agent = spawn_agent(host, &prompt).await;
+    let mut interrupted = host.turn(&prompt);
+    let mut worker = None;
+    let mut process_exit = None;
+    let mut background_card = None;
+    let mut streamed_chars = 0;
+    loop {
+        tokio::select! {
+            connected = listener.accept(), if worker.is_none() => {
+                let (mut connection, _) = connected.expect("accept the native command process");
+                let pid = connection.read_u32().await.expect("read command process identity");
+                assert!(pid > 1, "the real command supplied no usable process identity");
+                let mut observer = tokio::process::Command::new("python3")
+                    .arg(&script)
+                    .arg("watch")
+                    .arg(pid.to_string())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("observe the actual command's process exit");
+                let mut ready = [0];
+                observer.stdout.as_mut().expect("process observer readiness pipe")
+                    .read_exact(&mut ready).await.expect("arm native process-exit observation");
+                assert!(ready == *b"R", "process-exit observer was not armed");
+                process_exit = Some(observer);
+                worker = Some(connection);
+            }
+            event = owned_background_chat(host, &mut interrupted) => {
+                assert!(
+                    !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                    "the owning turn ended before its background-command interruption barrier"
+                );
+                if let ChatEvent::ToolProgress(progress) = &event
+                    && progress.execution_mode == ToolExecutionMode::Background
+                    && interrupted.tool_requests().any(|request| {
+                        request.tool_call_id == progress.tool_call_id
+                            && matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+                                if command.contains("owned_background_command.py")
+                                    && command.contains(" worker "))
+                    })
+                {
+                    if let Some(card) = &background_card {
+                        assert!(card == &progress.tool_call_id, "the command changed its card owner");
+                    }
+                    background_card = Some(progress.tool_call_id.clone());
+                }
+                if background_card.is_some()
+                    && let ChatEvent::StreamDelta(delta) = &event
+                {
+                    streamed_chars += delta.text.chars().count();
+                }
+            }
+        }
+        if worker.is_some() && background_card.is_some() && streamed_chars >= MID_ANSWER_CHARS {
+            break;
+        }
+    }
+    let card = background_card.expect("actual native background card");
+    let mut worker = worker.expect("actual native background process");
+    let mut process_exit = process_exit.expect("armed command process-exit observer");
+    assert!(
+        process_exit
+            .try_wait()
+            .expect("read process observer state")
+            .is_none(),
+        "the background command exited before interruption"
+    );
+    assert!(
+        interrupted.tool_requests().count() == 1
+            && !interrupted
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == card)
+            && !proof.exists()
+            && interrupted
+                .events()
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true))),
+        "interruption requires exactly one open, genuinely running command on its owning turn"
+    );
+    let streamed = interrupted
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamDelta(delta) => Some(delta.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        !streamed.contains(COUNTED_MARKER),
+        "the foreground answer finished before interruption"
+    );
+    let before_interrupt = interrupted.events.len();
+    interrupt_backend(host).await;
+    let mut idle = false;
+    let mut cancelled = false;
+    let mut terminal = false;
+    while !(idle && cancelled && terminal) {
+        let event = owned_background_chat(host, &mut interrupted).await;
+        idle |= matches!(event, ChatEvent::TypingStatusChanged(false));
+        cancelled |= matches!(event, ChatEvent::OperationCancelled(_));
+        terminal |= matches!(&event, ChatEvent::ToolExecutionCompleted(completion)
+            if completion.tool_call_id == card);
+    }
+    assert!(
+        process_exit
+            .wait()
+            .await
+            .expect("await the actual command process exit")
+            .success(),
+        "the native command's process-exit observer failed"
+    );
+    let mut unexpected = [0];
+    assert!(
+        worker
+            .read(&mut unexpected)
+            .await
+            .expect("read the command's closed handshake")
+            == 0
+            && !proof.exists(),
+        "the interrupted command must exit without reaching its unreleased completion proof"
+    );
+    assert_owned_background_terminal(interrupted.events(), &card);
+    let after_interrupt = &interrupted.events()[before_interrupt..];
+    let cancellations = after_interrupt
+        .iter()
+        .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+        .count();
+    let idles = after_interrupt
+        .iter()
+        .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+        .count();
+    assert!(
+        cancellations == 1 && idles == 1,
+        "one native interruption must produce one cancellation and one idle transition"
+    );
+    assert_streams_are_balanced_for_cancellation(&interrupted);
+    let prompt = launch_prompt();
+    send_prompt(host, &agent, &prompt).await;
+    let followed = collect_owned_background_turn(host, &prompt).await;
+    assert_ready_handshake(&followed);
+    assert_owned_background_terminal(interrupted.events().iter().chain(followed.events()), &card);
+    eprintln!(
+        "Owned background interruption: process_exit=true proof_absent=true \
+         exactly_one_native_terminal_before_close=true same_session_followup=true"
+    );
+    let closing = host.shutdown().await;
+    assert!(
+        !closing
+            .iter()
+            .any(|event| matches!(event, ChatEvent::MessageAdded(message)
+            if matches!(message.sender, MessageSender::Error))),
+        "the settled owned-command session failed during shutdown"
+    );
+    assert_owned_background_terminal(
+        interrupted
+            .events()
+            .iter()
+            .chain(followed.events())
+            .chain(&closing),
+        &card,
+    );
+    let resumed = resume_agent(host, &agent.session_id).await;
+    assert_owned_background_terminal(&resumed.replayed_history, &card);
+    let live_request = interrupted
+        .tool_requests()
+        .find(|request| request.tool_call_id == card)
+        .expect("live command request");
+    let replayed_requests = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request) if request.tool_call_id == card => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(replayed_requests.as_slice(), [request]
+            if serde_json::to_value(request).expect("serialize replayed command request")
+                == serde_json::to_value(live_request).expect("serialize live command request")),
+        "resume must preserve exactly one original command request and its card owner"
+    );
+    let live_terminal = interrupted
+        .tool_completions()
+        .find(|completion| completion.tool_call_id == card)
+        .expect("live command terminal");
+    let replayed_terminal = resumed
+        .replayed_history
+        .iter()
+        .find_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == card => {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .expect("replayed command terminal");
+    assert!(
+        live_terminal.outcome == replayed_terminal.outcome,
+        "resume must retain the exact native cancellation outcome"
+    );
+    send_prompt(host, &resumed, &prompt).await;
+    let after_resume = collect_owned_background_turn(host, &prompt).await;
+    assert_ready_handshake(&after_resume);
+    assert!(
+        !after_resume.events().iter().any(|event| matches!(event,
+            ChatEvent::ToolRequest(request) if request.tool_call_id == card))
+            && !after_resume
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == card)
+            && !proof.exists(),
+        "resume must not restart or complete the cancelled command a second time"
+    );
+    assert_universal_contract(&[followed, after_resume]);
+    assert_clean_close(host, &resumed).await;
+    assert!(
+        host.protocol_violations().is_empty(),
+        "owned interruption violated the backend event contract"
+    );
+    eprintln!(
+        "Owned background interruption replay: original_card=true exact_native_terminal=true followup=true"
+    );
+}
+
+fn assert_owned_background_terminal<'a>(
+    events: impl IntoIterator<Item = &'a ChatEvent>,
+    card: &str,
+) {
+    let terminals = events
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == card => {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(terminals.as_slice(), [completion]
+            if matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { message }
+                if !message.is_empty())),
+        "the original background card must carry exactly one native cancelled outcome"
+    );
+}
+
+async fn owned_background_chat<B: Backend>(host: &mut Harness<B>, turn: &mut Turn) -> ChatEvent {
+    loop {
+        match host.next_backend_event().await {
+            server::backend::BackendEvent::Chat(event) => {
+                assert!(
+                    !matches!(&event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Error)),
+                    "the owned-command case received a real backend error"
+                );
+                turn.events.push(event.clone());
+                return event;
+            }
+            server::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
+                if usage
+                    .current_context_usage
+                    .as_ref()
+                    .and_then(|value| value.known())
+                    .is_some()
+                {
+                    turn.context_usage_event_positions.push(turn.events.len());
+                }
+                turn.model_requests.push(usage);
+            }
+            server::backend::BackendEvent::Compaction(_) => {}
+            server::backend::BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected replay boundary during owned-command live collection");
+            }
+        }
+    }
+}
+
+async fn collect_owned_background_turn<B: Backend>(host: &mut Harness<B>, prompt: &str) -> Turn {
+    let mut turn = host.turn(prompt);
+    loop {
+        if matches!(
+            owned_background_chat(host, &mut turn).await,
+            ChatEvent::TypingStatusChanged(false)
+        ) {
+            return turn;
+        }
+    }
 }

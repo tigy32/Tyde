@@ -29,6 +29,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Muse => "Muse",
         BackendKind::Kiro => "Kiro",
         BackendKind::Tycode => "Tycode",
     }
@@ -44,6 +45,7 @@ fn backend_rank(kind: BackendKind) -> usize {
         BackendKind::Hermes => 2,
         BackendKind::Grok => 5,
         BackendKind::Opencode => 6,
+        BackendKind::Muse => 7,
         BackendKind::Antigravity => 3,
         BackendKind::Tycode => 4,
         BackendKind::Kiro => 7,
@@ -134,6 +136,7 @@ fn source_label(source: CapacitySource) -> &'static str {
         CapacitySource::AntigravityUsageCommand => "Antigravity",
         CapacitySource::KiroUsageCommand => "Kiro",
         CapacitySource::GrokBilling => "Grok",
+        CapacitySource::MuseUsage => "Muse",
     }
 }
 
@@ -228,6 +231,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
         CapacityBucketId::Antigravity { .. } => "antigravity",
         CapacityBucketId::Kiro { .. } => "kiro",
         CapacityBucketId::Grok { .. } => "grok",
+        CapacityBucketId::Muse { .. } => "muse",
     }
 }
 

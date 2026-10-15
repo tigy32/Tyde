@@ -24,6 +24,30 @@ use super::format_bytes;
 
 const COMPACT_LINE_CAP: usize = 30;
 
+pub(super) fn render_native_content(
+    text: &str,
+    images: &[protocol::ImageData],
+    failure: Option<(&str, Option<&str>)>,
+) -> AnyView {
+    view! {
+        <div class="tool-native-content">
+            {failure.map(|(message, details)| view! {
+                <pre class="tool-result-stderr tool-error-pre">{message.to_owned()}</pre>
+                {details.map(|details| view! {
+                    <pre class="tool-error-detail">{details.to_owned()}</pre>
+                })}
+            })}
+            {(!text.is_empty()).then(|| view! {
+                <pre class="tool-raw-result">{text.to_owned()}</pre>
+            })}
+            {(!images.is_empty()).then(|| {
+                crate::components::chat_message::render_message_images(images.to_vec())
+            })}
+        </div>
+    }
+    .into_any()
+}
+
 pub(crate) fn render(
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,

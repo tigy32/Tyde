@@ -2317,6 +2317,7 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Muse => "Muse",
     }
 }
 
@@ -2330,6 +2331,7 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "hermes",
         BackendKind::Grok => "grok",
         BackendKind::Opencode => "opencode",
+        BackendKind::Muse => "muse",
     }
 }
 

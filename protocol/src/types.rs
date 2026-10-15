@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 81;
+pub const PROTOCOL_VERSION: u32 = 82;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -325,6 +325,16 @@ impl fmt::Display for SessionId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct UserQuestionId(pub String);
+
+impl fmt::Display for UserQuestionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct QueuedMessageId(pub String);
 
 impl fmt::Display for QueuedMessageId {
@@ -552,6 +562,7 @@ pub enum BackendKind {
     Hermes,
     Grok,
     Opencode,
+    Muse,
 }
 
 impl BackendKind {
@@ -570,7 +581,8 @@ impl BackendKind {
             | Self::Codex
             | Self::Hermes
             | Self::Grok
-            | Self::Opencode => true,
+            | Self::Opencode
+            | Self::Muse => true,
             Self::Tycode | Self::Antigravity => false,
         }
     }
@@ -2814,6 +2826,7 @@ pub enum CapacitySource {
     KiroUsageCommand,
     /// Grok's authenticated `_x.ai/billing` ACP extension.
     GrokBilling,
+    MuseUsage,
 }
 
 impl CapacitySource {
@@ -2824,6 +2837,7 @@ impl CapacitySource {
             Self::AntigravityUsageCommand => BackendKind::Antigravity,
             Self::KiroUsageCommand => BackendKind::Kiro,
             Self::GrokBilling => BackendKind::Grok,
+            Self::MuseUsage => BackendKind::Muse,
         }
     }
 }
@@ -2875,6 +2889,9 @@ pub enum CapacityBucketId {
         bucket: String,
     },
     Grok {
+        bucket: String,
+    },
+    Muse {
         bucket: String,
     },
 }
@@ -3565,6 +3582,8 @@ pub enum SendMessageToolResponse {
     AskUserQuestion {
         tool_call_id: String,
         answer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_answers: Option<Vec<UserQuestionAnswer>>,
     },
     ExitPlanMode {
         tool_call_id: String,
@@ -4105,6 +4124,21 @@ pub struct NativeToolCatalog {
 pub struct NativeTool {
     pub name: String,
     pub kind: NativeToolKind,
+    #[serde(default)]
+    pub selection: NativeToolSelection,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolSelection {
+    DefaultOnly,
+    NamedSelectable,
+    /// The adapter admits this tool in named selections only without MCP
+    /// tools. This verified compatibility limit does not restrict default
+    /// toolsets or claim a universal native-provider limitation.
+    NamedWithoutMcp,
+    #[default]
+    Unverified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -8610,7 +8644,7 @@ pub struct TydeAgentWaitStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: Option<UserQuestionId>,
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
@@ -8618,6 +8652,118 @@ pub struct AskUserQuestion {
     pub options: Vec<AskUserQuestionOption>,
     #[serde(default, rename = "multiSelect")]
     pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_schema: Option<UserQuestionAnswerSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionAnswerSchema {
+    pub min_selections: Option<u32>,
+    pub max_selections: Option<u32>,
+    pub max_free_text_chars: Option<u32>,
+    pub max_note_chars: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionAnswer {
+    pub question_id: UserQuestionId,
+    pub answer: UserQuestionAnswerValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UserQuestionAnswerValue {
+    Selected {
+        labels: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    FreeText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+impl AskUserQuestion {
+    pub fn structured_answer(
+        &self,
+        labels: Vec<String>,
+        text: String,
+        note: Option<String>,
+    ) -> Result<UserQuestionAnswer, String> {
+        let question_id = self
+            .id
+            .clone()
+            .ok_or("Structured question omitted its identity")?;
+        let answer = if labels.is_empty() && !text.trim().is_empty() {
+            UserQuestionAnswerValue::FreeText { text, note }
+        } else {
+            UserQuestionAnswerValue::Selected { labels, note }
+        };
+        let answer = UserQuestionAnswer {
+            question_id,
+            answer,
+        };
+        self.validate_structured_answer(&answer)?;
+        Ok(answer)
+    }
+
+    pub fn validate_structured_answer(&self, answer: &UserQuestionAnswer) -> Result<(), String> {
+        if self.id.as_ref() != Some(&answer.question_id) {
+            return Err("Question answer does not target this question".to_owned());
+        }
+        let schema = self
+            .answer_schema
+            .as_ref()
+            .ok_or("This question does not support structured answers")?;
+        match &answer.answer {
+            UserQuestionAnswerValue::Selected { labels, note } => {
+                if (!self.multi_select && labels.len() != 1)
+                    || (labels.is_empty() && schema.min_selections != Some(0))
+                {
+                    return Err("Select an answer for this question".to_owned());
+                }
+                if labels.iter().enumerate().any(|(index, label)| {
+                    !self.options.iter().any(|option| option.label == *label)
+                        || labels[..index].contains(label)
+                }) {
+                    return Err("Question answer contains an unknown or repeated option".to_owned());
+                }
+                if let Some(min) = schema.min_selections
+                    && labels.len() < min as usize
+                {
+                    return Err(format!("Select at least {min} options"));
+                }
+                if let Some(max) = schema.max_selections
+                    && labels.len() > max as usize
+                {
+                    return Err(format!("Select at most {max} options"));
+                }
+                if let (Some(note), Some(max)) = (note, schema.max_note_chars)
+                    && note.chars().count() > max as usize
+                {
+                    return Err(format!("The note must be at most {max} characters"));
+                }
+            }
+            UserQuestionAnswerValue::FreeText { text, note } => {
+                if text.trim().is_empty() {
+                    return Err("Enter an answer for this question".to_owned());
+                }
+                if let Some(max) = schema.max_free_text_chars
+                    && text.chars().count() > max as usize
+                {
+                    return Err(format!("The answer must be at most {max} characters"));
+                }
+                if let (Some(note), Some(max)) = (note, schema.max_note_chars)
+                    && note.chars().count() > max as usize
+                {
+                    return Err(format!("The note must be at most {max} characters"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8828,6 +8974,9 @@ pub enum ToolExecutionOutcome {
         details: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        /// Typed output retained alongside the failure, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ToolExecutionResult>,
     },
     Cancelled {
         message: String,
@@ -8837,6 +8986,9 @@ pub enum ToolExecutionOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ToolExecutionResult {
+    AskUserQuestion {
+        answers: Vec<UserQuestionAnswer>,
+    },
     ExitPlanMode {
         decision: ExitPlanModeDecision,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8887,6 +9039,12 @@ pub enum ToolExecutionResult {
         preview_error: Option<String>,
     },
     Sleep,
+    /// Native presentation text and independently retained images, not canonical
+    /// MCP blocks, their boundaries/interleaving, or structured result metadata.
+    NativeContent {
+        text: String,
+        images: Vec<ImageData>,
+    },
     Other {
         result: Value,
     },
@@ -8895,7 +9053,9 @@ pub enum ToolExecutionResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
-    pub bytes: u64,
+    // Native read transcripts can retain content without its original file size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -269,6 +269,7 @@ impl TurnEmitter {
                 message: "Tool execution failed".to_owned(),
                 details: Some(error.to_owned()),
                 normalization_failure: None,
+                result: None,
             },
         );
         true

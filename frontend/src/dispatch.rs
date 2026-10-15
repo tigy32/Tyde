@@ -9522,6 +9522,7 @@ mod wasm_tests {
                     normalization_failure: Some(
                         protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
                     ),
+                    result: None,
                 },
             }),
         );
@@ -9680,6 +9681,7 @@ mod wasm_tests {
                 normalization_failure: Some(
                     protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
                 ),
+                result: None,
             },
         };
 

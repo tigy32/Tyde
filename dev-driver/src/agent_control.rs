@@ -356,7 +356,8 @@ impl AgentControlHandle {
             BackendKind::Hermes => 4,
             BackendKind::Grok => 5,
             BackendKind::Opencode => 6,
-            BackendKind::Tycode => 7,
+            BackendKind::Muse => 7,
+            BackendKind::Tycode => 8,
         });
         ListLaunchOptionsResult {
             catalog: snapshot.launch_profile_catalog,

@@ -14,6 +14,9 @@ extern "C" {
     #[wasm_bindgen(method)]
     fn destroy(this: &ShellHandle);
 
+    #[wasm_bindgen(method)]
+    fn refresh(this: &ShellHandle);
+
     #[wasm_bindgen(catch, js_name = attachTextarea)]
     fn attach_textarea(
         textarea: &web_sys::HtmlTextAreaElement,
@@ -104,14 +107,72 @@ pub fn install(root: NodeRef<leptos::html::Div>) {
         observer
             .observe_with_options(&root, &options)
             .expect("observe mobile shell");
+        let style_owner = mounted.clone();
+        let style_callback =
+            Closure::<dyn FnMut(js_sys::Array)>::new(move |records: js_sys::Array| {
+                let stylesheet = |node: &web_sys::Node| {
+                    node.node_name().eq_ignore_ascii_case("style")
+                        || node.node_name().eq_ignore_ascii_case("link")
+                };
+                let changed = records.iter().any(|record| {
+                    let record: web_sys::MutationRecord = record.unchecked_into();
+                    if record.target().is_some_and(|target| {
+                        stylesheet(&target)
+                            || target
+                                .parent_element()
+                                .is_some_and(|parent| stylesheet(parent.unchecked_ref()))
+                    }) {
+                        return true;
+                    }
+                    [record.added_nodes(), record.removed_nodes()]
+                        .iter()
+                        .any(|nodes| {
+                            (0..nodes.length())
+                                .filter_map(|index| nodes.item(index))
+                                .any(|node| stylesheet(&node))
+                        })
+                });
+                if changed && let Some(shell) = style_owner.borrow().as_ref() {
+                    log::debug!("Shared mobile shell refreshed after stylesheet mutation");
+                    shell.handle.refresh();
+                }
+            });
+        let style_observer =
+            web_sys::MutationObserver::new(style_callback.as_ref().unchecked_ref())
+                .expect("mobile shell stylesheet observer");
+        if let Some(document) = root.owner_document() {
+            // Insets can change without resizing any of the shell's bound regions.
+            let style_options = web_sys::MutationObserverInit::new();
+            style_options.set_child_list(true);
+            style_options.set_subtree(true);
+            style_options.set_character_data(true);
+            style_options.set_attributes(true);
+            style_options.set_attribute_filter(&js_sys::Array::of4(
+                &"href".into(),
+                &"disabled".into(),
+                &"media".into(),
+                &"rel".into(),
+            ));
+            style_observer
+                .observe_with_options(&document, &style_options)
+                .expect("observe mobile shell stylesheets");
+        }
         if let Err(error) = bind_regions(&root, &mounted) {
             log::error!("Shared mobile shell could not mount: {error:?}");
         }
-        let held = send_wrapper::SendWrapper::new((observer, callback, mounted));
+        let held = send_wrapper::SendWrapper::new((
+            observer,
+            callback,
+            style_observer,
+            style_callback,
+            mounted,
+        ));
         on_cleanup(move || {
-            let (observer, callback, mounted) = held.take();
+            let (observer, callback, style_observer, style_callback, mounted) = held.take();
             observer.disconnect();
+            style_observer.disconnect();
             drop(callback);
+            drop(style_callback);
             mounted.borrow_mut().take();
         });
     });

@@ -6,8 +6,8 @@
 //! selectable options plus a custom-text field and a Submit button.
 //!
 //! Submitting composes the chosen answers into a typed tool response
-//! and sends it through the normal `SendMessage` path, resuming Claude on the
-//! next turn. There is no live stdin channel.
+//! and sends it through the normal `SendMessage` path. Structured provider
+//! answers retain question identity, option boundaries and notes.
 
 use std::sync::Arc;
 
@@ -23,7 +23,6 @@ use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
 /// Compose the chosen answers into the message sent back to the agent. One line
 /// per answered question: `"{header}: {answers}"`, answers comma-joined.
-/// Pure function so the message format is unit-tested without a DOM.
 fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String)]) -> String {
     let mut lines = Vec::new();
     for (q, (selected, custom)) in questions.iter().zip(responses) {
@@ -66,6 +65,10 @@ pub(crate) fn render(
             tool_call_id=tool_call_id.to_owned()
             questions=questions.clone()
             answered=result.is_some()
+            answers=match result {
+                Some(ToolExecutionResult::AskUserQuestion { answers }) => answers.clone(),
+                _ => Vec::new(),
+            }
         />
     }
     .into_any()
@@ -75,6 +78,37 @@ pub(crate) fn render(
 struct QuestionState {
     selected: RwSignal<Vec<usize>>,
     custom: RwSignal<String>,
+    note: RwSignal<String>,
+}
+
+#[derive(Clone, Copy)]
+struct AnswerSendStatus {
+    delivered: RwSignal<bool>,
+    sending: RwSignal<bool>,
+    send_error: RwSignal<Option<String>>,
+}
+
+fn structured_response(
+    question: &AskUserQuestion,
+    state: QuestionState,
+) -> Result<protocol::UserQuestionAnswer, String> {
+    let selected = state.selected.get();
+    let labels = selected
+        .iter()
+        .map(|index| {
+            question
+                .options
+                .get(*index)
+                .map(|option| option.label.clone())
+                .ok_or("Selected question option is unavailable".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let note = state.note.get();
+    question.structured_answer(
+        labels,
+        state.custom.get(),
+        (!note.is_empty()).then_some(note),
+    )
 }
 
 fn target_is_fatal_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
@@ -96,6 +130,7 @@ fn AskUserQuestionCard(
     tool_call_id: String,
     questions: Vec<AskUserQuestion>,
     answered: bool,
+    answers: Vec<protocol::UserQuestionAnswer>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -103,9 +138,33 @@ fn AskUserQuestionCard(
     let states: Arc<Vec<QuestionState>> = Arc::new(
         questions
             .iter()
-            .map(|_| QuestionState {
-                selected: RwSignal::new(Vec::new()),
-                custom: RwSignal::new(String::new()),
+            .map(|question| {
+                let answer = answers
+                    .iter()
+                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
+                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
+                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, option)| {
+                                labels.contains(&option.label).then_some(index)
+                            })
+                            .collect(),
+                        String::new(),
+                        note.clone().unwrap_or_default(),
+                    ),
+                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
+                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
+                    }
+                    None => (Vec::new(), String::new(), String::new()),
+                };
+                QuestionState {
+                    selected: RwSignal::new(selected),
+                    custom: RwSignal::new(custom),
+                    note: RwSignal::new(note),
+                }
             })
             .collect(),
     );
@@ -117,10 +176,15 @@ fn AskUserQuestionCard(
 
     let all_answered = {
         let states = states.clone();
+        let questions = questions.clone();
         move || {
-            states
-                .iter()
-                .all(|qs| !qs.selected.get().is_empty() || !qs.custom.get().trim().is_empty())
+            states.iter().zip(questions.iter()).all(|(qs, question)| {
+                if question.answer_schema.is_some() {
+                    structured_response(question, *qs).is_ok()
+                } else {
+                    !qs.selected.get().is_empty() || !qs.custom.get().trim().is_empty()
+                }
+            })
         }
     };
 
@@ -150,7 +214,26 @@ fn AskUserQuestionCard(
                 .map(|qs| (qs.selected.get_untracked(), qs.custom.get_untracked()))
                 .collect();
             let message = format_answer(&questions, &responses);
-            if message.is_empty() {
+            let structured_answers = if questions
+                .iter()
+                .any(|question| question.answer_schema.is_some())
+            {
+                match questions
+                    .iter()
+                    .zip(states.iter())
+                    .map(|(question, state)| structured_response(question, *state))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(answers) => Some(answers),
+                    Err(error) => {
+                        send_error.set(Some(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if message.is_empty() && structured_answers.is_none() {
                 return;
             }
             let Some(agent_ref) = agent_ref.get_untracked() else {
@@ -173,9 +256,12 @@ fn AskUserQuestionCard(
                 stream,
                 tool_call_id.clone(),
                 message,
-                delivered,
-                sending,
-                send_error,
+                structured_answers,
+                AnswerSendStatus {
+                    delivered,
+                    sending,
+                    send_error,
+                },
             );
         }
     };
@@ -233,6 +319,9 @@ fn render_question(
     target_is_fatal: Memo<bool>,
 ) -> AnyView {
     let multi_select = question.multi_select;
+    let schema = question.answer_schema.clone();
+    let max_selections = schema.as_ref().and_then(|schema| schema.max_selections);
+    let structured = schema.is_some();
     let header = question
         .header
         .as_deref()
@@ -252,6 +341,7 @@ fn render_question(
                 if locked.get_untracked() || target_is_fatal.get_untracked() {
                     return;
                 }
+                if structured { qstate.custom.set(String::new()); }
                 selected.update(|current| {
                     if multi_select {
                         if let Some(pos) = current.iter().position(|&i| i == idx) {
@@ -279,6 +369,7 @@ fn render_question(
                     class="ask-question-option"
                     class:selected=is_selected
                     prop:disabled=move || locked.get() || target_is_fatal.get()
+                        || (multi_select && max_selections.is_some_and(|max| selected.get().len() >= max as usize) && !is_selected())
                     aria-pressed=move || if is_selected() { "true" } else { "false" }
                     on:click=on_click
                 >
@@ -296,7 +387,24 @@ fn render_question(
         if locked.get_untracked() || target_is_fatal.get_untracked() {
             return;
         }
-        custom.set(event_target_value(&ev));
+        let value = event_target_value(&ev);
+        if structured && !value.is_empty() {
+            qstate.selected.set(Vec::new());
+        }
+        custom.set(value);
+    };
+    let note = qstate.note;
+    let validation_question = question.clone();
+    let validation_message = move || {
+        if structured
+            && (!qstate.selected.get().is_empty()
+                || !qstate.custom.get().is_empty()
+                || !note.get().is_empty())
+        {
+            structured_response(&validation_question, qstate).err()
+        } else {
+            None
+        }
     };
 
     view! {
@@ -308,13 +416,34 @@ fn render_question(
             <div class="ask-question-options" class:multi=multi_select>
                 {option_views}
             </div>
-            <input
-                class="ask-question-custom"
-                r#type="text"
-                placeholder="Or type your own answer"
-                prop:disabled=move || locked.get() || target_is_fatal.get()
-                on:input=on_custom_input
-            />
+            {schema.as_ref().and_then(|schema| match (schema.min_selections, schema.max_selections) {
+                (Some(min), Some(max)) if min == max => Some(format!("Select exactly {min} options")),
+                (Some(min), Some(max)) => Some(format!("Select {min}–{max} options")),
+                (Some(min), None) => Some(format!("Select at least {min} options")),
+                (None, Some(max)) => Some(format!("Select at most {max} options")),
+                _ => None,
+            }).map(|text| view! { <div class="ask-question-selection-hint">{text}</div> })}
+            {if structured {
+                view! { <textarea class="ask-question-custom" rows="2" placeholder="Or type your own answer"
+                    prop:value=move || custom.get()
+                    prop:disabled=move || locked.get() || target_is_fatal.get()
+                    on:input=on_custom_input /> }.into_any()
+            } else {
+                view! { <input class="ask-question-custom" r#type="text" placeholder="Or type your own answer"
+                    prop:value=move || custom.get()
+                    prop:disabled=move || locked.get() || target_is_fatal.get()
+                    on:input=on_custom_input /> }.into_any()
+            }}
+            {structured.then(|| view! {
+                <textarea class="ask-question-custom ask-question-note" rows="2" placeholder="Optional note" aria-label="Optional note"
+                    prop:value=move || note.get()
+                    prop:disabled=move || locked.get() || target_is_fatal.get()
+                    on:input=move |ev| {
+                        if !locked.get_untracked() && !target_is_fatal.get_untracked() { note.set(event_target_value(&ev)); }
+                    }
+                />
+                <div role="status">{validation_message}</div>
+            })}
         </div>
     }
     .into_any()
@@ -348,10 +477,14 @@ fn send_answer(
     stream: StreamPath,
     tool_call_id: String,
     message: String,
-    delivered: RwSignal<bool>,
-    sending: RwSignal<bool>,
-    send_error: RwSignal<Option<String>>,
+    structured_answers: Option<Vec<protocol::UserQuestionAnswer>>,
+    status: AnswerSendStatus,
 ) {
+    let AnswerSendStatus {
+        delivered,
+        sending,
+        send_error,
+    } = status;
     spawn_local(async move {
         let payload = SendMessagePayload {
             message: message.clone(),
@@ -360,6 +493,8 @@ fn send_answer(
             tool_response: Some(SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
                 answer: message,
+
+                structured_answers,
             }),
         };
         match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
@@ -419,6 +554,7 @@ mod wasm_tests {
                 question: "Which language?".to_owned(),
                 header: Some("Language".to_owned()),
                 options: vec![opt("Rust", "Systems lang"), opt("Python", "Scripting lang")],
+                answer_schema: None,
                 multi_select: false,
             }],
         }
@@ -432,6 +568,7 @@ mod wasm_tests {
                 question: "Which frameworks?".to_owned(),
                 header: Some("Frameworks".to_owned()),
                 options: vec![opt("Leptos", ""), opt("Axum", ""), opt("Tauri", "")],
+                answer_schema: None,
                 multi_select: true,
             }],
         }
@@ -918,6 +1055,251 @@ mod wasm_tests {
         next_tick().await;
         assert!(!is_pressed(&buttons[0]));
         assert!(is_pressed(&buttons[2]));
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_question_bounds_and_text_limits_control_submission() {
+        let calls = install_deferred_send_stub();
+        let mut req = multi_select_req();
+        let ToolRequestType::AskUserQuestion { questions, .. } = &mut req else {
+            panic!("question fixture must contain questions");
+        };
+        questions[0].id = Some(protocol::UserQuestionId("bounded-question".to_owned()));
+        questions[0].answer_schema = Some(protocol::UserQuestionAnswerSchema {
+            min_selections: Some(2),
+            max_selections: Some(2),
+            max_free_text_chars: Some(5),
+            max_note_chars: Some(5),
+        });
+        questions[0].options = vec![
+            opt("Leptos, UI", ""),
+            opt("Axum, HTTP", ""),
+            opt("Tauri, shell", ""),
+        ];
+        questions.push(AskUserQuestion {
+            id: Some(protocol::UserQuestionId("free-text-question".to_owned())),
+            question: "Add implementation details".to_owned(),
+            header: Some("Frameworks".to_owned()),
+            options: Vec::new(),
+            multi_select: false,
+            answer_schema: Some(protocol::UserQuestionAnswerSchema {
+                min_selections: Some(1),
+                max_selections: Some(1),
+                max_free_text_chars: Some(5),
+                max_note_chars: Some(5),
+            }),
+        });
+        let mount_req = req.clone();
+        let container = mount_with_state_setup(configure_active_agent, move || {
+            render(
+                test_agent_ref(),
+                "bounded-tool",
+                &mount_req,
+                None,
+                ToolOutputMode::Summary,
+            )
+        });
+        next_tick().await;
+        let free_text: web_sys::HtmlTextAreaElement = container
+            .query_selector_all(".ask-question-custom:not(.ask-question-note)")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        free_text.set_value("a\nb");
+        free_text
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let free_note: web_sys::HtmlTextAreaElement = container
+            .query_selector_all(".ask-question-note")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        free_note.set_value("c\nd");
+        free_note
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(text(&container).contains("Add implementation details"));
+        assert_eq!(free_text.value(), "a\nb");
+        assert_eq!(free_note.value(), "c\nd");
+        let options = option_buttons(&container);
+        let submit: HtmlButtonElement = container
+            .query_selector(".ask-question-submit")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(submit.disabled());
+        options[0].click();
+        next_tick().await;
+        assert!(
+            submit.disabled(),
+            "one choice cannot satisfy the native minimum"
+        );
+        options[1].click();
+        next_tick().await;
+        assert!(!submit.disabled(), "two choices satisfy the native bounds");
+        assert!(
+            options[2].disabled(),
+            "an unselected third choice must be unavailable at the native maximum"
+        );
+        options[0].click();
+        next_tick().await;
+        assert!(
+            !options[2].disabled(),
+            "deselection restores another available choice"
+        );
+        assert!(submit.disabled());
+        options[2].click();
+        next_tick().await;
+        assert!(
+            !submit.disabled(),
+            "two choices restore a valid answer before testing the note limit"
+        );
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector(".ask-question-note")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("sixsix");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(submit.disabled(), "an oversized note cannot be submitted");
+        options[1].click();
+        options[2].click();
+        next_tick().await;
+        input.set_value("five");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector(".ask-question-custom")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("sixsix");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            submit.disabled(),
+            "an oversized free-text answer cannot be submitted either"
+        );
+        input.set_value("five");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            !submit.disabled(),
+            "valid free text remains available beside bounded choices"
+        );
+        assert_eq!(calls.length(), 0, "editing must not submit an answer");
+        options[1].click();
+        options[2].click();
+        next_tick().await;
+        assert_eq!(input.value(), "", "choosing options replaces free text");
+        assert!(is_pressed(&options[1]) && is_pressed(&options[2]));
+        assert!(!submit.disabled());
+        submit.click();
+        next_tick().await;
+
+        assert_eq!(
+            last_send_route(&calls),
+            ("host-1".to_owned(), "/agent/agent-1/inst".to_owned())
+        );
+        let envelope: protocol::Envelope = serde_json::from_str(&last_send_line(&calls)).unwrap();
+        assert_eq!(envelope.kind, FrameKind::SendMessage);
+        let payload: SendMessagePayload = envelope.parse_payload().unwrap();
+        let Some(SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            structured_answers: Some(answers),
+            ..
+        }) = payload.tool_response
+        else {
+            panic!("the UI bridge must emit typed structured question answers");
+        };
+        assert_eq!(tool_call_id, "bounded-tool");
+        assert_eq!(
+            answers,
+            vec![
+                protocol::UserQuestionAnswer {
+                    question_id: protocol::UserQuestionId("bounded-question".to_owned()),
+                    answer: protocol::UserQuestionAnswerValue::Selected {
+                        labels: vec!["Axum, HTTP".to_owned(), "Tauri, shell".to_owned()],
+                        note: Some("five".to_owned()),
+                    },
+                },
+                protocol::UserQuestionAnswer {
+                    question_id: protocol::UserQuestionId("free-text-question".to_owned()),
+                    answer: protocol::UserQuestionAnswerValue::FreeText {
+                        text: "a\nb".to_owned(),
+                        note: Some("c\nd".to_owned()),
+                    },
+                },
+            ],
+            "submission must preserve question identity, label boundaries, text and notes"
+        );
+        assert!(submit.disabled());
+        assert!(options.iter().all(HtmlButtonElement::disabled));
+        assert_eq!(
+            container
+                .query_selector_all("textarea:not([disabled])")
+                .unwrap()
+                .length(),
+            0,
+            "all structured answer controls lock during submission"
+        );
+        assert!(text(&container).contains("Sending..."));
+        assert!(!has_sent_note(&container));
+        submit.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            1,
+            "a pending answer cannot be submitted twice"
+        );
+
+        resolve_deferred_send();
+        next_tick().await;
+        assert!(text(&container).contains("Waiting for the agent to accept this answer."));
+        assert!(!has_sent_note(&container));
+        assert!(submit.disabled());
+        assert!(options.iter().all(HtmlButtonElement::disabled));
+        assert!(free_text.disabled() && free_note.disabled());
+
+        let result = ToolExecutionResult::AskUserQuestion { answers };
+        let saved = mount_with_state(move || {
+            render(
+                test_agent_ref(),
+                "bounded-tool",
+                &req,
+                Some(&result),
+                ToolOutputMode::Summary,
+            )
+        });
+        next_tick().await;
+        let saved_options = option_buttons(&saved);
+        assert!(is_pressed(&saved_options[1]) && is_pressed(&saved_options[2]));
+        assert!(saved_options.iter().all(HtmlButtonElement::disabled));
+        let textareas = saved.query_selector_all("textarea").unwrap();
+        for (index, expected) in ["", "five", "a\nb", "c\nd"].iter().enumerate() {
+            let input: web_sys::HtmlTextAreaElement =
+                textareas.get(index as u32).unwrap().dyn_into().unwrap();
+            assert_eq!(input.value(), *expected, "settled answers remain readable");
+            assert!(input.disabled());
+        }
+        assert!(submit_button(&saved).disabled());
+        assert!(has_sent_note(&saved));
     }
 
     #[wasm_bindgen_test]

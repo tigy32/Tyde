@@ -131,6 +131,10 @@ impl<B: Backend> ControlService<B> {
         self.changed.send_modify(|revision| *revision += 1);
     }
 
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
     fn caller(&self, context: &RequestContext<RoleServer>) -> Result<protocol::AgentId, String> {
         let parts = context
             .extensions
@@ -483,7 +487,7 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
                         .map_err(|_| "child closed")?;
                     done.await
                         .map_err(|_| "child did not acknowledge input")??;
-                    Ok(json!({"agent_id":id.0,"queued":false}))
+                    Ok(json!({"ok":true}))
                 }
                 _ => Err("unknown tool on this MCP endpoint".to_owned()),
             }

@@ -890,6 +890,7 @@ impl TurnMapper {
                     message,
                     details: None,
                     normalization_failure: None,
+                    result: None,
                 },
             );
             return;
@@ -1339,6 +1340,7 @@ impl Supervisor {
         let protocol::SendMessageToolResponse::AskUserQuestion {
             tool_call_id,
             answer,
+            ..
         } = response
         else {
             self.inner.emitter.backend_error(
@@ -1816,7 +1818,7 @@ fn tool_execution_result(
                 .iter()
                 .map(|path| protocol::FileInfo {
                     path: path.clone(),
-                    bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+                    bytes: Some(fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)),
                 })
                 .collect(),
         },
@@ -2422,6 +2424,7 @@ fn antigravity_history(brain_dir: &Path, session_id: &str) -> Result<Vec<ChatEve
                         message: content.to_owned(),
                         details: None,
                         normalization_failure: None,
+                        result: None,
                     }
                 } else {
                     let output = content

@@ -194,6 +194,41 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
     let gate = MockGateHandle::new();
     let cancel_blocking_gate = MockGateHandle::new();
     let cancel_async_gate = MockGateHandle::new();
+    let structured_gate = MockGateHandle::new();
+    let structured_questions = vec![
+        protocol::AskUserQuestion {
+            id: Some(protocol::UserQuestionId("colors".to_owned())),
+            question: "Choose colors".to_owned(),
+            header: None,
+            options: ["BLUE", "GREEN", "RED"]
+                .into_iter()
+                .map(|label| protocol::AskUserQuestionOption {
+                    label: label.to_owned(),
+                    description: None,
+                })
+                .collect(),
+            multi_select: true,
+            answer_schema: Some(protocol::UserQuestionAnswerSchema {
+                min_selections: Some(1),
+                max_selections: Some(2),
+                max_free_text_chars: Some(8),
+                max_note_chars: Some(4),
+            }),
+        },
+        protocol::AskUserQuestion {
+            id: Some(protocol::UserQuestionId("shape".to_owned())),
+            question: "Describe a shape".to_owned(),
+            header: None,
+            options: Vec::new(),
+            multi_select: false,
+            answer_schema: Some(protocol::UserQuestionAnswerSchema {
+                min_selections: None,
+                max_selections: None,
+                max_free_text_chars: Some(8),
+                max_note_chars: Some(4),
+            }),
+        },
+    ];
     let question = fixture
         .spawn_scripted(
             "blocking-question",
@@ -210,7 +245,14 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
             .then(MockTurn::async_question_request(
                 "cancelled-async-question",
                 &cancel_async_gate,
-            )),
+            ))
+            .then(MockTurn::structured_question_request(
+                "structured-question",
+                structured_questions.clone(),
+                &structured_gate,
+            ))
+            .then(MockTurn::text("structured answer accepted"))
+            .then(MockTurn::text("structured question follow-up")),
         )
         .await;
     gate.wait_until_entered().await;
@@ -286,6 +328,8 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
                 tool_response: Some(SendMessageToolResponse::AskUserQuestion {
                     tool_call_id: request.tool_call_id.clone(),
                     answer: "BLUE".to_owned(),
+
+                    structured_answers: None,
                 }),
             },
         )
@@ -370,6 +414,208 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
             "history must record each withdrawn question as cancelled exactly once"
         );
     }
+    drop(late);
+
+    fixture
+        .client
+        .send_message(&question.stream, "ask structured questions".to_owned())
+        .await
+        .expect("request structured questions");
+    structured_gate.wait_until_entered().await;
+    structured_gate.release_one();
+    let structured = expect_live_question_awaiting_user(&mut fixture, &question).await;
+    assert!(
+        matches!(&structured.tool_type,
+        protocol::ToolRequestType::AskUserQuestion { mode: protocol::UserQuestionMode::Blocking, questions }
+            if questions == &structured_questions),
+        "schema-bearing questions must reach the client intact"
+    );
+    fixture
+        .client
+        .send_message_payload(
+            &question.stream,
+            SendMessagePayload {
+                message: "structured question follow-up".to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::Supervisor),
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("queue behind structured questions");
+    let queued = fixture.expect_queued_messages(&question, 1).await;
+    let valid = vec![
+        protocol::UserQuestionAnswer {
+            question_id: protocol::UserQuestionId("colors".to_owned()),
+            answer: protocol::UserQuestionAnswerValue::Selected {
+                labels: vec!["BLUE".to_owned(), "GREEN".to_owned()],
+                note: Some("cool".to_owned()),
+            },
+        },
+        protocol::UserQuestionAnswer {
+            question_id: protocol::UserQuestionId("shape".to_owned()),
+            answer: protocol::UserQuestionAnswerValue::FreeText {
+                text: "round".to_owned(),
+                note: None,
+            },
+        },
+    ];
+    let mut duplicate_ids = valid.clone();
+    duplicate_ids[1] = duplicate_ids[0].clone();
+    let mut unknown_id = valid.clone();
+    unknown_id[1].question_id = protocol::UserQuestionId("unknown".to_owned());
+    let mut long_text = valid.clone();
+    long_text[1].answer = protocol::UserQuestionAnswerValue::FreeText {
+        text: "too many characters".to_owned(),
+        note: None,
+    };
+    let selection = |labels: &[&str], note: Option<&str>| {
+        let mut answers = valid.clone();
+        answers[0].answer = protocol::UserQuestionAnswerValue::Selected {
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            note: note.map(str::to_owned),
+        };
+        answers
+    };
+    for (case, answers) in [
+        ("duplicate IDs", duplicate_ids),
+        ("unknown ID", unknown_id),
+        ("unknown label", selection(&["PURPLE"], None)),
+        ("repeated label", selection(&["BLUE", "BLUE"], None)),
+        ("below minimum", selection(&[], None)),
+        ("above maximum", selection(&["BLUE", "GREEN", "RED"], None)),
+        ("long free text", long_text),
+        ("long note", selection(&["BLUE"], Some("too long"))),
+    ] {
+        fixture
+            .client
+            .send_message_payload(
+                &question.stream,
+                SendMessagePayload {
+                    message: String::new(),
+                    images: None,
+                    origin: None,
+                    tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                        tool_call_id: structured.tool_call_id.clone(),
+                        answer: "Legacy text must not bypass the schema".to_owned(),
+                        structured_answers: Some(answers),
+                    }),
+                },
+            )
+            .await
+            .expect("submit malformed structured answer");
+        fixture
+            .next_chat_event_matching(&question, "structured answer rejected", |event| {
+                assert!(
+                    !matches!(event, ChatEvent::TypingStatusChanged(true)),
+                    "{case}: rejected answer must not resume the backend"
+                );
+                assert!(
+                    !matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == structured.tool_call_id),
+                    "{case}: rejected answer must not retire the question"
+                );
+                if let ChatEvent::MessageAdded(message) = event
+                    && matches!(message.sender, protocol::MessageSender::Error)
+                {
+                    assert!(
+                        message.content
+                            == "Structured answer does not satisfy the pending questions",
+                        "{case}: expected the structured-answer admission error"
+                    );
+                    return true;
+                }
+                false
+            })
+            .await;
+        let (mut observer, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+            fixture.host_for_test(),
+            "structured-question-observer",
+        )
+        .await;
+        let descriptor = bootstrap
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == question.new_agent.agent_id)
+            .expect("structured question agent descriptor");
+        assert_eq!(
+            descriptor.activity,
+            AgentActivity::AwaitingUser,
+            "{case}: malformed answers must leave the question pending"
+        );
+        let stream = descriptor.instance_stream.clone();
+        fixture::send_load_agent_on(&mut observer, &stream).await;
+        let replay: protocol::AgentBootstrapPayload = fixture::next_frame_matching_on(
+            &mut observer,
+            "pending structured question replay",
+            |env| env.kind == FrameKind::AgentBootstrap && env.stream == stream,
+        )
+        .await
+        .parse_payload()
+        .expect("parse pending structured question replay");
+        assert_eq!(replay.activity, AgentActivity::AwaitingUser);
+        assert!(replay.events.iter().any(|event| matches!(event,
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
+                if pending.tool_call_id == structured.tool_call_id && pending.tool_type == structured.tool_type)),
+            "{case}: pending schema-bearing question must survive reconnect");
+        assert!(
+            !replay.events.iter().any(|event| matches!(event,
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+                if completion.tool_call_id == structured.tool_call_id)),
+            "{case}: replay must not claim the unanswered question completed"
+        );
+        assert!(replay.events.iter().any(|event| matches!(event,
+            protocol::AgentBootstrapEvent::QueuedMessages(snapshot)
+                if snapshot.messages.len() == 1 && snapshot.messages[0].id == queued.messages[0].id)),
+            "{case}: malformed answers must retain the queued follow-up");
+    }
+    fixture
+        .client
+        .send_message_payload(
+            &question.stream,
+            SendMessagePayload {
+                message: String::new(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                    tool_call_id: structured.tool_call_id.clone(),
+                    answer: String::new(),
+                    structured_answers: Some(valid.clone()),
+                }),
+            },
+        )
+        .await
+        .expect("submit structured-only answer with empty legacy text");
+    let admitted = fixture
+        .next_frame_matching("structured-only answer admission", |env| {
+            env.stream == question.stream && env.kind == FrameKind::ChatEvent
+        })
+        .await;
+    assert!(
+        !matches!(admitted.parse_payload::<ChatEvent>().expect("parse answer admission"),
+        ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::Error)),
+        "a valid structured answer must not hit the legacy empty-text rejection"
+    );
+    fixture::push_front_pending_frame_on(&fixture.client, admitted);
+    let answered = fixture.finish_turn(&question).await;
+    assert_eq!(answered.chat_events().iter().filter(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == structured.tool_call_id
+            && matches!(&completion.outcome, protocol::ToolExecutionOutcome::Succeeded {
+                result: protocol::ToolExecutionResult::AskUserQuestion { answers }
+            } if answers == &valid))).count(), 1,
+        "structured-only answer must complete exactly once with the submitted values");
+    assert!(
+        answered.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::StreamEnd(end) if end.message.content == "structured answer accepted")),
+        "valid structured-only answer must resume the pending turn"
+    );
+    let drained = fixture.finish_turn(&question).await;
+    assert!(
+        drained.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::StreamEnd(end) if end.message.content == "structured question follow-up")),
+        "the queued follow-up must run after structured-answer completion"
+    );
+    assert!(answered.saw_queue_drained() || drained.saw_queue_drained());
     fixture.mock(&question).await.assert_clean().await;
 }
 

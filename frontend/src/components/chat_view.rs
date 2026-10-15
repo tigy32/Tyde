@@ -960,6 +960,7 @@ pub fn ChatView(
                             BackendKind::Hermes => ("backend-badge hermes", "Hermes"),
                             BackendKind::Grok => ("backend-badge grok", "Grok"),
                             BackendKind::Opencode => ("backend-badge opencode", "OpenCode"),
+                            BackendKind::Muse => ("backend-badge muse", "Muse"),
                         };
                         view! { <span class=badge_class>{label}</span> }
                     })}

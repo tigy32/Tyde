@@ -613,6 +613,8 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         tool_response: Some(protocol::SendMessageToolResponse::AskUserQuestion {
             tool_call_id: request.tool_call_id.clone(),
             answer: "GREEN".to_owned(),
+
+            structured_answers: None,
         }),
     };
     fixture

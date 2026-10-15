@@ -161,6 +161,7 @@ impl CodexCommandHandle {
             Some(protocol::SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
                 answer,
+                ..
             }) if tool_call_id.starts_with("async-user-input-") => {
                 if answer.trim().is_empty()
                     || !self
@@ -14736,10 +14737,11 @@ impl CodexInner {
                     .questions
                     .into_iter()
                     .map(|question| protocol::AskUserQuestion {
-                        id: Some(question.id),
+                        id: Some(protocol::UserQuestionId(question.id)),
                         header: Some(question.header),
                         question: question.question,
                         options: question.options.unwrap_or_default(),
+                        answer_schema: None,
                         multi_select: false,
                     })
                     .collect::<Vec<_>>();
@@ -15293,6 +15295,7 @@ impl CodexInner {
                         description: None,
                     })
                     .collect(),
+                answer_schema: None,
                 multi_select: false,
             })
             .collect::<Vec<_>>();
@@ -20598,6 +20601,7 @@ impl CodexNativeExecutionTrace {
                             message,
                             details: None,
                             normalization_failure: None,
+                            result: None,
                         }
                     }
                     _ => return Err("native_trace_direct_result_shape_invalid"),
@@ -23123,6 +23127,7 @@ fn codex_tool_execution_outcome(
         message: error.unwrap_or_else(|| "Tool execution failed".to_string()),
         details: (!result.is_null()).then(|| result.to_string()),
         normalization_failure,
+        result: None,
     }
 }
 
@@ -23603,7 +23608,9 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::SessionSpeed,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::McpImageResults,
+            tyde_agent_adapter::BackendCapability::McpOriginalContentFidelity,
             tyde_agent_adapter::BackendCapability::McpErrorResults,
+            tyde_agent_adapter::BackendCapability::McpErrorImageResults,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::CumulativeUsageReported,
@@ -23616,6 +23623,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::NativeSubagentWaitProgress,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
             tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,

@@ -22,6 +22,7 @@ const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const GROK_CLI_CANDIDATES: &[&str] = &["grok"];
 const OPENCODE_CLI_CANDIDATES: &[&str] = &["opencode"];
+const MUSE_CLI_CANDIDATES: &[&str] = &["muse"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
 const ACP_AGGREGATE_MAX_FAILURES: usize = 4;
@@ -88,6 +89,7 @@ pub(crate) async fn collect_backend_setup(
             BackendKind::Hermes,
             BackendKind::Grok,
             BackendKind::Opencode,
+            BackendKind::Muse,
         ]
         .into_iter()
         .map(|kind| probe_backend(kind, platform, acp_agents)),
@@ -116,6 +118,7 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
         BackendKind::Hermes,
         BackendKind::Grok,
         BackendKind::Opencode,
+        BackendKind::Muse,
     ]
     .into_iter()
     .map(|kind| {
@@ -252,6 +255,7 @@ async fn probe_backend(
         BackendKind::Opencode => {
             probe_candidates(&command_candidates(OPENCODE_CLI_CANDIDATES)).await
         }
+        BackendKind::Muse => probe_candidates(&command_candidates(MUSE_CLI_CANDIDATES)).await,
     };
 
     backend_setup_info_from_probe(kind, platform, probe)
@@ -885,11 +889,13 @@ fn docs_url(kind: BackendKind) -> String {
         }
         BackendKind::Grok => "https://docs.x.ai/build/overview".to_string(),
         BackendKind::Opencode => "https://opencode.ai/docs/cli/".to_string(),
+        BackendKind::Muse => "https://dev.meta.ai/docs/muse-code".to_owned(),
     }
 }
 
 fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendSetupCommand> {
     match kind {
+        BackendKind::Muse => Some(BackendSetupCommand { title: "Muse Code".to_owned(), display_command: None, runnable: true, command: match platform { HostPlatform::Windows => "irm https://dev.meta.ai/install.ps1 | iex".to_owned(), _ => "curl -fsSL https://dev.meta.ai/install.sh | sh".to_owned() }, description: "Install Muse Code with the official Meta installer".to_owned() }),
         BackendKind::Tycode => None,
         BackendKind::Kiro => Some(BackendSetupCommand {
             title: "Install CLI".to_string(),
@@ -961,6 +967,13 @@ fn sign_in_command(
     hermes_executable: Option<&str>,
 ) -> Option<BackendSetupCommand> {
     match kind {
+        BackendKind::Muse => Some(BackendSetupCommand {
+            title: "Muse Code".to_owned(),
+            display_command: None,
+            runnable: true,
+            command: "muse login".to_owned(),
+            description: "Sign in to Muse Code with your Meta account".to_owned(),
+        }),
         BackendKind::Tycode => None,
         BackendKind::Kiro => Some(BackendSetupCommand {
             title: "Sign In".to_string(),

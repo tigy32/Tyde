@@ -570,7 +570,7 @@ fn normalize_grok_shell_command<'a>(
     if !args.is_empty() {
         return (command, None);
     }
-    for shell in ["/bin/bash", "/bin/zsh", "/bin/sh"] {
+    for shell in ["/bin/bash", "/usr/bin/bash", "/bin/zsh", "/bin/sh"] {
         let prefix = format!("{shell} -lc ");
         let Some(raw_script) = command.strip_prefix(&prefix) else {
             continue;

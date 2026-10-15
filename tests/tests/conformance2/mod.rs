@@ -56,6 +56,7 @@ pub async fn real_resume_start_race_child<B: Backend>(host: &Harness<B>) -> bool
         .arg(script)
         .arg(std::env::current_exe().expect("conformance executable"))
         .arg(&host.test_name)
+        .arg(super::spawn_tool_backend_name(host.backend()))
         .status()
         .await
         .expect("run isolated real-provider resume race");
@@ -153,8 +154,11 @@ impl Turn {
     /// Prefix for this turn's assertion failures. Not an identity — it names the
     /// turn by what it asked for, which an index into the conversation could not.
     pub fn label(&self) -> String {
-        let prompt: String = self.prompt.chars().take(48).collect();
-        format!("{:?} turn {prompt:?}", self.backend)
+        format!(
+            "{:?} turn ({} prompt characters)",
+            self.backend,
+            self.prompt.chars().count()
+        )
     }
 
     pub fn tool_requests(&self) -> impl Iterator<Item = &ToolRequest> {
@@ -355,6 +359,7 @@ pub fn tool_kind(request: &ToolRequest) -> &'static str {
 fn result_kind(result: &ToolExecutionResult) -> &'static str {
     use ToolExecutionResult as R;
     match result {
+        ToolExecutionResult::AskUserQuestion { .. } => "AskUserQuestion",
         R::ModifyFile { .. } => "modify_file",
         R::RunCommand { .. } => "run_command",
         R::ReadFiles { .. } => "read_files",
@@ -366,6 +371,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         R::WebSearch => "web_search",
         R::ViewImage { .. } => "view_image",
         R::Sleep => "sleep",
+        R::NativeContent { .. } => "native_content",
         R::Other { .. } => "other",
         R::ExitPlanMode { .. } => "exit_plan_mode",
     }
@@ -413,7 +419,8 @@ pub fn backend_selected(name: &str) -> bool {
                 "antigravity",
                 "kiro",
                 "grok",
-                "opencode"
+                "opencode",
+                "muse"
             ]
             .contains(kind)),
         "invalid TYDE_REAL_BACKENDS={selection:?}"
@@ -755,9 +762,8 @@ pub async fn ask<B: Backend>(
 ) -> Turn {
     let prompt = prompt.as_ref();
     let backend = host.backend.as_ref().expect("backend must be running");
-    assert_eq!(
-        backend.session_id(),
-        agent.session_id,
+    assert!(
+        backend.session_id() == agent.session_id,
         "input addressed the wrong session"
     );
     assert!(
@@ -767,7 +773,9 @@ pub async fn ask<B: Backend>(
                 .await,
             SendOutcome::Accepted
         ),
-        "backend did not accept {prompt:?}"
+        "{:?}: backend did not accept a {}-character message",
+        host.backend(),
+        prompt.chars().count()
     );
     collect_turn(host, agent, prompt).await
 }
@@ -788,17 +796,25 @@ pub(super) async fn collect_turn_until<B: Backend>(
     turn: &mut Turn,
     mut stop: impl FnMut(&ChatEvent) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     let stream = host
         .events
         .as_mut()
         .expect("backend event stream must be open");
     loop {
-        let event = tokio::time::timeout_at(deadline, stream.recv_backend())
+        let event = stream
+            .recv_backend()
             .await
-            .unwrap_or_else(|_| panic!("{}: timed out collecting turn", turn.label()))
             .unwrap_or_else(|| panic!("{}: backend closed mid-turn", turn.label()));
-        eprintln!("{} {event:?}", turn.label());
+        eprintln!(
+            "{} backend event {}",
+            turn.label(),
+            match &event {
+                BackendEvent::Chat(_) => "chat",
+                BackendEvent::ModelRequestTokenUsage(_) => "model_usage",
+                BackendEvent::Compaction(_) => "compaction",
+                BackendEvent::ResumeReplayComplete(_) => "resume_barrier",
+            }
+        );
         match event {
             BackendEvent::Chat(event) => {
                 let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
@@ -1090,6 +1106,15 @@ impl<B: Backend> Harness<B> {
             }
         }
     }
+
+    pub async fn next_backend_event(&mut self) -> BackendEvent {
+        self.events
+            .as_mut()
+            .expect("backend event stream must be open")
+            .recv_backend()
+            .await
+            .expect("backend closed before the awaited event")
+    }
 }
 
 pub async fn send_prompt<B: Backend>(host: &mut Harness<B>, agent: &Agent, prompt: &str) {
@@ -1098,7 +1123,9 @@ pub async fn send_prompt<B: Backend>(host: &mut Harness<B>, agent: &Agent, promp
             try_send_prompt(host, agent, prompt).await,
             SendOutcome::Accepted
         ),
-        "backend did not accept {prompt:?}"
+        "{:?}: backend did not accept a {}-character message",
+        host.backend(),
+        prompt.chars().count()
     );
 }
 
@@ -1508,6 +1535,8 @@ pub async fn send_question_response<B: Backend>(
         tool_response: Some(SendMessageToolResponse::AskUserQuestion {
             tool_call_id: tool_call_id.to_owned(),
             answer: answer.to_owned(),
+
+            structured_answers: None,
         }),
     };
     assert!(
@@ -1520,6 +1549,34 @@ pub async fn send_question_response<B: Backend>(
             SendOutcome::Accepted
         ),
         "backend refused the question's answer"
+    );
+}
+
+pub async fn send_structured_question_response<B: Backend>(
+    host: &Harness<B>,
+    tool_call_id: &str,
+    answers: Vec<protocol::UserQuestionAnswer>,
+) {
+    let payload = SendMessagePayload {
+        message: "structured question answer".to_owned(),
+        images: None,
+        origin: None,
+        tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+            tool_call_id: tool_call_id.to_owned(),
+            answer: "structured question answer".to_owned(),
+            structured_answers: Some(answers),
+        }),
+    };
+    assert!(
+        matches!(
+            host.backend
+                .as_ref()
+                .expect("backend must be running")
+                .send_with_outcome(AgentInput::SendMessage(payload))
+                .await,
+            SendOutcome::Accepted
+        ),
+        "backend refused the native structured question answer"
     );
 }
 
@@ -1575,10 +1632,14 @@ pub async fn install_skill<B: Backend>(
 pub struct Observer {
     capacity: std::sync::Mutex<Vec<(BackendKind, protocol::BackendCapacityState)>>,
     pub children: std::sync::Arc<std::sync::Mutex<Vec<ChildObservation>>>,
+    parent_agent_id: Option<protocol::AgentId>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone)]
 pub struct ChildObservation {
     pub id: protocol::AgentId,
+    pub parent_agent_id: Option<protocol::AgentId>,
     pub tool_use_id: String,
     pub name: String,
     pub description: String,
@@ -1612,6 +1673,18 @@ impl server::backend::SubAgentEmitter for Observer {
         >,
     > {
         Box::pin(async move {
+            if let Some(parent) = &self.parent_agent_id {
+                loop {
+                    let changed = self.changed.notified();
+                    let published=self.children.lock().expect("native parent observations").iter()
+                        .find(|child| &child.id==parent).is_some_and(|child| child.events.iter()
+                            .any(|event|matches!(event,ChatEvent::ToolRequest(request) if request.tool_call_id==tool_use_id)));
+                    if published {
+                        break;
+                    }
+                    changed.await;
+                }
+            }
             let id = protocol::AgentId(uuid::Uuid::new_v4().to_string());
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             let (model_usage_tx, mut model_usage_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1622,6 +1695,7 @@ impl server::backend::SubAgentEmitter for Observer {
                 let index = children.len();
                 children.push(ChildObservation {
                     id: id.clone(),
+                    parent_agent_id: self.parent_agent_id.clone(),
                     tool_use_id,
                     name,
                     description,
@@ -1634,6 +1708,7 @@ impl server::backend::SubAgentEmitter for Observer {
                 index
             };
             let children = self.children.clone();
+            let changed = self.changed.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -1643,14 +1718,21 @@ impl server::backend::SubAgentEmitter for Observer {
                         Some(name) = name_update_rx.recv() => children.lock().expect("child observations")[index].name = name,
                         else => break,
                     }
+                    changed.notify_waiters();
                 }
             });
             Ok(server::backend::SubAgentHandle {
                 event_tx,
                 model_usage_tx,
                 total_usage_tx,
-                agent_id: id,
+                agent_id: id.clone(),
                 name_update_tx: Some(name_update_tx),
+                subagent_emitter: Some(std::sync::Arc::new(Self {
+                    capacity: Default::default(),
+                    children: self.children.clone(),
+                    parent_agent_id: Some(id),
+                    changed: self.changed.clone(),
+                })),
             })
         })
     }
@@ -1807,17 +1889,15 @@ pub async fn resume_agent_at_roots<B: Backend>(
     let (backend, mut events) = B::resume(roots, host.config.clone(), id.clone())
         .await
         .expect("resume through Backend trait");
-    assert_eq!(
-        &backend.session_id(),
-        id,
+    assert!(
+        &backend.session_id() == id,
         "resume silently changed the provider session identity"
     );
     let mut replayed_history = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
-        let event = tokio::time::timeout_at(deadline, events.recv_backend())
+        let event = events
+            .recv_backend()
             .await
-            .expect("resume replay timed out before its ordered boundary")
             .expect("backend disconnected before its resume boundary");
         match event {
             BackendEvent::ResumeReplayComplete(result) => {
@@ -2080,6 +2160,61 @@ pub async fn await_session_schema<B: Backend>(
     .schema
 }
 
+pub async fn assert_discovery_waits_for_live_reply<B: Backend>(host: &Harness<B>) {
+    let normal = B::discover(&server::backend::BackendProbeContext {
+        workspace_roots: host.workspace_roots(),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|_| panic!("real native discovery positive control failed"));
+    let program = host.workspace().join("discovery_proxy.py");
+    let proof = host.workspace().join("discovery-delay-proof.json");
+    std::fs::write(&program, include_str!("discovery_proxy.py"))
+        .expect("write transparent real CLI discovery proxy");
+    std::fs::write(
+        program.with_extension("json"),
+        serde_json::json!({
+            "program": super::spawn_tool_backend_name(host.backend()),
+            "proof": proof,
+            "delay_seconds": 35,
+        })
+        .to_string(),
+    )
+    .expect("write real discovery delay configuration");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make real discovery proxy executable");
+    }
+    let started = std::time::Instant::now();
+    let delayed = B::discover(&server::backend::BackendProbeContext {
+        program: Some(program.to_string_lossy().into_owned()),
+        workspace_roots: host.workspace_roots(),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|_| panic!("real native discovery must await the delayed provider reply"));
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proof).expect("real discovery must pass through the reply delay"),
+    )
+    .expect("read content-free live discovery timing proof");
+    assert!(
+        started.elapsed() >= Duration::from_secs(35)
+            && evidence["held_seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds >= 35.0)
+            && evidence["native_result_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+        "a successful real native RPC reply must remain pending beyond the former 30-second deadline"
+    );
+    assert!(
+        delayed.schema == normal.schema,
+        "delayed real discovery must preserve the provider's catalog"
+    );
+}
+
 pub async fn spawn_agent_with_settings<B: Backend>(
     host: &mut Harness<B>,
     prompt: &str,
@@ -2232,6 +2367,43 @@ pub async fn relocate_workspace_when_ready<B: Backend>(
     }
 }
 
+pub async fn assert_session_setting_reset_rejected<B: Backend>(
+    host: &mut Harness<B>,
+    key: &str,
+) -> SessionSettingsValues {
+    let backend = host.backend.as_mut().expect("live backend");
+    let before = backend
+        .read_session_settings()
+        .await
+        .unwrap_or_else(|_| panic!("read native setting before its unsupported reset"));
+    assert!(
+        matches!(before.0.get(key), Some(SessionSettingValue::String(value)) if !value.is_empty()),
+        "unsupported-reset positive control must have an explicit applied tier"
+    );
+    let result = backend
+        .update_session_settings(protocol::SetSessionSettingsPayload {
+            values: SessionSettingsValues(
+                [(key.to_owned(), SessionSettingValue::Null)]
+                    .into_iter()
+                    .collect(),
+            ),
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "a non-nullable setting must reject an unsupported live reset rather than report success"
+    );
+    let after = backend
+        .read_session_settings()
+        .await
+        .unwrap_or_else(|_| panic!("read native setting after its rejected reset"));
+    assert!(
+        after == before,
+        "a rejected live reset must preserve the actual native applied tier and other settings"
+    );
+    after
+}
+
 pub async fn set_session_setting_value<B: Backend>(
     host: &mut Harness<B>,
     _agent: &Agent,
@@ -2339,7 +2511,6 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
     use server::backend::compaction::{
         BackendCompactionEvent, BackendCompactionRequest, BackendCompactionStart,
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let operation_id = protocol::CompactionOperationId(uuid::Uuid::new_v4().to_string());
     let mut events = Vec::new();
     let mut observations = Vec::new();
@@ -2350,24 +2521,31 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
             focus: None,
             transcript_authoritative: true,
         };
-        let start = tokio::time::timeout_at(
-            deadline,
-            host.backend
-                .as_ref()
-                .expect("live backend")
-                .begin_compaction(request),
-        )
-        .await
-        .expect("native compaction dispatch timed out");
+        let start = host
+            .backend
+            .as_ref()
+            .expect("live backend")
+            .begin_compaction(request)
+            .await;
         match start {
             BackendCompactionStart::Accepted(accepted) => break accepted,
             BackendCompactionStart::Deferred { reason } => {
                 eprintln!("{}: compaction deferred: {reason:?}", host.test_name);
                 loop {
                     let event = host
-                        .next_chat(deadline)
+                        .events
+                        .as_mut()
+                        .expect("backend events")
+                        .recv_backend()
                         .await
-                        .expect("deferred compaction did not become idle");
+                        .expect("backend closed while compaction was deferred");
+                    let BackendEvent::Chat(event) = event else {
+                        assert!(
+                            !matches!(event, BackendEvent::ResumeReplayComplete(_)),
+                            "unexpected resume boundary while compaction was deferred"
+                        );
+                        continue;
+                    };
                     let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
                     events.push(event);
                     if idle {
@@ -2394,7 +2572,6 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
                     BackendEvent::ResumeReplayComplete(_) => panic!("unexpected resume boundary during compaction"),
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => panic!("native compaction did not complete"),
         }
     };
     assert_eq!(terminal.operation_id, operation_id);
@@ -2471,8 +2648,19 @@ pub async fn delegate<B: Backend>(
         .0
         .clone();
     let before = service.children.lock().expect("children").len();
+    let mut changed = service.subscribe_changes();
     let parent = ask(host, parent, prompt).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(360);
+    eprintln!(
+        "REAL DELEGATION PARENT requests={} completions={} registered_children={:?}",
+        parent.tool_requests().count(),
+        parent.tool_completions().count(),
+        service
+            .children
+            .lock()
+            .expect("children")
+            .len()
+            .checked_sub(before)
+    );
     loop {
         {
             let children = service.children.lock().expect("children");
@@ -2483,11 +2671,16 @@ pub async fn delegate<B: Backend>(
                 spawned.len() <= 1,
                 "one spawn call created more than one child"
             );
+            // The fixture registers its child before acknowledging the spawn RPC.
+            assert!(
+                !spawned.is_empty(),
+                "parent reached idle without a registered fixture child (registered={})",
+                spawned.len()
+            );
             if let Some(child) = spawned.first() {
                 assert!(
                     child.failure.is_none(),
-                    "child backend failed: {:?}",
-                    child.failure
+                    "child backend failed before completing the delegated turn"
                 );
                 if child.idle {
                     let mut turn = host.turn(child_prompt);
@@ -2501,11 +2694,10 @@ pub async fn delegate<B: Backend>(
                 }
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "child did not complete its real backend turn"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        changed
+            .changed()
+            .await
+            .expect("agent-control observations closed before the delegated turn completed");
     }
 }
 
@@ -2634,7 +2826,16 @@ pub async fn ask_through_final_response<B: Backend>(
             }
             Err(_) => panic!("{}: final response did not arrive", turn.label()),
         };
-        eprintln!("{} {event:?}", turn.label());
+        eprintln!(
+            "{} backend event {}",
+            turn.label(),
+            match &event {
+                BackendEvent::Chat(_) => "chat",
+                BackendEvent::ModelRequestTokenUsage(_) => "model_usage",
+                BackendEvent::Compaction(_) => "compaction",
+                BackendEvent::ResumeReplayComplete(_) => "resume_barrier",
+            }
+        );
         match event {
             BackendEvent::Chat(event) => {
                 if matches!(&event, ChatEvent::StreamEnd(end) if end.message.content.contains(final_marker))

@@ -3566,6 +3566,12 @@ class WasmToolScriptTests(unittest.TestCase):
             "  printf 'WASM_BINDGEN_TEST_TIMEOUT=%s\\n' "
             '"${WASM_BINDGEN_TEST_TIMEOUT-<unset>}"\n'
             "  printf 'RUSTFLAGS=%s\\n' \"${RUSTFLAGS-<unset>}\"\n"
+            "  printf 'CARGO_ENCODED_RUSTFLAGS=%s\\n' "
+            '"${CARGO_ENCODED_RUSTFLAGS-<unset>}"\n'
+            "  printf 'CARGO_PROFILE_DEV_DEBUG=%s\\n' "
+            '"${CARGO_PROFILE_DEV_DEBUG-<unset>}"\n'
+            "  printf 'CARGO_PROFILE_TEST_DEBUG=%s\\n' "
+            '"${CARGO_PROFILE_TEST_DEBUG-<unset>}"\n'
             "  printf 'RUNNER=%s\\n' \"${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER-<unset>}\"\n"
             "  printf '=== end ===\\n'\n"
             '} >>"$CARGO_RECORD"\n'
@@ -3585,6 +3591,9 @@ class WasmToolScriptTests(unittest.TestCase):
             "TYDE_WASM_WEBDRIVER_SOURCE_JSON",
             "TYDE_WASM_TOOLS_PREPARED",
             "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_PROFILE_TEST_DEBUG",
             "CARGO_FAIL_IN",
             "TRUNK_FAIL",
         ):
@@ -3777,7 +3786,12 @@ class WasmToolScriptTests(unittest.TestCase):
             )
             for invocation in invocations:
                 self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
-                self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=0")
+                # Global rustflags replace the target config, including its
+                # 16 MiB WASM stack. Keep the no-DWARF default via profiles.
+                self.assertEqual(invocation["RUSTFLAGS"], "<unset>")
+                self.assertEqual(invocation["CARGO_ENCODED_RUSTFLAGS"], "<unset>")
+                self.assertEqual(invocation["CARGO_PROFILE_DEV_DEBUG"], "0")
+                self.assertEqual(invocation["CARGO_PROFILE_TEST_DEBUG"], "0")
 
                 command = shlex.split(invocation["RUNNER"])
                 self.assertEqual(command[0], "python3")
@@ -3785,21 +3799,49 @@ class WasmToolScriptTests(unittest.TestCase):
                 self.assertEqual(command[2:5], ["--hang-seconds", "600", "--"])
                 self.assertEqual(command[5], env["WASM_BINDGEN_TEST_RUNNER"])
 
-            # Flags and the disabled suite deadline reach all three suites.
-            record.unlink()
-            tuned = subprocess.run(
-                [str(script)],
-                env=dict(
-                    env, WASM_BINDGEN_TEST_TIMEOUT=U64_MAX_SECONDS, RUSTFLAGS="-C debuginfo=2"
-                ),
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(tuned.returncode, 0, tuned.stderr)
-            for invocation in self._cargo_invocations(record):
-                self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS)
-                self.assertEqual(invocation["RUSTFLAGS"], "-C debuginfo=2")
+            # Cargo owns flag precedence; the wrapper must preserve both
+            # spellings byte-for-byte, including deliberately empty values.
+            for overrides in (
+                {"RUSTFLAGS": "-C debuginfo=2"},
+                {"CARGO_ENCODED_RUSTFLAGS": "-C\x1fdebuginfo=1"},
+                {
+                    "RUSTFLAGS": "-C debuginfo=2",
+                    "CARGO_ENCODED_RUSTFLAGS": "-C\x1fdebuginfo=1",
+                    "CARGO_PROFILE_DEV_DEBUG": "1",
+                    "CARGO_PROFILE_TEST_DEBUG": "2",
+                },
+                {"RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": ""},
+            ):
+                with self.subTest(overrides=overrides):
+                    record.unlink()
+                    tuned = subprocess.run(
+                        [str(script)],
+                        env=dict(
+                            env, WASM_BINDGEN_TEST_TIMEOUT=U64_MAX_SECONDS, **overrides
+                        ),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(tuned.returncode, 0, tuned.stderr)
+                    invocations = self._cargo_invocations(record)
+                    self.assertEqual(
+                        [invocation["cwd"] for invocation in invocations],
+                        ["frontend", "rtc-transport", "mobile-frontend"],
+                    )
+                    for invocation in invocations:
+                        self.assertEqual(
+                            invocation["WASM_BINDGEN_TEST_TIMEOUT"], U64_MAX_SECONDS
+                        )
+                        for variable, default in (
+                            ("RUSTFLAGS", "<unset>"),
+                            ("CARGO_ENCODED_RUSTFLAGS", "<unset>"),
+                            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+                            ("CARGO_PROFILE_TEST_DEBUG", "0"),
+                        ):
+                            self.assertEqual(
+                                invocation[variable], overrides.get(variable, default)
+                            )
 
             # A failed frontend suite must not be followed by a mobile run that
             # could mask it in the stage output.

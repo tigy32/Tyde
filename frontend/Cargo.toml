@@ -75,4 +75,5 @@ qrcodegen = "1.8"
 pulldown-latex = { version = "0.8", default-features = false }
 
 [dev-dependencies]
+web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"] }
 wasm-bindgen-test = "0.3"

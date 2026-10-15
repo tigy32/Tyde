@@ -1464,6 +1464,7 @@ fn claude_init_frame_native_tool_catalog(
             tools.push(NativeTool {
                 name: name.to_owned(),
                 kind: claude_native_tool_kind(name),
+                selection: protocol::NativeToolSelection::Unverified,
             });
         }
         Ok(NativeToolCatalog {
@@ -3219,6 +3220,7 @@ impl ClaudeInner {
             SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
                 answer,
+                ..
             } => {
                 self.answer_pending_ask_user_question(tool_call_id, answer)
                     .await
@@ -7887,7 +7889,7 @@ fn answer_for_ask_user_question(
     parsed_lines: &HashMap<String, String>,
 ) -> Option<String> {
     let labels = [
-        question.id.as_deref(),
+        question.id.as_ref().map(|id| id.0.as_str()),
         question.header.as_deref(),
         Some(question.question.as_str()),
     ];
@@ -7911,7 +7913,13 @@ fn ask_user_question_answer_key(index: usize, question: &protocol::AskUserQuesti
         .header
         .as_deref()
         .and_then(normalize_nonempty)
-        .or_else(|| question.id.as_deref().and_then(normalize_nonempty))
+        .or_else(|| {
+            question
+                .id
+                .as_ref()
+                .map(|id| id.0.as_str())
+                .and_then(normalize_nonempty)
+        })
         .unwrap_or_else(|| format!("question_{}", index + 1))
 }
 
@@ -8963,6 +8971,7 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
                     result.stderr.clone()
                 }),
                 normalization_failure: None,
+                result: None,
             }
         }
     } else {
@@ -8981,6 +8990,7 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
                     "the completion notification named no output file".to_owned()
                 })),
                 normalization_failure: None,
+                result: None,
             },
             BackgroundTaskStatus::Stopped => ToolExecutionOutcome::Cancelled {
                 message: "Background command stopped".to_owned(),
@@ -8996,6 +9006,7 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
                     message: first_line_trimmed(&message, 140),
                     details: Some(message),
                     normalization_failure: None,
+                    result: None,
                 }
             }
             BackgroundTaskStatus::Running => return false,
@@ -12659,10 +12670,11 @@ fn claude_ask_user_questions(arguments: &Value) -> Vec<protocol::AskUserQuestion
 
 fn claude_ask_user_question_from_value(value: &Value) -> protocol::AskUserQuestion {
     protocol::AskUserQuestion {
-        id: claude_argument_string(value, &["id"]),
+        id: claude_argument_string(value, &["id"]).map(protocol::UserQuestionId),
         question: claude_argument_string(value, &["question", "prompt"]).unwrap_or_default(),
         header: claude_argument_string(value, &["header", "title"]),
         options: claude_ask_user_question_options(value),
+        answer_schema: None,
         multi_select: claude_argument_bool(value, &["multiSelect", "multi_select"])
             .unwrap_or(false),
     }
@@ -12914,6 +12926,7 @@ fn claude_tool_execution_outcome(
             .unwrap_or_else(|| "Tool execution failed".to_owned()),
         details,
         normalization_failure: None,
+        result: None,
     }
 }
 
@@ -13807,6 +13820,21 @@ fn extract_tool_result_events_from_message(
             continue;
         }
 
+        if is_error
+            && claude_is_ask_user_question_tool_name(&tool_name)
+            && result_text.starts_with("The user doesn't want to proceed with this tool use.")
+        {
+            tracing::debug!("Replaying Claude's recorded user rejection as a cancelled question");
+            events.push(ClaudeReplayToolExecution {
+                tool_call_id,
+                tool_name,
+                success: false,
+                tool_result: json!({"kind": "Cancelled", "message": "Cancelled by user"}),
+                error: None,
+            });
+            continue;
+        }
+
         if is_error {
             // AskUserQuestion, ExitPlanMode, and EnterPlanMode return is_error in
             // --print mode because they need interactive input. This is expected —
@@ -13925,18 +13953,15 @@ fn extract_tool_result_events_from_message(
                 .map(|tool_call| claude_argument_file_paths(&tool_call.arguments))
                 .unwrap_or_default();
             let tool_result = if let [path] = file_paths.as_slice() {
-                eprintln!(
-                    "TYDE CLAUDE READ RESULT path={path:?} result_text={result_text:?} result_bytes={}",
-                    result_text.len()
+                tracing::debug!(
+                    result_bytes = result_text.len(),
+                    "Claude replayed a native read without retained file-size metadata"
                 );
-                let bytes = std::fs::metadata(path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(result_text.len() as u64);
                 json!({
                     "kind": "ReadFiles",
                     "files": [{
                         "path": path,
-                        "bytes": bytes
+                        "bytes": null
                     }],
                 })
             } else {
@@ -15353,6 +15378,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::SessionSpeed,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::McpImageResults,
+            tyde_agent_adapter::BackendCapability::McpOriginalContentFidelity,
             tyde_agent_adapter::BackendCapability::McpErrorResults,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
@@ -15365,6 +15391,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::ForegroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
@@ -15373,6 +15400,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
             tyde_agent_adapter::BackendCapability::WorkflowProgress,
             tyde_agent_adapter::BackendCapability::UserQuestionRequests,
+            tyde_agent_adapter::BackendCapability::UserQuestionHistory,
             tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
             tyde_agent_adapter::BackendCapability::Customization,

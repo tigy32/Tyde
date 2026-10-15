@@ -109,6 +109,7 @@ enum BackendKindInput {
     Codex,
     Antigravity,
     Hermes,
+    Muse,
 }
 
 impl From<BackendKindInput> for BackendKind {
@@ -119,6 +120,7 @@ impl From<BackendKindInput> for BackendKind {
             BackendKindInput::Codex => Self::Codex,
             BackendKindInput::Antigravity => Self::Antigravity,
             BackendKindInput::Hermes => Self::Hermes,
+            BackendKindInput::Muse => Self::Muse,
         }
     }
 }

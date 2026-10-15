@@ -7561,7 +7561,7 @@ pub(super) fn send_hermes_disabled_providers(
     }
 }
 
-fn all_backends() -> [BackendKind; 7] {
+fn all_backends() -> [BackendKind; 8] {
     crate::components::agents_panel::BACKENDS_BY_PREFERENCE
 }
 
@@ -7605,6 +7605,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "hermes" => Some(BackendKind::Hermes),
         "grok" => Some(BackendKind::Grok),
         "opencode" => Some(BackendKind::Opencode),
+        "muse" => Some(BackendKind::Muse),
         _ => None,
     }
 }
@@ -7619,6 +7620,7 @@ pub(super) fn backend_value(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "hermes",
         BackendKind::Grok => "grok",
         BackendKind::Opencode => "opencode",
+        BackendKind::Muse => "muse",
     }
 }
 
@@ -7632,6 +7634,7 @@ pub(super) fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Muse => "Muse",
     }
 }
 
@@ -7645,6 +7648,7 @@ fn backend_badge_class(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "backend-badge hermes",
         BackendKind::Grok => "backend-badge grok",
         BackendKind::Opencode => "backend-badge opencode",
+        BackendKind::Muse => "backend-badge muse",
     }
 }
 
@@ -14723,6 +14727,7 @@ mod wasm_tests {
                 "Kiro".to_owned(),
                 "Grok".to_owned(),
                 "OpenCode".to_owned(),
+                "Muse".to_owned(),
             ],
             "the enable rows follow the preference order and use agent names"
         );
@@ -16093,11 +16098,65 @@ mod wasm_tests {
     async fn launch_profiles_add_emits_settings_write() {
         let calls = install_settings_send_stub();
         let container = make_container();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut("host-lp")
+                .unwrap()
+                .enabled_backends
+                .push(BackendKind::Muse);
+        });
+        let muse_schema = SessionSchemaEntry::Ready {
+            schema: SessionSettingsSchema {
+                backend_kind: BackendKind::Muse,
+                model_resolutions: Default::default(),
+                fields: [
+                    ("model", "Model", "fixture-spark", "Fixture Spark"),
+                    ("reasoning_effort", "Reasoning effort", "low", "Low"),
+                ]
+                .into_iter()
+                .map(|(key, label, value, option_label)| SessionSettingField {
+                    key: key.to_owned(),
+                    label: label.to_owned(),
+                    description: None,
+                    use_slider: false,
+                    select_options_by_setting: None,
+                    field_type: SessionSettingFieldType::Select {
+                        options: vec![SelectOption {
+                            value: value.to_owned(),
+                            label: option_label.to_owned(),
+                        }],
+                        default: None,
+                        nullable: true,
+                    },
+                })
+                .collect(),
+            },
+        };
+        state.session_schemas.update(|hosts| {
+            hosts
+                .get_mut("host-lp")
+                .unwrap()
+                .insert(BackendKind::Muse, muse_schema.clone());
+        });
+        crate::dispatch::reset_inbound_state_for_host("host-lp");
+        let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_launch_profile_host(&state, Vec::new());
-            provide_context(state);
-            view! { <LaunchProfilesSection /> }
+            provide_context(mounted_state.clone());
+            let active_state = mounted_state.clone();
+            let active =
+                Memo::new(move |_| active_state.center_zone.with(|zone| zone.active_tab_id()));
+            let lru_state = mounted_state.clone();
+            Effect::new(move |_| {
+                if let Some(tab) = active.get() {
+                    lru_state.bump_tab_lru(tab);
+                }
+            });
+            view! {
+                <LaunchProfilesSection />
+                <crate::components::center_zone::CenterZone />
+            }
         });
         next_tick().await;
 
@@ -16140,6 +16199,305 @@ mod wasm_tests {
             profile.get("backend_kind").and_then(|v| v.as_str()),
             Some("hermes"),
             "backend kind must be carried typed"
+        );
+
+        find_button_by_text(&container, "+ New launch profile")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let inputs = container
+            .query_selector_all(".settings-form .settings-text-input")
+            .unwrap();
+        set_input_value(&inputs.item(0).unwrap().dyn_into().unwrap(), "muse:cheap");
+        set_input_value(
+            &inputs.item(1).unwrap().dyn_into().unwrap(),
+            "Muse cheap profile",
+        );
+        let backend: HtmlSelectElement = container
+            .query_selector(".settings-form select.settings-select")
+            .unwrap()
+            .expect("profile backend selector")
+            .dyn_into()
+            .unwrap();
+        backend.set_value("muse");
+        dispatch_event_from_js(&backend.unchecked_into(), "change", None);
+        next_tick().await;
+        let form = container.query_selector(".settings-form").unwrap().unwrap();
+        let text = form.text_content().unwrap();
+        assert!(
+            text.contains("Fixture Spark") && text.contains("Reasoning effort"),
+            "choosing Muse must replace the previous backend's controls"
+        );
+        assert!(
+            !text.contains("Sonnet"),
+            "Hermes options must not survive selecting Muse"
+        );
+        let selects = form.query_selector_all(".session-setting-select").unwrap();
+        assert_eq!(selects.length(), 2);
+        for (index, value) in ["fixture-spark", "low"].into_iter().enumerate() {
+            let select: HtmlSelectElement = selects.item(index as u32).unwrap().dyn_into().unwrap();
+            select.set_value(value);
+            dispatch_event_from_js(&select.unchecked_into(), "change", None);
+            next_tick().await;
+        }
+        next_tick().await;
+        find_button_by_text(&container, "Save").unwrap().click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let frames = || {
+            calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                    if entry.get(0).as_string()?.as_str() != "send_host_line" {
+                        return None;
+                    }
+                    let args: Value = serde_json::from_str(&entry.get(1).as_string()?).unwrap();
+                    Some(
+                        serde_json::from_str::<protocol::Envelope>(args["line"].as_str().unwrap())
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let outgoing = frames();
+        let write = outgoing
+            .iter()
+            .rev()
+            .find(|env| env.kind == FrameKind::SettingsWrite)
+            .unwrap();
+        assert_eq!(
+            write.stream,
+            protocol::StreamPath("/host/host-lp".to_owned())
+        );
+        let payload: SettingsWritePayload = write.parse_payload().unwrap();
+        assert_eq!(payload.ops.len(), 1);
+        let SettingOp::Replace { path, value, .. } = &payload.ops[0] else {
+            panic!("profile replacement required")
+        };
+        assert_eq!(path, "/launch_profiles/muse:cheap");
+        let saved: HostLaunchProfileConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(saved.id, LaunchProfileId("muse:cheap".to_owned()));
+        assert_eq!(saved.label, "Muse cheap profile");
+        assert_eq!(saved.backend_kind, BackendKind::Muse);
+        assert_eq!(
+            saved.session_settings.0,
+            HashMap::from([
+                (
+                    "model".to_owned(),
+                    SessionSettingValue::String("fixture-spark".to_owned())
+                ),
+                (
+                    "reasoning_effort".to_owned(),
+                    SessionSettingValue::String("low".to_owned())
+                ),
+            ])
+        );
+
+        let mut settings = state.selected_host_settings_untracked().unwrap();
+        let hermes: HostLaunchProfileConfig = serde_json::from_value(profile.clone()).unwrap();
+        settings.launch_profiles.insert(hermes.id.clone(), hermes);
+        settings
+            .launch_profiles
+            .insert(saved.id.clone(), saved.clone());
+        let stream = protocol::StreamPath("/host/host-lp".to_owned());
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::HostSettings,
+                0,
+                &settings_model::HostSettingsPayload {
+                    settings,
+                    etag: "saved-profile".to_owned(),
+                    configured_secrets: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::LaunchProfileCatalogNotify,
+                1,
+                &protocol::LaunchProfileCatalogPayload {
+                    catalog: protocol::LaunchProfileCatalog {
+                        entries: vec![LaunchProfileEntry::Ready {
+                            profile: protocol::LaunchProfile {
+                                id: saved.id.clone(),
+                                kind: protocol::LaunchProfileKind::Custom,
+                                label: saved.label.clone(),
+                                description: saved.description.clone(),
+                                backend_kind: saved.backend_kind,
+                                session_settings: saved.session_settings.clone(),
+                            },
+                        }],
+                        default_profile_id: None,
+                        custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {
+                            launch_profile_id: saved.id.clone(),
+                            schema: muse_schema,
+                        }],
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Muse cheap profile")
+        );
+        container
+            .query_selector("button[aria-label='Choose backend and agent role']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let chooser: HtmlElement = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .query_selector("[role=dialog][aria-label='New agent']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let labels = chooser
+            .query_selector_all("[role=group][aria-label='Backend choices'] button span > span")
+            .unwrap();
+        let matches = (0..labels.length())
+            .filter_map(|index| labels.item(index)?.dyn_into::<HtmlElement>().ok())
+            .filter(|label| label.text_content().as_deref() == Some(saved.label.as_str()))
+            .collect::<Vec<_>>();
+        wasm_bindgen_test::console_log!(
+            "PROFILE LAUNCH DOM phase=chooser exact_profile_label_matches={}",
+            matches.len()
+        );
+        assert_eq!(
+            matches.len(),
+            1,
+            "the saved profile label must appear exactly once among backend choices"
+        );
+        // Whole-button text also contains the backend tag. Match the visible
+        // label itself, retaining the separate backend-identity guarantee.
+        let choice: HtmlElement = matches[0]
+            .closest("button")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            choice
+                .query_selector("small")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Muse"),
+            "the custom launch profile must show its actual backend identity"
+        );
+        assert!(choice.text_content().unwrap().contains("Muse"));
+        choice.click();
+        next_tick().await;
+        assert_eq!(
+            choice.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        find_button_by_text(&chooser, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+        let toggle: HtmlElement = container
+            .query_selector("button.session-settings-toggle")
+            .unwrap()
+            .expect("the selected profile must visibly open a Muse draft")
+            .dyn_into()
+            .unwrap();
+        let heading = toggle.text_content().unwrap();
+        wasm_bindgen_test::console_log!(
+            "PROFILE LAUNCH DOM phase=draft muse_heading_visible={}",
+            heading.contains("Session Settings (Muse)")
+        );
+        assert_eq!(
+            heading.trim_start_matches(['▶', '▼']).trim(),
+            "Session Settings (Muse)",
+            "the draft settings heading must identify Muse independently of its disclosure control"
+        );
+        let accordion = toggle
+            .closest(".session-settings-accordion")
+            .unwrap()
+            .unwrap();
+        if accordion.query_selector("select").unwrap().is_none() {
+            toggle.click();
+        }
+        next_tick().await;
+        let selected: HtmlSelectElement = accordion
+            .query_selector("select")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            selected
+                .item(selected.selected_index() as u32)
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Fixture Spark")
+        );
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("launch selected profile");
+        dispatch_event_from_js(&input.unchecked_into(), "input", None);
+        next_tick().await;
+        container
+            .query_selector("[data-test='chat-send-primary']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+        let outgoing = frames();
+        let spawns = outgoing
+            .iter()
+            .filter(|env| env.kind == FrameKind::SpawnAgent)
+            .collect::<Vec<_>>();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(
+            spawns[0].stream,
+            protocol::StreamPath("/host/host-lp".to_owned())
+        );
+        let spawn: protocol::SpawnAgentPayload = spawns[0].parse_payload().unwrap();
+        let protocol::SpawnAgentParams::New {
+            backend_kind,
+            launch_profile_id,
+            session_settings,
+            ..
+        } = spawn.params
+        else {
+            panic!("new chat launch required")
+        };
+        assert_eq!(backend_kind, BackendKind::Muse);
+        assert_eq!(launch_profile_id, Some(saved.id));
+        assert!(
+            session_settings.is_none(),
+            "the server must resolve the saved profile's typed settings"
         );
     }
 

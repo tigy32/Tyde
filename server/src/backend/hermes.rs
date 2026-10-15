@@ -996,6 +996,7 @@ impl HermesNativeDelegation {
                 message,
                 details: Some(result.to_string()),
                 normalization_failure: None,
+                result: None,
             }
         } else if self.stopped {
             ToolExecutionOutcome::Cancelled {
@@ -1129,7 +1130,7 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
             key: "reasoning_effort".to_string(),
             label: "Reasoning Effort".to_string(),
             description: Some(
-                "Per-session Hermes reasoning effort; Auto uses the Hermes profile default."
+                "Per-session Hermes reasoning effort. The native gateway cannot clear a live override."
                     .to_string(),
             ),
             use_slider: false,
@@ -1162,7 +1163,7 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
                     },
                 ],
                 default: None,
-                nullable: true,
+                nullable: false,
             },
         },
         SessionSettingField {
@@ -1308,6 +1309,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
+            tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::MidTurnSteering,
@@ -3323,6 +3325,7 @@ impl HermesSessionActor {
             SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
                 answer,
+                ..
             } => {
                 let Some(pending) = self.mapper.pending_clarify.clone() else {
                     self.emit_error("Hermes received a question response with no pending clarify");
@@ -3522,7 +3525,12 @@ impl HermesSessionActor {
                         return Err(format!("Hermes config.set reasoning failed: {err}"));
                     }
                 }
-                ("reasoning_effort", SessionSettingValue::Null) => {}
+                ("reasoning_effort", SessionSettingValue::Null) => {
+                    return Err(
+                        "Hermes cannot reset a live reasoning override through its native gateway"
+                            .to_owned(),
+                    );
+                }
                 ("fast", SessionSettingValue::Bool(fast)) => {
                     let value = if fast { "fast" } else { "normal" };
                     if let Err(err) = self
@@ -6196,6 +6204,7 @@ impl HermesEventMapper {
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
                 ),
                 normalization_failure: None,
+                result: None,
             }
         };
         let background_task_id = (success
@@ -6423,6 +6432,7 @@ impl HermesEventMapper {
                 message,
                 details: Some(output),
                 normalization_failure: None,
+                result: None,
             }
         };
         vec![ChatEvent::ToolExecutionCompleted(
@@ -7112,10 +7122,11 @@ fn hermes_clarify_questions(payload: &Value) -> Result<Vec<protocol::AskUserQues
             }
         };
         Ok(protocol::AskUserQuestion {
-            id: optional_string(value, &["qid"]),
+            id: optional_string(value, &["qid"]).map(protocol::UserQuestionId),
             question,
             header: None,
             options,
+            answer_schema: None,
             multi_select: value
                 .get("multi_select")
                 .and_then(Value::as_bool)
@@ -7163,7 +7174,7 @@ fn hermes_clarify_answers(
 
     if questions.len() == 1 {
         return Ok(vec![(
-            questions[0].id.clone(),
+            questions[0].id.as_ref().map(|id| id.0.clone()),
             extract(&questions[0], answer),
         )]);
     }
@@ -7187,7 +7198,7 @@ fn hermes_clarify_answers(
             let question_id = question.id.clone().ok_or_else(|| {
                 "Hermes batch clarify question is missing its question id".to_string()
             })?;
-            Ok((Some(question_id), extract(question, answer)))
+            Ok((Some(question_id.0), extract(question, answer)))
         })
         .collect()
 }
@@ -8096,6 +8107,7 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                             .unwrap_or_else(|| "Hermes MCP tool failed".to_owned()),
                         details: Some(normalized.tool_result.to_string()),
                         normalization_failure: None,
+                        result: None,
                     },
                     None => ToolExecutionOutcome::Succeeded {
                         result: ToolExecutionResult::Other {

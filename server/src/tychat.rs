@@ -386,6 +386,8 @@ pub(crate) fn answer(request: &ToolRequest, text: &str) -> Result<SendMessageToo
         ToolRequestType::AskUserQuestion { .. } => Ok(SendMessageToolResponse::AskUserQuestion {
             tool_call_id: request.tool_call_id.clone(),
             answer: text.into(),
+
+            structured_answers: None,
         }),
         ToolRequestType::ExitPlanMode { .. } => {
             let decision = match text.trim().to_ascii_lowercase().as_str() {

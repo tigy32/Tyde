@@ -8,8 +8,8 @@
 //! variant (usually empty), what `Compact` shows under per-tool caps, and what
 //! `Full` lays out without truncation.
 //!
-//! Failures are special-cased in the shell and route through
-//! `error_result::render`, no matter the request kind.
+//! Failures retain their status regardless of request kind. Typed native
+//! content is rendered alongside its failure; other failures use `error_result`.
 
 use std::sync::Arc;
 
@@ -657,6 +657,31 @@ fn render_body(
     mode: ToolOutputMode,
     result_failed: bool,
 ) -> AnyView {
+    let native_content = match outcome {
+        Some(ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::NativeContent { text, images },
+        }) => Some(other::render_native_content(text, images, None)),
+        Some(ToolExecutionOutcome::Failed {
+            message,
+            details,
+            result: Some(ToolExecutionResult::NativeContent { text, images }),
+            ..
+        }) => Some(other::render_native_content(
+            text,
+            images,
+            Some((message, details.as_deref())),
+        )),
+        _ => None,
+    };
+    if let Some(native_content) = native_content {
+        let request = matches!(req, ToolRequestType::Other { .. })
+            .then(|| other::render(req, None, malformed_payload, mode));
+        return view! {
+            {request}
+            {native_content}
+        }
+        .into_any();
+    }
     if let Some(ToolExecutionOutcome::Cancelled { message }) = outcome {
         return view! {
             <div class="tool-cancelled" role="status">{message.clone()}</div>
@@ -1250,6 +1275,7 @@ pub(crate) fn completion_header_summary(
     result: &ToolExecutionResult,
 ) -> String {
     match result {
+        ToolExecutionResult::AskUserQuestion { answers } => format!("{} answered", answers.len()),
         ToolExecutionResult::ModifyFile {
             lines_added,
             lines_removed,
@@ -1275,11 +1301,15 @@ pub(crate) fn completion_header_summary(
             parts.join(" \u{b7} ")
         }
         ToolExecutionResult::ReadFiles { files } => {
-            let total_bytes: u64 = files.iter().map(|f| f.bytes).sum();
-            if files.len() == 1 {
-                format_bytes(total_bytes)
-            } else {
-                format!("{} files \u{b7} {}", files.len(), format_bytes(total_bytes))
+            let total_bytes: Option<u64> = files.iter().map(|f| f.bytes).sum();
+            match total_bytes {
+                Some(bytes) if files.len() == 1 => format_bytes(bytes),
+                Some(bytes) => format!("{} files \u{b7} {}", files.len(), format_bytes(bytes)),
+                None => format!(
+                    "{} {}",
+                    files.len(),
+                    if files.len() == 1 { "file" } else { "files" }
+                ),
             }
         }
         ToolExecutionResult::SearchTypes { types } => {
@@ -1327,6 +1357,7 @@ pub(crate) fn completion_header_summary(
         ToolExecutionResult::ViewImage { .. } => "image viewed".to_owned(),
         ToolExecutionResult::Sleep => "wait complete".to_owned(),
         ToolExecutionResult::ExitPlanMode { .. } => String::new(),
+        ToolExecutionResult::NativeContent { .. } => String::new(),
         ToolExecutionResult::Other { .. } => String::new(),
     }
 }
@@ -1484,6 +1515,36 @@ mod live_card_wasm_tests {
             .unwrap_or_default()
     }
 
+    async fn assert_rendered_pixel(image: &web_sys::HtmlImageElement, expected: [u8; 4]) {
+        wasm_bindgen_futures::JsFuture::from(image.decode())
+            .await
+            .expect("native image decodes in the mounted DOM");
+        let canvas = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("canvas")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .unwrap();
+        canvas.set_width(1);
+        canvas.set_height(1);
+        let context = canvas
+            .get_context("2d")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::CanvasRenderingContext2d>()
+            .unwrap();
+        context
+            .draw_image_with_html_image_element_and_dw_and_dh(image, 0.0, 0.0, 1.0, 1.0)
+            .unwrap();
+        assert_eq!(
+            context.get_image_data(0.0, 0.0, 1.0, 1.0).unwrap().data().0,
+            expected,
+            "the displayed images retain their ordered pixels"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn viewed_image_is_visible_in_full_mode_and_opens_full_size() {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -1597,6 +1658,240 @@ mod live_card_wasm_tests {
         next_tick().await;
         assert!(text(&container).contains("Preview could not be decoded"));
         container.remove();
+
+        let native_text =
+            "first line\n[Image #2: native annotation]\n{\"unchanged\":true}\nlast line";
+        let failure_message = "Native call failed\nwith retained output";
+        let failure_details = "Original failure detail";
+        let images = [svg.to_owned(), svg.replace("fill='red'", "fill='blue'")]
+            .into_iter()
+            .map(|svg| protocol::ImageData {
+                media_type: "image/svg+xml".to_owned(),
+                data: web_sys::window().unwrap().btoa(&svg).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let args = json!({
+            "path": "/tmp/retained-invocation-context.png",
+            "labels": ["first, label", "second, label"],
+            "note": "line one\nline two",
+        });
+        for (request, failed) in [
+            (
+                ToolRequestType::ViewImage {
+                    path: "/tmp/native-preview.png".to_owned(),
+                },
+                false,
+            ),
+            (ToolRequestType::Other { args: args.clone() }, false),
+            (ToolRequestType::Other { args }, true),
+        ] {
+            let expected_parameters = match &request {
+                ToolRequestType::Other { args } => Some(format!("{args:#}")),
+                _ => None,
+            };
+            for mode in [
+                ToolOutputMode::Full,
+                ToolOutputMode::Compact,
+                ToolOutputMode::Summary,
+            ] {
+                let native_result = ToolExecutionResult::NativeContent {
+                    text: native_text.to_owned(),
+                    images: images.clone(),
+                };
+                let completion = ToolExecutionCompletedData {
+                    tool_call_id: "native-content".to_owned(),
+                    outcome: if failed {
+                        ToolExecutionOutcome::Failed {
+                            message: failure_message.to_owned(),
+                            details: Some(failure_details.to_owned()),
+                            normalization_failure: None,
+                            result: Some(native_result),
+                        }
+                    } else {
+                        ToolExecutionOutcome::Succeeded {
+                            result: native_result,
+                        }
+                    },
+                };
+                let entry = ArcRwSignal::new(ToolRequestEntry {
+                    tool_name: "catalog_preview".to_owned(),
+                    request: ToolRequest {
+                        tool_call_id: "native-content".to_owned(),
+                        tool_name: "catalog_preview".to_owned(),
+                        tool_type: request.clone(),
+                    },
+                    result: None,
+                });
+                let state = AppState::new();
+                state.tool_output_mode.set(mode);
+                let container = make_container();
+                let mount_state = state.clone();
+                let mounted_entry = entry.clone();
+                let handle = mount_to(container.clone(), move || {
+                    provide_context(mount_state);
+                    let agent_ref = Signal::derive(|| Some(chat_agent_ref()));
+                    view! { <StreamingToolCardView agent_ref=agent_ref entry=mounted_entry /> }
+                });
+                next_tick().await;
+                next_tick().await;
+                let pending = container
+                    .query_selector("details")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlDetailsElement>()
+                    .unwrap();
+                if !pending.open() {
+                    pending
+                        .query_selector("summary")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<HtmlElement>()
+                        .unwrap()
+                        .click();
+                    next_tick().await;
+                }
+                let assert_parameters = || {
+                    let parameters = container.query_selector(".tool-raw-args").unwrap();
+                    match expected_parameters
+                        .as_ref()
+                        .filter(|_| mode != ToolOutputMode::Summary)
+                    {
+                        Some(expected) => {
+                            let parameters =
+                                parameters.expect("invocation parameters remain visible");
+                            assert_eq!(
+                                parameters.text_content().as_deref(),
+                                Some(expected.as_str())
+                            );
+                            assert!(parameters.get_bounding_client_rect().height() > 0.0);
+                        }
+                        None => assert!(parameters.is_none()),
+                    }
+                };
+                assert_eq!(tool_header_status(&container), "Running…");
+                assert_parameters();
+                entry.update(|entry| entry.result = Some(completion));
+                next_tick().await;
+                next_tick().await;
+                assert_eq!(
+                    tool_header_status(&container),
+                    if failed { "Failed" } else { "Done" }
+                );
+                assert_eq!(count(&container, ".tool-typed-mismatch"), 0);
+                let disclosure = container
+                    .query_selector("details")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlDetailsElement>()
+                    .unwrap();
+                assert_eq!(disclosure.open(), mode == ToolOutputMode::Full);
+                if !disclosure.open() {
+                    disclosure
+                        .query_selector("summary")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<HtmlElement>()
+                        .unwrap()
+                        .click();
+                    next_tick().await;
+                }
+                assert!(disclosure.open());
+                assert_parameters();
+                let output = container
+                    .query_selector(".tool-native-content")
+                    .unwrap()
+                    .expect("typed native output is not discarded by request dispatch");
+                assert_eq!(
+                    output.text_content().unwrap(),
+                    if failed {
+                        format!("{failure_message}{failure_details}{native_text}")
+                    } else {
+                        native_text.to_owned()
+                    }
+                );
+                let blocks = output.query_selector_all("pre").unwrap();
+                assert_eq!(blocks.length(), if failed { 3 } else { 1 });
+                let text_block = blocks
+                    .item(blocks.length() - 1)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap();
+                assert_eq!(text_block.text_content().unwrap(), native_text);
+                assert!(text_block.get_bounding_client_rect().height() > 0.0);
+                let previews = output.query_selector_all("img").unwrap();
+                assert_eq!(previews.length(), 2);
+                for (index, expected) in
+                    [[255, 0, 0, 255], [0, 0, 255, 255]].into_iter().enumerate()
+                {
+                    let image = previews
+                        .item(index as u32)
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlImageElement>()
+                        .unwrap();
+                    assert_rendered_pixel(&image, expected).await;
+                    let rect = image.get_bounding_client_rect();
+                    assert!(rect.width() > 0.0 && rect.width() <= 200.0);
+                    assert!(rect.height() > 0.0 && rect.height() <= 200.0);
+                    assert!(text_block.get_bounding_client_rect().bottom() <= rect.top());
+                }
+                let buttons = output
+                    .query_selector_all("button[aria-label='Open image full size']")
+                    .unwrap();
+                buttons
+                    .item(1)
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                let viewer = document
+                    .query_selector("[role='dialog'][aria-label='Image viewer']")
+                    .unwrap()
+                    .unwrap();
+                let image = viewer
+                    .query_selector("img")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlImageElement>()
+                    .unwrap();
+                assert_rendered_pixel(&image, [0, 0, 255, 255]).await;
+                viewer
+                    .query_selector("button[aria-label='Previous image']")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                let image = viewer
+                    .query_selector("img")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlImageElement>()
+                    .unwrap();
+                assert_rendered_pixel(&image, [255, 0, 0, 255]).await;
+                viewer
+                    .query_selector("button[aria-label='Close image viewer']")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                assert!(
+                    document
+                        .query_selector("[role='dialog'][aria-label='Image viewer']")
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    tool_header_status(&container),
+                    if failed { "Failed" } else { "Done" }
+                );
+                drop(handle);
+                container.remove();
+            }
+        }
         style.remove();
     }
 
@@ -1609,7 +1904,7 @@ mod live_card_wasm_tests {
             ToolExecutionResult::ReadFiles {
                 files: vec![FileInfo {
                     path: path.to_owned(),
-                    bytes: 70,
+                    bytes: Some(70),
                 }],
             },
         );
@@ -1669,6 +1964,89 @@ mod live_card_wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn retained_read_without_file_size_is_not_an_empty_file() {
+        let result = serde_json::from_value(serde_json::json!({
+            "kind": "ReadFiles", "files": [{"path":"/workspace/deleted-history.txt","bytes":null}]
+        }))
+        .expect("decode the server's explicit unavailable read size");
+        let entry = completed_read_request(
+            "history-read",
+            vec!["/workspace/deleted-history.txt"],
+            result,
+        );
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+        assert_eq!(tool_header_status(&container), "Done");
+        assert!(text(&container).contains("deleted-history.txt"));
+        // Retained native reads explicitly carry bytes:null, not a failed read
+        // or a measured zero. Keep the successful file visible without a warning.
+        assert_eq!(completion_summary(&container), "1 file");
+        assert_eq!(count(&container, ".tool-result-file"), 1);
+        assert_eq!(count(&container, ".tool-result-file-size"), 0);
+        assert_eq!(count(&container, ".tool-result-file-sep"), 0);
+        assert_eq!(
+            selector_text(&container, ".tool-result-file"),
+            "\u{1f4c4}\u{2026}/workspace/deleted-history.txt"
+        );
+        assert!(!text(&container).contains("Size unavailable"));
+        assert!(!text(&container).contains("0B"));
+
+        for (bytes, expected_summary, expected_sizes) in [
+            ([None, None], "2 files", [None, None]),
+            ([None, Some(1024)], "2 files", [None, Some("1.0KB")]),
+            (
+                [Some(2048), Some(1024)],
+                "2 files \u{b7} 3.0KB",
+                [Some("2.0KB"), Some("1.0KB")],
+            ),
+        ] {
+            let paths = ["/workspace/deleted-history.txt", "/workspace/measured.txt"];
+            let entry = completed_read_request(
+                "history-read-pair",
+                paths.to_vec(),
+                ToolExecutionResult::ReadFiles {
+                    files: paths
+                        .iter()
+                        .zip(bytes)
+                        .map(|(path, bytes)| FileInfo {
+                            path: (*path).to_owned(),
+                            bytes,
+                        })
+                        .collect(),
+                },
+            );
+            let (container, state) = mount_card(entry, None);
+            state.tool_output_mode.set(ToolOutputMode::Full);
+            next_tick().await;
+
+            assert_eq!(tool_header_status(&container), "Done");
+            assert_eq!(completion_summary(&container), expected_summary);
+            let body = text(&container);
+            assert!(body.contains("deleted-history.txt") && body.contains("measured.txt"));
+            assert!(!body.contains("Size unavailable"));
+            assert!(!body.contains("0B"));
+            let rows = container.query_selector_all(".tool-result-file").unwrap();
+            assert_eq!(rows.length(), 2);
+            for (i, (name, size)) in ["deleted-history.txt", "measured.txt"]
+                .into_iter()
+                .zip(expected_sizes)
+                .enumerate()
+            {
+                let path_row = format!("\u{1f4c4}\u{2026}/workspace/{name}");
+                let expected = match size {
+                    Some(size) => format!("{path_row}\u{b7}{size}"),
+                    None => path_row,
+                };
+                assert_eq!(
+                    rows.get(i as u32).unwrap().text_content().unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
     async fn measured_empty_kiro_read_card_shows_one_legitimate_zero() {
         let entry = completed_read_request(
             "T4",
@@ -1676,7 +2054,7 @@ mod live_card_wasm_tests {
             ToolExecutionResult::ReadFiles {
                 files: vec![FileInfo {
                     path: "/workspace/empty.txt".to_owned(),
-                    bytes: 0,
+                    bytes: Some(0),
                 }],
             },
         );
@@ -1855,6 +2233,7 @@ mod live_card_wasm_tests {
                         id: None,
                         question: "Which language?".to_owned(),
                         header: Some("Lang".to_owned()),
+                        answer_schema: None,
                         multi_select: false,
                         options: vec![protocol::AskUserQuestionOption {
                             label: "Rust".to_owned(),
@@ -2843,6 +3222,7 @@ mod live_card_wasm_tests {
                     message: "unknown agent_id".to_owned(),
                     details: Some("agent-sub is not a direct child".to_owned()),
                     normalization_failure: None,
+                    result: None,
                 }),
             ),
             None,

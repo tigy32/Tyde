@@ -16,6 +16,7 @@ pub(crate) mod handle;
 pub mod hermes;
 pub mod hermes_config;
 pub mod mock;
+pub mod muse;
 pub mod opencode;
 pub mod setup;
 pub mod skill_projection;
@@ -859,6 +860,19 @@ impl EventStream {
                     &open.arguments,
                     status,
                 );
+                if agent_control_progress::is_tyde_agent_control_spawn_tool_name(&open.name)
+                    && let ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::NativeContent { text, .. },
+                    } = &completion.outcome
+                {
+                    progress = progress.or_else(|| {
+                        agent_control_progress::spawn_progress_data_for_tool_result(
+                            &completion.tool_call_id,
+                            &open.name,
+                            &Value::String(text.clone()),
+                        )
+                    });
+                }
                 if let ToolExecutionOutcome::Succeeded {
                     result: ToolExecutionResult::Other { result },
                 } = &completion.outcome
@@ -1124,7 +1138,7 @@ pub struct NativeSettingsWriteOutcome {
     pub refresh_required: bool,
 }
 
-pub const SUPPORTED_BACKENDS: [BackendKind; 7] = [
+pub const SUPPORTED_BACKENDS: [BackendKind; 8] = [
     BackendKind::Kiro,
     BackendKind::Claude,
     BackendKind::Codex,
@@ -1132,6 +1146,7 @@ pub const SUPPORTED_BACKENDS: [BackendKind; 7] = [
     BackendKind::Hermes,
     BackendKind::Grok,
     BackendKind::Opencode,
+    BackendKind::Muse,
 ];
 
 /// A coding agent backend session handle.
@@ -1640,6 +1655,9 @@ pub trait Backend: Send + Sync + 'static {
     /// Request interruption of the currently active turn, if any.
     /// The returned future may resolve after the backend accepts or dispatches
     /// the interrupt request, before the interrupted turn has fully quiesced.
+    /// Background commands follow the adapter's declared cancellation scope:
+    /// `BackgroundTasks` alone does not promise survival across interruption.
+    /// Native terminal events, not this acknowledgement, settle their cards.
     /// Backends that provide stronger semantics should document them.
     /// Returns false if the backend has terminated or does not support
     /// interruption.
@@ -1786,6 +1804,10 @@ macro_rules! with_backend_type {
             }
             protocol::BackendKind::Opencode => {
                 type $B = $crate::backend::opencode::OpencodeBackend;
+                $body
+            }
+            protocol::BackendKind::Muse => {
+                type $B = $crate::backend::muse::MuseBackend;
                 $body
             }
         }
@@ -2695,6 +2717,7 @@ pub(crate) fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str 
         protocol::BackendKind::Hermes => "hermes",
         protocol::BackendKind::Grok => "grok",
         protocol::BackendKind::Opencode => "opencode",
+        protocol::BackendKind::Muse => "muse",
     }
 }
 
@@ -2708,6 +2731,7 @@ pub(crate) fn backend_launch_profile_label(backend_kind: protocol::BackendKind) 
         protocol::BackendKind::Hermes => "Hermes",
         protocol::BackendKind::Grok => "Grok",
         protocol::BackendKind::Opencode => "OpenCode",
+        protocol::BackendKind::Muse => "Muse",
     }
 }
 

@@ -17,6 +17,7 @@ fn backend_name(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Muse => "Muse",
     }
 }
 

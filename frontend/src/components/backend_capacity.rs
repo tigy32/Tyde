@@ -131,6 +131,7 @@ fn source_label(source: CapacitySource) -> &'static str {
         CapacitySource::AntigravityUsageCommand => "Antigravity",
         CapacitySource::KiroUsageCommand => "Kiro",
         CapacitySource::GrokBilling => "Grok",
+        CapacitySource::MuseUsage => "Muse",
     }
 }
 
@@ -238,6 +239,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
         CapacityBucketId::Antigravity { .. } => "antigravity",
         CapacityBucketId::Kiro { .. } => "kiro",
         CapacityBucketId::Grok { .. } => "grok",
+        CapacityBucketId::Muse { .. } => "muse",
     }
 }
 

@@ -892,6 +892,7 @@ fn backend_value(backend: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Hermes => "hermes",
         protocol::BackendKind::Grok => "grok",
         protocol::BackendKind::Opencode => "opencode",
+        protocol::BackendKind::Muse => "muse",
     }
 }
 
@@ -905,6 +906,7 @@ pub(crate) fn backend_label(backend: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Hermes => "Hermes",
         protocol::BackendKind::Grok => "Grok",
         protocol::BackendKind::Opencode => "OpenCode",
+        protocol::BackendKind::Muse => "Muse",
     }
 }
 
@@ -919,6 +921,7 @@ fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
         "hermes" => Some(protocol::BackendKind::Hermes),
         "grok" => Some(protocol::BackendKind::Grok),
         "opencode" => Some(protocol::BackendKind::Opencode),
+        "muse" => Some(protocol::BackendKind::Muse),
         _ => None,
     }
 }
@@ -3017,6 +3020,7 @@ mod wasm_tests {
                             BackendKind::Hermes,
                             BackendKind::Grok,
                             BackendKind::Opencode,
+                            BackendKind::Muse,
                         ],
                         default_backend: Some(BackendKind::Codex),
                         ..HostSettings::default()
@@ -3066,6 +3070,7 @@ mod wasm_tests {
             ("hermes", "Hermes", Some(BackendKind::Hermes)),
             ("grok", "Grok", Some(BackendKind::Grok)),
             ("opencode", "OpenCode", Some(BackendKind::Opencode)),
+            ("muse", "Muse", Some(BackendKind::Muse)),
             ("", "Host default (Codex)", None),
         ] {
             backend.set_value(value);

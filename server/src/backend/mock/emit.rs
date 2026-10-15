@@ -553,6 +553,7 @@ pub(super) fn abandoned_response_command_frames(
                 message: "Tool execution was interrupted".to_owned(),
                 details: Some("Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned()),
                 normalization_failure: None,
+                result: None,
             },
         }), typing(false)]),
         AbandonedResponse::Replaced => frames.extend([
@@ -596,6 +597,7 @@ pub(super) fn failed_tool_frames(tool_call_id: &str) -> Vec<BackendEvent> {
                 message: "Tool execution was interrupted".to_owned(),
                 details: Some("Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned()),
                 normalization_failure: None,
+                result: None,
             },
         }),
     ]
@@ -629,7 +631,7 @@ pub(super) async fn spawn_native_child(
 
     let handle = match emitter
         .on_subagent_spawned(
-            tool_use_id,
+            tool_use_id.clone(),
             child.name.clone(),
             child.prompt.clone(),
             "mock".to_owned(),
@@ -654,16 +656,70 @@ pub(super) async fn spawn_native_child(
             active_subagents.push(handle);
         }
         MockChildLifecycle::CompleteAndRetain => {
-            emit_native_child_turn(&handle.event_tx, &child.prompt);
+            emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+            if let Some(grandchild) = &child.grandchild {
+                let grandchild_tool_id = format!("mock-grandchild-tool-use-{}", Uuid::new_v4());
+                let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: grandchild_tool_id.clone(),
+                    tool_name: "Task".to_owned(),
+                    tool_type: ToolRequestType::AgentSpawn {
+                        prompt: Some(grandchild.prompt.clone()),
+                        name: Some(grandchild.name.clone()),
+                        execution_mode: protocol::AgentExecutionMode::Background,
+                    },
+                }));
+                let child_emitter = handle
+                    .subagent_emitter
+                    .as_ref()
+                    .expect("mock native grandchild requires the returned child-scoped emitter");
+                let grandchild_handle = child_emitter
+                    .on_subagent_spawned(
+                        grandchild_tool_id.clone(),
+                        grandchild.name.clone(),
+                        grandchild.prompt.clone(),
+                        "mock".to_owned(),
+                        Some(SessionId(Uuid::new_v4().to_string())),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("mock native grandchild registration failed"));
+                emit_native_child_turn(&grandchild_handle.event_tx, &grandchild.prompt, 25, 8);
+                let _ = handle.event_tx.send(native_child_link(
+                    &grandchild_tool_id,
+                    &grandchild_handle,
+                    &grandchild.name,
+                ));
+                let _ = events_tx.send_event(BackendEvent::Chat(native_child_link(
+                    &tool_use_id,
+                    &handle,
+                    &child.name,
+                )));
+                active_subagents.push(grandchild_handle);
+            }
             active_subagents.push(handle);
         }
         MockChildLifecycle::CompleteAndDrop => {
-            emit_native_child_turn(&handle.event_tx, &child.prompt);
+            emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
             // Dropping the handle closes event_tx, so the relay actor sees
             // events.recv() == None and must park instead of exiting.
             drop(handle);
         }
     }
+}
+
+fn native_child_link(tool_call_id: &str, child: &SubAgentHandle, name: &str) -> ChatEvent {
+    ChatEvent::ToolProgress(ToolProgressData {
+        tool_call_id: tool_call_id.to_owned(),
+        execution_mode: protocol::ToolExecutionMode::Background,
+        cancellable: false,
+        update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            agent_id: child.agent_id.clone(),
+            agent_name: name.to_owned(),
+            last_tool_name: None,
+            tool_calls: 0,
+            completed: true,
+            status: protocol::SubAgentProgressStatus::Completed,
+        }),
+    })
 }
 
 fn live_native_child_message_id(handle: &SubAgentHandle) -> String {
@@ -723,7 +779,12 @@ pub(super) fn idle_live_native_children(active_subagents: &[SubAgentHandle]) {
     }
 }
 
-fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &str) {
+fn emit_native_child_turn(
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    prompt: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
     let message_id = Some(Uuid::new_v4().to_string());
     let response_text = format!("mock native child response to: {prompt}");
 
@@ -751,17 +812,17 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
             }),
             token_usage: Some(MessageTokenUsage::request_and_turn_known(
                 TokenUsage {
-                    input_tokens: 250,
-                    output_tokens: 80,
-                    total_tokens: 330,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens + output_tokens,
                     cached_prompt_tokens: Some(0),
                     cache_creation_input_tokens: Some(0),
                     reasoning_tokens: Some(0),
                 },
                 TokenUsage {
-                    input_tokens: 250,
-                    output_tokens: 80,
-                    total_tokens: 330,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens + output_tokens,
                     cached_prompt_tokens: Some(0),
                     cache_creation_input_tokens: Some(0),
                     reasoning_tokens: Some(0),
@@ -845,6 +906,7 @@ pub(super) async fn agent_control_await(
                     message: "tyde_await_agents result normalization failed".to_owned(),
                     details: Some(error.to_string()),
                     normalization_failure: Some(error.normalization_failure),
+                    result: None,
                 },
                 format!("mock agent-control await normalization failed: {error}"),
             ),
@@ -854,6 +916,7 @@ pub(super) async fn agent_control_await(
                 message: "tyde_await_agents failed".to_owned(),
                 details: Some(error.clone()),
                 normalization_failure: None,
+                result: None,
             },
             format!("mock agent-control await failed: {error}"),
         ),

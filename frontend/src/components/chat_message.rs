@@ -165,7 +165,7 @@ pub(crate) fn interleave_message(
 }
 
 /// Attached images, rendered in the slot [`interleave_message`] chose for them.
-fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
+pub(crate) fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
     let sources: Arc<[String]> = images
         .iter()
         .map(|img| format!("data:{};base64,{}", img.media_type, img.data))

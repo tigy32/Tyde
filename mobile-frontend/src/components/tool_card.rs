@@ -75,6 +75,20 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
         .and_then(completion_normalization_failure);
     let normalization_failed = normalization_failure.is_some();
 
+    if matches!(
+        entry.result.as_ref().map(|completion| &completion.outcome),
+        Some(
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::NativeContent { .. },
+            } | ToolExecutionOutcome::Failed {
+                result: Some(ToolExecutionResult::NativeContent { .. }),
+                ..
+            }
+        )
+    ) {
+        return render_generic_card(entry, tool_output_mode);
+    }
+
     if let ToolRequestType::AskUserQuestion { questions, .. } = &entry.request.tool_type
         && entry.result.as_ref().is_none_or(completion_succeeded)
     {
@@ -88,6 +102,11 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                     owner_agent_ref=owner_agent_ref.clone()
                     tool_call_id=entry.request.tool_call_id.clone()
                     questions=questions
+                    answered=entry.result.is_some()
+                    answers=match entry.result.as_ref().and_then(completion_result) {
+                        Some(ToolExecutionResult::AskUserQuestion { answers }) => answers.clone(),
+                        _ => Vec::new(),
+                    }
                 />
             </div>
         }
@@ -311,23 +330,50 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
         }
     }
 
+    render_generic_card(entry, tool_output_mode)
+}
+
+fn render_generic_card(
+    entry: ToolRequestEntry,
+    tool_output_mode: RwSignal<ToolOutputMode>,
+) -> AnyView {
+    let tool_name = entry.tool_name.clone();
+    let normalization_failed = entry
+        .result
+        .as_ref()
+        .and_then(completion_normalization_failure)
+        .is_some();
     let is_completed = entry.result.is_some();
     let success = entry.result.as_ref().is_some_and(completion_succeeded);
     let cancelled = entry
         .result
         .as_ref()
         .is_some_and(|result| matches!(&result.outcome, ToolExecutionOutcome::Cancelled { .. }));
-    let result_summary = entry
+    let outcome = entry
         .result
         .as_ref()
-        .map(|r| format!("{:?}", r.outcome))
-        .unwrap_or_default();
+        .map(|completion| completion.outcome.clone());
+    let has_native_content = matches!(
+        &outcome,
+        Some(
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::NativeContent { .. },
+            } | ToolExecutionOutcome::Failed {
+                result: Some(ToolExecutionResult::NativeContent { .. }),
+                ..
+            }
+        )
+    );
 
     // A canonical-request normalization marker pairs with the preserved `Other`
     // request. Surface a sanitized copy in every mode; never infer this state
     // from a tool name, result shape, or error prose.
     let malformed_payload = malformed_request_payload(&entry);
     let request_detail = request_detail(&entry.request.tool_type);
+    let request_parameters = match &entry.request.tool_type {
+        ToolRequestType::Other { args } if malformed_payload.is_none() => Some(format!("{args:#}")),
+        _ => None,
+    };
 
     let (status_class, status_icon, status_test, aria_label) = if normalization_failed {
         (
@@ -380,6 +426,11 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             {request_detail.map(|detail| view! {
                 <div class="tool-card-detail" data-mobile-test="tool-card-detail">{detail}</div>
             })}
+            {request_parameters.map(|parameters| view! {
+                <Show when=move || tool_output_mode.get() != ToolOutputMode::Summary>
+                    <pre class="tool-output" data-mobile-test="tool-card-parameters">{parameters.clone()}</pre>
+                </Show>
+            })}
             {malformed_payload.map(|payload| view! {
                 <div
                     class="tool-typed-mismatch"
@@ -398,11 +449,9 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                 </details>
             })}
             {
-                let rs = result_summary.clone();
-                let rs2 = result_summary.clone();
                 let show = move || {
-                    !rs.is_empty()
-                        && (force_show || tool_output_mode.get() != ToolOutputMode::Summary)
+                    is_completed
+                        && (force_show || has_native_content || tool_output_mode.get() != ToolOutputMode::Summary)
                 };
                 view! {
                     <Show when=show>
@@ -410,19 +459,61 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                         // Leaving a failure behind a closed disclosure in
                         // Summary/Compact hid the only explanation of what went
                         // wrong behind an extra tap.
-                        <details
-                            class="tool-result"
-                            data-mobile-test="tool-card-result"
-                            prop:open=move || {
-                                force_show || tool_output_mode.get() == ToolOutputMode::Full
+                        {
+                            let outcome = outcome.clone();
+                            view! {
+                                <details
+                                    class="tool-result"
+                                    data-mobile-test="tool-card-result"
+                                    prop:open=move || {
+                                        force_show || tool_output_mode.get() == ToolOutputMode::Full
+                                    }
+                                >
+                                    <summary>"Result"</summary>
+                                    {move || match &outcome {
+                                        Some(ToolExecutionOutcome::Succeeded {
+                                            result: ToolExecutionResult::NativeContent { text, images },
+                                        }) => render_native_content(text, images, None),
+                                        Some(ToolExecutionOutcome::Failed {
+                                            message,
+                                            details,
+                                            result: Some(ToolExecutionResult::NativeContent { text, images }),
+                                            ..
+                                        }) => render_native_content(text, images, Some((message, details.as_deref()))),
+                                        _ => view! {
+                                            <pre class="tool-output">{outcome.as_ref().map(|outcome| format!("{outcome:?}")).unwrap_or_default()}</pre>
+                                        }.into_any(),
+                                    }}
+                                </details>
                             }
-                        >
-                            <summary>"Result"</summary>
-                            <pre class="tool-output">{rs2.clone()}</pre>
-                        </details>
+                        }
                     </Show>
                 }
             }
+        </div>
+    }
+    .into_any()
+}
+
+fn render_native_content(
+    text: &str,
+    images: &[protocol::ImageData],
+    failure: Option<(&str, Option<&str>)>,
+) -> AnyView {
+    view! {
+        <div class="tool-native-content">
+            {failure.map(|(message, details)| view! {
+                <pre class="tool-output">{message.to_owned()}</pre>
+                {details.map(|details| view! {
+                    <pre class="tool-output">{details.to_owned()}</pre>
+                })}
+            })}
+            {(!text.is_empty()).then(|| view! {
+                <pre class="tool-output">{text.to_owned()}</pre>
+            })}
+            {(!images.is_empty()).then(|| {
+                crate::components::chat_message::render_message_images(images.to_vec())
+            })}
         </div>
     }
     .into_any()
@@ -1008,6 +1099,31 @@ fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String
 struct QuestionState {
     selected: RwSignal<Vec<usize>>,
     custom: RwSignal<String>,
+    note: RwSignal<String>,
+}
+
+fn structured_response(
+    question: &AskUserQuestion,
+    state: QuestionState,
+) -> Result<protocol::UserQuestionAnswer, String> {
+    let labels = state
+        .selected
+        .get()
+        .iter()
+        .map(|index| {
+            question
+                .options
+                .get(*index)
+                .map(|option| option.label.clone())
+                .ok_or("Selected question option is unavailable".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let note = state.note.get();
+    question.structured_answer(
+        labels,
+        state.custom.get(),
+        (!note.is_empty()).then_some(note),
+    )
 }
 
 #[component]
@@ -1015,6 +1131,8 @@ fn AskUserQuestionCard(
     owner_agent_ref: AgentRef,
     tool_call_id: String,
     questions: Vec<AskUserQuestion>,
+    answered: bool,
+    answers: Vec<protocol::UserQuestionAnswer>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -1022,9 +1140,33 @@ fn AskUserQuestionCard(
     let states: std::sync::Arc<Vec<QuestionState>> = std::sync::Arc::new(
         questions
             .iter()
-            .map(|_| QuestionState {
-                selected: RwSignal::new(Vec::new()),
-                custom: RwSignal::new(String::new()),
+            .map(|question| {
+                let answer = answers
+                    .iter()
+                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
+                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
+                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, option)| {
+                                labels.contains(&option.label).then_some(index)
+                            })
+                            .collect(),
+                        String::new(),
+                        note.clone().unwrap_or_default(),
+                    ),
+                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
+                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
+                    }
+                    None => (Vec::new(), String::new(), String::new()),
+                };
+                QuestionState {
+                    selected: RwSignal::new(selected),
+                    custom: RwSignal::new(custom),
+                    note: RwSignal::new(note),
+                }
             })
             .collect(),
     );
@@ -1043,17 +1185,24 @@ fn AskUserQuestionCard(
 
     let all_answered = {
         let states = states.clone();
+        let questions = questions.clone();
         move || {
-            states
-                .iter()
-                .all(|qs| !qs.selected.get().is_empty() || !qs.custom.get().trim().is_empty())
+            states.iter().zip(questions.iter()).all(|(qs, question)| {
+                if question.answer_schema.is_some() {
+                    structured_response(question, *qs).is_ok()
+                } else {
+                    !qs.selected.get().is_empty() || !qs.custom.get().trim().is_empty()
+                }
+            })
         }
     };
 
     let question_views = questions
         .iter()
         .enumerate()
-        .map(|(idx, question)| render_question(question.clone(), states[idx], submitted, sending))
+        .map(|(idx, question)| {
+            render_question(question.clone(), states[idx], submitted, sending, answered)
+        })
         .collect::<Vec<_>>();
 
     let on_submit = {
@@ -1063,7 +1212,7 @@ fn AskUserQuestionCard(
         let state = state.clone();
         let tool_call_id = tool_call_id.clone();
         move |_| {
-            if submitted.get_untracked().is_some() || sending.get_untracked() {
+            if answered || submitted.get_untracked().is_some() || sending.get_untracked() {
                 return;
             }
             send_error.set(None);
@@ -1072,7 +1221,26 @@ fn AskUserQuestionCard(
                 .map(|qs| (qs.selected.get_untracked(), qs.custom.get_untracked()))
                 .collect();
             let message = format_answer(&questions, &responses);
-            if message.is_empty() {
+            let structured_answers = if questions
+                .iter()
+                .any(|question| question.answer_schema.is_some())
+            {
+                match questions
+                    .iter()
+                    .zip(states.iter())
+                    .map(|(question, state)| structured_response(question, *state))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(answers) => Some(answers),
+                    Err(error) => {
+                        send_error.set(Some(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if message.is_empty() && structured_answers.is_none() {
                 return;
             }
             // The answer goes back to the agent that *asked*, on its own host —
@@ -1102,6 +1270,7 @@ fn AskUserQuestionCard(
                 status,
                 tool_call_id.clone(),
                 message,
+                structured_answers,
             );
         }
     };
@@ -1113,7 +1282,7 @@ fn AskUserQuestionCard(
         move || {
             submitted.get().is_some()
                 || sending.get()
-                || !all_answered()
+                || answered || !all_answered()
                 // The asker died: Submit can never be delivered. Reactive, so
                 // the control closes the moment the fatal frame lands, even
                 // with the card already on screen and answers picked.
@@ -1147,7 +1316,7 @@ fn AskUserQuestionCard(
                             } else if sending.get() {
                                 "Queueing..."
                             } else {
-                                "Submit answer"
+                                if answered { "Answer sent" } else { "Submit answer" }
                             }
                         }}
                     </span>
@@ -1179,8 +1348,12 @@ fn render_question(
     qstate: QuestionState,
     submitted: RwSignal<Option<SubmissionOriginId>>,
     sending: RwSignal<bool>,
+    answered: bool,
 ) -> AnyView {
     let multi_select = question.multi_select;
+    let schema = question.answer_schema.clone();
+    let max_selections = schema.as_ref().and_then(|schema| schema.max_selections);
+    let structured = schema.is_some();
     let header = question
         .header
         .as_deref()
@@ -1197,9 +1370,10 @@ fn render_question(
             let selected = qstate.selected;
             let is_selected = move || selected.get().contains(&idx);
             let on_click = move |_| {
-                if submitted.get_untracked().is_some() || sending.get_untracked() {
+                if answered || submitted.get_untracked().is_some() || sending.get_untracked() {
                     return;
                 }
+                if structured { qstate.custom.set(String::new()); }
                 selected.update(|current| {
                     if multi_select {
                         if let Some(pos) = current.iter().position(|&i| i == idx) {
@@ -1227,7 +1401,8 @@ fn render_question(
                     class="ask-question-option"
                     data-mobile-test="ask-question-option"
                     class:selected=is_selected
-                    prop:disabled=move || submitted.get().is_some() || sending.get()
+                    prop:disabled=move || answered || submitted.get().is_some() || sending.get()
+                        || (multi_select && max_selections.is_some_and(|max| selected.get().len() >= max as usize) && !is_selected())
                     aria-pressed=move || if is_selected() { "true" } else { "false" }
                     on:click=on_click
                 >
@@ -1242,10 +1417,27 @@ fn render_question(
 
     let custom = qstate.custom;
     let on_custom_input = move |ev: web_sys::Event| {
-        if submitted.get_untracked().is_some() || sending.get_untracked() {
+        if answered || submitted.get_untracked().is_some() || sending.get_untracked() {
             return;
         }
-        custom.set(event_target_value(&ev));
+        let value = event_target_value(&ev);
+        if structured && !value.is_empty() {
+            qstate.selected.set(Vec::new());
+        }
+        custom.set(value);
+    };
+    let note = qstate.note;
+    let validation_question = question.clone();
+    let validation_message = move || {
+        if structured
+            && (!qstate.selected.get().is_empty()
+                || !qstate.custom.get().is_empty()
+                || !note.get().is_empty())
+        {
+            structured_response(&validation_question, qstate).err()
+        } else {
+            None
+        }
     };
 
     view! {
@@ -1257,14 +1449,27 @@ fn render_question(
             <div class="ask-question-options" class:multi=multi_select>
                 {option_views}
             </div>
-            <input
-                class="ask-question-custom"
-                data-mobile-test="ask-question-custom"
-                r#type="text"
-                placeholder="Or type your own answer"
-                prop:disabled=move || submitted.get().is_some() || sending.get()
-                on:input=on_custom_input
-            />
+            {if structured {
+                view! { <textarea class="ask-question-custom" data-mobile-test="ask-question-custom" rows="2" placeholder="Or type your own answer"
+                    prop:value=move || custom.get()
+                    prop:disabled=move || answered || submitted.get().is_some() || sending.get()
+                    on:input=on_custom_input /> }.into_any()
+            } else {
+                view! { <input class="ask-question-custom" data-mobile-test="ask-question-custom" r#type="text" placeholder="Or type your own answer"
+                    prop:value=move || custom.get()
+                    prop:disabled=move || answered || submitted.get().is_some() || sending.get()
+                    on:input=on_custom_input /> }.into_any()
+            }}
+            {structured.then(|| view! {
+                <textarea class="ask-question-custom ask-question-note" data-mobile-test="ask-question-note" rows="2" placeholder="Optional note" aria-label="Optional note"
+                    prop:value=move || note.get()
+                    prop:disabled=move || answered || submitted.get().is_some() || sending.get()
+                    on:input=move |ev| {
+                        if !answered && submitted.get_untracked().is_none() && !sending.get_untracked() { note.set(event_target_value(&ev)); }
+                    }
+                />
+                <div role="status">{validation_message}</div>
+            })}
         </div>
     }
     .into_any()
@@ -1462,7 +1667,13 @@ struct ReplyStatus {
     send_error: RwSignal<Option<String>>,
 }
 
-fn send_answer(channel: ReplyChannel, status: ReplyStatus, tool_call_id: String, message: String) {
+fn send_answer(
+    channel: ReplyChannel,
+    status: ReplyStatus,
+    tool_call_id: String,
+    message: String,
+    structured_answers: Option<Vec<protocol::UserQuestionAnswer>>,
+) {
     spawn_local(async move {
         // The answer has to ride as a typed tool response, not as chat text. The
         // question keeps its turn open until the tool is answered, and the server
@@ -1471,6 +1682,8 @@ fn send_answer(channel: ReplyChannel, status: ReplyStatus, tool_call_id: String,
         let tool_response = SendMessageToolResponse::AskUserQuestion {
             tool_call_id,
             answer: message.clone(),
+
+            structured_answers,
         };
         let payload = SendMessagePayload {
             message: message.clone(),
@@ -1768,6 +1981,7 @@ fn send_decision(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::components::pending_submissions::AgentPendingSubmissions;
     use crate::state::{ActiveAgentRef, AgentInfo, AppState, LocalHostId, ToolRequestEntry};
     use leptos::mount::mount_to;
     use protocol::{
@@ -1802,6 +2016,7 @@ mod wasm_tests {
                 message: message.to_owned(),
                 details: details.map(str::to_owned),
                 normalization_failure,
+                result: None,
             },
         }
     }
@@ -1847,6 +2062,7 @@ mod wasm_tests {
                             opt("Python", "Scripting lang"),
                             opt("Go", ""),
                         ],
+                        answer_schema: None,
                         multi_select,
                     }],
                 },
@@ -2143,6 +2359,391 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn structured_question_bounds_and_saved_answers_are_visible() {
+        let calls = configure_deferred_web_sends();
+        let mut entry = ask_entry(true);
+        let ToolRequestType::AskUserQuestion { questions, .. } = &mut entry.request.tool_type
+        else {
+            panic!("question fixture must contain questions");
+        };
+        questions[0].id = Some(protocol::UserQuestionId("bounded-question".to_owned()));
+        questions[0].answer_schema = Some(protocol::UserQuestionAnswerSchema {
+            min_selections: Some(2),
+            max_selections: Some(2),
+            max_free_text_chars: Some(5),
+            max_note_chars: Some(5),
+        });
+        questions[0].options = vec![
+            opt("Rust, systems", ""),
+            opt("Python, scripts", ""),
+            opt("Go, services", ""),
+        ];
+        questions.push(AskUserQuestion {
+            id: Some(protocol::UserQuestionId("free-text-question".to_owned())),
+            question: "Add implementation details".to_owned(),
+            header: Some("Language".to_owned()),
+            options: Vec::new(),
+            multi_select: false,
+            answer_schema: Some(protocol::UserQuestionAnswerSchema {
+                min_selections: Some(1),
+                max_selections: Some(1),
+                max_free_text_chars: Some(5),
+                max_note_chars: Some(5),
+            }),
+        });
+        let (container, state) = mount_card_with_state(entry.clone(), configure_active_agent);
+        next_tick().await;
+        let free_text: web_sys::HtmlTextAreaElement = container
+            .query_selector_all("[data-mobile-test='ask-question-custom']")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        free_text.set_value("a\nb");
+        free_text
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let free_note: web_sys::HtmlTextAreaElement = container
+            .query_selector_all("[data-mobile-test='ask-question-note']")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        free_note.set_value("c\nd");
+        free_note
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Add implementation details")
+        );
+        assert_eq!(free_text.value(), "a\nb");
+        assert_eq!(free_note.value(), "c\nd");
+        let options = option_buttons(&container);
+        options[0].click();
+        next_tick().await;
+        assert!(
+            submit_button(&container).disabled(),
+            "native minimum controls submission"
+        );
+        options[1].click();
+        next_tick().await;
+        assert!(!submit_button(&container).disabled());
+        assert!(
+            options[2].disabled(),
+            "native maximum disables another selection"
+        );
+        let note: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='ask-question-note']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        note.set_value("one\ntwo");
+        note.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            submit_button(&container).disabled(),
+            "the note limit is enforced independently of selection count"
+        );
+        assert_eq!(
+            note.value(),
+            "one\ntwo",
+            "note editing preserves line breaks"
+        );
+        submit_button(&container).click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            0,
+            "invalid answers must not reach the bridge"
+        );
+        note.set_value("a\nb");
+        note.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(!submit_button(&container).disabled());
+        submit_button(&container).click();
+        next_tick().await;
+
+        assert_eq!(calls.length(), 1, "one structured answer for one submit");
+        let envelope: protocol::Envelope =
+            serde_json::from_str(&last_send_payload(&calls)).unwrap();
+        assert_eq!(envelope.kind, FrameKind::SendMessage);
+        assert_eq!(
+            envelope.stream,
+            StreamPath("/agent/agent-1/inst".to_owned())
+        );
+        let payload: SendMessagePayload = envelope.parse_payload().unwrap();
+        let Some(SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            structured_answers: Some(answers),
+            ..
+        }) = payload.tool_response.as_ref()
+        else {
+            panic!("the UI bridge must emit typed structured question answers");
+        };
+        assert_eq!(tool_call_id, "toolu_ask");
+        assert_eq!(
+            answers,
+            &vec![
+                protocol::UserQuestionAnswer {
+                    question_id: protocol::UserQuestionId("bounded-question".to_owned()),
+                    answer: protocol::UserQuestionAnswerValue::Selected {
+                        labels: vec!["Rust, systems".to_owned(), "Python, scripts".to_owned()],
+                        note: Some("a\nb".to_owned()),
+                    },
+                },
+                protocol::UserQuestionAnswer {
+                    question_id: protocol::UserQuestionId("free-text-question".to_owned()),
+                    answer: protocol::UserQuestionAnswerValue::FreeText {
+                        text: "a\nb".to_owned(),
+                        note: Some("c\nd".to_owned()),
+                    },
+                },
+            ],
+            "submission must preserve question identity, label boundaries, text and notes"
+        );
+        assert!(submit_button(&container).disabled());
+        assert!(options.iter().all(HtmlButtonElement::disabled));
+        assert_eq!(
+            container
+                .query_selector_all("textarea:not([disabled])")
+                .unwrap()
+                .length(),
+            0,
+            "all structured answer controls lock during submission"
+        );
+        assert!(!has_sent_note(&container));
+        assert!(state.pending_submissions.get_untracked().is_empty());
+        submit_button(&container).click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            1,
+            "a pending answer cannot be submitted twice"
+        );
+
+        resolve_deferred_send();
+        next_tick().await;
+        let held = state.pending_submissions.get_untracked();
+        assert_eq!(
+            held.len(),
+            1,
+            "the admitted structured reply must be recoverable"
+        );
+        let record = held.values().next().unwrap();
+        assert_eq!(
+            record.target,
+            crate::state::SubmissionTarget::Agent(owner_ref())
+        );
+        assert_eq!(
+            record.tool_response, payload.tool_response,
+            "Send again must retain the exact structured response emitted by the UI"
+        );
+        assert_eq!(record.text, payload.message);
+        assert!(has_sent_note(&container));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Queued locally.")
+        );
+        assert!(!container.text_content().unwrap().contains("Answer sent"));
+        assert!(submit_button(&container).disabled());
+        assert!(options.iter().all(HtmlButtonElement::disabled));
+        assert!(free_text.disabled() && free_note.disabled() && note.disabled());
+
+        let recovery = make_container();
+        let recovery_state = state.clone();
+        let recovery_handle = mount_to(recovery.clone(), move || {
+            provide_context(recovery_state);
+            view! { <AgentPendingSubmissions agent_ref=owner_ref() /> }
+        });
+        recovery_handle.forget();
+        next_tick().await;
+        assert!(
+            recovery
+                .query_selector("[data-mobile-test='pending-submission']")
+                .unwrap()
+                .is_none(),
+            "a healthy queued answer must not show recovery actions"
+        );
+        state.active_connection_instance_ids.update(|instances| {
+            instances.insert(record.local_host_id.clone(), record.connection_instance_id);
+        });
+        state.apply_submission_outcome(
+            record.local_submission_id,
+            record.connection_instance_id,
+            crate::bridge::SubmissionTransportOutcome::DeliveryUnknown,
+        );
+        next_tick().await;
+        let recovery_row = recovery
+            .query_selector("[data-mobile-test='pending-submission']")
+            .unwrap()
+            .expect("the ambiguous structured answer must offer mounted recovery");
+        assert_eq!(recovery_row.get_attribute("role").as_deref(), Some("alert"));
+        assert!(
+            recovery_row
+                .text_content()
+                .unwrap()
+                .contains("May not have been received")
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("May not have reached")
+        );
+        let resend: HtmlButtonElement = recovery_row
+            .query_selector("[data-mobile-test='pending-submission-resend']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(resend.text_content().unwrap(), "Send again");
+        assert!(resend.disabled(), "recovery requires a new connection");
+        resend.click();
+        next_tick().await;
+        assert_eq!(calls.length(), 1, "the lost connection cannot resend");
+        state.active_connection_instance_ids.update(|instances| {
+            instances.insert(
+                record.local_host_id.clone(),
+                record.connection_instance_id + 1,
+            );
+        });
+        next_tick().await;
+        assert!(!resend.disabled());
+        resend.click();
+        next_tick().await;
+        assert_eq!(calls.length(), 2, "Send again emits one new bridge frame");
+        let retry_envelope: protocol::Envelope =
+            serde_json::from_str(&last_send_payload(&calls)).unwrap();
+        assert_eq!(retry_envelope.kind, FrameKind::SendMessage);
+        assert_eq!(retry_envelope.stream, envelope.stream);
+        assert_eq!(retry_envelope.seq, envelope.seq + 1);
+        let retry_payload: SendMessagePayload = retry_envelope.parse_payload().unwrap();
+        let Some(SendMessageToolResponse::AskUserQuestion {
+            tool_call_id: retry_tool_call_id,
+            structured_answers: Some(retry_answers),
+            ..
+        }) = retry_payload.tool_response.as_ref()
+        else {
+            panic!("mounted Send again must emit typed structured question answers");
+        };
+        assert_eq!(retry_tool_call_id, "toolu_ask");
+        assert_eq!(
+            retry_answers, answers,
+            "the second outgoing envelope must retain exact question IDs, separate comma-containing labels, multiline text and notes"
+        );
+        assert_eq!(retry_payload.tool_response, payload.tool_response);
+        assert_eq!(retry_payload.message, payload.message);
+        assert!(resend.disabled());
+        assert_eq!(resend.text_content().unwrap(), "Sending…");
+        assert_eq!(
+            recovery_row
+                .query_selector_all("button:not([disabled])")
+                .unwrap()
+                .length(),
+            0,
+            "recovery actions lock while the second send is unsettled"
+        );
+        resend.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            2,
+            "a recovery double-tap cannot duplicate the answer"
+        );
+        resolve_deferred_send();
+        next_tick().await;
+        assert!(
+            recovery
+                .query_selector("[data-mobile-test='pending-submission']")
+                .unwrap()
+                .is_none(),
+            "admitted recovery retires the surfaced attempt"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Queued locally.")
+        );
+        assert!(!container.text_content().unwrap().contains("Answer sent"));
+        assert!(submit_button(&container).disabled());
+        assert!(options.iter().all(HtmlButtonElement::disabled));
+        assert!(free_text.disabled() && free_note.disabled() && note.disabled());
+
+        entry.result = Some(succeeded_completion(
+            &entry.request.tool_call_id,
+            ToolExecutionResult::AskUserQuestion {
+                answers: retry_answers.clone(),
+            },
+        ));
+        let saved = mount_card(entry);
+        next_tick().await;
+        let saved_options = option_buttons(&saved);
+        assert!(
+            is_pressed(&saved_options[0]) && is_pressed(&saved_options[1]),
+            "replay shows the actual selected options"
+        );
+        assert!(
+            saved_options.iter().all(HtmlButtonElement::disabled),
+            "settled question controls cannot answer again"
+        );
+        let note: web_sys::HtmlTextAreaElement = saved
+            .query_selector("[data-mobile-test='ask-question-note']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            note.value(),
+            "a\nb",
+            "replay shows the original multiline note"
+        );
+        assert!(note.disabled() && submit_button(&saved).disabled());
+        let saved_text: web_sys::HtmlTextAreaElement = saved
+            .query_selector_all("[data-mobile-test='ask-question-custom']")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let saved_note: web_sys::HtmlTextAreaElement = saved
+            .query_selector_all("[data-mobile-test='ask-question-note']")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            saved_text.value(),
+            "a\nb",
+            "replay preserves multiline free text"
+        );
+        assert_eq!(
+            saved_note.value(),
+            "c\nd",
+            "replay preserves its separate note"
+        );
+        assert!(saved_text.disabled() && saved_note.disabled());
+        assert!(
+            saved
+                .text_content()
+                .unwrap_or_default()
+                .contains("Answer sent")
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn submit_waits_for_successful_send_before_showing_sent() {
         let calls = configure_deferred_web_sends();
         let container = mount_card_with_setup(ask_entry(false), configure_active_agent);
@@ -2225,6 +2826,7 @@ mod wasm_tests {
             Some(SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
                 answer,
+                ..
             }) => {
                 assert_eq!(tool_call_id, "toolu_ask");
                 assert!(answer.contains("Rust"), "held answer: {answer}");
@@ -4525,6 +5127,36 @@ mod wasm_tests {
             })
     }
 
+    async fn assert_rendered_pixel(image: &web_sys::HtmlImageElement, expected: [u8; 4]) {
+        wasm_bindgen_futures::JsFuture::from(image.decode())
+            .await
+            .expect("native image decodes in the mounted DOM");
+        let canvas = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("canvas")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .unwrap();
+        canvas.set_width(1);
+        canvas.set_height(1);
+        let context = canvas
+            .get_context("2d")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::CanvasRenderingContext2d>()
+            .unwrap();
+        context
+            .draw_image_with_html_image_element_and_dw_and_dh(image, 0.0, 0.0, 1.0, 1.0)
+            .unwrap();
+        assert_eq!(
+            context.get_image_data(0.0, 0.0, 1.0, 1.0).unwrap().data().0,
+            expected,
+            "the displayed images retain their ordered pixels"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn view_image_path_stays_inside_phone_width() {
         crate::components::test_styles::ensure_styles_loaded();
@@ -4563,6 +5195,185 @@ mod wasm_tests {
             container.scroll_width(),
             container.client_width()
         );
+        container.remove();
+
+        let native_text =
+            "first line\n[Image #2: native annotation]\n{\"unchanged\":true}\nlast line";
+        let failure_message = "Native call failed\nwith retained output";
+        let failure_details = "Original failure detail";
+        let images = ["red", "blue"].into_iter().map(|color| {
+            let svg = format!("<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='600'><rect width='1200' height='600' fill='{color}'/></svg>");
+            protocol::ImageData {
+                media_type: "image/svg+xml".to_owned(),
+                data: web_sys::window().unwrap().btoa(&svg).unwrap(),
+            }
+        }).collect::<Vec<_>>();
+        let args = serde_json::json!({
+            "path": "/tmp/retained-invocation-context.png",
+            "labels": ["first, label", "second, label"],
+            "note": "line one\nline two",
+        });
+        for (request, failed) in [
+            (
+                ToolRequestType::ViewImage {
+                    path: "/tmp/native-preview.png".to_owned(),
+                },
+                false,
+            ),
+            (ToolRequestType::Other { args: args.clone() }, false),
+            (ToolRequestType::Other { args }, true),
+        ] {
+            let expected_parameters = match &request {
+                ToolRequestType::Other { args } => Some(format!("{args:#}")),
+                _ => None,
+            };
+            for mode in [
+                ToolOutputMode::Full,
+                ToolOutputMode::Compact,
+                ToolOutputMode::Summary,
+            ] {
+                let native_result = ToolExecutionResult::NativeContent {
+                    text: native_text.to_owned(),
+                    images: images.clone(),
+                };
+                let completion = ToolExecutionCompletedData {
+                    tool_call_id: "native-content".to_owned(),
+                    outcome: if failed {
+                        ToolExecutionOutcome::Failed {
+                            message: failure_message.to_owned(),
+                            details: Some(failure_details.to_owned()),
+                            normalization_failure: None,
+                            result: Some(native_result),
+                        }
+                    } else {
+                        ToolExecutionOutcome::Succeeded {
+                            result: native_result,
+                        }
+                    },
+                };
+                let entry = RwSignal::new(ToolRequestEntry {
+                    tool_name: "catalog_preview".to_owned(),
+                    request: ToolRequest {
+                        tool_call_id: "native-content".to_owned(),
+                        tool_name: "catalog_preview".to_owned(),
+                        tool_type: request.clone(),
+                    },
+                    result: None,
+                });
+                let state = AppState::new();
+                state.tool_output_mode.set(mode);
+                let container = make_container();
+                container.style().set_property("width", "320px").unwrap();
+                let handle = mount_to(container.clone(), move || {
+                    provide_context(state);
+                    move || view! { <ToolCardView owner_agent_ref=owner_ref() entry=entry.get() /> }
+                });
+                next_tick().await;
+                let assert_parameters = || {
+                    let parameters = container
+                        .query_selector("[data-mobile-test='tool-card-parameters']")
+                        .unwrap();
+                    match expected_parameters
+                        .as_ref()
+                        .filter(|_| mode != ToolOutputMode::Summary)
+                    {
+                        Some(expected) => {
+                            let parameters =
+                                parameters.expect("invocation parameters remain visible");
+                            assert_eq!(
+                                parameters.text_content().as_deref(),
+                                Some(expected.as_str())
+                            );
+                            assert!(parameters.get_bounding_client_rect().height() > 0.0);
+                        }
+                        None => assert!(parameters.is_none()),
+                    }
+                };
+                assert_parameters();
+                assert!(container.scroll_width() <= container.client_width() + 1);
+                entry.update(|entry| entry.result = Some(completion));
+                next_tick().await;
+                next_tick().await;
+                let card = container.query_selector("[aria-label]").unwrap().unwrap();
+                assert_eq!(
+                    card.get_attribute("aria-label").as_deref(),
+                    Some(if failed {
+                        "Tool failed"
+                    } else {
+                        "Tool completed successfully"
+                    })
+                );
+                assert!(
+                    container
+                        .query_selector("[data-mobile-test='tool-card-malformed-note']")
+                        .unwrap()
+                        .is_none()
+                );
+                let disclosure = details(&container, "tool-card-result")
+                    .expect("native output remains reachable in every output mode");
+                assert_eq!(disclosure.open(), failed || mode == ToolOutputMode::Full);
+                if !disclosure.open() {
+                    disclosure
+                        .query_selector("summary")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<HtmlElement>()
+                        .unwrap()
+                        .click();
+                    next_tick().await;
+                }
+                assert!(disclosure.open());
+                assert_parameters();
+                let output = container
+                    .query_selector(".tool-native-content")
+                    .unwrap()
+                    .expect("typed native output is not discarded by request dispatch");
+                assert_eq!(
+                    output.text_content().unwrap(),
+                    if failed {
+                        format!("{failure_message}{failure_details}{native_text}")
+                    } else {
+                        native_text.to_owned()
+                    }
+                );
+                let blocks = output.query_selector_all("pre").unwrap();
+                assert_eq!(blocks.length(), if failed { 3 } else { 1 });
+                let text_block = blocks
+                    .item(blocks.length() - 1)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap();
+                assert_eq!(text_block.text_content().unwrap(), native_text);
+                assert!(text_block.get_bounding_client_rect().height() > 0.0);
+                let previews = output.query_selector_all("img").unwrap();
+                assert_eq!(previews.length(), 2);
+                for (index, expected) in
+                    [[255, 0, 0, 255], [0, 0, 255, 255]].into_iter().enumerate()
+                {
+                    let image = previews
+                        .item(index as u32)
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlImageElement>()
+                        .unwrap();
+                    assert_rendered_pixel(&image, expected).await;
+                    let rect = image.get_bounding_client_rect();
+                    assert!(rect.width() > 0.0 && rect.width() <= container.client_width() as f64);
+                    assert!(rect.height() > 0.0 && rect.height() <= 320.0);
+                    assert!(text_block.get_bounding_client_rect().bottom() <= rect.top());
+                }
+                assert!(container.scroll_width() <= container.client_width() + 1);
+                assert_eq!(
+                    card.get_attribute("data-mobile-test").as_deref(),
+                    Some(if failed {
+                        "tool-card-failed"
+                    } else {
+                        "tool-card-success"
+                    })
+                );
+                drop(handle);
+                container.remove();
+            }
+        }
     }
 
     /// A shell card previews what was run — whatever the provider calls the

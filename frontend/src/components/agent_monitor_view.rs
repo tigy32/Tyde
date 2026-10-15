@@ -609,13 +609,14 @@ fn status_filter_label(filter: AgentStatusFilter) -> &'static str {
     }
 }
 
-const BACKENDS: [BackendKind; 6] = [
+const BACKENDS: [BackendKind; 7] = [
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Kiro,
     BackendKind::Antigravity,
     BackendKind::Hermes,
     BackendKind::Grok,
+    BackendKind::Muse,
 ];
 
 const ORIGINS: [AgentOrigin; 6] = [

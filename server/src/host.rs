@@ -2731,6 +2731,8 @@ impl SubAgentEmitter for HostSubAgentEmitter {
             let (reply_tx, reply_rx) = oneshot::channel();
             self.spawn_tx
                 .send(HostSubAgentSpawnRequest {
+                    spawn_tx: self.spawn_tx.clone(),
+                    capacity_tx: self.capacity_tx.clone(),
                     parent_agent_id: self.parent_agent_id.clone(),
                     workspace_roots: self
                         .workspace_roots
@@ -12991,11 +12993,9 @@ impl HostHandle {
         request: &HostSubAgentSpawnRequest,
     ) -> Result<SubAgentHandle, String> {
         tracing::info!(
-            parent_agent_id = %request.parent_agent_id,
-            tool_use_id = %request.tool_use_id,
-            requested_name = %request.name,
-            description = %request.description,
-            agent_type = %request.agent_type,
+            provider_session_present = request.session_id_hint.is_some(),
+            description_present = !request.description.is_empty(),
+            agent_type_present = !request.agent_type.is_empty(),
             "host backend-native sub-agent spawn requested"
         );
 
@@ -13178,12 +13178,19 @@ impl HostHandle {
         }
 
         let child_agent_id = start.agent_id.clone();
+        let child_emitter = Arc::new(HostSubAgentEmitter::new(
+            request.spawn_tx.clone(),
+            request.capacity_tx.clone(),
+            child_agent_id.clone(),
+            request.workspace_roots.clone(),
+        ));
         let result = SubAgentHandle {
             event_tx,
             model_usage_tx,
             total_usage_tx,
             agent_id: child_agent_id.clone(),
             name_update_tx: Some(name_update_tx),
+            subagent_emitter: Some(child_emitter),
         };
         let parent_agent_id = request.parent_agent_id.clone();
         let tool_use_id = request.tool_use_id.clone();

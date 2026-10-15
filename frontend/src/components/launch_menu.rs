@@ -16,6 +16,7 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Muse => "Muse",
     }
 }
 
@@ -80,6 +81,15 @@ fn backend_icon(kind: BackendKind) -> impl IntoView {
             <rect x="2" y="2" width="20" height="20" rx="3" />
             <path d="m6 7 4 5-4 5m7 0h5" />
         }.into_any(),
+        BackendKind::Muse => {
+            // Bundle https://muse.ai/images/favicon/app-squiggle.svg unchanged;
+            // its embedded SVG keeps gradient IDs private and works offline.
+            let source = format!(
+                "data:image/svg+xml,{}",
+                String::from(js_sys::encode_uri_component(include_str!("../../muse.svg")))
+            );
+            view! { <image href=source width="24" height="24" /> }.into_any()
+        },
     };
     view! {
         <svg class="launch-backend-icon" width="24" height="24" viewBox="0 0 24 24"
@@ -1442,7 +1452,16 @@ mod wasm_tests {
         set_catalog(
             &state,
             "local",
-            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+            vec![
+                ready("claude:default", "Claude", BackendKind::Claude),
+                ready("muse:default", "Muse", BackendKind::Muse),
+                ready_kind(
+                    "muse:custom",
+                    "Code helper",
+                    BackendKind::Muse,
+                    LaunchProfileKind::Custom,
+                ),
+            ],
         );
         let open = RwSignal::new(true);
         let _handle = mount_menu(&container, &state, open);
@@ -1457,6 +1476,91 @@ mod wasm_tests {
             rect.width() >= 20.0 && rect.height() >= 20.0,
             "backend identity has a visible icon"
         );
+        for label in ["Muse", "Code helper"] {
+            let row = find_button_by_text(&container, label).unwrap();
+            let mark = row
+                .query_selector("svg[aria-hidden=true]")
+                .unwrap()
+                .unwrap();
+            let bounds = mark.get_bounding_client_rect();
+            assert!(bounds.width() >= 20.0 && bounds.height() >= 20.0);
+            let mounted_image = mark
+                .query_selector("image")
+                .unwrap()
+                .expect("Muse renders its official mark, not the placeholder letter");
+            let mounted_bounds = mounted_image.get_bounding_client_rect();
+            assert!(
+                mounted_bounds.width() >= 20.0 && mounted_bounds.height() >= 20.0,
+                "the actual mounted mark must occupy the icon slot"
+            );
+            let style = web_sys::window()
+                .unwrap()
+                .get_computed_style(&mounted_image)
+                .unwrap()
+                .unwrap();
+            assert_ne!(style.get_property_value("display").unwrap(), "none");
+            assert_ne!(style.get_property_value("visibility").unwrap(), "hidden");
+            assert!(
+                style
+                    .get_property_value("opacity")
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+                    > 0.0
+            );
+            // Give the actual DOM serialization its XML namespace; retain its
+            // mounted image dimensions, visibility and embedded asset intact.
+            let markup = mark.outer_html().replacen(
+                "<svg ",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" ",
+                1,
+            );
+            let image = web_sys::HtmlImageElement::new().unwrap();
+            image.set_src(&format!(
+                "data:image/svg+xml,{}",
+                String::from(js_sys::encode_uri_component(&markup))
+            ));
+            wasm_bindgen_futures::JsFuture::from(image.decode())
+                .await
+                .expect("the bundled Muse mark decodes without a network request");
+            let canvas = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .create_element("canvas")
+                .unwrap()
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .unwrap();
+            canvas.set_width(bounds.width().ceil() as u32);
+            canvas.set_height(bounds.height().ceil() as u32);
+            let context = canvas
+                .get_context("2d")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::CanvasRenderingContext2d>()
+                .unwrap();
+            context
+                .draw_image_with_html_image_element(&image, 0.0, 0.0)
+                .unwrap();
+            let pixels = context
+                .get_image_data(
+                    0.0,
+                    0.0,
+                    f64::from(canvas.width()),
+                    f64::from(canvas.height()),
+                )
+                .unwrap()
+                .data()
+                .0;
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .filter(|rgba| rgba[2] > 180 && rgba[0] < 40 && rgba[3] > 200)
+                    .count()
+                    > 30,
+                "both default and custom Muse rows display the blue brand mark"
+            );
+        }
         assert!(!row_button_text(&container).contains(['▶', '◀']));
         assert!(
             find_button_by_text(&container, "Default agent")

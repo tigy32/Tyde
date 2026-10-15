@@ -502,6 +502,7 @@ fn ask_user_question(raw: &Value) -> AskUserQuestion {
                     .collect()
             })
             .unwrap_or_default(),
+        answer_schema: None,
         multi_select: raw
             .get("is_multi_select")
             .and_then(Value::as_bool)

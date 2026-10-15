@@ -156,6 +156,7 @@ impl OpenCodeAdapter {
                             .to_owned(),
                         details: None,
                         normalization_failure: None,
+                        result: None,
                     },
                     other => {
                         return Err(format!(

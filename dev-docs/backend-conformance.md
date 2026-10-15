@@ -1059,31 +1059,61 @@ pause, restart and resume, images, naming, replacement) remains covered by
 the protocol sims in `server/tests/swarms.rs`. The provider contracts those
 cases had caught are now trait-level:
 
-- `real_mcp_image_result` (`StartupMcpServers`, `McpImageResults`): an MCP
-  server returns a text block and a PNG. The completion must be a canonical
-  `CallToolResult` with exactly those pixels as one typed image block, and
-  the model must name the colors. This covers the Claude projection of
-  native `image.source` blocks onto MCP image content.
+- `real_mcp_image_result` (`StartupMcpServers`, `McpImageResults`,
+  `McpErrorResults`): an MCP server returns successful text and a PNG. The
+  model must identify the colors from the pixels. A canonical `CallToolResult` retains
+  the original text and image blocks; typed `NativeContent` instead retains
+  native presentation text and the original pixels and media type without
+  claiming canonical block boundaries. The complete original multiline text,
+  including its annotation-shaped literal, must survive unchanged once. The
+  second real call returns an image error on every eligible backend. Exactly
+  two server calls, with only the second carrying `fail: true`, must produce
+  one matching MCP image request and completion that stays failed, preserves
+  the actual native reason and retains the complete unchanged server text once.
+  Only the additional original error-pixel and media-type assertions depend on
+  `McpErrorImageResults`; status, text and call counts never do. Universal
+  contracts still cover every request and completion, including any native
+  execution container.
 - `real_mcp_error_result` (`StartupMcpServers`, `McpErrorResults`): the MCP
   server returns `isError: true`. The completion must be a failure carrying
-  the canonical result with `isError: true` and the server's text. This
-  covers the Codex restoration of the flag that its failed `mcpToolCall`
-  items omit. It was split out of `real_mcp_tool_call`, which keeps its
-  success phases and stays gated only on `StartupMcpServers`.
+  its retained result: either canonical MCP output with `isError: true`, or
+  typed native output alongside the actual native failure reason. This covers
+  the Codex restoration of the flag that its failed `mcpToolCall` items omit
+  and Muse's native failure projection. `real_mcp_tool_call` keeps its success
+  phases and stays gated only on `StartupMcpServers`.
+- `real_mcp_image_text_fidelity` additionally requires
+  `McpOriginalContentFidelity`. Its unchanged oracle requires canonical MCP
+  output containing the complete original server text block once beside the
+  original typed image, even when authentic text resembles a native image
+  annotation. Native presentation is not an equivalent result. This flow
+  does not certify arbitrary interleaving, `structuredContent`, or `_meta`.
 
 ### Capabilities
 
-`McpImageResults` is declared by Claude, Codex and OpenCode. Grok moves the
+`McpImageResults` guarantees successful image results, not failed-image
+retention. It is declared by Claude, Codex, Muse and OpenCode. Grok moves the
 image into a synthetic user message and Hermes into a cache file path, so
 neither stream carries the pixels. Kiro reports the canonical block, but its
 model receives the image as base64 text: asked for the colors, it decoded
 the PNG with a shell command, and once answered `red:green:blue` from the
 "pixel data".
 
-`McpErrorResults` is declared by Claude, Codex, Grok, Kiro and OpenCode.
+`McpOriginalContentFidelity` is declared by Claude, Codex and OpenCode, based
+on their prior passing runs of the unchanged strict text-fidelity flow.
+Muse does not declare it: its known strict-fidelity RED is an unsupported
+guarantee, not a new passing result. Muse remains eligible for the basic
+successful-image, text-error and lifecycle cases independently of this split.
+
+`McpErrorResults` is declared by Claude, Codex, Grok, Kiro, Muse and OpenCode.
 Antigravity and Hermes reach MCP servers through Tyde's bridge, which
 reports every call as a success so the provider keeps the embedded result,
 and both then flatten it to plain text.
+
+`McpErrorImageResults` separately promises original image retention on an MCP
+failure and requires both `McpImageResults` and `McpErrorResults`. Only Codex
+declares it, based on actual retained failed-result pixels, text and error
+status. It gates only additional pixel assertions within the shared image
+success/error flow, not admission to that flow or any error-status/text checks.
 
 ### Provider fixes found by these cases
 
@@ -1110,3 +1140,377 @@ Negative controls: `real_mcp_image_result` fails on Claude without the
 image projection (`missing field data`), and `real_mcp_error_result` fails on
 Codex without the `isError` restoration. Grok and OpenCode failed both cases
 before their fixes.
+
+### Native failed-image audit (2026-10-14)
+
+The strengthened successful-image phase identified the actual colors and
+preserved the complete server-owned multiline literal and exact PNG on Claude,
+Codex, Muse and OpenCode. The combined case then failed in its error phase;
+none of those complete combined runs is recorded as passing.
+
+Retained native results establish why failed-image retention is separate:
+Claude returned error text only (178 bytes, no image blocks), OpenCode error
+text only (178 bytes, no attachments), and Muse one committed text result
+(191 bytes containing the unchanged 178-byte server block once, with a 13-byte
+native prefix) without an image event for that failed call. These three missing
+native payloads remain explicit unsupported guarantees, not adapter fixes or passes.
+The native error-text oracle requires the entire server block, including every
+newline, to occur exactly once without removing or rewriting that prefix. A
+whole-line requirement incorrectly rejected the prefixed first line despite
+the complete block being intact. The successful-image whole-line collision
+oracle is unchanged.
+
+Codex retained `isError: true`, the entire original text block once and one
+`image/png` whose decoded 3,564 bytes and SHA-256 exactly match the fixture.
+Its native code-mode trace contains one outer `exec` call/output and the inner
+MCP image call. The old assertion counted all requests and rejected this valid
+container rather than finding a missing payload. The shared error oracle
+now requires exactly one request with the successful call's exact native tool
+name, and exactly one completion with that request's call identity. It does not
+ignore the outer card's declaration, arguments, completion or stream contracts.
+The consolidated shared success/error case passed through the production
+Backend on all four eligible backends, then passed again after restoring
+canonical error-text block equality: Muse 27.11 seconds, Claude 15.40, Codex
+10.18 and OpenCode 160.68. Failed-image pixels alone remain capability-gated;
+all four still exercise genuine image-bearing error status and original text.
+The transient dedicated-case
+split excluded three backends' error-status/text/call-count checks and was
+replaced rather than accepted as coverage.
+
+## Muse integration workbench
+
+Muse runs as a native `muse serve` MSP client, not as an HTTP imitation of
+Wonder. The public `meta-models/muse-code-sdk` repository supplies the MIT
+TypeScript client and protocol declarations; it does not contain the native
+host. The integration is being validated against Muse 1.4.6-R6000.1 and
+1.4.7-R6101.1 on Linux. Real-provider runs pin the actual installed binary in
+a private test PATH so launcher updates cannot change the host mid-run.
+The 1.4.7 stable additions concern computer setup, sandbox availability,
+partial-reply marking and name origin; existing consumed fields are unchanged.
+The launch chooser bundles the official Muse SVG from
+`https://muse.ai/images/favicon/app-squiggle.svg`, preserving its path and blue
+gradient for both default and custom profiles without a runtime asset request.
+Contributor mode is explicitly off. Model choices come from the account's
+native catalogue: this subscription grants Wonder 1.0 and Spark 1.2/1.3,
+with no separate Wonder Full catalogue entry. No unlisted model is advertised
+or substituted.
+
+Stable MSP transcript items omit pre-tool commentary. Native experimental
+log paging also rejects retained omission markers. The adapter therefore
+uses one ordered native session ledger for provider response ownership,
+commentary, declarations and usage, alongside MSP's typed control and item
+facts. It validates record/stream sequences, retention frames and the schema
+fingerprint. This native-ledger dependency is not a stable SDK storage
+contract; incompatible shapes fail visibly instead of synthesizing history.
+
+Fork starts a fresh independent handle with inherited native model context;
+it is not resume replay. Its validated checkpoint replaces inherited durable
+run records with omission markers. Those markers are admitted only inside
+the native fork-context boundary; inherited context is never presented as
+new executable requests or fabricated provider responses. Resume uses the acknowledged native view head and
+replays settled question requests and decisions. The distinct
+`UserQuestionHistory` capability requires actual persisted settlements.
+Claude's native user-rejection result also normalizes to cancellation on
+replay. Codex's current adapter does not persist asynchronous settlements and
+does not claim this additional history capability.
+
+AskUser-only category exclusion and exact question-only deny lists negotiate
+`initialize.capabilities.userInputDialogs=false` while retaining the native
+default toolset. An empty deny list is equivalent to unrestricted policy;
+without a category exclusion, dialog support stays enabled. Each spawn,
+resume and fork opens a private native host with its own negotiation.
+Other allow/deny policies use exact native toolset selectors and enumerate
+the configured MCP servers to retain their non-denied tools without an
+unsafe wildcard. The default catalog includes `write_todos` and
+`snooze_reminder`, but the pinned host rejects those names as selectors.
+Omitting them loses unrelated controls. `NativeTool.selection` therefore
+separates `DefaultOnly`, `NamedSelectable`, `NamedWithoutMcp` and `Unverified`
+from the tool's effect classification. Missing selection metadata decodes as `Unverified`,
+not presumed selectability. Muse's shared audited description marks the two
+controls `DefaultOnly`, the six audited `subagent_*` tools `NamedWithoutMcp`,
+and the remaining ordinary native registry `NamedSelectable`.
+An actual named native catalog also attests the selectors it used; a tool
+merely visible in the default catalog does not gain that evidence. Claude's
+catalog does not yet make a selection-admission claim.
+
+`NamedWithoutMcp` is the current adapter's verified named-selection admission
+limit, not a claim that the native tools are universally incompatible with MCP.
+Exactly owned native ledgers show a default catalog of 33 tools followed by a
+named configuration that denied only the two default-only controls but returned
+25 tools instead of 31: all six subagent tools were additionally absent. The
+native trigger is unknown; no alias or undocumented configuration knob is
+assumed. The adapter now rejects an effective named set containing both an MCP
+tool and any `NamedWithoutMcp` tool before connecting to the native host. It
+checks the effective selected tools, not merely whether an MCP server is
+configured, and never silently removes an unrequested tool. Default and question-only toolsets
+still retain the MCP tools and all six subagent tools together.
+
+Allow lists reject default-only or unverified native selectors. Non-question
+deny lists must explicitly deny every default-only control; they cannot
+silently drop one. Per-session MCP references additionally resolve against
+the actual configured MCP inventory before the Muse process starts, rather
+than trusting an arbitrary `mcp__` prefix. Default/question-only negotiation
+does not acquire an extra discovery query. `real_native_tool_policies` stays
+active: accepted policy catalogs retain exact equality, while full-catalog
+allow lists and the original question-plus-MCP-only deny list must explicitly
+fail pre-start admission. The final full-policy flow passed on Muse in
+263.10 seconds with a 33-tool baseline after its MCP/question/read turns,
+the exact nine-tool native-control selection, the configured MCP/read subset,
+and exact denial catalogs. Conditional session controls remain part of those
+native-only named selections; they are not relabeled default-only or omitted
+from the equality oracle.
+
+`real_native_local_work_waits_for_completion` now directly rejects the original
+mixed named configuration through the production Backend before startup.
+Its positive path explicitly denies both typed default-only controls and all
+typed `NamedWithoutMcp` tools. The exact baseline-minus-eight name/kind equality,
+all-`NamedSelectable` assertion, nine-second discovery proof, MCP/file liveness
+and 35-second native-RPC proof remain required. This flow passed in 88.85
+seconds. Restoring permissive mixed admission produced a real 8.43-second RED
+at the unchanged pre-start rejection assertion. Restoring the 30-second RPC
+cutoff produced a separate RED after an actual native response entered the
+35-second delivery barrier. The unsupported mixed named combination is
+quarantined, not advertised as repaired. Restoring unconditional dialog
+support also failed the question-exclusion flow: the actual restricted
+catalog retained the unwanted `request_user_input` tool.
+
+Native `serve` does not load the managed hooks in the audited hosts: `hook/list` is empty,
+no hook events fire, and real native tools execute despite hook denial.
+The adapter does not rely on those hooks. Customization uses model-visible
+MSP input parts; durable `displayText` keeps the original user prompt in
+transcripts. Explicit `turn/steer` has no `displayText`, so it uses the
+session's already-retained instructions rather than injecting visible text.
+Muse now rejects `EnforcedReadOnly` before native startup and does not declare
+that capability. Its prior broad named-toolset path cannot retain default-only
+controls, and the filesystem-write contract does not authorize silently
+removing unrelated session controls or explicitly allowed tools. A
+default-catalog-preserving, flags-only replacement has not been verified
+across the remaining mutation pathways. Advisory `ReadOnly` is unchanged.
+The full native-policy flow also checks this unsupported mode's direct
+Backend admission rejection; it is not represented as successful protection.
+Muse emits `FileInfo.bytes: None` for both live and replayed reads because
+the native result retains no read-time file size. It performs no post-read
+filesystem lookup and never substitutes numbered presentation-text length.
+The read contents and successful result remain intact if the file changes or
+disappears before adapter completion. Claude history likewise omits sizes
+that its native transcript does not retain. The mounted UI distinguishes an
+unavailable size from a genuinely empty file. The real live-read regression
+holds genuine successful native completion, removes the original file, and
+forwards unchanged frames: fixed Muse and Claude pass, while restoring only
+Muse's old post-read stat produces a valid RED. Multiple native Muse selections
+use `selectedLabels`, not free text; the explicit legacy answer encoding still
+rejects ambiguous comma-containing option labels instead of guessing selections.
+
+Native question replies now carry typed question identities, selected label arrays,
+free text and a separate optional note. The desktop and mobile widgets render
+native min/max selection bounds and the MSP 500-character answer/note limits;
+structured text controls preserve line breaks. Muse's MSP has no advertised
+per-question flag to forbid free text, so the adapter does not invent one.
+Legacy textual replies remain an explicit compatibility input, not the source
+for structured selections. Native settlements own the typed completion and
+replay; completed mobile controls are read-only. A real regression failed before
+this projection and passes with comma-containing labels, multiline notes and
+multiline free text through resume. Existing question lifecycle/history cases
+still pass on Muse. This additional capability is advertised only by adapters
+that actually provide structured answers; existing question gates are unchanged.
+
+Native goals require an explicit native idle wake on resume. Goal preflight
+reads the validated durable control ledger, not the cached unloaded-session
+view: that view can omit a committed pause and otherwise wake a paused goal.
+Active-goal wake is pipelined with resume so real turn starts can precede the
+resume acknowledgement while historical replay still precedes live events.
+The real paused-goal lifecycle failed before this correction and passed after
+it on Muse; the same unchanged case also passed on Codex. Muse's controlled
+active-goal resume race still passes. No goal assertion was relaxed.
+
+MCP completion joins the stable tool terminal with the native committed result
+and model-visible content. A new provider response or native turn terminal
+seals that content; the earlier text-only task completion cannot discard late
+image pixels. Generic completions use typed `NativeContent`: unmodified
+native presentation text plus independently retained image pixels and media
+types in native image order. Generated annotations are neither stripped nor
+replaced, and the adapter does not synthesize canonical MCP block metadata.
+A native failed terminal stays `Failed`, preserving its original reason and
+`result: Some(NativeContent)`; success does not acquire an invented ambiguity
+or image-loss failure. Known Tyde agent-control results retain their existing
+typed normalization path. The strengthened shared success/error flow passes
+with the complete literal, original successful pixels and native failure
+status/text. The failed call has no native image payload, so Muse does not
+claim `McpErrorImageResults`. Text-error and replay coverage remain separate
+from that unsupported guarantee.
+Direct image input additionally passed on Wonder 1.0 with the audited 1.4.7
+host, not only the cheaper Spark profile.
+
+The unchanged `real_mcp_image_text_fidelity` case has prior passing results on
+Claude, Codex and OpenCode, which declare `McpOriginalContentFidelity`. Muse
+does not declare that capability, and its retained strict RED remains an
+explicit unsupported guarantee: a generated image annotation can collide with
+genuine server text. Native audits with interleaved text and two images confirm that
+neither MSP nor the retained ledger preserves original block boundaries,
+`structuredContent` or `_meta`; outbound MCP requests carry no native call
+identity for an independent exact result join. `NativeContent` honestly
+preserves the available native text and images without claiming the missing
+canonical shape or emitting an artificial normalization failure. Separating
+this presentation from original-content fidelity does not repair or turn the
+known Muse strict failure green. Full rich-result fidelity requires a native
+retained-result surface and separate evidence for those additional guarantees.
+
+The separate `real_mcp_image_lifecycle` case adds exact terminal replay and
+model-context retention through resume and independent fork. Its lifecycle
+requirements do not narrow the existing live-image case, which remains open
+to OpenCode as well as Claude, Codex and Muse. Initial lifecycle runs passed
+on Muse and Claude but caught a Codex MCP replay omission; it also reproduces
+against unchanged mainline production code and is outside the Muse-only fix
+scope. It remains outstanding, not successful cross-backend certification.
+
+The original lifecycle seed already stated the image colors, so later color
+recall could pass from text alone. The strengthened seed acknowledges only
+storage and rejects color disclosures in text or reasoning. Fork runs before
+any parent recall can contaminate the source with an answer. The strengthened
+case passes on Muse and Claude; Codex still fails the exact MCP replay oracle.
+
+A separate real user-image history flow preserves the original live-image
+case and catches Muse dropping attachment bytes on resume. Stable MSP exposes
+only attachment metadata; the native queued-input intake retains the actual
+bytes. Projection joins intake to the user item by its exact command ID and
+checks metadata against those bytes. Only the consumed queued-input schema is
+pinned: unrelated native session-start intake uses a different schema version.
+
+Native background stopping targets the exact tool item's task ID. Its typed
+acknowledgement is admission-only; native terminal events remain authoritative.
+A yielded bash result can report `background_running` while stable MSP leaves
+`background` absent. The adapter uses that durable native fact plus the current
+uncached `task/list` inventory, rather than closing the still-running command
+with its response. Historical progress never grants a current cancel affordance.
+Named cancellation rechecks the native inventory and validates the echoed stop
+command and task. Real outliving-turn and named-cancel cases failed before this
+projection and pass afterward. Task lists, usage accounting, subscription
+capacity and plain-text resume also pass on the audited 1.4.7 host.
+
+Survival across interruption of the still-active owning turn is unsupported:
+native `turn/interrupt` kills that turn's work. A direct real-host audit also
+admitted explicit `task/background`
+promotion, then observed native cancellation and a missing command proof after
+interrupt. Repeating that same native audit with normal-lane `turn/cancel`
+also cancelled the promoted task and left the proof absent; switching stop
+commands therefore cannot satisfy the background-survival contract. The
+adapter does not synthesize survival or change the strict survival oracle.
+The distinct, unchanged later-turn isolation check passed on Muse within
+`real_interruption` (159.69 seconds): interrupting a later foreground turn
+must not kill an earlier turn's background command.
+
+`BackgroundTasks` promises only that commands can outlive their launching turn.
+The separate `InterruptPreservesBackgroundTasks` promise keeps the existing
+strict survival cases on Claude, Codex and Hermes. Muse instead declares
+`InterruptCancelsOwnedBackgroundCommands`: a still-active owning turn shares
+cancellation with its background commands, without claiming session-wide,
+subagent or workflow cancellation. Capability validation requires an explicit,
+non-conflicting scope when interruption and backgrounding coexist.
+
+The new `real_interrupt_cancels_owned_background_command` scenario requires an
+actual running process, native background progress, an interrupted streaming
+answer, process death without the unreleased completion proof, and exactly one
+cancelled card before closing the host. Same-session followup and exact replay
+must also work. Its initial run failed replay in 13.99 seconds: the adapter
+ignored the owning run's cancellation terminal and left its response open.
+Consuming that authentic terminal fixed the flow (20.16 seconds), including
+live cancellation, followup, exact replay and resumed followup. The strict
+owning-turn survival cases separately passed on Claude, Codex and Hermes.
+
+The native-policy flow also preserves a genuine `read_file({})` declaration,
+its native missing-path failure, same-session recovery and exact replay.
+Restoring fatal missing-field normalization produced a real 40.94-second RED
+before recovery. This is valid JSON with missing required arguments, not
+syntactically malformed JSON. Almost-JSON and non-object argument recovery
+remain unverified: bounded real attempts and inspected native declarations
+did not produce those inputs. No scripted provider or fabricated event is
+counted as coverage for that path.
+
+The new user-image history case passes on Muse. Cross-backend runs expose absent
+image replay on Codex, Hermes, Kiro, Grok and OpenCode; Claude stopped earlier at
+the live pixel-identification oracle. Antigravity is ineligible for this flow.
+These results are retained, not counted as green cross-backend certification,
+and other-provider fixes are outside the user's Muse-only scope.
+
+Muse-native `subagent_spawn` now uses normalized spawn cards and the shared
+`SubAgentEmitter` relay interface. Each returned handle can supply a scoped
+emitter for its own descendants. Native accepted parent-run identity and the
+attested provider call resolve the immediate owner; native `parentSessionId`
+and `depth` are not used to reconstruct the tree, because Muse stores nested
+control records in the outer session and reports flat physical provenance.
+
+Each child follows its explicitly bound session/log and opaque MSP view cursor.
+Muse rejects live view subscription for these unloaded native child sessions,
+so file-append notifications drive native view paging without polling, directory
+searches or guessed paths. The same production projection handles each child's
+messages, reasoning, tools and per-request usage. Initial replay is bounded by
+the acknowledged native snapshot; actual terminal metadata does not resurrect
+finished work, while an unfinished response hands over to a live stream.
+Child events reach their relay before descendant registration, matching the
+host's parent-card publication barrier. Native terminal events own completion.
+The snapshot handoff regression distinguishes completed attempt A from active
+attempt B: its original run failed in 12.56 seconds; the fixed flow passed in
+21.61 seconds without reopening A or losing B's live response.
+
+The existing sibling-delegation scenario failed before normalization and passes
+on Muse (17.81 seconds). A new `NativeSubagentHierarchy` scenario checks two
+native generations, immediate-parent cards, separate conversations/accounting,
+a yielded shell, exact replies and resume without new live historical children.
+It also reproduces the rendered-app child `task/list` failure before its fix
+(7.90 seconds), and passes afterward (38.78 seconds). An observed child has no
+loaded root task-control plane: it preserves native execution-state facts but
+does not query that inventory or offer an unsupported direct cancel button.
+Native child conversations retain the shared read-only relay contract; parent
+native collaboration tools remain the control surface.
+
+The existing nested-ownership scenario's Muse prompt now explicitly names native
+spawn/wait/read tools instead of allowing a mistaken Tyde MCP spawn with backend
+`default`. Its assertions and other provider prompts are unchanged. Runs against
+all six eligible backends pass Muse (19.14 seconds), Codex (13.86), Grok (43.06)
+and OpenCode (26.67), but fail Claude at native-child discovery and Hermes at
+child completion. These failures remain red; they are not Muse certification
+passes or permission to weaken the common scenario. The hierarchy reply oracle
+accepts exact assistant content from both replay `MessageAdded` and live
+`StreamEnd`, rather than rejecting correctly rendered live replies.
+
+Scoped rendered QA on Linux, Muse 1.4.7 and Spark 1.3 low observed all three
+cards Thinking with the command proof absent, then all three Idle with the
+proof present. Two 16-pixel indentation steps and both parent/descendant tool
+links were rendered, each conversation retained its own final reply, child
+input was read-only, and no error appeared after the fix. The initial long-shell
+UI failure was retained and added to real conformance rather than counted as
+passing. Both disposable instances were stopped, their stores removed, and
+owned native processes verified absent. Later retained captures cover the
+desktop question/read/native-output layouts, phone-width loader and native
+output, and the corrected Muse profile flow. The latter also launched a real
+Tyde-managed Muse child and verified both native model identities, lineage,
+working-to-idle transitions and exact child response. These are scoped QA,
+not a claim of full backend certification or physical-device testing.
+
+Mid-turn steering is not advertised: the native host backgrounds the
+conformance command after ten seconds even with a longer foreground yield.
+Manual compaction now uses native `session/compact` admission and the durable
+command target, candidate installation and command outcome. Busy turns and
+background work defer dispatch. Installation identity correlates the terminal
+and observation into one timeline entry; estimated native budget snapshots do
+not become a trusted provider occupancy reset. Focus text is rejected because
+MSP does not expose that parameter. The unchanged compaction/resume scenario
+failed before this transport was implemented (17.44 seconds) and passes on
+Muse 1.4.7 after the fix (64.37 seconds): idle dispatch, busy-turn deferral,
+tool continuity, retained steering and native resume. Its first fixed run also
+caught internal compaction events being decoded as chat events; the adapter
+now routes the typed compaction envelope through the backend event boundary.
+The slow-compaction regression additionally held genuine native terminal
+delivery beyond the old 300-second cutoff. The restored expiry failed in
+323.64 seconds; the fixed durable-outcome flow passed in 341.51 seconds.
+Automatic compaction, native workflow presentation, full background-task
+control, slash commands and native skill projection remain uncertified.
+Tyde-managed agent tools remain a separate MCP capability. A passing ordinary
+repository check is not a real-provider certification; retained scoped runs
+must also pass before this workbench is ready. Inference-only execution is
+explicitly rejected because the audited host cannot disable autonomous
+observers; no unsupported CLI setting is passed as pretend enforcement.
+Unadvertised native capabilities and the explicitly recorded cross-backend
+failures remain limitations, not passing conformance. Ordinary repository
+validation, retained real-provider evidence and focused review are separate
+requirements; none substitutes for another.

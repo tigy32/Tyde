@@ -1471,6 +1471,8 @@ async fn team_describe_includes_default_agent_member() {
                 tool_response: Some(protocol::SendMessageToolResponse::AskUserQuestion {
                     tool_call_id: request.tool_call_id.clone(),
                     answer: "GREEN".to_owned(),
+
+                    structured_answers: None,
                 }),
             },
         )

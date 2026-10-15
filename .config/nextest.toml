@@ -39,15 +39,14 @@ filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found
 threads-required = "num-test-threads"
 success-output = "final"
 
-# These real protocol flows spawn Git worktrees or probe native CLI settings.
-# Reserve process-heavy flows so their I/O does not contend with the suite.
+# Reserve the process-heavy worktree and native Hermes settings flows.
 [[profile.default.overrides]]
-filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots)'
+filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & (test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots) | test(hermes_save_is_not_blocked_by_a_stale_untouched_profile_value) | test(settings_write_lifecycle_is_serialized_across_writers))'
 threads-required = "num-test-threads"
 success-output = "final"
 
 [[profile.ci.overrides]]
-filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots)'
+filter = 'binary_id(server::swarms) & test(workspace_scopes_authorize_current_projects_workbenches_and_resume_roots) | binary_id(server::settings) & (test(settings_write_enabled_backends_refreshes_schemas_and_config_snapshots) | test(hermes_save_is_not_blocked_by_a_stale_untouched_profile_value) | test(settings_write_lifecycle_is_serialized_across_writers))'
 threads-required = "num-test-threads"
 success-output = "final"
 

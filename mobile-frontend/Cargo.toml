@@ -82,6 +82,7 @@ web-sys = { version = "0.3", features = [
     "DomTokenList",
     "MutationObserver",
     "MutationObserverInit",
+    "MutationRecord",
     "Screen",
     "Storage",
     "VisualViewport",
@@ -135,5 +136,5 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 
 [dev-dependencies]
 ciborium = "0.2"
-web-sys = { version = "0.3", features = ["HtmlIFrameElement", "EventInit"] }
+web-sys = { version = "0.3", features = ["HtmlIFrameElement", "HtmlImageElement", "EventInit"] }
 wasm-bindgen-test = "0.3"

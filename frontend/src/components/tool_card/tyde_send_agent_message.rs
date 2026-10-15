@@ -79,6 +79,7 @@ pub(crate) fn render(
 
 fn result_kind(result: &ToolExecutionResult) -> &'static str {
     match result {
+        ToolExecutionResult::AskUserQuestion { .. } => "AskUserQuestion",
         ToolExecutionResult::ModifyFile { .. } => "ModifyFile",
         ToolExecutionResult::RunCommand { .. } => "RunCommand",
         ToolExecutionResult::ReadFiles { .. } => "ReadFiles",
@@ -91,6 +92,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         ToolExecutionResult::ViewImage { .. } => "ViewImage",
         ToolExecutionResult::Sleep => "Sleep",
         ToolExecutionResult::ExitPlanMode { .. } => "ExitPlanMode",
+        ToolExecutionResult::NativeContent { .. } => "NativeContent",
         ToolExecutionResult::Other { .. } => "Other",
     }
 }

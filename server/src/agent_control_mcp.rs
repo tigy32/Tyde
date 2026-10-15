@@ -332,6 +332,7 @@ pub(crate) enum BackendKindInput {
     Hermes,
     Grok,
     Opencode,
+    Muse,
 }
 
 impl From<BackendKindInput> for BackendKind {
@@ -344,6 +345,7 @@ impl From<BackendKindInput> for BackendKind {
             BackendKindInput::Hermes => Self::Hermes,
             BackendKindInput::Grok => Self::Grok,
             BackendKindInput::Opencode => Self::Opencode,
+            BackendKindInput::Muse => Self::Muse,
         }
     }
 }

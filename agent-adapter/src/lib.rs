@@ -93,17 +93,26 @@ exhaustive_capabilities! {
     SessionSettings,
     SessionSpeed,
     StartupMcpServers,
-    // An image block in an MCP tool result reaches both the model, as an
-    // image, and the completion, intact. Grok moves it into a synthetic user
-    // message and Hermes into a cache file path, so neither stream carries
+    // An image block in a successful MCP tool result reaches both the model,
+    // as an image, and the completion, intact. Grok moves it into a synthetic
+    // user message and Hermes into a cache file path, so neither stream carries
     // the pixels. Kiro reports the block but gives its model base64 text: the
     // model decoded the PNG with a shell command instead of seeing it.
     McpImageResults,
+    // Retains the server's original text block beside its typed image in the
+    // canonical result used by real_mcp_image_text_fidelity, not native
+    // presentation text. This does not certify arbitrary block interleaving,
+    // structuredContent, or _meta.
+    McpOriginalContentFidelity,
     // An MCP result with `isError: true` completes as a failure carrying the
     // server's result. Antigravity and Hermes reach MCP servers through Tyde's
     // bridge, which reports every call as a success so the provider keeps the
     // embedded result, and both then flatten it to plain text.
     McpErrorResults,
+    // An MCP failure also retains its original image pixels and media type
+    // beside the server text, without losing the failed outcome. Error status
+    // and text preservation alone do not promise failed-image retention.
+    McpErrorImageResults,
     AgentControlTools,
     TurnUsageReported,
     // Reports a session-cumulative total alongside the turn. Split out from
@@ -118,13 +127,27 @@ exhaustive_capabilities! {
     ContextUsageReported,
     ContextBreakdownReported,
     CompactionReported,
+    // Manual admission is separate from its command-correlated durable target
+    // and outcome; any completed installation is attested on the same ledger.
+    DurableCompactionLedger,
     Subagents,
+    NativeSubagentHierarchy,
     ExcludeAgentDelegation,
     EnforcedReadOnly,
+    // Exact allow and deny lists are enforced by the native tool catalogue.
+    NativeToolPolicies,
     NativeSubagentWaitProgress,
     ForegroundSubagents,
     BackgroundSubagents,
+    // Commands can outlive their launching turn. This does not promise that
+    // interrupting a turn preserves them; cancellation scope is separate.
     BackgroundTasks,
+    // Interrupting either the launching turn or a later foreground turn leaves
+    // already-backgrounded commands running until their own terminal outcome.
+    InterruptPreservesBackgroundTasks,
+    // Background commands share their still-active owning turn's cancellation
+    // scope. This says nothing about other turns, subagents, or workflows.
+    InterruptCancelsOwnedBackgroundCommands,
     // The runtime can stop one named background command without touching the
     // turn or any other background work, so the user gets a cancel affordance
     // on that card. Measured: Claude answers the `stop_task` control request
@@ -163,6 +186,8 @@ exhaustive_capabilities! {
     RetryTelemetry,
     OrchestrationEvents,
     UserQuestionRequests,
+    UserQuestionHistory,
+    StructuredUserQuestionAnswers,
     AsyncUserQuestionRequests,
     PlanApprovalRequests,
     WorkspaceInstructions,
@@ -236,6 +261,14 @@ impl BackendCapabilities {
             BackendCapability::GenericOtherTool,
         )?;
         self.require(
+            BackendCapability::McpErrorImageResults,
+            BackendCapability::McpImageResults,
+        )?;
+        self.require(
+            BackendCapability::McpErrorImageResults,
+            BackendCapability::McpErrorResults,
+        )?;
+        self.require(
             BackendCapability::ForegroundSubagents,
             BackendCapability::Subagents,
         )?;
@@ -251,6 +284,28 @@ impl BackendCapabilities {
             BackendCapability::CancelsBackgroundTasks,
             BackendCapability::BackgroundTasks,
         )?;
+        for scope in [
+            BackendCapability::InterruptPreservesBackgroundTasks,
+            BackendCapability::InterruptCancelsOwnedBackgroundCommands,
+        ] {
+            self.require(scope, BackendCapability::BackgroundTasks)?;
+            self.require(scope, BackendCapability::Interrupt)?;
+        }
+        let preserves = self.contains(BackendCapability::InterruptPreservesBackgroundTasks);
+        let cancels = self.contains(BackendCapability::InterruptCancelsOwnedBackgroundCommands);
+        if preserves && cancels {
+            return Err(CapabilityDeclarationError::Conflicting {
+                first: BackendCapability::InterruptPreservesBackgroundTasks,
+                second: BackendCapability::InterruptCancelsOwnedBackgroundCommands,
+            });
+        }
+        if self.contains(BackendCapability::BackgroundTasks)
+            && self.contains(BackendCapability::Interrupt)
+            && !preserves
+            && !cancels
+        {
+            return Err(CapabilityDeclarationError::MissingBackgroundInterruptionScope);
+        }
         self.require(
             BackendCapability::MovesTimedOutCommandsToBackground,
             BackendCapability::BackgroundTasks,
@@ -272,7 +327,7 @@ impl BackendCapabilities {
         required: BackendCapability,
     ) -> Result<(), CapabilityDeclarationError> {
         if self.contains(capability) && !self.contains(required) {
-            return Err(CapabilityDeclarationError {
+            return Err(CapabilityDeclarationError::MissingRequired {
                 capability,
                 required,
             });
@@ -282,18 +337,33 @@ impl BackendCapabilities {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapabilityDeclarationError {
-    pub capability: BackendCapability,
-    pub required: BackendCapability,
+pub enum CapabilityDeclarationError {
+    MissingRequired {
+        capability: BackendCapability,
+        required: BackendCapability,
+    },
+    Conflicting {
+        first: BackendCapability,
+        second: BackendCapability,
+    },
+    MissingBackgroundInterruptionScope,
 }
 
 impl std::fmt::Display for CapabilityDeclarationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "capability {:?} requires {:?}",
-            self.capability, self.required
-        )
+        match self {
+            Self::MissingRequired {
+                capability,
+                required,
+            } => write!(formatter, "capability {capability:?} requires {required:?}"),
+            Self::Conflicting { first, second } => {
+                write!(formatter, "capabilities {first:?} and {second:?} conflict")
+            }
+            Self::MissingBackgroundInterruptionScope => write!(
+                formatter,
+                "BackgroundTasks with Interrupt requires an explicit background interruption scope"
+            ),
+        }
     }
 }
 

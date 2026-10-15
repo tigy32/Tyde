@@ -366,6 +366,10 @@ pub enum BackendCompactionFailureKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionTerminalEvidence {
+    Muse {
+        session_id: String,
+        install_id: String,
+    },
     Claude {
         session_id: Option<String>,
         boundary_uuid: Option<String>,
@@ -406,6 +410,10 @@ impl BackendCompactionTerminalEvidence {
     /// Hermes carries no per-event id, so it cannot name this correlation.
     pub(crate) fn observation_id(&self) -> Option<CompactionObservationId> {
         match self {
+            Self::Muse {
+                session_id,
+                install_id,
+            } => Some(stable_observation_id("muse", session_id, install_id)),
             Self::Claude {
                 session_id: Some(session_id),
                 boundary_uuid: Some(boundary_uuid),
@@ -457,6 +465,9 @@ pub struct BackendObservedCompaction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionObservationSource {
+    MuseInstall {
+        install_id: String,
+    },
     ClaudeBoundary {
         boundary_uuid: String,
     },

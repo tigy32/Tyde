@@ -213,6 +213,7 @@ pub(crate) fn normalize_tyde_chat_event(
             message: failure.detail.clone(),
             details: Some(failure.detail),
             normalization_failure: Some(failure.kind),
+            result: None,
         };
     }
     (ChatEvent::ToolExecutionCompleted(completion), None)

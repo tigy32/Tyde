@@ -2133,6 +2133,11 @@ kbd {
     color: #2dd4bf;
 }
 
+.backend-badge.muse {
+    background: rgba(0, 100, 255, 0.12);
+    color: #388bff;
+}
+
 /* ===== Views ===== */
 
 .placeholder-text {

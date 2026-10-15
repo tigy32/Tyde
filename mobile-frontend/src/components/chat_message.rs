@@ -2,6 +2,32 @@ use leptos::prelude::*;
 
 use crate::state::{AgentRef, ChatMessageEntry};
 
+pub(crate) fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
+    view! {
+        <div class="chat-message-images" data-mobile-test="chat-message-images">
+            {images.into_iter().map(|image| {
+                let src = format!("data:{};base64,{}", image.media_type, image.data);
+                let href = matches!(
+                    image.media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+                )
+                .then(|| src.clone());
+                view! {
+                    <a
+                        class="chat-message-image-link"
+                        href=href
+                        target="_blank"
+                        rel="noopener"
+                        aria-label="Open image full size"
+                    >
+                        <img class="chat-message-image" src=src alt="Chat image" loading="lazy" />
+                    </a>
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
+}
+
 fn compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
@@ -246,33 +272,7 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
 
             <div class="message-content" data-mobile-test="chat-message-content" inner_html=crate::markdown::render_markdown(&content)></div>
 
-            {(!images.is_empty()).then(|| view! {
-                <div class="chat-message-images" data-mobile-test="chat-message-images">
-                    {images.into_iter().map(|image| {
-                        let src = format!("data:{};base64,{}", image.media_type, image.data);
-                        let href = matches!(
-                            image.media_type.as_str(),
-                            "image/png"
-                                | "image/jpeg"
-                                | "image/jpg"
-                                | "image/gif"
-                                | "image/webp"
-                        )
-                        .then(|| src.clone());
-                        view! {
-                            <a
-                                class="chat-message-image-link"
-                                href=href
-                                target="_blank"
-                                rel="noopener"
-                                aria-label="Open image full size"
-                            >
-                                <img class="chat-message-image" src=src alt="Chat image" loading="lazy" />
-                            </a>
-                        }
-                    }).collect::<Vec<_>>()}
-                </div>
-            })}
+            {(!images.is_empty()).then(|| render_message_images(images))}
 
             // Tool requests
             {if tool_requests.is_empty() {

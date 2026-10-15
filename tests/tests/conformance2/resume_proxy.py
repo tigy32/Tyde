@@ -11,15 +11,15 @@ import time
 
 
 def proxy():
-    if "app-server" not in sys.argv[2:]:
-        real = os.environ["TYDE_REAL_CODEX_EXECUTABLE"]
+    if not any(arg in {"app-server", "serve"} for arg in sys.argv[2:]):
+        real = os.environ["TYDE_REAL_RESUME_EXECUTABLE"]
         os.execv(real, [real, *sys.argv[2:]])
     child = subprocess.Popen(
-        [os.environ["TYDE_REAL_CODEX_EXECUTABLE"], *sys.argv[2:]],
+        [os.environ["TYDE_REAL_RESUME_EXECUTABLE"], *sys.argv[2:]],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
     )
     lock = threading.Lock()
-    state = {"request": None, "thread": None, "started": False, "released": False}
+    state = {"request": None, "scope": None, "scope_key": None, "started": False, "released": False}
     held = None
     deadline = None
 
@@ -34,10 +34,14 @@ def proxy():
         try:
             for line in sys.stdin.buffer:
                 request = json.loads(line)
-                if request.get("method") == "thread/resume":
+                if request.get("method") in {"thread/resume", "session/resume"}:
+                    keys = [key for key in ("threadId", "sessionId") if key in request["params"]]
+                    if len(keys) != 1:
+                        raise RuntimeError("real resume request must identify one native scope")
                     with lock:
                         state["request"] = request["id"]
-                        state["thread"] = request["params"]["threadId"]
+                        state["scope_key"] = keys[0]
+                        state["scope"] = request["params"][keys[0]]
                     deadline = threading.Timer(30, expire)
                     deadline.start()
                 child.stdin.write(line)
@@ -65,7 +69,7 @@ def proxy():
                 resumed_start = (
                     state["request"] is not None
                     and message.get("method") == "turn/started"
-                    and message.get("params", {}).get("threadId") == state["thread"]
+                    and message.get("params", {}).get(state["scope_key"]) == state["scope"]
                 )
                 if resumed_start:
                     state["started"] = True
@@ -99,13 +103,14 @@ def proxy():
 
 def run():
     os.umask(0o077)
-    real = shutil.which("codex")
+    program = sys.argv[3]
+    real = shutil.which(program)
     if real is None:
-        raise RuntimeError("real Codex CLI is required")
+        raise RuntimeError("the selected real provider CLI is required")
     run_dir = Path(tempfile.mkdtemp(prefix="tyde-real-resume-race-"))
     binary_dir = run_dir / "bin"
     binary_dir.mkdir()
-    wrapper = binary_dir / "codex"
+    wrapper = binary_dir / program
     wrapper.write_text(
         "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " "
         + shlex.quote(str(Path(__file__).resolve())) + ' --proxy "$@"\n'
@@ -121,7 +126,7 @@ def run():
         os.environ,
         PATH=str(binary_dir) + os.pathsep + os.environ["PATH"],
         SHELL=str(shell),
-        TYDE_REAL_CODEX_EXECUTABLE=real,
+        TYDE_REAL_RESUME_EXECUTABLE=real,
         TYDE_RESUME_RACE_PROOF=str(proof),
     )
     print("Real resume race evidence:", run_dir, flush=True)

@@ -37,6 +37,7 @@ pub fn failed_completion(
             message: message.to_owned(),
             details: details.map(str::to_owned),
             normalization_failure,
+            result: None,
         },
     }
 }
