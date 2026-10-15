@@ -64,7 +64,7 @@ pub(crate) fn tyde_permissions_guidance(role: protocol::AgentTydePermissions) ->
             "Tyde permissions: Tyde Orchestrator. You may control any agent on this Tyde host, and add new steering, agent presets, or review aspects for self-improvement. Never edit or remove existing steering, presets, aspects, or other Tyde settings, including remote access, authentication, or host pairing. Do not promote yourself or another agent unless the human explicitly asks. New children default to Agent."
         }
         protocol::AgentTydePermissions::Root => {
-            "Tyde permissions: Root. You may use any Tyde control, including editing and removing steering, review aspects, agent presets, and other configuration, to carry out the human's request. Read current state before changing it and report what changed. New children default to Agent; do not change their role unless the human explicitly asks."
+            "Tyde permissions: Root. You may use any Tyde control, including creating, renaming, and removing projects and their roots, and editing and removing steering, review aspects, agent presets, and other configuration, to carry out the human's request. Read current state before changing it and report what changed. New children default to Agent; do not change their role unless the human explicitly asks."
         }
     }
 }

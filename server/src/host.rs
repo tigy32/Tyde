@@ -6840,7 +6840,7 @@ impl HostHandle {
         Ok(agent_id)
     }
 
-    pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<()> {
+    pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<Project> {
         const OPERATION: &str = "project_create";
         let mut state = self.state.lock().await;
         let project = {
@@ -6850,7 +6850,13 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
         let project_id = project.id.clone();
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        fan_out_project_notify(
+            &mut state,
+            ProjectNotifyPayload::Upsert {
+                project: project.clone(),
+            },
+        )
+        .await;
         if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
             tracing::warn!(
                 project_id = %project_id,
@@ -6884,7 +6890,7 @@ impl HostHandle {
         drop(state);
         self.update_workflow_watcher_targets_and_reload("project_create")
             .await?;
-        Ok(())
+        Ok(project)
     }
 
     pub(crate) async fn move_agent(

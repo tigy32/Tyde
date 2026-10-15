@@ -11303,12 +11303,99 @@ async fn help_controls_top_level_agents_across_projects() {
     let existing = spawn_agent_control_parent(&mut fixture, "existing top level").await;
     let ordinary = fixture.agent_control_caller(&existing.agent_id).await;
     let project_root = tempfile::tempdir().unwrap();
-    let project = create_project(
-        &mut fixture.client,
-        "Other project",
-        vec![project_root.path().to_string_lossy().into_owned()],
+    let extra_root = tempfile::tempdir().unwrap();
+    let project_root_path = project_root.path().to_string_lossy().into_owned();
+    let extra_root_path = extra_root.path().to_string_lossy().into_owned();
+    let created = config_agent_tool(
+        &url,
+        "tyde_config_create_project",
+        json!({"name": "Draft project", "roots": [project_root_path]}),
     )
     .await;
+    let created = mcp_success_json(&created);
+    let project = match expect_project_notify(&mut fixture.client, "Help project create").await {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected Help-created project upsert, got {other:?}"),
+    };
+    assert_eq!(created["id"], project.id.0);
+    assert_eq!(project.name, "Draft project");
+    assert_eq!(project_roots(&project), vec![project_root_path.clone()]);
+
+    let added = config_agent_tool(
+        &url,
+        "tyde_config_add_project_root",
+        json!({"project_id": project.id.0, "root": extra_root_path}),
+    )
+    .await;
+    let added = mcp_success_json(&added);
+    assert_eq!(
+        added["source"]["roots"],
+        json!([project_root_path, extra_root_path])
+    );
+    match expect_project_notify(&mut fixture.client, "Help add root").await {
+        ProjectNotifyPayload::Upsert { project: updated } => assert_eq!(
+            project_roots(&updated),
+            vec![project_root_path.clone(), extra_root_path.clone()]
+        ),
+        other => panic!("expected Help add-root upsert, got {other:?}"),
+    }
+    let removed = config_agent_tool(
+        &url,
+        "tyde_config_remove_project_root",
+        json!({"project_id": project.id.0, "root": extra_root_path}),
+    )
+    .await;
+    let removed = mcp_success_json(&removed);
+    assert_eq!(removed["source"]["roots"], json!([project_root_path]));
+    match expect_project_notify(&mut fixture.client, "Help remove root").await {
+        ProjectNotifyPayload::Upsert { project: updated } => {
+            assert_eq!(project_roots(&updated), vec![project_root_path.clone()])
+        }
+        other => panic!("expected Help remove-root upsert, got {other:?}"),
+    }
+    let renamed = config_agent_tool(
+        &url,
+        "tyde_config_rename_project",
+        json!({"project_id": project.id.0, "name": "Other project"}),
+    )
+    .await;
+    assert_eq!(mcp_success_json(&renamed)["name"], "Other project");
+    let project = match expect_project_notify(&mut fixture.client, "Help rename").await {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected Help rename upsert, got {other:?}"),
+    };
+    assert_eq!(project.name, "Other project");
+    let rejected = config_agent_tool(
+        &url,
+        "tyde_config_create_project",
+        json!({"name": "Rootless", "roots": []}),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&rejected),
+        "Help project creation must share the UI's root validation"
+    );
+
+    let doomed_root = tempfile::tempdir().unwrap();
+    let doomed = config_agent_tool(
+        &url,
+        "tyde_config_create_project",
+        json!({"name": "Doomed", "roots": [doomed_root.path().to_string_lossy()]}),
+    )
+    .await;
+    let doomed_id = mcp_success_json(&doomed)["id"].as_str().unwrap().to_owned();
+    expect_project_notify(&mut fixture.client, "Help doomed create").await;
+    let deleted = config_agent_tool(
+        &url,
+        "tyde_config_delete_project",
+        json!({"project_id": doomed_id}),
+    )
+    .await;
+    assert_eq!(mcp_success_json(&deleted)["deleted"], true);
+    match expect_project_notify(&mut fixture.client, "Help delete").await {
+        ProjectNotifyPayload::Delete { project: deleted } => assert_eq!(deleted.id.0, doomed_id),
+        other => panic!("expected Help project delete, got {other:?}"),
+    }
     let projects = config_agent_tool(&url, "tyde_config_list_projects", json!({})).await;
     let projects = mcp_success_json(&projects);
     assert!(
@@ -11317,6 +11404,14 @@ async fn help_controls_top_level_agents_across_projects() {
             .unwrap()
             .iter()
             .any(|p| p["id"] == project.id.0)
+    );
+    assert!(
+        projects
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["id"] != doomed_id.as_str()),
+        "Help-deleted project must leave the project list"
     );
 
     let redirect_gate = MockGateHandle::new();

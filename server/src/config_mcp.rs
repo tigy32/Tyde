@@ -1,6 +1,6 @@
 //! Built-in `tyde-config` MCP server.
 //!
-//! Exposes host configuration — settings, custom agents, skills, MCP servers,
+//! Exposes host configuration — settings, projects, custom agents, skills, MCP servers,
 //! backend setup status, and host-wide agent lifecycle — as MCP tools. Agents
 //! receive human-assigned role guidance through this surface; roles are advisory
 //! rather than an operating-system security boundary. All mutations go through the same `HostHandle`
@@ -80,6 +80,16 @@ impl TydeConfigMcpServer {
                 .map(|e| e.message)
                 .collect::<Vec<_>>()
                 .join("; "))
+        }
+    }
+
+    async fn project_json(&self, id: &protocol::ProjectId) -> Result<CallToolResult, McpError> {
+        match self.host.list_projects().await {
+            Ok(projects) => match projects.into_iter().find(|project| &project.id == id) {
+                Some(project) => ok_json(project),
+                None => Ok(err_text(format!("project {id} no longer exists"))),
+            },
+            Err(error) => Ok(err_text(error)),
         }
     }
 
@@ -300,6 +310,35 @@ struct UpsertSteeringToolInput {
 #[serde(deny_unknown_fields)]
 struct SteeringIdToolInput {
     steering_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CreateProjectToolInput {
+    name: String,
+    /// Absolute directory paths on this host; at least one.
+    roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RenameProjectToolInput {
+    project_id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProjectRootToolInput {
+    project_id: String,
+    /// Absolute directory path on this host.
+    root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProjectIdToolInput {
+    project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -565,6 +604,126 @@ impl TydeConfigMcpServer {
         }
     }
 
+    #[tool(
+        description = "Create a standalone project from absolute root directories on this host, exactly like adding a project in the Tyde UI. Only Root role guidance permits project changes. Returns the created project."
+    )]
+    async fn tyde_config_create_project(
+        &self,
+        Parameters(input): Parameters<CreateProjectToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let payload = protocol::ProjectCreatePayload {
+            name: input.name,
+            roots: input
+                .roots
+                .into_iter()
+                .map(protocol::ProjectRootPath)
+                .collect(),
+        };
+        let result = async {
+            crate::router::ensure_non_empty("project_create", "name", &payload.name)?;
+            crate::router::validate_project_roots(&payload.roots)?;
+            self.host.create_project(payload).await
+        }
+        .await;
+        match result {
+            Ok(project) => ok_json(project),
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
+        description = "Rename a project or workbench by exact project_id. Only Root role guidance permits project changes."
+    )]
+    async fn tyde_config_rename_project(
+        &self,
+        Parameters(input): Parameters<RenameProjectToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = protocol::ProjectId(input.project_id);
+        let payload = protocol::ProjectRenamePayload {
+            id: id.clone(),
+            name: input.name,
+        };
+        let result = async {
+            crate::router::ensure_non_empty("project_rename", "id", &payload.id.0)?;
+            crate::router::ensure_non_empty("project_rename", "name", &payload.name)?;
+            self.host.rename_project(payload).await
+        }
+        .await;
+        match result {
+            Ok(()) => self.project_json(&id).await,
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
+        description = "Add an absolute root directory to an existing standalone project by exact project_id, exactly like Add Root in the Tyde UI. Only Root role guidance permits project changes. Returns the updated project."
+    )]
+    async fn tyde_config_add_project_root(
+        &self,
+        Parameters(input): Parameters<ProjectRootToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = protocol::ProjectId(input.project_id);
+        let payload = protocol::ProjectAddRootPayload {
+            id: id.clone(),
+            root: protocol::ProjectRootPath(input.root),
+        };
+        let result = async {
+            crate::router::ensure_non_empty("project_add_root", "id", &payload.id.0)?;
+            crate::router::ensure_non_empty("project_add_root", "root", &payload.root.0)?;
+            self.host.add_project_root(payload).await
+        }
+        .await;
+        match result {
+            Ok(()) => self.project_json(&id).await,
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
+        description = "Remove a root directory from a standalone project by exact project_id and root path as listed by tyde_config_list_projects. Does not delete files on disk. Only Root role guidance permits project changes. Returns the updated project."
+    )]
+    async fn tyde_config_remove_project_root(
+        &self,
+        Parameters(input): Parameters<ProjectRootToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = protocol::ProjectId(input.project_id);
+        let payload = protocol::ProjectDeleteRootPayload {
+            id: id.clone(),
+            root: protocol::ProjectRootPath(input.root),
+        };
+        let result = async {
+            crate::router::ensure_non_empty("project_delete_root", "id", &payload.id.0)?;
+            crate::router::ensure_non_empty("project_delete_root", "root", &payload.root.0)?;
+            self.host.delete_project_root(payload).await
+        }
+        .await;
+        match result {
+            Ok(()) => self.project_json(&id).await,
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
+
+    #[tool(
+        description = "Remove a standalone project from Tyde by exact project_id, exactly like deleting it in the Tyde UI. Does not delete files on disk; saved sessions are detached and project-scoped steering is removed. Workbenches must be removed with tyde_remove_workbench, and a project with workbenches cannot be removed until they are. Confirm the target with the user first. Only Root role guidance permits project changes."
+    )]
+    async fn tyde_config_delete_project(
+        &self,
+        Parameters(input): Parameters<ProjectIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let payload = protocol::ProjectDeletePayload {
+            id: protocol::ProjectId(input.project_id),
+        };
+        let id = payload.id.clone();
+        let result = async {
+            crate::router::ensure_non_empty("project_delete", "id", &payload.id.0)?;
+            self.host.delete_project(payload).await
+        }
+        .await;
+        match result {
+            Ok(()) => ok_json(json!({"project_id": id, "deleted": true})),
+            Err(error) => Ok(err_text(error.message)),
+        }
+    }
     #[tool(
         description = "List enabled backends, launch profiles, ordered advisory preferences, defaults, and known backend limits. Read before creating an agent."
     )]
@@ -1086,7 +1245,7 @@ impl ServerHandler for TydeConfigMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, check backend setup status, and create/list/message/close live agents across all projects on this host. Global agent tools are distinct from custom-agent templates; Call tyde_config_get_permissions before controlling Tyde and obey the human-assigned role: Agent controls own sub-agents, Orchestrator controls any agent and adds new steering or review aspects, Root may edit or remove anything in Tyde. Roles are behavioral guidance, not a security sandbox. Read current state before changing it, and tell the user exactly what changed."
+                "Tools for inspecting and configuring this Tyde host: read/change settings, create/rename/remove projects and add/remove their roots, manage custom agents, install/update/delete skills and MCP servers, check backend setup status, and create/list/message/close live agents across all projects on this host. Global agent tools are distinct from custom-agent templates; Call tyde_config_get_permissions before controlling Tyde and obey the human-assigned role: Agent controls own sub-agents, Orchestrator controls any agent and adds new steering or review aspects, Root may edit or remove anything in Tyde. Roles are behavioral guidance, not a security sandbox. Read current state before changing it, and tell the user exactly what changed."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

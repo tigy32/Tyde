@@ -1579,7 +1579,11 @@ fn validate_terminal_dimensions(operation: &'static str, cols: u16, rows: u16) -
     Ok(())
 }
 
-fn ensure_non_empty(operation: &'static str, field: &'static str, value: &str) -> AppResult<()> {
+pub(crate) fn ensure_non_empty(
+    operation: &'static str,
+    field: &'static str,
+    value: &str,
+) -> AppResult<()> {
     if value.trim().is_empty() {
         return Err(AppError::invalid(
             operation,
@@ -1846,7 +1850,7 @@ async fn send_agent_unavailable_error(stream: Stream, agent_id: AgentId, reason:
     }
 }
 
-fn validate_project_roots(roots: &[ProjectRootPath]) -> AppResult<()> {
+pub(crate) fn validate_project_roots(roots: &[ProjectRootPath]) -> AppResult<()> {
     if roots.is_empty() {
         return Err(AppError::invalid(
             "project_create",
