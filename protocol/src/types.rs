@@ -8811,6 +8811,10 @@ pub enum ToolProgressUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubAgentProgress {
     pub agent_id: AgentId,
+    /// Set from the owning agent's typed backend before server publication.
+    /// Older durable transcript revisions predate this provenance field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<BackendKind>,
     pub agent_name: String,
     pub last_tool_name: Option<String>,
     pub tool_calls: u64,

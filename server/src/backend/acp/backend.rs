@@ -2593,6 +2593,7 @@ impl KiroInner {
             execution_mode: protocol::ToolExecutionMode::Background,
             cancellable: false,
             update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                backend_kind: None,
                 agent_id: handle.agent_id.clone(),
                 agent_name: name,
                 last_tool_name: None,
@@ -3757,6 +3758,7 @@ impl KiroInner {
                                 cancellable: false,
                                 update: protocol::ToolProgressUpdate::SubAgent(
                                     protocol::SubAgentProgress {
+                                        backend_kind: None,
                                         agent_id: handle.agent_id.clone(),
                                         agent_name: child.name.clone(),
                                         last_tool_name: None,

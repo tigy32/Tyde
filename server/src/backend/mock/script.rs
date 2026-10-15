@@ -919,6 +919,34 @@ impl MockTurn {
         ])
     }
 
+    pub fn with_open_native_subagent(self, tool_call_id: &str, agent_id: AgentId) -> Self {
+        self.with_appended_steps(vec![
+            MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "Task".to_owned(),
+                tool_type: protocol::ToolRequestType::AgentSpawn {
+                    prompt: None,
+                    name: Some("Native progress".to_owned()),
+                    execution_mode: protocol::AgentExecutionMode::Background,
+                },
+            })),
+            MockStep::emit(emit::tool_progress(protocol::ToolProgressData {
+                tool_call_id: tool_call_id.to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                    agent_id,
+                    backend_kind: None,
+                    agent_name: "Native progress".to_owned(),
+                    last_tool_name: None,
+                    tool_calls: 0,
+                    completed: false,
+                    status: protocol::SubAgentProgressStatus::Running,
+                }),
+            })),
+        ])
+    }
+
     /// Leave a background tool call in flight and end the turn without ever
     /// collecting it: the request and a background-mode progress snapshot go
     /// out, and no completion follows. This is the state a provider leaves

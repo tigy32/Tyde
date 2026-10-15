@@ -5345,6 +5345,13 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
+                    let event = match event {
+                        BackendEvent::Chat(mut event) => {
+                            project_native_progress_backend(&mut event, backend_kind);
+                            BackendEvent::Chat(event)
+                        }
+                        event => event,
+                    };
                     let mut event = match event {
                         BackendEvent::ResumeReplayComplete(result) => {
                             let result = if resume_replay_gate_pending {
@@ -10229,6 +10236,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
 
+                    project_native_progress_backend(&mut event, current_start.backend_kind);
                     if let ChatEvent::MessageAdded(message) = &mut event
                         && matches!(message.sender, MessageSender::User)
                         && message.origin.is_none()
@@ -12734,6 +12742,15 @@ async fn read_viewed_image(
         media_type: media_type.to_owned(),
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
+}
+
+fn project_native_progress_backend(event: &mut ChatEvent, backend_kind: BackendKind) {
+    if let ChatEvent::ToolProgress(progress) = event
+        && let protocol::ToolProgressUpdate::SubAgent(subagent) = &mut progress.update
+    {
+        // Native relays inherit this exact backend in Host::spawn_backend_native_subagent.
+        subagent.backend_kind = Some(backend_kind);
+    }
 }
 
 async fn append_backend_chat_event(

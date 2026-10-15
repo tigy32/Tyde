@@ -1628,6 +1628,7 @@ impl Actor {
                 execution_mode: ToolExecutionMode::Background,
                 cancellable: false,
                 update: ToolProgressUpdate::SubAgent(SubAgentProgress {
+                    backend_kind: None,
                     agent_id: child.handle.agent_id.clone(),
                     agent_name: child.name.clone(),
                     last_tool_name: child.last_tool_name.clone(),

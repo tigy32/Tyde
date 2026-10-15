@@ -7372,6 +7372,7 @@ fn hermes_subagent_progress(
         execution_mode: ToolExecutionMode::Background,
         cancellable: false,
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            backend_kind: None,
             agent_id: handle.agent_id.clone(),
             agent_name: agent_name.to_string(),
             last_tool_name: None,

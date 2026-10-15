@@ -8016,6 +8016,7 @@ fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolP
         },
         cancellable: false,
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            backend_kind: None,
             agent_id: stream.agent_id.clone(),
             agent_name: stream.agent_name.clone(),
             last_tool_name: stream.last_tool_name.clone(),

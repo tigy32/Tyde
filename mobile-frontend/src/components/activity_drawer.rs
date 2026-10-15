@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 
 use leptos::prelude::*;
-use protocol::{ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunStatus};
+use protocol::{
+    BackendKind, ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunStatus,
+};
+
+use crate::components::chat_input::backend_label;
 
 use crate::state::{ActiveAgentRef, AppState};
 
@@ -10,6 +14,7 @@ struct ActivityRow {
     id: String,
     name: String,
     status: String,
+    backend_kind: Option<BackendKind>,
     target: Option<ActiveAgentRef>,
 }
 
@@ -83,6 +88,7 @@ fn activity_snapshot(state: &AppState) -> ActivitySnapshot {
                 "Running"
             }
             .to_owned(),
+            backend_kind: Some(agent.backend_kind),
             target: Some(ActiveAgentRef {
                 local_host_id: parent.local_host_id.clone(),
                 agent_id: agent.agent_id.clone(),
@@ -110,21 +116,18 @@ fn activity_snapshot(state: &AppState) -> ActivitySnapshot {
                     continue;
                 }
                 children.insert(sub.agent_id.clone());
-                let target = registry
-                    .iter()
-                    .find(|agent| {
-                        agent.local_host_id == parent.local_host_id
-                            && agent.agent_id == sub.agent_id
-                    })
-                    .map(|agent| ActiveAgentRef {
-                        local_host_id: agent.local_host_id.clone(),
-                        agent_id: agent.agent_id.clone(),
-                    });
+                let agent = registry.iter().find(|agent| {
+                    agent.local_host_id == parent.local_host_id && agent.agent_id == sub.agent_id
+                });
                 snapshot.agents.push(ActivityRow {
                     id: sub.agent_id.0,
                     name: sub.agent_name,
                     status: sub.last_tool_name.unwrap_or_else(|| "Running".to_owned()),
-                    target,
+                    backend_kind: sub.backend_kind,
+                    target: agent.map(|agent| ActiveAgentRef {
+                        local_host_id: agent.local_host_id.clone(),
+                        agent_id: agent.agent_id.clone(),
+                    }),
                 });
             }
             ToolProgressUpdate::Workflow(run) if run.status == WorkflowRunStatus::Running => {
@@ -132,6 +135,7 @@ fn activity_snapshot(state: &AppState) -> ActivitySnapshot {
                     id: call_id,
                     name: run.workflow_name,
                     status: "Running workflow".to_owned(),
+                    backend_kind: None,
                     target: None,
                 });
             }
@@ -180,6 +184,7 @@ fn activity_snapshot(state: &AppState) -> ActivitySnapshot {
                     id: call_id,
                     name,
                     status: "Running".to_owned(),
+                    backend_kind: None,
                     target: None,
                 });
             }
@@ -275,7 +280,12 @@ pub fn ActivityDrawer() -> impl IntoView {
                                                 <span class="activity-dot" aria-hidden="true"></span>
                                                 <div class="activity-label">
                                                     <div class="activity-name">{row.name}</div>
-                                                    <div class="activity-status">{row.status}</div>
+                                                    <div class="activity-status">
+                                                        {row.status}
+                                                        <span class="activity-backend">{
+                                                            row.backend_kind.map(backend_label).unwrap_or("Backend unavailable")
+                                                        }</span>
+                                                    </div>
                                                 </div>
                                                 {row.target.map(|target| view! {
                                                     <button

@@ -14315,6 +14315,7 @@ impl CodexInner {
                 execution_mode: ToolExecutionMode::Background,
                 cancellable: false,
                 update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                    backend_kind: None,
                     agent_id,
                     agent_name,
                     last_tool_name: None,
@@ -16308,6 +16309,7 @@ impl CodexInner {
                     execution_mode: ToolExecutionMode::Background,
                     cancellable: false,
                     update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                        backend_kind: None,
                         agent_id: spawned_agent,
                         agent_name: spawn_name,
                         last_tool_name: None,

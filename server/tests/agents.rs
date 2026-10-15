@@ -8009,6 +8009,75 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     }
 }
 
+#[tokio::test]
+async fn native_progress_keeps_typed_backend_without_a_registry_record() {
+    const CALL: &str = "native-progress";
+    let native_id = protocol::AgentId("progress-only-child".to_owned());
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "native-progress-owner",
+            MockScript::one(
+                MockTurn::text("Delegated").with_open_native_subagent(CALL, native_id.clone()),
+            ),
+        )
+        .await;
+    let progress = fixture.next_chat_event_matching(&agent, "native backend provenance", |event| {
+        matches!(event, ChatEvent::ToolProgress(progress) if progress.tool_call_id == CALL)
+    }).await;
+    let ChatEvent::ToolProgress(progress) = progress else {
+        unreachable!()
+    };
+    let protocol::ToolProgressUpdate::SubAgent(sub) = progress.update else {
+        unreachable!()
+    };
+    assert_eq!(sub.backend_kind, Some(agent.new_agent.backend_kind));
+    assert_eq!(sub.agent_id, native_id);
+    assert!(!sub.completed);
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        !bootstrap
+            .agents
+            .iter()
+            .any(|agent| agent.agent_id == native_id),
+        "native progress provenance cannot depend on a child registry record"
+    );
+    let replayed = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &replayed.instance_stream,
+        "native progress replay",
+    )
+    .await;
+    assert!(replay.events.iter().any(|event| matches!(event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+            if matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(sub)
+                if sub.agent_id == native_id && sub.backend_kind == Some(agent.new_agent.backend_kind) && !sub.completed)
+    )), "late clients receive the same typed native provenance");
+
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close native progress owner");
+    let terminal = fixture
+        .next_chat_event_matching(&agent, "native progress stopped", |event| {
+            matches!(event, ChatEvent::ToolProgress(progress)
+            if matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(sub)
+                if sub.agent_id == native_id && sub.completed))
+        })
+        .await;
+    let ChatEvent::ToolProgress(terminal) = terminal else {
+        unreachable!()
+    };
+    let protocol::ToolProgressUpdate::SubAgent(sub) = terminal.update else {
+        unreachable!()
+    };
+    assert_eq!(sub.backend_kind, Some(agent.new_agent.backend_kind));
+    assert_eq!(sub.status, protocol::SubAgentProgressStatus::Stopped);
+}
+
 /// A backend-native relay child accepts no direct input of any kind: a
 /// checked agent-control delivery is refused without wedging the parent's
 /// await or appending a secondary transcript error, its session is marked

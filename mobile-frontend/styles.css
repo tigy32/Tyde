@@ -2374,6 +2374,12 @@ input, textarea, select {
     color: var(--text-secondary);
 }
 
+.activity-backend {
+    margin-left: 6px;
+    font-size: 10px;
+    color: var(--text-secondary);
+}
+
 .activity-dot {
     flex: 0 0 8px;
     height: 8px;

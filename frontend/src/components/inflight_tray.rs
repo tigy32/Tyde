@@ -4316,6 +4316,7 @@ mod wasm_tests {
                     execution_mode: ToolExecutionMode::Foreground,
                     cancellable: false,
                     update: ToolProgressUpdate::SubAgent(SubAgentProgress {
+                        backend_kind: None,
                         agent_id: AgentId("agent-sub".to_owned()),
                         agent_name: "Explore".to_owned(),
                         last_tool_name: Some("Read".to_owned()),

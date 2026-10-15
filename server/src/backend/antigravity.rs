@@ -1534,6 +1534,7 @@ impl Supervisor {
                                 cancellable: false,
                                 update: protocol::ToolProgressUpdate::SubAgent(
                                     protocol::SubAgentProgress {
+                                        backend_kind: None,
                                         agent_id: child.agent_id.clone(),
                                         agent_name: name.clone(),
                                         last_tool_name: None,
@@ -2368,6 +2369,7 @@ async fn relay_antigravity_child(
             execution_mode: ToolExecutionMode::Background,
             cancellable: false,
             update: ToolProgressUpdate::SubAgent(SubAgentProgress {
+                backend_kind: None,
                 agent_id: child.agent_id.clone(),
                 agent_name: name.clone(),
                 last_tool_name: None,

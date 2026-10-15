@@ -712,6 +712,7 @@ fn native_child_link(tool_call_id: &str, child: &SubAgentHandle, name: &str) -> 
         execution_mode: protocol::ToolExecutionMode::Background,
         cancellable: false,
         update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            backend_kind: None,
             agent_id: child.agent_id.clone(),
             agent_name: name.to_owned(),
             last_tool_name: None,

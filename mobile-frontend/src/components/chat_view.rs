@@ -1600,6 +1600,42 @@ mod wasm_tests {
         panic!("activity drawer never stopped moving");
     }
 
+    fn rendered_text_contrast(text: &web_sys::Element, surface: &web_sys::Element) -> f64 {
+        js_sys::Function::new_with_args(
+            "text,surface",
+            r#"
+                const rgba = color => {
+                    const match = color.match(/^rgba?\(([^)]+)\)$/);
+                    if (!match) throw new Error("Expected a rendered RGB color");
+                    const channels = match[1].split(",").map(Number);
+                    return [...channels.slice(0, 3), channels[3] ?? 1];
+                };
+                const foreground = rgba(getComputedStyle(text).color);
+                const background = rgba(getComputedStyle(surface).backgroundColor);
+                if (background[3] !== 1 || Number(getComputedStyle(surface).opacity) !== 1) {
+                    throw new Error("The popup's painted surface must be opaque");
+                }
+                let alpha = foreground[3];
+                for (let node = text; node !== surface; node = node.parentElement) {
+                    if (!node) throw new Error("Text is outside the measured surface");
+                    alpha *= Number(getComputedStyle(node).opacity);
+                }
+                const luminance = rgb => rgb.slice(0, 3).reduce((sum, channel, index) => {
+                    const value = channel / 255;
+                    const linear = value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+                    return sum + linear * [0.2126, 0.7152, 0.0722][index];
+                }, 0);
+                const painted = foreground.slice(0, 3).map((channel, index) => channel * alpha + background[index] * (1 - alpha));
+                const a = luminance(painted), b = luminance(background);
+                return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+            "#,
+        )
+        .call2(&wasm_bindgen::JsValue::NULL, text, surface)
+        .expect("measure rendered text against the popup surface")
+        .as_f64()
+        .expect("rendered contrast ratio")
+    }
+
     #[wasm_bindgen_test]
     async fn mobile_activity_drawer_opens_agents_and_tracks_background_work() {
         crate::components::test_styles::ensure_styles_loaded();
@@ -1745,6 +1781,302 @@ mod wasm_tests {
             1
         );
 
+        assert_eq!(
+            element("activity-agent")
+                .query_selector(".activity-backend")
+                .unwrap()
+                .expect("child backend label")
+                .text_content()
+                .as_deref(),
+            Some("Claude")
+        );
+        container.set_attribute("data-theme", "dark").unwrap();
+        container.style().set_property("width", "320px").unwrap();
+        let sequence = std::cell::Cell::new(0);
+        crate::dispatch::reset_inbound_seq_for_host(&owner.local_host_id);
+        let publish_child = |backend_kind, name: &str| {
+            let seq = sequence.get();
+            sequence.set(seq + 1);
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &owner.local_host_id,
+                protocol::Envelope::from_payload(
+                    StreamPath("/host/fixture".to_owned()),
+                    protocol::FrameKind::NewAgent,
+                    seq,
+                    &protocol::NewAgentPayload {
+                        agent_id: AgentId("child-2".to_owned()),
+                        name: name.to_owned(),
+                        origin: AgentOrigin::BackendNative,
+                        backend_kind,
+                        parent_agent_id: Some(owner.agent_id.clone()),
+                        session_id: Some(protocol::SessionId("child-session".to_owned())),
+                        instance_stream: StreamPath("stream/child-2".to_owned()),
+                        tyde_permissions: Default::default(),
+                        swarm_membership: None,
+                        launch_profile_id: None,
+                        workspace_roots: Vec::new(),
+                        custom_agent_id: None,
+                        team_id: None,
+                        team_member_id: None,
+                        project_id: None,
+                        workflow: None,
+                        created_at_ms: 0,
+                        activity_summary: Default::default(),
+                        activity: protocol::AgentActivity::Thinking,
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        publish_child(BackendKind::Codex, "Fit complete ships in battle");
+        settle_autoscroll().await;
+        let agent_rows = || {
+            container
+                .query_selector_all("[data-mobile-test='activity-agent']")
+                .unwrap()
+        };
+        assert_eq!(agent_rows().length(), 2);
+        assert!(toggle.text_content().unwrap().contains("2 agents"));
+        let second_row = || {
+            agent_rows()
+                .item(1)
+                .unwrap()
+                .dyn_into::<web_sys::Element>()
+                .unwrap()
+        };
+        assert_eq!(
+            second_row()
+                .query_selector(".activity-backend")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Codex")
+        );
+
+        let long_name = "Codex is a task name, not the backend: remove duplicated warp progress while keeping complete ships readable";
+        for (backend, expected) in [
+            (BackendKind::Tycode, "Tycode"),
+            (BackendKind::Kiro, "Kiro"),
+            (BackendKind::Claude, "Claude"),
+            (BackendKind::Codex, "Codex"),
+            (BackendKind::Antigravity, "Antigravity"),
+            (BackendKind::Hermes, "Hermes"),
+            (BackendKind::Grok, "Grok"),
+            (BackendKind::Opencode, "OpenCode"),
+            (BackendKind::Muse, "Muse"),
+        ] {
+            publish_child(backend, long_name);
+            settle_autoscroll().await;
+            assert_eq!(
+                toggle.get_attribute("aria-expanded").as_deref(),
+                Some("true"),
+                "metadata updates do not close the popup"
+            );
+            assert_eq!(
+                agent_rows().length(),
+                2,
+                "same-key metadata replaces the row rather than duplicating it"
+            );
+            let row = second_row();
+            let name = row.query_selector(".activity-name").unwrap().unwrap();
+            let status = row.query_selector(".activity-status").unwrap().unwrap();
+            let label = row
+                .query_selector(".activity-backend")
+                .unwrap()
+                .expect("reactive backend label");
+            let button = row.query_selector("button").unwrap().unwrap();
+            assert_eq!(name.text_content().as_deref(), Some(long_name));
+            assert!(status.text_content().unwrap().contains("Running"));
+            assert_eq!(label.text_content().as_deref(), Some(expected));
+            assert_eq!(
+                button.get_attribute("aria-label"),
+                Some(format!("Open chat with {long_name}"))
+            );
+            let style = |element| {
+                web_sys::window()
+                    .unwrap()
+                    .get_computed_style(element)
+                    .unwrap()
+                    .unwrap()
+            };
+            let font_size = |element| {
+                style(element)
+                    .get_property_value("font-size")
+                    .unwrap()
+                    .trim_end_matches("px")
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            assert!(
+                font_size(&label) < font_size(&status) && font_size(&status) < font_size(&name),
+                "backend text stays subordinate to status and name"
+            );
+            // Returned captures showed #6e6e6e/#1f1f1f at 3.23:1 and
+            // #8b95a5/white at 3.03:1. The old RGB pin certified unreadable
+            // 10px text; protect rendered contrast in both themes instead.
+            for theme in ["dark", "light"] {
+                container.set_attribute("data-theme", theme).unwrap();
+                next_tick().await;
+                let surface = element("activity-list");
+                let contrast = rendered_text_contrast(&label, &surface);
+                assert!(
+                    contrast >= 4.5,
+                    "{theme} backend label contrast {contrast:.5}:1 is below readable small-text contrast"
+                );
+                assert!(
+                    contrast < rendered_text_contrast(&name, &surface),
+                    "the small backend label stays visually subordinate to the agent name"
+                );
+            }
+            container.set_attribute("data-theme", "dark").unwrap();
+            let bounds = row.get_bounding_client_rect();
+            let name_bounds = name.get_bounding_client_rect();
+            let label_bounds = label.get_bounding_client_rect();
+            let button_bounds = button.get_bounding_client_rect();
+            let list_bounds = element("activity-list").get_bounding_client_rect();
+            assert!(
+                name_bounds.height() > font_size(&name) * 2.0,
+                "long names wrap rather than disappear"
+            );
+            assert!(bounds.left() >= list_bounds.left() && bounds.right() <= list_bounds.right());
+            assert!(
+                name_bounds.right() <= button_bounds.left()
+                    && label_bounds.right() <= button_bounds.left(),
+                "name and backend never obscure Open at 320px"
+            );
+            assert!(label_bounds.left() >= bounds.left() && label_bounds.width() > 0.0);
+            assert!(
+                (label_bounds.top() - status.get_bounding_client_rect().top()).abs() < 4.0,
+                "backend stays alongside the secondary status"
+            );
+            assert!(button_bounds.width() >= 64.0 && button_bounds.height() >= 44.0);
+            let list = element("activity-list").dyn_into::<HtmlElement>().unwrap();
+            assert!(
+                list.scroll_width() <= list.client_width(),
+                "no horizontal overflow at mobile width"
+            );
+        }
+        let native_sequence = std::cell::Cell::new(0);
+        let publish_native = |backend_kind, completed| {
+            let seq = native_sequence.get();
+            native_sequence.set(seq + 1);
+            crate::dispatch::dispatch_envelope(
+                &state, &owner.local_host_id,
+                protocol::Envelope::from_payload(
+                    StreamPath("stream/1".to_owned()), protocol::FrameKind::ChatEvent, seq,
+                    &protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                        tool_call_id: "native-progress".to_owned(),
+                        execution_mode: protocol::ToolExecutionMode::Background,
+                        cancellable: false,
+                        update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                            agent_id: AgentId("native-progress-only".to_owned()),
+                            backend_kind,
+                            agent_name: "Claude is a task name: inspect native progress on a narrow mobile screen".to_owned(),
+                            last_tool_name: None, tool_calls: 0, completed,
+                            status: if completed { protocol::SubAgentProgressStatus::Completed } else { protocol::SubAgentProgressStatus::Running },
+                        }),
+                    }),
+                ).unwrap(),
+            );
+        };
+        publish_native(None, false);
+        settle_autoscroll().await;
+        let native_row = || {
+            agent_rows()
+                .item(2)
+                .unwrap()
+                .dyn_into::<web_sys::Element>()
+                .unwrap()
+        };
+        assert_eq!(
+            agent_rows().length(),
+            3,
+            "native progress is an agent row in this popup"
+        );
+        assert_eq!(
+            native_row()
+                .query_selector(".activity-backend")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Backend unavailable"),
+            "legacy missing provenance is explicit, not guessed from the parent or task name"
+        );
+        for backend in [BackendKind::Codex, BackendKind::Antigravity] {
+            publish_native(Some(backend), false);
+            settle_autoscroll().await;
+            let row = native_row();
+            let label = row.query_selector(".activity-backend").unwrap().unwrap();
+            assert_eq!(
+                label.text_content().as_deref(),
+                Some(crate::components::chat_input::backend_label(backend)),
+                "same-key native progress uses its typed provenance"
+            );
+            assert!(row.text_content().unwrap().contains("Running"));
+            assert!(
+                row.query_selector("button").unwrap().is_none(),
+                "progress-only entries have no invented Open target"
+            );
+            let bounds = row.get_bounding_client_rect();
+            let label_bounds = label.get_bounding_client_rect();
+            assert!(
+                label_bounds.width() > 0.0
+                    && label_bounds.left() >= bounds.left()
+                    && label_bounds.right() <= bounds.right()
+            );
+            assert_eq!(
+                toggle.get_attribute("aria-expanded").as_deref(),
+                Some("true")
+            );
+            assert!(
+                element("activity-list").scroll_width() <= element("activity-list").client_width()
+            );
+        }
+        for theme in ["dark", "light"] {
+            container.set_attribute("data-theme", theme).unwrap();
+            next_tick().await;
+            let label = native_row()
+                .query_selector(".activity-backend")
+                .unwrap()
+                .unwrap();
+            let contrast = rendered_text_contrast(&label, &element("activity-list"));
+            assert!(
+                contrast >= 4.5,
+                "{theme} native backend label contrast {contrast:.5}:1 is below readable small-text contrast"
+            );
+        }
+        container.set_attribute("data-theme", "dark").unwrap();
+        publish_native(Some(BackendKind::Antigravity), true);
+        settle_autoscroll().await;
+        assert_eq!(
+            agent_rows().length(),
+            2,
+            "completed native progress leaves the popup"
+        );
+
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &owner.local_host_id,
+            protocol::Envelope::from_payload(
+                StreamPath("stream/child-2".to_owned()),
+                protocol::FrameKind::AgentActivityChanged,
+                0,
+                &protocol::AgentActivityChangedPayload {
+                    activity: protocol::AgentActivity::Idle,
+                },
+            )
+            .unwrap(),
+        );
+        settle_autoscroll().await;
+        assert_eq!(
+            agent_rows().length(),
+            1,
+            "the added child leaves when it becomes idle"
+        );
+
         // A spawn progress snapshot must not duplicate its registered child.
         crate::dispatch::apply_chat_event(
             &state,
@@ -1754,6 +2086,7 @@ mod wasm_tests {
                 execution_mode: protocol::ToolExecutionMode::Foreground,
                 cancellable: false,
                 update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                    backend_kind: None,
                     agent_id: child_ref.agent_id.clone(),
                     agent_name: "Duplicate child".to_owned(),
                     last_tool_name: None,
