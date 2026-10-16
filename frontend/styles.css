@@ -7943,7 +7943,7 @@ math merror {
    carrying them has to wrap sooner to leave the name the same stretch: 32px of
    chevron, padding and gaps, then 11.5em for twelve characters of the name and
    the ellipsis that stands in for the rest, the branch's 3ch sliver and the
-   counts' 2.5ch floor. Capped at the row's own width so the button can never
+   counts' 2em floor. Capped at the row's own width so the button can never
    ask for more than the dock has and push itself out of the header.
 
    The markup says which rows these are. Matching on the counts themselves
@@ -7964,7 +7964,9 @@ math merror {
    branch and the ahead/behind pair: it takes its text width first and the
    others divide what is left. Sharing the shrinking instead would cost the
    name its last character, because a flex item that gives up even a fraction
-   of a pixel renders an ellipsis in place of it. */
+   of a pixel renders an ellipsis in place of it. The toggle's 0.04em
+   tracking is that fraction, and with it the dock minimum renders 10 of 14
+   characters once History is as wide as DejaVu Sans draws it. */
 .gp-root-name {
     flex: 0 1 auto;
     min-width: 0;
@@ -7972,6 +7974,7 @@ math merror {
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--font-mono);
+    letter-spacing: 0;
 }
 
 /* Grows out of the space the name leaves over, never past its own text, and
@@ -7999,8 +8002,12 @@ math merror {
     /* Never shrink away entirely: an arrow and an ellipsis keep the counts
        visible as something to hover, and the title carries the numbers. A
        zero-width label paints nothing and cannot be hovered, so the counts
-       would become undiscoverable rather than merely truncated. */
-    min-width: 2.5ch;
+       would become undiscoverable rather than merely truncated.
+       2.5ch is two and a half zeros, which is short of the arrow and the
+       ellipsis in DejaVu Sans, the UI face behind system-ui on the Linux
+       test browser: that floor is 15.625px and neither glyph fits. An em is
+       the square each of those glyphs is drawn in. */
+    min-width: 2em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
