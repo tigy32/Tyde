@@ -84,11 +84,43 @@ pub(super) fn kind(name: &str) -> NativeToolKind {
     }
 }
 
-pub(super) fn selection(name: &str, named_selectors: &[String]) -> NativeToolSelection {
-    // The audited 1.4.7 host exposes these controls in its default catalog
-    // but rejects their names in run.toolset.
+/// An audited Muse host, identified by the MSP schema fingerprint it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Host {
+    V1_4_6,
+    V1_4_7,
+    V1_4_10,
+}
+
+pub(super) const HOSTS: &[(&str, Host)] = &[
+    (
+        "sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f",
+        Host::V1_4_6,
+    ),
+    (
+        "sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9",
+        Host::V1_4_7,
+    ),
+    (
+        "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c",
+        Host::V1_4_10,
+    ),
+];
+
+pub(super) fn host(fingerprint: &str) -> Option<Host> {
+    HOSTS
+        .iter()
+        .find(|(known, _)| *known == fingerprint)
+        .map(|(_, host)| *host)
+}
+
+pub(super) fn selection(name: &str, named_selectors: &[String], host: Host) -> NativeToolSelection {
+    // Every audited host exposes these in its default catalog but rejects
+    // their names in run.toolset. 1.4.6 and 1.4.7 accept read_skill there;
+    // 1.4.10 rejects it as an unknown tool name.
     match name {
         "snooze_reminder" | "write_todos" => NativeToolSelection::DefaultOnly,
+        "read_skill" if host == Host::V1_4_10 => NativeToolSelection::DefaultOnly,
         // The audited mixed named configuration silently omitted these tools.
         // Quarantine that combination without narrowing the default toolset.
         "subagent_spawn"
@@ -106,10 +138,21 @@ pub(super) fn selection(name: &str, named_selectors: &[String]) -> NativeToolSel
     }
 }
 
-pub(super) fn descriptor(name: String, named_selectors: &[String]) -> NativeTool {
+/// Policy admission happens before the host is known, so it refuses only
+/// selectors that no audited host accepts. A selector some hosts reject is
+/// refused when the launched host's named toolset is derived.
+pub(super) fn admission_selection(name: &str) -> NativeToolSelection {
+    HOSTS
+        .iter()
+        .map(|(_, host)| selection(name, &[], *host))
+        .find(|selection| *selection != NativeToolSelection::DefaultOnly)
+        .unwrap_or(NativeToolSelection::DefaultOnly)
+}
+
+pub(super) fn descriptor(name: String, named_selectors: &[String], host: Host) -> NativeTool {
     NativeTool {
         kind: kind(&name),
-        selection: selection(&name, named_selectors),
+        selection: selection(&name, named_selectors, host),
         name,
     }
 }

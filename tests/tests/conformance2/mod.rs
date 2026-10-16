@@ -2314,6 +2314,58 @@ pub async fn ask_until_marker_and_idle<B: Backend>(
     }
 }
 
+/// Collects runtime-initiated activity, with no user input sent, until a
+/// response carrying `marker` has settled idle.
+pub async fn await_agent_initiated_marker<B: Backend>(
+    host: &mut Harness<B>,
+    label: &str,
+    marker: &str,
+) -> Turn {
+    let mut turn = host.turn(label);
+    let mut answered = false;
+    loop {
+        match host
+            .events
+            .as_mut()
+            .expect("live backend stream")
+            .recv_backend()
+            .await
+            .unwrap_or_else(|| panic!("{label}: backend closed before the agent woke"))
+        {
+            BackendEvent::Chat(event) => {
+                answered |= matches!(&event, ChatEvent::StreamEnd(end) if end.message.content.contains(marker));
+                match &event {
+                    ChatEvent::StreamEnd(end) => eprintln!(
+                        "{label} response bytes={} marker={} tools={}",
+                        end.message.content.len(),
+                        end.message.content.contains(marker),
+                        end.message.tool_calls.len()
+                    ),
+                    ChatEvent::TypingStatusChanged(typing) => {
+                        eprintln!("{label} typing={typing} answered={answered}")
+                    }
+                    ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, protocol::MessageSender::Error) =>
+                    {
+                        eprintln!("{label} native error before the woken response")
+                    }
+                    _ => {}
+                }
+                let done = answered && matches!(event, ChatEvent::TypingStatusChanged(false));
+                turn.events.push(event);
+                if done {
+                    return turn;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => turn.model_requests.push(usage),
+            BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("{label}: unexpected resume boundary in live events")
+            }
+        }
+    }
+}
+
 pub async fn relocate_workspace_when_ready<B: Backend>(
     host: &mut Harness<B>,
     roots: Vec<String>,

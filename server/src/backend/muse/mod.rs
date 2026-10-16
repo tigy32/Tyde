@@ -26,11 +26,6 @@ use actor::{Actor, Command};
 use transport::Connection;
 use wire::{GoalControlApplied, Models, SessionResult};
 
-const FINGERPRINTS: &[&str] = &[
-    "sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f",
-    "sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9",
-];
-
 pub struct MuseBackend {
     session_id: SessionId,
     commands: mpsc::UnboundedSender<Command>,
@@ -89,7 +84,7 @@ impl MuseBackend {
                 "Muse does not expose mutable backend configuration through Tyde".to_owned(),
             );
         }
-        let (mut connection, mut notifications) = launch(&config).await?;
+        let (mut connection, mut notifications, mut host) = launch(&config).await?;
         let models: Models = connection.typed("model/list", json!({})).await?;
         let mut settings = Self::resolve_session_settings(&config);
         let requested_model = matches!(
@@ -150,7 +145,7 @@ impl MuseBackend {
         if fork {
             let fork_id = opened.session.session_id.clone();
             connection.close().await?;
-            (connection, notifications) = launch(&config).await?;
+            (connection, notifications, host) = launch(&config).await?;
             opened = connection.typed("session/resume", json!({"commandId":self::command_id(),"sessionId":fork_id,"history":"snapshot","config":mcp})).await?;
         }
         if source.is_some() && !requested_model {
@@ -209,7 +204,10 @@ impl MuseBackend {
             receive,
             events,
             opened,
-            models.models,
+            actor::Served {
+                host,
+                models: models.models,
+            },
             config,
         )?;
         actor.initialize(source.is_some() && !fork).await?;
@@ -338,62 +336,12 @@ impl Backend for MuseBackend {
         Ok(())
     }
     fn validate_tool_policy(policy: &ToolPolicy) -> Result<(), String> {
-        match policy {
-            ToolPolicy::Unrestricted => Ok(()),
-            ToolPolicy::AllowList { tools } | ToolPolicy::DenyList { tools } => {
-                let allow_list = matches!(policy, ToolPolicy::AllowList { .. });
-                if allow_list && tools.is_empty() {
-                    return Err("Muse has no verified empty named toolset".to_owned());
-                }
-                let mut normalized = Vec::new();
-                for name in tools {
-                    if name.contains(['*', '?', '[', ']']) {
-                        return Err("Muse tool policies require exact native tool names".to_owned());
-                    }
-                    for native in self::tools::policy_names(name) {
-                        match self::tools::selection(&native, &[]) {
-                            protocol::NativeToolSelection::NamedSelectable
-                            | protocol::NativeToolSelection::NamedWithoutMcp => {}
-                            protocol::NativeToolSelection::DefaultOnly if !allow_list => {}
-                            protocol::NativeToolSelection::DefaultOnly => return Err(
-                                "Muse cannot select default-only controls in an exact allow list"
-                                    .to_owned(),
-                            ),
-                            protocol::NativeToolSelection::Unverified => {
-                                // Per-session MCP identities require the configured inventory,
-                                // not just this context-free policy definition.
-                                if !self::tools::mcp_selector_reference(&native) {
-                                    return Err(
-                                        "Muse policy references an unverified native selector"
-                                            .to_owned(),
-                                    );
-                                }
-                            }
-                        }
-                        normalized.push(native);
-                    }
-                }
-                if !allow_list
-                    && !self::tools::question_only_policy(policy)
-                    && self::tools::NATIVE_TOOLS.iter().any(|name| {
-                        self::tools::selection(name, &[])
-                            == protocol::NativeToolSelection::DefaultOnly
-                            && !normalized.iter().any(|denied| denied.as_str() == *name)
-                    })
-                {
-                    return Err(
-                        "Muse named deny lists must explicitly deny every default-only control"
-                            .to_owned(),
-                    );
-                }
-                Ok(())
-            }
-        }
+        validate_policy(policy, self::tools::admission_selection)
     }
 
     async fn discover(context: &BackendProbeContext) -> Result<BackendDiscovery, String> {
         let program = context.program.as_deref().unwrap_or("muse");
-        let (connection, _notifications) = connect(
+        let (connection, _notifications, _host) = connect(
             program,
             &[
                 "serve".to_owned(),
@@ -498,7 +446,7 @@ impl Backend for MuseBackend {
             sessions: Vec<wire::Session>,
             next_cursor: Option<String>,
         }
-        let (connection, _notifications) = connect(
+        let (connection, _notifications, _host) = connect(
             context.program.as_deref().unwrap_or("muse"),
             &[
                 "serve".to_owned(),
@@ -632,10 +580,15 @@ fn validate_inference_only(config: &BackendSpawnConfig, resuming: bool) -> Resul
 
 /// Workspace stays untrusted so no project-local configuration, hooks, or
 /// skills load; the reminder roster is Muse's set of autonomous observers.
-const INFERENCE_ONLY_ARGS: [&str; 15] = [
+/// Muse's provider-default system prompt documents its native `muse.*` tools
+/// even when the toolset is empty, and Meta only sends `tool_choice: auto`, so
+/// models call those absent tools. The system prompt override replaces it.
+const INFERENCE_ONLY_ARGS: [&str; 17] = [
     "serve",
     "--contributor-mode",
     "off",
+    "-c",
+    r#"run.system_prompt="You are a text-only assistant. No tools are available, so never call a tool. Answer the request directly in plain text.""#,
     "-c",
     "run.toolset=[]",
     "-c",
@@ -650,9 +603,7 @@ const INFERENCE_ONLY_ARGS: [&str; 15] = [
     "tools.artifact.enabled=false",
 ];
 
-async fn launch(
-    config: &BackendSpawnConfig,
-) -> Result<(Connection, mpsc::UnboundedReceiver<transport::Incoming>), String> {
+async fn launch(config: &BackendSpawnConfig) -> Result<Launched, String> {
     if config.execution_mode == super::BackendExecutionMode::InferenceOnly {
         let args = INFERENCE_ONLY_ARGS.map(str::to_owned);
         tracing::debug!(
@@ -667,34 +618,62 @@ async fn launch(
         "--contributor-mode".to_owned(),
         "off".to_owned(),
     ];
-    if let Some(toolset) = toolset(config).await? {
-        args.extend([
-            "-c".to_owned(),
-            format!(
-                "run.toolset={}",
-                serde_json::to_string(&toolset).map_err(|error| error.to_string())?
-            ),
-        ]);
+    if !named_toolset_required(config) {
+        return connect("muse", &args, None, user_input_dialogs(config)).await;
     }
-    connect("muse", &args, None, user_input_dialogs(config)).await
+    // Hosts differ in which selectors run.toolset accepts, so the named
+    // toolset is derived for the host identified by its served schema.
+    let (identified, _notifications, host) = connect(
+        "muse",
+        &[
+            "serve".to_owned(),
+            "--contributor-mode".to_owned(),
+            "off".to_owned(),
+        ],
+        None,
+        false,
+    )
+    .await?;
+    identified.close().await?;
+    validate_policy(&config.resolved_spawn_config.tool_policy, |name| {
+        self::tools::selection(name, &[], host)
+    })?;
+    let toolset = toolset(config, host).await?;
+    args.extend([
+        "-c".to_owned(),
+        format!(
+            "run.toolset={}",
+            serde_json::to_string(&toolset).map_err(|error| error.to_string())?
+        ),
+    ]);
+    let launched = connect("muse", &args, None, user_input_dialogs(config)).await?;
+    if launched.2 != host {
+        launched.0.shutdown();
+        return Err("The Muse host changed between named toolset derivation and launch".to_owned());
+    }
+    Ok(launched)
 }
+
+type Launched = (
+    Connection,
+    mpsc::UnboundedReceiver<transport::Incoming>,
+    self::tools::Host,
+);
 
 async fn connect(
     program: &str,
     args: &[String],
     customization: Option<tempfile::TempDir>,
     user_input_dialogs: bool,
-) -> Result<(Connection, mpsc::UnboundedReceiver<transport::Incoming>), String> {
+) -> Result<Launched, String> {
     let (connection, notifications) = Connection::spawn(program, args, customization).await?;
     let hello=connection.request("initialize",json!({"clientInfo":{"name":"tyde","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"requestedCapabilities":["rawLog","sessionMcp"],"userInputDialogs":user_input_dialogs}})).await.map_err(|error|error.to_string())?;
-    if hello.pointer("/schema/version").and_then(Value::as_u64) != Some(1)
-        || !hello
-            .pointer("/schema/fingerprint")
-            .and_then(Value::as_str)
-            .is_some_and(|fingerprint| FINGERPRINTS.contains(&fingerprint))
-    {
-        return Err("Muse's served MSP schema is not supported; this adapter requires a validated 1.4.6/1.4.7 schema".to_owned());
-    }
+    let host = hello
+        .pointer("/schema/fingerprint")
+        .and_then(Value::as_str)
+        .and_then(self::tools::host)
+        .filter(|_| hello.pointer("/schema/version").and_then(Value::as_u64) == Some(1))
+        .ok_or("Muse's served MSP schema is not supported; this adapter requires a validated 1.4.6/1.4.7/1.4.10 schema")?;
     let grants = hello
         .get("grantedCapabilities")
         .and_then(Value::as_array)
@@ -713,9 +692,10 @@ async fn connect(
         .map_err(|error| error.to_string())?;
     tracing::info!(
         schema_version = 1,
+        ?host,
         "Muse native protocol initialized with authoritative transcript access"
     );
-    Ok((connection, notifications))
+    Ok((connection, notifications, host))
 }
 
 fn mcp_config(servers: &[super::StartupMcpServer]) -> Result<Value, String> {
@@ -800,17 +780,76 @@ fn user_input_dialogs(config: &BackendSpawnConfig) -> bool {
         }
 }
 
-async fn toolset(config: &BackendSpawnConfig) -> Result<Option<Vec<String>>, String> {
+fn named_toolset_required(config: &BackendSpawnConfig) -> bool {
     let resolved = &config.resolved_spawn_config;
-    let default_toolset = self::tools::question_only_policy(&resolved.tool_policy);
-    if default_toolset
+    !(self::tools::question_only_policy(&resolved.tool_policy)
         && resolved
             .excluded_tool_categories
             .iter()
-            .all(|category| *category == ToolCategory::AskUser)
-    {
-        return Ok(None);
+            .all(|category| *category == ToolCategory::AskUser))
+}
+
+fn validate_policy(
+    policy: &ToolPolicy,
+    selection: impl Fn(&str) -> protocol::NativeToolSelection,
+) -> Result<(), String> {
+    match policy {
+        ToolPolicy::Unrestricted => Ok(()),
+        ToolPolicy::AllowList { tools } | ToolPolicy::DenyList { tools } => {
+            let allow_list = matches!(policy, ToolPolicy::AllowList { .. });
+            if allow_list && tools.is_empty() {
+                return Err("Muse has no verified empty named toolset".to_owned());
+            }
+            let mut normalized = Vec::new();
+            for name in tools {
+                if name.contains(['*', '?', '[', ']']) {
+                    return Err("Muse tool policies require exact native tool names".to_owned());
+                }
+                for native in self::tools::policy_names(name) {
+                    match selection(&native) {
+                        protocol::NativeToolSelection::NamedSelectable
+                        | protocol::NativeToolSelection::NamedWithoutMcp => {}
+                        protocol::NativeToolSelection::DefaultOnly if !allow_list => {}
+                        protocol::NativeToolSelection::DefaultOnly => {
+                            return Err(
+                                "Muse cannot select default-only controls in an exact allow list"
+                                    .to_owned(),
+                            );
+                        }
+                        protocol::NativeToolSelection::Unverified => {
+                            // Per-session MCP identities require the configured inventory,
+                            // not just this context-free policy definition.
+                            if !self::tools::mcp_selector_reference(&native) {
+                                return Err("Muse policy references an unverified native selector"
+                                    .to_owned());
+                            }
+                        }
+                    }
+                    normalized.push(native);
+                }
+            }
+            if !allow_list
+                && !self::tools::question_only_policy(policy)
+                && self::tools::NATIVE_TOOLS.iter().any(|name| {
+                    selection(name) == protocol::NativeToolSelection::DefaultOnly
+                        && !normalized.iter().any(|denied| denied.as_str() == *name)
+                })
+            {
+                return Err(
+                    "Muse named deny lists must explicitly deny every default-only control"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+async fn toolset(
+    config: &BackendSpawnConfig,
+    host: self::tools::Host,
+) -> Result<Vec<String>, String> {
+    let resolved = &config.resolved_spawn_config;
     let references = match &resolved.tool_policy {
         ToolPolicy::Unrestricted => Vec::new(),
         ToolPolicy::AllowList { tools } | ToolPolicy::DenyList { tools } => tools
@@ -873,7 +912,7 @@ async fn toolset(config: &BackendSpawnConfig) -> Result<Option<Vec<String>>, Str
     let selects_mcp = names.iter().any(|name| mcp_names.contains(name));
     if selects_mcp
         && names.iter().any(|name| {
-            self::tools::selection(name, &mcp_names)
+            self::tools::selection(name, &mcp_names, host)
                 == protocol::NativeToolSelection::NamedWithoutMcp
         })
     {
@@ -882,18 +921,19 @@ async fn toolset(config: &BackendSpawnConfig) -> Result<Option<Vec<String>>, Str
                 .to_owned(),
         );
     }
-    if names
-        .iter()
-        .any(|name| match self::tools::selection(name, &mcp_names) {
+    if names.iter().any(
+        |name| match self::tools::selection(name, &mcp_names, host) {
             protocol::NativeToolSelection::NamedSelectable => false,
             protocol::NativeToolSelection::NamedWithoutMcp => selects_mcp,
             protocol::NativeToolSelection::DefaultOnly
             | protocol::NativeToolSelection::Unverified => true,
-        })
-    {
-        return Err("Muse named toolset contains a default-only or unverified selector".to_owned());
+        },
+    ) {
+        return Err(format!(
+            "Muse {host:?} named toolset contains a default-only or unverified selector"
+        ));
     }
-    Ok(Some(names))
+    Ok(names)
 }
 
 async fn configured_mcp_selectors(config: &BackendSpawnConfig) -> Result<Vec<String>, String> {

@@ -105,12 +105,24 @@ impl Drop for NativeChild {
 struct Response {
     run_id: String,
     provider_id: String,
+    live: bool,
     handle: Option<ResponseHandle>,
     content: String,
     reasoning: String,
     declarations: Vec<ToolUseData>,
     usage: Option<MessageTokenUsage>,
     model: Option<ModelInfo>,
+}
+
+impl Response {
+    /// Muse wakes can settle a provider response with no text, reasoning or
+    /// tool call; the client stream opens only once there is something to show.
+    fn stream(&mut self, emitter: &TurnEmitter) -> Option<&ResponseHandle> {
+        if self.live && self.handle.is_none() {
+            self.handle = Some(emitter.stream_start(None));
+        }
+        self.handle.as_ref()
+    }
 }
 
 struct OpenTool {
@@ -163,6 +175,7 @@ pub(super) struct Actor {
     question_outcomes: HashMap<String, QuestionSettled>,
     question_completions: HashMap<String, Item>,
     catalog: Option<NativeToolCatalog>,
+    host: tools::Host,
     inference_only: bool,
     last_sequence: u64,
     fork_context_through: u64,
@@ -187,6 +200,12 @@ pub(super) struct Actor {
     relay: Option<SubAgentHandle>,
 }
 
+/// What the connected Muse process serves: its audited host and models.
+pub(super) struct Served {
+    pub host: tools::Host,
+    pub models: Vec<Model>,
+}
+
 impl Actor {
     pub fn new(
         connection: Connection,
@@ -194,7 +213,7 @@ impl Actor {
         commands: mpsc::UnboundedReceiver<Command>,
         events: mpsc::UnboundedSender<BackendEvent>,
         opened: SessionResult,
-        models: Vec<Model>,
+        Served { host, models }: Served,
         config: crate::backend::BackendSpawnConfig,
     ) -> Result<Self, String> {
         let mut settings = super::MuseBackend::resolve_session_settings(&config);
@@ -256,6 +275,7 @@ impl Actor {
             question_outcomes: HashMap::new(),
             question_completions: HashMap::new(),
             catalog: None,
+            host,
             inference_only,
             last_sequence: 0,
             fork_context_through: 0,
@@ -579,6 +599,7 @@ impl Actor {
                 if self.active_turn.as_ref()==Some(&turn.turn_id){self.active_turn=None;if !self.replaying {self.emitter.typing_status_changed(false);}}
             }
             "item/started" | "item/updated" | "item/completed"=>{
+                tracing::debug!(method, kind = params.pointer("/item/kind").and_then(serde_json::Value::as_str), "Muse native item notification");
                 let event:ItemEvent=parse(params)?;
                 if event.session_id==self.session.session_id {self.item(event.item).await?;}
             }
@@ -1031,7 +1052,7 @@ impl Actor {
                         tools: toolset
                             .active_tools
                             .iter()
-                            .map(|name| tools::descriptor(name.clone(), named_selectors))
+                            .map(|name| tools::descriptor(name.clone(), named_selectors, self.host))
                             .collect(),
                     });
                     tracing::debug!(
@@ -1066,11 +1087,8 @@ impl Actor {
                 self.response = Some(Response {
                     run_id,
                     provider_id: response_id,
-                    handle: if self.replaying {
-                        None
-                    } else {
-                        Some(self.emitter.stream_start(None))
-                    },
+                    live: !self.replaying,
+                    handle: None,
                     content: String::new(),
                     reasoning: String::new(),
                     declarations: Vec::new(),
@@ -1131,7 +1149,9 @@ impl Actor {
                     .as_mut()
                     .ok_or("Muse message arrived without a provider response")?;
                 response.content.push_str(&suffix);
-                if let Some(handle) = &response.handle {
+                if !suffix.is_empty()
+                    && let Some(handle) = response.stream(&self.emitter)
+                {
                     self.emitter.stream_delta(handle, &suffix);
                 }
             }
@@ -1156,7 +1176,9 @@ impl Actor {
                     .as_mut()
                     .ok_or("Muse summary arrived without a provider response")?;
                 response.reasoning.push_str(&suffix);
-                if let Some(handle) = &response.handle {
+                if !suffix.is_empty()
+                    && let Some(handle) = response.stream(&self.emitter)
+                {
                     self.emitter.stream_reasoning_delta(handle, &suffix);
                 }
             }
@@ -1168,7 +1190,9 @@ impl Actor {
                         .as_mut()
                         .ok_or("Muse reasoning arrived without a provider response")?;
                     response.reasoning.push_str(&text);
-                    if let Some(handle) = &response.handle {
+                    if !text.is_empty()
+                        && let Some(handle) = response.stream(&self.emitter)
+                    {
                         self.emitter.stream_reasoning_delta(handle, &text);
                     }
                 }
@@ -1183,6 +1207,7 @@ impl Actor {
                 if self.inference_only && !tool_calls.is_empty() {
                     tracing::warn!(
                         tool_calls = tool_calls.len(),
+                        tools = ?tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
                         "Muse inference-only response committed native tool calls"
                     );
                     return Err(
@@ -1432,7 +1457,10 @@ impl Actor {
                 commands,
                 events_tx,
                 opened,
-                self.models.clone(),
+                Served {
+                    host: self.host,
+                    models: self.models.clone(),
+                },
                 config,
             )?;
             actor.relay = Some(handle.clone());
@@ -1574,15 +1602,18 @@ impl Actor {
             // Native starts, not historical completion metadata, own unfinished work.
             self.emitter.typing_status_changed(true);
             if let Some(response) = &mut self.response {
-                let handle = self.emitter.stream_start(None);
-                if !response.content.is_empty() {
-                    self.emitter.stream_delta(&handle, &response.content);
+                response.live = true;
+                if (!response.content.is_empty() || !response.reasoning.is_empty())
+                    && let Some(handle) = response.stream(&self.emitter).cloned()
+                {
+                    if !response.content.is_empty() {
+                        self.emitter.stream_delta(&handle, &response.content);
+                    }
+                    if !response.reasoning.is_empty() {
+                        self.emitter
+                            .stream_reasoning_delta(&handle, &response.reasoning);
+                    }
                 }
-                if !response.reasoning.is_empty() {
-                    self.emitter
-                        .stream_reasoning_delta(&handle, &response.reasoning);
-                }
-                response.handle = Some(handle);
             }
         }
         Ok(())
@@ -1675,19 +1706,28 @@ impl Actor {
     }
 
     fn finish_response(&mut self) -> Result<(), String> {
-        let response = self
+        let mut response = self
             .response
             .take()
             .ok_or("Muse completed a response that was not open")?;
         tracing::debug!(
             replaying = self.replaying,
-            live_stream = response.handle.is_some(),
+            live_stream = response.live,
             content_chars = response.content.chars().count(),
             reasoning_chars = response.reasoning.chars().count(),
             tool_calls = response.declarations.len(),
             native_sequence = self.last_sequence,
             "Muse settled its native provider response"
         );
+        if response.handle.is_none()
+            && response.content.is_empty()
+            && response.reasoning.is_empty()
+            && response.declarations.is_empty()
+        {
+            tracing::debug!("Muse provider response carried nothing to publish");
+            return Ok(());
+        }
+        let handle = response.stream(&self.emitter).cloned();
         let reasoning = (!response.reasoning.is_empty()).then_some(ReasoningData {
             text: response.reasoning,
             tokens: None,
@@ -1707,9 +1747,7 @@ impl Actor {
                     images: Vec::new(),
                 });
         } else {
-            let handle = response
-                .handle
-                .ok_or("Muse live response had no stream handle")?;
+            let handle = handle.ok_or("Muse live response had no stream handle")?;
             self.emitter.stream_end(
                 handle,
                 StreamEndPayload {
@@ -1737,7 +1775,9 @@ impl Actor {
                 .ok_or("Muse text delta arrived before its native model response was opened")?;
             surface.text.push_str(&delta.delta);
             response.content.push_str(&delta.delta);
-            if let Some(handle) = &response.handle {
+            if !delta.delta.is_empty()
+                && let Some(handle) = response.stream(&self.emitter)
+            {
                 self.emitter.stream_delta(handle, &delta.delta);
             }
         }

@@ -1191,11 +1191,46 @@ replaced rather than accepted as coverage.
 Muse runs as a native `muse serve` MSP client, not as an HTTP imitation of
 Wonder. The public `meta-models/muse-code-sdk` repository supplies the MIT
 TypeScript client and protocol declarations; it does not contain the native
-host. The integration is being validated against Muse 1.4.6-R6000.1 and
-1.4.7-R6101.1 on Linux. Real-provider runs pin the actual installed binary in
-a private test PATH so launcher updates cannot change the host mid-run.
+host. The integration is validated against Muse 1.4.6-R6000.1,
+1.4.7-R6101.1 and 1.4.10-R6427.1 on Linux. Each accepted host is pinned by
+its served `readSchema` fingerprint; any other fingerprint fails startup.
+The harness launches the `muse` launcher from PATH, which auto-updates, so
+real-provider runs set `MUSE_NO_AUTO_UPDATE=1` to keep the host fixed.
 The 1.4.7 stable additions concern computer setup, sandbox availability,
 partial-reply marking and name origin; existing consumed fields are unchanged.
+The audited 1.4.7 to 1.4.10 SDK schema difference is additive: the open
+`ItemKind` gains `monitorFeed`, a completed, turnless view item emitted
+per watched line when the `monitor` tool runs with `show_lines`. The
+adapter decodes it as a typed kind with no chat surface, like `hookRun`
+and `userShell`; the line reaches the user through the agent's woken run.
+Before that variant existed, the first feed item failed the session with
+an unknown-variant payload error. Two other observed host contracts changed. `read_skill` is still in the default catalog but
+1.4.10 `run.toolset` rejects it as a selector, while verified 1.4.6 and
+1.4.7 artifacts still accept it at `session/start`. Selection is therefore
+typed per audited host inside the backend: the served schema fingerprint
+names the host, and only 1.4.10 marks `read_skill` `DefaultOnly` alongside
+`write_todos` and `snooze_reminder`. Policy admission runs before the host
+is known, so it refuses only selectors no audited host accepts; a named
+toolset first identifies the host and reapplies the same admission with
+that host's selection, so a host-only refusal returns the identical
+guard, then derives the toolset and fails the spawn explicitly if the
+launched host differs.
+`real_native_tool_policies` caught the 1.4.10 rejection as a startup exit
+on the derived deny-list toolset. A watched `monitor` command
+completion wakes the agent in a new native run that can settle a provider
+response with no text, reasoning or tool call. The adapter opens a client
+stream only once a live response has something to publish, and neither
+live nor replayed history publishes such a response, so the wake renders
+no empty assistant message before or after resume.
+`real_background_event_wakes_the_agent` (BackgroundTasks and
+AgentInitiatedTurns) covers the wake, then resumes the session and checks
+the replayed history. On 1.4.10 it failed first with one empty assistant
+message and, once Muse's monitor used `show_lines`, with the `monitorFeed`
+payload error. After the fixes it passes on Muse 1.4.10/Spark 1.3 (65.2s,
+four feed items), Claude Haiku (50.7s), Codex (52.9s) and Hermes (56.4s). With the
+1.4.10 fingerprint and these fixes, conversation, task list, MCP tool call,
+native subagent, resumed session, background task, native tool policies
+and hidden inference (Spark 1.3) pass on Muse 1.4.10.
 The launch chooser bundles the official Muse SVG from
 `https://muse.ai/images/favicon/app-squiggle.svg`, preserving its path and blue
 gradient for both default and custom profiles without a runtime asset request.
@@ -1238,8 +1273,9 @@ without a category exclusion, dialog support stays enabled. Each spawn,
 resume and fork opens a private native host with its own negotiation.
 Other allow/deny policies use exact native toolset selectors and enumerate
 the configured MCP servers to retain their non-denied tools without an
-unsafe wildcard. The default catalog includes `write_todos` and
-`snooze_reminder`, but the pinned host rejects those names as selectors.
+unsafe wildcard. The default catalog includes `write_todos`,
+`snooze_reminder` and, on 1.4.10 only, `read_skill`, but the host rejects
+those names as selectors.
 Omitting them loses unrelated controls. `NativeTool.selection` therefore
 separates `DefaultOnly`, `NamedSelectable`, `NamedWithoutMcp` and `Unverified`
 from the tool's effect classification. Missing selection metadata decodes as `Unverified`,
@@ -1527,11 +1563,13 @@ repository check is not a real-provider certification; retained scoped runs
 must also pass before this workbench is ready.
 
 Hidden inference helpers (supervisor verdicts, agent naming, usage wake-up)
-run Muse 1.4.7 in a dedicated host: an untrusted workspace, contributor mode
-off, `run.toolset=[]` (a named mode with no active tools), an empty
-`run.reminder_roster` (Muse's autonomous observers), workflow triggers, web
-search, web fetch and artifacts disabled, and no user-input dialogs. All of
-these are documented `readSchema` keys. Only fresh sessions with an empty
+run Muse in a dedicated host: an untrusted workspace, contributor mode
+off, a text-only `run.system_prompt`, `run.toolset=[]` (a named mode with
+no active tools), an empty `run.reminder_roster` (Muse's autonomous
+observers), workflow triggers, web search, web fetch and artifacts
+disabled, and no user-input dialogs. All of these are documented settings;
+`muse config validate` reports the `run.*` keys as active and
+user-overridable on 1.4.10. Only fresh sessions with an empty
 allow-list and no MCP servers are admitted. The adapter fails closed if Muse
 reports a non-empty or non-named toolset, commits a tool call, or emits any
 item other than user, assistant or reasoning text. Agent-mode empty allow-lists
@@ -1540,7 +1578,20 @@ injected into the prompt, and helper sessions are durable native sessions.
 `real_hidden_inference_tool_free` failed before this path existed with the
 production startup error ("no verified empty named toolset") and passes on
 Muse 1.4.7 in 5.09 seconds with an empty provider-confirmed catalog and a
-text-only reply to a tool-provoking prompt.
+text-only reply to a tool-provoking prompt. On 1.4.10 the catalog stays
+empty and no reminder children run, but Muse's provider-default system
+prompt (about 46k characters) still documents its namespaced native tools
+(`muse.read_file`, `muse.bash`, `muse.edit_file` and others), and the Meta
+provider only sends `tool_choice: auto`. Spark 1.3 therefore called those
+absent tools in 6 of 7 hidden sessions; Muse rejected them as unknown and
+the adapter failed the helper closed. The helper host now also passes
+`run.system_prompt`, an active, user-overridable setting that replaces
+the provider default (`base_instructions_source` becomes `settings`), with
+a short text-only instruction. Hidden sessions then carry no `muse.*` tool
+text, and the case passes 3 of 3 on the default Spark 1.3 with every
+existing check retained. `config validate --plane defaults` and a direct
+`session/start` with the override on verified 1.4.6 and 1.4.7 artifacts
+show the same active, overridable `run.system_prompt`.
 Unadvertised native capabilities and the explicitly recorded cross-backend
 failures remain limitations, not passing conformance. Ordinary repository
 validation, retained real-provider evidence and focused review are separate

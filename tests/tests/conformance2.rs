@@ -3253,6 +3253,10 @@ const BG_SETTLE: Duration = Duration::from_secs(60);
 const BG_SECONDS: u64 = 20;
 const BG_SECONDS_FOR_INTERRUPT: u64 = 45;
 const TIMED_OUT_FILE: &str = "timed_out.txt";
+const WAKE_FILE: &str = "wake.txt";
+const WOKE_MARKER: &str = "TYDE_WOKE";
+const WAKE_PROGRESS_MARKER: &str = "TYDE_BG_STARTED";
+const WAKE_COMMAND_SECONDS: u64 = 45;
 const TIMED_OUT_COMMAND_SECONDS: u64 = 20;
 const TIMED_OUT_COMMAND_TIMEOUT_MS: u64 = 5000;
 const SLOW_COMMAND_SECONDS: u64 = 25;
@@ -3591,6 +3595,114 @@ async fn real_timed_out_command_moves_to_background<B: Backend>(host: &mut Harne
     );
 
     assert_clean_close(host, &agent).await;
+}
+
+/// A watched background command reports its completion by waking the agent
+/// with no user input, and the woken reply must reach the chat without
+/// stray empty assistant messages. Muse 1.4.10 settles a provider response
+/// in the woken run that carries no text, reasoning or tool call; an
+/// adapter that opens a client stream per provider response publishes it
+/// as an empty assistant message.
+async fn real_background_event_wakes_the_agent<B: Backend>(host: &mut Harness<B>) {
+    let workspace = host.workspace().to_path_buf();
+    let wake_path = workspace.join(WAKE_FILE);
+    let prompt = wake_prompt(&workspace, host.backend());
+    let agent = spawn_agent(host, &prompt).await;
+    let started = collect_turn(host, &agent, &prompt).await;
+
+    assert_no_error_message(&started.label(), started.events());
+    assert_streams_are_balanced(&started);
+    assert_reached_idle(&started);
+    assert!(
+        started.tool_requests().next().is_some(),
+        "{}: emitted zero tool requests, so nothing was started that could wake the agent",
+        started.label()
+    );
+    assert!(
+        !started.final_text().contains(WOKE_MARKER),
+        "{}: claimed the wake before the command could have finished",
+        started.label()
+    );
+    assert!(
+        !wake_path.is_file(),
+        "{}: {} was already written when the launching turn ended, so the command did not \
+         outlive its turn and any later reply would not be a wake",
+        started.label(),
+        wake_path.display()
+    );
+
+    let label = format!("{:?} background wake", host.backend());
+    let woke = await_agent_initiated_marker(host, &label, WOKE_MARKER).await;
+    assert_no_error_message(&label, woke.events());
+    assert_no_empty_responses(&label, woke.events());
+    assert!(
+        woke.events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true))),
+        "{label}: the woken reply arrived without the agent reporting work, so the runtime's \
+         own turn was never surfaced as activity"
+    );
+    assert!(
+        wake_path.is_file(),
+        "{label}: replied {WOKE_MARKER} before {} was written, so the reply did not come from \
+         the command's completion event",
+        wake_path.display()
+    );
+
+    let after = ask(
+        host,
+        &agent,
+        format!("Reply with exactly {REPORTED_MARKER} and nothing else. Do not use any tool."),
+    )
+    .await;
+    assert_no_error_message(&after.label(), after.events());
+    assert_final_text_contains(&after, REPORTED_MARKER);
+
+    close_agent(host, &agent).await;
+    let resumed = resume_agent(host, &agent.session_id).await;
+    let replay = format!("{:?} resumed background wake", host.backend());
+    assert_no_error_message(&replay, &resumed.replayed_history);
+    let replayed = resumed
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, protocol::MessageSender::Assistant { .. }) =>
+            {
+                Some(message)
+            }
+            ChatEvent::StreamEnd(end) => Some(&end.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        replayed
+            .iter()
+            .any(|message| message.content.contains(WOKE_MARKER)),
+        "{replay}: the woken reply is missing from the replayed history"
+    );
+    let empty = replayed
+        .iter()
+        .filter(|message| {
+            message.content.trim().is_empty()
+                && message
+                    .reasoning
+                    .as_ref()
+                    .is_none_or(|reasoning| reasoning.text.trim().is_empty())
+                && message.tool_calls.is_empty()
+                && message
+                    .images
+                    .as_ref()
+                    .is_none_or(|images| images.is_empty())
+        })
+        .count();
+    assert!(
+        empty == 0,
+        "{replay}: replayed {empty} empty assistant message(s) of {} — the blank bubble the \
+         live wake suppressed returns after resume",
+        replayed.len()
+    );
+    assert_clean_close(host, &resumed).await;
 }
 
 async fn real_background_task_cancel<B: Backend>(host: &mut Harness<B>) {
@@ -4663,30 +4775,48 @@ async fn real_native_tool_policies<B: Backend>(host: &mut Harness<B>) {
                     .chain(std::iter::once(mcp_name.clone()))
                     .collect(),
             },
-        ]
-        .into_iter()
-        .chain(
-            default_only
-                .iter()
-                .cloned()
-                .map(|name| protocol::ToolPolicy::AllowList { tools: vec![name] }),
-        )
-        .chain(default_only.iter().map(|retained| {
-            protocol::ToolPolicy::DenyList {
-                tools: default_only
-                    .iter()
-                    .filter(|name| *name != retained)
-                    .cloned()
-                    .chain(questions.iter().cloned())
-                    .chain(std::iter::once(mcp_name.clone()))
-                    .collect(),
-            }
-        })) {
+        ] {
             let expected = B::validate_tool_policy(&policy)
                 .expect_err("default-only catalog entries cannot be silently selected or dropped");
             let mut config = host.config.clone();
             config.resolved_spawn_config.tool_policy = policy;
             assert_native_prestart_rejection(host, config, Some(&expected)).await;
+        }
+        // Selectability can differ between provider host versions. Admission
+        // runs before the host is known, so a control only this host refuses
+        // passes it; spawn must then refuse it with the same admission guard
+        // as a control every host refuses, in the same policy shape.
+        let allow_only = |name: &String| protocol::ToolPolicy::AllowList {
+            tools: vec![name.clone()],
+        };
+        let retain_only = |retained: &String| protocol::ToolPolicy::DenyList {
+            tools: default_only
+                .iter()
+                .filter(|name| *name != retained)
+                .cloned()
+                .chain(questions.iter().cloned())
+                .chain(std::iter::once(mcp_name.clone()))
+                .collect(),
+        };
+        let universal = default_only
+            .iter()
+            .find(|name| B::validate_tool_policy(&allow_only(name)).is_err())
+            .expect("some default-only control must be refused by every audited host");
+        for name in &default_only {
+            for (policy, guard) in [
+                (allow_only(name), allow_only(universal)),
+                (retain_only(name), retain_only(universal)),
+            ] {
+                let expected = B::validate_tool_policy(&policy)
+                    .err()
+                    .or_else(|| B::validate_tool_policy(&guard).err())
+                    .expect(
+                        "a default-only control must be refused by admission or its host guard",
+                    );
+                let mut config = host.config.clone();
+                config.resolved_spawn_config.tool_policy = policy;
+                assert_native_prestart_rejection(host, config, Some(&expected)).await;
+            }
         }
     }
     let mut config = host.config.clone();
@@ -5035,16 +5165,27 @@ async fn real_native_local_work_waits_for_completion<B: Backend>(host: &mut Harn
         !default_only.is_empty(),
         "the local-work policy probe requires an actual default-only exclusion"
     );
-    for name in &default_only {
-        assert!(
-            catalog
-                .tools
+    // Default-only is a host selector limit, not an effect class: Muse 1.4.10
+    // also rejects the read-only read_skill in run.toolset. Each denial must
+    // still be an established non-working effect, and the probe must deny an
+    // actual session control.
+    let default_only_kinds = catalog
+        .tools
+        .iter()
+        .filter(|tool| default_only.contains(&tool.name))
+        .map(|tool| &tool.kind)
+        .collect::<Vec<_>>();
+    assert!(
+        default_only_kinds.len() == default_only.len()
+            && default_only_kinds.iter().all(|kind| matches!(
+                kind,
+                protocol::NativeToolKind::SessionControl | protocol::NativeToolKind::ReadOnly
+            ))
+            && default_only_kinds
                 .iter()
-                .any(|tool| tool.name == *name
-                    && tool.kind == protocol::NativeToolKind::SessionControl),
-            "each explicit denial must name an actual unrestricted session-control tool"
-        );
-    }
+                .any(|kind| **kind == protocol::NativeToolKind::SessionControl),
+        "explicit denials must name actual unrestricted session-control or read-only tools, including a session control"
+    );
     assert!(
         catalog.tools.iter().any(|tool| is_probe_tool(&tool.name)),
         "the actual unrestricted catalog must include the configured MCP probe"
@@ -7396,6 +7537,43 @@ fn background_prompt(
     format!("{launch} As soon as it is started, reply with exactly {BG_MARKER} and nothing else.")
 }
 
+fn wake_prompt(workspace: &Path, backend_kind: BackendKind) -> String {
+    let root = workspace_root(workspace);
+    let command = format!(
+        "echo {WAKE_PROGRESS_MARKER}; sleep {WAKE_COMMAND_SECONDS}; echo DONE > {WAKE_FILE}; \
+         echo {BG_OUTPUT_MARKER}"
+    );
+    let launch = match backend_kind {
+        BackendKind::Codex => format!(
+            "Run this exact shell command in {root} as an ordinary foreground command: \
+             {command}. Do not append `&`, and do not use `nohup`, `disown`, or a detached \
+             subshell. Do not wait for its output."
+        ),
+        BackendKind::Hermes => format!(
+            "Call terminal exactly once with background=true and notify=true, command \
+             `{command}`, and workdir {root}. The background and notify arguments must both be \
+             the JSON boolean true."
+        ),
+        BackendKind::Muse => format!(
+            "Call the native monitor tool exactly once, with show_lines set to true, to run \
+             and watch this exact shell command in {root}: {command}. Do not use bash or any \
+             other tool."
+        ),
+        _ => format!(
+            "Call Bash exactly once with run_in_background set to true to start this exact \
+             shell command in {root}: {command}. Once it has started, reply with exactly \
+             {BG_MARKER} and nothing else, without mentioning any other marker."
+        ),
+    };
+    format!(
+        "{launch} Do not wait for it, poll it, or check on it, and do not run it again; end \
+         your turn as soon as it is started. The command takes {WAKE_COMMAND_SECONDS} seconds; \
+         starting it, its start result and any reminder are not its completion, so never \
+         write {WOKE_MARKER} before then. Later, when you are notified that it printed \
+         {BG_OUTPUT_MARKER}, reply with exactly {WOKE_MARKER} and nothing else."
+    )
+}
+
 fn timed_out_command_prompt(workspace: &Path) -> String {
     let file = workspace.join(TIMED_OUT_FILE);
     format!(
@@ -8014,6 +8192,13 @@ conformance2_scenario!(
 conformance2_scenario!(
     real_timed_out_command_moves_to_background,
     [BackendCapability::MovesTimedOutCommandsToBackground]
+);
+conformance2_scenario!(
+    real_background_event_wakes_the_agent,
+    [
+        BackendCapability::BackgroundTasks,
+        BackendCapability::AgentInitiatedTurns
+    ]
 );
 conformance2_scenario!(
     real_background_task_cancel,

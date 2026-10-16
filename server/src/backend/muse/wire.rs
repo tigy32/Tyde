@@ -234,6 +234,7 @@ pub(super) enum ItemKind {
     UserShell,
     WebSearch,
     SkillRead,
+    MonitorFeed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
