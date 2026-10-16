@@ -735,7 +735,7 @@ fn send_tags_update(state: &AppState, update: AgentTagsUpdate) {
 /// Send a pin/unpin mutation to the primary local host. The Pinned section is a
 /// pure projection of the server snapshot's pins, so this only sends the frame;
 /// the confirming snapshot floats/unfloats the row (dev-docs/26 §4.7).
-fn send_pins_update(state: &AppState, update: AgentPinsUpdate) {
+pub(crate) fn send_pins_update(state: &AppState, update: AgentPinsUpdate) {
     let Some(host_id) = state.agents_view_preferences_host.get_untracked() else {
         log::warn!("pin change with no primary host; ignored");
         return;

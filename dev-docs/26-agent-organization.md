@@ -385,6 +385,14 @@ Display rule:
   does not match the current Smart View/filter/search is not forced visible.
 - Within pinned and unpinned sections, preserve the active sort/group rules.
 
+The Agents sidebar renders this section inside each owning host, above its
+custom and project groups. Pin buttons remain visible on collapsed chat rows;
+only the authoritative snapshot changes their pressed state and placement.
+Pinned parents retain their unpinned descendants and expansion state, while
+independently pinned descendants appear once as pinned roots. Unpinning restores
+the existing custom/project grouping and parent tree without changing ownership.
+Names and the Tychat origin are not pin-state sources.
+
 Persistence and cleanup use the same session-keyed/transient-target rules as
 manual tags.
 

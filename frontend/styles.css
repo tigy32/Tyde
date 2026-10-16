@@ -6687,6 +6687,7 @@ math merror {
     gap: var(--space-1);
 }
 
+.agent-sidebar-pinned,
 .agent-sidebar-host-section,
 .agent-sidebar-project-section,
 .agent-sidebar-custom-groups-section,
@@ -6884,6 +6885,36 @@ math merror {
     display: flex;
     align-items: center;
     gap: var(--space-2);
+}
+
+.agent-card-pin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    padding: 4px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-tertiary);
+    cursor: pointer;
+}
+
+.agent-card-pin:hover,
+.agent-card-pin:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--border-secondary);
+    background: var(--surface-3);
+}
+
+.agent-card-pin.pinned {
+    color: var(--accent-primary);
+}
+
+.agent-card-pin.pinned svg {
+    fill: currentColor;
 }
 
 .agent-card-top-main {
