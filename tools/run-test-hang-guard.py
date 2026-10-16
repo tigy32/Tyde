@@ -154,6 +154,9 @@ def run_python_tests(command: list[str], hang_seconds: float) -> int:
     unittest.TestResult.startTest = start_test
     unittest.TestResult.stopTest = stop_test
     if command[:2] == ["-m", "unittest"]:
+        # Script launch puts this file's directory on sys.path, replacing the
+        # working directory `python -m unittest` uses as the only module root.
+        sys.path[0] = ""
         sys.argv = command[1:]
         runpy.run_module("unittest", run_name="__main__")
     else:

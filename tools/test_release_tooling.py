@@ -867,5 +867,78 @@ esac
         self.assertTrue((self.state / "published").exists())
 
 
+class ReleasePythonGuardTests(unittest.TestCase):
+    def test_release_guard_imports_tools_package(self) -> None:
+        release_check = (REPO_ROOT / "tools" / "release_check.sh").read_text(
+            encoding="utf-8"
+        )
+        command_text = (
+            "python3 -B tools/run-test-hang-guard.py --python-tests -- -m unittest \\\n"
+            "    tools/test_dev_check.py \\\n"
+            "    tools/test_release_tooling.py \\\n"
+            "    tools/test_check_mobile_web_manifest.py\n"
+        )
+        self.assertIn(command_text, release_check)
+        modules = (
+            "tools/test_dev_check.py",
+            "tools/test_release_tooling.py",
+            "tools/test_check_mobile_web_manifest.py",
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name)
+            tools = root / "tools"
+            tools.mkdir()
+            shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
+            (tools / "test_dev_check.py").write_text(
+                "import unittest\n"
+                "class Cases(unittest.TestCase):\n"
+                " def test_imports_as_tools_module(self):\n"
+                "  self.assertEqual(__name__, 'tools.test_dev_check')\n"
+                "  self.assertEqual(__package__, 'tools')\n"
+                "  from .test_release_tooling import PACKAGE_MARKER\n"
+                "  self.assertEqual(PACKAGE_MARKER, 'tools.test_release_tooling')\n"
+            )
+            (tools / "test_release_tooling.py").write_text(
+                "import unittest\n"
+                "PACKAGE_MARKER = __name__\n"
+                "class Cases(unittest.TestCase):\n"
+                " def test_imports_as_tools_module(self):\n"
+                "  self.assertEqual(__name__, 'tools.test_release_tooling')\n"
+                "  self.assertEqual(__package__, 'tools')\n"
+            )
+            (tools / "test_check_mobile_web_manifest.py").write_text(
+                "import unittest\n"
+                "class Cases(unittest.TestCase):\n"
+                " def test_imports_as_tools_module(self):\n"
+                "  self.assertEqual(__name__, 'tools.test_check_mobile_web_manifest')\n"
+                "  self.assertEqual(__package__, 'tools')\n"
+            )
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-B",
+                    "tools/run-test-hang-guard.py",
+                    "--python-tests",
+                    "--",
+                    "-m",
+                    "unittest",
+                    *modules,
+                ],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Ran 3 tests", result.stderr)
+            self.assertIn("\nOK\n", result.stderr)
+            self.assertNotIn(
+                "ModuleNotFoundError", result.stdout + result.stderr
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
