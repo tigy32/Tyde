@@ -634,6 +634,20 @@ impl SupervisorState {
         };
     }
 
+    /// Settles a verdict whose failure no retry can repair, returning how many
+    /// attempts this idle period actually started, including the failed one.
+    pub(crate) fn abandon_verdict(&mut self, now: Instant) -> Option<u8> {
+        let Phase::VerdictInFlight {
+            attempts_started, ..
+        } = &self.phase
+        else {
+            return None;
+        };
+        let attempts_started = *attempts_started;
+        self.settle(now);
+        Some(attempts_started)
+    }
+
     /// Records a failed or invalidated verdict and schedules the next attempt.
     /// Returns the attempt count once they are exhausted, so the caller can
     /// tell the user supervision gave up; `None` while retries remain.
@@ -826,7 +840,7 @@ pub(crate) async fn generate_supervision_verdict(
     result
 }
 
-fn supervision_spawn_config(
+pub fn supervision_spawn_config(
     cost_hint: Option<SpawnCostHint>,
     session_settings: Option<SessionSettingsValues>,
 ) -> BackendSpawnConfig {
@@ -901,6 +915,7 @@ fn supervision_backend_error_kind(backend_kind: BackendKind) -> SupervisionFailu
 }
 
 pub(crate) const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
+pub(crate) const MOCK_SUPERVISOR_START_FAILURE: &str = "__mock_supervisor_start_failure__";
 pub(crate) const MOCK_SUPERVISOR_INVALID: &str = "__mock_supervisor_invalid__";
 pub(crate) const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
 pub(crate) const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
@@ -913,6 +928,15 @@ fn generate_mock_supervision_verdict(
         return Err(SupervisionFailure::new(
             SupervisionFailureKind::BackendStream,
             "mock supervision failure",
+        ));
+    }
+    if request
+        .last_user_message
+        .contains(MOCK_SUPERVISOR_START_FAILURE)
+    {
+        return Err(SupervisionFailure::new(
+            SupervisionFailureKind::BackendStart,
+            "mock supervision startup failure",
         ));
     }
     if request.last_user_message.contains(MOCK_SUPERVISOR_INVALID) {

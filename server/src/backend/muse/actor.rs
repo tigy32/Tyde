@@ -163,6 +163,7 @@ pub(super) struct Actor {
     question_outcomes: HashMap<String, QuestionSettled>,
     question_completions: HashMap<String, Item>,
     catalog: Option<NativeToolCatalog>,
+    inference_only: bool,
     last_sequence: u64,
     fork_context_through: u64,
     last_position: Option<Position>,
@@ -197,6 +198,8 @@ impl Actor {
         config: crate::backend::BackendSpawnConfig,
     ) -> Result<Self, String> {
         let mut settings = super::MuseBackend::resolve_session_settings(&config);
+        let inference_only =
+            config.execution_mode == crate::backend::BackendExecutionMode::InferenceOnly;
         let cwd = opened
             .session
             .workspace_root
@@ -253,6 +256,7 @@ impl Actor {
             question_outcomes: HashMap::new(),
             question_completions: HashMap::new(),
             catalog: None,
+            inference_only,
             last_sequence: 0,
             fork_context_through: 0,
             last_position: None,
@@ -1004,6 +1008,18 @@ impl Actor {
                 }
             }
             RunEvent::ModelRequestConfigured { toolset } => {
+                if self.inference_only
+                    && !(matches!(toolset.mode, ToolsetMode::Named)
+                        && toolset.active_tools.is_empty())
+                {
+                    tracing::warn!(
+                        tools = toolset.active_tools.len(),
+                        "Muse inference-only request was configured with native tools"
+                    );
+                    return Err(
+                        "Muse configured native tools for an inference-only request".to_owned()
+                    );
+                }
                 if !self.replaying {
                     let named_selectors = match toolset.mode {
                         ToolsetMode::Named => toolset.active_tools.as_slice(),
@@ -1164,6 +1180,16 @@ impl Actor {
                 self.check_response(&response_id)?;
                 let mut declarations = Vec::new();
                 let mut pending_items = Vec::new();
+                if self.inference_only && !tool_calls.is_empty() {
+                    tracing::warn!(
+                        tool_calls = tool_calls.len(),
+                        "Muse inference-only response committed native tool calls"
+                    );
+                    return Err(
+                        "Muse committed a native tool call during inference-only execution"
+                            .to_owned(),
+                    );
+                }
                 for call in tool_calls {
                     if let Some(items) = self.undeclared_items.remove(&call.call_id) {
                         pending_items.extend(items);
@@ -1719,6 +1745,21 @@ impl Actor {
     }
 
     async fn item(&mut self, item: Item) -> Result<(), String> {
+        if self.inference_only
+            && !matches!(
+                item.kind,
+                ItemKind::UserMessage | ItemKind::AgentMessage | ItemKind::Reasoning
+            )
+        {
+            tracing::warn!(
+                kind = ?item.kind,
+                "Muse inference-only session produced an autonomous native item"
+            );
+            return Err(
+                "Muse produced autonomous native activity during inference-only execution"
+                    .to_owned(),
+            );
+        }
         if item.kind == ItemKind::ToolCall {
             let call = item
                 .call_id

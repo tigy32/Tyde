@@ -21,6 +21,7 @@ const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
 const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__";
 const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
+const MOCK_SUPERVISOR_START_FAILURE: &str = "__mock_supervisor_start_failure__";
 
 /// The supervisor debounces 3s after an idle transition before reading
 /// context, so supervisor-driven frames need a longer wait than ordinary
@@ -577,6 +578,40 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         &mut fixture.client,
         QUIET_WAIT,
         "duplicate warning for the second unchanged generation",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
+
+    // A helper that cannot start is not retried even when retries remain, and
+    // the warning counts the attempt that actually ran.
+    apply_supervisor_setting(&mut fixture, "/supervisor/retry_attempts", 3, 0_u32).await;
+    fixture
+        .client
+        .send_message(
+            &affected.instance_stream,
+            format!("startup generation {MOCK_SUPERVISOR_START_FAILURE}"),
+        )
+        .await
+        .expect("send unstartable supervision generation");
+    fixture
+        .next_frame_matching("startup generation assistant turn", |env| {
+            is_assistant_message_containing(env, &affected_stream, "startup generation")
+        })
+        .await;
+    let startup = fixture
+        .next_frame_matching("unstartable supervisor failure warning", |env| {
+            supervisor_failure_warning(env).is_some()
+        })
+        .await;
+    let (startup_stream, startup_copy) =
+        supervisor_failure_warning(&startup).expect("unstartable supervisor failure warning");
+    assert_eq!(startup_stream, affected.instance_stream);
+    assert_eq!(startup_copy, singular);
+    assert!(!startup_copy.contains("mock supervision startup failure"));
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "retry or duplicate warning for an unstartable supervisor",
         |env| supervisor_failure_warning(env).is_some(),
     )
     .await;

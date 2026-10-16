@@ -78,8 +78,12 @@ impl MuseBackend {
             .ok_or("Muse requires a workspace root")?
             .clone();
         Self::validate_access_mode(config.resolved_spawn_config.access_mode)?;
-        Self::validate_tool_policy(&config.resolved_spawn_config.tool_policy)?;
-        Self::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
+        if config.execution_mode == super::BackendExecutionMode::InferenceOnly {
+            validate_inference_only(&config, source.is_some())?;
+        } else {
+            Self::validate_tool_policy(&config.resolved_spawn_config.tool_policy)?;
+            Self::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
+        }
         if !config.backend_config.0.is_empty() {
             return Err(
                 "Muse does not expose mutable backend configuration through Tyde".to_owned(),
@@ -609,14 +613,53 @@ pub(super) fn command_id() -> String {
     uuid::Uuid::from_bytes(bytes).to_string()
 }
 
+/// Hidden helpers get only Muse's verified empty named toolset with every
+/// autonomous observer and implicit capability disabled; anything that
+/// could reintroduce native activity is refused rather than approximated.
+fn validate_inference_only(config: &BackendSpawnConfig, resuming: bool) -> Result<(), String> {
+    if resuming {
+        return Err("Muse inference-only execution requires a fresh session".to_owned());
+    }
+    if !matches!(&config.resolved_spawn_config.tool_policy, ToolPolicy::AllowList { tools } if tools.is_empty())
+    {
+        return Err("Muse inference-only execution requires an empty tool allow-list".to_owned());
+    }
+    if !config.startup_mcp_servers.is_empty() {
+        return Err("Muse inference-only execution cannot attach MCP servers".to_owned());
+    }
+    Ok(())
+}
+
+/// Workspace stays untrusted so no project-local configuration, hooks, or
+/// skills load; the reminder roster is Muse's set of autonomous observers.
+const INFERENCE_ONLY_ARGS: [&str; 15] = [
+    "serve",
+    "--contributor-mode",
+    "off",
+    "-c",
+    "run.toolset=[]",
+    "-c",
+    r#"run.reminder_roster={"agents":[]}"#,
+    "-c",
+    r#"run.workflow_trigger_mode="off""#,
+    "-c",
+    r#"tools.web_search.mode="off""#,
+    "-c",
+    "tools.web_fetch.enabled=false",
+    "-c",
+    "tools.artifact.enabled=false",
+];
+
 async fn launch(
     config: &BackendSpawnConfig,
 ) -> Result<(Connection, mpsc::UnboundedReceiver<transport::Incoming>), String> {
     if config.execution_mode == super::BackendExecutionMode::InferenceOnly {
-        return Err(
-            "Muse's audited host cannot disable autonomous observers for inference-only execution"
-                .to_owned(),
+        let args = INFERENCE_ONLY_ARGS.map(str::to_owned);
+        tracing::debug!(
+            overrides = args.len(),
+            "Muse launching tool-free, observer-free inference host"
         );
+        return connect("muse", &args, None, false).await;
     }
     let mut args = vec![
         "serve".to_owned(),

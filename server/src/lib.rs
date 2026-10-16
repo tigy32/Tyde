@@ -46,8 +46,9 @@ pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 pub use acceptor::{BoundUdsListener, bind_uds, serve_uds};
 pub use acceptor::{HandshakeError, accept, host_shutdown_signal, listen_uds};
 #[cfg(feature = "test-support")]
-pub use agent::take_duplicate_tool_completion_count;
+pub use agent::supervisor::supervision_spawn_config;
 #[cfg(feature = "test-support")]
+pub use agent::take_duplicate_tool_completion_count;
 pub use agent::usage_wakeup_spawn_config;
 pub use agent_control_mcp::AgentControlMcpCaller;
 #[cfg(feature = "test-support")]

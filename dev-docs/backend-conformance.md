@@ -1524,9 +1524,23 @@ Automatic compaction, native workflow presentation, full background-task
 control, slash commands and native skill projection remain uncertified.
 Tyde-managed agent tools remain a separate MCP capability. A passing ordinary
 repository check is not a real-provider certification; retained scoped runs
-must also pass before this workbench is ready. Inference-only execution is
-explicitly rejected because the audited host cannot disable autonomous
-observers; no unsupported CLI setting is passed as pretend enforcement.
+must also pass before this workbench is ready.
+
+Hidden inference helpers (supervisor verdicts, agent naming, usage wake-up)
+run Muse 1.4.7 in a dedicated host: an untrusted workspace, contributor mode
+off, `run.toolset=[]` (a named mode with no active tools), an empty
+`run.reminder_roster` (Muse's autonomous observers), workflow triggers, web
+search, web fetch and artifacts disabled, and no user-input dialogs. All of
+these are documented `readSchema` keys. Only fresh sessions with an empty
+allow-list and no MCP servers are admitted. The adapter fails closed if Muse
+reports a non-empty or non-named toolset, commits a tool call, or emits any
+item other than user, assistant or reasoning text. Agent-mode empty allow-lists
+are still rejected. Passive user rules and memory context may still be
+injected into the prompt, and helper sessions are durable native sessions.
+`real_hidden_inference_tool_free` failed before this path existed with the
+production startup error ("no verified empty named toolset") and passes on
+Muse 1.4.7 in 5.09 seconds with an empty provider-confirmed catalog and a
+text-only reply to a tool-provoking prompt.
 Unadvertised native capabilities and the explicitly recorded cross-backend
 failures remain limitations, not passing conformance. Ordinary repository
 validation, retained real-provider evidence and focused review are separate

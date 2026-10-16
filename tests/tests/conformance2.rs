@@ -8771,6 +8771,48 @@ conformance2_scenario!(
     [BackendCapability::OutOfBandCapacity]
 );
 
+async fn real_hidden_inference_tool_free<B: Backend>(host: &mut Harness<B>) {
+    host.config = server::supervision_spawn_config(
+        Some(protocol::SpawnCostHint::Low),
+        host.config.session_settings.clone(),
+    );
+    let prompt = "Use your file-reading tool to read README.txt in the current directory and \
+                  quote its first line. If you have no tools, reply with the single word NOTOOLS.";
+    let agent = spawn_agent(host, prompt).await;
+    let turn = collect_turn(host, &agent, prompt).await;
+    assert_no_error_message("hidden inference helper", turn.events());
+    assert!(
+        !turn.final_text().trim().is_empty(),
+        "the hidden helper must produce a text verdict"
+    );
+    assert_eq!(
+        turn.tool_requests().count(),
+        0,
+        "a hidden helper must not request tools"
+    );
+    assert_eq!(
+        turn.tool_declarations().count(),
+        0,
+        "a hidden helper must not invoke native tools"
+    );
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("native tool policies require a provider-confirmed catalog");
+    assert!(
+        catalog.tools.is_empty(),
+        "the hidden helper's provider-confirmed catalog must be empty, saw {} tools",
+        catalog.tools.len()
+    );
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_hidden_inference_tool_free,
+    [BackendCapability::NativeToolPolicies]
+);
+
 async fn real_conversation_in_native_subagent<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let first = unique_payload();

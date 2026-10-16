@@ -5002,12 +5002,13 @@ pub(crate) fn spawn_agent_actor(
                                         now,
                                     )
                                 } else {
-                                    supervisor_state.settle(now);
-                                    Some(0)
+                                    supervisor_state.abandon_verdict(now)
                                 };
                                 if let Some(attempts_started) = exhausted {
                                     tracing::warn!(
                                         agent_id = %current_start.agent_id,
+                                        attempts_started,
+                                        failure_kind = ?failure.kind,
                                         error = %failure.message,
                                         "agent supervision gave up on this turn"
                                     );
