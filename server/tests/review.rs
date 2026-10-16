@@ -3384,20 +3384,23 @@ async fn review_keeps_comments_when_git_cannot_read_the_repository() {
         .review_subscribe(&review.id, ReviewSubscribePayload::default())
         .await
         .expect("review subscribe after git recovery");
-    // The damaged Git objects can also fail concurrent watcher initialization.
-    // Its queued nonfatal project warning is valid even after permissions are
-    // restored; it must not prevent the stored review from loading.
+    // Unreadable objects can fail watcher initialization or Git status refresh.
+    // The latter must report project_git_status, not a fabricated clean status
+    // that resets comments. Both errors may already be queued at recovery.
     let snapshot = next_frame_matching_on(&mut client, "review after git recovery", |env| {
         if env.kind == FrameKind::CommandError {
             let error: CommandErrorPayload = env.parse_payload().expect("project watcher warning");
             assert_eq!(error.stream.0, project_stream(&project));
             assert_eq!(env.stream, error.stream);
-            assert_eq!(error.operation, "project_watch");
+            assert!(matches!(
+                error.operation.as_str(),
+                "project_watch" | "project_git_status"
+            ));
+            assert!(!error.fatal);
+            assert!(error.message.contains("automatic recovery"));
             assert_eq!(error.request_kind, FrameKind::ProjectFileList);
             assert_eq!(error.code, protocol::CommandErrorCode::Internal);
-            assert!(!error.fatal);
             assert!(error.message.contains("not a git repository"));
-            assert!(error.message.contains("automatic recovery"));
         }
         env.kind == FrameKind::ReviewBootstrap
     })

@@ -7122,7 +7122,10 @@ fn MobileDirectField(
 }
 
 #[component]
-fn BackendCard(kind: BackendKind) -> impl IntoView {
+pub(super) fn BackendCard(
+    kind: BackendKind,
+    #[prop(optional)] on_setup: Option<Callback<()>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let name = backend_label(kind);
     let badge_class = backend_badge_class(kind);
@@ -7162,11 +7165,14 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                 return;
             };
 
+            let requested = input.checked();
+            // The native toggle must not claim success before the server accepts it.
+            input.set_checked(settings.enabled_backends.contains(&kind));
             let enabled_backends = all_backends()
                 .into_iter()
                 .filter(|candidate| {
                     if *candidate == kind {
-                        input.checked()
+                        requested
                     } else {
                         settings.enabled_backends.contains(candidate)
                     }
@@ -7219,6 +7225,9 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                                                 kind,
                                                 BackendSetupAction::Install,
                                             );
+                                            if let Some(on_setup) = on_setup {
+                                                on_setup.run(());
+                                            }
                                         }
                                     >
                                         {label}
@@ -7233,6 +7242,7 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                     <input
                         type="checkbox"
                         prop:checked=checked
+                        aria-label=format!("Enable {name}")
                         disabled=disable_toggle
                         on:change=on_toggle
                     />
@@ -7284,7 +7294,11 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
     }
 }
 
-fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: BackendSetupAction) {
+pub(super) fn send_run_backend_setup(
+    state: &AppState,
+    backend_kind: BackendKind,
+    action: BackendSetupAction,
+) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("send_run_backend_setup called without a selected host stream");
         crate::notices::report_settings_error(
@@ -7314,7 +7328,7 @@ fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: B
     });
 }
 
-fn backend_setup_status_label(info: Option<&BackendSetupInfo>) -> &'static str {
+pub(super) fn backend_setup_status_label(info: Option<&BackendSetupInfo>) -> &'static str {
     match info.map(|info| info.status) {
         Some(BackendSetupStatus::Installed) => "Installed",
         Some(BackendSetupStatus::NotInstalled) => "Not installed",

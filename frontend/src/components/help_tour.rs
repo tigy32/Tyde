@@ -166,6 +166,7 @@ pub fn HelpTour() -> impl IntoView {
         let is_first = step_index == 0;
         let is_last = step_index + 1 == STEPS.len();
 
+        let setup_state = state.clone();
         let close_state = state.clone();
         let on_close = move |_| close_state.help_tour_step.set(None);
         let back_state = state.clone();
@@ -191,6 +192,10 @@ pub fn HelpTour() -> impl IntoView {
                 {spotlight}
                 <div class="help-tour-card" style=card_style>
                     <div class="help-tour-card-top">
+                        <button class="action-btn" on:click=move |_| {
+                            setup_state.help_tour_step.set(None);
+                            setup_state.getting_started_open.set(true);
+                        }>"Getting started"</button>
                         <span class="help-tour-progress">
                             {format!("{} of {}", step_index + 1, STEPS.len())}
                         </span>

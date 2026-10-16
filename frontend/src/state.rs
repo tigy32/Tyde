@@ -3270,7 +3270,7 @@ pub struct SessionInfo {
 /// different consumers (project create, future: add-root, pick-file, ...).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowsePurpose {
-    OpenProject,
+    OpenProject { allow_host_switch: bool },
     AddRoot { project_id: ProjectId },
 }
 
@@ -3872,6 +3872,7 @@ pub struct AppState {
     /// Current step of the guided help tour overlay, `None` when the tour is
     /// closed. The Help button on the home screen starts it at step 0.
     pub help_tour_step: RwSignal<Option<usize>>,
+    pub getting_started_open: RwSignal<bool>,
     pub feedback_open: RwSignal<bool>,
     pub find_bar_open: RwSignal<bool>,
     /// Which left-dock tab is active (Files / Git / Search).
@@ -4385,6 +4386,7 @@ impl AppState {
             settings_open: RwSignal::new(false),
             settings_tab_request: RwSignal::new(None),
             help_tour_step: RwSignal::new(None),
+            getting_started_open: RwSignal::new(false),
             feedback_open: RwSignal::new(false),
             find_bar_open: RwSignal::new(false),
             left_tab: RwSignal::new(LeftTab::Files),

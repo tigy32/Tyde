@@ -2144,6 +2144,13 @@ where
         ) {
             Ok(output) => output,
             Err(err) if is_not_git_repository_error(&err) => {
+                if root_is_git_repository(&root.0) {
+                    tracing::warn!(
+                        error_len = err.len(),
+                        "Git could not read an existing repository; preserving project state"
+                    );
+                    return Err(err);
+                }
                 roots.push(ProjectRootGitStatus {
                     root,
                     branch: None,

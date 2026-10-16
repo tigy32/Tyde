@@ -1,8 +1,8 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::actions::begin_new_chat_with_profile;
-use crate::state::{AppState, DEFAULT_CUSTOM_AGENT_ID};
+use crate::actions::{begin_new_chat_with_profile, begin_new_chat_with_profile_in_project};
+use crate::state::{ActiveProjectRef, AppState, DEFAULT_CUSTOM_AGENT_ID};
 
 use protocol::{BackendKind, CustomAgent, CustomAgentId, LaunchProfileEntry, LaunchProfileKind};
 
@@ -45,7 +45,7 @@ fn backend_tag_for(
     }
 }
 
-fn backend_icon(kind: BackendKind) -> impl IntoView {
+pub(super) fn backend_icon(kind: BackendKind) -> impl IntoView {
     let mark = match kind {
         BackendKind::Tycode => view! { <path d="m7 5-5 7 5 7m10-14 5 7-5 7m-3-16-4 18" /> }.into_any(),
         BackendKind::Kiro => view! {
@@ -99,9 +99,20 @@ fn backend_icon(kind: BackendKind) -> impl IntoView {
 }
 
 #[component]
-pub fn LaunchChooser(open_sig: RwSignal<bool>) -> impl IntoView {
+pub fn LaunchChooser(
+    open_sig: RwSignal<bool>,
+    #[prop(optional)] initial_backend: Option<BackendKind>,
+    #[prop(optional)] project_context: Option<Memo<Option<ActiveProjectRef>>>,
+    #[prop(optional)] on_created: Option<Callback<()>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let host = state.chat_context_host_id_untracked();
+    let chosen_project = project_context.and_then(|context| context.get_untracked());
+    let host = match project_context {
+        Some(_) => chosen_project
+            .as_ref()
+            .map(|project| project.host_id.clone()),
+        None => state.chat_context_host_id_untracked(),
+    };
     let entries_state = state.clone();
     let entries_host = host.clone();
     let entries = Memo::new(move |_| {
@@ -115,6 +126,17 @@ pub fn LaunchChooser(open_sig: RwSignal<bool>) -> impl IntoView {
     });
     let initial_profile = state.launch_profile_catalog.with_untracked(|catalogs| {
         let catalog = catalogs.get(host.as_ref()?)?;
+        if let Some(backend) = initial_backend {
+            return catalog.entries.iter().find_map(|entry| match entry {
+                LaunchProfileEntry::Ready { profile }
+                    if profile.backend_kind == backend
+                        && profile.kind == LaunchProfileKind::BackendDefault =>
+                {
+                    Some(profile.id.clone())
+                }
+                _ => None,
+            });
+        }
         let id = catalog.default_profile_id.as_ref()?;
         catalog.entries.iter().find_map(|entry| match entry {
             LaunchProfileEntry::Ready { profile } if &profile.id == id => Some(id.clone()),
@@ -170,22 +192,42 @@ pub fn LaunchChooser(open_sig: RwSignal<bool>) -> impl IntoView {
 
     let context_state = state.clone();
     let context_host = host.clone();
+    let context_project = chosen_project.clone();
+    let context_matches = Memo::new(move |_| match project_context {
+        Some(current) => current
+            .get()
+            .is_some_and(|project| Some(project) == context_project),
+        None => context_state.chat_context_host_id() == context_host,
+    });
     Effect::new(move |_| {
-        if context_state.chat_context_host_id() != context_host {
+        if !context_matches.get() {
             open_sig.set(false);
         }
     });
 
     let create = Callback::new(move |()| {
         if !open_sig.get_untracked()
-            || state.chat_context_host_id_untracked() != host
+            || !context_matches.get_untracked()
             || !role_available.get_untracked()
         {
             return;
         }
         if let Some(profile) = ready_profile.get_untracked() {
             open_sig.set(false);
-            begin_new_chat_with_profile(&state, profile, selected_agent.get_untracked());
+            match chosen_project.clone() {
+                Some(project) => begin_new_chat_with_profile_in_project(
+                    &state,
+                    profile,
+                    selected_agent.get_untracked(),
+                    project,
+                ),
+                None => {
+                    begin_new_chat_with_profile(&state, profile, selected_agent.get_untracked())
+                }
+            }
+            if let Some(on_created) = on_created {
+                on_created.run(());
+            }
         }
     });
     let dialog_ref = NodeRef::<leptos::html::Div>::new();

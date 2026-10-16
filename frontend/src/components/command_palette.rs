@@ -27,6 +27,7 @@ pub enum CommandId {
     OpenWorkflows,
     OpenAgentMonitor,
     GoToHome,
+    GettingStarted,
     GoToChat,
     ToggleSettings,
     SendFeedback,
@@ -199,6 +200,11 @@ impl CommandDescriptor {
 /// `global_bindings()` — the window keydown handler itself.
 pub const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
+        id: CommandId::GettingStarted,
+        name: "Getting started",
+        binding: None,
+    },
+    CommandDescriptor {
         id: CommandId::NewChat,
         name: "New Chat",
         binding: Some(Binding::Global(Chord::cmd("n"))),
@@ -362,6 +368,7 @@ pub fn command_availability(
         | CommandId::ToggleBottomPanel
         | CommandId::OpenWorkflows
         | CommandId::OpenAgentMonitor
+        | CommandId::GettingStarted
         | CommandId::GoToHome
         | CommandId::GoToChat
         | CommandId::ToggleSettings
@@ -542,6 +549,11 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         }
         CommandId::OpenAgentMonitor => {
             state.open_tab(TabContent::AgentMonitor, "Agent Monitor".to_owned(), true);
+        }
+        CommandId::GettingStarted => {
+            state.settings_open.set(false);
+            state.help_tour_step.set(None);
+            state.getting_started_open.set(true);
         }
         CommandId::GoToHome => {
             state.open_tab(TabContent::Home, "Home".to_string(), false);

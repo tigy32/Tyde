@@ -284,14 +284,21 @@ pub fn is_background_send(kind: FrameKind) -> bool {
 }
 
 #[component]
-pub fn InlineNotices(#[prop(into)] scopes: Signal<Vec<NoticeScope>>) -> impl IntoView {
+pub fn InlineNotices(
+    #[prop(into)] scopes: Signal<Vec<NoticeScope>>,
+    #[prop(optional)] include_operation: Option<FrameKind>,
+) -> impl IntoView {
     let notices = NOTICES.with(Clone::clone);
     let visible = Memo::new(move |_| {
         let scopes = scopes.get();
         notices.with(|notices| {
             notices
                 .iter()
-                .filter(|notice| scopes.contains(&notice.scope))
+                .filter(|notice| {
+                    scopes.contains(&notice.scope)
+                        || include_operation
+                            .is_some_and(|operation| notice.operation == Some(operation))
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         })

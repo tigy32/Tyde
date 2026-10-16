@@ -23,7 +23,7 @@ pub fn TerminalView() -> impl IntoView {
     view! {
         <div class="terminal-view">
             <TerminalTabBar />
-            <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Terminals] />
+            <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Terminals] include_operation=FrameKind::RunBackendSetup />
             <div class="terminal-body">
                 <Show when=show_empty>
                     <div class="terminal-empty">

@@ -218,8 +218,32 @@ pub fn begin_new_chat_with_profile(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
 ) {
-    // A profile id is only meaningful in this host's catalog.
-    let selection_host = state.chat_context_host_id_untracked();
+    begin_profile_chat(
+        state,
+        profile,
+        custom_agent_id,
+        state.chat_context_host_id_untracked(),
+    );
+}
+
+pub(crate) fn begin_new_chat_with_profile_in_project(
+    state: &AppState,
+    profile: LaunchProfile,
+    custom_agent_id: Option<CustomAgentId>,
+    project: ActiveProjectRef,
+) {
+    if state.active_project_ref_untracked().as_ref() != Some(&project) {
+        state.switch_active_project(Some(project.clone()));
+    }
+    begin_profile_chat(state, profile, custom_agent_id, Some(project.host_id));
+}
+
+fn begin_profile_chat(
+    state: &AppState,
+    profile: LaunchProfile,
+    custom_agent_id: Option<CustomAgentId>,
+    selection_host: Option<String>,
+) {
     // An explicit New Chat outranks a restore still waiting on its host.
     state.retire_pending_restores();
     let Some(tab) = state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true) else {

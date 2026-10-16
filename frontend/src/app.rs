@@ -983,6 +983,7 @@ pub fn App() -> impl IntoView {
             <FeedbackModal />
             <HostBrowser />
             <HelpTour />
+            <crate::components::home_view::GettingStarted />
             <HoverPopover />
             <crate::voice::VoiceRuntime />
         </div>

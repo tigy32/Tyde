@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
@@ -50,7 +51,38 @@ pub fn open_project_browser(state: &AppState) {
         );
         return;
     };
-    open_browser_for(state, host_id, host_stream, BrowsePurpose::OpenProject);
+    open_browser_for(
+        state,
+        host_id,
+        host_stream,
+        BrowsePurpose::OpenProject {
+            allow_host_switch: true,
+        },
+    );
+}
+
+pub(super) fn open_project_browser_on_selected_host(state: &AppState) {
+    let selected = state.selected_host_stream_untracked().filter(|(host, _)| {
+        matches!(
+            state.connection_status_for_host(host),
+            ConnectionStatus::Connected
+        )
+    });
+    let Some((host_id, host_stream)) = selected else {
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
+            "Connect the selected computer in Host settings before choosing a folder.",
+        );
+        return;
+    };
+    open_browser_for(
+        state,
+        host_id,
+        host_stream,
+        BrowsePurpose::OpenProject {
+            allow_host_switch: false,
+        },
+    );
 }
 
 pub fn open_add_root_browser(state: &AppState) {
@@ -111,7 +143,7 @@ fn open_browser_for(
     crate::notices::clear_scope(&crate::notices::NoticeScope::Browser);
     let browse_stream = new_browse_stream();
     let initial = match &purpose {
-        BrowsePurpose::OpenProject => HostBrowseInitial::Home,
+        BrowsePurpose::OpenProject { .. } => HostBrowseInitial::Home,
         BrowsePurpose::AddRoot { project_id } => HostBrowseInitial::ProjectRoots {
             project_id: project_id.clone(),
         },
@@ -472,7 +504,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
             return;
         };
         match dialog_purpose.clone() {
-            BrowsePurpose::OpenProject => {
+            BrowsePurpose::OpenProject { .. } => {
                 let name = path
                     .0
                     .rsplit('/')
@@ -539,16 +571,69 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         }
     };
 
+    let dialog_ref = NodeRef::<leptos::html::Div>::new();
+    let address_ref = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move |_| {
+        if let Some(address) = address_ref.get() {
+            let _ = address.focus();
+        }
+    });
     let state_for_esc = state.clone();
     let on_modal_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() == "Escape" {
-            close_dialog(&state_for_esc);
+        ev.stop_propagation();
+        match ev.key().as_str() {
+            "Escape" => {
+                ev.prevent_default();
+                close_dialog(&state_for_esc);
+            }
+            "Tab" => {
+                let Some(dialog) = dialog_ref.get_untracked() else {
+                    return;
+                };
+                let Ok(nodes) = dialog.query_selector_all(
+                    "button:not([disabled]), input:not([disabled]), select:not([disabled])",
+                ) else {
+                    return;
+                };
+                let (Some(first), Some(last)) = (
+                    nodes
+                        .item(0)
+                        .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok()),
+                    nodes
+                        .item(nodes.length().saturating_sub(1))
+                        .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok()),
+                ) else {
+                    return;
+                };
+                let active = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.active_element());
+                if ev.shift_key()
+                    && active
+                        .as_ref()
+                        .is_some_and(|element| element.is_same_node(Some(&first)))
+                {
+                    ev.prevent_default();
+                    let _ = last.focus();
+                } else if !ev.shift_key()
+                    && active
+                        .as_ref()
+                        .is_some_and(|element| element.is_same_node(Some(&last)))
+                {
+                    ev.prevent_default();
+                    let _ = first.focus();
+                }
+            }
+            _ => {}
         }
     };
 
-    // Host dropdown is meaningless for AddRoot — the project lives on a
-    // single host. Disable the control entirely in that mode.
-    let allow_host_switch = matches!(dialog.purpose, BrowsePurpose::OpenProject);
+    let allow_host_switch = matches!(
+        dialog.purpose,
+        BrowsePurpose::OpenProject {
+            allow_host_switch: true
+        }
+    );
 
     let dropdown_view = {
         let state = state.clone();
@@ -704,13 +789,13 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     };
 
     let confirm_label = match &dialog.purpose {
-        BrowsePurpose::OpenProject => "Open Project Here",
+        BrowsePurpose::OpenProject { .. } => "Open Project Here",
         BrowsePurpose::AddRoot { .. } => "Add Root",
     };
 
     view! {
         <div class="browser-backdrop" on:click=on_backdrop on:keydown=on_modal_keydown tabindex="0">
-            <div class="browser-modal" on:click=|ev| ev.stop_propagation()>
+            <div class="browser-modal" role="dialog" aria-modal="true" aria-label="Folder browser" node_ref=dialog_ref on:click=|ev| ev.stop_propagation()>
                 <div class="browser-header">
                     <button
                         class="browser-btn"
@@ -720,6 +805,8 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     >"↑"</button>
                     <input
                         class="browser-address"
+                        aria-label="Folder path"
+                        node_ref=address_ref
                         type="text"
                         prop:value=move || address_input.get()
                         on:input=move |ev| address_input.set(event_target_value(&ev))
