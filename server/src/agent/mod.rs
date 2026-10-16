@@ -375,6 +375,10 @@ enum RunningTurnRedirect {
 }
 
 enum AgentCommand {
+    RecordHandoff {
+        handoff: protocol::AgentHandoff,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     SetTydePermissions {
         access: protocol::AgentTydePermissions,
         reply: oneshot::Sender<Result<(), String>>,
@@ -1053,7 +1057,8 @@ impl AgentActivityStatsTracker {
             | ChatEvent::RestartRecovery { .. }
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
-            | ChatEvent::Orchestration(_) => {}
+            | ChatEvent::Orchestration(_)
+            | ChatEvent::AgentHandoff(_) => {}
             ChatEvent::ContextCompaction(compaction)
                 if compaction.status == ContextCompactionTimelineStatus::Completed =>
             {
@@ -1452,6 +1457,19 @@ pub(crate) enum InterruptOutcome {
 }
 
 impl AgentHandle {
+    pub(crate) async fn record_handoff(
+        &self,
+        handoff: protocol::AgentHandoff,
+    ) -> Result<(), String> {
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::RecordHandoff { handoff, reply })
+            .map_err(|_| "Handoff source stopped".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Handoff source stopped before recording navigation".to_owned())?
+    }
+
     pub async fn send_input(&self, input: AgentInput) -> bool {
         if self.closing.load(Ordering::SeqCst) {
             return false;
@@ -3664,8 +3682,11 @@ pub(crate) fn spawn_agent_actor(
                                 "Wait until the agent is ready before moving it".to_owned(),
                             ));
                         }
-                        AgentCommand::SetTydePermissions { reply, .. } => {
+            AgentCommand::SetTydePermissions { reply, .. } => {
                             let _ = reply.send(Err("Wait until the agent has started before changing its Tyde permissions".to_owned()));
+                        }
+                        AgentCommand::RecordHandoff { reply, .. } => {
+                            let _ = reply.send(Err("Handoff source is still starting".to_owned()));
                         }
                         command @ AgentCommand::SetName { .. } => {
                             pending_name_commands.push_back(command);
@@ -9403,6 +9424,19 @@ pub(crate) fn spawn_agent_actor(
                             };
                             let _ = reply.send(result);
                         }
+                        AgentCommand::RecordHandoff { handoff, reply } => {
+                            let result = if !matches!(lifecycle, ActorLifecycle::Running) {
+                                Err("Handoff source is not running".to_owned())
+                            } else if replay_state.journal.is_none() {
+                                Err("Handoff source has no transcript journal".to_owned())
+                            } else {
+                                append_chat_event_with_transcript_metadata(
+                                    &canonical_stream, &mut event_log, &mut subscribers,
+                                    &mut replay_state, None, &ChatEvent::AgentHandoff(handoff),
+                                ).await
+                            };
+                            let _ = reply.send(result);
+                        }
             AgentCommand::SetName {
                             name,
                             persistence,
@@ -10488,6 +10522,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::ScheduleProjectMove { reply, .. } => { let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned())); }
                         AgentCommand::MoveToProject { reply, .. } => { let _ = reply.send(Err("This agent cannot move in its current state".to_owned())); }
+            AgentCommand::RecordHandoff { reply, .. } => {
+                let _ = reply.send(Err("Handoff source is not running".to_owned()));
+            }
             AgentCommand::SetTydePermissions { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot change its Tyde permissions in its current state".to_owned()));
             }
@@ -11629,6 +11666,9 @@ async fn park_terminal_agent(
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
+            AgentCommand::RecordHandoff { reply, .. } => {
+                let _ = reply.send(Err("Handoff source is not running".to_owned()));
+            }
             AgentCommand::SetTydePermissions { reply, .. } => {
                 let _ = reply.send(Err(
                     "This agent cannot change its Tyde permissions in its current state".to_owned(),
@@ -11851,6 +11891,9 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
+            }
+            AgentCommand::RecordHandoff { reply, .. } => {
+                let _ = reply.send(Err("Handoff source is not running".to_owned()));
             }
             AgentCommand::SetTydePermissions { reply, .. } => {
                 let _ = reply.send(Err(
@@ -12369,6 +12412,7 @@ fn startup_reservation(
         swarm_membership: start.swarm_membership.clone(),
         agent_id: start.agent_id.clone(),
         spawn: protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(start.name.clone()),
             custom_agent_id: start.custom_agent_id.clone(),
             parent_agent_id: start.parent_agent_id.clone(),
@@ -12649,7 +12693,7 @@ async fn append_chat_event(
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
 ) {
-    append_chat_event_with_transcript_metadata(
+    let _ = append_chat_event_with_transcript_metadata(
         canonical_stream,
         event_log,
         subscribers,
@@ -12763,7 +12807,7 @@ async fn append_backend_chat_event(
     events: &EventStream,
     event: &ChatEvent,
 ) {
-    append_chat_event_with_transcript_metadata(
+    let _ = append_chat_event_with_transcript_metadata(
         canonical_stream,
         event_log,
         subscribers,
@@ -12781,7 +12825,7 @@ async fn append_chat_event_with_transcript_metadata(
     replay_state: &mut AgentReplayState,
     transcript_metadata: Option<(BackendKind, &EventStream)>,
     event: &ChatEvent,
-) {
+) -> Result<(), String> {
     let projected = match event {
         ChatEvent::MessageAdded(message)
             if matches!(message.sender, MessageSender::User)
@@ -12837,6 +12881,13 @@ async fn append_chat_event_with_transcript_metadata(
         )
         .await
     };
+    let result = match &persistence {
+        Ok(Some(outcome)) if matches!(event, ChatEvent::AgentHandoff(_)) && outcome.unreadable_record => {
+            Err("Handoff transcript contains an unreadable record; this receipt cannot replay after restart".to_owned())
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.clone()),
+    };
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
     report_transcript_persistence(
         canonical_stream,
@@ -12846,6 +12897,7 @@ async fn append_chat_event_with_transcript_metadata(
         persistence,
     )
     .await;
+    result
 }
 
 fn transcript_provider_identities(
@@ -14021,7 +14073,8 @@ fn record_chat_event_for_replay(
         // Session state, not transcript: the actor holds the latest set for
         // bootstrap, and a logged copy would resurface in history pages.
         ChatEvent::SlashCommandsChanged(_) => {}
-        ChatEvent::RestartRecovery { .. }
+        ChatEvent::AgentHandoff(_)
+        | ChatEvent::RestartRecovery { .. }
         | ChatEvent::MessageAdded(_)
         | ChatEvent::GoalCapabilities(_)
         | ChatEvent::GoalChanged(_)
@@ -14469,6 +14522,7 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
                 ))
             }
         }
+        ChatEvent::AgentHandoff(_) => Some("Created an independent agent handoff".to_owned()),
         ChatEvent::RestartRecovery { phase } => Some(phase.notice_text()),
         ChatEvent::OperationCancelled(cancelled) => Some(format!(
             "Operation cancelled: {}",

@@ -1362,6 +1362,59 @@ with `tyde_config_list_agents`, and report what they did. Do the work yourself
 only when the user explicitly asks you to.";
 
 fn operator_instructions() -> String {
+    superseded_operator_v3_instructions()
+        .replace(OPERATOR_INTRO, "You are Tyde Help, the hands-on guide and top-level coordinator for this Tyde host.
+
+Use your tools to help the user get things working and answer questions about Tyde.")
+        .replace(OPERATOR_COORDINATION, HELP_SETUP_AND_HANDOFF)
+        .replace("Each backend is enabled,\n  installed, and signed in from Settings → Backends. Sign-in happens in the\n  bottom-dock terminal through the CLI's own flow (for example running\n  `claude`) — that is the canonical way to authenticate; Tyde just launches\n  it.", "Enable backends in Settings → Backends. Installed means the CLI is present,\n  not that it is authenticated. Tyde has no sign-in buttons or links.\n  Authenticate through the provider CLI in the bottom-dock terminal when\n  needed (for example running `claude`); Tyde launches that CLI.")
+        .replace("**Default** (used whenever no other agent is picked — edit it to\n  customize every plain chat)", "**Default** (for ordinary project chats and simple one-off work)")
+        .replace("and **Tyde Operator** (you)", "and **Help** (you, formerly Tyde Operator)")
+}
+
+const HELP_SETUP_AND_HANDOFF: &str = r#"## Hands-on setup and project ownership
+
+Help is a preset, not a permission level. Read `tyde_config_get_permissions`
+before controlling Tyde and obey its guidance. Tyde Root is host configuration
+metadata, not OS root, and does not waive confirmations. Only fresh human Home
+Help chats start with Root; do not promote yourself, children, or project owners.
+
+Use your native file, terminal, and Tyde tools to do practical setup yourself:
+clone or check out repositories, create folders, inspect and set up the
+environment, and create or select projects. You do not need to delegate before
+setup. Explain one useful Tyde pattern briefly as you use it, not a long tour.
+Read existing state before changing it; preserve user files and configuration.
+Ask before destructive actions or replacing the user's work.
+
+Ordinary questions need no project. Simple one-off work can use Default.
+For ongoing development, propose a concrete project (name and folder/repository)
+and a **Project Manager** owner. Reuse an appropriate existing project from
+`tyde_config_list_projects`. Get the user's go-ahead for that project and owner
+unless they already authorized it. Do not launch ongoing work before approval.
+
+After approval, finish the setup and use `tyde_config_spawn_agent` with the exact
+`project_id` and `custom_agent_id: "tyde-project-manager"` to launch an INDEPENDENT
+top-level project owner, not your child. Read `tyde_config_list_launch_options`
+first; use an installed/configured backend and the user's preference. Claude
+alone is sufficient; do not require Codex or another backend. Supply a complete
+handoff in `prompt`: original task, decisions and approvals, repository/folders,
+setup performed, constraints, acceptance criteria, and next steps. The user must
+not have to repeat themselves. Project owners and children ordinarily stay Agent.
+
+Home launches: Stay in Home and remain available. In an explicitly selected
+project, keep that assigned scope instead. Do not transform, relaunch, move,
+or demote yourself. The config spawn emits a typed handoff with an **Open agent** action;
+point the user there to open the owner in its project. Use
+`tyde_config_list_agents` for actual status, not conversation text. Creating a
+project does not require entering it. When repository rules require a workbench,
+let the project owner create and enter it using `tyde_create_workbench` with
+`action: "enter"`; finish that turn immediately. If you need a workbench during
+setup, launch an independent project-scoped setup agent to create and enter it
+with `action: "enter"`; Home has no canonical project for self-move/workbench entry.
+Do not use a shell directory change as a substitute for Tyde project entry.
+"#;
+
+pub fn superseded_operator_v3_instructions() -> String {
     superseded_operator_v2_instructions().replace(
         "`tyde_config_send_agent_message` steers into running work by default; set\ninterrupt=true only when the user wants to cancel active work.",
         "`tyde_config_send_agent_message` steers into running work by default, or\ncancels the turn and sends next when steering is unsupported. Set\ninterrupt=true to always cancel active work and send next.",
@@ -2055,9 +2108,9 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
         },
         CustomAgent {
             id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
-            name: "Tyde Operator".to_owned(),
+            name: "Help".to_owned(),
             description:
-                "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde."
+                "Hands-on setup and Tyde guidance; hands ongoing work to an independent project owner."
                     .to_owned(),
             instructions: Some(operator_instructions()),
             skill_ids: Vec::new(),
@@ -2138,11 +2191,23 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         agent.instructions = match agent.id.0.as_str() {
             TEAM_LEAD_CUSTOM_AGENT_ID => Some(superseded_orchestrator_v11_instructions()),
             PROJECT_MANAGER_CUSTOM_AGENT_ID => Some(superseded_project_manager_v2_instructions()),
-            OPERATOR_CUSTOM_AGENT_ID => Some(superseded_operator_v2_instructions()),
+            OPERATOR_CUSTOM_AGENT_ID => {
+                agent.name = "Tyde Operator".to_owned();
+                agent.description = "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde.".to_owned();
+                Some(superseded_operator_v2_instructions())
+            }
             _ => continue,
         };
         published.push(agent);
     }
+    published.push(CustomAgent {
+        id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
+        name: "Tyde Operator".to_owned(),
+        description: "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde.".to_owned(),
+        instructions: Some(superseded_operator_v3_instructions()),
+        skill_ids: Vec::new(), mcp_server_ids: Vec::new(),
+        tool_policy: ToolPolicy::Unrestricted,
+    });
     published.push(CustomAgent {
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),

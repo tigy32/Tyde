@@ -587,7 +587,8 @@ enum ProjectKindOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SpawnAgentResult {
-    agent_id: String,
+    pub agent_id: AgentId,
+    pub project_id: Option<ProjectId>,
     name: String,
     status: AgentControlStatus,
 }
@@ -1351,7 +1352,7 @@ impl TydeAgentControlMcpServer {
         {
             return Ok(err_text(error));
         }
-        match do_list_launch_options(&self.host).await {
+        match do_list_launch_options(&self.host, false).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -2466,7 +2467,7 @@ pub(crate) async fn do_spawn_agent(
     let custom_agent_id = match input.custom_agent_id.as_deref().map(str::trim) {
         None => None,
         Some("") => return Err("custom_agent_id must not be empty".to_owned()),
-        Some(id) if id == protocol::OPERATOR_CUSTOM_AGENT_ID => {
+        Some(id) if id == protocol::OPERATOR_CUSTOM_AGENT_ID && caller_agent_id.is_some() => {
             return Err(format!(
                 "custom_agent_id {id} is the host Operator and cannot be spawned through agent control"
             ));
@@ -2483,6 +2484,7 @@ pub(crate) async fn do_spawn_agent(
     };
 
     let payload = SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: requested_name.clone(),
         custom_agent_id,
         parent_agent_id,
@@ -2510,17 +2512,17 @@ pub(crate) async fn do_spawn_agent(
         .await
         .ok_or_else(|| format!("spawned agent {} missing status snapshot", agent_id.0))?
         .status();
-    let name = host
+    let start = host
         .list_agents()
         .await
         .into_iter()
         .find(|start| start.agent_id == agent_id)
-        .map(|start| start.name)
         .ok_or_else(|| format!("spawned agent {} missing from host registry", agent_id.0))?;
 
     Ok(SpawnAgentResult {
-        agent_id: agent_id.0,
-        name,
+        agent_id,
+        project_id: start.project_id,
+        name: start.name,
         status: agent_status,
     })
 }
@@ -2746,6 +2748,7 @@ async fn do_remove_workbench(
 
 pub(crate) async fn do_list_launch_options(
     host: &HostHandle,
+    include_host_operator: bool,
 ) -> Result<ListLaunchOptionsResult, String> {
     let settings = host.read_settings().await?;
     let catalog = host.read_launch_profile_catalog().await?;
@@ -2786,7 +2789,7 @@ pub(crate) async fn do_list_launch_options(
         .list_custom_agents()
         .await?
         .into_iter()
-        .filter(|agent| agent.id.0 != protocol::OPERATOR_CUSTOM_AGENT_ID)
+        .filter(|agent| include_host_operator || agent.id.0 != protocol::OPERATOR_CUSTOM_AGENT_ID)
         .map(|agent| CustomAgentOption {
             id: agent.id.0,
             name: agent.name,

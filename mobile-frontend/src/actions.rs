@@ -90,6 +90,7 @@ pub async fn spawn_new_chat(
     };
 
     let payload = protocol::SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::HumanChat,
         name: None,
         custom_agent_id,
         parent_agent_id: None,
@@ -170,6 +171,7 @@ pub async fn spawn_side_question(
         .ok_or(SendFrameError::Rejected(SendRejected::NotConnected))?;
 
     let payload = protocol::SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: None,
         custom_agent_id: None,
         parent_agent_id: None,

@@ -591,6 +591,7 @@ impl HostHandle {
         let id = self
             .spawn_agent_with_origin(
                 SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::Standard,
                     name: Some("Tychat agent".into()),
                     parent_agent_id: None,
                     project_id: None,

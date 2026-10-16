@@ -1697,6 +1697,7 @@ impl HostHandle {
         let agent = self
             .spawn_agent_with_origin_config_and_team(
                 SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::Standard,
                     name: Some(batch.member.spec.name.clone()),
                     custom_agent_id: None,
                     parent_agent_id: None,

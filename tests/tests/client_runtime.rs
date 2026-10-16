@@ -339,6 +339,7 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     // caller-selected backend or invent a launch profile.
     commands
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("capacity-invariant".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -792,6 +793,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     let prompt = "runtime split test";
     commands
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("split-runtime".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

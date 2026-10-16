@@ -733,7 +733,7 @@ impl TydeConfigMcpServer {
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        match do_list_launch_options(&self.host).await {
+        match do_list_launch_options(&self.host, true).await {
             Ok(options) => ok_json(options),
             Err(error) => Ok(err_text(error)),
         }
@@ -760,16 +760,26 @@ impl TydeConfigMcpServer {
         Extension(parts): Extension<axum::http::request::Parts>,
         Parameters(input): Parameters<SpawnAgentToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let message_origin = match self.host.config_mcp_caller(&parts).await {
-            Ok(Some(caller)) => match self.host.agent_message_origin(&caller).await {
+        let caller = match self.host.config_mcp_caller(&parts).await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let source = match caller.as_ref() {
+            Some(caller) => match self.host.agent_handle(caller).await {
+                Some(handle) => Some(handle),
+                None => return Ok(err_text("Handoff source is no longer running")),
+            },
+            None => None,
+        };
+        let message_origin = match caller {
+            Some(caller) => match self.host.agent_message_origin(&caller).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(err_text(error)),
             },
-            Ok(None) => protocol::MessageOrigin::Agent {
+            None => protocol::MessageOrigin::Agent {
                 agent_id: None,
                 name: "Operator".to_owned(),
             },
-            Err(error) => return Ok(err_text(error)),
         };
 
         let request = SpawnRequestInput {
@@ -785,7 +795,21 @@ impl TydeConfigMcpServer {
             custom_agent_id: input.custom_agent_id,
         };
         match do_spawn_agent(&self.host, request, None, message_origin).await {
-            Ok(agent) => ok_json(agent),
+            Ok(agent) => {
+                if let Some(source) = source
+                    && let Err(error) = source
+                        .record_handoff(protocol::AgentHandoff {
+                            agent_id: agent.agent_id.clone(),
+                            project_id: agent.project_id.clone(),
+                        })
+                        .await
+                {
+                    return Ok(err_text(format!(
+                        "Agent created, but its handoff could not be recorded: {error}"
+                    )));
+                }
+                ok_json(agent)
+            }
             Err(error) => Ok(err_text(error)),
         }
     }

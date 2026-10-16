@@ -2178,6 +2178,10 @@ fn summarize_envelope(envelope: &Envelope) -> String {
 
 fn summarize_chat_event(event: &ChatEvent) -> String {
     match event {
+        ChatEvent::AgentHandoff(handoff) => format!(
+            "event=agent_handoff project_present={}",
+            handoff.project_id.is_some()
+        ),
         ChatEvent::TypingStatusChanged(typing) => {
             format!("event=typing_status_changed typing={typing}")
         }

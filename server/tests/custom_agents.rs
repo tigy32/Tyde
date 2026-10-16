@@ -464,7 +464,7 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let help = builtins
         .get(&CustomAgentId("tyde-help".to_owned()))
         .expect("built-in Tyde Operator should be seeded");
-    assert_eq!(help.name, "Tyde Operator");
+    assert_eq!(help.name, "Help");
     assert!(
         help.instructions.as_deref().is_some_and(|instructions| {
             instructions.contains("tyde-config")
@@ -482,6 +482,30 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         }),
         "Help should introduce the Project Manager and Lander builtins: {help:?}"
     );
+    let guidance = help.instructions.as_deref().unwrap();
+    for required in [
+        "clone or check out repositories",
+        "create folders",
+        "set up the",
+        "go-ahead",
+        "INDEPENDENT",
+        "original task",
+        "Stay in Home",
+        "Claude",
+        "Open agent",
+        "Root is host configuration",
+    ] {
+        assert!(
+            guidance.contains(required),
+            "Help must teach practical setup and ownership: missing {required}"
+        );
+    }
+    assert!(!guidance.contains("You coordinate; other agents do the work"));
+    assert!(
+        guidance.contains("Installed means the CLI is present")
+            && guidance.contains("Tyde has no sign-in buttons or links")
+    );
+    assert!(!guidance.contains("signed in from Settings"));
     assert_project_manager_and_lander(&builtins);
     for deprecated in [
         "tyde-code-reviewer",
@@ -580,6 +604,56 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         "Workflow migration must preserve user edits"
     );
 
+    for instructions in [
+        server::store::custom_agents::superseded_operator_v1_instructions(),
+        server::store::custom_agents::superseded_operator_v2_instructions(),
+        server::store::custom_agents::superseded_operator_v3_instructions(),
+    ] {
+        let mut previous = help.clone();
+        previous.name = "Tyde Operator".to_owned();
+        previous.description = "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde.".to_owned();
+        previous.instructions = Some(instructions);
+        fixture
+            .client
+            .custom_agent_upsert(CustomAgentUpsertPayload {
+                custom_agent: previous,
+            })
+            .await
+            .unwrap();
+        fixture
+            .next_frame_matching("old Operator saved", |env| {
+                env.kind == FrameKind::CustomAgentNotify
+            })
+            .await;
+        let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+        let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
+        assert_eq!(
+            upgraded.get(&help.id),
+            Some(help),
+            "Every unedited Operator migrates to Help"
+        );
+    }
+    let mut customized_help = help.clone();
+    customized_help.description = "My personal setup guide".to_owned();
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: customized_help.clone(),
+        })
+        .await
+        .unwrap();
+    fixture
+        .next_frame_matching("custom Help saved", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+        })
+        .await;
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        collect_builtin_team_custom_agents_from_bootstrap(&bootstrap).get(&help.id),
+        Some(&customized_help),
+        "Any customized Help field must prevent migration"
+    );
+
     let shipped_help_v2 = server::store::custom_agents::superseded_help_v2_instructions();
     let shipped_help_v1 = shipped_help_v2
         .split_once("\n\n## Global agent control")
@@ -612,7 +686,7 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         assert_eq!(
             replayed.get(&help.id),
             Some(help),
-            "Unedited shipped Help must upgrade to the Tyde Operator on restart"
+            "Unedited shipped Help must upgrade to current Help on restart"
         );
         assert_eq!(
             replayed.get(&orchestrator_id),
@@ -817,6 +891,11 @@ async fn superseded_builtin_prompts_upgrade_on_restart() {
         );
         let mut previous = active.clone();
         previous.instructions = Some(instructions);
+        if id.0 == protocol::OPERATOR_CUSTOM_AGENT_ID {
+            // Published Operator records predate Help's new name and description.
+            previous.name = "Tyde Operator".to_owned();
+            previous.description = "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde.".to_owned();
+        }
         fixture
             .client
             .custom_agent_upsert(CustomAgentUpsertPayload {
@@ -1175,6 +1254,7 @@ async fn replay_order_replays_customization_before_agents() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("ordered".to_string()),
             custom_agent_id: Some(custom_agent.id.clone()),
             parent_agent_id: None,
@@ -1294,6 +1374,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("customized".to_string()),
             custom_agent_id: Some(custom_agent.id.clone()),
             parent_agent_id: None,
@@ -1367,6 +1448,7 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("default-customized".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1427,6 +1509,7 @@ async fn generated_name_isolates_configured_http_mcp_from_setup() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1502,6 +1585,7 @@ async fn tool_policy_rejection_for_non_claude_backends() {
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some(id.to_string()),
                 custom_agent_id: Some(custom_agent.id.clone()),
                 parent_agent_id: None,
@@ -1561,6 +1645,7 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumable".to_string()),
             custom_agent_id: Some(custom_agent.id.clone()),
             parent_agent_id: None,
@@ -1612,6 +1697,7 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1725,6 +1811,7 @@ async fn steering_ordering_combines_host_and_project_by_title() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("ordered-steering".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1760,6 +1847,7 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("with-agent-control".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1835,6 +1923,7 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("without-agent-control".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1899,6 +1988,7 @@ async fn spawn_resolves_project_skills_from_workspace_root() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("project-skills-agent".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1952,6 +2042,7 @@ async fn project_skills_override_host_skills_on_name_collision() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("override-agent".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2016,6 +2107,7 @@ async fn explicit_custom_agent_resolves_project_skills_alongside_selection() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("specialist-agent".to_string()),
             custom_agent_id: Some(custom_agent.id.clone()),
             parent_agent_id: None,

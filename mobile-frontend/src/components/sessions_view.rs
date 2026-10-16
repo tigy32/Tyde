@@ -344,6 +344,7 @@ async fn resume_session(
 
     let active_project = state.active_project.get_untracked();
     let payload = protocol::SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: None,
         custom_agent_id: None,
         parent_agent_id: None,

@@ -7837,6 +7837,7 @@ fn describe_event(event: &ChatEvent) -> String {
         ChatEvent::GoalCompleted(_) => "GoalCompleted".to_owned(),
         ChatEvent::SlashCommandsChanged(_) => "SlashCommandsChanged".to_owned(),
         ChatEvent::TaskUpdate(_) => "TaskUpdate".to_owned(),
+        ChatEvent::AgentHandoff(_) => "AgentHandoff".to_owned(),
         ChatEvent::RestartRecovery { .. } => "RestartRecovery".to_owned(),
         ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
         ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),

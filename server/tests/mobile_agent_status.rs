@@ -237,6 +237,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await;
     mobile
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("late".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -409,6 +410,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await;
     let (question_agent, _) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("async-question".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(busy.new_agent.agent_id.clone()),

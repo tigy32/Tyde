@@ -144,7 +144,15 @@ pub fn LaunchChooser(
         })
     });
     let selected_profile = RwSignal::new(initial_profile);
-    let selected_agent = RwSignal::new(None::<CustomAgentId>);
+    let initial_agent =
+        if chosen_project.is_none() && state.active_project_ref_untracked().is_none() {
+            state.launch_profile_catalog.with_untracked(|catalogs| {
+                catalogs.get(host.as_ref()?)?.home_custom_agent_id.clone()
+            })
+        } else {
+            None
+        };
+    let selected_agent = RwSignal::new(initial_agent);
     let backend_query = RwSignal::new(String::new());
     let role_query = RwSignal::new(String::new());
     let agents_state = state.clone();
@@ -174,6 +182,7 @@ pub fn LaunchChooser(
     });
     let role_name = Memo::new(move |_| match selected_agent.get() {
         None => "Default agent".to_owned(),
+        Some(id) if id.0 == DEFAULT_CUSTOM_AGENT_ID => "Default agent".to_owned(),
         Some(id) => agents
             .get()
             .into_iter()
@@ -386,8 +395,8 @@ pub fn LaunchChooser(
                         <div class="launch-role-list" role="group" aria-label="Agent role choices">
                             <Show when=move || "default agent".contains(&role_query.get().trim().to_lowercase())
                                 || default_description.get().to_lowercase().contains(&role_query.get().trim().to_lowercase())>
-                                <button type="button" class="launch-role-choice" aria-pressed=move || selected_agent.get().is_none().to_string()
-                                    title=move || default_description.get() on:click=move |_| selected_agent.set(None)>
+                                <button type="button" class="launch-role-choice" aria-pressed=move || selected_agent.get().is_none_or(|id| id.0 == DEFAULT_CUSTOM_AGENT_ID).to_string()
+                                    title=move || default_description.get() on:click=move |_| selected_agent.set(Some(CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned())))>
                                     <span class="launch-choice-text"><strong>"Default agent"</strong><small>{default_description}</small></span>
                                     <span class="launch-selection-mark" aria-hidden="true"></span>
                                 </button>
@@ -588,6 +597,7 @@ mod wasm_tests {
             map.insert(
                 host_id.to_owned(),
                 LaunchProfileCatalog {
+                    home_custom_agent_id: None,
                     entries,
                     default_profile_id: None,
                     custom_profile_schemas: Vec::new(),
@@ -1407,6 +1417,123 @@ mod wasm_tests {
             "no server default → no backend override; server resolves its default"
         );
         assert_rendered_draft(&container, "Claude", "Auto").await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn home_help_default_preserves_explicit_choices_and_project_defaults() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+        );
+        let help_id = CustomAgentId(protocol::OPERATOR_CUSTOM_AGENT_ID.to_owned());
+        state.launch_profile_catalog.update(|catalogs| {
+            let catalog = catalogs.get_mut("local").unwrap();
+            catalog.home_custom_agent_id = Some(help_id.clone());
+            catalog.default_profile_id = Some(LaunchProfileId("claude:default".to_owned()));
+        });
+        state.custom_agents.update(|hosts| {
+            hosts.entry("local".to_owned()).or_default().insert(
+                CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
+                CustomAgent {
+                    id: CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
+                    name: "Default".to_owned(),
+                    description: "My project defaults".to_owned(),
+                    instructions: Some("Preserve these project defaults".to_owned()),
+                    skill_ids: Vec::new(),
+                    mcp_server_ids: Vec::new(),
+                    tool_policy: ToolPolicy::Unrestricted,
+                },
+            );
+            hosts.entry("local".to_owned()).or_default().insert(
+                help_id.clone(),
+                CustomAgent {
+                    id: help_id.clone(),
+                    name: "My setup guide".to_owned(),
+                    description: "My customized Help".to_owned(),
+                    instructions: Some("Keep my preferences".to_owned()),
+                    skill_ids: Vec::new(),
+                    mcp_server_ids: Vec::new(),
+                    tool_policy: ToolPolicy::Unrestricted,
+                },
+            );
+        });
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+        assert_eq!(
+            find_button_by_text(&container, "My setup guide")
+                .unwrap()
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("true"),
+            "Home chooses the server-provided canonical preset, keeping its customized name"
+        );
+        assert_eq!(
+            find_button_by_text(&container, "Default agent")
+                .unwrap()
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("false")
+        );
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            Some(help_id.clone())
+        );
+        assert_rendered_draft(&container, "Claude", "Auto").await;
+
+        open.set(true);
+        next_tick().await;
+        find_button_by_text(&container, "Default agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            Some(CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned())),
+            "An explicit Default choice must not be mistaken for an unspecified Home role"
+        );
+        crate::actions::begin_new_chat_default(&state);
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            Some(help_id)
+        );
+
+        let project = ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: protocol::ProjectId("approved-project".to_owned()),
+        };
+        state.switch_active_project(Some(project));
+        open.set(true);
+        next_tick().await;
+        assert_eq!(
+            find_button_by_text(&container, "Default agent")
+                .unwrap()
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("true")
+        );
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            None,
+            "Project launches retain the ordinary Default"
+        );
+        container.remove();
     }
 
     fn row_button_text(container: &HtmlElement) -> String {

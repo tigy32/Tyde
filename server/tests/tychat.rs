@@ -515,6 +515,7 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             parent_agent_id: None,
             project_id: None,

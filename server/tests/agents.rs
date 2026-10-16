@@ -923,6 +923,7 @@ async fn spawn_token_usage_agent(
 ) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1726,6 +1727,7 @@ async fn spawn_named_session(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1806,6 +1808,7 @@ async fn spawn_user_child(
 ) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent_agent_id.clone()),
@@ -1874,6 +1877,7 @@ async fn spawn_parent_with_native_child(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("parent-with-native-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2090,6 +2094,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("strict-self-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2767,6 +2772,7 @@ async fn agent_lifecycle() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("test-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3323,6 +3329,7 @@ async fn spawn_busy_user_child(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent_agent_id.clone()),
@@ -3389,6 +3396,7 @@ async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("busy-close-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4400,6 +4408,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("await-exit-plan-mode".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent.agent_id.clone()),
@@ -4553,6 +4562,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("await-exit-plan-mode-resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent.agent_id.clone()),
@@ -4745,6 +4755,7 @@ async fn agent_control_spawns_children_by_custom_agent_type() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("typed-parent".to_owned()),
             custom_agent_id: Some(protocol::CustomAgentId("tyde-project-manager".to_owned())),
             parent_agent_id: None,
@@ -4783,12 +4794,13 @@ async fn agent_control_spawns_children_by_custom_agent_type() {
     );
     let (operator, operator_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::HumanChat,
             name: Some("human-operator".to_owned()),
             custom_agent_id: Some(protocol::CustomAgentId("tyde-help".to_owned())),
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/human-operator".to_owned()],
+                workspace_roots: Vec::new(),
                 prompt: "Inspect Tyde configuration".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -4841,6 +4853,7 @@ async fn agent_control_spawns_children_by_custom_agent_type() {
         .await;
     let (restored_operator, restored_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4957,6 +4970,7 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("mcp-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -5082,6 +5096,7 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
     assert!(initial_bootstrap.agents.is_empty());
     resumed_client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -6204,6 +6219,7 @@ async fn agent_control_http_await_emits_progress_notifications() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("await-progress".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent.agent_id.clone()),
@@ -6328,6 +6344,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("await-tool-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -6374,6 +6391,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("await-tool-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent_new.agent_id.clone()),
@@ -7192,6 +7210,7 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
         .await;
         let (resumed, resumed_start) = fixture
             .spawn_with(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: None,
                 custom_agent_id: None,
                 project_id: None,
@@ -7389,6 +7408,7 @@ async fn agent_control_http_explicit_parent_requires_bearer_and_binds_child() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("explicit-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -7499,6 +7519,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("project-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8192,6 +8213,7 @@ async fn backend_native_child_rejects_direct_input_and_resume() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-native-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8288,6 +8310,7 @@ async fn parked_backend_native_child_replays_to_late_clients_and_rejects_interru
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("parent-with-dropped-native-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8411,6 +8434,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("parent-with-live-native-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8661,6 +8685,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("interrupt-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8786,6 +8811,7 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("spawn-failure".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8875,6 +8901,7 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8941,6 +8968,7 @@ async fn generated_name_publishes_provisionally_then_renames_authoritatively() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9048,6 +9076,7 @@ async fn user_rename_wins_race_with_generated_name() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9139,6 +9168,7 @@ async fn spawn_operation_capacity_and_shutdown_are_typed_and_drained() {
         .install_spawn_operation_start_test_gate();
     let (active_limit, queue_capacity) = fixture.spawn_operation_limits_for_test();
     let spawn_payload = |index: usize| SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: Some(format!("Capacity Spawn {index}")),
         custom_agent_id: None,
         parent_agent_id: None,
@@ -9253,6 +9283,7 @@ async fn spawn_operation_panic_and_reconnect_have_one_typed_terminal() {
     let mut fixture = Fixture::new().await;
     let gate = fixture.install_agent_name_test_gate().await;
     let payload = SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: None,
         custom_agent_id: None,
         parent_agent_id: None,
@@ -9346,6 +9377,7 @@ async fn completed_spawn_is_not_reclassified_as_shutdown_cancellation() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Completed Spawn".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9405,6 +9437,7 @@ async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Published Spawn".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9466,6 +9499,7 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Bootstrap First".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9601,6 +9635,7 @@ async fn startup_fanout_advertises_all_subscribers_before_any_attach_wait() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Two Subscriber Startup".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9728,6 +9763,7 @@ async fn held_resume_does_not_block_later_connection_request() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Held Resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9780,6 +9816,7 @@ async fn held_fork_does_not_block_later_connection_request() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Held Fork".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -9851,6 +9888,7 @@ async fn unavailable_session_schema_is_typed_and_not_reprobed_for_new_and_resume
             fixture
                 .client
                 .spawn_agent(SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::Standard,
                     name: Some(format!("Unavailable New {attempt}")),
                     custom_agent_id: None,
                     parent_agent_id: None,
@@ -9965,6 +10003,7 @@ async fn unavailable_session_schema_is_typed_and_not_reprobed_for_new_and_resume
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some(format!("Unavailable Resume {attempt}")),
                 custom_agent_id: None,
                 parent_agent_id: None,
@@ -10025,6 +10064,7 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Terminal Bootstrap First".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10315,6 +10355,7 @@ async fn failed_generated_name_keeps_fallback_without_user_error() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10705,6 +10746,7 @@ async fn renaming_agent_updates_live_streams_and_replay() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Original Name".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10782,6 +10824,7 @@ async fn multiple_agents() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("first".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10803,6 +10846,7 @@ async fn multiple_agents() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("second".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10924,6 +10968,7 @@ async fn late_joining_client_gets_replay() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("replay-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -11221,6 +11266,7 @@ async fn project_replay_happens_before_agent_replay() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("project-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -11317,6 +11363,7 @@ async fn project_delete_detaches_sessions_that_reference_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("delete-guard-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -11425,6 +11472,7 @@ async fn spawn_with_missing_project_id_emits_terminal_agent_error() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("missing-project-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -11806,6 +11854,14 @@ async fn help_controls_top_level_agents_across_projects() {
         "Help must discover agent types: {options}"
     );
 
+    assert!(
+        options["custom_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["id"] == "tyde-help"),
+        "Config launch discovery must offer the canonical Help preset"
+    );
     let existing = spawn_agent_control_parent(&mut fixture, "existing top level").await;
     let ordinary = fixture.agent_control_caller(&existing.agent_id).await;
     let project_root = tempfile::tempdir().unwrap();
@@ -12241,4 +12297,444 @@ async fn help_controls_top_level_agents_across_projects() {
         .await;
     }
     fixture.mock_by_id(&target_id).await.assert_clean().await;
+}
+
+#[tokio::test]
+async fn human_home_help_hands_off_to_independent_project_owner() {
+    use protocol::{AgentLaunchContext, AgentTydePermissions, CustomAgentId};
+    let mut fixture = Fixture::new().await;
+    assert_eq!(
+        fixture
+            .bootstrap
+            .launch_profile_catalog
+            .home_custom_agent_id,
+        Some(CustomAgentId(protocol::OPERATOR_CUSTOM_AGENT_ID.to_owned()))
+    );
+    let url = fixture.config_mcp_http_url().await;
+    let configured = config_agent_tool(
+        &url,
+        "tyde_config_set_setting",
+        json!({
+            "setting": {"setting": "enabled_backends", "enabled_backends": ["claude"]}
+        }),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&configured));
+    let deleted = config_agent_tool(
+        &url,
+        "tyde_config_delete_custom_agent",
+        json!({"custom_agent_id": "tyde-help"}),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&deleted),
+        "The Home preset must remain available"
+    );
+    assert!(mcp_result_text(&deleted).contains("required Home launch preset"));
+    let (help, help_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: AgentLaunchContext::HumanChat,
+            name: Some("Home setup guide".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "Set up my project".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    assert_eq!(
+        help.new_agent.custom_agent_id,
+        Some(CustomAgentId("tyde-help".to_owned()))
+    );
+    assert_eq!(help_start.custom_agent_id, help.new_agent.custom_agent_id);
+    assert_eq!(help_start.project_id, None);
+    assert_eq!(help_start.tyde_permissions, AgentTydePermissions::Root);
+    assert_eq!(help.new_agent.tyde_permissions, AgentTydePermissions::Root);
+    fixture.finish_turn(&help).await;
+    eprintln!("HELP HANDOFF: fresh Home Help finished its initial turn");
+    let mut config = fixture.agent_control_caller(&help.new_agent.agent_id).await;
+    config.url = url;
+    let options = mcp_success_json(
+        &mcp_tool_call_as(&config, false, "tyde_config_list_launch_options", json!({})).await,
+    );
+    assert_eq!(options["enabled_backends"], json!(["claude"]));
+    assert!(
+        options["custom_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == "tyde-help")
+    );
+    let folder = tempfile::tempdir().unwrap();
+    let created = mcp_success_json(
+        &mcp_tool_call_as(
+            &config,
+            false,
+            "tyde_config_create_project",
+            json!({
+                "name": "Approved project", "roots": [folder.path().to_string_lossy()]
+            }),
+        )
+        .await,
+    );
+    let project_id = ProjectId(created["id"].as_str().unwrap().to_owned());
+    let project = match expect_project_notify(&mut fixture.client, "approved project").await {
+        ProjectNotifyPayload::Upsert { project } => project,
+        _ => panic!("expected approved project"),
+    };
+    assert_eq!(project.id, project_id);
+    let handoff_prompt = "Original task: build the app. Decision: reuse this repository. User approved this project and a Project Manager. Setup: folder ready. Next: inspect AGENTS.md.";
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Independent owner",
+            MockScript::one(MockTurn::text("Owner received handoff")).with_user_bubbles(),
+        )
+        .await;
+    let spawned = mcp_success_json(
+        &mcp_tool_call_as(
+            &config,
+            false,
+            "tyde_config_spawn_agent",
+            json!({
+                "project_id": project_id.0, "prompt": handoff_prompt, "name": "Independent owner",
+                "backend_kind": "claude", "custom_agent_id": "tyde-project-manager"
+            }),
+        )
+        .await,
+    );
+    eprintln!("HELP HANDOFF: independent config spawn returned");
+    drop(reservation);
+    let owner_id = protocol::AgentId(spawned["agent_id"].as_str().unwrap().to_owned());
+    let owner =
+        expect_replayed_new_agent(&mut fixture.client, &owner_id, "independent owner").await;
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &owner.instance_stream, "owner start")
+            .await;
+    assert_eq!(
+        start.custom_agent_id,
+        Some(CustomAgentId("tyde-project-manager".to_owned()))
+    );
+    assert_eq!(start.project_id, Some(project_id.clone()));
+    assert_eq!(start.workspace_roots, project_roots(&project));
+    assert_eq!(start.tyde_permissions, AgentTydePermissions::Agent);
+    assert!(start.parent_agent_id.is_none());
+    assert!(owner.parent_agent_id.is_none());
+    eprintln!("HELP HANDOFF: owner startup has the assigned project and Agent role");
+    loop {
+        let env = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &owner.instance_stream,
+            "owner original context",
+        )
+        .await;
+        if let ChatEvent::MessageAdded(message) = env.parse_payload::<ChatEvent>().unwrap() {
+            assert!(
+                message.content == handoff_prompt,
+                "Owner must receive the original task and decisions intact"
+            );
+            assert!(
+                matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &help.new_agent.agent_id),
+                "Owner input must carry Help's authenticated origin"
+            );
+            break;
+        }
+    }
+    eprintln!("HELP HANDOFF: owner received the complete original context");
+    loop {
+        let env =
+            expect_chat_event_on_stream(&mut fixture.client, &help.stream, "typed project handoff")
+                .await;
+        if matches!(env.parse_payload::<ChatEvent>().unwrap(), ChatEvent::AgentHandoff(h)
+            if h.agent_id == owner_id && h.project_id == Some(project_id.clone()))
+        {
+            break;
+        }
+    }
+    eprintln!("HELP HANDOFF: source received its live typed receipt");
+    let (mut observer, snapshot) = fixture.connect_with_bootstrap().await;
+    let help_replay_stream =
+        bootstrapped_agent(&snapshot, &help.new_agent.agent_id).instance_stream;
+    let owner_replay_stream = bootstrapped_agent(&snapshot, &owner_id).instance_stream;
+    let mut help_replayed = false;
+    let mut owner_replayed = false;
+    while !help_replayed || !owner_replayed {
+        let env = observer.next_event().await.unwrap().unwrap();
+        if env.kind != FrameKind::AgentBootstrap {
+            continue;
+        }
+        let replay: AgentBootstrapPayload = env.parse_payload().unwrap();
+        if env.stream == help_replay_stream {
+            assert!(replay.events.iter().any(|event| matches!(event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::AgentHandoff(h)) if h.agent_id == owner_id)),
+                "Help's bootstrap must replay the typed handoff");
+            help_replayed = true;
+            eprintln!("HELP HANDOFF: source replay includes the receipt");
+        }
+        if env.stream == owner_replay_stream {
+            assert!(replay.events.iter().any(|event| matches!(event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) if message.content == handoff_prompt
+                    && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &help.new_agent.agent_id))),
+                "Owner's bootstrap must retain the task and decisions");
+            owner_replayed = true;
+            eprintln!("HELP HANDOFF: owner replay includes the original context");
+        }
+    }
+    let listed = mcp_success_json(
+        &mcp_tool_call_as(&config, false, "tyde_config_list_agents", json!({})).await,
+    );
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["agent_id"] == help.new_agent.agent_id.0 && a["project_id"].is_null())
+    );
+    // Explicit selections and non-human contexts never inherit the Home default or authority.
+    for (context, role, project, expected_role) in [
+        (
+            AgentLaunchContext::HumanChat,
+            Some("tyde-default"),
+            None,
+            Some("tyde-default"),
+        ),
+        (
+            AgentLaunchContext::HumanChat,
+            Some("tyde-project-manager"),
+            None,
+            Some("tyde-project-manager"),
+        ),
+        (
+            AgentLaunchContext::HumanChat,
+            None,
+            Some(project_id.clone()),
+            None,
+        ),
+        (
+            AgentLaunchContext::HumanChat,
+            Some("tyde-help"),
+            Some(project_id.clone()),
+            Some("tyde-help"),
+        ),
+        (AgentLaunchContext::Standard, None, None, None),
+        (
+            AgentLaunchContext::Standard,
+            Some("tyde-help"),
+            None,
+            Some("tyde-help"),
+        ),
+    ] {
+        let (agent, start) = fixture
+            .spawn_with(SpawnAgentPayload {
+                launch_context: context,
+                name: Some("Explicit context".to_owned()),
+                custom_agent_id: role.map(|id| CustomAgentId(id.to_owned())),
+                parent_agent_id: None,
+                project_id: project,
+                params: SpawnAgentParams::New {
+                    workspace_roots: Vec::new(),
+                    prompt: "Bounded question".to_owned(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await;
+        assert_eq!(
+            start.custom_agent_id,
+            expected_role.map(|id| CustomAgentId(id.to_owned()))
+        );
+        assert_eq!(start.tyde_permissions, AgentTydePermissions::Agent);
+        fixture.finish_turn(&agent).await;
+    }
+    fixture
+        .client
+        .send_message(&help.stream, "Another Home question".to_owned())
+        .await
+        .unwrap();
+    fixture.finish_turn(&help).await;
+    let session_id = help_start
+        .session_id
+        .as_ref()
+        .expect("Help session must exist")
+        .clone();
+    let journal_path = fixture
+        .store_dir()
+        .join("transcripts")
+        .join(format!("{}.jsonl", session_id.0));
+    let journal_contents = std::fs::read(&journal_path).expect("Help transcript exists");
+    std::fs::remove_file(&journal_path).unwrap();
+    std::fs::create_dir(&journal_path).unwrap();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Owner without saved receipt",
+            MockScript::one(MockTurn::text("Read-only owner")),
+        )
+        .await;
+    let partial = mcp_tool_call_as(&config, false, "tyde_config_spawn_agent", json!({
+        "project_id": project_id.0, "prompt": "Bounded task", "name": "Owner without saved receipt",
+        "backend_kind": "claude", "custom_agent_id": "tyde-project-manager"
+    })).await;
+    drop(reservation);
+    assert!(
+        mcp_result_is_error(&partial),
+        "A failed journal append must not acknowledge a saved handoff"
+    );
+    assert!(
+        partial["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["text"].as_str().is_some_and(
+                |text| text.contains("Agent created, but its handoff could not be recorded")
+            )),
+        "Partial success must explicitly identify the handoff persistence failure"
+    );
+    std::fs::remove_dir(&journal_path).unwrap();
+    std::fs::write(&journal_path, journal_contents).unwrap();
+    let unreadable = format!(
+        "{{\"logical_session_id\":\"{}\",\"sequence\":9999,\"event_id\":\"unknown-handoff-schema\",\"visibility\":\"visible\",\"event\":{{\"type\":\"future_handoff_event\",\"payload\":{{}}}},\"timestamp_ms\":1}}\n",
+        session_id.0
+    );
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap()
+            .write_all(unreadable.as_bytes())
+            .unwrap();
+    }
+    for name in ["Unreadable handoff", "Cached unreadable handoff"] {
+        let reservation = fixture
+            .reserve_next_mock_launch(name, MockScript::one(MockTurn::text("Read-only owner")))
+            .await;
+        let partial = mcp_tool_call_as(
+            &config,
+            false,
+            "tyde_config_spawn_agent",
+            json!({
+                "project_id": project_id.0, "prompt": "Bounded task", "name": name,
+                "backend_kind": "claude", "custom_agent_id": "tyde-project-manager"
+            }),
+        )
+        .await;
+        drop(reservation);
+        assert!(
+            mcp_result_is_error(&partial),
+            "An unreadable transcript must not acknowledge a replayable handoff, including cached appends"
+        );
+        assert!(mcp_result_text(&partial).contains("cannot replay after restart"));
+    }
+    assert!(
+        std::fs::read_to_string(&journal_path)
+            .unwrap()
+            .contains(&unreadable),
+        "An incompatible complete record must remain intact"
+    );
+    fixture.client.close_agent(&help.stream).await.unwrap();
+    fixture
+        .next_frame_matching("Help closed", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|p| p.agent_id == help.new_agent.agent_id)
+        })
+        .await;
+    let independent = config_agent_tool(&config.url, "tyde_config_list_agents", json!({})).await;
+    assert!(
+        mcp_success_json(&independent)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["agent_id"] == owner_id.0),
+        "Closing Help must not close the independent project owner"
+    );
+    fixture.restart_host().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: AgentLaunchContext::Standard,
+            name: Some("Resumed Help".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .unwrap();
+    // Automatic restoration publishes other agents too, so the first NewAgent
+    // is not necessarily the requested resume (it can be an Agent-role owner).
+    let env = fixture::next_logical_frame_matching_on(&mut fixture.client, "resumed Help", |env| {
+        env.kind == FrameKind::NewAgent
+            && env
+                .parse_payload::<NewAgentPayload>()
+                .is_ok_and(|agent| agent.session_id.as_ref() == Some(&session_id))
+    })
+    .await;
+    let resumed: NewAgentPayload = env.parse_payload().unwrap();
+    assert_eq!(
+        resumed.custom_agent_id,
+        Some(CustomAgentId("tyde-help".to_owned()))
+    );
+    assert_eq!(resumed.project_id, None);
+    eprintln!("HELP HANDOFF: exact saved Help session selected after restart");
+    // A deliberately unreadable journal can report a nonfatal history warning;
+    // errors on independently restored agents must not select the resume.
+    let env = fixture::next_logical_frame_matching_on(&mut fixture.client, "resumed Help start", |env| {
+        if env.stream != resumed.instance_stream { return false; }
+        if env.kind == FrameKind::AgentError {
+            let error: AgentErrorPayload = env.parse_payload().unwrap();
+            let history_warning = error.message.contains("saved history");
+            eprintln!("HELP HANDOFF: resume error fatal={} code={:?} history_warning={history_warning}", error.fatal, error.code);
+            assert!(!error.fatal && history_warning, "Only the deliberately unreadable history warning is expected");
+        }
+        assert!(!matches!(env.kind, FrameKind::CommandError | FrameKind::AgentClosed), "Resume must remain usable");
+        env.kind == FrameKind::AgentStart
+    }).await;
+    let resumed_start: AgentStartPayload = env.parse_payload().unwrap();
+    assert_eq!(resumed_start.tyde_permissions, AgentTydePermissions::Root);
+    let (mut reader, snapshot) = fixture.connect_with_bootstrap().await;
+    let replay_stream = bootstrapped_agent(&snapshot, &resumed.agent_id).instance_stream;
+    loop {
+        let env = reader.next_event().await.unwrap().unwrap();
+        if env.kind != FrameKind::AgentBootstrap || env.stream != replay_stream {
+            continue;
+        }
+        let replay: AgentBootstrapPayload = env.parse_payload().unwrap();
+        let receipts: Vec<_> = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::AgentHandoff(handoff)) => Some(handoff),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "Fresh-host replay only includes the receipt before the unreadable record"
+        );
+        assert_eq!(receipts[0].agent_id, owner_id);
+        break;
+    }
+    assert!(
+        std::fs::read_to_string(&journal_path)
+            .unwrap()
+            .contains(&unreadable),
+        "Fresh-host replay must not replace incompatible bytes"
+    );
 }

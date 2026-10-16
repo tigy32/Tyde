@@ -224,6 +224,7 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     }
     client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("voice target".into()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -597,6 +598,7 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     );
     client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("transport-loss target".into()),
             custom_agent_id: None,
             parent_agent_id: None,

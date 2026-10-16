@@ -5980,6 +5980,11 @@ impl HistoryReplay {
             // A retry or cancellation inside this page, in stream order, for
             // the same reason as the compaction marker below: the notice is
             // about a specific turn and is meaningless detached from it.
+            ChatEvent::AgentHandoff(handoff) => {
+                self.rows.push(crate::state::ChatRowHandle::notice(
+                    crate::state::ChatNotice::AgentHandoff(handoff),
+                ));
+            }
             ChatEvent::RestartRecovery { phase } => {
                 self.rows.push(crate::state::ChatRowHandle::notice(
                     crate::state::ChatNotice::RestartRecovery(phase),
@@ -6420,6 +6425,9 @@ pub fn apply_chat_event_from(
             state.task_lists.update(|task_lists| {
                 task_lists.insert(agent_id.clone(), task_list);
             });
+        }
+        ChatEvent::AgentHandoff(handoff) => {
+            state.push_chat_notice(agent_id.clone(), ChatNotice::AgentHandoff(handoff));
         }
         ChatEvent::RestartRecovery { phase } => {
             state.push_chat_notice(agent_id.clone(), ChatNotice::RestartRecovery(phase));

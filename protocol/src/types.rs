@@ -655,6 +655,9 @@ impl fmt::Display for LaunchProfileId {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchProfileCatalog {
+    /// Preset for a fresh human chat in Home; project chats use Default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_custom_agent_id: Option<CustomAgentId>,
     #[serde(default)]
     pub entries: Vec<LaunchProfileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3499,8 +3502,18 @@ pub enum RejectCode {
     InvalidHandshake,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLaunchContext {
+    #[default]
+    Standard,
+    HumanChat,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentPayload {
+    #[serde(default)]
+    pub launch_context: AgentLaunchContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8229,9 +8242,16 @@ impl RestartRecoveryPhase {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHandoff {
+    pub agent_id: AgentId,
+    pub project_id: Option<ProjectId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
+    AgentHandoff(AgentHandoff),
     RestartRecovery {
         phase: RestartRecoveryPhase,
     },

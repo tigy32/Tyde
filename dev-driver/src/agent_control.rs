@@ -668,6 +668,7 @@ async fn run_runtime(
                             continue;
                         }
                         let payload = SpawnAgentPayload {
+                            launch_context: protocol::AgentLaunchContext::Standard,
                             name: request.name.clone(),
                             custom_agent_id: None,
                             parent_agent_id: request.parent_agent_id.clone(),
@@ -1095,7 +1096,8 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                         agent.turn_completed = true;
                     }
                 }
-                ChatEvent::RestartRecovery { .. }
+                ChatEvent::AgentHandoff(_)
+                | ChatEvent::RestartRecovery { .. }
                 | ChatEvent::MessageMetadataUpdated(_)
                 | ChatEvent::ToolRequest(_)
                 | ChatEvent::ToolProgress(_)

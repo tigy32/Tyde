@@ -87,12 +87,12 @@ const DID_YOU_KNOW_TIPS: &[(&str, &str)] = &[
         "Choose Orchestrator from the New Chat \u{25be} chooser: every backend drafts a plan, the plans cross-review to consensus, one agent implements, and the other backends review the result.",
     ),
     (
-        "Ask the Tyde Operator",
-        "Choose Tyde Operator from the New Chat \u{25be} chooser to ask how anything in Tyde works \u{2014} it can change settings and run other agents for you.",
+        "Ask Help",
+        "Choose Help from the New Chat \u{25be} chooser to ask how anything in Tyde works \u{2014} it can change settings and run other agents for you.",
     ),
     (
         "Customize your default agent",
-        "Edit the Default agent in Settings \u{2192} Custom Agents to shape every chat that doesn't pick a specific agent.",
+        "Edit the Default agent in Settings \u{2192} Custom Agents to shape ordinary project chats. Fresh Home chats start with Help.",
     ),
     (
         "Task complexity tiers",
@@ -1269,7 +1269,7 @@ fn MeasuredRow(
                     view! { <ContextCompactionMarker event=event /> }.into_any()
                 }
                 ChatRowContent::Notice(notice) => {
-                    view! { <ChatNoticeView notice=notice /> }.into_any()
+                    view! { <ChatNoticeView agent_ref=agent_ref notice=notice /> }.into_any()
                 }
             }}
         </div>
@@ -1437,6 +1437,51 @@ fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> imp
     }
 }
 
+#[component]
+fn AgentHandoffView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    handoff: protocol::AgentHandoff,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let target_state = state.clone();
+    let target = Memo::new(move |_| {
+        let source = agent_ref.get()?;
+        target_state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.host_id == source.host_id && agent.agent_id == handoff.agent_id)
+                .cloned()
+        })
+    });
+    let label_state = state.clone();
+    let project = move || {
+        let source = agent_ref.get()?;
+        let project_id = handoff.project_id.as_ref()?;
+        label_state.projects.with(|projects| {
+            projects
+                .iter()
+                .find(|project| {
+                    project.host_id == source.host_id && &project.project.id == project_id
+                })
+                .map(|project| project.project.name.clone())
+        })
+    };
+    view! {
+        <div class="chat-card chat-card-system">
+            <div class="chat-card-body">
+                <p>"Independent agent: "{move || target.get().map(|agent| agent.name).unwrap_or_else(|| "No longer open".to_owned())}
+                    {move || project().map(|name| format!(" · {name}"))}</p>
+                <button type="button" class="tool-live-link" disabled=move || target.get().is_none()
+                    on:click=move |_| {
+                        if let Some(agent) = target.get_untracked() {
+                            crate::components::agents_panel::open_agent_chat(&state, &agent);
+                        }
+                    }>"Open agent"</button>
+            </div>
+        </div>
+    }
+}
+
 /// A retry or cancellation, rendered where it happened.
 ///
 /// A row, not a floating card, for the same reason the compaction marker is
@@ -1446,9 +1491,15 @@ fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> imp
 /// re-mounts it wholesale, so live-region semantics would replay an old
 /// rate-limit warning as news.
 #[component]
-fn ChatNoticeView(notice: ArcRwSignal<ChatNotice>) -> impl IntoView {
+fn ChatNoticeView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    notice: ArcRwSignal<ChatNotice>,
+) -> impl IntoView {
     view! {
         {move || match notice.get() {
+            ChatNotice::AgentHandoff(handoff) => view! {
+                <AgentHandoffView agent_ref=agent_ref handoff=handoff />
+            }.into_any(),
             ChatNotice::RestartRecovery(phase) => view! {
                 <div class="chat-card chat-card-system"><div class="chat-card-body"><p>{phase.notice_text()}</p></div></div>
             }.into_any(),
@@ -2000,6 +2051,165 @@ mod wasm_tests {
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn typed_home_handoff_opens_independent_owner_without_moving_help() {
+        use crate::state::{ActiveProjectRef, AgentInfo, ProjectInfo};
+        ensure_styles_loaded();
+        let container = make_container();
+        let state = AppState::new();
+        let help = AgentInfo {
+            tyde_permissions: protocol::AgentTydePermissions::Root,
+            host_id: "home-host".to_owned(),
+            agent_id: AgentId("help".to_owned()),
+            name: "Help".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            team_member_id: None,
+            session_id: None,
+            custom_agent_id: Some(protocol::CustomAgentId("tyde-help".to_owned())),
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/help".to_owned()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        };
+        let project_id = ProjectId("approved".to_owned());
+        let mut owner = help.clone();
+        owner.agent_id = AgentId("independent-owner".to_owned());
+        owner.name = "Project Manager".to_owned();
+        owner.tyde_permissions = protocol::AgentTydePermissions::Agent;
+        owner.project_id = Some(project_id.clone());
+        owner.custom_agent_id = Some(protocol::CustomAgentId("tyde-project-manager".to_owned()));
+        owner.instance_stream = StreamPath("/agent/independent-owner".to_owned());
+        state.agents.set(vec![help.clone(), owner.clone()]);
+        state.projects.set(vec![ProjectInfo {
+            host_id: "home-host".to_owned(),
+            project: protocol::Project {
+                id: project_id.clone(),
+                name: "Approved app".to_owned(),
+                source: protocol::ProjectSource::Standalone {
+                    roots: vec![ProjectRootPath("/repo/app".to_owned())],
+                },
+                sort_order: 0,
+            },
+        }]);
+        let bound = ActiveAgentRef {
+            host_id: help.host_id.clone(),
+            agent_id: help.agent_id.clone(),
+        };
+        crate::components::agents_panel::open_agent_chat(&state, &help);
+        let active_state = state.clone();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatView tab_id=TabId(10_007) agent_ref=Signal::derive(move || active_state.active_agent.get())
+            is_active=Signal::derive(|| true) /> }
+        });
+        let mut prose = mk_user_msg("Open agent in Approved app").message;
+        prose.sender = MessageSender::Assistant {
+            agent: "claude".to_owned(),
+        };
+        crate::dispatch::apply_chat_event(
+            &state,
+            &bound.host_id,
+            &bound.agent_id,
+            ChatEvent::MessageAdded(prose),
+        );
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Independent agent:"),
+            "Transcript prose must not create a handoff"
+        );
+        let event = ChatEvent::AgentHandoff(protocol::AgentHandoff {
+            agent_id: owner.agent_id.clone(),
+            project_id: owner.project_id.clone(),
+        });
+        crate::dispatch::apply_chat_event(&state, &bound.host_id, &bound.agent_id, event);
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Independent agent: Project Manager · Approved app")
+        );
+        let buttons = container.query_selector_all("button").unwrap();
+        let open = (0..buttons.length())
+            .filter_map(|i| buttons.item(i))
+            .filter_map(|node| node.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().as_deref() == Some("Open agent"))
+            .unwrap();
+        assert!(open.get_bounding_client_rect().width() > 0.0);
+        let mut owner_message = mk_user_msg("The project owner retains the approved task").message;
+        owner_message.sender = MessageSender::Assistant {
+            agent: "claude".to_owned(),
+        };
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner.host_id,
+            &owner.agent_id,
+            ChatEvent::MessageAdded(owner_message),
+        );
+        open.click();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("The project owner retains the approved task"),
+            "Open agent must render the independent owner's conversation"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Independent agent:")
+        );
+        assert_eq!(
+            state.active_project_ref_untracked(),
+            Some(ActiveProjectRef {
+                host_id: "home-host".to_owned(),
+                project_id
+            })
+        );
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id,
+            owner.agent_id
+        );
+        assert!(
+            state
+                .agents
+                .get_untracked()
+                .iter()
+                .any(|agent| agent.agent_id == help.agent_id
+                    && agent.project_id.is_none()
+                    && agent.tyde_permissions == protocol::AgentTydePermissions::Root)
+        );
+        crate::components::agents_panel::open_agent_chat(&state, &help);
+        next_tick().await;
+        assert_eq!(state.active_project_ref_untracked(), None);
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Independent agent: Project Manager · Approved app"),
+            "Help's Home conversation remains available after opening its owner"
+        );
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id,
+            help.agent_id
+        );
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]

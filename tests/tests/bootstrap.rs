@@ -1745,6 +1745,7 @@ async fn live_agent_reconnect_starts_with_agent_bootstrap() {
 
     first
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Bootstrap Agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1832,6 +1833,7 @@ async fn spawn_agent_accepts_launch_profile_id_and_records_metadata() {
 
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Profile Agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1929,6 +1931,7 @@ async fn launch_profile_errors_are_visible_command_errors() {
     ] {
         client
             .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some(format!("Bad profile {profile_id}")),
                 custom_agent_id: None,
                 parent_agent_id: None,

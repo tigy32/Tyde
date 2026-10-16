@@ -1624,6 +1624,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_message_index.update(|m| {
         m.remove(agent_ref);
     });
+    state.agent_handoffs.update(|m| {
+        m.remove(agent_ref);
+    });
     state.restart_notices.update(|m| {
         m.remove(agent_ref);
     });
@@ -2536,6 +2539,19 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 data.payload.kind()
             );
         }
+        ChatEvent::AgentHandoff(handoff) => {
+            let message_index = state
+                .chat_messages
+                .with_untracked(|m| m.get(&agent_ref).map_or(0, Vec::len));
+            state.agent_handoffs.update(|m| {
+                m.entry(agent_ref)
+                    .or_default()
+                    .push(crate::state::PositionedAgentHandoff {
+                        message_index,
+                        handoff,
+                    })
+            });
+        }
         ChatEvent::ContextCompaction(event) => {
             state.push_context_compaction_marker(&agent_ref, event);
         }
@@ -2596,6 +2612,16 @@ fn apply_session_history(
         rebuild_chat_message_index(state, &agent_ref);
     }
 
+    state.agent_handoffs.update(|map| {
+        let mut current = map.remove(&agent_ref).unwrap_or_default();
+        for handoff in &mut current {
+            handoff.message_index = handoff
+                .message_index
+                .saturating_add(prepended_message_count);
+        }
+        replay.agent_handoffs.extend(current);
+        map.insert(agent_ref.clone(), replay.agent_handoffs);
+    });
     state.restart_notices.update(|map| {
         let mut current = map.remove(&agent_ref).unwrap_or_default();
         for notice in &mut current {
@@ -2694,6 +2720,7 @@ struct MobileHistoryReplay {
     rows: Vec<ChatMessageEntry>,
     markers: Vec<PositionedCompactionMarker>,
     restart_notices: Vec<crate::state::PositionedRestartNotice>,
+    agent_handoffs: Vec<crate::state::PositionedAgentHandoff>,
     marker_ids: HashSet<protocol::CompactionObservationId>,
     message_index: HashMap<protocol::ChatMessageId, usize>,
     tool_index: HashMap<String, usize>,
@@ -2785,6 +2812,13 @@ impl MobileHistoryReplay {
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
+            ChatEvent::AgentHandoff(handoff) => {
+                self.agent_handoffs
+                    .push(crate::state::PositionedAgentHandoff {
+                        message_index: self.rows.len(),
+                        handoff,
+                    });
+            }
             ChatEvent::RestartRecovery { phase } => {
                 self.restart_notices
                     .push(crate::state::PositionedRestartNotice {
@@ -3410,6 +3444,9 @@ fn apply_agent_bootstrap(
     state.chat_message_index.update(|m| {
         m.remove(&agent_ref);
     });
+    state.agent_handoffs.update(|m| {
+        m.remove(&agent_ref);
+    });
     state.restart_notices.update(|m| {
         m.remove(&agent_ref);
     });
@@ -3695,6 +3732,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
         ChatEvent::Orchestration(_) => "Orchestration",
+        ChatEvent::AgentHandoff(_) => "AgentHandoff",
         ChatEvent::ContextCompaction(_) => "ContextCompaction",
     }
 }

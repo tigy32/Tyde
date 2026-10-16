@@ -39,12 +39,12 @@ use protocol::{
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CompactionAvailabilityReason, CompactionMethod,
     CompactionMutation, CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionStatus,
-    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT, FrameKind, GitBranchName, HostAbsPath,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile,
-    LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
-    LaunchProfileKind, LaunchProfileSessionSchema, ListSessionsPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT, FrameKind, GitBranchName,
+    HostAbsPath, HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload,
+    HostBrowseStartPayload, HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
+    LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, LaunchProfileKind, LaunchProfileSessionSchema, ListSessionsPayload,
     MAX_SESSION_LIST_PAGE_LIMIT, McpServerDeletePayload, McpServerNotifyPayload,
     McpServerUpsertPayload, MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
@@ -4534,6 +4534,7 @@ impl HostHandle {
             }
         };
         let replacement_payload = SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(start.name.clone()),
             custom_agent_id: start.custom_agent_id.clone(),
             parent_agent_id: start.parent_agent_id.clone(),
@@ -4766,6 +4767,19 @@ impl HostHandle {
                 "spawn_agent",
                 "Swarm members cannot create child agents",
             ));
+        }
+        let human_home_launch = payload.launch_context == protocol::AgentLaunchContext::HumanChat
+            && origin == AgentOrigin::User
+            && input_origin.is_none()
+            && team_context.is_none()
+            && swarm_binding.is_none()
+            && workflow.is_none()
+            && payload.parent_agent_id.is_none()
+            && payload.project_id.is_none()
+            && matches!(&payload.params, SpawnAgentParams::New { workspace_roots, .. } if workspace_roots.is_empty());
+        if human_home_launch && payload.custom_agent_id.is_none() {
+            payload.custom_agent_id =
+                Some(CustomAgentId(protocol::OPERATOR_CUSTOM_AGENT_ID.to_owned()));
         }
         let source_session = match &payload.params {
             SpawnAgentParams::Resume { session_id, .. } => Some(session_id),
@@ -5809,7 +5823,7 @@ impl HostHandle {
         if request.resume_session_id.is_none()
             && request.fork_from_session_id.is_none()
             && (origin == AgentOrigin::Tychat
-                || (origin == AgentOrigin::User
+                || (human_home_launch
                     && request.custom_agent_id.as_ref().is_some_and(|id| {
                         id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID
                     })))
@@ -7846,6 +7860,12 @@ impl HostHandle {
         payload: CustomAgentDeletePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "custom_agent_delete";
+        if payload.id.0 == protocol::OPERATOR_CUSTOM_AGENT_ID {
+            return Err(AppError::conflict(
+                OPERATION,
+                "cannot delete Help: it is the required Home launch preset",
+            ));
+        }
         let mut state = self.state.lock().await;
         let snapshot = state
             .team_registry
@@ -8392,6 +8412,7 @@ impl HostHandle {
     ) -> Result<TeamMemberMessageOutcome, String> {
         let clear_session_on_failure = matches!(&params, SpawnAgentParams::Resume { .. });
         let payload = SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(plan.member.name.clone()),
             custom_agent_id: plan.member.custom_agent_id.clone(),
             parent_agent_id: None,
@@ -11163,6 +11184,7 @@ impl HostHandle {
                 let owner = self
                     .spawn_agent_with_origin_config_and_team(
                         SpawnAgentPayload {
+                            launch_context: protocol::AgentLaunchContext::Standard,
                             name: None,
                             custom_agent_id: record.custom_agent_id.clone(),
                             parent_agent_id,
@@ -14911,6 +14933,7 @@ impl HostHandle {
         let prompt = build_reviewer_user_prompt();
         let prompt_len = prompt.len();
         let payload = SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(if name == "AI Review" {
                 name.to_owned()
             } else {
@@ -16826,6 +16849,7 @@ impl HostHandle {
             let restored = self
                 .spawn_agent_with_origin_config_and_team(
                     SpawnAgentPayload {
+                        launch_context: protocol::AgentLaunchContext::Standard,
                         name: None,
                         custom_agent_id: record.custom_agent_id.clone(),
                         parent_agent_id,
@@ -21971,6 +21995,7 @@ fn launch_profile_catalog_for_settings(
     }
 
     LaunchProfileCatalog {
+        home_custom_agent_id: Some(CustomAgentId(protocol::OPERATOR_CUSTOM_AGENT_ID.to_owned())),
         entries,
         default_profile_id: settings
             .default_launch_profile_id

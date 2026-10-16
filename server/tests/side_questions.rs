@@ -229,6 +229,7 @@ async fn mock_fork_creates_standalone_top_level_agent() {
     let mut fixture = Fixture::new().await;
     let (parent, parent_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -273,6 +274,7 @@ async fn mock_fork_creates_standalone_top_level_agent() {
 
     let (child, child_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("BTW".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -378,6 +380,7 @@ async fn server_rejects_fork_with_parent_or_without_source_session() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("invalid fork".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(AgentId("parent-agent".to_owned())),
@@ -398,6 +401,7 @@ async fn server_rejects_fork_with_parent_or_without_source_session() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("invalid fork".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -422,6 +426,7 @@ async fn stale_fork_source_session_fails_as_agent_error() {
 
     let (child, _child_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Stale BTW".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -450,6 +455,7 @@ async fn fork_outlives_the_agent_it_forked_from() {
     let mut fixture = Fixture::new().await;
     let (source, source_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Source".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -474,6 +480,7 @@ async fn fork_outlives_the_agent_it_forked_from() {
 
     let (child, _child_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("BTW".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -519,6 +526,7 @@ async fn fork_outlives_the_agent_it_forked_from() {
 
     let (second, second_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("BTW again".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -595,6 +603,7 @@ async fn removed_backend_fork_fails_without_touching_source_session() {
 
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Unsupported BTW".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -750,6 +759,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
     );
     let (source, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Source".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -776,6 +786,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
     let source_session = start.session_id.expect("source session");
     let (btw, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("BTW: Restart reproduction".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -892,6 +903,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
         for params in operations {
             client
                 .spawn_agent(SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::Standard,
                     name: None,
                     custom_agent_id: None,
                     parent_agent_id: None,
@@ -976,6 +988,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
         if stage == 1 {
             client
                 .spawn_agent(SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::Standard,
                     name: Some("Invalid fresh settings".to_owned()),
                     custom_agent_id: None,
                     parent_agent_id: None,

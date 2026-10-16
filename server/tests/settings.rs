@@ -2253,6 +2253,7 @@ async fn default_launch_profile_persists_and_drives_new_chats() {
 
     let (agent, start) = fixture
         .spawn_with(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Profile default".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2387,6 +2388,7 @@ async fn default_launch_profile_persists_and_drives_new_chats() {
     fixture
         .client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Missing default".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2771,6 +2773,7 @@ async fn running_agent_settings_carry_the_schema_the_agent_validates() {
     };
     let (agent, _) = fixture
         .spawn_with(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Catalog drift".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

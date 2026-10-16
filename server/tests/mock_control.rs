@@ -48,6 +48,7 @@ async fn reservation_name_mismatch_fails_spawn_visibly() {
 
     let (mismatched, _start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("some-other-name".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -390,6 +391,7 @@ async fn explicit_prompts_survive_resume_replay() {
         .await;
     let (resumed, _start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("recorded-resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -563,6 +565,7 @@ async fn reserved_script_governs_resumed_session() {
     let mut fixture = Fixture::new().await;
     let (seed, seed_start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-seed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -592,6 +595,7 @@ async fn reserved_script_governs_resumed_session() {
         .await;
     let (resumed, _start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-scripted".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -615,6 +619,7 @@ async fn reserved_script_governs_forked_session() {
         let mut fixture = Fixture::new().await;
         let (seed, seed_start) = fixture
             .spawn_with(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some("fork-seed".to_owned()),
                 custom_agent_id: None,
                 parent_agent_id: None,
@@ -648,6 +653,7 @@ async fn reserved_script_governs_forked_session() {
             .await;
         let (forked, _start) = fixture
             .spawn_with(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some("fork-scripted".to_owned()),
                 custom_agent_id: None,
                 parent_agent_id: None,
@@ -872,6 +878,7 @@ async fn reserved_spawn_failure_fails_startup_visibly() {
         .await;
     let (agent, _start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("doomed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -993,6 +1000,7 @@ async fn dying_launch_prompt_is_absent_from_resumed_history() {
         .await;
     let (agent, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("dying-launch".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1043,6 +1051,7 @@ async fn dying_launch_prompt_is_absent_from_resumed_history() {
         .await;
     let (resumed, _start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("dying-launch-resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

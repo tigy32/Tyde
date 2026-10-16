@@ -378,6 +378,7 @@ async fn spawn_project_agent_with_prompt(
 ) -> (NewAgentPayload, SessionId) {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Review Origin".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

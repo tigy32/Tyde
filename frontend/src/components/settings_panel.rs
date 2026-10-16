@@ -13964,6 +13964,7 @@ mod wasm_tests {
                 catalogs.insert(
                     "host-lp".to_owned(),
                     protocol::LaunchProfileCatalog {
+                        home_custom_agent_id: None,
                         entries: vec![
                             protocol::LaunchProfileEntry::Ready {
                                 profile: protocol::LaunchProfile {
@@ -14307,6 +14308,7 @@ mod wasm_tests {
             catalogs.insert(
                 "host-general".to_owned(),
                 protocol::LaunchProfileCatalog {
+                    home_custom_agent_id: None,
                     entries: vec![
                         LaunchProfileEntry::Ready {
                             profile: profile.clone(),
@@ -16038,6 +16040,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 protocol::LaunchProfileCatalog {
+                    home_custom_agent_id: None,
                     entries: Vec::new(),
                     default_profile_id: None,
                     custom_profile_schemas: profile_ids
@@ -16341,6 +16344,7 @@ mod wasm_tests {
                 1,
                 &protocol::LaunchProfileCatalogPayload {
                     catalog: protocol::LaunchProfileCatalog {
+                        home_custom_agent_id: None,
                         entries: vec![LaunchProfileEntry::Ready {
                             profile: protocol::LaunchProfile {
                                 id: saved.id.clone(),
@@ -16681,6 +16685,7 @@ mod wasm_tests {
                 catalogs.insert(
                     "host-lp".to_owned(),
                     protocol::LaunchProfileCatalog {
+                        home_custom_agent_id: None,
                         entries: Vec::new(),
                         default_profile_id: None,
                         custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {

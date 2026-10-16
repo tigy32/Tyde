@@ -34,6 +34,7 @@ async fn spawn_agent(
 ) -> (NewAgentPayload, AgentStartPayload) {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id,

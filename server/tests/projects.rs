@@ -4012,6 +4012,26 @@ async fn project_watch_failures_keep_other_projects_live() {
         .unwrap();
     let before =
         expect_project_file_contents(&mut fixture.client, "observe before kernel overflow").await;
+    // Catch-up rescans invalidate opened files, not every inventory entry.
+    // Without this read, the old test waited for an unopened b.rs even when
+    // the real watcher correctly reported observed_files=0 after queue loss.
+    let storm_file = ProjectPath {
+        root: ProjectRootPath(project_root(&storm, 0)),
+        relative_path: "b.rs".to_owned(),
+    };
+    fixture
+        .client
+        .project_read_file(
+            &storm.id,
+            ProjectReadFilePayload {
+                path: storm_file.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let storm_before =
+        expect_project_file_contents(&mut fixture.client, "observe before read flood").await;
+    assert_eq!(storm_before.contents.as_deref(), Some("b\n"));
     let queue_capacity: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
         .unwrap()
         .trim()
@@ -4068,6 +4088,19 @@ async fn project_watch_failures_keep_other_projects_live() {
     // versions unchanged and both projects still receive subsequent writes.
     fs::write(storm_repo.path().join("b.rs"), "write after read flood\n").unwrap();
     expect_watched_change(&mut fixture.client, "b.rs").await;
+    fixture
+        .client
+        .project_read_file(&storm.id, ProjectReadFilePayload { path: storm_file })
+        .await
+        .unwrap();
+    let storm_after =
+        expect_project_file_contents(&mut fixture.client, "read after read flood").await;
+    assert_eq!(
+        storm_after.contents.as_deref(),
+        Some("write after read flood\n")
+    );
+    assert!(storm_after.version > storm_before.version);
+
     assert_no_watched_changes(&mut fixture.client, &["src/file.rs"]).await;
     fixture
         .client
@@ -4259,7 +4292,10 @@ async fn expect_watched_change_at_phase(
     let mut listings = 0;
     let mut target_listed = false;
     eprintln!("PROJECT WATCH PHASE begin={phase}");
-    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+    // A local positive protocol wait has no timed product contract; nextest
+    // owns hung-test protection, while disconnects and errors still fail.
+    let started = std::time::Instant::now();
+    (async {
         loop {
             let env = client
                 .next_event()
@@ -4303,10 +4339,9 @@ async fn expect_watched_change_at_phase(
     })
     .await;
     eprintln!(
-        "PROJECT WATCH PHASE end={phase} delivered={} frames={frames} change_batches={change_batches} changed_paths={changed_paths} listings={listings} target_listed={target_listed}",
-        outcome.is_ok()
+        "PROJECT WATCH PHASE end={phase} delivered=true frames={frames} change_batches={change_batches} changed_paths={changed_paths} listings={listings} target_listed={target_listed} elapsed_ms={}",
+        started.elapsed().as_millis()
     );
-    outcome.unwrap_or_else(|_| panic!("live update missing for {relative_path}, phase={phase}"));
 }
 
 async fn assert_no_watched_changes(client: &mut client::Connection, paths: &[&str]) {
@@ -5709,6 +5744,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
         .await;
     let (mut agent, mut start) = fixture
         .spawn_with(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Moving agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

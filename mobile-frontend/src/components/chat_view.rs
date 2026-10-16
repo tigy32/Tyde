@@ -14,6 +14,68 @@ use crate::state::{
     PositionedCompactionMarker,
 };
 
+#[component]
+fn AgentHandoffView(owner_agent_ref: AgentRef, handoff: protocol::AgentHandoff) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let target_state = state.clone();
+    let target = Memo::new(move |_| {
+        target_state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent.local_host_id == owner_agent_ref.local_host_id
+                        && agent.agent_id == handoff.agent_id
+                })
+                .cloned()
+        })
+    });
+    let label_state = state.clone();
+    let label = move || match target.get() {
+        None => "Independent agent is no longer open".to_owned(),
+        Some(agent) => {
+            let project = agent.project_id.as_ref().map(|id| {
+                label_state.projects.with(|projects| {
+                    projects
+                        .iter()
+                        .find(|p| p.local_host_id == agent.local_host_id && &p.project.id == id)
+                        .map(|p| p.project.name.clone())
+                        .unwrap_or_else(|| "Project unavailable".to_owned())
+                })
+            });
+            match project {
+                Some(project) => format!("Independent agent: {} · {project}", agent.name),
+                None => format!("Independent agent: {}", agent.name),
+            }
+        }
+    };
+    let disabled = Signal::derive(move || target.get().is_none());
+    let on_open = Callback::new(move |_: ()| {
+        let Some(agent) = target.get_untracked() else {
+            return;
+        };
+        state
+            .active_local_host_id
+            .set(Some(agent.local_host_id.clone()));
+        state.active_project.set(agent.project_id.map(|project_id| {
+            crate::state::ActiveProjectRef {
+                local_host_id: agent.local_host_id.clone(),
+                project_id,
+            }
+        }));
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: agent.local_host_id,
+            agent_id: agent.agent_id,
+        }));
+        state.viewing_chat.set(true);
+    });
+    view! {
+        <div class="chat-card chat-card-system">
+            <span>{label}</span>
+            <Button label="Open agent" variant=ButtonVariant::Secondary size=ButtonSize::Compact disabled=disabled on_click=on_open />
+        </div>
+    }
+}
+
 const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
 
@@ -22,15 +84,23 @@ enum MobileTimelineRow {
     Message(ChatMessageEntry),
     ContextCompaction(protocol::ContextCompactionTimelineEvent),
     RestartRecovery(protocol::RestartRecoveryPhase),
+    AgentHandoff(protocol::AgentHandoff),
 }
 
 fn merge_timeline_rows(
     messages: Vec<ChatMessageEntry>,
     markers: Vec<PositionedCompactionMarker>,
     notices: Vec<crate::state::PositionedRestartNotice>,
+    handoffs: Vec<crate::state::PositionedAgentHandoff>,
 ) -> Vec<MobileTimelineRow> {
     let mut rows = Vec::with_capacity(messages.len().saturating_add(markers.len()));
     for message_index in 0..=messages.len() {
+        rows.extend(
+            handoffs
+                .iter()
+                .filter(|handoff| handoff.message_index == message_index)
+                .map(|handoff| MobileTimelineRow::AgentHandoff(handoff.handoff.clone())),
+        );
         rows.extend(
             notices
                 .iter()
@@ -922,7 +992,8 @@ pub fn ChatView() -> impl IntoView {
                     });
                     let prior_history = s_body.session_history.with(|m| m.get(&key).cloned());
                     let notices = s_body.restart_notices.with(|m| m.get(&key).cloned().unwrap_or_default());
-                    let shown = merge_timeline_rows(messages.clone(), markers.clone(), notices);
+                    let handoffs = s_body.agent_handoffs.with(|m| m.get(&key).cloned().unwrap_or_default());
+                    let shown = merge_timeline_rows(messages.clone(), markers.clone(), notices, handoffs);
                     let load_state = s_body.clone();
                     let load_key = key.clone();
                     let load_stream = s_body.agents.with(|agents| {
@@ -1163,6 +1234,7 @@ pub fn ChatView() -> impl IntoView {
                                             <ChatMessageView owner_agent_ref=owner_agent_ref entry=entry />
                                         }.into_any()
                                     }
+                                    MobileTimelineRow::AgentHandoff(handoff) => view! { <AgentHandoffView owner_agent_ref=key.clone() handoff=handoff /> }.into_any(),
                                     MobileTimelineRow::RestartRecovery(phase) => view! { <div class="chat-card chat-card-system">{phase.notice_text()}</div> }.into_any(),
                                         MobileTimelineRow::ContextCompaction(event) => view! {
                                         <ContextCompactionMarkerView event=event />
@@ -3790,6 +3862,154 @@ mod wasm_tests {
                 .is_some(),
             "retry transient selector must render"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn typed_home_handoff_opens_owner_and_replays_without_moving_help() {
+        let container = make_container();
+        let state = AppState::new();
+        let host = LocalHostId("handoff-host".to_owned());
+        seed_connected_agent(&state, &host);
+        let help = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        };
+        let mut owner = make_agent(&host, "Independent owner");
+        owner.agent_id = AgentId("owner".to_owned());
+        owner.instance_stream = StreamPath("stream/owner".to_owned());
+        owner.project_id = Some(protocol::ProjectId("approved-project".to_owned()));
+        state.agents.update(|agents| agents.push(owner.clone()));
+        state.projects.set(vec![crate::state::ProjectInfo {
+            local_host_id: host.clone(),
+            project: protocol::Project {
+                id: owner.project_id.clone().unwrap(),
+                name: "Approved project".to_owned(),
+                sort_order: 0,
+                source: protocol::ProjectSource::Standalone { roots: Vec::new() },
+            },
+        }]);
+        state.agent_loaded.update(|loaded| {
+            loaded.insert(help.clone());
+            loaded.insert(owner.agent_ref());
+        });
+        state.chat_messages.update(|messages| {
+            messages.insert(
+                help.clone(),
+                vec![make_message(
+                    MessageSender::Assistant {
+                        agent: "Help".to_owned(),
+                    },
+                    "Open agent in Approved project",
+                )],
+            );
+            messages.insert(
+                owner.agent_ref(),
+                vec![make_message(
+                    MessageSender::Assistant {
+                        agent: "Owner".to_owned(),
+                    },
+                    "Original task received",
+                )],
+            );
+        });
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <ChatView /> }
+        });
+        next_tick().await;
+        let open_button = || {
+            (0..container.query_selector_all("button").unwrap().length()).find_map(|index| {
+                let node = container
+                    .query_selector_all("button")
+                    .unwrap()
+                    .item(index)
+                    .unwrap();
+                (node.text_content().unwrap_or_default() == "Open agent")
+                    .then(|| node.unchecked_into::<HtmlElement>())
+            })
+        };
+        assert!(
+            open_button().is_none(),
+            "Transcript prose must never create a handoff"
+        );
+        let handoff = protocol::AgentHandoff {
+            agent_id: owner.agent_id.clone(),
+            project_id: owner.project_id.clone(),
+        };
+        crate::dispatch::apply_chat_event(
+            &state,
+            &help,
+            protocol::ChatEvent::AgentHandoff(handoff.clone()),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Independent agent: Independent owner · Approved project")
+        );
+        open_button().expect("typed Open agent action").click();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Original task received")
+        );
+        assert_eq!(
+            state.active_project.get_untracked().unwrap().project_id,
+            owner.project_id.clone().unwrap()
+        );
+        assert!(
+            state
+                .agents
+                .get_untracked()
+                .iter()
+                .find(|a| a.agent_id == help.agent_id)
+                .unwrap()
+                .project_id
+                .is_none()
+        );
+        state.active_project.set(None);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: help.agent_id.clone(),
+        }));
+        crate::dispatch::reset_inbound_seq_for_host(&host);
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                StreamPath("stream/1".to_owned()),
+                protocol::FrameKind::AgentBootstrap,
+                0,
+                &protocol::AgentBootstrapPayload {
+                    events: vec![protocol::AgentBootstrapEvent::ChatEvent(
+                        protocol::ChatEvent::AgentHandoff(handoff),
+                    )],
+                    latest_output: Default::default(),
+                    activity: protocol::AgentActivity::Idle,
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            open_button().is_some(),
+            "Reconnect replays the authoritative handoff"
+        );
+        state
+            .agents
+            .update(|agents| agents.retain(|a| a.agent_id != owner.agent_id));
+        next_tick().await;
+        assert!(
+            open_button().unwrap().has_attribute("disabled"),
+            "A closed target must not navigate to a guessed agent"
+        );
+        assert!(container.text_content().unwrap().contains("no longer open"));
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]

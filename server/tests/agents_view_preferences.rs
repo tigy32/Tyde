@@ -298,6 +298,7 @@ async fn expect_client_kind(
 async fn spawn_agent_for_order(client: &mut client::Connection) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("ordered-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -328,6 +329,7 @@ async fn spawn_agent_for_tags(
 ) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("tagged-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -357,6 +359,7 @@ async fn spawn_agent_with_parent(
 ) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id,

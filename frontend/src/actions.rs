@@ -70,6 +70,7 @@ pub fn resume_session(
             return;
         };
         let payload = SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -200,7 +201,17 @@ pub fn begin_new_chat_with(
     // open rather than before it.
     let composer = state.composer_for(tab);
     composer.backend_override.set(backend_override);
-    composer.custom_agent_id.set(custom_agent_id);
+    composer.custom_agent_id.set(custom_agent_id.or_else(|| {
+        if state.active_project_ref_untracked().is_some() {
+            return None;
+        }
+        state.launch_profile_catalog.with_untracked(|catalogs| {
+            catalogs
+                .get(selection_host.as_ref()?)?
+                .home_custom_agent_id
+                .clone()
+        })
+    }));
     composer.launch_profile_id.set(None);
     composer.selection_host.set(selection_host);
     composer
@@ -251,7 +262,17 @@ fn begin_profile_chat(
     };
     let composer = state.composer_for(tab);
     composer.backend_override.set(Some(profile.backend_kind));
-    composer.custom_agent_id.set(custom_agent_id);
+    composer.custom_agent_id.set(custom_agent_id.or_else(|| {
+        if state.active_project_ref_untracked().is_some() {
+            return None;
+        }
+        state.launch_profile_catalog.with_untracked(|catalogs| {
+            catalogs
+                .get(selection_host.as_ref()?)?
+                .home_custom_agent_id
+                .clone()
+        })
+    }));
     composer.launch_profile_id.set(Some(profile.id));
     composer.selection_host.set(selection_host);
     // Show the profile's settings as the effective draft values, but mark them
@@ -450,6 +471,7 @@ pub fn spawn_new_chat(
     let pending_state = state.clone();
     spawn_local(async move {
         let payload = SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::HumanChat,
             name: None,
             custom_agent_id,
             parent_agent_id: None,
@@ -500,6 +522,7 @@ pub fn fork_payload(
     images: Option<Vec<ImageData>>,
 ) -> SpawnAgentPayload {
     SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
         name: None,
         custom_agent_id: None,
         parent_agent_id: None,

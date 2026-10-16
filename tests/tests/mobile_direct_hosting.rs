@@ -87,6 +87,7 @@ impl Harness {
         let store_dir = tempfile::tempdir().expect("create direct hosting store dir");
         let runtime_config = server::HostRuntimeConfig {
             mobile_pairing_ttl: pairing_ttl,
+            skip_real_backend_probe: true,
             ..Default::default()
         };
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
@@ -124,11 +125,20 @@ impl Harness {
 }
 
 async fn next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    timeout(EVENT_TIMEOUT, client.next_event())
+    // These are positive local protocol waits, not timed product contracts.
+    // The old five-second cutoff rejected healthy initial backend discovery.
+    let started = std::time::Instant::now();
+    let event = client
+        .next_event()
         .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
         .unwrap_or_else(|error| panic!("failed reading {context}: {error:?}"))
-        .unwrap_or_else(|| panic!("connection closed while waiting for {context}"))
+        .unwrap_or_else(|| panic!("connection closed while waiting for {context}"));
+    eprintln!(
+        "MOBILE HOSTING: context={context} kind={:?} elapsed_ms={}",
+        event.kind,
+        started.elapsed().as_millis()
+    );
+    event
 }
 
 async fn expect_initial_replay(client: &mut client::Connection) -> MobileAccessStatePayload {

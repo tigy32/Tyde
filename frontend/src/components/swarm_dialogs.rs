@@ -1853,6 +1853,7 @@ mod wasm_tests {
             catalogs.insert(
                 host.to_owned(),
                 LaunchProfileCatalog {
+                    home_custom_agent_id: None,
                     entries: vec![LaunchProfileEntry::Ready {
                         profile: LaunchProfile {
                             id: LaunchProfileId("claude-default".to_owned()),

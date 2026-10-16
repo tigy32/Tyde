@@ -672,6 +672,12 @@ pub struct ChatMessageEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct PositionedAgentHandoff {
+    pub message_index: usize,
+    pub handoff: protocol::AgentHandoff,
+}
+
+#[derive(Clone, Debug)]
 pub struct PositionedRestartNotice {
     pub message_index: usize,
     pub phase: protocol::RestartRecoveryPhase,
@@ -973,6 +979,7 @@ pub struct AppState {
     /// patched in place. Cleared anywhere `chat_messages` is cleared
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
+    pub agent_handoffs: RwSignal<HashMap<AgentRef, Vec<PositionedAgentHandoff>>>,
     pub restart_notices: RwSignal<HashMap<AgentRef, Vec<PositionedRestartNotice>>>,
     pub compaction_markers: RwSignal<HashMap<AgentRef, Vec<PositionedCompactionMarker>>>,
     pub compaction_marker_ids: RwSignal<HashMap<AgentRef, HashSet<CompactionObservationId>>>,
@@ -1174,6 +1181,7 @@ impl AppState {
             agent_load_errors: RwSignal::new(HashMap::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
+            agent_handoffs: RwSignal::new(HashMap::new()),
             restart_notices: RwSignal::new(HashMap::new()),
             compaction_markers: RwSignal::new(HashMap::new()),
             compaction_marker_ids: RwSignal::new(HashMap::new()),
@@ -1949,6 +1957,9 @@ impl AppState {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.chat_message_index.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_handoffs.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.restart_notices.update(|m| {

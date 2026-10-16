@@ -317,6 +317,7 @@ async fn turn_mobile_new_chat_spawns_and_loads_agent() {
         &mut mobile,
         FrameKind::SpawnAgent,
         &SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("mobile new chat agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -406,6 +407,7 @@ async fn turn_mobile_duplicate_load_agent_reports_command_error() {
 
     desktop
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("mobile duplicate load agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -680,6 +682,7 @@ async fn turn_mobile_receives_agent_replay_sessions_and_chat_events() {
 
     desktop
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("mobile replay agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -790,6 +793,7 @@ async fn turn_mobile_reconnect_replays_bootstrap_state_again() {
 
     desktop
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("mobile reconnect agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

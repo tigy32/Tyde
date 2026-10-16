@@ -1480,6 +1480,7 @@ mod wasm_tests {
             catalogs.insert(
                 "local".to_owned(),
                 protocol::LaunchProfileCatalog {
+                    home_custom_agent_id: None,
                     entries: vec![LaunchProfileEntry::Ready {
                         profile: protocol::LaunchProfile {
                             id: protocol::LaunchProfileId("claude:default".to_owned()),

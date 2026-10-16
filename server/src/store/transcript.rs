@@ -70,6 +70,7 @@ impl Drop for SessionJournal {
 #[derive(Debug, Default)]
 struct TranscriptIndex {
     stamp: Option<JournalStamp>,
+    unreadable_record: bool,
     next_sequence: u64,
     event_ids: HashSet<String>,
     provider_identities: HashSet<ProviderEventIdentity>,
@@ -465,6 +466,7 @@ impl SessionJournal {
                 };
                 let (existing, read) = self.store.read_journal_for_append(session_id)?;
                 outcome = read;
+                index.unreadable_record = outcome.unreadable_record;
                 tracing::debug!(%session_id, records = existing.len(), "loading transcript append index");
                 for record in existing {
                     index.include(&record);
@@ -474,6 +476,7 @@ impl SessionJournal {
             let index = cached
                 .as_mut()
                 .ok_or("transcript index was not initialized")?;
+            outcome.unreadable_record = index.unreadable_record;
             for mut record in records {
                 if record.logical_session_id != *session_id {
                     return Err("transcript append batch contains multiple sessions".to_owned());

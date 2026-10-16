@@ -1541,6 +1541,7 @@ async fn spawn_restart_agent(
     };
     let (agent, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id,

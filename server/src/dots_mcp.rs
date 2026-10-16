@@ -61,7 +61,7 @@ impl DotsMcpServer {
         &self,
         Parameters(_input): Parameters<DotsEmptyInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        result(agent_control_mcp::do_list_launch_options(&self.host).await)
+        result(agent_control_mcp::do_list_launch_options(&self.host, false).await)
     }
 
     #[tool(

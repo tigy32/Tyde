@@ -985,23 +985,35 @@ fn NewChatOptions() -> impl IntoView {
         agents
     });
     let selected_agent_state = state.clone();
-    let selected_agent = move || {
+    let selected_agent = Signal::derive(move || {
         selected_agent_state
             .draft_custom_agent_id
             .get()
+            .or_else(|| {
+                if selected_agent_state.active_project.get().is_some() {
+                    return None;
+                }
+                let host = selected_agent_state.active_local_host_id.get()?;
+                selected_agent_state
+                    .launch_profile_catalog_by_host
+                    .with(|catalogs| catalogs.get(&host)?.home_custom_agent_id.clone())
+            })
+    });
+    let selected_agent_value = move || {
+        selected_agent
+            .get()
             .map(|id| id.0)
-            .unwrap_or_default()
+            .unwrap_or_else(|| "tyde-default".to_owned())
     };
     let change_agent_state = state.clone();
     let on_agent_change = move |event| {
-        let value = event_target_value(&event);
         change_agent_state
             .draft_custom_agent_id
-            .set((!value.is_empty()).then_some(protocol::CustomAgentId(value)));
+            .set(Some(protocol::CustomAgentId(event_target_value(&event))));
     };
     let agent_hint_state = state.clone();
     let agent_hint = move || {
-        let Some(selected) = agent_hint_state.draft_custom_agent_id.get() else {
+        let Some(selected) = selected_agent.get() else {
             return "Use the host's default agent instructions.".to_owned();
         };
         agent_hint_state
@@ -1121,10 +1133,10 @@ fn NewChatOptions() -> impl IntoView {
                     data-mobile-test="new-chat-agent"
                     aria-label="Agent"
                     aria-describedby="new-chat-agent-hint"
-                    prop:value=selected_agent
+                    prop:value=selected_agent_value
                     on:change=on_agent_change
                 >
-                    <option value="">"Default agent"</option>
+                    <option value="tyde-default">"Default agent"</option>
                     {move || custom_agents.get().into_iter().map(|agent| {
                         let value = agent.id.0;
                         view! { <option value=value>{agent.name}</option> }
@@ -2999,6 +3011,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn new_chat_can_choose_backend_and_custom_agent() {
+        let send_guard = crate::bridge::test_capture_sends();
         let container = make_container();
         let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -3028,7 +3041,7 @@ mod wasm_tests {
                 );
             });
             state.custom_agents_by_host.update(|agents| {
-                agents.entry(host).or_default().insert(
+                agents.entry(host.clone()).or_default().insert(
                     CustomAgentId("reviewer".to_owned()),
                     CustomAgent {
                         id: CustomAgentId("reviewer".to_owned()),
@@ -3040,6 +3053,25 @@ mod wasm_tests {
                         tool_policy: ToolPolicy::Unrestricted,
                     },
                 );
+            });
+            state.custom_agents_by_host.update(|agents| {
+                let mut help = agents[&host][&CustomAgentId("reviewer".to_owned())].clone();
+                help.id = CustomAgentId("tyde-help".to_owned());
+                help.name = "My setup guide".to_owned();
+                help.description = "Hands-on setup".to_owned();
+                agents.get_mut(&host).unwrap().insert(help.id.clone(), help);
+            });
+            state.launch_profile_catalog_by_host.update(|catalogs| {
+                catalogs.insert(
+                    host.clone(),
+                    protocol::LaunchProfileCatalog {
+                        home_custom_agent_id: Some(CustomAgentId("tyde-help".to_owned())),
+                        ..Default::default()
+                    },
+                );
+            });
+            state.host_streams.update(|streams| {
+                streams.insert(host, StreamPath("/host/home-help".to_owned()));
             });
             *handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
@@ -3105,6 +3137,46 @@ mod wasm_tests {
                 .contains("Reviewer"),
             "custom agents should be offered by name"
         );
+        assert_eq!(
+            agent.value(),
+            "tyde-help",
+            "Home projects the server's preset, including its customized label"
+        );
+        assert!(
+            agent
+                .query_selector("option:checked")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("My setup guide")
+        );
+        agent.set_value("tyde-default");
+        agent
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(agent.value(), "tyde-default");
+        assert_eq!(
+            state.draft_custom_agent_id.get_untracked(),
+            Some(CustomAgentId("tyde-default".to_owned()))
+        );
+        state.draft_custom_agent_id.set(None);
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                local_host_id: LocalHostId("host-1".to_owned()),
+                project_id: protocol::ProjectId("project".to_owned()),
+            }));
+        next_tick().await;
+        assert_eq!(agent.value(), "tyde-default", "Project chats keep Default");
+        state.active_project.set(None);
+        next_tick().await;
+        assert_eq!(
+            agent.value(),
+            "tyde-help",
+            "An unspecified Home choice returns to Help"
+        );
         agent.set_value("reviewer");
         agent
             .dispatch_event(&web_sys::Event::new("change").unwrap())
@@ -3127,6 +3199,22 @@ mod wasm_tests {
                 .contains("Review changes before they ship."),
             "the chosen agent's description should explain the selection"
         );
+        type_text(&container, "Bounded question");
+        next_tick().await;
+        primary(&container).unchecked_ref::<HtmlElement>().click();
+        next_tick().await;
+        next_tick().await;
+        let frames: Vec<serde_json::Value> = crate::bridge::test_sent_lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let spawn = frames
+            .iter()
+            .find(|f| f["kind"] == "spawn_agent")
+            .expect("human chat launch");
+        assert_eq!(spawn["payload"]["launch_context"], "human_chat");
+        assert_eq!(spawn["payload"]["custom_agent_id"], "reviewer");
+        drop(send_guard);
     }
 
     #[wasm_bindgen_test]
@@ -3226,6 +3314,7 @@ mod wasm_tests {
                     0,
                     &protocol::LaunchProfileCatalogPayload {
                         catalog: protocol::LaunchProfileCatalog {
+                            home_custom_agent_id: None,
                             entries: vec![protocol::LaunchProfileEntry::Ready { profile }],
                             default_profile_id: Some(protocol::LaunchProfileId("focus".to_owned())),
                             custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {

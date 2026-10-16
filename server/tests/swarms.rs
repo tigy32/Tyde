@@ -5257,6 +5257,7 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
         .fixture
         .client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(normal_name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -7060,6 +7061,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         .fixture
         .client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(ordinary_name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -10330,6 +10332,7 @@ async fn authenticated_peer_wakes_exhaust_one_causal_budget_without_losing_posts
         .fixture
         .client
         .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(ordinary_name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

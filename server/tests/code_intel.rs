@@ -764,6 +764,7 @@ async fn agent_launch_with_project_id_warms_code_intel() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("code-intel-warm".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

@@ -339,6 +339,7 @@ async fn spawn_project_caller(
 ) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -954,6 +955,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("workbench-live-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1078,6 +1080,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("workbench-session-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1203,6 +1206,7 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("workbench-orchestrator".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1454,6 +1458,7 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("projectless-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1958,6 +1963,7 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         .await;
     let (agent, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Entering worker".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

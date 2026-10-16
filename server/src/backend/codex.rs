@@ -23365,7 +23365,8 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
         | ChatEvent::OperationCancelled(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
-        | ChatEvent::ContextCompaction(_) => return None,
+        | ChatEvent::ContextCompaction(_)
+        | ChatEvent::AgentHandoff(_) => return None,
     };
     Some(format!("{role}:{id}"))
 }

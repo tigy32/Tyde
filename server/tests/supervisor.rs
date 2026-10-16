@@ -311,6 +311,7 @@ async fn spawn_supervised_agent_with_turn(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -779,6 +780,7 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("codex-error-tail".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1303,6 +1305,7 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(source_name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1377,6 +1380,7 @@ async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("restored-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1479,6 +1483,7 @@ async fn stalled_turn_is_interrupted_then_judged_once() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("stalled-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

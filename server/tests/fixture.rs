@@ -1492,6 +1492,7 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn spawn(&mut self, name: &str, prompt: &str) -> TestAgent {
         self.spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,

@@ -461,6 +461,7 @@ async fn list_sessions_and_resume_agent() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumable".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -505,6 +506,7 @@ async fn list_sessions_and_resume_agent() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -589,6 +591,7 @@ async fn session_store_keeps_foreign_records_across_turn() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("live-session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -744,6 +747,7 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("shared session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -779,6 +783,7 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -836,6 +841,7 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("raced session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -892,6 +898,7 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     // and persists its marker before the held write erases it.
     resumer
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -965,6 +972,7 @@ async fn a_close_does_not_wait_on_a_held_resume_of_its_session() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("closed while resumed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1006,6 +1014,7 @@ async fn a_close_does_not_wait_on_a_held_resume_of_its_session() {
     let mut resumer = fixture.connect().await;
     resumer
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1057,6 +1066,7 @@ async fn a_failed_resume_stops_owning_the_session_it_could_not_open() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("healthy card".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1103,6 +1113,7 @@ async fn a_failed_resume_stops_owning_the_session_it_could_not_open() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("failed resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1224,6 +1235,7 @@ async fn restoration_skips_a_session_closed_while_its_pass_was_held() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("closed mid-pass".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1285,6 +1297,7 @@ async fn restoration_skips_a_session_closed_while_its_pass_was_held() {
     // still carries.
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1337,6 +1350,7 @@ async fn restoration_does_not_duplicate_a_session_a_client_is_resuming() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("contended session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1391,6 +1405,7 @@ async fn restoration_does_not_duplicate_a_session_a_client_is_resuming() {
     let (mut client, _) = fixture::connect_host(host.clone()).await;
     client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1448,6 +1463,7 @@ async fn restart_without_an_ambient_runtime_restores_working_agents() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("survives a runtimeless restart".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1544,6 +1560,7 @@ async fn restart_keeps_a_read_only_agent_read_only() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("read-only survivor".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -1854,6 +1871,7 @@ async fn resume_completed_turn_and_followup_settle_before_attach() {
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: Some("completed before boundary".to_owned()),
                 custom_agent_id: None,
                 parent_agent_id: None,
@@ -1999,6 +2017,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("survives restart".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2048,6 +2067,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("child survives restart".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(survivor.agent_id.clone()),
@@ -2100,6 +2120,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("closed before restart".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2319,6 +2340,7 @@ async fn restart_restores_open_agents_and_preserves_settings() {
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
                 name: None,
                 custom_agent_id: None,
                 parent_agent_id: None,
@@ -2371,6 +2393,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("history-on-demand".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2591,6 +2614,7 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("history-no-dupe".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2705,6 +2729,7 @@ async fn resume_long_replay_history_stays_capped_without_live_broadcast() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-long-source".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2761,6 +2786,7 @@ async fn resume_long_replay_history_stays_capped_without_live_broadcast() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-long".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2812,6 +2838,7 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-no-leak-source".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2855,6 +2882,7 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-no-leak".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -2999,6 +3027,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-close-before-barrier-source".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3052,6 +3081,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-close-before-barrier".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3104,6 +3134,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("active-history-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3146,6 +3177,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("active-history-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent.agent_id.clone()),
@@ -3297,6 +3329,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3339,6 +3372,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: Some(parent_new_agent.agent_id.clone()),
@@ -3395,6 +3429,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3467,6 +3502,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("project-session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3515,6 +3551,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-same-project".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3548,6 +3585,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resume-other-project".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3635,6 +3673,7 @@ async fn delete_session_removes_it_from_list() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("to-delete".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3843,6 +3882,7 @@ async fn requested_compactions_keep_one_row_when_observed_after_completion() {
     let session = &sessions.sessions[0];
     let (resumed, _) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed compacted session".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -3980,6 +4020,7 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("torn".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4079,6 +4120,7 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4186,6 +4228,7 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed twice".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4257,6 +4300,7 @@ async fn a_transcript_that_cannot_be_written_reports_a_non_fatal_error() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("unwritable".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4363,6 +4407,7 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("unknown schema".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4409,6 +4454,7 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("resumed".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4479,6 +4525,7 @@ async fn restart_does_not_resurrect_backend_native_children() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("parent-with-native-child".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4592,6 +4639,7 @@ async fn session_sqlite_import_preserves_json_and_survives_restart() {
     original
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Pre-migration conversation".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4679,6 +4727,7 @@ async fn session_sqlite_import_preserves_json_and_survives_restart() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -4763,6 +4812,7 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Before commit".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -5108,6 +5158,7 @@ async fn spawn_restart_agent(
     let reservation = fixture.reserve_next_mock_launch(name, script).await;
     let (agent, start) = fixture
         .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id,
@@ -5926,6 +5977,7 @@ async fn manual_resume_reports_interruption_without_continuing() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("manual resume".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -6612,6 +6664,7 @@ async fn skipped_restored_parent_does_not_strand_an_unrelated_root() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
             parent_agent_id: None,
@@ -7309,6 +7362,7 @@ async fn expect_closed_agent_not_continued(fixture: &mut Fixture, session: &Sess
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -7678,6 +7732,7 @@ async fn restart_during_initial_prompt_startup_continues_the_spawned_turn() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
@@ -8411,6 +8466,7 @@ async fn spawn_held_at_startup(
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
             name: Some(name.to_owned()),
             custom_agent_id: None,
             parent_agent_id,
