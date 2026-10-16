@@ -103,7 +103,7 @@ def run():
     with (root / "run.log").open("w") as output:
         result = subprocess.run(
             [sys.argv[1], "--exact", sys.argv[2], "--ignored", "--nocapture"],
-            env=env, stdout=output, stderr=subprocess.STDOUT, timeout=420,
+            env=env, stdout=output, stderr=subprocess.STDOUT,
         )
     if not proof.exists():
         raise RuntimeError("real provider never requested blocking user input")

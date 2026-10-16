@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use protocol::{
     BackendCapacityState, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
@@ -24,9 +24,9 @@ use crate::acp::adapter::{
     AcpSessionKind, AcpSlashCommandCtx, AcpSlashCommandPlan, adapter_for_spec,
 };
 use crate::acp::{
-    AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
-    extract_text_from_update, extract_tool_call_id, map_plan_status, parse_tool_call_completion,
-    parse_tool_call_request,
+    AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, AcpStateActor, acp_mcp_servers_json,
+    extract_message_id, extract_text_from_update, extract_tool_call_id, map_plan_status,
+    parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -593,7 +593,6 @@ impl KiroSession {
             .flatten();
         let agent_name = adapter.agent_name().to_owned();
         let inner = Arc::new(KiroInner {
-            inbound_gate: Mutex::new(()),
             adapter,
             capabilities,
             bridge: Arc::new(bridge),
@@ -602,14 +601,9 @@ impl KiroSession {
             workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             capacity_probe,
-            capacity_state: Mutex::new(KiroCapacityState::default()),
-            prompt_lock: Arc::new(Mutex::new(())),
             in_flight_prompts: AtomicUsize::new(0),
-            native_child_sessions: Mutex::new(HashSet::new()),
-            native_sessions: Arc::new(NativeSessionRoutes::default()),
-            native_owned_children: Mutex::new(Vec::new()),
-            native_relay_tasks: Mutex::new(tokio::task::JoinSet::new()),
-            state: Mutex::new(KiroState {
+            native_sessions: AcpStateActor::spawn(NativeSessionRoutes::default()),
+            state: KiroStateActor::spawn(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
                 workspace_roots: configured_workspace_roots,
@@ -654,6 +648,7 @@ impl KiroSession {
                 opencode_cumulative_usage: TokenUsage::default(),
                 opencode_current_context_usage: None,
                 pending_compaction: None,
+                ..Default::default()
             }),
         });
 
@@ -667,8 +662,15 @@ impl KiroSession {
 
         // Emit SessionStarted so forward_events sets backend_session_id on the store record
         {
-            let state = inner.state.lock().await;
-            inner.emitter.session_started(&state.session_id);
+            inner
+                .state
+                .with({
+                    let emitter = Arc::clone(&inner.emitter);
+                    move |state| {
+                        emitter.session_started(&state.session_id);
+                    }
+                })
+                .await
         }
 
         Ok((Self { inner }, event_rx))
@@ -691,6 +693,12 @@ impl KiroSession {
 
 #[derive(Default)]
 struct KiroState {
+    capacity: KiroCapacityState,
+    prompt_admission: KiroAdmissionState,
+    inbound_admission: KiroAdmissionState,
+    native_child_sessions: HashSet<String>,
+    native_owned_children: Vec<Arc<KiroInner>>,
+    native_relay_tasks: tokio::task::JoinSet<()>,
     session_id: String,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
@@ -900,8 +908,8 @@ fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bo
 
 #[derive(Default)]
 struct NativeSessionRoutes {
-    children: Mutex<HashMap<String, std::sync::Weak<KiroInner>>>,
-    pending: Mutex<HashMap<String, Vec<(String, Value)>>>,
+    children: HashMap<String, std::sync::Weak<KiroInner>>,
+    pending: HashMap<String, Vec<(String, Value)>>,
 }
 
 struct KiroInner {
@@ -909,19 +917,13 @@ struct KiroInner {
     capabilities: AcpCapabilities,
     bridge: Arc<AcpBridge>,
     emitter: Arc<TurnEmitter>,
-    state: Mutex<KiroState>,
-    inbound_gate: Mutex<()>,
+    state: KiroStateActor,
     shutting_down: AtomicBool,
     workspace_reload_in_progress: AtomicBool,
     ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
-    capacity_state: Mutex<KiroCapacityState>,
-    prompt_lock: Arc<Mutex<()>>,
     in_flight_prompts: AtomicUsize,
-    native_child_sessions: Mutex<HashSet<String>>,
-    native_sessions: Arc<NativeSessionRoutes>,
-    native_owned_children: Mutex<Vec<Arc<KiroInner>>>,
-    native_relay_tasks: Mutex<tokio::task::JoinSet<()>>,
+    native_sessions: AcpStateActor<NativeSessionRoutes>,
 }
 
 #[derive(Default)]
@@ -939,6 +941,220 @@ impl Drop for AcpWorkspaceReload<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KiroAdmissionPhase {
+    Prompt,
+    RelocationCandidate,
+    Relocation,
+    Compaction,
+    Inbound,
+}
+
+struct KiroAdmissionWaiter {
+    id: u64,
+    phase: KiroAdmissionPhase,
+    reply: oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct KiroAdmissionState {
+    active: Option<(u64, KiroAdmissionPhase)>,
+    waiting: VecDeque<KiroAdmissionWaiter>,
+}
+
+impl KiroAdmissionState {
+    fn admit_waiters(&mut self) {
+        while self.active.is_none() {
+            let Some(waiter) = self.waiting.pop_front() else {
+                break;
+            };
+            if waiter.reply.send(()).is_ok() {
+                self.active = Some((waiter.id, waiter.phase));
+            }
+        }
+    }
+
+    fn try_admit(&mut self, id: u64, phase: KiroAdmissionPhase) -> bool {
+        self.admit_waiters();
+        if self.active.is_some() {
+            return false;
+        }
+        self.active = Some((id, phase));
+        true
+    }
+
+    fn release(&mut self, id: u64) {
+        self.waiting.retain(|waiter| waiter.id != id);
+        if self.active.is_some_and(|(active, _)| active == id) {
+            self.active = None;
+        }
+        self.admit_waiters();
+    }
+
+    fn relocating(&self) -> bool {
+        self.active
+            .is_some_and(|(_, phase)| phase == KiroAdmissionPhase::Relocation)
+    }
+}
+
+type KiroStateChange = Box<dyn FnOnce(&mut KiroState) + Send>;
+
+enum KiroStateTransition {
+    Now(KiroStateChange),
+    AfterRelocation(KiroStateChange),
+}
+
+#[derive(Clone)]
+struct KiroStateActor {
+    transitions: mpsc::UnboundedSender<KiroStateTransition>,
+    next_admission: Arc<AtomicU64>,
+}
+
+impl KiroStateActor {
+    fn spawn(mut state: KiroState) -> Self {
+        let (transitions, mut inbox) = mpsc::unbounded_channel::<KiroStateTransition>();
+        crate::backend::subprocess::spawn(async move {
+            let mut held = VecDeque::new();
+            while let Some(transition) = inbox.recv().await {
+                match transition {
+                    KiroStateTransition::Now(change) => change(&mut state),
+                    KiroStateTransition::AfterRelocation(change) => {
+                        if state.prompt_admission.relocating() {
+                            held.push_back(change);
+                        } else {
+                            change(&mut state);
+                        }
+                    }
+                }
+                while !state.prompt_admission.relocating()
+                    && let Some(change) = held.pop_front()
+                {
+                    change(&mut state);
+                }
+            }
+        });
+        Self {
+            transitions,
+            next_admission: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    async fn with<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut KiroState) -> R + Send + 'static,
+    ) -> R {
+        self.run(KiroStateTransition::Now, transition).await
+    }
+
+    async fn with_after_relocation<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut KiroState) -> R + Send + 'static,
+    ) -> R {
+        self.run(KiroStateTransition::AfterRelocation, transition)
+            .await
+    }
+
+    fn apply(&self, transition: impl FnOnce(&mut KiroState) + Send + 'static) {
+        let _ = self
+            .transitions
+            .send(KiroStateTransition::Now(Box::new(transition)));
+    }
+
+    async fn run<R: Send + 'static>(
+        &self,
+        kind: fn(KiroStateChange) -> KiroStateTransition,
+        transition: impl FnOnce(&mut KiroState) -> R + Send + 'static,
+    ) -> R {
+        let (reply, result) = oneshot::channel();
+        self.transitions
+            .send(kind(Box::new(move |state| {
+                if reply.is_closed() {
+                    return;
+                }
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transition(state)));
+                let _ = reply.send(outcome);
+            })))
+            .unwrap_or_else(|_| panic!("ACP session owner stopped while its adapter is live"));
+        match result.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("ACP session owner dropped a transition"),
+        }
+    }
+
+    fn admission(&self, phase: KiroAdmissionPhase) -> KiroAdmission {
+        KiroAdmission {
+            state: self.clone(),
+            id: self.next_admission.fetch_add(1, Ordering::Relaxed),
+            phase,
+        }
+    }
+
+    async fn admit(&self, phase: KiroAdmissionPhase) -> KiroAdmission {
+        // Armed before enqueue: dropping a waiter or a just-admitted caller
+        // always removes its reservation, including the reply-delivery race.
+        let admission = self.admission(phase);
+        let id = admission.id;
+        let (reply, result) = oneshot::channel();
+        self.apply(move |state| {
+            let slot = if phase == KiroAdmissionPhase::Inbound {
+                &mut state.inbound_admission
+            } else {
+                &mut state.prompt_admission
+            };
+            slot.waiting
+                .push_back(KiroAdmissionWaiter { id, phase, reply });
+            slot.admit_waiters();
+        });
+        result
+            .await
+            .expect("ACP session owner dropped admission reply");
+        admission
+    }
+}
+
+struct KiroAdmission {
+    state: KiroStateActor,
+    id: u64,
+    phase: KiroAdmissionPhase,
+}
+
+impl KiroAdmission {
+    fn release(state: &mut KiroState, id: u64, phase: KiroAdmissionPhase) {
+        if phase == KiroAdmissionPhase::Inbound {
+            state.inbound_admission.release(id);
+        } else {
+            if phase == KiroAdmissionPhase::Compaction
+                && state
+                    .prompt_admission
+                    .active
+                    .is_some_and(|(active, _)| active == id)
+            {
+                state.pending_compaction = None;
+            }
+            state.prompt_admission.release(id);
+        }
+    }
+
+    async fn finish(self) {
+        let id = self.id;
+        let phase = self.phase;
+        self.state
+            .with(move |state| Self::release(state, id, phase))
+            .await;
+    }
+}
+
+impl Drop for KiroAdmission {
+    fn drop(&mut self) {
+        let id = self.id;
+        let phase = self.phase;
+        self.state
+            .apply(move |state| Self::release(state, id, phase));
+    }
+}
+
 impl KiroInner {
     async fn set_workspace_roots(
         self: &Arc<Self>,
@@ -952,38 +1168,100 @@ impl KiroInner {
         }
         let roots = crate::backend::validate_local_workspace_roots(workspace_roots)
             .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
-        let prompt_guard = Arc::clone(&self.prompt_lock)
-            .try_lock_owned()
-            .map_err(|_| crate::backend::WorkspaceRelocationError::Busy)?;
+        let prompt_guard = self
+            .state
+            .admission(KiroAdmissionPhase::RelocationCandidate);
+        let admission_id = prompt_guard.id;
+        if !self
+            .state
+            .with(move |state| {
+                state
+                    .prompt_admission
+                    .try_admit(admission_id, KiroAdmissionPhase::RelocationCandidate)
+            })
+            .await
+        {
+            return Err(crate::backend::WorkspaceRelocationError::Busy);
+        }
         self.bridge
             .sync_inbound()
             .await
             .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
-        let (session_id, previous_root, startup_mcp_servers, settings) = {
-            let state = self.state.lock().await;
-            if self.shutting_down.load(Ordering::Acquire)
-                || self.in_flight_prompts.load(Ordering::SeqCst) > 0
-                || state.active_response.is_some()
-                || !state.active_tool_contexts.is_empty()
-                || state.pending_compaction.is_some()
-                || state.replaying_history
-                || !self.native_child_sessions.lock().await.is_empty()
-                || !self.native_owned_children.lock().await.is_empty()
-            {
-                return Err(crate::backend::WorkspaceRelocationError::Busy);
+        let inner = Arc::clone(self);
+        let (session_id, previous_root, startup_mcp_servers, settings) = self
+            .state
+            .with(move |state| {
+                if inner.shutting_down.load(Ordering::Acquire)
+                    || inner.in_flight_prompts.load(Ordering::SeqCst) > 0
+                    || state.active_response.is_some()
+                    || !state.active_tool_contexts.is_empty()
+                    || state.pending_compaction.is_some()
+                    || state.replaying_history
+                    || !state.native_child_sessions.is_empty()
+                    || !state.native_owned_children.is_empty()
+                {
+                    return Err(crate::backend::WorkspaceRelocationError::Busy);
+                }
+                state.prompt_admission.active =
+                    Some((admission_id, KiroAdmissionPhase::Relocation));
+                Ok((
+                    state.session_id.clone(),
+                    state.workspace_root.clone(),
+                    state.startup_mcp_servers.clone(),
+                    json!({"model": state.model, "mode": state.mode}),
+                ))
+            })
+            .await?;
+        let this = Arc::clone(self);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        crate::backend::subprocess::spawn(async move {
+            let outcome = this
+                .reload_workspace(
+                    &roots,
+                    session_id,
+                    previous_root,
+                    startup_mcp_servers,
+                    settings,
+                )
+                .await;
+            // Released before the caller wakes, so its immediate rollback of an
+            // unknown outcome is admitted rather than refused as busy.
+            prompt_guard.finish().await;
+            if let Err(Err(error)) = outcome_tx.send(outcome) {
+                tracing::warn!(
+                    outcome = error.kind(),
+                    backend = ?this.adapter.backend_kind(),
+                    "ACP workspace relocation failed with no caller waiting"
+                );
+                this.emitter.backend_error(&format!(
+                    "The provider could not finish changing workspace roots ({}) after the \
+                     request was abandoned; reopen the saved conversation before continuing.",
+                    error.kind()
+                ));
             }
-            (
-                state.session_id.clone(),
-                state.workspace_root.clone(),
-                state.startup_mcp_servers.clone(),
-                json!({"model": state.model, "mode": state.mode}),
+        });
+        outcome_rx.await.map_err(|_| {
+            crate::backend::WorkspaceRelocationError::OutcomeUnknown(
+                "ACP workspace relocation task ended without an outcome".to_owned(),
             )
-        };
+        })?
+    }
+
+    /// Moves the provider session to `roots`. Runs in the relocation's owner
+    /// task while it owns prompt admission.
+    async fn reload_workspace(
+        self: &Arc<Self>,
+        roots: &[String],
+        session_id: String,
+        previous_root: String,
+        startup_mcp_servers: Vec<StartupMcpServer>,
+        settings: Value,
+    ) -> Result<(), crate::backend::WorkspaceRelocationError> {
         let cwd = &roots[0];
         self.workspace_reload_in_progress
             .store(true, Ordering::Release);
         let reload_guard = AcpWorkspaceReload(&self.workspace_reload_in_progress);
-        tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
+        tracing::info!(roots = roots.len(), backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
         let kind = self.adapter.backend_kind();
         if matches!(
             kind,
@@ -1012,7 +1290,10 @@ impl KiroInner {
                 spec.local_args.insert(index, "--no-leader".to_owned());
             }
             let program = spec.local_program.clone();
-            tracing::info!(%session_id, %cwd, ?kind, "Retiring native runtime before relocating persisted workspace metadata");
+            tracing::info!(
+                ?kind,
+                "Retiring native runtime before relocating persisted workspace metadata"
+            );
             self.bridge
                 .restart_local(spec, async {
                     match kind {
@@ -1077,18 +1358,27 @@ impl KiroInner {
             ));
         }
         {
-            let mut state = self.state.lock().await;
-            apply_acp_config_options(&mut state, &response, self.adapter.backend_kind());
-            state.workspace_root = cwd.clone();
-            state.workspace_roots = Some(roots.clone());
-            let models = extract_known_models(&response);
-            if !models.is_empty() {
-                state.known_models = models;
-            }
-            let modes = extract_known_modes(&response, self.adapter.backend_kind());
-            if !modes.is_empty() {
-                state.known_modes = modes;
-            }
+            self.state
+                .with({
+                    let response = response.clone();
+                    let roots = roots.to_vec();
+                    let cwd = (*cwd).clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        apply_acp_config_options(state, &response, adapter.backend_kind());
+                        state.workspace_root = cwd.clone();
+                        state.workspace_roots = Some(roots.to_vec());
+                        let models = extract_known_models(&response);
+                        if !models.is_empty() {
+                            state.known_models = models;
+                        }
+                        let modes = extract_known_modes(&response, adapter.backend_kind());
+                        if !modes.is_empty() {
+                            state.known_modes = modes;
+                        }
+                    }
+                })
+                .await
         }
         self.execute(SessionCommand::UpdateSettings {
             settings,
@@ -1101,13 +1391,17 @@ impl KiroInner {
             .await
             .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
         drop(reload_guard);
-        drop(prompt_guard);
-        tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "ACP session reloaded in new workspace roots");
+        tracing::info!(roots = roots.len(), backend = ?self.adapter.backend_kind(), "ACP session reloaded in new workspace roots");
         Ok(())
     }
 
     async fn set_capacity_emitter(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
-        self.capacity_state.lock().await.emitter = Some(emitter.clone());
+        self.state
+            .with({
+                let emitter = Arc::clone(&emitter);
+                move |state| state.capacity.emitter = Some(emitter)
+            })
+            .await;
         if self.capacity_probe.is_none()
             && self.adapter.backend_kind() != protocol::BackendKind::Grok
         {
@@ -1123,29 +1417,30 @@ impl KiroInner {
     }
 
     async fn spawn_capacity_refresh(self: &Arc<Self>, force: bool) {
-        let emitter = {
-            let mut state = self.capacity_state.lock().await;
-            if state.in_flight
-                || (!force
-                    && state
-                        .read_at
-                        .is_some_and(|last| last.elapsed() < ACP_CAPACITY_REFRESH_INTERVAL))
-            {
-                return;
-            }
-            let Some(emitter) = state.emitter.clone() else {
-                return;
-            };
-            state.in_flight = true;
-            state.read_at = Some(std::time::Instant::now());
-            emitter
-        };
         let inner = Arc::clone(self);
-        crate::backend::subprocess::spawn(async move {
-            let capacity = inner.read_capacity().await;
-            inner.capacity_state.lock().await.in_flight = false;
-            emitter.on_backend_capacity(inner.adapter.backend_kind(), capacity);
-        });
+        self.state
+            .with(move |state| {
+                let capacity = &mut state.capacity;
+                if capacity.in_flight
+                    || (!force
+                        && capacity
+                            .read_at
+                            .is_some_and(|last| last.elapsed() < ACP_CAPACITY_REFRESH_INTERVAL))
+                {
+                    return;
+                }
+                let Some(emitter) = capacity.emitter.clone() else {
+                    return;
+                };
+                capacity.in_flight = true;
+                capacity.read_at = Some(std::time::Instant::now());
+                crate::backend::subprocess::spawn(async move {
+                    let capacity = inner.read_capacity().await;
+                    inner.state.apply(|state| state.capacity.in_flight = false);
+                    emitter.on_backend_capacity(inner.adapter.backend_kind(), capacity);
+                });
+            })
+            .await;
     }
 
     async fn read_capacity(&self) -> BackendCapacityState {
@@ -1206,7 +1501,7 @@ impl KiroInner {
                     if attempt < KIRO_PROMPT_MAX_RETRIES
                         && kiro_prompt_error_is_retryable(&error.to_string()) =>
                 {
-                    if self.state.lock().await.cancelled {
+                    if self.state.with(|state| state.cancelled).await {
                         return Err(error);
                     }
                     attempt += 1;
@@ -1223,7 +1518,7 @@ impl KiroInner {
                         backoff_ms,
                     });
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    if self.state.lock().await.cancelled {
+                    if self.state.with(|state| state.cancelled).await {
                         return Err(error);
                     }
                 }
@@ -1244,28 +1539,35 @@ impl KiroInner {
             } => {
                 // ACP notifications carry a session id, not a prompt id. Drain
                 // the preceding prompt before admitting another into that stream.
-                let prompt_guard = self.prompt_lock.lock().await;
+                let prompt_guard = self.state.admit(KiroAdmissionPhase::Prompt).await;
                 eprintln!(
                     "TYDE ACP PROMPT ADMITTED cancelled={}",
-                    self.state.lock().await.cancelled
+                    self.state.with(|state| state.cancelled).await
                 );
                 {
-                    let mut state = self.state.lock().await;
-                    state.provider_turn_quarantined = false;
-                    if self.adapter.backend_kind() == protocol::BackendKind::Grok {
-                        state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
-                        state.grok_request_usages.clear();
-                        state.grok_last_message_id = None;
-                        state.grok_pending_response_end = None;
-                    }
-                    if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
-                        state.opencode_turn_sequence =
-                            state.opencode_turn_sequence.saturating_add(1);
-                        state.opencode_request_usages.clear();
-                        state.opencode_provider_request_ids.clear();
-                        state.opencode_active_provider_message_id = None;
-                        state.opencode_pending_response_usage = None;
-                    }
+                    self.state
+                        .with({
+                            let adapter = Arc::clone(&self.adapter);
+                            move |state| {
+                                state.provider_turn_quarantined = false;
+                                if adapter.backend_kind() == protocol::BackendKind::Grok {
+                                    state.grok_turn_sequence =
+                                        state.grok_turn_sequence.saturating_add(1);
+                                    state.grok_request_usages.clear();
+                                    state.grok_last_message_id = None;
+                                    state.grok_pending_response_end = None;
+                                }
+                                if adapter.backend_kind() == protocol::BackendKind::Opencode {
+                                    state.opencode_turn_sequence =
+                                        state.opencode_turn_sequence.saturating_add(1);
+                                    state.opencode_request_usages.clear();
+                                    state.opencode_provider_request_ids.clear();
+                                    state.opencode_active_provider_message_id = None;
+                                    state.opencode_pending_response_usage = None;
+                                }
+                            }
+                        })
+                        .await
                 }
                 if origin != Some(protocol::MessageOrigin::HostRestart) {
                     self.emit_user_message_added(&message, images.as_deref(), origin);
@@ -1273,33 +1575,42 @@ impl KiroInner {
                 self.emitter.typing_status_changed(true);
 
                 let (session_id, model, mode, steering, command_plan) = {
-                    let state = self.state.lock().await;
-                    let plan = state
-                        .slash_commands
-                        .as_ref()
-                        .and_then(|catalog| catalog.invoked_by(&message))
-                        .map(|command| {
-                            self.adapter.plan_slash_command(
-                                command,
-                                &message,
-                                &AcpSlashCommandCtx {
-                                    session_id: &state.session_id,
-                                    workspace_root: &state.workspace_root,
-                                    model: state.model.as_deref(),
-                                    mode: state.mode.as_deref(),
-                                    known_models: &state.known_models,
-                                    usage: &state.opencode_cumulative_usage,
-                                    context_usage: state.opencode_current_context_usage.as_ref(),
-                                },
-                            )
-                        });
-                    (
-                        state.session_id.clone(),
-                        state.model.clone(),
-                        state.mode.clone(),
-                        state.steering_content.clone(),
-                        plan,
-                    )
+                    self.state
+                        .with({
+                            let message = message.clone();
+                            let adapter = Arc::clone(&self.adapter);
+                            move |state| {
+                                let plan = state
+                                    .slash_commands
+                                    .as_ref()
+                                    .and_then(|catalog| catalog.invoked_by(&message))
+                                    .map(|command| {
+                                        adapter.plan_slash_command(
+                                            command,
+                                            &message,
+                                            &AcpSlashCommandCtx {
+                                                session_id: &state.session_id,
+                                                workspace_root: &state.workspace_root,
+                                                model: state.model.as_deref(),
+                                                mode: state.mode.as_deref(),
+                                                known_models: &state.known_models,
+                                                usage: &state.opencode_cumulative_usage,
+                                                context_usage: state
+                                                    .opencode_current_context_usage
+                                                    .as_ref(),
+                                            },
+                                        )
+                                    });
+                                (
+                                    state.session_id.clone(),
+                                    state.model.clone(),
+                                    state.mode.clone(),
+                                    state.steering_content.clone(),
+                                    plan,
+                                )
+                            }
+                        })
+                        .await
                 };
 
                 let invokes_command = match command_plan {
@@ -1343,7 +1654,10 @@ impl KiroInner {
                     };
                     crate::backend::workspace_prompt(
                         &steered,
-                        self.state.lock().await.workspace_roots.as_deref(),
+                        self.state
+                            .with(|state| state.workspace_roots.clone())
+                            .await
+                            .as_deref(),
                     )
                 };
                 let mut prompt_blocks = vec![json!({
@@ -1377,7 +1691,7 @@ impl KiroInner {
                     },
                 );
 
-                self.state.lock().await.cancelled = false;
+                self.state.with(|state| state.cancelled = false).await;
 
                 let response = match self.request_prompt_with_retry(params).await {
                     Ok(value) => value,
@@ -1386,13 +1700,10 @@ impl KiroInner {
                         // session/cancel. If the prompt error is just the stale
                         // rejection of a cancelled request, swallow it — the cancel
                         // handler already emitted OperationCancelled + TypingStatusChanged.
-                        let state = self.state.lock().await;
-                        if state.cancelled {
-                            drop(state);
+                        if self.state.with(|state| state.cancelled).await {
                             self.bridge.sync_inbound().await?;
                             return Ok(());
                         }
-                        drop(state);
                         let rejected = matches!(err, AcpRequestError::Rejected(_));
                         tracing::warn!(
                             backend = self.adapter.display_name(),
@@ -1429,27 +1740,55 @@ impl KiroInner {
                     return Err(err);
                 }
 
-                if self.state.lock().await.provider_turn_quarantined {
+                if self
+                    .state
+                    .with(|state| state.provider_turn_quarantined)
+                    .await
+                {
                     return Ok(());
                 }
 
                 if let Some(model) = extract_current_model(&response) {
-                    let mut state = self.state.lock().await;
-                    state.model = Some(model);
+                    self.state
+                        .with({
+                            let model = model.clone();
+                            move |state| {
+                                state.model = Some(model);
+                            }
+                        })
+                        .await
                 }
                 if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
-                    let mut state = self.state.lock().await;
-                    state.mode = Some(mode);
+                    self.state
+                        .with({
+                            let mode = mode.clone();
+                            move |state| {
+                                state.mode = Some(mode);
+                            }
+                        })
+                        .await
                 }
                 let known_models = extract_known_models(&response);
                 if !known_models.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state.known_models = known_models;
+                    self.state
+                        .with({
+                            let known_models = known_models.clone();
+                            move |state| {
+                                state.known_models = known_models;
+                            }
+                        })
+                        .await
                 }
                 let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
                 if !known_modes.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state.known_modes = known_modes;
+                    self.state
+                        .with({
+                            let known_modes = known_modes.clone();
+                            move |state| {
+                                state.known_modes = known_modes;
+                            }
+                        })
+                        .await
                 }
 
                 let stop_reason = response
@@ -1461,7 +1800,7 @@ impl KiroInner {
                 if stop_reason == "cancelled" {
                     // If the user initiated the cancel, `CancelConversation` already
                     // fired OperationCancelled + TypingStatusChanged — don't double-emit.
-                    let user_initiated = { self.state.lock().await.cancelled };
+                    let user_initiated = { self.state.with(|state| state.cancelled).await };
                     if !user_initiated {
                         self.abort_active_turn("Operation cancelled").await;
                     }
@@ -1497,10 +1836,13 @@ impl KiroInner {
                 Ok(())
             }
             SessionCommand::CancelConversation => {
-                let mut state = self.state.lock().await;
-                state.cancelled = true;
-                let session_id = state.session_id.clone();
-                drop(state);
+                let session_id = self
+                    .state
+                    .with(|state| {
+                        state.cancelled = true;
+                        state.session_id.clone()
+                    })
+                    .await;
                 self.bridge
                     .trace_terminal_state("cancelling ACP conversation")
                     .await;
@@ -1518,12 +1860,18 @@ impl KiroInner {
                 result.and(terminal_result)
             }
             SessionCommand::GetSettings => {
-                let state = self.state.lock().await;
-                self.emitter.settings(json!({
-                    "model": state.model,
-                    "mode": state.mode,
-                }));
-                Ok(())
+                self.state
+                    .with({
+                        let emitter = Arc::clone(&self.emitter);
+                        move |state| {
+                            emitter.settings(json!({
+                                "model": state.model,
+                                "mode": state.mode,
+                            }));
+                            Ok(())
+                        }
+                    })
+                    .await
             }
             SessionCommand::ListSessions => self.list_sessions().await,
             SessionCommand::ResumeSession { session_id } => self.resume_session(session_id).await,
@@ -1538,7 +1886,7 @@ impl KiroInner {
                 Ok(())
             }
             SessionCommand::ListModels => {
-                let models = self.state.lock().await.known_models.clone();
+                let models = self.state.with(|state| state.known_models.clone()).await;
                 self.emitter.models_list(models);
                 Ok(())
             }
@@ -1549,10 +1897,11 @@ impl KiroInner {
                 if let Some(obj) = settings.as_object() {
                     if let Some(model_value) = obj.get("model") {
                         let next_model = normalize_optional_string(model_value);
-                        let session_id = self.state.lock().await.session_id.clone();
+                        let session_id = self.state.with(|state| state.session_id.clone()).await;
                         match next_model.clone() {
                             Some(model_id) => {
-                                let config_id = self.state.lock().await.model_config_id.clone();
+                                let config_id =
+                                    self.state.with(|state| state.model_config_id.clone()).await;
                                 let (method, params) = match config_id {
                                     Some(config_id) => (
                                         "session/set_config_option",
@@ -1568,25 +1917,36 @@ impl KiroInner {
                                     ),
                                 };
                                 let response = self.bridge.request(method, params).await?;
-                                apply_acp_config_options(
-                                    &mut *self.state.lock().await,
-                                    &response,
-                                    self.adapter.backend_kind(),
-                                );
+                                self.state
+                                    .with({
+                                        let response = response.clone();
+                                        let kind = self.adapter.backend_kind();
+                                        move |state| {
+                                            apply_acp_config_options(state, &response, kind)
+                                        }
+                                    })
+                                    .await;
                             }
                             None => {
                                 // Let backend fallback to default model.
                             }
                         }
-                        let mut state = self.state.lock().await;
-                        state.model = next_model;
+                        self.state
+                            .with({
+                                let next_model = next_model.clone();
+                                move |state| {
+                                    state.model = next_model;
+                                }
+                            })
+                            .await
                     }
 
                     if let Some(mode_value) = obj.get("mode").or_else(|| obj.get("modeId")) {
                         let next_mode = normalize_optional_string(mode_value);
-                        let session_id = self.state.lock().await.session_id.clone();
+                        let session_id = self.state.with(|state| state.session_id.clone()).await;
                         if let Some(mode_id) = next_mode.clone() {
-                            let config_id = self.state.lock().await.mode_config_id.clone();
+                            let config_id =
+                                self.state.with(|state| state.mode_config_id.clone()).await;
                             let (method, params) = match config_id {
                                 Some(config_id) => (
                                     "session/set_config_option",
@@ -1602,23 +1962,37 @@ impl KiroInner {
                                 ),
                             };
                             let response = self.bridge.request(method, params).await?;
-                            apply_acp_config_options(
-                                &mut *self.state.lock().await,
-                                &response,
-                                self.adapter.backend_kind(),
-                            );
+                            self.state
+                                .with({
+                                    let response = response.clone();
+                                    let kind = self.adapter.backend_kind();
+                                    move |state| apply_acp_config_options(state, &response, kind)
+                                })
+                                .await;
                         }
-                        let mut state = self.state.lock().await;
-                        state.mode = next_mode;
+                        self.state
+                            .with({
+                                let next_mode = next_mode.clone();
+                                move |state| {
+                                    state.mode = next_mode;
+                                }
+                            })
+                            .await
                     }
                 }
 
-                let state = self.state.lock().await;
-                self.emitter.settings(json!({
-                    "model": state.model,
-                    "mode": state.mode,
-                }));
-                Ok(())
+                self.state
+                    .with({
+                        let emitter = Arc::clone(&self.emitter);
+                        move |state| {
+                            emitter.settings(json!({
+                                "model": state.model,
+                                "mode": state.mode,
+                            }));
+                            Ok(())
+                        }
+                    })
+                    .await
             }
         }
     }
@@ -1633,7 +2007,7 @@ impl KiroInner {
     async fn list_sessions_via_acp(&self) -> Result<Vec<BackendSession>, String> {
         const MAX_PAGES: usize = 100;
 
-        let workspace_root = self.state.lock().await.workspace_root.clone();
+        let workspace_root = self.state.with(|state| state.workspace_root.clone()).await;
         let mut sessions = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -1680,12 +2054,17 @@ impl KiroInner {
 
     async fn list_sessions(&self) -> Result<(), String> {
         let excluded_session_id = {
-            let state = self.state.lock().await;
-            if state.admin_session {
-                Some(state.session_id.clone())
-            } else {
-                None
-            }
+            self.state
+                .with({
+                    move |state| {
+                        if state.admin_session {
+                            Some(state.session_id.clone())
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .await
         };
 
         // `session/list` is the spec's own way to enumerate sessions, so an
@@ -1742,27 +2121,34 @@ impl KiroInner {
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
         let (cwd, startup_mcp_servers) = {
-            let mut state = self.state.lock().await;
-            state.replaying_history = true;
-            state.provider_turn_quarantined = false;
-            state.replay_session_id = Some(session_id.clone());
-            state.replay_assistant_identity = None;
-            state.replay_assistant_text.clear();
-            state.replay_assistant_reasoning.clear();
-            state.replay_assistant_message_emitted_since_user = false;
-            state.replay_error = None;
-            tracing::info!(
-                target: "tyde_acp_resume",
-                phase = "load",
-                backend = ?self.adapter.backend_kind(),
-                requested_identity_present = !session_id.is_empty(),
-                requested_matches_current = session_id == state.session_id,
-                "ACP resume recorded requested identity; current identity unchanged"
-            );
-            (
-                state.workspace_root.clone(),
-                state.startup_mcp_servers.clone(),
-            )
+            self.state
+                .with({
+                    let session_id = session_id.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        state.replaying_history = true;
+                        state.provider_turn_quarantined = false;
+                        state.replay_session_id = Some(session_id.clone());
+                        state.replay_assistant_identity = None;
+                        state.replay_assistant_text.clear();
+                        state.replay_assistant_reasoning.clear();
+                        state.replay_assistant_message_emitted_since_user = false;
+                        state.replay_error = None;
+                        tracing::info!(
+                            target: "tyde_acp_resume",
+                            phase = "load",
+                            backend = ?adapter.backend_kind(),
+                            requested_identity_present = !session_id.is_empty(),
+                            requested_matches_current = session_id == state.session_id,
+                            "ACP resume recorded requested identity; current identity unchanged"
+                        );
+                        (
+                            state.workspace_root.clone(),
+                            state.startup_mcp_servers.clone(),
+                        )
+                    }
+                })
+                .await
         };
 
         self.clear_active_stream().await;
@@ -1792,15 +2178,21 @@ impl KiroInner {
         {
             Ok(response) => response,
             Err(err) => {
-                let mut state = self.state.lock().await;
-                state.replaying_history = false;
-                state.replay_session_id = None;
-                state.replay_assistant_identity = None;
-                state.replay_assistant_text.clear();
-                state.replay_assistant_reasoning.clear();
-                state.replay_assistant_message_emitted_since_user = false;
-                state.replay_error = None;
-                self.emitter.typing_status_changed(false);
+                self.state
+                    .with({
+                        let emitter = Arc::clone(&self.emitter);
+                        move |state| {
+                            state.replaying_history = false;
+                            state.replay_session_id = None;
+                            state.replay_assistant_identity = None;
+                            state.replay_assistant_text.clear();
+                            state.replay_assistant_reasoning.clear();
+                            state.replay_assistant_message_emitted_since_user = false;
+                            state.replay_error = None;
+                            emitter.typing_status_changed(false);
+                        }
+                    })
+                    .await;
                 return Err(err);
             }
         };
@@ -1811,25 +2203,38 @@ impl KiroInner {
             "ACP session/load response received; awaiting inbound replay barrier"
         );
         if let Err(err) = self.bridge.sync_inbound().await {
-            let mut state = self.state.lock().await;
-            state.replaying_history = false;
-            state.replay_session_id = None;
-            state.replay_assistant_identity = None;
-            state.replay_assistant_text.clear();
-            state.replay_assistant_reasoning.clear();
-            state.replay_assistant_message_emitted_since_user = false;
-            state.replay_error = None;
-            self.emitter.typing_status_changed(false);
+            self.state
+                .with({
+                    let emitter = Arc::clone(&self.emitter);
+                    move |state| {
+                        state.replaying_history = false;
+                        state.replay_session_id = None;
+                        state.replay_assistant_identity = None;
+                        state.replay_assistant_text.clear();
+                        state.replay_assistant_reasoning.clear();
+                        state.replay_assistant_message_emitted_since_user = false;
+                        state.replay_error = None;
+                        emitter.typing_status_changed(false);
+                    }
+                })
+                .await;
             return Err(format!("Failed to finish ACP session replay: {err}"));
         }
 
         // Acquire only after the inbound barrier has been handled. Holding this
         // through the flush and marker keeps inbound chunks on one side of the
-        // replay/live transition, including handlers that await the state lock.
-        let _inbound_guard = self.inbound_gate.lock().await;
+        // replay/live transition, including handlers that await a state transition.
+        let inbound_admission = self.state.admit(KiroAdmissionPhase::Inbound).await;
 
         {
-            let mut state = self.state.lock().await;
+            match self.state.with({
+                let session_id = session_id.clone();
+                let response = response.clone();
+                let adapter = Arc::clone(&self.adapter);
+                let emitter = Arc::clone(&self.emitter);
+                move |state| {
+
+{
             if let Some(error) = state.replay_error.take() {
                 tracing::info!(
                     target: "tyde_acp_resume",
@@ -1843,8 +2248,8 @@ impl KiroInner {
                 state.replay_assistant_text.clear();
                 state.replay_assistant_reasoning.clear();
                 state.replay_assistant_message_emitted_since_user = false;
-                self.emitter.typing_status_changed(false);
-                return Err(error);
+                emitter.typing_status_changed(false);
+                return std::ops::ControlFlow::Break(Err(error));
             }
             // session/load has finished replay, not started a live turn. A killed
             // provider can leave historical requests without terminal results.
@@ -1863,7 +2268,7 @@ impl KiroInner {
             }
             for tool_call_id in unresolved {
                 state.completed_tool_call_ids.insert(tool_call_id.clone());
-                self.emitter.tool_completed(
+                emitter.tool_completed(
                     &tool_call_id,
                     ToolExecutionOutcome::Cancelled {
                         message: "No terminal result was reported in this session history. Inspect side effects before repeating this operation.".to_owned(),
@@ -1873,32 +2278,49 @@ impl KiroInner {
             state.active_tool_contexts.clear();
             state.tool_call_aliases.clear();
             state.session_id = session_id;
-            apply_acp_config_options(&mut state, &response, self.adapter.backend_kind());
+            apply_acp_config_options(state, &response, adapter.backend_kind());
             if let Some(model) = extract_current_model(&response) {
                 state.model = Some(model);
             }
-            if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
+            if let Some(mode) = extract_current_mode(&response, adapter.backend_kind()) {
                 state.mode = Some(mode);
             }
             let known_models = extract_known_models(&response);
             if !known_models.is_empty() {
                 state.known_models = known_models;
             }
-            let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
+            let known_modes = extract_known_modes(&response, adapter.backend_kind());
             if !known_modes.is_empty() {
                 state.known_modes = known_modes;
             }
             // Emit SessionStarted so forward_events sets backend_session_id on resume
-            self.emitter.session_started(&state.session_id);
+            emitter.session_started(&state.session_id);
+
+std::ops::ControlFlow::Continue(())
+}
+                }
+            }).await {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
+            }
         }
 
         self.flush_replay_assistant_message().await;
-        let mut state = self.state.lock().await;
-        state.replay_session_id = None;
-        self.emitter.typing_status_changed(false);
-        self.emitter.resume_replay_complete();
+        {
+            self.state.with({
+                let emitter = Arc::clone(&self.emitter);
+                move |state| {
+
+            state.replay_session_id = None;
+        emitter.typing_status_changed(false);
+        emitter.resume_replay_complete();
         state.replaying_history = false;
-        tracing::info!("ACP replay flushed and boundary emitted before releasing inbound handling");
+            tracing::info!("ACP replay flushed and boundary emitted before releasing inbound handling");
+
+                }
+            }).await
+        }
+        drop(inbound_admission);
         Ok(())
     }
 
@@ -1932,68 +2354,65 @@ impl KiroInner {
                 ),
             };
         }
-        if self.shutting_down.load(Ordering::Acquire) {
-            return BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::BackendClosed,
-            };
+        let prompt_guard = self.state.admission(KiroAdmissionPhase::Compaction);
+        let admission_id = prompt_guard.id;
+        let inner = Arc::clone(self);
+        let authoritative = request.transcript_authoritative;
+        let admitted = self
+            .state
+            .with_after_relocation(move |state| {
+                if inner.shutting_down.load(Ordering::Acquire) {
+                    return Err(BackendCompactionStart::NotDispatched {
+                        reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                    });
+                }
+                if inner.in_flight_prompts.load(Ordering::SeqCst) > 0 {
+                    return Err(BackendCompactionStart::Deferred {
+                        reason: BackendCompactionDeferredReason::ActiveTurn,
+                    });
+                }
+                if !authoritative {
+                    return Err(BackendCompactionStart::NotDispatched {
+                        reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                            BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+                        ),
+                    });
+                }
+                if state.pending_compaction.is_some() {
+                    return Err(BackendCompactionStart::Deferred {
+                        reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                    });
+                }
+                if state.replaying_history {
+                    return Err(BackendCompactionStart::Deferred {
+                        reason: BackendCompactionDeferredReason::SessionInitializing,
+                    });
+                }
+                if !state
+                    .prompt_admission
+                    .try_admit(admission_id, KiroAdmissionPhase::Compaction)
+                {
+                    return Err(BackendCompactionStart::Deferred {
+                        reason: BackendCompactionDeferredReason::ActiveTurn,
+                    });
+                }
+                state.pending_compaction = Some(PendingGrokCompaction {
+                    tokens_before: None,
+                    tokens_after: None,
+                    failed_message: None,
+                });
+                Ok(())
+            })
+            .await;
+        if let Err(outcome) = admitted {
+            return outcome;
         }
-        if self.in_flight_prompts.load(Ordering::SeqCst) > 0 {
-            return BackendCompactionStart::Deferred {
-                reason: BackendCompactionDeferredReason::ActiveTurn,
-            };
-        }
-        if !request.transcript_authoritative {
-            return BackendCompactionStart::NotDispatched {
-                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
-                    BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
-                ),
-            };
-        }
-        {
-            let state = self.state.lock().await;
-            if state.pending_compaction.is_some() {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
-                };
-            }
-            if state.replaying_history {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::SessionInitializing,
-                };
-            }
-        }
-        let Ok(prompt_guard) = Arc::clone(&self.prompt_lock).try_lock_owned() else {
-            return BackendCompactionStart::Deferred {
-                reason: BackendCompactionDeferredReason::ActiveTurn,
-            };
-        };
-        if self.in_flight_prompts.load(Ordering::SeqCst) > 0 {
-            drop(prompt_guard);
-            return BackendCompactionStart::Deferred {
-                reason: BackendCompactionDeferredReason::ActiveTurn,
-            };
-        }
-
         let (terminal_tx, terminal_rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock().await;
-            if state.pending_compaction.is_some() {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
-                };
-            }
-            state.pending_compaction = Some(PendingGrokCompaction {
-                tokens_before: None,
-                tokens_after: None,
-                failed_message: None,
-            });
-        }
-
         let inner = Arc::clone(self);
         let operation_id = request.operation_id.clone();
         crate::backend::subprocess::spawn(async move {
-            let _prompt_guard = prompt_guard;
             inner.run_grok_compact(request, terminal_tx).await;
+            prompt_guard.finish().await;
         });
         crate::backend::BackendCompactionStart::Accepted(
             crate::backend::BackendAcceptedCompaction {
@@ -2050,8 +2469,12 @@ impl KiroInner {
                 },
             ));
 
-        let pending = self.state.lock().await.pending_compaction.take();
-        let session_id = protocol::SessionId(self.state.lock().await.session_id.clone());
+        let pending = self
+            .state
+            .with(|state| state.pending_compaction.take())
+            .await;
+        let session_id =
+            protocol::SessionId(self.state.with(|state| state.session_id.clone()).await);
         let (tokens_before, tokens_after, failed_message) = match pending {
             Some(pending) => (
                 pending.tokens_before,
@@ -2154,7 +2577,7 @@ impl KiroInner {
     }
 
     async fn dispatch_grok_compact(&self, focus: Option<&str>) -> Result<bool, String> {
-        let session_id = self.state.lock().await.session_id.clone();
+        let session_id = self.state.with(|state| state.session_id.clone()).await;
         let mut params = json!({ "sessionId": session_id });
         if let Some(focus) = focus {
             params["userContext"] = json!(focus);
@@ -2178,9 +2601,14 @@ impl KiroInner {
         };
         self.emitter.typing_status_changed(true);
         {
-            let mut state = self.state.lock().await;
-            state.provider_turn_quarantined = false;
-            state.cancelled = false;
+            self.state
+                .with({
+                    move |state| {
+                        state.provider_turn_quarantined = false;
+                        state.cancelled = false;
+                    }
+                })
+                .await
         }
         let params = json!({
             "sessionId": session_id,
@@ -2189,7 +2617,7 @@ impl KiroInner {
         let response = match self.request_prompt_with_retry(params).await {
             Ok(value) => value,
             Err(error) => {
-                if self.state.lock().await.cancelled {
+                if self.state.with(|state| state.cancelled).await {
                     self.bridge.sync_inbound().await?;
                     self.emitter.typing_status_changed(false);
                     return Err("Grok compaction was cancelled".to_owned());
@@ -2199,7 +2627,11 @@ impl KiroInner {
             }
         };
         self.bridge.sync_inbound().await?;
-        if self.state.lock().await.provider_turn_quarantined {
+        if self
+            .state
+            .with(|state| state.provider_turn_quarantined)
+            .await
+        {
             self.emitter.typing_status_changed(false);
             return Err("Grok compaction was quarantined after a provider error".to_owned());
         }
@@ -2230,20 +2662,30 @@ impl KiroInner {
 
     async fn record_grok_compact_started(&self, update: &Value) {
         let tokens = json_u64(update, &["tokens_used", "tokensUsed"]);
-        let mut state = self.state.lock().await;
-        if let Some(pending) = state.pending_compaction.as_mut() {
-            pending.tokens_before = tokens.or(pending.tokens_before);
-        }
+        self.state
+            .with({
+                move |state| {
+                    if let Some(pending) = state.pending_compaction.as_mut() {
+                        pending.tokens_before = tokens.or(pending.tokens_before);
+                    }
+                }
+            })
+            .await
     }
 
     async fn record_grok_compact_completed(&self, update: &Value) {
         let before = json_u64(update, &["tokens_before", "tokensBefore"]);
         let after = json_u64(update, &["tokens_after", "tokensAfter"]);
-        let mut state = self.state.lock().await;
-        if let Some(pending) = state.pending_compaction.as_mut() {
-            pending.tokens_before = before.or(pending.tokens_before);
-            pending.tokens_after = after.or(pending.tokens_after);
-        }
+        self.state
+            .with({
+                move |state| {
+                    if let Some(pending) = state.pending_compaction.as_mut() {
+                        pending.tokens_before = before.or(pending.tokens_before);
+                        pending.tokens_after = after.or(pending.tokens_after);
+                    }
+                }
+            })
+            .await
     }
 
     async fn record_grok_compact_failed(&self, update: &Value) {
@@ -2253,10 +2695,16 @@ impl KiroInner {
             .or_else(|| update.get("reason").and_then(Value::as_str))
             .unwrap_or("Grok compaction failed")
             .to_owned();
-        let mut state = self.state.lock().await;
-        if let Some(pending) = state.pending_compaction.as_mut() {
-            pending.failed_message = Some(message);
-        }
+        self.state
+            .with({
+                let message = message.clone();
+                move |state| {
+                    if let Some(pending) = state.pending_compaction.as_mut() {
+                        pending.failed_message = Some(message);
+                    }
+                }
+            })
+            .await
     }
 
     async fn shutdown(&self) {
@@ -2267,7 +2715,7 @@ impl KiroInner {
         // EOF and stays running. Kill the remote process explicitly
         // using the PID from its session lock file.
         if let Some(host) = &self.ssh_host {
-            let session_id = self.state.lock().await.session_id.clone();
+            let session_id = self.state.with(|state| state.session_id.clone()).await;
             let cmd = format!(
                 "PID=$(grep -oE '[0-9]+' ~/.kiro/sessions/cli/{0}.lock 2>/dev/null | head -1); \
                  [ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null; true",
@@ -2278,42 +2726,39 @@ impl KiroInner {
 
         self.bridge.shutdown().await;
         let mut children = self
-            .native_owned_children
-            .lock()
-            .await
-            .drain(..)
-            .collect::<Vec<_>>();
-        self.native_sessions.children.lock().await.clear();
+            .state
+            .with(|state| std::mem::take(&mut state.native_owned_children))
+            .await;
+        self.native_sessions.apply(|routes| routes.children.clear());
         let mut relays = Vec::new();
         while let Some(child) = children.pop() {
-            children.extend(child.native_owned_children.lock().await.drain(..));
+            children.extend(
+                child
+                    .state
+                    .with(|state| std::mem::take(&mut state.native_owned_children))
+                    .await,
+            );
             child.emitter.close("ACP parent session closed");
             relays.push(child);
         }
         for child in relays {
-            while child
-                .native_relay_tasks
-                .lock()
-                .await
-                .join_next()
-                .await
-                .is_some()
-            {}
+            let mut tasks = child
+                .state
+                .with(|state| std::mem::take(&mut state.native_relay_tasks))
+                .await;
+            while tasks.join_next().await.is_some() {}
         }
-        while self
-            .native_relay_tasks
-            .lock()
-            .await
-            .join_next()
-            .await
-            .is_some()
-        {}
-        self.native_sessions.pending.lock().await.clear();
+        let mut tasks = self
+            .state
+            .with(|state| std::mem::take(&mut state.native_relay_tasks))
+            .await;
+        while tasks.join_next().await.is_some() {}
+        self.native_sessions.apply(|routes| routes.pending.clear());
         self.emitter.close("ACP session closed");
     }
 
     async fn handle_inbound(&self, inbound: AcpInbound) {
-        let _inbound_guard = self.inbound_gate.lock().await;
+        let inbound_admission = self.state.admit(KiroAdmissionPhase::Inbound).await;
         match inbound {
             AcpInbound::Stderr(line) => {
                 self.emitter.subprocess_stderr(&line);
@@ -2340,7 +2785,10 @@ impl KiroInner {
                 if self.adapter.backend_kind() == protocol::BackendKind::Grok
                     && (method.starts_with("x.ai/") || method.starts_with("_x.ai/"))
                 {
-                    eprintln!("TYDE ACP GROK SERVER REQUEST method={method} params={params}");
+                    eprintln!(
+                        "TYDE ACP GROK SERVER REQUEST method={method} params_present={}",
+                        !params.is_null()
+                    );
                 }
                 match self
                     .bridge
@@ -2363,6 +2811,7 @@ impl KiroInner {
                 let _ = ack.send(());
             }
         }
+        drop(inbound_admission);
     }
     fn handle_notification<'a>(
         &'a self,
@@ -2375,8 +2824,15 @@ impl KiroInner {
                 .or_else(|| params.get("session_id"))
                 .and_then(Value::as_str);
             let foreign = {
-                let state = self.state.lock().await;
-                let obsolete_kiro_commands = self.adapter.backend_kind()
+                match self.state.with({
+                    let actual = actual.map(str::to_owned);
+                    let method = method.to_owned();
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+let actual = actual.as_deref();
+let method = &method;
+std::ops::ControlFlow::Continue({
+                let obsolete_kiro_commands = adapter.backend_kind()
                     == protocol::BackendKind::Kiro
                     && method == "_kiro.dev/commands/available"
                     && state.replaying_history
@@ -2412,29 +2868,42 @@ impl KiroInner {
                 // session/new metadata must not replace the requested session's
                 // command state: Kiro normalization mutates its subcommand table.
                 if obsolete_kiro_commands {
-                    return;
+                    return std::ops::ControlFlow::Break(());
                 }
                 foreign
+
+})
+                    }
+                }).await {
+                    std::ops::ControlFlow::Continue(value) => value,
+                    std::ops::ControlFlow::Break(value) => return value,
+                }
             };
             if let Some(session_id) = foreign {
                 let child = self
                     .native_sessions
-                    .children
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .and_then(std::sync::Weak::upgrade);
+                    .with({
+                        let method = method.to_owned();
+                        let params = params.clone();
+                        move |routes| {
+                            let child = routes
+                                .children
+                                .get(&session_id)
+                                .and_then(std::sync::Weak::upgrade);
+                            if child.is_none() {
+                                eprintln!("TYDE ACP BUFFER CHILD method={method}");
+                                routes
+                                    .pending
+                                    .entry(session_id)
+                                    .or_default()
+                                    .push((method, params));
+                            }
+                            child
+                        }
+                    })
+                    .await;
                 if let Some(child) = child {
                     child.handle_notification(method, params).await;
-                } else {
-                    eprintln!("TYDE ACP BUFFER CHILD method={method}");
-                    self.native_sessions
-                        .pending
-                        .lock()
-                        .await
-                        .entry(session_id)
-                        .or_default()
-                        .push((method.to_owned(), params.clone()));
                 }
                 return;
             }
@@ -2480,7 +2949,7 @@ impl KiroInner {
                 if self.adapter.backend_kind() == protocol::BackendKind::Grok
                     && matches!(normalized.session_update, "response_end" | "turn_end")
                 {
-                    let session_id = self.state.lock().await.session_id.clone();
+                    let session_id = self.state.with(|state| state.session_id.clone()).await;
                     if let Ok(info) = self
                         .bridge
                         .request("_x.ai/session/info", json!({ "sessionId": session_id }))
@@ -2509,17 +2978,26 @@ impl KiroInner {
         name: String,
         tool_call_id: &str,
     ) {
-        let Some(subagents) = self.capacity_state.lock().await.emitter.clone() else {
+        let Some(subagents) = self
+            .state
+            .with(|state| state.capacity.emitter.clone())
+            .await
+        else {
             return;
         };
         if self
             .native_sessions
-            .children
-            .lock()
+            .with({
+                let session_id = session_id.clone();
+                move |routes| {
+                    routes
+                        .children
+                        .get(&session_id.0)
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some()
+                }
+            })
             .await
-            .get(&session_id.0)
-            .and_then(std::sync::Weak::upgrade)
-            .is_some()
         {
             return;
         }
@@ -2540,22 +3018,30 @@ impl KiroInner {
             }
         };
         let state = {
-            let parent = self.state.lock().await;
-            KiroState {
-                session_id: session_id.0.clone(),
-                workspace_root: parent.workspace_root.clone(),
-                workspace_roots: parent.workspace_roots.clone(),
-                model: parent.model.clone(),
-                mode: parent.mode.clone(),
-                startup_mcp_servers: parent.startup_mcp_servers.clone(),
-                grok_turn_sequence: 1,
-                native_child: true,
-                ..Default::default()
-            }
+            self.state
+                .with({
+                    let session_id = session_id.clone();
+                    let subagents = subagents.clone();
+                    move |parent| KiroState {
+                        session_id: session_id.0.clone(),
+                        workspace_root: parent.workspace_root.clone(),
+                        workspace_roots: parent.workspace_roots.clone(),
+                        model: parent.model.clone(),
+                        mode: parent.mode.clone(),
+                        startup_mcp_servers: parent.startup_mcp_servers.clone(),
+                        grok_turn_sequence: 1,
+                        native_child: true,
+                        capacity: KiroCapacityState {
+                            emitter: Some(subagents),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .await
         };
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let child = Arc::new(KiroInner {
-            inbound_gate: Mutex::new(()),
             adapter: Arc::clone(&self.adapter),
             capabilities: self.capabilities.clone(),
             bridge: Arc::clone(&self.bridge),
@@ -2563,31 +3049,29 @@ impl KiroInner {
                 events_tx,
                 AgentName(self.adapter.agent_name()),
             )),
-            state: Mutex::new(state),
+            state: KiroStateActor::spawn(state),
             shutting_down: AtomicBool::new(false),
             workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: self.ssh_host.clone(),
             capacity_probe: None,
-            capacity_state: Mutex::new(KiroCapacityState {
-                emitter: Some(subagents),
-                ..Default::default()
-            }),
-            prompt_lock: Arc::new(Mutex::new(())),
             in_flight_prompts: AtomicUsize::new(0),
-            native_child_sessions: Mutex::new(HashSet::new()),
-            native_sessions: Arc::clone(&self.native_sessions),
-            native_owned_children: Mutex::new(Vec::new()),
-            native_relay_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            native_sessions: self.native_sessions.clone(),
         });
-        self.native_sessions
-            .children
-            .lock()
-            .await
-            .insert(session_id.0.clone(), Arc::downgrade(&child));
-        self.native_owned_children
-            .lock()
-            .await
-            .push(Arc::clone(&child));
+        self.state.apply({
+            let child = Arc::clone(&child);
+            move |state| state.native_owned_children.push(child)
+        });
+        let pending = self
+            .native_sessions
+            .with({
+                let session_id = session_id.clone();
+                let child = Arc::downgrade(&child);
+                move |routes| {
+                    routes.children.insert(session_id.0.clone(), child);
+                    routes.pending.remove(&session_id.0).unwrap_or_default()
+                }
+            })
+            .await;
         let progress = protocol::ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
             execution_mode: protocol::ToolExecutionMode::Background,
@@ -2604,48 +3088,45 @@ impl KiroInner {
         };
         self.emitter.tool_progress(&progress);
         let parent_emitter = Arc::clone(&self.emitter);
-        self.native_relay_tasks.lock().await.spawn(async move {
-            let mut progress = progress;
-            while let Some(raw) = events_rx.recv().await {
-                if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
-                    if let Some(data) = raw.get("data")
-                        && let Ok(usage) = serde_json::from_value(data.clone())
-                    {
-                        let _ = handle.model_usage_tx.send(usage);
-                    }
-                    continue;
-                }
-                if let Some(event) = map_kiro_value_to_chat_event(&raw) {
-                    if let protocol::ToolProgressUpdate::SubAgent(details) = &mut progress.update {
-                        match &event {
-                            protocol::ChatEvent::ToolRequest(request) => {
-                                details.tool_calls += 1;
-                                details.last_tool_name = Some(request.tool_name.clone());
-                            }
-                            protocol::ChatEvent::TypingStatusChanged(active) => {
-                                details.completed = !active;
-                                details.status = if *active {
-                                    protocol::SubAgentProgressStatus::Running
-                                } else {
-                                    protocol::SubAgentProgressStatus::Completed
-                                };
-                            }
-                            _ => {}
+        self.state.apply(move |state| {
+            state.native_relay_tasks.spawn(async move {
+                let mut progress = progress;
+                while let Some(raw) = events_rx.recv().await {
+                    if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
+                        if let Some(data) = raw.get("data")
+                            && let Ok(usage) = serde_json::from_value(data.clone())
+                        {
+                            let _ = handle.model_usage_tx.send(usage);
                         }
+                        continue;
                     }
-                    let _ = handle.event_tx.send(event);
-                    parent_emitter.tool_progress(&progress);
+                    if let Some(event) = map_kiro_value_to_chat_event(&raw) {
+                        if let protocol::ToolProgressUpdate::SubAgent(details) =
+                            &mut progress.update
+                        {
+                            match &event {
+                                protocol::ChatEvent::ToolRequest(request) => {
+                                    details.tool_calls += 1;
+                                    details.last_tool_name = Some(request.tool_name.clone());
+                                }
+                                protocol::ChatEvent::TypingStatusChanged(active) => {
+                                    details.completed = !active;
+                                    details.status = if *active {
+                                        protocol::SubAgentProgressStatus::Running
+                                    } else {
+                                        protocol::SubAgentProgressStatus::Completed
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = handle.event_tx.send(event);
+                        parent_emitter.tool_progress(&progress);
+                    }
                 }
-            }
+            });
         });
-        eprintln!("TYDE ACP NATIVE SESSION ROUTE tool={tool_call_id}");
-        let pending = self
-            .native_sessions
-            .pending
-            .lock()
-            .await
-            .remove(&session_id.0)
-            .unwrap_or_default();
+        eprintln!("TYDE ACP NATIVE SESSION ROUTE registered=true");
         for (method, params) in pending {
             child.handle_notification(&method, &params).await;
         }
@@ -2658,7 +3139,16 @@ impl KiroInner {
         params: &Value,
     ) -> bool {
         let error = {
-            let state = self.state.lock().await;
+            match self.state.with({
+                let method = method.to_owned();
+                let update_kind = update_kind.to_owned();
+                let params = params.to_owned();
+                let adapter = Arc::clone(&self.adapter);
+                move |state| {
+let method = &method;
+let update_kind = &update_kind;
+let params = &params;
+std::ops::ControlFlow::Continue({
             if !state.replaying_history {
                 tracing::info!(
                     target: "tyde_acp_resume",
@@ -2667,7 +3157,7 @@ impl KiroInner {
                     decision = "accept_non_replay",
                     "ACP recognized notification identity validation"
                 );
-                return true;
+                return std::ops::ControlFlow::Break(true);
             }
             let expected = state.replay_session_id.as_deref();
             let actual = params
@@ -2678,7 +3168,7 @@ impl KiroInner {
                 (Some(expected), Some(actual)) if expected == actual => None,
                 (Some(_), Some(actual))
                     if matches!(
-                        self.adapter.backend_kind(),
+                        adapter.backend_kind(),
                         protocol::BackendKind::Grok | protocol::BackendKind::Opencode
                     ) && actual == state.session_id =>
                 {
@@ -2687,7 +3177,7 @@ impl KiroInner {
                 (Some(_), Some(actual)) => Some(format!(
                     "{} session replay identity mismatch: method={}, update_kind={}, \
                      matches_current={}, matches_requested=false",
-                    self.adapter.display_name(),
+                    adapter.display_name(),
                     diagnostic_notification_method(method),
                     diagnostic_update_kind(update_kind),
                     actual == state.session_id,
@@ -2714,6 +3204,13 @@ impl KiroInner {
                 "ACP recognized notification identity validation"
             );
             error
+
+})
+                }
+            }).await {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
+            }
         };
 
         if let Some(error) = error {
@@ -2778,8 +3275,8 @@ impl KiroInner {
             tracing::warn!(
                 message = "ACP read normalization degraded to Other",
                 agent = self.adapter.display_name(),
-                tool_call_id = tool_call_id,
-                raw_input_keys = ?raw_input_keys,
+                tool_call_id_present = !tool_call_id.is_empty(),
+                raw_input_key_count = raw_input_keys.len(),
             );
         }
         mapped
@@ -2806,13 +3303,20 @@ impl KiroInner {
         if update_type == "error" {
             return false;
         }
-        let state = self.state.lock().await;
-        let suppressed =
-            !state.replaying_history && (state.provider_turn_quarantined || state.cancelled);
-        if suppressed && state.cancelled {
-            eprintln!("TYDE ACP DROP CANCELLED UPDATE type={update_type}");
-        }
-        suppressed
+        self.state
+            .with({
+                let update_type = update_type.to_owned();
+                move |state| {
+                    let update_type = &update_type;
+                    let suppressed = !state.replaying_history
+                        && (state.provider_turn_quarantined || state.cancelled);
+                    if suppressed && state.cancelled {
+                        eprintln!("TYDE ACP DROP CANCELLED UPDATE type={update_type}");
+                    }
+                    suppressed
+                }
+            })
+            .await
     }
 
     /// The one place a `session/update` discriminant is turned into behavior.
@@ -2840,18 +3344,22 @@ impl KiroInner {
                 if let (Some(input_tokens), Some(context_window)) = (used, size)
                     && context_window >= input_tokens
                 {
-                    self.state.lock().await.opencode_current_context_usage =
-                        Some(CurrentContextUsage::Known {
-                            input_tokens,
-                            context_window,
-                        });
+                    self.state
+                        .with(move |state| {
+                            state.opencode_current_context_usage =
+                                Some(CurrentContextUsage::Known {
+                                    input_tokens,
+                                    context_window,
+                                })
+                        })
+                        .await;
                 }
             }
             "response_end" => self.handle_grok_response_end(update).await,
             // Not part of the standard update family; adapters for agents that
             // signal end-of-turn out of band normalize onto this.
             "turn_end" => {
-                if self.state.lock().await.replaying_history {
+                if self.state.with(|state| state.replaying_history).await {
                     self.flush_replay_assistant_message().await;
                     return;
                 }
@@ -2868,16 +3376,24 @@ impl KiroInner {
             "grok_compact_cancelled" => self.record_grok_compact_failed(update).await,
             "current_mode_update" => {
                 if let Some(mode) = extract_current_mode(update, self.adapter.backend_kind()) {
-                    let mut state = self.state.lock().await;
-                    state.mode = Some(mode);
+                    self.state
+                        .with({
+                            let mode = mode.clone();
+                            move |state| {
+                                state.mode = Some(mode);
+                            }
+                        })
+                        .await
                 }
             }
             "config_option_update" => {
-                apply_acp_config_options(
-                    &mut *self.state.lock().await,
-                    update,
-                    self.adapter.backend_kind(),
-                );
+                self.state
+                    .with({
+                        let response = update.clone();
+                        let kind = self.adapter.backend_kind();
+                        move |state| apply_acp_config_options(state, &response, kind)
+                    })
+                    .await;
             }
             _ => {}
         }
@@ -2906,7 +3422,7 @@ impl KiroInner {
     async fn handle_available_commands_update(&self, update: &Value) {
         let Some(commands) = acp_available_commands(update) else {
             tracing::warn!(
-                update = %update,
+                update_present = !update.is_null(),
                 "ACP available_commands_update carried no readable command list"
             );
             return;
@@ -2915,11 +3431,23 @@ impl KiroInner {
             commands: self.adapter.normalize_slash_commands(commands),
         };
         {
-            let mut state = self.state.lock().await;
-            if state.slash_commands.as_ref() == Some(&catalog) {
-                return;
+            match self
+                .state
+                .with({
+                    let catalog = catalog.clone();
+                    move |state| {
+                        if state.slash_commands.as_ref() == Some(&catalog) {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        state.slash_commands = Some(catalog.clone());
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
-            state.slash_commands = Some(catalog.clone());
         }
         tracing::info!(
             target: "tyde_acp_resume",
@@ -2948,7 +3476,7 @@ impl KiroInner {
     }
 
     async fn handle_user_message_chunk(&self, params: &Value) {
-        let replaying = self.state.lock().await.replaying_history;
+        let replaying = self.state.with(|state| state.replaying_history).await;
         if !replaying {
             return;
         }
@@ -2965,9 +3493,8 @@ impl KiroInner {
             None,
         );
         self.state
-            .lock()
-            .await
-            .replay_assistant_message_emitted_since_user = false;
+            .with(|state| state.replay_assistant_message_emitted_since_user = false)
+            .await;
     }
 
     async fn handle_reasoning_chunk(&self, params: &Value) {
@@ -2976,7 +3503,7 @@ impl KiroInner {
             return;
         }
 
-        if self.state.lock().await.replaying_history {
+        if self.state.with(|state| state.replaying_history).await {
             self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), &delta, true)
                 .await;
             return;
@@ -2986,23 +3513,37 @@ impl KiroInner {
             .await;
 
         let response = {
-            let mut state = self.state.lock().await;
-            if state.replaying_history {
-                return;
+            match self
+                .state
+                .with({
+                    let adapter = Arc::clone(&self.adapter);
+                    let emitter = Arc::clone(&self.emitter);
+                    move |state| {
+                        std::ops::ControlFlow::Continue({
+                            if state.replaying_history {
+                                return std::ops::ControlFlow::Break(());
+                            }
+                            let started = state.active_response.is_none();
+                            let model = state
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| adapter.display_name().to_string());
+                            if started {
+                                emitter.typing_status_changed(true);
+                                let response = emitter.stream_start(Some(&model));
+                                state.active_response = Some(response);
+                                state.active_stream_text.clear();
+                                state.active_stream_tool_calls.clear();
+                            }
+                            state.active_response.clone().expect("response just opened")
+                        })
+                    }
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
-            let started = state.active_response.is_none();
-            let model = state
-                .model
-                .clone()
-                .unwrap_or_else(|| self.adapter.display_name().to_string());
-            if started {
-                self.emitter.typing_status_changed(true);
-                let response = self.emitter.stream_start(Some(&model));
-                state.active_response = Some(response);
-                state.active_stream_text.clear();
-                state.active_stream_tool_calls.clear();
-            }
-            state.active_response.clone().expect("response just opened")
         };
         self.emitter.stream_reasoning_delta(&response, &delta);
     }
@@ -3014,41 +3555,50 @@ impl KiroInner {
         reasoning: bool,
     ) {
         let previous = {
-            let mut state = self.state.lock().await;
-            let active_identity = state.replay_assistant_identity.clone();
-            let identity = match active_identity {
-                Some(active)
-                    if provider_message_id.is_none()
-                        || provider_message_id == active.message_id =>
-                {
-                    active
-                }
-                _ => KiroReplayMessageIdentity::new(provider_message_id),
-            };
+            self.state
+                .with({
+                    let provider_message_id = provider_message_id.clone();
+                    let delta = delta.to_owned();
 
-            let previous = if state
-                .replay_assistant_identity
-                .as_ref()
-                .is_some_and(|active| active.message_id != identity.message_id)
-            {
-                state.replay_assistant_identity.take().map(|active| {
-                    (
-                        active,
-                        std::mem::take(&mut state.replay_assistant_text),
-                        std::mem::take(&mut state.replay_assistant_reasoning),
-                    )
+                    move |state| {
+                        let delta = &delta;
+                        let active_identity = state.replay_assistant_identity.clone();
+                        let identity = match active_identity {
+                            Some(active)
+                                if provider_message_id.is_none()
+                                    || provider_message_id == active.message_id =>
+                            {
+                                active
+                            }
+                            _ => KiroReplayMessageIdentity::new(provider_message_id),
+                        };
+
+                        let previous = if state
+                            .replay_assistant_identity
+                            .as_ref()
+                            .is_some_and(|active| active.message_id != identity.message_id)
+                        {
+                            state.replay_assistant_identity.take().map(|active| {
+                                (
+                                    active,
+                                    std::mem::take(&mut state.replay_assistant_text),
+                                    std::mem::take(&mut state.replay_assistant_reasoning),
+                                )
+                            })
+                        } else {
+                            None
+                        };
+
+                        state.replay_assistant_identity = Some(identity);
+                        if reasoning {
+                            state.replay_assistant_reasoning.push_str(delta);
+                        } else {
+                            state.replay_assistant_text.push_str(delta);
+                        }
+                        previous
+                    }
                 })
-            } else {
-                None
-            };
-
-            state.replay_assistant_identity = Some(identity);
-            if reasoning {
-                state.replay_assistant_reasoning.push_str(delta);
-            } else {
-                state.replay_assistant_text.push_str(delta);
-            }
-            previous
+                .await
         };
 
         if let Some(previous) = previous {
@@ -3066,7 +3616,7 @@ impl KiroInner {
             return;
         }
 
-        if self.state.lock().await.replaying_history {
+        if self.state.with(|state| state.replaying_history).await {
             self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), &delta, false)
                 .await;
             return;
@@ -3076,39 +3626,56 @@ impl KiroInner {
             .await;
 
         if !has_renderable_stream_text(&delta) {
-            let has_active_stream = self.state.lock().await.active_response.is_some();
+            let has_active_stream = self
+                .state
+                .with(|state| state.active_response.is_some())
+                .await;
             if !has_active_stream {
                 return;
             }
         }
 
         let response = {
-            let mut state = self.state.lock().await;
-            if state.active_response.is_none() {
-                let model = state
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.adapter.display_name().to_string());
-                self.emitter.typing_status_changed(true);
-                state.active_response = Some(self.emitter.stream_start(Some(&model)));
-                state.active_stream_text.clear();
-                state.active_stream_tool_calls.clear();
-            }
-            state.active_stream_text.push_str(&delta);
-            state.active_response.clone().expect("response just opened")
+            self.state
+                .with({
+                    let delta = delta.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    let emitter = Arc::clone(&self.emitter);
+                    move |state| {
+                        if state.active_response.is_none() {
+                            let model = state
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| adapter.display_name().to_string());
+                            emitter.typing_status_changed(true);
+                            state.active_response = Some(emitter.stream_start(Some(&model)));
+                            state.active_stream_text.clear();
+                            state.active_stream_tool_calls.clear();
+                        }
+                        state.active_stream_text.push_str(&delta);
+                        state.active_response.clone().expect("response just opened")
+                    }
+                })
+                .await
         };
         self.emitter.stream_delta(&response, &delta);
     }
 
     async fn set_replay_error(&self, message: String) {
-        let mut state = self.state.lock().await;
-        if state.replay_error.is_none() {
-            state.replay_error = Some(message);
-        }
+        self.state
+            .with({
+                let message = message.clone();
+                move |state| {
+                    if state.replay_error.is_none() {
+                        state.replay_error = Some(message);
+                    }
+                }
+            })
+            .await
     }
 
     async fn replay_error_is_set(&self) -> bool {
-        self.state.lock().await.replay_error.is_some()
+        self.state.with(|state| state.replay_error.is_some()).await
     }
 
     async fn ensure_replay_assistant_message_for_tool(
@@ -3118,8 +3685,9 @@ impl KiroInner {
     ) {
         self.flush_replay_assistant_message().await;
         let should_emit = {
-            let state = self.state.lock().await;
-            state.replaying_history && state.replay_error.is_none()
+            self.state
+                .with(move |state| state.replaying_history && state.replay_error.is_none())
+                .await
         };
         if should_emit {
             self.emit_replay_assistant_message(
@@ -3158,8 +3726,9 @@ impl KiroInner {
                 .is_some_and(serde_json::Map::is_empty)
         {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             if let Some(args) = self
                 .adapter
@@ -3180,7 +3749,11 @@ impl KiroInner {
         if self.replay_error_is_set().await {
             return;
         }
-        let identity = { self.state.lock().await.replay_assistant_identity.clone() };
+        let identity = {
+            self.state
+                .with(|state| state.replay_assistant_identity.clone())
+                .await
+        };
         let Some(identity) = identity else {
             self.set_replay_error(
                 "ACP replay tool identity was not retained at the decode boundary".to_string(),
@@ -3189,11 +3762,20 @@ impl KiroInner {
             return;
         };
         let (workspace_root, is_mcp_tool) = {
-            let state = self.state.lock().await;
-            (
-                state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
-            )
+            self.state
+                .with({
+                    let request = request.clone();
+                    move |state| {
+                        (
+                            state.workspace_root.clone(),
+                            kiro_is_startup_mcp_tool(
+                                &request.tool_name,
+                                &state.startup_mcp_servers,
+                            ),
+                        )
+                    }
+                })
+                .await
         };
         let tool_type = self
             .map_tool_request(params, &request.args, &workspace_root)
@@ -3201,33 +3783,51 @@ impl KiroInner {
         let canonical_id = normalize_tool_call_id_fragment(&raw_tool_call_id);
 
         {
-            let mut state = self.state.lock().await;
-            if state.active_tool_contexts.contains_key(&canonical_id) {
-                state.replay_error = Some(format!(
-                    "ACP session replay contained duplicate tool_call id {canonical_id}"
-                ));
-                return;
-            }
+            match self
+                .state
+                .with({
+                    let canonical_id = canonical_id.clone();
+                    let request = request.clone();
+                    let tool_type = tool_type.clone();
 
-            state.active_tool_contexts.insert(
-                canonical_id.clone(),
-                KiroToolContext {
-                    tool_name: request.tool_name.clone(),
-                    tool_type: tool_type.clone(),
-                    is_mcp_tool,
-                    request_emitted: true,
-                    defer_request_until_completion: false,
-                    pending_completion: None,
-                },
-            );
-            state
-                .tool_call_aliases
-                .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            if let Some(message_id) = identity.message_id.as_ref() {
-                state.tool_call_aliases.insert(
-                    tool_alias_message_key(&message_id.0, &raw_tool_call_id),
-                    canonical_id.clone(),
-                );
+                    let raw_tool_call_id = raw_tool_call_id.clone();
+                    let identity = identity.clone();
+                    move |state| {
+                        if state.active_tool_contexts.contains_key(&canonical_id) {
+                            state.replay_error = Some(format!(
+                                "ACP session replay contained duplicate tool_call id {canonical_id}"
+                            ));
+                            return std::ops::ControlFlow::Break(());
+                        }
+
+                        state.active_tool_contexts.insert(
+                            canonical_id.clone(),
+                            KiroToolContext {
+                                tool_name: request.tool_name.clone(),
+                                tool_type: tool_type.clone(),
+                                is_mcp_tool,
+                                request_emitted: true,
+                                defer_request_until_completion: false,
+                                pending_completion: None,
+                            },
+                        );
+                        state
+                            .tool_call_aliases
+                            .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
+                        if let Some(message_id) = identity.message_id.as_ref() {
+                            state.tool_call_aliases.insert(
+                                tool_alias_message_key(&message_id.0, &raw_tool_call_id),
+                                canonical_id.clone(),
+                            );
+                        }
+
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
         }
 
@@ -3259,17 +3859,24 @@ impl KiroInner {
         let message_id = extract_kiro_message_id(params);
 
         let (resolved_tool_call_id, fallback_name) = {
-            let state = self.state.lock().await;
-            let resolved_id = resolve_tool_call_id_alias(
-                &state,
-                raw_tool_call_id.as_deref(),
-                message_id.as_deref(),
-            );
-            let fallback_name = resolved_id
-                .as_ref()
-                .and_then(|id| state.active_tool_contexts.get(id))
-                .map(|ctx| ctx.tool_name.clone());
-            (resolved_id, fallback_name)
+            self.state
+                .with({
+                    let raw_tool_call_id = raw_tool_call_id.clone();
+                    let message_id = message_id.clone();
+                    move |state| {
+                        let resolved_id = resolve_tool_call_id_alias(
+                            state,
+                            raw_tool_call_id.as_deref(),
+                            message_id.as_deref(),
+                        );
+                        let fallback_name = resolved_id
+                            .as_ref()
+                            .and_then(|id| state.active_tool_contexts.get(id))
+                            .map(|ctx| ctx.tool_name.clone());
+                        (resolved_id, fallback_name)
+                    }
+                })
+                .await
         };
 
         let Some(resolved_tool_call_id) = resolved_tool_call_id else {
@@ -3286,18 +3893,24 @@ impl KiroInner {
 
         let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
             self.state
-                .lock()
+                .with({
+                    let tool_call_id = completion.tool_call_id.clone();
+                    move |state| {
+                        state
+                            .active_tool_contexts
+                            .get(&tool_call_id)
+                            .is_some_and(|context| context.is_mcp_tool)
+                    }
+                })
                 .await
-                .active_tool_contexts
-                .get(&completion.tool_call_id)
-                .is_some_and(|context| context.is_mcp_tool)
         } else {
             false
         };
         if opencode_mcp {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             if let Some(result) = self
                 .adapter
@@ -3308,23 +3921,29 @@ impl KiroInner {
             }
         }
 
-        let completion_to_emit = {
-            let mut state = self.state.lock().await;
+        let completion_to_emit =
+            {
+                match self.state.with({
+                let mut completion = completion.clone();
+                let raw_tool_call_id = raw_tool_call_id.clone();
+                let message_id = message_id.clone();
+                let adapter = Arc::clone(&self.adapter);
+                move |state| {
+
+std::ops::ControlFlow::Continue({
             let Some(context) = state.active_tool_contexts.get(&completion.tool_call_id) else {
                 state.replay_error = Some(format!(
                     "ACP session replay lost context for tool_call_update id {}",
                     completion.tool_call_id
                 ));
-                return;
+                return std::ops::ControlFlow::Break(());
             };
 
             completion.tool_name = context.tool_name.clone();
             completion.is_mcp_tool = context.is_mcp_tool;
-            let task_update = self
-                .adapter
+            let task_update = adapter
                 .map_task_update(&completion, Some(&context.tool_type));
-            let tool_result = self
-                .adapter
+            let tool_result = adapter
                 .map_tool_result(&completion, Some(&context.tool_type));
             let (success, error) = normalize_mapped_tool_outcome(
                 &completion.tool_call_id,
@@ -3356,7 +3975,14 @@ impl KiroInner {
                 message_id.as_deref(),
             );
             output
-        };
+
+})
+                }
+            }).await {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
+            }
+            };
 
         let (tool_call_id, _tool_name, tool_result, success, error, task_update) =
             completion_to_emit;
@@ -3370,7 +3996,7 @@ impl KiroInner {
     }
 
     async fn handle_tool_call(&self, params: &Value) {
-        if self.state.lock().await.replaying_history {
+        if self.state.with(|state| state.replaying_history).await {
             self.handle_replay_tool_call(params).await;
             return;
         }
@@ -3383,8 +4009,9 @@ impl KiroInner {
         };
         if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             let provider_message_id = self
                 .adapter
@@ -3406,8 +4033,9 @@ impl KiroInner {
                 .is_some_and(serde_json::Map::is_empty)
         {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             if let Some(args) = self
                 .adapter
@@ -3430,136 +4058,158 @@ impl KiroInner {
 
         let incoming_message_id = extract_kiro_message_id(params);
         let (workspace_root, is_mcp_tool) = {
-            let state = self.state.lock().await;
-            (
-                state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
-            )
+            self.state
+                .with({
+                    let request = request.clone();
+                    move |state| {
+                        (
+                            state.workspace_root.clone(),
+                            kiro_is_startup_mcp_tool(
+                                &request.tool_name,
+                                &state.startup_mcp_servers,
+                            ),
+                        )
+                    }
+                })
+                .await
         };
 
-        let mut start_event: Option<String> = None;
-        let mut declaration: Option<(ToolUseData, String, Value)> = None;
-        {
-            let mut state = self.state.lock().await;
-            let canonical_id = build_canonical_tool_call_id(
-                &mut state,
-                incoming_message_id.as_deref().unwrap_or_default(),
-                &raw_tool_call_id,
-            );
-            let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
-            let mut tool_type = self
-                .map_tool_request(params, &request.args, &workspace_root)
-                .await;
-            if super::adapters::grok::is_exit_plan_mode_tool(&request.tool_name) {
-                tool_type = super::adapters::grok::exit_plan_mode_tool_type(
-                    super::adapters::grok::plan_from_tool_args(&request.args),
-                    super::adapters::grok::plan_path_from_tool_args(&request.args),
-                );
-            }
+        let tool_type = self
+            .map_tool_request(params, &request.args, &workspace_root)
+            .await;
+        // Mapping can suspend on a file read while a cancellation runs, so the
+        // commit rechecks the turn and emits its events in the same transition.
+        self.state
+            .with({
+                let mut tool_type = tool_type;
+                let adapter = Arc::clone(&self.adapter);
+                let emitter = Arc::clone(&self.emitter);
+                move |state| {
+                    if state.cancelled || state.provider_turn_quarantined {
+                        eprintln!(
+                            "TYDE ACP DROP TOOL CALL MAPPED AFTER TURN END cancelled={} quarantined={}",
+                            state.cancelled, state.provider_turn_quarantined
+                        );
+                        return;
+                    }
+                    let mut start_event: Option<String> = None;
+                    let mut declaration: Option<(ToolUseData, String, Value)> = None;
+                    let canonical_id = build_canonical_tool_call_id(
+                        state,
+                        incoming_message_id.as_deref().unwrap_or_default(),
+                        &raw_tool_call_id,
+                    );
+                    let duplicate_request =
+                        state.active_tool_contexts.contains_key(&canonical_id);
 
-            let context = state
-                .active_tool_contexts
-                .entry(canonical_id.clone())
-                .or_insert_with(|| KiroToolContext {
-                    tool_name: request.tool_name.clone(),
-                    tool_type: tool_type.clone(),
-                    is_mcp_tool,
-                    request_emitted: false,
-                    defer_request_until_completion,
-                    pending_completion: None,
-                });
-            let prev_tool_type = context.tool_type.clone();
-            let request_already_emitted = context.request_emitted;
-            context.tool_type = tool_type.clone();
-            context.is_mcp_tool |= is_mcp_tool;
+                    if super::adapters::grok::is_exit_plan_mode_tool(&request.tool_name) {
+                        tool_type = super::adapters::grok::exit_plan_mode_tool_type(
+                            super::adapters::grok::plan_from_tool_args(&request.args),
+                            super::adapters::grok::plan_path_from_tool_args(&request.args),
+                        );
+                    }
 
-            if duplicate_request && request_already_emitted {
-                let changed = prev_tool_type != tool_type;
-                if changed {
-                    // The re-emitted request advances the emitted identity, so
-                    // the stored context must advance with it: a titleless
-                    // completion later falls back to `context.tool_name`, which
-                    // has to name the card the user is actually looking at.
-                    // "tool" is the parser's missing-title placeholder and must
-                    // not overwrite a real name.
-                    if request.tool_name != "tool" {
-                        context.tool_name = request.tool_name.clone();
+                    let context = state
+                        .active_tool_contexts
+                        .entry(canonical_id.clone())
+                        .or_insert_with(|| KiroToolContext {
+                            tool_name: request.tool_name.clone(),
+                            tool_type: tool_type.clone(),
+                            is_mcp_tool,
+                            request_emitted: false,
+                            defer_request_until_completion,
+                            pending_completion: None,
+                        });
+                    let prev_tool_type = context.tool_type.clone();
+                    let request_already_emitted = context.request_emitted;
+                    context.tool_type = tool_type.clone();
+                    context.is_mcp_tool |= is_mcp_tool;
+
+                    if duplicate_request && request_already_emitted {
+                        let changed = prev_tool_type != tool_type;
+                        if changed {
+                            // The re-emitted request advances the emitted identity, so
+                            // the stored context must advance with it: a titleless
+                            // completion later falls back to `context.tool_name`, which
+                            // has to name the card the user is actually looking at.
+                            // "tool" is the parser's missing-title placeholder and must
+                            // not overwrite a real name.
+                            if request.tool_name != "tool" {
+                                context.tool_name = request.tool_name.clone();
+                            }
+                        }
+                    }
+
+                    state
+                        .tool_call_aliases
+                        .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
+                    if let Some(message_id) = incoming_message_id.as_deref() {
+                        state.tool_call_aliases.insert(
+                            tool_alias_message_key(message_id, &raw_tool_call_id),
+                            canonical_id.clone(),
+                        );
+                    }
+
+                    if !duplicate_request {
+                        if state.active_response.is_none() {
+                            state.active_stream_text.clear();
+                            state.active_stream_tool_calls.clear();
+                            let model = state
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| adapter.display_name().to_string());
+                            start_event = Some(model);
+                        }
+
+                        let tool_call_entry = ToolUseData {
+                            tool_call_id: canonical_id.clone(),
+                            name: request.tool_name.clone(),
+                            arguments: public_acp_tool_arguments(&request.args),
+                            content_offset: Some(
+                                u32::try_from(state.active_stream_text.chars().count())
+                                    .unwrap_or(u32::MAX),
+                            ),
+                        };
+                        let already_present = state
+                            .active_stream_tool_calls
+                            .iter()
+                            .any(|call| call.tool_call_id == canonical_id);
+                        if !already_present {
+                            state.active_stream_tool_calls.push(tool_call_entry.clone());
+                            declaration =
+                                Some((tool_call_entry, canonical_id.clone(), tool_type));
+                        }
+                    }
+                    if let Some(model) = start_event {
+                        emitter.typing_status_changed(true);
+                        state.active_response = Some(emitter.stream_start(Some(&model)));
+                    }
+
+                    // Declare the call on the response that is still open rather than
+                    // ending that response to declare it. Kiro delivers every call of a
+                    // parallel batch before the first result, so ending here would give
+                    // each one its own chat message; declaring keeps the card immediate,
+                    // which waiting for the result would not — Kiro sends no in-progress
+                    // update, only the completion.
+                    if let Some((declaration, canonical_id, tool_type)) = declaration
+                        && let Some(response) = state.active_response.as_ref()
+                    {
+                        emitter.declare_streaming_tools(response, vec![declaration]);
+                        if !defer_request_until_completion {
+                            emitter.tool_request(&canonical_id, kiro_tool_request_type(tool_type));
+                            if let Some(context) = state.active_tool_contexts.get_mut(&canonical_id)
+                            {
+                                context.request_emitted = true;
+                            }
+                        }
                     }
                 }
-            }
-
-            state
-                .tool_call_aliases
-                .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            if let Some(message_id) = incoming_message_id.as_deref() {
-                state.tool_call_aliases.insert(
-                    tool_alias_message_key(message_id, &raw_tool_call_id),
-                    canonical_id.clone(),
-                );
-            }
-
-            if !duplicate_request {
-                if state.active_response.is_none() {
-                    state.active_stream_text.clear();
-                    state.active_stream_tool_calls.clear();
-                    let model = state
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| self.adapter.display_name().to_string());
-                    start_event = Some(model);
-                }
-
-                let tool_call_entry = ToolUseData {
-                    tool_call_id: canonical_id.clone(),
-                    name: request.tool_name.clone(),
-                    arguments: public_acp_tool_arguments(&request.args),
-                    content_offset: Some(
-                        u32::try_from(state.active_stream_text.chars().count()).unwrap_or(u32::MAX),
-                    ),
-                };
-                let already_present = state
-                    .active_stream_tool_calls
-                    .iter()
-                    .any(|call| call.tool_call_id == canonical_id);
-                if !already_present {
-                    state.active_stream_tool_calls.push(tool_call_entry.clone());
-                    declaration = Some((tool_call_entry, canonical_id.clone(), tool_type));
-                }
-            }
-        };
-
-        if let Some(model) = start_event {
-            self.emitter.typing_status_changed(true);
-            let response = self.emitter.stream_start(Some(&model));
-            let mut state = self.state.lock().await;
-            state.active_response = Some(response);
-        }
-
-        // Declare the call on the response that is still open rather than
-        // ending that response to declare it. Kiro delivers every call of a
-        // parallel batch before the first result, so ending here would give
-        // each one its own chat message; declaring keeps the card immediate,
-        // which waiting for the result would not — Kiro sends no in-progress
-        // update, only the completion.
-        if let Some((declaration, canonical_id, tool_type)) = declaration {
-            let response = { self.state.lock().await.active_response.clone() };
-            if let Some(response) = response {
-                self.emitter
-                    .declare_streaming_tools(&response, vec![declaration]);
-                if !defer_request_until_completion {
-                    self.emitter
-                        .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
-                    let mut state = self.state.lock().await;
-                    if let Some(context) = state.active_tool_contexts.get_mut(&canonical_id) {
-                        context.request_emitted = true;
-                    }
-                }
-            }
-        }
+            })
+            .await
     }
 
     async fn handle_tool_call_update(&self, params: &Value) {
-        if self.state.lock().await.replaying_history {
+        if self.state.with(|state| state.replaying_history).await {
             self.handle_replay_tool_call_update(params).await;
             return;
         }
@@ -3569,17 +4219,24 @@ impl KiroInner {
         let message_id = extract_kiro_message_id(params);
 
         let (resolved_tool_call_id, fallback_name) = {
-            let state = self.state.lock().await;
-            let resolved_id = resolve_tool_call_id_alias(
-                &state,
-                raw_tool_call_id.as_deref(),
-                message_id.as_deref(),
-            );
-            let fallback_name = resolved_id
-                .as_ref()
-                .and_then(|id| state.active_tool_contexts.get(id))
-                .map(|ctx| ctx.tool_name.clone());
-            (resolved_id, fallback_name)
+            self.state
+                .with({
+                    let raw_tool_call_id = raw_tool_call_id.clone();
+                    let message_id = message_id.clone();
+                    move |state| {
+                        let resolved_id = resolve_tool_call_id_alias(
+                            state,
+                            raw_tool_call_id.as_deref(),
+                            message_id.as_deref(),
+                        );
+                        let fallback_name = resolved_id
+                            .as_ref()
+                            .and_then(|id| state.active_tool_contexts.get(id))
+                            .map(|ctx| ctx.tool_name.clone());
+                        (resolved_id, fallback_name)
+                    }
+                })
+                .await
         };
 
         let Some(resolved_tool_call_id) = resolved_tool_call_id else {
@@ -3587,10 +4244,11 @@ impl KiroInner {
         };
         if self
             .state
-            .lock()
+            .with({
+                let tool_call_id = resolved_tool_call_id.clone();
+                move |state| state.completed_tool_call_ids.contains(&tool_call_id)
+            })
             .await
-            .completed_tool_call_ids
-            .contains(&resolved_tool_call_id)
         {
             return;
         }
@@ -3601,18 +4259,24 @@ impl KiroInner {
 
         let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
             self.state
-                .lock()
+                .with({
+                    let tool_call_id = completion.tool_call_id.clone();
+                    move |state| {
+                        state
+                            .active_tool_contexts
+                            .get(&tool_call_id)
+                            .is_some_and(|context| context.is_mcp_tool)
+                    }
+                })
                 .await
-                .active_tool_contexts
-                .get(&completion.tool_call_id)
-                .is_some_and(|context| context.is_mcp_tool)
         } else {
             false
         };
         if opencode_mcp {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             if let Some(result) = self
                 .adapter
@@ -3630,84 +4294,107 @@ impl KiroInner {
             self.flush_pending_grok_response_end().await;
         } else if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
             let (session_id, workspace_root) = {
-                let state = self.state.lock().await;
-                (state.session_id.clone(), state.workspace_root.clone())
+                self.state
+                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .await
             };
             let usage = self
                 .adapter
                 .usage_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
                 .await;
-            self.state.lock().await.opencode_pending_response_usage = usage;
+            self.state
+                .with(move |state| state.opencode_pending_response_usage = usage)
+                .await;
         } else {
             self.finalize_active_stream_if_any(None, false).await;
         }
 
         let backfill_after_path = {
-            let state = self.state.lock().await;
-            if !completion.success {
-                None
-            } else if let Some(context) = state.active_tool_contexts.get(&completion.tool_call_id) {
-                let kind = context
-                    .tool_type
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if kind != "ModifyFile" {
-                    None
-                } else {
-                    let file_path = context
-                        .tool_type
-                        .get("file_path")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let before = context
-                        .tool_type
-                        .get("before")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let after = context
-                        .tool_type
-                        .get("after")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if file_path.is_empty() || !has_visible_text(before) || has_visible_text(after)
-                    {
-                        None
-                    } else {
-                        let resolved = resolve_tool_file_path(file_path, &state.workspace_root);
-                        if resolved.is_empty() || !Path::new(&resolved).exists() {
+            self.state
+                .with({
+                    let completion = completion.clone();
+                    move |state| {
+                        if !completion.success {
                             None
+                        } else if let Some(context) =
+                            state.active_tool_contexts.get(&completion.tool_call_id)
+                        {
+                            let kind = context
+                                .tool_type
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if kind != "ModifyFile" {
+                                None
+                            } else {
+                                let file_path = context
+                                    .tool_type
+                                    .get("file_path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let before = context
+                                    .tool_type
+                                    .get("before")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let after = context
+                                    .tool_type
+                                    .get("after")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if file_path.is_empty()
+                                    || !has_visible_text(before)
+                                    || has_visible_text(after)
+                                {
+                                    None
+                                } else {
+                                    let resolved =
+                                        resolve_tool_file_path(file_path, &state.workspace_root);
+                                    if resolved.is_empty() {
+                                        None
+                                    } else {
+                                        Some(resolved)
+                                    }
+                                }
+                            }
                         } else {
-                            Some(resolved)
+                            None
                         }
                     }
-                }
+                })
+                .await
+        };
+
+        let backfilled_after_contents =
+            if let Some(path) = backfill_after_path.filter(|path| Path::new(path).exists()) {
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .ok()
+                    .filter(|contents| has_visible_text(contents))
             } else {
                 None
-            }
-        };
-
-        let backfilled_after_contents = if let Some(path) = backfill_after_path {
-            tokio::fs::read_to_string(&path)
-                .await
-                .ok()
-                .filter(|contents| has_visible_text(contents))
-        } else {
-            None
-        };
+            };
 
         let (parent_session_id, workspace_root, native_tool_name) = {
-            let state = self.state.lock().await;
-            let name = state
-                .active_tool_contexts
-                .get(&completion.tool_call_id)
-                .map(|context| context.tool_name.clone())
-                .unwrap_or_else(|| completion.tool_name.clone());
-            (state.session_id.clone(), state.workspace_root.clone(), name)
+            self.state
+                .with({
+                    let completion = completion.clone();
+                    move |state| {
+                        let name = state
+                            .active_tool_contexts
+                            .get(&completion.tool_call_id)
+                            .map(|context| context.tool_name.clone())
+                            .unwrap_or_else(|| completion.tool_name.clone());
+                        (state.session_id.clone(), state.workspace_root.clone(), name)
+                    }
+                })
+                .await
         };
         eprintln!(
-            "TYDE ACP NATIVE CHILD LOOKUP id={} declared={} title={}",
-            completion.tool_call_id, native_tool_name, completion.tool_name
+            "TYDE ACP NATIVE CHILD LOOKUP id_present={} declared_present={} title_present={}",
+            !completion.tool_call_id.is_empty(),
+            !native_tool_name.is_empty(),
+            !completion.tool_name.is_empty()
         );
         if let Some((session_id, name)) = self
             .adapter
@@ -3727,13 +4414,18 @@ impl KiroInner {
             .await
         {
             Ok(Some(child)) => {
-                let emitter = self.capacity_state.lock().await.emitter.clone();
+                let emitter = self
+                    .state
+                    .with(|state| state.capacity.emitter.clone())
+                    .await;
                 if let Some(emitter) = emitter
                     && self
-                        .native_child_sessions
-                        .lock()
+                        .state
+                        .with({
+                            let session_id = child.session_id.0.clone();
+                            move |state| state.native_child_sessions.insert(session_id)
+                        })
                         .await
-                        .insert(child.session_id.0.clone())
                 {
                     match emitter
                         .on_subagent_spawned(
@@ -3747,9 +4439,9 @@ impl KiroInner {
                     {
                         Ok(handle) => {
                             eprintln!(
-                                "TYDE ACP NATIVE CHILD tool={} agent={} events={}",
-                                completion.tool_call_id,
-                                handle.agent_id.0,
+                                "TYDE ACP NATIVE CHILD tool_present={} agent_present={} events={}",
+                                !completion.tool_call_id.is_empty(),
+                                !handle.agent_id.0.is_empty(),
                                 child.events.len()
                             );
                             let progress = |completed| protocol::ToolProgressData {
@@ -3793,83 +4485,109 @@ impl KiroInner {
             Err(error) => self.emitter.backend_error(&error),
         }
 
-        let mut emit_request_now: Option<(String, Value)> = None;
-        let mut emit_completion_now: Option<(String, PendingToolCompletion)> = None;
-        {
-            let mut state = self.state.lock().await;
-            let defer_opencode_completion = self.adapter.backend_kind()
-                == protocol::BackendKind::Opencode
-                && state.active_response.is_some();
-            if let Some(context) = state.active_tool_contexts.get_mut(&completion.tool_call_id) {
-                if let Some(refined) = self
-                    .adapter
-                    .refine_tool_request(&completion, &context.tool_type)
-                {
-                    context.tool_type = refined;
-                }
-                if let Some(after_contents) = backfilled_after_contents.clone() {
-                    let current_after = context
-                        .tool_type
-                        .get("after")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if current_after != after_contents
-                        && let Some(obj) = context.tool_type.as_object_mut()
-                    {
-                        obj.insert("after".to_string(), Value::String(after_contents));
+        let (emit_request_now, emit_completion_now) = {
+            match self
+                .state
+                .with({
+                    let mut completion = completion.clone();
+                    let backfilled_after_contents = backfilled_after_contents.clone();
+                    let raw_tool_call_id = raw_tool_call_id.clone();
+                    let message_id = message_id.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        std::ops::ControlFlow::Continue({
+                            let mut emit_request_now: Option<(String, Value)> = None;
+                            let mut emit_completion_now: Option<(String, PendingToolCompletion)> =
+                                None;
+                            let defer_opencode_completion = adapter.backend_kind()
+                                == protocol::BackendKind::Opencode
+                                && state.active_response.is_some();
+                            if let Some(context) =
+                                state.active_tool_contexts.get_mut(&completion.tool_call_id)
+                            {
+                                if let Some(refined) =
+                                    adapter.refine_tool_request(&completion, &context.tool_type)
+                                {
+                                    context.tool_type = refined;
+                                }
+                                if let Some(after_contents) = backfilled_after_contents.clone() {
+                                    let current_after = context
+                                        .tool_type
+                                        .get("after")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    if current_after != after_contents
+                                        && let Some(obj) = context.tool_type.as_object_mut()
+                                    {
+                                        obj.insert(
+                                            "after".to_string(),
+                                            Value::String(after_contents),
+                                        );
+                                    }
+                                }
+
+                                if completion.tool_name == "tool" {
+                                    completion.tool_name = context.tool_name.clone();
+                                }
+                                completion.is_mcp_tool = context.is_mcp_tool;
+                                let task_update =
+                                    adapter.map_task_update(&completion, Some(&context.tool_type));
+                                let tool_result =
+                                    adapter.map_tool_result(&completion, Some(&context.tool_type));
+                                let (success, error) = normalize_mapped_tool_outcome(
+                                    &completion.tool_call_id,
+                                    &completion.tool_name,
+                                    &tool_result,
+                                    completion.success,
+                                    completion.error.clone(),
+                                );
+                                let pending = PendingToolCompletion {
+                                    tool_result,
+                                    success,
+                                    error,
+                                    task_update,
+                                };
+                                if context.defer_request_until_completion
+                                    && !context.request_emitted
+                                {
+                                    context.request_emitted = true;
+                                    emit_request_now = Some((
+                                        completion.tool_call_id.clone(),
+                                        context.tool_type.clone(),
+                                    ));
+                                }
+                                if context.request_emitted && !defer_opencode_completion {
+                                    emit_completion_now =
+                                        Some((completion.tool_call_id.clone(), pending));
+                                } else {
+                                    context.pending_completion = Some(pending);
+                                }
+                            } else {
+                                return std::ops::ControlFlow::Break(());
+                            }
+
+                            if emit_completion_now.is_some() {
+                                state.active_tool_contexts.remove(&completion.tool_call_id);
+                                state
+                                    .completed_tool_call_ids
+                                    .insert(completion.tool_call_id.clone());
+                                remove_tool_call_aliases(
+                                    &mut state.tool_call_aliases,
+                                    &completion.tool_call_id,
+                                    raw_tool_call_id.as_deref(),
+                                    message_id.as_deref(),
+                                );
+                            }
+                            (emit_request_now, emit_completion_now)
+                        })
                     }
-                }
-
-                if completion.tool_name == "tool" {
-                    completion.tool_name = context.tool_name.clone();
-                }
-                completion.is_mcp_tool = context.is_mcp_tool;
-                let task_update = self
-                    .adapter
-                    .map_task_update(&completion, Some(&context.tool_type));
-                let tool_result = self
-                    .adapter
-                    .map_tool_result(&completion, Some(&context.tool_type));
-                let (success, error) = normalize_mapped_tool_outcome(
-                    &completion.tool_call_id,
-                    &completion.tool_name,
-                    &tool_result,
-                    completion.success,
-                    completion.error.clone(),
-                );
-                let pending = PendingToolCompletion {
-                    tool_result,
-                    success,
-                    error,
-                    task_update,
-                };
-                if context.defer_request_until_completion && !context.request_emitted {
-                    context.request_emitted = true;
-                    emit_request_now =
-                        Some((completion.tool_call_id.clone(), context.tool_type.clone()));
-                }
-                if context.request_emitted && !defer_opencode_completion {
-                    emit_completion_now = Some((completion.tool_call_id.clone(), pending));
-                } else {
-                    context.pending_completion = Some(pending);
-                }
-            } else {
-                return;
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
-
-            if emit_completion_now.is_some() {
-                state.active_tool_contexts.remove(&completion.tool_call_id);
-                state
-                    .completed_tool_call_ids
-                    .insert(completion.tool_call_id.clone());
-                remove_tool_call_aliases(
-                    &mut state.tool_call_aliases,
-                    &completion.tool_call_id,
-                    raw_tool_call_id.as_deref(),
-                    message_id.as_deref(),
-                );
-            }
-        }
+        };
 
         if let Some((tool_call_id, tool_type)) = emit_request_now {
             self.emitter
@@ -3889,12 +4607,17 @@ impl KiroInner {
             }
         }
         let pending_turn_end = {
-            let mut state = self.state.lock().await;
-            if state.active_tool_contexts.is_empty() {
-                state.grok_pending_turn_end.take()
-            } else {
-                None
-            }
+            self.state
+                .with({
+                    move |state| {
+                        if state.active_tool_contexts.is_empty() {
+                            state.grok_pending_turn_end.take()
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .await
         };
         if let Some(update) = pending_turn_end {
             self.finalize_grok_turn_end(&update).await;
@@ -3952,7 +4675,7 @@ impl KiroInner {
             .unwrap_or("Agent error")
             .to_string();
 
-        if self.state.lock().await.replaying_history {
+        if self.state.with(|state| state.replaying_history).await {
             self.set_replay_error(format!(
                 "{} session replay failed: {message}",
                 self.adapter.display_name()
@@ -3962,11 +4685,22 @@ impl KiroInner {
         }
 
         {
-            let mut state = self.state.lock().await;
-            if state.provider_turn_quarantined {
-                return;
+            match self
+                .state
+                .with({
+                    move |state| {
+                        if state.provider_turn_quarantined {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        state.provider_turn_quarantined = true;
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
-            state.provider_turn_quarantined = true;
         }
 
         self.abort_active_turn(&message).await;
@@ -4000,10 +4734,8 @@ impl KiroInner {
 
         let model = {
             self.state
-                .lock()
+                .with(|state| state.model.clone())
                 .await
-                .model
-                .clone()
                 .unwrap_or_else(|| self.adapter.display_name().to_string())
         };
         self.emitter.replay_assistant_message(
@@ -4023,31 +4755,50 @@ impl KiroInner {
                 images: Vec::new(),
             },
         );
-        let mut state = self.state.lock().await;
-        state.replay_assistant_message_emitted_since_user = true;
+        self.state
+            .with({
+                move |state| {
+                    state.replay_assistant_message_emitted_since_user = true;
+                }
+            })
+            .await
     }
 
     async fn flush_replay_assistant_message(&self) {
         let replay = {
-            let mut state = self.state.lock().await;
-            state.replay_assistant_identity.take().map(|identity| {
-                (
-                    identity,
-                    std::mem::take(&mut state.replay_assistant_text),
-                    std::mem::take(&mut state.replay_assistant_reasoning),
-                )
-            })
+            self.state
+                .with({
+                    move |state| {
+                        state.replay_assistant_identity.take().map(|identity| {
+                            (
+                                identity,
+                                std::mem::take(&mut state.replay_assistant_text),
+                                std::mem::take(&mut state.replay_assistant_reasoning),
+                            )
+                        })
+                    }
+                })
+                .await
         };
         self.emit_replay_message(replay).await;
     }
 
     async fn handle_grok_response_end(&self, update: &Value) {
         self.flush_pending_grok_response_end().await;
-        self.state.lock().await.grok_pending_response_end = Some(update.clone());
+        self.state
+            .with({
+                let update = update.clone();
+                move |state| state.grok_pending_response_end = Some(update)
+            })
+            .await;
     }
 
     async fn flush_pending_grok_response_end(&self) {
-        let Some(update) = self.state.lock().await.grok_pending_response_end.take() else {
+        let Some(update) = self
+            .state
+            .with(|state| state.grok_pending_response_end.take())
+            .await
+        else {
             return;
         };
         let request_usage = normalize_token_usage(Some(&update))
@@ -4061,21 +4812,39 @@ impl KiroInner {
             .finalize_active_stream_if_any(Some(update.clone()), false)
             .await;
 
-        let mut state = self.state.lock().await;
-        state.grok_last_message_id = message_id;
-        if let Some(usage) = request_usage {
-            state.grok_request_usages.push(GrokRequestUsage {
-                usage,
-                current_context_usage,
-                context_breakdown,
-            });
-        }
+        self.state
+            .with({
+                let message_id = message_id.clone();
+                let request_usage = request_usage.clone();
+                let current_context_usage = current_context_usage.clone();
+                let context_breakdown = context_breakdown.clone();
+                move |state| {
+                    state.grok_last_message_id = message_id;
+                    if let Some(usage) = request_usage {
+                        state.grok_request_usages.push(GrokRequestUsage {
+                            usage,
+                            current_context_usage,
+                            context_breakdown,
+                        });
+                    }
+                }
+            })
+            .await
     }
 
     async fn handle_grok_turn_end(&self, update: &Value) {
         self.flush_pending_grok_response_end().await;
-        if !self.state.lock().await.active_tool_contexts.is_empty() {
-            self.state.lock().await.grok_pending_turn_end = Some(update.clone());
+        if !self
+            .state
+            .with(|state| state.active_tool_contexts.is_empty())
+            .await
+        {
+            self.state
+                .with({
+                    let update = update.clone();
+                    move |state| state.grok_pending_turn_end = Some(update)
+                })
+                .await;
             return;
         }
         self.finalize_grok_turn_end(update).await;
@@ -4091,17 +4860,25 @@ impl KiroInner {
             .and_then(|value| serde_json::from_value::<TokenUsage>(value).ok());
 
         let (turn_id, requests, last_message_id, model) = {
-            let mut state = self.state.lock().await;
-            let turn_id = ModelTurnId(format!("{}:{}", state.session_id, state.grok_turn_sequence));
-            if state.native_child {
-                state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
-            }
-            (
-                turn_id,
-                std::mem::take(&mut state.grok_request_usages),
-                state.grok_last_message_id.take(),
-                state.model.clone().unwrap_or_else(|| "grok".to_owned()),
-            )
+            self.state
+                .with({
+                    move |state| {
+                        let turn_id = ModelTurnId(format!(
+                            "{}:{}",
+                            state.session_id, state.grok_turn_sequence
+                        ));
+                        if state.native_child {
+                            state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
+                        }
+                        (
+                            turn_id,
+                            std::mem::take(&mut state.grok_request_usages),
+                            state.grok_last_message_id.take(),
+                            state.model.clone().unwrap_or_else(|| "grok".to_owned()),
+                        )
+                    }
+                })
+                .await
         };
 
         if let Some(turn) = turn.as_ref() {
@@ -4167,58 +4944,66 @@ impl KiroInner {
         else {
             return;
         };
-        let mut state = self.state.lock().await;
-        state
-            .opencode_request_usages
-            .push((usage.clone(), message_id));
-        let mut turn = TokenUsage::default();
-        for (request, _) in &state.opencode_request_usages {
-            add_token_usage(&mut turn, request);
-        }
-        add_token_usage(&mut state.opencode_cumulative_usage, &usage);
-        let model = state.model.as_deref().unwrap_or("opencode");
-        let current_context_usage = state
-            .opencode_current_context_usage
-            .as_ref()
-            .and_then(|context| context.known())
-            .and_then(|(_, context_window)| {
-                let input_tokens = usage
-                    .input_tokens
-                    .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
-                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
-                (input_tokens > 0 && input_tokens <= context_window).then_some(
-                    CurrentContextUsage::Known {
-                        input_tokens,
-                        context_window,
-                    },
-                )
-            });
-        let request_id = ModelRequestId {
-            turn_id: ModelTurnId(format!(
-                "{}:{}",
-                state.session_id, state.opencode_turn_sequence
-            )),
-            sequence: u32::try_from(state.opencode_request_usages.len()).unwrap_or(u32::MAX),
-        };
-        tracing::debug!(
-            model,
-            request_sequence = request_id.sequence,
-            request = ?usage,
-            ?current_context_usage,
-            "OpenCode request context usage diagnostic"
-        );
-        self.emitter
-            .model_request_token_usage(&ModelRequestTokenUsage {
-                request_id,
-                request: usage,
-                turn,
-                cumulative: state.opencode_cumulative_usage.clone(),
-                model_context_window: current_context_usage
-                    .as_ref()
-                    .and_then(|usage| usage.known().map(|(_, window)| window)),
-                current_context_usage,
-                estimated_context_breakdown: None,
-            });
+        self.state
+            .with({
+                let usage = usage.clone();
+                let message_id = message_id.clone();
+                let emitter = Arc::clone(&self.emitter);
+                move |state| {
+                    state
+                        .opencode_request_usages
+                        .push((usage.clone(), message_id));
+                    let mut turn = TokenUsage::default();
+                    for (request, _) in &state.opencode_request_usages {
+                        add_token_usage(&mut turn, request);
+                    }
+                    add_token_usage(&mut state.opencode_cumulative_usage, &usage);
+                    let model = state.model.as_deref().unwrap_or("opencode");
+                    let current_context_usage = state
+                        .opencode_current_context_usage
+                        .as_ref()
+                        .and_then(|context| context.known())
+                        .and_then(|(_, context_window)| {
+                            let input_tokens = usage
+                                .input_tokens
+                                .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
+                                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+                            (input_tokens > 0 && input_tokens <= context_window).then_some(
+                                CurrentContextUsage::Known {
+                                    input_tokens,
+                                    context_window,
+                                },
+                            )
+                        });
+                    let request_id = ModelRequestId {
+                        turn_id: ModelTurnId(format!(
+                            "{}:{}",
+                            state.session_id, state.opencode_turn_sequence
+                        )),
+                        sequence: u32::try_from(state.opencode_request_usages.len())
+                            .unwrap_or(u32::MAX),
+                    };
+                    tracing::debug!(
+                        model,
+                        request_sequence = request_id.sequence,
+                        request = ?usage,
+                        ?current_context_usage,
+                        "OpenCode request context usage diagnostic"
+                    );
+                    emitter.model_request_token_usage(&ModelRequestTokenUsage {
+                        request_id,
+                        request: usage,
+                        turn,
+                        cumulative: state.opencode_cumulative_usage.clone(),
+                        model_context_window: current_context_usage
+                            .as_ref()
+                            .and_then(|usage| usage.known().map(|(_, window)| window)),
+                        current_context_usage,
+                        estimated_context_breakdown: None,
+                    });
+                }
+            })
+            .await
     }
 
     async fn transition_opencode_provider_message(&self, provider_message_id: Option<String>) {
@@ -4229,17 +5014,34 @@ impl KiroInner {
             return;
         };
         let usage = {
-            let mut state = self.state.lock().await;
-            match state.opencode_active_provider_message_id.as_deref() {
-                None => {
-                    state.opencode_active_provider_message_id = Some(provider_message_id);
-                    return;
-                }
-                Some(active) if active == provider_message_id => return,
-                Some(_) => {
-                    state.opencode_active_provider_message_id = Some(provider_message_id);
-                    state.opencode_pending_response_usage.take()
-                }
+            match self
+                .state
+                .with({
+                    let provider_message_id = provider_message_id.clone();
+                    move |state| {
+                        std::ops::ControlFlow::Continue({
+                            match state.opencode_active_provider_message_id.as_deref() {
+                                None => {
+                                    state.opencode_active_provider_message_id =
+                                        Some(provider_message_id);
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                Some(active) if active == provider_message_id => {
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                Some(_) => {
+                                    state.opencode_active_provider_message_id =
+                                        Some(provider_message_id);
+                                    state.opencode_pending_response_usage.take()
+                                }
+                            }
+                        })
+                    }
+                })
+                .await
+            {
+                std::ops::ControlFlow::Continue(value) => value,
+                std::ops::ControlFlow::Break(value) => return value,
             }
         };
         let usage = self.dedupe_opencode_usage(usage).await;
@@ -4260,24 +5062,31 @@ impl KiroInner {
             return Some(raw);
         };
         self.state
-            .lock()
+            .with(move |state| {
+                state
+                    .opencode_provider_request_ids
+                    .insert(provider_message_id)
+                    .then_some(raw)
+            })
             .await
-            .opencode_provider_request_ids
-            .insert(provider_message_id)
-            .then_some(raw)
     }
 
     async fn finalize_opencode_turn(&self) {
         let (requests, turn, cumulative, model) = {
-            let mut state = self.state.lock().await;
-            let requests = std::mem::take(&mut state.opencode_request_usages);
-            let mut turn = TokenUsage::default();
-            for (usage, _) in &requests {
-                add_token_usage(&mut turn, usage);
-            }
-            let cumulative = state.opencode_cumulative_usage.clone();
-            let model = state.model.clone().unwrap_or_else(|| "opencode".to_owned());
-            (requests, turn, cumulative, model)
+            self.state
+                .with({
+                    move |state| {
+                        let requests = std::mem::take(&mut state.opencode_request_usages);
+                        let mut turn = TokenUsage::default();
+                        for (usage, _) in &requests {
+                            add_token_usage(&mut turn, usage);
+                        }
+                        let cumulative = state.opencode_cumulative_usage.clone();
+                        let model = state.model.clone().unwrap_or_else(|| "opencode".to_owned());
+                        (requests, turn, cumulative, model)
+                    }
+                })
+                .await
         };
 
         if let Some((request, Some(message_id))) = requests.last() {
@@ -4301,14 +5110,19 @@ impl KiroInner {
         end_typing: bool,
     ) -> Option<ChatMessageId> {
         let active = {
-            let mut state = self.state.lock().await;
-            state.active_response.take().map(|response| {
-                (
-                    response,
-                    std::mem::take(&mut state.active_stream_text),
-                    std::mem::take(&mut state.active_stream_tool_calls),
-                )
-            })
+            self.state
+                .with({
+                    move |state| {
+                        state.active_response.take().map(|response| {
+                            (
+                                response,
+                                std::mem::take(&mut state.active_stream_text),
+                                std::mem::take(&mut state.active_stream_tool_calls),
+                            )
+                        })
+                    }
+                })
+                .await
         };
 
         if let Some((response, text, tool_calls)) = active {
@@ -4325,12 +5139,17 @@ impl KiroInner {
     }
 
     async fn clear_active_stream(&self) {
-        let mut state = self.state.lock().await;
-        state.active_response = None;
-        state.active_stream_text.clear();
-        state.active_stream_tool_calls.clear();
-        state.active_tool_contexts.clear();
-        state.tool_call_aliases.clear();
+        self.state
+            .with({
+                move |state| {
+                    state.active_response = None;
+                    state.active_stream_text.clear();
+                    state.active_stream_tool_calls.clear();
+                    state.active_tool_contexts.clear();
+                    state.tool_call_aliases.clear();
+                }
+            })
+            .await
     }
 
     async fn abort_active_turn(&self, message: &str) {
@@ -4362,7 +5181,10 @@ impl KiroInner {
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
         let tool_type = super::adapters::grok::exit_plan_mode_tool_type(plan, None);
-        let previous = self.state.lock().await.pending_grok_exit_plan_mode.take();
+        let previous = self
+            .state
+            .with(|state| state.pending_grok_exit_plan_mode.take())
+            .await;
         if let Some(previous) = previous {
             let _ = self
                 .bridge
@@ -4377,40 +5199,49 @@ impl KiroInner {
         }
 
         let (canonical_id, emit_request, interjected) = {
-            let mut state = self.state.lock().await;
-            let canonical_id = resolve_tool_call_id_alias(&state, Some(&raw_tool_call_id), None)
-                .unwrap_or_else(|| raw_tool_call_id.clone());
-            // After session/load Grok re-asks an approval its previous process
-            // left unanswered, outside any response and with no tool call
-            // announcing it.
-            let interjected = !state.active_tool_contexts.contains_key(&canonical_id)
-                && state.active_response.is_none();
-            let context = state
-                .active_tool_contexts
-                .entry(canonical_id.clone())
-                .or_insert_with(|| KiroToolContext {
-                    tool_name: "exit_plan_mode".to_owned(),
-                    tool_type: tool_type.clone(),
-                    is_mcp_tool: false,
-                    request_emitted: false,
-                    defer_request_until_completion: true,
-                    pending_completion: None,
-                });
-            context.tool_name = "exit_plan_mode".to_owned();
-            context.tool_type = tool_type.clone();
-            let emit_request = !context.request_emitted;
-            context.request_emitted = true;
-            state.pending_grok_exit_plan_mode = Some(PendingGrokExitPlanMode {
-                rpc_id,
-                tool_call_id: canonical_id.clone(),
-            });
-            (canonical_id, emit_request, interjected)
+            self.state
+                .with({
+                    let raw_tool_call_id = raw_tool_call_id.clone();
+                    let tool_type = tool_type.clone();
+                    let rpc_id = rpc_id.clone();
+                    move |state| {
+                        let canonical_id =
+                            resolve_tool_call_id_alias(state, Some(&raw_tool_call_id), None)
+                                .unwrap_or_else(|| raw_tool_call_id.clone());
+                        // After session/load Grok re-asks an approval its previous process
+                        // left unanswered, outside any response and with no tool call
+                        // announcing it.
+                        let interjected = !state.active_tool_contexts.contains_key(&canonical_id)
+                            && state.active_response.is_none();
+                        let context = state
+                            .active_tool_contexts
+                            .entry(canonical_id.clone())
+                            .or_insert_with(|| KiroToolContext {
+                                tool_name: "exit_plan_mode".to_owned(),
+                                tool_type: tool_type.clone(),
+                                is_mcp_tool: false,
+                                request_emitted: false,
+                                defer_request_until_completion: true,
+                                pending_completion: None,
+                            });
+                        context.tool_name = "exit_plan_mode".to_owned();
+                        context.tool_type = tool_type.clone();
+                        let emit_request = !context.request_emitted;
+                        context.request_emitted = true;
+                        state.pending_grok_exit_plan_mode = Some(PendingGrokExitPlanMode {
+                            rpc_id,
+                            tool_call_id: canonical_id.clone(),
+                        });
+                        (canonical_id, emit_request, interjected)
+                    }
+                })
+                .await
         };
 
         self.flush_pending_grok_response_end().await;
         if interjected {
             tracing::info!(
-                tool_call_id = canonical_id,
+                tool_call_id_present = !canonical_id.is_empty(),
                 "Grok asked for plan approval without declaring the tool call"
             );
             self.emitter.typing_status_changed(true);
@@ -4444,18 +5275,26 @@ impl KiroInner {
             );
         };
 
-        let pending = self.state.lock().await.pending_grok_exit_plan_mode.take();
-        let Some(pending) = pending else {
-            return Err(
-                "Grok received a plan approval with no pending ExitPlanMode request".to_owned(),
-            );
-        };
-        if pending.tool_call_id != tool_call_id {
-            self.state.lock().await.pending_grok_exit_plan_mode = Some(pending);
-            return Err(format!(
-                "ExitPlanMode response targeted stale tool_call_id {tool_call_id}"
-            ));
-        }
+        let pending = self
+            .state
+            .with(move |state| {
+                let Some(pending) = state.pending_grok_exit_plan_mode.as_ref() else {
+                    return Err(
+                        "Grok received a plan approval with no pending ExitPlanMode request"
+                            .to_owned(),
+                    );
+                };
+                if pending.tool_call_id != tool_call_id {
+                    return Err(format!(
+                        "ExitPlanMode response targeted stale tool_call_id {tool_call_id}"
+                    ));
+                }
+                Ok(state
+                    .pending_grok_exit_plan_mode
+                    .take()
+                    .expect("pending approval checked in this transition"))
+            })
+            .await?;
 
         tracing::debug!(
             ?decision,
@@ -4472,11 +5311,16 @@ impl KiroInner {
             .await?;
         let plan_info = self
             .state
-            .lock()
-            .await
-            .active_tool_contexts
-            .get(&pending.tool_call_id)
-            .map(|context| context.tool_type.clone());
+            .with({
+                let tool_call_id = pending.tool_call_id.clone();
+                move |state| {
+                    state
+                        .active_tool_contexts
+                        .get(&tool_call_id)
+                        .map(|context| context.tool_type.clone())
+                }
+            })
+            .await;
         let result = ToolExecutionResult::ExitPlanMode {
             decision,
             feedback: feedback.filter(|text| !text.trim().is_empty()),
@@ -4492,11 +5336,15 @@ impl KiroInner {
                 .map(str::to_owned),
         };
         {
-            let mut state = self.state.lock().await;
-            state
-                .completed_tool_call_ids
-                .insert(pending.tool_call_id.clone());
-            state.active_tool_contexts.remove(&pending.tool_call_id);
+            self.state
+                .with({
+                    let tool_call_id = pending.tool_call_id.clone();
+                    move |state| {
+                        state.completed_tool_call_ids.insert(tool_call_id.clone());
+                        state.active_tool_contexts.remove(&tool_call_id);
+                    }
+                })
+                .await
         }
         self.emitter.tool_completed(
             &pending.tool_call_id,
@@ -4507,7 +5355,10 @@ impl KiroInner {
     }
 
     async fn fail_pending_grok_exit_plan_mode(&self) {
-        let pending = self.state.lock().await.pending_grok_exit_plan_mode.take();
+        let pending = self
+            .state
+            .with(|state| state.pending_grok_exit_plan_mode.take())
+            .await;
         if let Some(pending) = pending {
             let _ = self
                 .bridge
@@ -4533,17 +5384,23 @@ impl KiroInner {
         let cleaned_text = self.adapter.sanitize_stream_text(&text).into_owned();
 
         let (session_id, model) = {
-            let state = self.state.lock().await;
-            (
-                state.session_id.clone(),
-                state
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.adapter.display_name().to_string()),
-            )
+            self.state
+                .with({
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        (
+                            state.session_id.clone(),
+                            state
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| adapter.display_name().to_string()),
+                        )
+                    }
+                })
+                .await
         };
         tracing::debug!(
-            session_id,
+            session_id_present = !session_id.is_empty(),
             text_bytes = cleaned_text.len(),
             tool_call_count = tool_calls.len(),
             "Finalizing ACP response stream"
@@ -4593,35 +5450,49 @@ impl KiroInner {
     }
 
     async fn flush_tool_events_after_stream_end(&self, tool_calls: &[ToolUseData]) {
-        let mut completions_to_emit: Vec<(String, PendingToolCompletion)> = Vec::new();
-        let mut requests_to_emit: Vec<(String, String, Value)> = Vec::new();
+        let (completions_to_emit, requests_to_emit) = {
+            self.state
+                .with({
+                    let tool_calls = tool_calls.to_owned();
+                    move |state| {
+                        let tool_calls = &tool_calls;
+                        let mut completions_to_emit: Vec<(String, PendingToolCompletion)> =
+                            Vec::new();
+                        let mut requests_to_emit: Vec<(String, String, Value)> = Vec::new();
+                        for tool_call in tool_calls {
+                            let tool_call_id = tool_call.tool_call_id.clone();
 
-        {
-            let mut state = self.state.lock().await;
-            for tool_call in tool_calls {
-                let tool_call_id = tool_call.tool_call_id.clone();
+                            if let Some(context) = state.active_tool_contexts.get_mut(&tool_call_id)
+                            {
+                                if !context.request_emitted {
+                                    requests_to_emit.push((
+                                        tool_call_id.clone(),
+                                        context.tool_name.clone(),
+                                        context.tool_type.clone(),
+                                    ));
+                                    context.request_emitted = true;
+                                }
+                                if let Some(completion) = context.pending_completion.take() {
+                                    completions_to_emit.push((tool_call_id.clone(), completion));
+                                }
+                            }
+                        }
 
-                if let Some(context) = state.active_tool_contexts.get_mut(&tool_call_id) {
-                    if !context.request_emitted {
-                        requests_to_emit.push((
-                            tool_call_id.clone(),
-                            context.tool_name.clone(),
-                            context.tool_type.clone(),
-                        ));
-                        context.request_emitted = true;
+                        for (tool_call_id, _) in &completions_to_emit {
+                            state.active_tool_contexts.remove(tool_call_id);
+                            state.completed_tool_call_ids.insert(tool_call_id.clone());
+                            remove_tool_call_aliases(
+                                &mut state.tool_call_aliases,
+                                tool_call_id,
+                                None,
+                                None,
+                            );
+                        }
+                        (completions_to_emit, requests_to_emit)
                     }
-                    if let Some(completion) = context.pending_completion.take() {
-                        completions_to_emit.push((tool_call_id.clone(), completion));
-                    }
-                }
-            }
-
-            for (tool_call_id, _) in &completions_to_emit {
-                state.active_tool_contexts.remove(tool_call_id);
-                state.completed_tool_call_ids.insert(tool_call_id.clone());
-                remove_tool_call_aliases(&mut state.tool_call_aliases, tool_call_id, None, None);
-            }
-        }
+                })
+                .await
+        };
 
         for (tool_call_id, tool_name, tool_type) in requests_to_emit {
             let _ = tool_name;
@@ -4993,7 +5864,7 @@ fn normalize_mapped_tool_outcome(
         .filter(|exit_code| *exit_code != 0);
     if provider_success && let Some(exit_code) = nonzero_exit {
         tracing::warn!(
-            tool_call_id,
+            tool_call_id_present = !tool_call_id.is_empty(),
             exit_code,
             "ACP provider marked a nonzero command completion successful; normalized to failure"
         );
@@ -5079,8 +5950,9 @@ pub(crate) fn map_tool_completion_result(
         }
         "edit" => {
             eprintln!(
-                "TYDE KIRO EDIT COMPLETION request_payload={request_payload:?} result={}",
-                completion.tool_result
+                "TYDE KIRO EDIT COMPLETION request_present={} result_present={}",
+                request_payload.is_some(),
+                !completion.tool_result.is_null()
             );
             let before = request_payload
                 .and_then(|payload| payload.get("before"))
@@ -6034,7 +6906,11 @@ pub(crate) async fn probe_session_settings_schema(
                 .ok_or_else(|| {
                     "ACP schema probe ModelsList response missing data.models array".to_string()
                 })?;
-            let known_modes = session.inner.state.lock().await.known_modes.clone();
+            let known_modes = session
+                .inner
+                .state
+                .with(|state| state.known_modes.clone())
+                .await;
             return session_settings_schema_from_known_options(known_models, &known_modes);
         }
     })
@@ -6898,11 +7774,14 @@ impl Backend for KiroBackend {
                     return;
                 }
             };
+            let initialized_session_id = session
+                .inner
+                .state
+                .with(|state| state.session_id.clone())
+                .await;
             *session_id_task
                 .lock()
-                .expect("kiro session_id mutex poisoned") = Some(SessionId(
-                session.inner.state.lock().await.session_id.clone(),
-            ));
+                .expect("kiro session_id mutex poisoned") = Some(SessionId(initialized_session_id));
 
             let handle = session.command_handle();
             let resolved_settings = resolve_agent_session_settings(&config);
@@ -7263,10 +8142,17 @@ impl Backend for KiroBackend {
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
-        let state = self.command_handle.inner.state.lock().await;
-        crate::backend::session_settings_from_json(
-            json!({"model": state.model, "mode": state.mode}),
-        )
+        self.command_handle
+            .inner
+            .state
+            .with({
+                move |state| {
+                    crate::backend::session_settings_from_json(
+                        json!({"model": state.model, "mode": state.mode}),
+                    )
+                }
+            })
+            .await
     }
 
     async fn send(&self, input: AgentInput) -> bool {

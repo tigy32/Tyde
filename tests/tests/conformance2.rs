@@ -6756,6 +6756,7 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
         .to_owned();
     let answered = answer_question(host, &agent, &asked, &choice).await;
     assert_question_answer_reached_the_model(&asked, &answered, &choice);
+    assert_answer_has_no_user_echo(&answered);
 
     // Second question, abandoned rather than answered. Cancelling is
     // the user's escape hatch from an interactive tool, and it is the
@@ -6777,11 +6778,47 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
         "cancelling must retire the unanswered question exactly once"
     );
 
+    // A typed answer can outlive its request: the question was retired
+    // while the answer was in flight. The backend holds nothing for the
+    // provider to answer, so it must reject the answer explicitly and
+    // settle the input it accepted, or the agent stays working forever.
+    let stale_idle = answer_question(host, &agent, &abandoned, &choice).await;
+    assert_stale_answer_rejected(&stale_idle, &abandoned, &choice);
+    assert_answer_has_no_user_echo(&stale_idle);
+    assert!(
+        !stale_idle
+            .events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::StreamStart(_))),
+        "{}: a rejected stale answer must not start a provider response",
+        stale_idle.label()
+    );
+
     // The assertion the wedge costs: a cancelled question must leave an
     // agent that still works. A latched turn queues every later message
     // instead of running it, and no further cancel can clear it.
     let recovered = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&recovered);
+
+    // The same stale answer delivered while a later turn streams must be
+    // rejected without ending, cancelling or truncating that turn.
+    let during = stale_answer_during_turn(host, &agent, &abandoned, &choice).await;
+    assert_stale_answer_rejected(&during, &abandoned, &choice);
+    assert!(
+        !during
+            .events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        "{}: rejecting a stale answer cancelled the running turn",
+        during.label()
+    );
+    assert!(
+        during
+            .assistant_messages()
+            .any(|message| message.content.contains(COUNTED_MARKER)),
+        "{}: the running turn ended before its final line after a stale answer was rejected",
+        during.label()
+    );
 
     let mut superseded = ask_question(host, &agent, &question_prompt).await;
     assert_question_waits_for_an_answer(&superseded);
@@ -6833,7 +6870,30 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
         "question answer, cancellation and follow-up must preserve the chat protocol"
     );
 
+    let session = agent.session_id.clone();
     assert_clean_close(host, &agent).await;
+
+    // A resumed session answers through the backend's resume path, which
+    // must not echo the typed answer either.
+    let resumed = resume_agent(host, &session).await;
+    assert_no_error_message("resumed question replay", &resumed.replayed_history);
+    let mut resumed_question = ask_question(host, &resumed, &question_prompt).await;
+    if resumed_question.mode() == protocol::UserQuestionMode::NonBlocking {
+        wait_for_unanswered_question_idle(host, &mut resumed_question).await;
+    }
+    assert_question_shape(&resumed_question);
+    let resumed_choice = resumed_question
+        .first_option()
+        .expect("question shape assertion guarantees an option")
+        .to_owned();
+    let resumed_answer = answer_question(host, &resumed, &resumed_question, &resumed_choice).await;
+    assert_question_answer_reached_the_model(&resumed_question, &resumed_answer, &resumed_choice);
+    assert_answer_has_no_user_echo(&resumed_answer);
+    assert!(
+        host.protocol_violations().is_empty(),
+        "a resumed question answer must preserve the chat protocol"
+    );
+    assert_clean_close(host, &resumed).await;
 }
 
 async fn real_user_question_history<B: Backend>(host: &mut Harness<B>) {
@@ -7233,7 +7293,7 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
         .to_owned();
     let answered = answer_question(host, &agent, &asked, &choice).await;
     assert_question_answer_reached_the_model(&asked, &answered, &choice);
-    assert_async_answer_has_no_user_echo(&answered);
+    assert_answer_has_no_user_echo(&answered);
 
     let continuing = ask_question(
         host,
@@ -7260,14 +7320,14 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     );
     let answered = answer_question(host, &agent, &continuing, "BETA").await;
     assert_question_answer_reached_the_model(&continuing, &answered, "BETA");
-    assert_async_answer_has_no_user_echo(&answered);
+    assert_answer_has_no_user_echo(&answered);
 
     let mut free_text = ask_question(host, &agent, prompt).await;
     wait_for_unanswered_question_idle(host, &mut free_text).await;
     assert_question_waits_for_an_answer(&free_text);
     let answered = answer_question(host, &agent, &free_text, "GAMMA").await;
     assert_question_answer_reached_the_model(&free_text, &answered, "GAMMA");
-    assert_async_answer_has_no_user_echo(&answered);
+    assert_answer_has_no_user_echo(&answered);
 
     let mut abandoned = ask_question(host, &agent, prompt).await;
     wait_for_unanswered_question_idle(host, &mut abandoned).await;
@@ -7474,7 +7534,95 @@ conformance2_scenario!(
     ]
 );
 
-fn assert_async_answer_has_no_user_echo(turn: &Turn) {
+/// Sends the stale answer once the later turn's response is streaming,
+/// then follows that turn to its own idle edge.
+async fn stale_answer_during_turn<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    question: &Question,
+    answer: &str,
+) -> Turn {
+    let prompt = long_answer_prompt();
+    send_prompt(host, agent, &prompt).await;
+    let mut turn = host.turn(&prompt);
+    let mut sent = false;
+    loop {
+        let event = match host.next_backend_event().await {
+            server::backend::BackendEvent::Chat(event) => {
+                let kind = serde_json::to_value(&event).expect("serialize event kind");
+                eprintln!("{} event={}", host.test_name, kind["kind"]);
+                event
+            }
+            server::backend::BackendEvent::ModelRequestTokenUsage(_)
+            | server::backend::BackendEvent::Compaction(_) => continue,
+            server::backend::BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume boundary in live events")
+            }
+        };
+        let streaming = matches!(event, ChatEvent::StreamDelta(_));
+        let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+        turn.events.push(event);
+        if idle {
+            assert!(
+                sent,
+                "{}: the turn ended before it streamed any text",
+                turn.label()
+            );
+            return turn;
+        }
+        if streaming && !sent {
+            send_question_response(host, question.tool_call_id(), answer).await;
+            sent = true;
+        }
+    }
+}
+
+fn assert_stale_answer_rejected(turn: &Turn, question: &Question, answer: &str) {
+    let errors = turn
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+            )
+        })
+        .count();
+    assert_eq!(
+        errors,
+        1,
+        "{}: an answer to a retired question must be rejected explicitly, exactly once",
+        turn.label()
+    );
+    assert!(
+        !turn
+            .tool_completions()
+            .any(
+                |completion| completion.tool_call_id == question.tool_call_id()
+                    && matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. })
+            ),
+        "{}: an answer to a retired question must not complete it as answered",
+        turn.label()
+    );
+    let echoes = turn
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User)
+                        && message.content.contains(answer)
+            )
+        })
+        .count();
+    assert_eq!(
+        echoes,
+        0,
+        "{}: a rejected answer must not appear as a human message",
+        turn.label()
+    );
+}
+
+fn assert_answer_has_no_user_echo(turn: &Turn) {
     let echoes = turn
         .events()
         .iter()
@@ -7486,7 +7634,7 @@ fn assert_async_answer_has_no_user_echo(turn: &Turn) {
         .count();
     assert_eq!(
         echoes, 0,
-        "the actor already persists the typed answer; a backend echo duplicates it"
+        "the actor owns any human message for a typed response; a backend echo duplicates it"
     );
 }
 
@@ -8225,7 +8373,10 @@ conformance2_scenario!(
 );
 conformance2_scenario!(
     real_user_question,
-    [BackendCapability::UserQuestionRequests]
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::ResumeSession
+    ]
 );
 
 const USAGE_MARKER: &str = "TYDE_USAGE";
@@ -10690,6 +10841,211 @@ async fn codex_global_settings<B: Backend>(host: &mut Harness<B>) {
     std::fs::write(&config_path, restore).expect("restore native config");
 }
 
+conformance2_scenario!(real_cancelled_send_leaves_session_admissible, []);
+
+/// Harmless if a backend delivers it alongside the admission probe.
+const CANCELLED_SEND_PROMPT: &str =
+    "This message only checks delivery. Reply briefly. Do not use tools.";
+
+/// Drops a user-message send at each of its suspensions, both before and
+/// after the task it woke has run, then proves the session still admits a
+/// turn. A send cancelled after its admission was recorded but before its
+/// message reached the turn loop used to leave every later turn refused.
+async fn real_cancelled_send_leaves_session_admissible<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mut probes = 0;
+    for point in [CancelPoint::BeforeOwnerRuns, CancelPoint::AfterWake] {
+        for boundary in 0.. {
+            let outcome =
+                cancel_send_at(host, &agent, CANCELLED_SEND_PROMPT, boundary, point).await;
+            eprintln!(
+                "CANCEL BOUNDARY op=send point={point:?} boundary={boundary} completed={}",
+                outcome.is_some()
+            );
+            if let Some(outcome) = &outcome {
+                assert!(
+                    matches!(outcome, server::backend::SendOutcome::Accepted),
+                    "{:?}: an idle session refused a send",
+                    host.backend()
+                );
+                let delivered = collect_turn(host, &agent, CANCELLED_SEND_PROMPT).await;
+                assert_no_error_after_cancellation(&delivered);
+            }
+            probes += 1;
+            probe_admission(host, &agent, &format!("TYDE_ADMITTED_{probes}")).await;
+            if outcome.is_some() {
+                break;
+            }
+        }
+    }
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_cancelled_relocation_leaves_session_admissible,
+    [BackendCapability::SetWorkspaceRoots]
+);
+
+/// Drops a workspace relocation at each of its suspensions, both before and
+/// after the task it woke has run, then drops a second relocation at the same
+/// point before proving the session still admits a turn. A relocation
+/// cancelled while its in-flight phase was set but not yet owned by its
+/// cleanup used to hold every later turn forever, and a dropped provider
+/// exchange used to leave Claude, Grok and OpenCode unable to answer.
+async fn real_cancelled_relocation_leaves_session_admissible<B: Backend>(host: &mut Harness<B>) {
+    let destination = tempfile::Builder::new()
+        .prefix("tyde-cancelled-relocation-")
+        .tempdir_in("/tmp")
+        .expect("destination workspaces");
+    let targets = ["a", "b"].map(|name| {
+        let root = destination.path().join(name);
+        std::fs::create_dir(&root).expect("create destination root");
+        std::fs::write(root.join("README.txt"), "tyde conformance workspace")
+            .expect("seed destination root");
+        vec![root.to_str().expect("UTF-8 root").to_owned()]
+    });
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mut attempts = 0;
+    for point in [CancelPoint::BeforeOwnerRuns, CancelPoint::AfterWake] {
+        for boundary in 0.. {
+            let roots = targets[attempts % targets.len()].clone();
+            attempts += 1;
+            let outcome = cancel_relocation_at(host, roots, boundary, point).await;
+            eprintln!(
+                "CANCEL BOUNDARY op=relocation point={point:?} boundary={boundary} completed={}",
+                outcome.is_some()
+            );
+            if outcome.is_none() {
+                // The dropped relocation may still be finishing; one admitted
+                // behind it must neither share nor end its exclusive phase.
+                let roots = targets[attempts % targets.len()].clone();
+                attempts += 1;
+                let overlapping = cancel_relocation_at(host, roots, boundary, point).await;
+                eprintln!(
+                    "CANCEL BOUNDARY op=overlap point={point:?} boundary={boundary} outcome={}",
+                    match &overlapping {
+                        None => "dropped",
+                        Some(Ok(())) => "ok",
+                        Some(Err(error)) => error.kind(),
+                    }
+                );
+                assert!(
+                    matches!(
+                        overlapping,
+                        None | Some(Ok(()) | Err(server::backend::WorkspaceRelocationError::Busy))
+                    ),
+                    "{:?}: an overlapping workspace relocation failed",
+                    host.backend()
+                );
+            }
+            probe_admission(host, &agent, &format!("TYDE_ADMITTED_{attempts}")).await;
+            if let Some(outcome) = outcome {
+                assert!(
+                    outcome.is_ok(),
+                    "{:?}: an idle session refused a workspace relocation",
+                    host.backend()
+                );
+                break;
+            }
+        }
+    }
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_cancelled_relocation_then_compaction,
+    [
+        BackendCapability::SetWorkspaceRoots,
+        BackendCapability::CompactionReported
+    ]
+);
+
+/// Drops a workspace relocation at each of its suspensions and compacts
+/// immediately, while the dropped relocation may still own the provider
+/// exchange. Claude used to admit that compaction during `set_cwd`, whose
+/// empty `result` frame then retired it as a protocol failure. Then drops
+/// a compaction request at each of its suspensions and requires a probe
+/// turn and another compaction to succeed; a request that finishes first
+/// is followed to its result. Codex used to reserve the compaction in one
+/// transition and dispatch it after, so a caller dropped between them left
+/// a reservation that refused every later turn.
+async fn real_cancelled_relocation_then_compaction<B: Backend>(host: &mut Harness<B>) {
+    let destination = tempfile::Builder::new()
+        .prefix("tyde-cancelled-relocation-compaction-")
+        .tempdir_in("/tmp")
+        .expect("destination workspaces");
+    let targets = ["a", "b"].map(|name| {
+        let root = destination.path().join(name);
+        std::fs::create_dir(&root).expect("create destination root");
+        std::fs::write(root.join("README.txt"), "tyde conformance workspace")
+            .expect("seed destination root");
+        vec![root.to_str().expect("UTF-8 root").to_owned()]
+    });
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mut attempts = 0;
+    for point in [CancelPoint::BeforeOwnerRuns, CancelPoint::AfterWake] {
+        for boundary in 0.. {
+            let roots = targets[attempts % targets.len()].clone();
+            attempts += 1;
+            let outcome = cancel_relocation_at(host, roots, boundary, point).await;
+            eprintln!(
+                "CANCEL BOUNDARY op=relocation-compaction point={point:?} boundary={boundary} completed={}",
+                outcome.is_some()
+            );
+            let Some(outcome) = outcome else {
+                assert_compaction_completed_once(&compact(host, &agent).await);
+                // The next compaction needs a turn after this one to compact.
+                probe_admission(host, &agent, &format!("TYDE_ADMITTED_{attempts}")).await;
+                continue;
+            };
+            assert!(
+                outcome.is_ok(),
+                "{:?}: an idle session refused a workspace relocation: {}",
+                host.backend(),
+                outcome.as_ref().err().map_or("ok", |error| error.kind())
+            );
+            break;
+        }
+    }
+    for point in [CancelPoint::BeforeOwnerRuns, CancelPoint::AfterWake] {
+        for boundary in 0.. {
+            attempts += 1;
+            let outcome = cancel_compaction_at(host, boundary, point).await;
+            eprintln!(
+                "CANCEL BOUNDARY op=compaction point={point:?} boundary={boundary} completed={}",
+                outcome.is_some()
+            );
+            if let Some(outcome) = outcome {
+                let server::backend::compaction::BackendCompactionStart::Accepted(accepted) =
+                    outcome
+                else {
+                    panic!(
+                        "{:?}: an idle session did not accept a compaction",
+                        host.backend()
+                    );
+                };
+                // The caller that kept its compaction owns it to the end.
+                assert_compaction_completed_once(
+                    &finish_compaction(host, &agent, accepted, Vec::new()).await,
+                );
+                probe_admission(host, &agent, &format!("TYDE_COMPACTED_{attempts}")).await;
+                break;
+            }
+            // A compaction needs a turn after the previous one to compact.
+            probe_admission(host, &agent, &format!("TYDE_ADMITTED_{attempts}")).await;
+            assert_compaction_completed_once(&compact(host, &agent).await);
+            probe_admission(host, &agent, &format!("TYDE_COMPACTED_{attempts}")).await;
+        }
+    }
+    assert_clean_close(host, &agent).await;
+}
+
 conformance2_scenario!(
     real_workspace_relocation,
     [BackendCapability::SetWorkspaceRoots]
@@ -12633,7 +12989,15 @@ async fn real_plan_approval<B: Backend>(host: &mut Harness<B>) {
     );
     assert!(
         matches!(&request.tool_type, ToolRequestType::ExitPlanMode { plan, plan_path } if plan.as_ref().is_some_and(|plan| !plan.trim().is_empty()) || plan_path.as_ref().is_some_and(|path| !path.trim().is_empty())),
-        "approval request omitted the plan: {request:?}"
+        "approval request omitted the plan: {}",
+        match &request.tool_type {
+            ToolRequestType::ExitPlanMode { plan, plan_path } => format!(
+                "plan present: {}, plan path present: {}",
+                plan.is_some(),
+                plan_path.is_some()
+            ),
+            _ => "not an ExitPlanMode request".to_owned(),
+        }
     );
     assert!(
         !planned
@@ -12642,6 +13006,7 @@ async fn real_plan_approval<B: Backend>(host: &mut Harness<B>) {
         "approval card completed while still awaiting the user"
     );
     let approved = approve_plan(host, &agent, &request.tool_call_id).await;
+    assert_answer_has_no_user_echo(&approved);
     let completions = approved
         .tool_completions()
         .filter(|completion| completion.tool_call_id == request.tool_call_id)

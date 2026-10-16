@@ -2999,7 +2999,9 @@ impl HermesSessionActor {
         match input {
             AgentInput::SendMessage(payload) => {
                 if let Some(response) = payload.tool_response.clone() {
-                    self.handle_tool_response(response, payload.message).await;
+                    if let Err(error) = self.handle_tool_response(response, payload.message).await {
+                        self.reject_tool_response(error);
+                    }
                 } else {
                     self.handle_send_message(payload).await;
                 }
@@ -3320,7 +3322,11 @@ impl HermesSessionActor {
         }
     }
 
-    async fn handle_tool_response(&mut self, response: SendMessageToolResponse, message: String) {
+    async fn handle_tool_response(
+        &mut self,
+        response: SendMessageToolResponse,
+        message: String,
+    ) -> Result<(), String> {
         match response {
             SendMessageToolResponse::AskUserQuestion {
                 tool_call_id,
@@ -3328,23 +3334,17 @@ impl HermesSessionActor {
                 ..
             } => {
                 let Some(pending) = self.mapper.pending_clarify.clone() else {
-                    self.emit_error("Hermes received a question response with no pending clarify");
-                    return;
+                    return Err(
+                        "Hermes received a question response with no pending clarify".to_owned(),
+                    );
                 };
                 if pending.tool_call_id != tool_call_id {
-                    self.emit_error(format!(
-                        "Hermes clarify response tool_call_id mismatch: expected {}, got {tool_call_id}",
-                        pending.tool_call_id
-                    ));
-                    return;
+                    return Err(
+                        "Hermes received a question response for a clarify that is not pending"
+                            .to_owned(),
+                    );
                 }
-                let answers = match hermes_clarify_answers(&pending.questions, &answer) {
-                    Ok(answers) => answers,
-                    Err(err) => {
-                        self.emit_error(err);
-                        return;
-                    }
-                };
+                let answers = hermes_clarify_answers(&pending.questions, &answer)?;
                 for (question_id, answer) in answers {
                     let mut params = json!({
                         "session_id": self.live_session_id,
@@ -3354,10 +3354,10 @@ impl HermesSessionActor {
                     if let Some(question_id) = question_id {
                         params["question_id"] = Value::String(question_id);
                     }
-                    if let Err(err) = self.gateway.request("clarify.respond", params).await {
-                        self.emit_error(format!("Hermes clarify.respond failed: {err}"));
-                        return;
-                    }
+                    self.gateway
+                        .request("clarify.respond", params)
+                        .await
+                        .map_err(|err| format!("Hermes clarify.respond failed: {err}"))?;
                 }
                 self.mapper.pending_clarify = None;
                 self.mapper.typing_active = true;
@@ -3369,14 +3369,15 @@ impl HermesSessionActor {
                 feedback: _,
             } => {
                 let Some(pending) = self.mapper.pending_approval_tool_id.clone() else {
-                    self.emit_error("Hermes received approval response with no pending approval");
-                    return;
+                    return Err(
+                        "Hermes received approval response with no pending approval".to_owned()
+                    );
                 };
                 if pending != tool_call_id {
-                    self.emit_error(format!(
-                        "Hermes approval response tool_call_id mismatch: expected {pending}, got {tool_call_id}"
-                    ));
-                    return;
+                    return Err(
+                        "Hermes received an approval response for an approval that is not pending"
+                            .to_owned(),
+                    );
                 }
                 let choice = match decision {
                     protocol::ExitPlanModeDecision::Approve => "once",
@@ -3419,9 +3420,24 @@ impl HermesSessionActor {
                         self.mapper.typing_active = true;
                         self.emit(ChatEvent::TypingStatusChanged(true));
                     }
-                    Err(err) => self.emit_error(format!("Hermes approval.respond failed: {err}")),
+                    Err(err) => return Err(format!("Hermes approval.respond failed: {err}")),
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A rejected response starts no provider work. A running turn keeps its
+    /// own lifecycle; otherwise the rejection is bracketed as its own turn so
+    /// the accepted response settles.
+    fn reject_tool_response(&self, message: String) {
+        let bracketed = !self.mapper.typing_active;
+        if bracketed {
+            self.emit(ChatEvent::TypingStatusChanged(true));
+        }
+        self.emit_error(message);
+        if bracketed {
+            self.emit(ChatEvent::TypingStatusChanged(false));
         }
     }
 

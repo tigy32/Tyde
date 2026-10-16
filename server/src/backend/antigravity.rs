@@ -1334,6 +1334,20 @@ impl Supervisor {
         }
     }
 
+    /// A rejected response starts no provider work. A running turn keeps its
+    /// own lifecycle; otherwise the rejection is bracketed as its own turn so
+    /// the accepted response settles.
+    fn reject_tool_response(&self, message: &str) {
+        let bracketed = self.mapper.is_none();
+        if bracketed {
+            self.inner.emitter.typing_status_changed(true);
+        }
+        self.inner.emitter.backend_error(message);
+        if bracketed {
+            self.inner.emitter.typing_status_changed(false);
+        }
+    }
+
     /// Closes the card the user acted on, so their answer and the transcript
     /// agree, and reports a mismatch rather than silently dropping it.
     async fn answer_question(&mut self, response: protocol::SendMessageToolResponse) -> bool {
@@ -1343,7 +1357,7 @@ impl Supervisor {
             ..
         } = response
         else {
-            self.inner.emitter.backend_error(
+            self.reject_tool_response(
                 "Antigravity received a plan-approval response, which it never requests",
             );
             return false;
@@ -1364,10 +1378,9 @@ impl Supervisor {
             Some(())
         });
         if held.is_none() {
-            self.inner.emitter.backend_error(&format!(
-                "Antigravity received an answer for question {tool_call_id}, which is not waiting \
-                 on one"
-            ));
+            self.reject_tool_response(
+                "Antigravity received an answer for a question that is not waiting on one",
+            );
             return false;
         }
         self.inner.emitter.tool_completed(

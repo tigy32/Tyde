@@ -746,6 +746,10 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     let final_stream = descriptor(&bootstrap.agents, &question_agent)
         .instance_stream
         .clone();
+    let answered_session = descriptor(&bootstrap.agents, &question_agent)
+        .session_id
+        .clone()
+        .expect("answered question agent has a session");
     send_load_agent_on(&mut final_mobile, &final_stream).await;
     let bootstrap: AgentBootstrapPayload =
         next_frame_matching_on(&mut final_mobile, "answered question bootstrap", |env| {
@@ -755,15 +759,82 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .parse_payload()
         .expect("parse answered bootstrap");
     assert_eq!(bootstrap.activity, AgentActivity::Idle);
-    assert_eq!(
-        bootstrap
-            .events
+    let completions = |events: &[protocol::AgentBootstrapEvent]| {
+        events
             .iter()
-            .filter(|event| matches!(event,
+            .filter(|event| {
+                matches!(event,
         protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
-            if completion.tool_call_id == request.tool_call_id))
-            .count(),
-        1
-    );
+            if completion.tool_call_id == request.tool_call_id)
+            })
+            .count()
+    };
+    let answers = |events: &[protocol::AgentBootstrapEvent]| {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+            if matches!(message.sender, protocol::MessageSender::User)
+                && message.content == "GREEN")
+            })
+            .count()
+    };
+    assert_eq!(completions(&bootstrap.events), 1);
+    let reconnect_answers = answers(&bootstrap.events);
     fixture.mock(&question_agent).await.assert_clean().await;
+
+    // Resume rebuilds the card from the journal, not the provider's history.
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("resumed-question".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: answered_session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the answered question session");
+    let resumed: NewAgentPayload = fixture
+        .next_frame_matching("resumed question NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env.parse_payload::<NewAgentPayload>().is_ok_and(|agent| {
+                    agent.session_id.as_ref() == Some(&answered_session)
+                        && agent.agent_id != question_agent.new_agent.agent_id
+                })
+        })
+        .await
+        .parse_payload()
+        .expect("parse resumed question NewAgent");
+    let resumed_stream = resumed.instance_stream.clone();
+    let resumed_bootstrap: AgentBootstrapPayload = fixture
+        .next_frame_matching("resumed question bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == resumed_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse resumed question bootstrap");
+    assert_eq!(
+        completions(&resumed_bootstrap.events),
+        1,
+        "resumed history must keep the answered card's single completion"
+    );
+    assert_eq!(
+        (reconnect_answers, answers(&resumed_bootstrap.events)),
+        (1, 1),
+        "reconnect and resumed replay must each show the typed answer exactly once"
+    );
+    fixture
+        .mock(&TestAgent {
+            stream: resumed_stream,
+            new_agent: resumed,
+        })
+        .await
+        .assert_clean()
+        .await;
 }

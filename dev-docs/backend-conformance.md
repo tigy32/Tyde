@@ -101,6 +101,85 @@ now supplies native trust consent pinned to the validated canonical root,
 under Tyde's policy that its projects are trusted. Conformance must not seed
 that consent on the adapter's behalf.
 
+## Cancelled input
+
+`real_cancelled_send_leaves_session_admissible` and
+`real_cancelled_relocation_leaves_session_admissible` hand-poll
+`send_with_outcome` and `set_workspace_roots` on the current-thread
+conformance runtime. They drop the future at each of its suspensions, either
+before any task it woke has run or after it was woken but before its result
+was observed. No backend task runs between a poll and a `BeforeOwnerRuns` drop,
+so each boundary is deterministic rather than timing-dependent. After every
+attempt, a probe turn must be admitted, answer with its own marker and go
+idle; a busy refusal must be followed by the running turn's idle. An error
+message in the probe, a drained running turn or a completed send's turn
+fails the case. A completed send must be `Accepted` and a
+completed relocation `Ok`. Setup and oracles are identical for every eligible
+backend: all backends for sends, and `SetWorkspaceRoots` providers for
+relocation.
+
+Neither case has a deadline of its own; a hang is caught by the
+`conformance` profile's ten-minute per-test guard.
+
+Both cases establish red coverage for Codex. The red runs used a
+temporary, uncommitted nextest profile that terminated a test after 300
+seconds, so that each run fit within one foreground command; it is not part
+of the cases. With the admission that reserved the root turn before
+enqueueing its message, the send case stopped progressing after `AfterWake`
+at its first suspension: every probe was refused busy and no backend event
+arrived before termination. With the relocation whose in-flight phase was
+set before its guard was armed and whose completion was awaited, the
+relocation case stopped at the `BeforeOwnerRuns` drop of that completion
+with no further backend event. Those runs show no progress for the
+remainder of the 300 seconds, not for the full ten-minute guard, which was
+not rerun. The fixed adapter passes both under the canonical profile.
+
+Runs on 2026-10-16, with the Claude and ACP relocation owners:
+
+| Scenario | Claude | Codex | Hermes | Kiro | Grok | OpenCode | Antigravity | Muse |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `real_cancelled_send_leaves_session_admissible` | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| `real_cancelled_relocation_leaves_session_admissible` | Pass | Pass | Pass | Pass | Pass | Pass | Pass | — |
+
+Muse first failed at spawn because its served MSP schema was unsupported,
+as did the untouched `real_task_list::muse`. After the Muse 1.4.10 host
+support landed, the send case passed on Muse with the current probe and its
+error check.
+
+Before the owners, the relocation case failed on Claude and timed out under
+the ten-minute guard on Grok and OpenCode.
+Claude dropped after writing its `set_cwd` control request but before its
+response. The CLI answers `set_cwd`, then emits an empty `result` frame, then
+answers the `apply_flag_settings` request that follows. The probe turn,
+admitted while that exchange was abandoned, was closed by the empty `result`
+and reported no assistant output. Grok and OpenCode dropped inside the ACP
+bridge's `restart_local`, after the old runtime's readers were aborted but
+before its replacement was installed: the next prompt was admitted and went
+typing, and the provider emitted nothing more.
+
+Both adapters now hand an admitted relocation to an owner task that finishes
+the provider exchange, and the caller only awaits its outcome. Claude holds
+user-turn admission until that task has finished both control requests, and
+refuses another relocation as busy meanwhile. ACP holds the prompt lock in
+the task, so prompts wait for the session reload and another relocation is
+busy. A failure whose caller has stopped waiting is reported as a backend
+error rather than only logged.
+
+After each dropped relocation the case immediately drops a second one at the
+same point, before any probe turn. With Claude's busy check removed, that
+second relocation was admitted alongside the unfinished one and the probe
+reported an error; with it, the extended case passes on Claude, Codex,
+Hermes, Kiro, Grok, OpenCode and Antigravity.
+
+`real_cancelled_relocation_then_compaction`, for backends that also report
+compaction, compacts immediately after each dropped relocation, then runs a
+probe turn. Claude used to admit that compaction during the unfinished
+`set_cwd` exchange, and the relocation then failed with an error. Grok
+deferred it as an active turn while the reload held the prompt lock, and no
+event ever settled it until the ten-minute guard. Compaction now waits for the
+relocation's owner task in both adapters; the case passes on Claude, Codex,
+Hermes and Grok.
+
 ## Typed input origins
 
 `real_mid_turn_steering` passes distinct `MessageOrigin::Tychat` identities in
@@ -200,7 +279,16 @@ provider responses unchanged and requiring native flag evidence. A
 nonblocking question must finish its asking turn before the paused-typing and
 response-closure assertions, and before the unrelated message is sent; a
 blocking question is interrupted first, as in the server's ordinary
-human-input path. The complete flow must emit no protocol violations. The
+human-input path. The answer turn must contain no backend user message: the
+agent actor persists the typed answer once, so a backend echo would render
+the single submission twice (Codex blocking questions once did, live and on
+replay). The flow then resumes the session and answers a fresh question
+through the backend's resume path under the same no-echo assertion;
+`real_plan_approval` applies it to the approval turn. Replay is server-owned:
+resume seeds the card from the authoritative journal and drops provider
+history, so the protocol simulation for late question answers counts the
+answer exactly once in reconnect and resumed bootstraps. The complete flow
+must emit no protocol violations. The
 follow-up must succeed and the old question must have
 exactly one cancelled completion, never an implicit answer. Its completion
 belongs to the earlier question request, not a tool newly started by the

@@ -522,6 +522,17 @@ impl std::fmt::Display for WorkspaceRelocationError {
 
 impl std::error::Error for WorkspaceRelocationError {}
 
+impl WorkspaceRelocationError {
+    /// The outcome class, for diagnostics that must not repeat the message.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Rejected(_) => "rejected",
+            Self::OutcomeUnknown(_) => "outcome_unknown",
+        }
+    }
+}
+
 /// Output stream from a backend session. The agent actor receives both chat
 /// events and backend-only accounting events while independently sending
 /// AgentInput through the Backend handle.

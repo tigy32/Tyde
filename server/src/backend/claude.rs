@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use protocol::{
@@ -191,31 +191,23 @@ impl ClaudeCommandHandle {
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
-        self.inner
-            .state
-            .try_lock()
-            .map(|state| state.compaction_capability.clone())
-            .unwrap_or_else(|_| {
-                BackendCompactionCapability::unknown(
-                    BackendCompactionUnknownReason::CapabilityProbeFailed(
-                        "Claude session state is busy".to_string(),
-                    ),
-                    None,
-                    BackendCompactionCapabilityEvidence::None,
-                )
-            })
+        self.inner.compaction_capability.borrow().clone()
     }
 
     async fn native_tool_catalog(&self) -> Option<NativeToolCatalog> {
-        let state = self.inner.state.lock().await;
-        if state.closing
-            || state
-                .stale_process_generation
-                .is_some_and(|stale| state.process_generation <= stale)
-        {
-            return None;
-        }
-        state.native_tool_catalog.clone()
+        self.inner
+            .state
+            .with(|state| {
+                if state.closing
+                    || state
+                        .stale_process_generation
+                        .is_some_and(|stale| state.process_generation <= stale)
+                {
+                    return None;
+                }
+                state.native_tool_catalog.clone()
+            })
+            .await
     }
 
     async fn begin_compaction(&self, request: BackendCompactionRequest) -> BackendCompactionStart {
@@ -522,13 +514,12 @@ impl ClaudeSession {
             degraded_notice,
         } = mode.skills;
 
-        let inner = Arc::new(ClaudeInner {
-            emitter: Arc::new(TurnEmitter::new_for_agent(
+        let inner = ClaudeInner::new(
+            Arc::new(TurnEmitter::new_for_agent(
                 event_tx,
                 AgentName(CLAUDE_AGENT_NAME),
             )),
-            active_response: StdMutex::new(None),
-            state: Mutex::new(ClaudeState {
+            ClaudeState {
                 program: None,
                 native_models: None,
                 native_tool_catalog: None,
@@ -559,11 +550,12 @@ impl ClaudeSession {
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
                 active_turn: None,
-                compaction_capability: BackendCompactionCapability::unknown(
+                compaction_capability: watch::channel(BackendCompactionCapability::unknown(
                     BackendCompactionUnknownReason::ProcessNotInitialized,
                     None,
                     BackendCompactionCapabilityEvidence::None,
-                ),
+                ))
+                .0,
                 compact_command_advertised: None,
                 initialize_slash_commands: None,
                 init_slash_commands: None,
@@ -581,19 +573,13 @@ impl ClaudeSession {
                 capacity_refresh_in_flight: false,
                 capacity_report_emitted: false,
                 authoritative_capacity_emitted: false,
-            }),
-            runtime: Mutex::new(None),
-            turn_event_gate: Mutex::new(()),
-            task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-            background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
-            native_subagent_tasks: StdMutex::new(HashSet::new()),
-            skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
-            skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
-            pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-            pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
-            background_work_active: std::sync::atomic::AtomicBool::new(false),
-            typing_active: std::sync::atomic::AtomicBool::new(false),
-        });
+                runtime: None,
+                control_waiters: HashMap::new(),
+                workspace_relocation_in_flight: false,
+                spawns_reserved: 0,
+                caller_turn_jobs: 0,
+            },
+        );
 
         // Armed through the same call every other caller uses, immediately after
         // construction and long before any prompt can be written. Setting the
@@ -612,8 +598,10 @@ impl ClaudeSession {
     }
 
     pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        let mut state = self.inner.state.lock().await;
-        state.subagent_emitter = Some(emitter);
+        self.inner
+            .state
+            .with(move |state| state.subagent_emitter = Some(emitter))
+            .await;
     }
 
     pub fn command_handle(&self) -> ClaudeCommandHandle {
@@ -624,15 +612,21 @@ impl ClaudeSession {
 
     async fn seed_installed_provider_version(&self, provider_version: Option<String>) {
         let provider_version = provider_version.and_then(|version| normalize_nonempty(&version));
-        let mut state = self.inner.state.lock().await;
-        state.installed_provider_version = provider_version.clone();
-        state.provider_version = provider_version;
-        if state.compact_command_advertised.is_some() {
-            state.compaction_capability = claude_compaction_capability(
-                state.compact_command_advertised,
-                state.provider_version.as_deref(),
-            );
-        }
+        self.inner
+            .state
+            .with(move |state| {
+                state.installed_provider_version = provider_version.clone();
+                state.provider_version = provider_version;
+                if state.compact_command_advertised.is_some() {
+                    state
+                        .compaction_capability
+                        .send_replace(claude_compaction_capability(
+                            state.compact_command_advertised,
+                            state.provider_version.as_deref(),
+                        ));
+                }
+            })
+            .await;
     }
 
     pub async fn shutdown(self) {
@@ -666,7 +660,7 @@ struct PendingClaudeCompaction {
     turn_id: u64,
     process_generation: u64,
     dispatched_at: std::time::Instant,
-    write_completed: bool,
+    write_submitted: bool,
     boundary: Option<ClaudeCompactionBoundary>,
     compact_result: Option<String>,
     compact_error: Option<String>,
@@ -688,6 +682,16 @@ struct ClaudeCompactionBoundary {
 enum ClaudeSendAdmission {
     Handled,
     Busy,
+}
+
+/// How an answer to a pending user prompt ended. A failed write leaves the
+/// process teardown to the caller, which also delivers any taken outcome.
+enum ClaudeAnswered {
+    Settled(Result<bool, String>),
+    WriteFailed {
+        error: String,
+        outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
+    },
 }
 
 #[derive(Clone)]
@@ -785,7 +789,7 @@ struct ClaudeState {
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
     active_turn: Option<ActiveTurn>,
-    compaction_capability: BackendCompactionCapability,
+    compaction_capability: watch::Sender<BackendCompactionCapability>,
     compact_command_advertised: Option<bool>,
     /// Every command the `initialize` response described, with descriptions
     /// and argument hints. The `init` frame later says which are terminal-bound.
@@ -812,6 +816,20 @@ struct ClaudeState {
     capacity_refresh_in_flight: bool,
     capacity_report_emitted: bool,
     authoritative_capacity_emitted: bool,
+    runtime: Option<ClaudeProcessRuntime>,
+    control_waiters: HashMap<String, ClaudeControlWaiter>,
+    /// True from a workspace relocation's admission until its owner task has
+    /// finished the CLI exchange. `set_cwd` ends with an empty `result` frame,
+    /// so a user or compaction turn admitted meanwhile would be closed by it.
+    workspace_relocation_in_flight: bool,
+    /// Process starts admitted but not yet installed or abandoned. Turn jobs
+    /// are not admitted meanwhile, because the reader that must order them
+    /// exists before its runtime is reachable.
+    spawns_reserved: usize,
+    /// Turn jobs running on their callers because no reader was live. A
+    /// process start is not admitted meanwhile, so its reader cannot handle
+    /// frames concurrently with them.
+    caller_turn_jobs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -853,11 +871,12 @@ impl Default for ClaudeState {
             cumulative_usage: None,
             cumulative_usage_complete: true,
             active_turn: None,
-            compaction_capability: BackendCompactionCapability::unknown(
+            compaction_capability: watch::channel(BackendCompactionCapability::unknown(
                 BackendCompactionUnknownReason::ProcessNotInitialized,
                 None,
                 BackendCompactionCapabilityEvidence::None,
-            ),
+            ))
+            .0,
             compact_command_advertised: None,
             initialize_slash_commands: None,
             init_slash_commands: None,
@@ -875,6 +894,11 @@ impl Default for ClaudeState {
             capacity_refresh_in_flight: false,
             capacity_report_emitted: false,
             authoritative_capacity_emitted: false,
+            runtime: None,
+            control_waiters: HashMap::new(),
+            workspace_relocation_in_flight: false,
+            spawns_reserved: 0,
+            caller_turn_jobs: 0,
         }
     }
 }
@@ -893,9 +917,9 @@ struct ClaudeInner {
     /// through here; there is no raw `event_tx` fallback.
     emitter: Arc<TurnEmitter>,
     active_response: StdMutex<Option<(String, ResponseHandle)>>,
-    state: Mutex<ClaudeState>,
-    runtime: Mutex<Option<ClaudeProcessRuntime>>,
-    turn_event_gate: Mutex<()>,
+    state: ClaudeStateActor,
+    /// Published by the state owner; read by the synchronous capability probe.
+    compaction_capability: watch::Receiver<BackendCompactionCapability>,
     task_tracker: StdMutex<ClaudeTaskTracker>,
     background_tasks: StdMutex<BackgroundTaskRegistry>,
     native_subagent_tasks: StdMutex<HashSet<String>>,
@@ -930,6 +954,277 @@ struct ClaudeInner {
     background_work_active: std::sync::atomic::AtomicBool,
     typing_active: std::sync::atomic::AtomicBool,
 }
+
+impl ClaudeInner {
+    fn new(emitter: Arc<TurnEmitter>, state: ClaudeState) -> Arc<Self> {
+        let compaction_capability = state.compaction_capability.subscribe();
+        Arc::new_cyclic(|inner| Self {
+            emitter,
+            active_response: StdMutex::new(None),
+            state: ClaudeStateActor::spawn(state, inner.clone()),
+            compaction_capability,
+            task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
+            native_subagent_tasks: StdMutex::new(HashSet::new()),
+            skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+            skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+            pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+            pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
+            background_work_active: std::sync::atomic::AtomicBool::new(false),
+            typing_active: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+type ClaudeStateChange = Box<dyn FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) + Send>;
+
+enum ClaudeStateTransition {
+    Now(ClaudeStateChange),
+    Held(ClaudeHold, ClaudeStateChange),
+}
+
+/// What a held transition waits out before it runs.
+#[derive(Clone, Copy)]
+enum ClaudeHold {
+    /// Starts provider work, so it must not interleave with a workspace
+    /// relocation whose `set_cwd` exchange is still unresolved: that exchange
+    /// ends with an empty `result` frame that would close the new turn.
+    Relocation,
+    /// Admits a process start, whose reader must not overlap a turn job
+    /// running on its caller.
+    CallerTurnJobs,
+    /// Admits a turn job, which must wait for a reserved process start to
+    /// install the reader that will run it.
+    SpawnsReserved,
+}
+
+impl ClaudeHold {
+    fn holds(self, state: &ClaudeState) -> bool {
+        match self {
+            Self::Relocation => state.workspace_relocation_in_flight,
+            Self::CallerTurnJobs => state.caller_turn_jobs > 0,
+            Self::SpawnsReserved => state.spawns_reserved > 0,
+        }
+    }
+}
+
+/// Sole owner of the adapter state, including the live process runtime and
+/// its control waiters. Every read or change is one synchronous transition
+/// run on the owner task, so no caller can keep the state across an await and
+/// combined checks stay atomic. Transitions see the adapter they belong to so
+/// emissions that must stay ordered with a state change happen inside it.
+#[derive(Clone)]
+struct ClaudeStateActor {
+    transitions: mpsc::UnboundedSender<ClaudeStateTransition>,
+}
+
+impl ClaudeStateActor {
+    fn spawn(mut state: ClaudeState, inner: std::sync::Weak<ClaudeInner>) -> Self {
+        let (transitions, mut inbox) = mpsc::unbounded_channel::<ClaudeStateTransition>();
+        crate::backend::subprocess::spawn(async move {
+            let mut held = VecDeque::new();
+            while let Some(transition) = inbox.recv().await {
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                match transition {
+                    ClaudeStateTransition::Now(change) => change(&mut state, &inner),
+                    ClaudeStateTransition::Held(hold, change) => held.push_back((hold, change)),
+                }
+                while let Some(index) = held.iter().position(|(hold, _)| !hold.holds(&state)) {
+                    let (_, change) = held
+                        .remove(index)
+                        .expect("released Claude transition is held");
+                    change(&mut state, &inner);
+                }
+            }
+        });
+        Self { transitions }
+    }
+
+    async fn with<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut ClaudeState) -> R + Send + 'static,
+    ) -> R {
+        self.run(None, move |state, _| transition(state)).await
+    }
+
+    async fn with_inner<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) -> R + Send + 'static,
+    ) -> R {
+        self.run(None, transition).await
+    }
+
+    async fn with_after_relocation<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) -> R + Send + 'static,
+    ) -> R {
+        self.run(Some(ClaudeHold::Relocation), transition).await
+    }
+
+    async fn with_after<R: Send + 'static>(
+        &self,
+        hold: ClaudeHold,
+        transition: impl FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) -> R + Send + 'static,
+    ) -> R {
+        self.run(Some(hold), transition).await
+    }
+
+    fn apply(&self, change: impl FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) + Send + 'static) {
+        let _ = self
+            .transitions
+            .send(ClaudeStateTransition::Now(Box::new(change)));
+    }
+
+    async fn run<R: Send + 'static>(
+        &self,
+        hold: Option<ClaudeHold>,
+        transition: impl FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) -> R + Send + 'static,
+    ) -> R {
+        let (reply, result) = oneshot::channel();
+        let change: ClaudeStateChange = Box::new(move |state, inner| {
+            if reply.is_closed() {
+                return;
+            }
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transition(state, inner)));
+            let _ = reply.send(outcome);
+        });
+        let transition = match hold {
+            Some(hold) => ClaudeStateTransition::Held(hold, change),
+            None => ClaudeStateTransition::Now(change),
+        };
+        self.transitions
+            .send(transition)
+            .unwrap_or_else(|_| panic!("Claude state owner stopped while its adapter is live"));
+        match result.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("Claude state owner dropped a transition"),
+        }
+    }
+}
+
+/// Ends a relocation phase however its owner task ends. Created only by the
+/// admitting transition and handed out through its reply, so a caller
+/// cancelled before receiving it still drops it.
+struct ClaudeWorkspaceRelocation {
+    state: ClaudeStateActor,
+}
+
+impl Drop for ClaudeWorkspaceRelocation {
+    fn drop(&mut self) {
+        self.state
+            .apply(|state, _| state.workspace_relocation_in_flight = false);
+    }
+}
+
+/// A process start admitted but not yet installed. Created by the admitting
+/// transition and returned through its reply, so a start abandoned at any
+/// point stops holding back turn jobs.
+struct ClaudeSpawnReservation {
+    state: Option<ClaudeStateActor>,
+}
+
+impl ClaudeSpawnReservation {
+    /// Ends the reservation inside the transition that installs or discards
+    /// its runtime, so no turn job is admitted between the two.
+    fn release(mut self, state: &mut ClaudeState) {
+        self.state = None;
+        state.spawns_reserved -= 1;
+    }
+}
+
+impl Drop for ClaudeSpawnReservation {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.apply(|state, _| state.spawns_reserved -= 1);
+        }
+    }
+}
+
+/// A turn job admitted to run on its caller. Created by the admitting
+/// transition and returned through its reply, so a caller dropped at any
+/// point stops holding back process starts.
+struct ClaudeCallerTurnJob {
+    state: ClaudeStateActor,
+}
+
+impl Drop for ClaudeCallerTurnJob {
+    fn drop(&mut self) {
+        self.state.apply(|state, _| state.caller_turn_jobs -= 1);
+    }
+}
+
+/// A turn job that started on a reader torn down before it finished. Its
+/// effects may be partly applied, so it is never offered again.
+struct ClaudeTurnJobAbandoned;
+
+/// A compaction turn reserved but not yet written. Created by the admitting
+/// transition and returned through its reply, so a reservation that never
+/// reaches its dispatcher is released rather than left blocking every turn.
+struct ClaudeCompactionReservation {
+    state: Option<ClaudeStateActor>,
+    turn_id: u64,
+}
+
+impl ClaudeCompactionReservation {
+    async fn abandon(mut self) {
+        let turn_id = self.turn_id;
+        if let Some(state) = self.state.take() {
+            let waiters = state
+                .with(move |state| take_undispatched_compaction(state, turn_id))
+                .await;
+            notify_turn_quiesced(waiters);
+        }
+    }
+
+    fn disarm(mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for ClaudeCompactionReservation {
+    fn drop(&mut self) {
+        let turn_id = self.turn_id;
+        if let Some(state) = self.state.take() {
+            state.apply(move |state, _| {
+                notify_turn_quiesced(take_undispatched_compaction(state, turn_id));
+            });
+        }
+    }
+}
+
+fn take_undispatched_compaction(state: &mut ClaudeState, turn_id: u64) -> Vec<oneshot::Sender<()>> {
+    if state
+        .pending_compaction
+        .as_ref()
+        .is_some_and(|pending| pending.turn_id == turn_id)
+    {
+        state.pending_compaction.take();
+    }
+    match state.active_turn.as_ref() {
+        Some(active)
+            if active.id == turn_id && matches!(active.owner, ClaudeTurnOwner::Compaction(_)) =>
+        {
+            state
+                .active_turn
+                .take()
+                .map(|active| active.quiesced_waiters)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Work that must not interleave with the stdout reader's handling of a
+/// frame. The reader runs these between frames, so it is the sole owner of
+/// turn-event ordering for its process.
+type ClaudeTurnJob = Box<
+    dyn FnOnce(Arc<ClaudeInner>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send,
+>;
 
 struct BackgroundTaskRegistry {
     owner_active: bool,
@@ -982,14 +1277,19 @@ enum ClaudeSkillReadiness {
 
 struct ClaudeProcessRuntime {
     generation: u64,
-    stdin: Arc<Mutex<ChildStdin>>,
-    child: Arc<Mutex<Option<AsyncGroupChild>>>,
-    control_waiters: ClaudeControlWaiters,
+    stdin: ClaudeStdinWriter,
+    child: Option<AsyncGroupChild>,
+    turn_jobs: mpsc::UnboundedSender<ClaudeTurnJob>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
 }
 
-type ClaudeControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+/// A caller waiting on the CLI's answer to a control request it wrote to the
+/// process of `generation`; only that process's reader may resolve it.
+struct ClaudeControlWaiter {
+    generation: u64,
+    reply: oneshot::Sender<Result<Value, String>>,
+}
 
 impl ClaudeProcessRuntime {
     /// Tear the process down.
@@ -1004,15 +1304,12 @@ impl ClaudeProcessRuntime {
     /// The group, not just the child: `claude` can exit while a provider-owned
     /// background command it spawned is still in its process group, so signalling
     /// the group is what actually guarantees no descendant survives the session.
-    async fn kill(self) {
-        let mut child = self.child.lock().await;
-        if let Some(child) = child.as_mut() {
+    async fn kill(mut self) {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
-        *child = None;
-        drop(child);
-        self.stdout_task.abort();
-        self.stderr_task.abort();
+        self.stdin.close().await;
+        self.abort_readers();
     }
 
     fn abort_readers(&self) {
@@ -1026,10 +1323,10 @@ impl Drop for ClaudeProcessRuntime {
     /// on both real leak paths:
     ///
     /// - Process self-exit (the dominant leak): the stdout reader hits EOF and
-    ///   calls `mark_process_exited`, which `take()`s the runtime out of its
-    ///   slot in `ClaudeInner`; the taken runtime then drops here. (It does NOT
-    ///   wait for the `Arc<ClaudeInner>` cycle to resolve, so it fires promptly
-    ///   even while other tasks still hold `ClaudeInner`.) The detached reaper
+    ///   calls `mark_process_exited`, which `take()`s the runtime out of the
+    ///   state owner; the taken runtime then drops here. (It does NOT wait for
+    ///   the `Arc<ClaudeInner>` cycle to resolve, so it fires promptly even
+    ///   while other tasks still hold `ClaudeInner`.) The detached reaper
     ///   `wait()`s the child, fixing the case where the old bare `try_wait`
     ///   raced the not-yet-reaped child and left a zombie.
     /// - Client disconnect / teardown: `shutdown()` → `shutdown_process()` →
@@ -1040,8 +1337,122 @@ impl Drop for ClaudeProcessRuntime {
     fn drop(&mut self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
-        crate::backend::subprocess::reap_group_child_slot(&self.child);
+        if let Some(child) = self.child.take() {
+            crate::backend::subprocess::reap_group_child(child);
+        }
     }
+}
+
+const CLAUDE_STDIN_CLOSED: &str = "Claude CLI stdin is closed";
+
+struct ClaudeStdinWrite {
+    line: String,
+    written: oneshot::Sender<Result<(), String>>,
+}
+
+/// Sole owner of the CLI's stdin. Frames are written whole, in the order they
+/// were submitted; a close drops stdin even while a write is blocked on a full
+/// pipe, so teardown never waits behind the child.
+#[derive(Clone)]
+struct ClaudeStdinWriter {
+    writes: mpsc::UnboundedSender<ClaudeStdinWrite>,
+    closes: mpsc::UnboundedSender<oneshot::Sender<()>>,
+}
+
+/// The pending result of one submitted frame.
+struct ClaudeStdinWritten(oneshot::Receiver<Result<(), String>>);
+
+impl ClaudeStdinWritten {
+    async fn result(self) -> Result<(), String> {
+        self.0
+            .await
+            .unwrap_or_else(|_| Err(CLAUDE_STDIN_CLOSED.to_owned()))
+    }
+}
+
+impl ClaudeStdinWriter {
+    fn spawn(stdin: ChildStdin) -> Self {
+        let (writes, write_rx) = mpsc::unbounded_channel();
+        let (closes, close_rx) = mpsc::unbounded_channel();
+        crate::backend::subprocess::spawn(run_claude_stdin_writer(stdin, write_rx, close_rx));
+        Self { writes, closes }
+    }
+
+    /// Queues one frame without waiting for it, so a state transition can fix
+    /// the frame's order against every other write.
+    fn submit(&self, value: &Value) -> ClaudeStdinWritten {
+        let (written, result) = oneshot::channel();
+        match serde_json::to_string(value) {
+            Ok(line) => {
+                let _ = self.writes.send(ClaudeStdinWrite { line, written });
+            }
+            Err(err) => {
+                let _ = written.send(Err(format!("Failed to encode Claude input payload: {err}")));
+            }
+        }
+        ClaudeStdinWritten(result)
+    }
+
+    async fn write_json_line(&self, value: &Value) -> Result<(), String> {
+        self.submit(value).result().await
+    }
+
+    async fn close(&self) {
+        let (closed, done) = oneshot::channel();
+        if self.closes.send(closed).is_ok() {
+            let _ = done.await;
+        }
+    }
+}
+
+async fn run_claude_stdin_writer(
+    mut stdin: ChildStdin,
+    mut writes: mpsc::UnboundedReceiver<ClaudeStdinWrite>,
+    mut closes: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+) {
+    let closed = loop {
+        let write = tokio::select! {
+            biased;
+            closed = closes.recv() => break closed,
+            write = writes.recv() => match write {
+                Some(write) => write,
+                None => break None,
+            },
+        };
+        tokio::select! {
+            biased;
+            closed = closes.recv() => {
+                let _ = write.written.send(Err(CLAUDE_STDIN_CLOSED.to_owned()));
+                break closed;
+            }
+            result = write_claude_stdin_line(&mut stdin, &write.line) => {
+                let _ = write.written.send(result);
+            }
+        }
+    };
+    drop(stdin);
+    writes.close();
+    if let Some(closed) = closed {
+        let _ = closed.send(());
+    }
+    while let Ok(closed) = closes.try_recv() {
+        let _ = closed.send(());
+    }
+}
+
+async fn write_claude_stdin_line(stdin: &mut ChildStdin, line: &str) -> Result<(), String> {
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|err| format!("Failed to write Claude input: {err}"))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|err| format!("Failed to finalize Claude input: {err}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|err| format!("Failed to flush Claude input: {err}"))
 }
 
 struct ClaudeResumeStartupGuard {
@@ -2032,10 +2443,10 @@ impl ClaudeInner {
             }
             SessionCommand::ListModels => {
                 this.ensure_process_ready().await?;
-                let state = this.state.lock().await;
-                let models = state
-                    .native_models
-                    .as_ref()
+                let models = this
+                    .state
+                    .with(|state| state.native_models.clone())
+                    .await
                     .ok_or("Claude model catalog unavailable")?;
                 this.emitter.models_list(
                     models
@@ -2071,52 +2482,58 @@ impl ClaudeInner {
                             _ => Err("Claude speed must be standard, fast, or null".to_owned()),
                         })
                         .transpose()?;
-                    let mut state = this.state.lock().await;
-                    if let Some(next) = speed_update {
-                        changed_process_setting |= state.fast_mode != next;
-                        state.fast_mode = next;
-                    }
-                    if let Some(model_value) = obj.get("model") {
-                        let next = normalize_optional_string(model_value);
-                        changed_process_setting |= state.model != next;
-                        state.model = next;
-                    }
-
-                    if let Some(next) = effort_update {
-                        changed_process_setting |= state.effort != next;
-                        state.effort = next;
-                    }
-
-                    if let Some(permission_mode_value) = obj
-                        .get("permission_mode")
-                        .or_else(|| obj.get("permissionMode"))
-                        .or_else(|| obj.get("approval_policy"))
-                    {
-                        if state.access_mode == BackendAccessMode::EnforcedReadOnly {
-                            if !matches!(permission_mode_value.as_str(), Some("dontAsk")) {
-                                return Err(
-                                    "Cannot change permissions under enforced read-only access"
-                                        .to_owned(),
-                                );
+                    let obj = obj.clone();
+                    changed_process_setting = this
+                        .state
+                        .with(move |state| {
+                            let mut changed_process_setting = false;
+                            if let Some(next) = speed_update {
+                                changed_process_setting |= state.fast_mode != next;
+                                state.fast_mode = next;
                             }
-                        } else if permission_mode_value.is_null() {
-                            changed_process_setting |= state.permission_mode.is_some();
-                            state.permission_mode = None;
-                        } else if let Some(permission_mode) =
-                            normalize_claude_permission_mode(permission_mode_value)
-                        {
-                            changed_process_setting |=
-                                state.permission_mode.as_deref() != Some(permission_mode.as_str());
-                            state.permission_mode = Some(permission_mode);
-                        }
-                    }
+                            if let Some(model_value) = obj.get("model") {
+                                let next = normalize_optional_string(model_value);
+                                changed_process_setting |= state.model != next;
+                                state.model = next;
+                            }
 
-                    if changed_process_setting {
-                        state.stale_process_generation = Some(state.process_generation);
-                    }
+                            if let Some(next) = effort_update {
+                                changed_process_setting |= state.effort != next;
+                                state.effort = next;
+                            }
+
+                            if let Some(permission_mode_value) = obj
+                                .get("permission_mode")
+                                .or_else(|| obj.get("permissionMode"))
+                                .or_else(|| obj.get("approval_policy"))
+                            {
+                                if state.access_mode == BackendAccessMode::EnforcedReadOnly {
+                                    if !matches!(permission_mode_value.as_str(), Some("dontAsk")) {
+                                        return Err(
+                                            "Cannot change permissions under enforced read-only access"
+                                                .to_owned(),
+                                        );
+                                    }
+                                } else if permission_mode_value.is_null() {
+                                    changed_process_setting |= state.permission_mode.is_some();
+                                    state.permission_mode = None;
+                                } else if let Some(permission_mode) =
+                                    normalize_claude_permission_mode(permission_mode_value)
+                                {
+                                    changed_process_setting |=
+                                        state.permission_mode.as_deref() != Some(permission_mode.as_str());
+                                    state.permission_mode = Some(permission_mode);
+                                }
+                            }
+                            if changed_process_setting {
+                                state.stale_process_generation = Some(state.process_generation);
+                            }
+                            Ok::<_, String>(changed_process_setting)
+                        })
+                        .await?;
                 }
                 if changed_process_setting {
-                    let idle = this.state.lock().await.active_turn.is_none();
+                    let idle = this.state.with(|state| state.active_turn.is_none()).await;
                     if idle {
                         this.retire_stale_process().await;
                     }
@@ -2141,7 +2558,7 @@ impl ClaudeInner {
             {
                 return Ok(ClaudeSendAdmission::Handled);
             }
-            this.emit_error("No matching pending tool request is waiting for that response.");
+            this.reject_unmatched_tool_response().await;
             return Ok(ClaudeSendAdmission::Handled);
         }
 
@@ -2158,85 +2575,93 @@ impl ClaudeInner {
         origin: Option<protocol::MessageOrigin>,
     ) -> ClaudeSendAdmission {
         let images = images.unwrap_or_default();
-        let (turn_id, model_hint, ephemeral, outcome_rx) = {
-            let mut state = self.state.lock().await;
-            if state.closing {
-                drop(state);
-                self.emit_error("Claude backend is shutting down; the message was not sent.");
-                return ClaudeSendAdmission::Handled;
-            }
-            if state.active_turn.is_some() {
-                return ClaudeSendAdmission::Busy;
-            }
-
-            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (outcome_tx, outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                prompt_written: false,
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            (turn_id, state.model.clone(), state.ephemeral, outcome_rx)
-        };
-        // A steer token only covers a turn the CLI opens before the next user
-        // turn; past this point it could only adopt a stray frame.
-        self.take_pending_steer_turn();
-
-        // The user bubble is emitted only once the turn is admitted, so a
-        // busy hand-back (which redispatches later) can never duplicate it and
-        // the chat never shows a message that was not delivered.
-        if origin != Some(protocol::MessageOrigin::HostRestart) {
-            self.emit_user_message_added(
-                &message,
-                (!images.is_empty()).then_some(images.as_slice()),
-                origin,
-            );
-        }
-        let message_id = format!("claude-msg-{turn_id}");
-        self.emit_typing_status(true);
-        self.emit_stream_start(&message_id, model_hint.clone());
-
-        crate::backend::subprocess::spawn(async move {
-            match self
-                .write_turn_to_persistent_process(turn_id, &message, &images)
-                .await
-            {
-                Ok(()) => {}
-                Err(TurnStartError::Cancelled) => {
-                    self.complete_active_turn_with_outcome(
-                        turn_id,
-                        TurnOutcome::Cancelled {
-                            summary: ClaudeStdoutSummary::default(),
-                        },
-                    )
-                    .await;
+        // Admission, the user-visible start, and the turn task's launch are one
+        // transition: a caller dropped after it cannot strand the reservation,
+        // and nothing can observe the turn before its start events.
+        self.state
+            .with_after_relocation(move |state, inner| {
+                if state.closing {
+                    inner.emit_error("Claude backend is shutting down; the message was not sent.");
+                    return ClaudeSendAdmission::Handled;
                 }
-                Err(TurnStartError::Failed(error)) => {
-                    self.complete_active_turn_with_outcome(
-                        turn_id,
-                        TurnOutcome::Failed {
-                            summary: ClaudeStdoutSummary::default(),
-                            error,
-                        },
-                    )
-                    .await;
+                if state.active_turn.is_some() {
+                    return ClaudeSendAdmission::Busy;
                 }
-            }
 
-            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-                summary: ClaudeStdoutSummary::default(),
-                error: "Claude turn ended before returning a result".to_string(),
-            });
+                let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let (outcome_tx, outcome_rx) = oneshot::channel();
+                state.active_turn = Some(ActiveTurn {
+                    id: turn_id,
+                    owner: ClaudeTurnOwner::User,
+                    outcome_tx: Some(outcome_tx),
+                    prompt_written: false,
+                    interrupt_requested: false,
+                    pending_ask_user_question: None,
+                    pending_exit_plan_mode: None,
+                    quiesced_waiters: Vec::new(),
+                });
+                let model_hint = state.model.clone();
+                let ephemeral = state.ephemeral;
+                // A steer token only covers a turn the CLI opens before the next user
+                // turn; past this point it could only adopt a stray frame.
+                inner.take_pending_steer_turn();
 
-            self.finalize_turn(turn_id, outcome, ephemeral, model_hint)
-                .await;
-        });
-        ClaudeSendAdmission::Handled
+                // The user bubble is emitted only once the turn is admitted, so a
+                // busy hand-back (which redispatches later) can never duplicate it and
+                // the chat never shows a message that was not delivered.
+                if origin != Some(protocol::MessageOrigin::HostRestart) {
+                    inner.emit_user_message_added(
+                        &message,
+                        (!images.is_empty()).then_some(images.as_slice()),
+                        origin,
+                    );
+                }
+                let message_id = format!("claude-msg-{turn_id}");
+                inner.emit_typing_status(true);
+                inner.emit_stream_start(&message_id, model_hint.clone());
+
+                let inner = Arc::clone(inner);
+                crate::backend::subprocess::spawn(async move {
+                    match inner
+                        .write_turn_to_persistent_process(turn_id, &message, &images)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(TurnStartError::Cancelled) => {
+                            inner
+                                .complete_active_turn_with_outcome(
+                                    turn_id,
+                                    TurnOutcome::Cancelled {
+                                        summary: ClaudeStdoutSummary::default(),
+                                    },
+                                )
+                                .await;
+                        }
+                        Err(TurnStartError::Failed(error)) => {
+                            inner
+                                .complete_active_turn_with_outcome(
+                                    turn_id,
+                                    TurnOutcome::Failed {
+                                        summary: ClaudeStdoutSummary::default(),
+                                        error,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+
+                    let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                        summary: ClaudeStdoutSummary::default(),
+                        error: "Claude turn ended before returning a result".to_string(),
+                    });
+
+                    inner
+                        .finalize_turn(turn_id, outcome, ephemeral, model_hint)
+                        .await;
+                });
+                ClaudeSendAdmission::Handled
+            })
+            .await
     }
 
     /// Offer a user message to the turn that is already running. The CLI reads
@@ -2251,55 +2676,58 @@ impl ClaudeInner {
         if payload.tool_response.is_some() {
             return SteerOutcome::Unsupported(payload);
         }
-        let stdin = {
-            let runtime = self.runtime.lock().await;
-            runtime.as_ref().map(|runtime| Arc::clone(&runtime.stdin))
+        // The checks, the token, and the frame's place in stdin are fixed in
+        // one transition, so neither an interrupt nor a blocking tool request
+        // can slip in between the checks and the write.
+        let admitted = self
+            .state
+            .with_inner(move |state, inner| {
+                if state.closing {
+                    return Err(Box::new(SteerOutcome::Closed));
+                }
+                let Some(active) = state.active_turn.as_ref() else {
+                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
+                };
+                let running = matches!(active.owner, ClaudeTurnOwner::User)
+                    && active.prompt_written
+                    && active.outcome_tx.is_some()
+                    && !active.interrupt_requested
+                    && state.resume_bootstrap.is_none();
+                if !running {
+                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
+                }
+                // A turn blocked on the user's own answer takes that answer, not a
+                // new message; a slash command is only recognized at the head of a
+                // turn; and a process due to restart after this turn would take a
+                // late steer down with it.
+                if active.pending_ask_user_question.is_some()
+                    || active.pending_exit_plan_mode.is_some()
+                    || state
+                        .stale_process_generation
+                        .is_some_and(|stale| stale >= state.process_generation)
+                    || super::invokes_slash_command(state.slash_commands.as_ref(), &payload.message)
+                {
+                    return Err(Box::new(SteerOutcome::Unsupported(payload)));
+                }
+                let Some(runtime) = state.runtime.as_ref() else {
+                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
+                };
+                // Workspace roots cannot change while a turn runs, so the context
+                // `write_turn_to_persistent_process` prepends is already current.
+                let images =
+                    protocol_images_to_attachments(payload.images.clone()).unwrap_or_default();
+                let input = build_stream_json_user_message(&payload.message, &images);
+                // Armed before the write: a turn the CLI opens for this message
+                // must never reach the reader ahead of its token.
+                inner.arm_steer_turn();
+                Ok((runtime.stdin.submit(&input), images, payload))
+            })
+            .await;
+        let (written, images, payload) = match admitted {
+            Ok(admitted) => admitted,
+            Err(outcome) => return *outcome,
         };
-        let (written, images) = {
-            // Held through the stdin write so neither an interrupt nor a
-            // blocking tool request can slip in between the checks and the
-            // write.
-            let state = self.state.lock().await;
-            if state.closing {
-                return SteerOutcome::Closed;
-            }
-            let Some(active) = state.active_turn.as_ref() else {
-                return SteerOutcome::NoActiveTurn(payload);
-            };
-            let running = matches!(active.owner, ClaudeTurnOwner::User)
-                && active.prompt_written
-                && active.outcome_tx.is_some()
-                && !active.interrupt_requested
-                && state.resume_bootstrap.is_none();
-            if !running {
-                return SteerOutcome::NoActiveTurn(payload);
-            }
-            // A turn blocked on the user's own answer takes that answer, not a
-            // new message; a slash command is only recognized at the head of a
-            // turn; and a process due to restart after this turn would take a
-            // late steer down with it.
-            if active.pending_ask_user_question.is_some()
-                || active.pending_exit_plan_mode.is_some()
-                || state
-                    .stale_process_generation
-                    .is_some_and(|stale| stale >= state.process_generation)
-                || super::invokes_slash_command(state.slash_commands.as_ref(), &payload.message)
-            {
-                return SteerOutcome::Unsupported(payload);
-            }
-            let Some(stdin) = stdin else {
-                return SteerOutcome::NoActiveTurn(payload);
-            };
-            // Workspace roots cannot change while a turn runs, so the context
-            // `write_turn_to_persistent_process` prepends is already current.
-            let images = protocol_images_to_attachments(payload.images.clone()).unwrap_or_default();
-            let input = build_stream_json_user_message(&payload.message, &images);
-            // Armed before the write: a turn the CLI opens for this message
-            // must never reach the reader ahead of its token.
-            self.arm_steer_turn();
-            (write_json_line_to_stdin(&stdin, &input).await, images)
-        };
-        if let Err(err) = written {
+        if let Err(err) = written.result().await {
             self.take_pending_steer_turn();
             tracing::error!("Failed to steer Claude turn: {err}");
             return SteerOutcome::Closed;
@@ -2325,82 +2753,132 @@ impl ClaudeInner {
             }
             Ok(focus) => focus,
         };
-        let (turn_id, terminal_rx, timeout_cancel_rx) = {
-            let mut state = self.state.lock().await;
-            if state.closing {
-                return BackendCompactionStart::NotDispatched {
-                    reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                };
-            }
-            if state.pending_compaction.is_some() {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
-                };
-            }
-            if state.active_turn.is_some() {
-                return BackendCompactionStart::Deferred {
-                    reason: BackendCompactionDeferredReason::ActiveTurn,
-                };
-            }
-            if let Some(start) =
-                super::compaction::not_dispatched_for_capability(&state.compaction_capability)
-            {
-                return start;
-            }
-            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (terminal_tx, terminal_rx) = oneshot::channel();
-            let (timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                owner: ClaudeTurnOwner::Compaction(request.operation_id.clone()),
-                outcome_tx: None,
-                prompt_written: false,
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            let process_generation = state.process_generation;
-            state.pending_compaction = Some(PendingClaudeCompaction {
-                request: request.clone(),
-                terminal_tx: Some(terminal_tx),
-                timeout_cancel_tx: Some(timeout_cancel_tx),
-                turn_id,
-                process_generation,
-                dispatched_at: std::time::Instant::now(),
-                write_completed: false,
-                boundary: None,
-                compact_result: None,
-                compact_error: None,
-                terminal_result_seen: false,
-                result_is_error: false,
-                diagnostic: None,
-            });
-            (turn_id, terminal_rx, timeout_cancel_rx)
+        let admitted = self
+            .state
+            .with_after_relocation({
+                let request = request.clone();
+                move |state, inner| {
+                    if state.closing {
+                        return Err(BackendCompactionStart::NotDispatched {
+                            reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                        });
+                    }
+                    if state.pending_compaction.is_some() {
+                        return Err(BackendCompactionStart::Deferred {
+                            reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                        });
+                    }
+                    if state.active_turn.is_some() {
+                        return Err(BackendCompactionStart::Deferred {
+                            reason: BackendCompactionDeferredReason::ActiveTurn,
+                        });
+                    }
+                    if let Some(start) = super::compaction::not_dispatched_for_capability(
+                        &state.compaction_capability.borrow(),
+                    ) {
+                        return Err(start);
+                    }
+                    let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let (terminal_tx, terminal_rx) = oneshot::channel();
+                    let (timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
+                    state.active_turn = Some(ActiveTurn {
+                        id: turn_id,
+                        owner: ClaudeTurnOwner::Compaction(request.operation_id.clone()),
+                        outcome_tx: None,
+                        prompt_written: false,
+                        interrupt_requested: false,
+                        pending_ask_user_question: None,
+                        pending_exit_plan_mode: None,
+                        quiesced_waiters: Vec::new(),
+                    });
+                    let process_generation = state.process_generation;
+                    state.pending_compaction = Some(PendingClaudeCompaction {
+                        request,
+                        terminal_tx: Some(terminal_tx),
+                        timeout_cancel_tx: Some(timeout_cancel_tx),
+                        turn_id,
+                        process_generation,
+                        dispatched_at: std::time::Instant::now(),
+                        write_submitted: false,
+                        boundary: None,
+                        compact_result: None,
+                        compact_error: None,
+                        terminal_result_seen: false,
+                        result_is_error: false,
+                        diagnostic: None,
+                    });
+                    Ok((
+                        ClaudeCompactionReservation {
+                            state: Some(inner.state.clone()),
+                            turn_id,
+                        },
+                        terminal_rx,
+                        timeout_cancel_rx,
+                    ))
+                }
+            })
+            .await;
+        let (reservation, terminal_rx, timeout_cancel_rx) = match admitted {
+            Ok(admitted) => admitted,
+            Err(start) => return start,
         };
+        // Dispatch belongs to its own task from here, so a caller dropped
+        // mid-dispatch cannot strand the reserved compaction turn.
+        let (start_tx, start_rx) = oneshot::channel();
+        crate::backend::subprocess::spawn(async move {
+            let start = self
+                .dispatch_compaction(reservation, request, focus, terminal_rx, timeout_cancel_rx)
+                .await;
+            let _ = start_tx.send(start);
+        });
+        start_rx
+            .await
+            .expect("Claude compaction dispatch ended without a start outcome")
+    }
 
+    async fn dispatch_compaction(
+        self: Arc<Self>,
+        reservation: ClaudeCompactionReservation,
+        request: BackendCompactionRequest,
+        focus: Option<String>,
+        terminal_rx: oneshot::Receiver<BackendCompactionResult>,
+        timeout_cancel_rx: oneshot::Receiver<()>,
+    ) -> BackendCompactionStart {
+        let turn_id = reservation.turn_id;
         if let Err(error) = self.ensure_current_process_ready().await {
-            self.abandon_undispatched_compaction(turn_id).await;
+            reservation.abandon().await;
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(
                     BackendCompactionUnknownReason::CapabilityProbeFailed(error),
                 ),
             };
         }
-        {
-            let mut state = self.state.lock().await;
-            if let Some(start) =
-                super::compaction::not_dispatched_for_capability(&state.compaction_capability)
-            {
-                drop(state);
-                self.abandon_undispatched_compaction(turn_id).await;
-                return start;
-            }
-            let process_generation = state.process_generation;
-            if let Some(pending) = state.pending_compaction.as_mut() {
-                pending.process_generation = process_generation;
-            }
+        let not_dispatched = self
+            .state
+            .with(|state| {
+                if let Some(start) = super::compaction::not_dispatched_for_capability(
+                    &state.compaction_capability.borrow(),
+                ) {
+                    return Some(start);
+                }
+                let process_generation = state.process_generation;
+                // Marked before the line reaches the writer, so the stdout
+                // reader can never see this compaction's frames first.
+                if let Some(pending) = state.pending_compaction.as_mut() {
+                    pending.process_generation = process_generation;
+                    pending.dispatched_at = std::time::Instant::now();
+                    pending.write_submitted = true;
+                }
+                None
+            })
+            .await;
+        if let Some(start) = not_dispatched {
+            reservation.abandon().await;
+            return start;
         }
+        // From the write on, the pending compaction is settled by its result,
+        // its failure, or its timeout.
+        reservation.disarm();
 
         let prompt = focus
             .as_deref()
@@ -2423,15 +2901,6 @@ impl ClaudeInner {
                 });
             return BackendCompactionStart::DispatchUncertain(Box::new(result));
         }
-        {
-            let mut state = self.state.lock().await;
-            if let Some(pending) = state.pending_compaction.as_mut()
-                && pending.turn_id == turn_id
-            {
-                pending.dispatched_at = std::time::Instant::now();
-                pending.write_completed = true;
-            }
-        }
         let timeout_inner = Arc::clone(&self);
         crate::backend::subprocess::spawn(async move {
             tokio::select! {
@@ -2452,33 +2921,6 @@ impl ClaudeInner {
             operation_id: request.operation_id,
             terminal: terminal_rx,
         })
-    }
-
-    async fn abandon_undispatched_compaction(&self, turn_id: u64) {
-        let waiters = {
-            let mut state = self.state.lock().await;
-            if state
-                .pending_compaction
-                .as_ref()
-                .is_some_and(|pending| pending.turn_id == turn_id)
-            {
-                state.pending_compaction.take();
-            }
-            match state.active_turn.as_ref() {
-                Some(active)
-                    if active.id == turn_id
-                        && matches!(active.owner, ClaudeTurnOwner::Compaction(_)) =>
-                {
-                    state
-                        .active_turn
-                        .take()
-                        .map(|active| active.quiesced_waiters)
-                        .unwrap_or_default()
-                }
-                _ => Vec::new(),
-            }
-        };
-        notify_turn_quiesced(waiters);
     }
 
     async fn finalize_turn(
@@ -2633,18 +3075,21 @@ impl ClaudeInner {
     }
 
     async fn emit_idle_if_no_active_turn(&self) {
-        let state = self.state.lock().await;
-        let active_turn = state.active_turn.as_ref().map(|turn| turn.id);
-        let turn_active = state.active_turn.as_ref().is_some_and(|turn| {
-            !matches!(turn.owner, ClaudeTurnOwner::User) || turn.outcome_tx.is_some()
-        });
-        eprintln!(
-            "TYDE CLAUDE IDLE CHECK active_turn={active_turn:?} turn_active={turn_active} stream_open={}",
-            self.emitter.is_stream_open()
-        );
-        if !turn_active {
-            self.emit_idle_if_quiescent();
-        }
+        self.state
+            .with_inner(|state, inner| {
+                let active_turn = state.active_turn.as_ref().map(|turn| turn.id);
+                let turn_active = state.active_turn.as_ref().is_some_and(|turn| {
+                    !matches!(turn.owner, ClaudeTurnOwner::User) || turn.outcome_tx.is_some()
+                });
+                eprintln!(
+                    "TYDE CLAUDE IDLE CHECK active_turn={active_turn:?} turn_active={turn_active} stream_open={}",
+                    inner.emitter.is_stream_open()
+                );
+                if !turn_active {
+                    inner.emit_idle_if_quiescent();
+                }
+            })
+            .await;
     }
 
     /// Wait until no turn is installed, i.e. the previous turn's finalizer has
@@ -2653,22 +3098,25 @@ impl ClaudeInner {
     /// and the CLI can deliver an entire wake burst inside that window.
     /// Retrying per frame is not enough, because every frame of the burst can
     /// land before the hand-off completes. Returns false on timeout.
-    /// Safe to await while holding `turn_event_gate`: the finalizer never
-    /// takes that gate.
+    /// Safe to await on the stdout reader: the finalizer never waits on the
+    /// reader's turn jobs.
     async fn await_active_turn_quiesced(&self, wait: Duration) -> bool {
-        let quiesced_rx = {
-            let mut state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_mut() else {
-                return true;
-            };
-            let (quiesced_tx, quiesced_rx) = oneshot::channel();
-            active.quiesced_waiters.push(quiesced_tx);
-            quiesced_rx
+        let quiesced_rx = self
+            .state
+            .with(|state| {
+                let active = state.active_turn.as_mut()?;
+                let (quiesced_tx, quiesced_rx) = oneshot::channel();
+                active.quiesced_waiters.push(quiesced_tx);
+                Some(quiesced_rx)
+            })
+            .await;
+        let Some(quiesced_rx) = quiesced_rx else {
+            return true;
         };
         matches!(
             tokio::time::timeout(wait, quiesced_rx).await,
             Ok(Ok(())) | Err(_)
-        ) && self.state.lock().await.active_turn.is_none()
+        ) && self.state.with(|state| state.active_turn.is_none()).await
     }
 
     /// Open a turn for output the Claude CLI produced on its own initiative,
@@ -2681,42 +3129,44 @@ impl ClaudeInner {
     /// emits no user bubble. Returns `None` if a turn is somehow already
     /// active, or if the backend is closing.
     async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
-        let (turn_id, ephemeral, model_hint, outcome_rx) = {
-            let mut state = self.state.lock().await;
-            if state.closing || state.active_turn.is_some() {
-                return None;
-            }
-            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (outcome_tx, outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                owner: ClaudeTurnOwner::User,
-                outcome_tx: Some(outcome_tx),
-                prompt_written: true,
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            (turn_id, state.ephemeral, state.model.clone(), outcome_rx)
-        };
+        self.state
+            .with_inner(|state, inner| {
+                if state.closing || state.active_turn.is_some() {
+                    return None;
+                }
+                let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let (outcome_tx, outcome_rx) = oneshot::channel();
+                state.active_turn = Some(ActiveTurn {
+                    id: turn_id,
+                    owner: ClaudeTurnOwner::User,
+                    outcome_tx: Some(outcome_tx),
+                    prompt_written: true,
+                    interrupt_requested: false,
+                    pending_ask_user_question: None,
+                    pending_exit_plan_mode: None,
+                    quiesced_waiters: Vec::new(),
+                });
+                let ephemeral = state.ephemeral;
+                let model_hint = state.model.clone();
 
-        let message_id = format!("claude-msg-{turn_id}");
-        eprintln!("TYDE CLAUDE WAKE TURN BEGIN turn={turn_id} message={message_id}");
-        self.emit_typing_status(true);
-        self.emit_stream_start(&message_id, model_hint.clone());
+                let message_id = format!("claude-msg-{turn_id}");
+                eprintln!("TYDE CLAUDE WAKE TURN BEGIN turn={turn_id} message={message_id}");
+                inner.emit_typing_status(true);
+                inner.emit_stream_start(&message_id, model_hint.clone());
 
-        let this = Arc::clone(self);
-        crate::backend::subprocess::spawn(async move {
-            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-                summary: ClaudeStdoutSummary::default(),
-                error: "Claude turn ended before returning a result".to_string(),
-            });
-            this.finalize_turn(turn_id, outcome, ephemeral, model_hint)
-                .await;
-        });
+                let this = Arc::clone(inner);
+                crate::backend::subprocess::spawn(async move {
+                    let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                        summary: ClaudeStdoutSummary::default(),
+                        error: "Claude turn ended before returning a result".to_string(),
+                    });
+                    this.finalize_turn(turn_id, outcome, ephemeral, model_hint)
+                        .await;
+                });
 
-        Some(turn_id)
+                Some(turn_id)
+            })
+            .await
     }
 
     async fn observe_compaction_frame(&self, turn_id: u64, value: &Value) {
@@ -2726,7 +3176,7 @@ impl ClaudeInner {
             "Claude compaction diagnostic frame"
         );
         if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-            let current_session_id = self.state.lock().await.session_id.clone();
+            let current_session_id = self.state.with(|state| state.session_id.clone()).await;
             if current_session_id
                 .as_deref()
                 .is_some_and(|current| current != session_id)
@@ -2748,38 +3198,45 @@ impl ClaudeInner {
                 };
                 match system.event() {
                     ClaudeSystemEvent::Status => {
-                        let mut progress = None;
-                        let mut state = self.state.lock().await;
-                        let process_generation = state.process_generation;
-                        let session_matches = system
-                            .session_id
-                            .as_deref()
-                            .or_else(|| value.get("session_id").and_then(Value::as_str))
-                            .is_none_or(|frame_session| {
-                                state.session_id.as_deref() == Some(frame_session)
-                            });
-                        let Some(pending) = state.pending_compaction.as_mut() else {
-                            return;
-                        };
-                        if pending.turn_id != turn_id
-                            || pending.process_generation != process_generation
-                            || !pending.write_completed
-                            || !session_matches
-                        {
-                            return;
-                        }
-                        if system.status.as_deref() == Some("compacting") {
-                            progress = Some(BackendCompactionProgress {
-                                operation_id: pending.request.operation_id.clone(),
-                                stage: CompactionStage::Compacting,
-                                elapsed_ms: Some(pending.dispatched_at.elapsed().as_millis() as u64),
-                            });
-                        }
-                        if let Some(compact_result) = system.compact_result {
-                            pending.compact_result = Some(compact_result);
-                            pending.compact_error = system.compact_error;
-                        }
-                        drop(state);
+                        let frame_session = system.session_id.clone().or_else(|| {
+                            value
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                        let compacting = system.status.as_deref() == Some("compacting");
+                        let compact_result = system.compact_result;
+                        let compact_error = system.compact_error;
+                        let progress = self
+                            .state
+                            .with(move |state| {
+                                let process_generation = state.process_generation;
+                                let session_matches =
+                                    frame_session.as_deref().is_none_or(|frame_session| {
+                                        state.session_id.as_deref() == Some(frame_session)
+                                    });
+                                let pending = state.pending_compaction.as_mut()?;
+                                if pending.turn_id != turn_id
+                                    || pending.process_generation != process_generation
+                                    || !pending.write_submitted
+                                    || !session_matches
+                                {
+                                    return None;
+                                }
+                                let progress = compacting.then(|| BackendCompactionProgress {
+                                    operation_id: pending.request.operation_id.clone(),
+                                    stage: CompactionStage::Compacting,
+                                    elapsed_ms: Some(
+                                        pending.dispatched_at.elapsed().as_millis() as u64
+                                    ),
+                                });
+                                if let Some(compact_result) = compact_result {
+                                    pending.compact_result = Some(compact_result);
+                                    pending.compact_error = compact_error;
+                                }
+                                progress
+                            })
+                            .await;
                         if let Some(progress) = progress {
                             self.emitter
                                 .compaction_event(&BackendCompactionEvent::Progress(progress));
@@ -2793,10 +3250,8 @@ impl ClaudeInner {
                             .and_then(Value::as_str)
                             .unwrap_or("auto");
                         if trigger != "manual" {
-                            let session_id = {
-                                let state = self.state.lock().await;
-                                state.session_id.clone()
-                            };
+                            let session_id =
+                                self.state.with(|state| state.session_id.clone()).await;
                             if let Some(observation) = claude_live_compaction_observation(
                                 value,
                                 &system,
@@ -2814,29 +3269,33 @@ impl ClaudeInner {
                         }) else {
                             return;
                         };
-                        let mut state = self.state.lock().await;
-                        let process_generation = state.process_generation;
-                        let session_matches = system
-                            .session_id
-                            .as_deref()
-                            .or_else(|| value.get("session_id").and_then(Value::as_str))
-                            .is_none_or(|frame_session| {
-                                state.session_id.as_deref() == Some(frame_session)
-                            });
-                        let Some(pending) = state.pending_compaction.as_mut() else {
-                            return;
-                        };
-                        if pending.turn_id != turn_id
-                            || pending.process_generation != process_generation
-                            || !pending.write_completed
-                            || !session_matches
-                        {
-                            return;
-                        }
-                        pending.boundary = Some(ClaudeCompactionBoundary {
-                            uuid,
-                            metrics: claude_compaction_metrics(system.compact_metadata.as_ref()),
+                        let frame_session = system.session_id.clone().or_else(|| {
+                            value
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
                         });
+                        let metrics = claude_compaction_metrics(system.compact_metadata.as_ref());
+                        self.state
+                            .with(move |state| {
+                                let process_generation = state.process_generation;
+                                let session_matches =
+                                    frame_session.as_deref().is_none_or(|frame_session| {
+                                        state.session_id.as_deref() == Some(frame_session)
+                                    });
+                                let Some(pending) = state.pending_compaction.as_mut() else {
+                                    return;
+                                };
+                                if pending.turn_id != turn_id
+                                    || pending.process_generation != process_generation
+                                    || !pending.write_submitted
+                                    || !session_matches
+                                {
+                                    return;
+                                }
+                                pending.boundary = Some(ClaudeCompactionBoundary { uuid, metrics });
+                            })
+                            .await;
                     }
                     ClaudeSystemEvent::Init
                     | ClaudeSystemEvent::TaskStarted
@@ -2855,29 +3314,37 @@ impl ClaudeInner {
                     .and_then(extract_text_from_message)
                     .and_then(|diagnostic| normalize_nonempty(&diagnostic));
                 if let Some(diagnostic) = diagnostic {
-                    let mut state = self.state.lock().await;
-                    if let Some(pending) = state.pending_compaction.as_mut()
-                        && pending.turn_id == turn_id
-                    {
-                        pending.diagnostic = Some(diagnostic);
-                    }
+                    self.state
+                        .with(move |state| {
+                            if let Some(pending) = state.pending_compaction.as_mut()
+                                && pending.turn_id == turn_id
+                            {
+                                pending.diagnostic = Some(diagnostic);
+                            }
+                        })
+                        .await;
                 }
             }
             "result" => {
-                let mut state = self.state.lock().await;
-                if let Some(pending) = state.pending_compaction.as_mut()
-                    && pending.turn_id == turn_id
-                {
-                    pending.terminal_result_seen = true;
-                    pending.result_is_error = value
-                        .get("is_error")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                        || value.get("subtype").and_then(Value::as_str) == Some("error");
-                    if pending.diagnostic.is_none() {
-                        pending.diagnostic = extract_result_error(value);
-                    }
-                }
+                let result_is_error = value
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || value.get("subtype").and_then(Value::as_str) == Some("error");
+                let result_error = extract_result_error(value);
+                self.state
+                    .with(move |state| {
+                        if let Some(pending) = state.pending_compaction.as_mut()
+                            && pending.turn_id == turn_id
+                        {
+                            pending.terminal_result_seen = true;
+                            pending.result_is_error = result_is_error;
+                            if pending.diagnostic.is_none() {
+                                pending.diagnostic = result_error;
+                            }
+                        }
+                    })
+                    .await;
             }
             _ => {}
         }
@@ -2890,174 +3357,185 @@ impl ClaudeInner {
         forced_failure: Option<String>,
         dispatch_uncertain: bool,
     ) -> Option<BackendCompactionResult> {
-        let (result, observation, terminal_tx, timeout_cancel_tx, waiters) = {
-            let mut state = self.state.lock().await;
-            let active_matches = state.active_turn.as_ref().is_some_and(|active| {
-                active.id == turn_id && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
-            });
-            if !active_matches {
-                return None;
-            }
-            let mut pending = state.pending_compaction.take()?;
-            if pending.turn_id != turn_id {
-                state.pending_compaction = Some(pending);
-                return None;
-            }
-            let interrupted = state
-                .active_turn
-                .as_ref()
-                .is_some_and(|active| active.interrupt_requested);
-            let boundary = pending.boundary.as_ref();
-            let typed_failed = pending.compact_result.as_deref() == Some("failed");
-            let semantic_failure = forced_failure
-                .or_else(|| interrupted.then(|| "Claude compaction was interrupted".to_string()))
-                .or_else(|| pending.compact_error.clone())
-                .or_else(|| {
-                    pending.result_is_error.then(|| {
-                        pending
-                            .diagnostic
-                            .clone()
-                            .unwrap_or_else(|| "Claude returned an error result".to_string())
+        // The terminal hand-off happens inside the transition that takes the
+        // compaction, so a caller torn down afterwards cannot lose it.
+        let result = self
+            .state
+            .with_inner(move |state, inner| {
+                let active_matches = state.active_turn.as_ref().is_some_and(|active| {
+                    active.id == turn_id && matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+                });
+                if !active_matches {
+                    return None;
+                }
+                let mut pending = state.pending_compaction.take()?;
+                if pending.turn_id != turn_id {
+                    state.pending_compaction = Some(pending);
+                    return None;
+                }
+                let interrupted = state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.interrupt_requested);
+                let boundary = pending.boundary.as_ref();
+                let typed_failed = pending.compact_result.as_deref() == Some("failed");
+                let semantic_failure = forced_failure
+                    .or_else(|| {
+                        interrupted.then(|| "Claude compaction was interrupted".to_string())
                     })
-                })
-                .or_else(|| {
-                    typed_failed.then(|| {
-                        pending
-                            .diagnostic
-                            .clone()
-                            .unwrap_or_else(|| "Claude reported compaction failure".to_string())
+                    .or_else(|| pending.compact_error.clone())
+                    .or_else(|| {
+                        pending.result_is_error.then(|| {
+                            pending
+                                .diagnostic
+                                .clone()
+                                .unwrap_or_else(|| "Claude returned an error result".to_string())
+                        })
                     })
-                })
-                .or_else(|| {
-                    (!pending.terminal_result_seen)
-                        .then(|| "Claude compaction did not reach a terminal result".to_string())
-                })
-                .or_else(|| {
-                    boundary.is_none().then(|| {
-                        "Claude returned a result without a manual compact boundary".to_string()
+                    .or_else(|| {
+                        typed_failed.then(|| {
+                            pending
+                                .diagnostic
+                                .clone()
+                                .unwrap_or_else(|| "Claude reported compaction failure".to_string())
+                        })
+                    })
+                    .or_else(|| {
+                        (!pending.terminal_result_seen).then(|| {
+                            "Claude compaction did not reach a terminal result".to_string()
+                        })
+                    })
+                    .or_else(|| {
+                        boundary.is_none().then(|| {
+                            "Claude returned a result without a manual compact boundary".to_string()
+                        })
+                    });
+                tracing::warn!(
+                    turn_id,
+                    terminal_result_seen = pending.terminal_result_seen,
+                    result_is_error = pending.result_is_error,
+                    compact_result = ?pending.compact_result,
+                    compact_error = ?pending.compact_error,
+                    diagnostic = ?pending.diagnostic,
+                    boundary = ?pending.boundary.as_ref().map(|boundary| &boundary.uuid),
+                    semantic_failure = ?semantic_failure,
+                    "Claude compaction terminal diagnostic"
+                );
+                let dispatch = if dispatch_uncertain {
+                    BackendCompactionDispatchState::MayHaveReachedProvider
+                } else {
+                    BackendCompactionDispatchState::Accepted
+                };
+                let mutation = if boundary.is_some() {
+                    BackendCompactionMutationState::Completed
+                } else if dispatch_uncertain
+                    || matches!(
+                        forced_failure_kind,
+                        BackendCompactionFailureKind::TimedOut
+                            | BackendCompactionFailureKind::TransportClosed
+                    )
+                {
+                    BackendCompactionMutationState::MayHaveMutated
+                } else {
+                    BackendCompactionMutationState::NotObserved
+                };
+                let metrics = boundary
+                    .map(|boundary| boundary.metrics.clone())
+                    .unwrap_or_default();
+                let post_context_tokens = metrics
+                    .after_tokens
+                    .map(PostCompactionTokenCount::Trusted)
+                    .unwrap_or(PostCompactionTokenCount::Unknown);
+                let outcome = if let Some(message) = semantic_failure {
+                    Err(BackendCompactionFailure {
+                        kind: if interrupted {
+                            BackendCompactionFailureKind::Interrupted
+                        } else if typed_failed || pending.result_is_error {
+                            BackendCompactionFailureKind::ProviderFailed
+                        } else {
+                            forced_failure_kind
+                        },
+                        message,
+                    })
+                } else {
+                    Ok(BackendCompactionSuccess {
+                        mechanism: CompactionMethod::NativeTextCommand,
+                    })
+                };
+                let result = BackendCompactionResult {
+                    operation_id: pending.request.operation_id.clone(),
+                    dispatch,
+                    mutation,
+                    outcome,
+                    provider_session_id: state.session_id.clone().map(SessionId),
+                    metrics,
+                    post_context_tokens,
+                    evidence: BackendCompactionTerminalEvidence::Claude {
+                        session_id: state.session_id.clone(),
+                        boundary_uuid: boundary.map(|boundary| boundary.uuid.clone()),
+                        compact_result: pending.compact_result.clone(),
+                        terminal_result_seen: pending.terminal_result_seen,
+                    },
+                };
+                let observation = boundary.and_then(|boundary| {
+                    let session_id = state.session_id.clone()?;
+                    Some(BackendObservedCompaction {
+                        observation_id: super::compaction::stable_observation_id(
+                            "claude",
+                            &session_id,
+                            &boundary.uuid,
+                        ),
+                        trigger: CompactionTrigger::BackendObservedManual,
+                        method: CompactionMethod::NativeTextCommand,
+                        provider_session_id: Some(SessionId(session_id)),
+                        metrics: boundary.metrics.clone(),
+                        source: BackendCompactionObservationSource::ClaudeBoundary {
+                            boundary_uuid: boundary.uuid.clone(),
+                        },
+                        user_focus: pending.request.focus.clone().map(|text| {
+                            BackendCompactionUserFocus {
+                                text,
+                                provenance: BackendCompactionUserFocusProvenance::TydeRequest,
+                            }
+                        }),
                     })
                 });
-            tracing::warn!(
-                turn_id,
-                terminal_result_seen = pending.terminal_result_seen,
-                result_is_error = pending.result_is_error,
-                compact_result = ?pending.compact_result,
-                compact_error = ?pending.compact_error,
-                diagnostic = ?pending.diagnostic,
-                boundary = ?pending.boundary.as_ref().map(|boundary| &boundary.uuid),
-                semantic_failure = ?semantic_failure,
-                "Claude compaction terminal diagnostic"
-            );
-            let dispatch = if dispatch_uncertain {
-                BackendCompactionDispatchState::MayHaveReachedProvider
-            } else {
-                BackendCompactionDispatchState::Accepted
-            };
-            let mutation = if boundary.is_some() {
-                BackendCompactionMutationState::Completed
-            } else if dispatch_uncertain
-                || matches!(
-                    forced_failure_kind,
-                    BackendCompactionFailureKind::TimedOut
-                        | BackendCompactionFailureKind::TransportClosed
-                )
-            {
-                BackendCompactionMutationState::MayHaveMutated
-            } else {
-                BackendCompactionMutationState::NotObserved
-            };
-            let metrics = boundary
-                .map(|boundary| boundary.metrics.clone())
-                .unwrap_or_default();
-            let post_context_tokens = metrics
-                .after_tokens
-                .map(PostCompactionTokenCount::Trusted)
-                .unwrap_or(PostCompactionTokenCount::Unknown);
-            let outcome = if let Some(message) = semantic_failure {
-                Err(BackendCompactionFailure {
-                    kind: if interrupted {
-                        BackendCompactionFailureKind::Interrupted
-                    } else if typed_failed || pending.result_is_error {
-                        BackendCompactionFailureKind::ProviderFailed
-                    } else {
-                        forced_failure_kind
-                    },
-                    message,
-                })
-            } else {
-                Ok(BackendCompactionSuccess {
-                    mechanism: CompactionMethod::NativeTextCommand,
-                })
-            };
-            let result = BackendCompactionResult {
-                operation_id: pending.request.operation_id.clone(),
-                dispatch,
-                mutation,
-                outcome,
-                provider_session_id: state.session_id.clone().map(SessionId),
-                metrics,
-                post_context_tokens,
-                evidence: BackendCompactionTerminalEvidence::Claude {
-                    session_id: state.session_id.clone(),
-                    boundary_uuid: boundary.map(|boundary| boundary.uuid.clone()),
-                    compact_result: pending.compact_result.clone(),
-                    terminal_result_seen: pending.terminal_result_seen,
-                },
-            };
-            let observation = boundary.and_then(|boundary| {
-                let session_id = state.session_id.clone()?;
-                Some(BackendObservedCompaction {
-                    observation_id: super::compaction::stable_observation_id(
-                        "claude",
-                        &session_id,
-                        &boundary.uuid,
-                    ),
-                    trigger: CompactionTrigger::BackendObservedManual,
-                    method: CompactionMethod::NativeTextCommand,
-                    provider_session_id: Some(SessionId(session_id)),
-                    metrics: boundary.metrics.clone(),
-                    source: BackendCompactionObservationSource::ClaudeBoundary {
-                        boundary_uuid: boundary.uuid.clone(),
-                    },
-                    user_focus: pending.request.focus.clone().map(|text| {
-                        BackendCompactionUserFocus {
-                            text,
-                            provenance: BackendCompactionUserFocusProvenance::TydeRequest,
-                        }
-                    }),
-                })
-            });
-            let terminal_tx = pending.terminal_tx.take();
-            let timeout_cancel_tx = pending.timeout_cancel_tx.take();
-            let waiters = state
-                .active_turn
-                .take()
-                .map(|active| active.quiesced_waiters)
-                .unwrap_or_default();
-            (result, observation, terminal_tx, timeout_cancel_tx, waiters)
-        };
-        if let Some(timeout_cancel_tx) = timeout_cancel_tx {
-            let _ = timeout_cancel_tx.send(());
-        }
-        if let Some(observation) = observation {
-            self.emitter
-                .compaction_event(&BackendCompactionEvent::Observed(Box::new(observation)));
-        }
-        if let Some(terminal_tx) = terminal_tx {
-            let _ = terminal_tx.send(result.clone());
-        }
-        notify_turn_quiesced(waiters);
+                let terminal_tx = pending.terminal_tx.take();
+                let timeout_cancel_tx = pending.timeout_cancel_tx.take();
+                let waiters = state
+                    .active_turn
+                    .take()
+                    .map(|active| active.quiesced_waiters)
+                    .unwrap_or_default();
+                if let Some(timeout_cancel_tx) = timeout_cancel_tx {
+                    let _ = timeout_cancel_tx.send(());
+                }
+                if let Some(observation) = observation {
+                    inner
+                        .emitter
+                        .compaction_event(&BackendCompactionEvent::Observed(Box::new(observation)));
+                }
+                if let Some(terminal_tx) = terminal_tx {
+                    let _ = terminal_tx.send(result.clone());
+                }
+                notify_turn_quiesced(waiters);
+                Some(result)
+            })
+            .await?;
         self.retire_stale_process().await;
         Some(result)
     }
 
     async fn active_turn_owner(&self, turn_id: u64) -> Option<ClaudeTurnOwner> {
-        let state = self.state.lock().await;
-        state
-            .active_turn
-            .as_ref()
-            .filter(|active| active.id == turn_id)
-            .map(|active| active.owner.clone())
+        self.state
+            .with(move |state| {
+                state
+                    .active_turn
+                    .as_ref()
+                    .filter(|active| active.id == turn_id)
+                    .map(|active| active.owner.clone())
+            })
+            .await
     }
 
     async fn write_turn_to_persistent_process(
@@ -3074,47 +3552,59 @@ impl ClaudeInner {
             return Err(TurnStartError::Cancelled);
         }
 
-        let prompt = {
-            let state = self.state.lock().await;
-            if super::invokes_slash_command(state.slash_commands.as_ref(), prompt) {
-                prompt.to_owned()
-            } else {
-                super::workspace_prompt(prompt, state.workspace_roots.as_deref())
-            }
-        };
+        let prompt = prompt.to_owned();
+        let prompt = self
+            .state
+            .with(move |state| {
+                if super::invokes_slash_command(state.slash_commands.as_ref(), &prompt) {
+                    prompt
+                } else {
+                    super::workspace_prompt(&prompt, state.workspace_roots.as_deref())
+                }
+            })
+            .await;
         let input_message = build_stream_json_user_message(&prompt, images);
-        let stdin = {
-            let runtime = self.runtime.lock().await;
-            runtime
-                .as_ref()
-                .map(|runtime| Arc::clone(&runtime.stdin))
-                .ok_or_else(|| {
-                    TurnStartError::Failed("Claude CLI process is not running".to_string())
-                })?
-        };
         tracing::info!(turn_id, "writing Claude foreground prompt");
-        let (resume_bootstrap_generation, resume_bootstrap_rx, written) = {
-            // Keep the bootstrap state locked through the stdin write so the
-            // resume terminal cannot race past waiter registration.
-            let mut state = self.state.lock().await;
-            let (generation, receiver) = if let Some(bootstrap) = state.resume_bootstrap.as_mut() {
-                let (completion, receiver) = oneshot::channel();
-                bootstrap.completions.push(completion);
-                (Some(bootstrap.generation), Some(receiver))
-            } else {
-                (None, None)
-            };
-            let written = write_json_line_to_stdin(&stdin, &input_message).await;
-            if written.is_ok() {
-                state.resume_bootstrap_required = true;
+        // Waiter registration and the frame's place in stdin are one
+        // transition, so the resume terminal cannot race past the waiter. The
+        // prompt counts as written from here: the writer keeps any later steer
+        // behind it.
+        let (resume_bootstrap_generation, resume_bootstrap_rx, written) = self
+            .state
+            .with(move |state| {
+                let runtime = state.runtime.as_ref().ok_or_else(|| {
+                    TurnStartError::Failed("Claude CLI process is not running".to_string())
+                })?;
+                let written = runtime.stdin.submit(&input_message);
+                let (generation, receiver) =
+                    if let Some(bootstrap) = state.resume_bootstrap.as_mut() {
+                        let (completion, receiver) = oneshot::channel();
+                        bootstrap.completions.push(completion);
+                        (Some(bootstrap.generation), Some(receiver))
+                    } else {
+                        (None, None)
+                    };
                 if let Some(active) = state.active_turn.as_mut()
                     && active.id == turn_id
                 {
                     active.prompt_written = true;
                 }
-            }
-            (generation, receiver, written)
-        };
+                Ok((generation, receiver, written))
+            })
+            .await?;
+        let written = written.result().await;
+        let succeeded = written.is_ok();
+        self.state
+            .with(move |state| {
+                if succeeded {
+                    state.resume_bootstrap_required = true;
+                } else if let Some(active) = state.active_turn.as_mut()
+                    && active.id == turn_id
+                {
+                    active.prompt_written = false;
+                }
+            })
+            .await;
         if let Err(error) = written {
             if let Some(generation) = resume_bootstrap_generation {
                 self.fail_resume_bootstrap(generation, &error).await;
@@ -3151,68 +3641,90 @@ impl ClaudeInner {
         &self,
         request: AskUserQuestionControlRequest,
     ) -> Result<(), String> {
-        {
-            let mut state = self.state.lock().await;
-            let active = state
-                .active_turn
-                .as_mut()
-                .ok_or_else(|| "Claude asked a question with no active turn".to_string())?;
-            if active.interrupt_requested {
-                return Err("Claude asked a question after the turn was interrupted".to_string());
-            }
-            if active.pending_ask_user_question.is_some() {
-                return Err(
-                    "Claude asked a second question before the first was answered".to_string(),
-                );
-            }
-            active.pending_ask_user_question = Some(PendingAskUserQuestionControl {
-                request_id: request.request_id,
-                tool_call_id: request.tool_call_id,
-                tool_name: request.tool_name,
-                input: request.input,
-            });
-        }
+        self.state
+            .with_inner(move |state, inner| {
+                let active = state
+                    .active_turn
+                    .as_mut()
+                    .ok_or_else(|| "Claude asked a question with no active turn".to_string())?;
+                if active.interrupt_requested {
+                    return Err(
+                        "Claude asked a question after the turn was interrupted".to_string()
+                    );
+                }
+                if active.pending_ask_user_question.is_some() {
+                    return Err(
+                        "Claude asked a second question before the first was answered".to_string(),
+                    );
+                }
+                active.pending_ask_user_question = Some(PendingAskUserQuestionControl {
+                    request_id: request.request_id,
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.tool_name,
+                    input: request.input,
+                });
 
-        self.emit_typing_status(false);
-        Ok(())
+                inner.emit_typing_status(false);
+                Ok(())
+            })
+            .await
     }
 
     async fn begin_exit_plan_mode_control_request(
         &self,
         request: ExitPlanModeControlRequest,
     ) -> Result<(), String> {
-        {
-            let mut state = self.state.lock().await;
-            let active = state
-                .active_turn
-                .as_mut()
-                .ok_or_else(|| "Claude requested plan approval with no active turn".to_string())?;
-            if active.interrupt_requested {
-                return Err(
-                    "Claude requested plan approval after the turn was interrupted".to_string(),
-                );
-            }
-            if active.pending_ask_user_question.is_some() || active.pending_exit_plan_mode.is_some()
-            {
-                return Err(
-                    "Claude requested plan approval while another user response is pending"
-                        .to_string(),
-                );
-            }
-            active.pending_exit_plan_mode = Some(PendingExitPlanModeControl {
-                request_id: request.request_id,
-                tool_call_id: request.tool_call_id,
-                tool_name: request.tool_name,
-                input: request.input,
-            });
-        }
+        self.state
+            .with_inner(move |state, inner| {
+                let active = state.active_turn.as_mut().ok_or_else(|| {
+                    "Claude requested plan approval with no active turn".to_string()
+                })?;
+                if active.interrupt_requested {
+                    return Err(
+                        "Claude requested plan approval after the turn was interrupted".to_string(),
+                    );
+                }
+                if active.pending_ask_user_question.is_some()
+                    || active.pending_exit_plan_mode.is_some()
+                {
+                    return Err(
+                        "Claude requested plan approval while another user response is pending"
+                            .to_string(),
+                    );
+                }
+                active.pending_exit_plan_mode = Some(PendingExitPlanModeControl {
+                    request_id: request.request_id,
+                    tool_call_id: request.tool_call_id,
+                    tool_name: request.tool_name,
+                    input: request.input,
+                });
 
-        self.emit_typing_status(false);
-        Ok(())
+                inner.emit_typing_status(false);
+                Ok(())
+            })
+            .await
+    }
+
+    /// Nothing the provider does will settle a response it holds no request
+    /// for. A running turn keeps its own lifecycle; otherwise the rejection
+    /// is bracketed as its own turn so the accepted response settles.
+    async fn reject_unmatched_tool_response(&self) {
+        self.state
+            .with_inner(|state, inner| {
+                let bracketed = state.active_turn.is_none();
+                if bracketed {
+                    inner.emit_typing_status(true);
+                }
+                inner.emit_error("No matching pending tool request is waiting for that response.");
+                if bracketed {
+                    inner.emit_typing_status(false);
+                }
+            })
+            .await;
     }
 
     async fn answer_pending_tool_response(
-        &self,
+        self: &Arc<Self>,
         tool_response: SendMessageToolResponse,
         message: String,
     ) -> Result<bool, String> {
@@ -3237,30 +3749,97 @@ impl ClaudeInner {
     }
 
     async fn answer_pending_ask_user_question(
-        &self,
+        self: &Arc<Self>,
         tool_call_id: String,
         message: String,
     ) -> Result<bool, String> {
-        let _turn_event_guard = self.turn_event_gate.lock().await;
-        let (turn_id, pending) = {
-            let state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_ref() else {
-                return Ok(false);
-            };
-            if active.interrupt_requested {
-                return Ok(false);
+        let answered = self
+            .run_turn_job({
+                let tool_call_id = tool_call_id.clone();
+                move |inner| {
+                    let tool_call_id = tool_call_id.clone();
+                    let message = message.clone();
+                    async move {
+                        inner
+                            .answer_pending_ask_user_question_in_order(tool_call_id, message)
+                            .await
+                    }
+                }
+            })
+            .await;
+        let Ok(answered) = answered else {
+            // The process was torn down by whoever aborted its reader, so it
+            // is not torn down again here: that could kill its replacement.
+            let error =
+                format!("Failed to send AskUserQuestion answer to Claude: {CLAUDE_STDIN_CLOSED}");
+            let failed_error = error.clone();
+            let outcome_tx = self
+                .state
+                .with_inner(move |state, inner| {
+                    let active = state.active_turn.as_mut()?;
+                    if active.interrupt_requested
+                        || !active
+                            .pending_ask_user_question
+                            .as_ref()
+                            .is_some_and(|pending| pending.tool_call_id == tool_call_id)
+                    {
+                        return None;
+                    }
+                    let pending = active.pending_ask_user_question.take()?;
+                    inner.emit_ask_user_question_failed(&pending, &failed_error);
+                    active.outcome_tx.take()
+                })
+                .await;
+            if let Some(outcome_tx) = outcome_tx {
+                let _ = outcome_tx.send(TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: error.clone(),
+                });
             }
-            (active.id, active.pending_ask_user_question.clone())
+            return Err(error);
         };
-        let Some(pending) = pending else {
-            return Ok(false);
+        match answered {
+            ClaudeAnswered::Settled(result) => result,
+            ClaudeAnswered::WriteFailed { error, outcome_tx } => {
+                self.retire_process_for_replacement().await;
+                if let Some(outcome_tx) = outcome_tx {
+                    let _ = outcome_tx.send(TurnOutcome::Failed {
+                        summary: ClaudeStdoutSummary::default(),
+                        error: error.clone(),
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The part of an answer that must not interleave with the reader's
+    /// frames. Process teardown is left to the caller, because it aborts the
+    /// reader this may be running on.
+    async fn answer_pending_ask_user_question_in_order(
+        self: Arc<Self>,
+        tool_call_id: String,
+        message: String,
+    ) -> ClaudeAnswered {
+        let current = self
+            .state
+            .with(|state| {
+                let active = state.active_turn.as_ref()?;
+                if active.interrupt_requested {
+                    return None;
+                }
+                Some((active.id, active.pending_ask_user_question.clone()))
+            })
+            .await;
+        let Some((turn_id, Some(pending))) = current else {
+            return ClaudeAnswered::Settled(Ok(false));
         };
         if pending.tool_call_id != tool_call_id {
             self.emit_error(&format!(
                 "AskUserQuestion response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {}.",
                 pending.tool_call_id
             ));
-            return Ok(true);
+            return ClaudeAnswered::Settled(Ok(true));
         }
 
         let updated_input = ask_user_question_input_with_answer(&pending.input, &message);
@@ -3270,21 +3849,14 @@ impl ClaudeInner {
             let error = format!("Failed to send AskUserQuestion answer to Claude: {err}");
             self.fail_pending_ask_user_question(turn_id, &error).await;
             let outcome_tx = self.take_active_turn_outcome_sender(turn_id).await;
-            self.retire_process_for_replacement().await;
-            if let Some(outcome_tx) = outcome_tx {
-                let _ = outcome_tx.send(TurnOutcome::Failed {
-                    summary: ClaudeStdoutSummary::default(),
-                    error: error.clone(),
-                });
-            }
-            return Err(error);
+            return ClaudeAnswered::WriteFailed { error, outcome_tx };
         }
 
         let Some(_) = self
             .take_pending_ask_user_question(turn_id, &pending.request_id)
             .await
         else {
-            return Ok(true);
+            return ClaudeAnswered::Settled(Ok(true));
         };
 
         self.emit_tool_execution_completed(
@@ -3295,36 +3867,105 @@ impl ClaudeInner {
             None,
         );
         self.emit_typing_status(true);
-        Ok(true)
+        ClaudeAnswered::Settled(Ok(true))
     }
 
     async fn answer_pending_exit_plan_mode(
-        &self,
+        self: &Arc<Self>,
         tool_call_id: String,
         decision: ExitPlanModeDecision,
         feedback: Option<String>,
         message: String,
     ) -> Result<bool, String> {
-        let _turn_event_guard = self.turn_event_gate.lock().await;
-        let (turn_id, pending) = {
-            let state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_ref() else {
-                return Ok(false);
-            };
-            if active.interrupt_requested {
-                return Ok(false);
+        let answered = self
+            .run_turn_job({
+                let tool_call_id = tool_call_id.clone();
+                move |inner| {
+                    let tool_call_id = tool_call_id.clone();
+                    let feedback = feedback.clone();
+                    let message = message.clone();
+                    async move {
+                        inner
+                            .answer_pending_exit_plan_mode_in_order(
+                                tool_call_id,
+                                decision,
+                                feedback,
+                                message,
+                            )
+                            .await
+                    }
+                }
+            })
+            .await;
+        let Ok(answered) = answered else {
+            // The process was torn down by whoever aborted its reader, so it
+            // is not torn down again here: that could kill its replacement.
+            let error =
+                format!("Failed to send ExitPlanMode response to Claude: {CLAUDE_STDIN_CLOSED}");
+            let failed_error = error.clone();
+            let outcome_tx = self
+                .state
+                .with_inner(move |state, inner| {
+                    let active = state.active_turn.as_mut()?;
+                    if active.interrupt_requested
+                        || !active
+                            .pending_exit_plan_mode
+                            .as_ref()
+                            .is_some_and(|pending| pending.tool_call_id == tool_call_id)
+                    {
+                        return None;
+                    }
+                    let pending = active.pending_exit_plan_mode.take()?;
+                    inner.emit_exit_plan_mode_failed(&pending, &failed_error);
+                    active.outcome_tx.take()
+                })
+                .await;
+            if let Some(outcome_tx) = outcome_tx {
+                let _ = outcome_tx.send(TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: error.clone(),
+                });
             }
-            (active.id, active.pending_exit_plan_mode.clone())
+            return Err(error);
         };
-        let Some(pending) = pending else {
-            return Ok(false);
+        match answered {
+            ClaudeAnswered::Settled(result) => result,
+            ClaudeAnswered::WriteFailed { error, .. } => {
+                self.shutdown_process().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// The part of an answer that must not interleave with the reader's
+    /// frames. Process teardown is left to the caller, because it aborts the
+    /// reader this may be running on.
+    async fn answer_pending_exit_plan_mode_in_order(
+        self: Arc<Self>,
+        tool_call_id: String,
+        decision: ExitPlanModeDecision,
+        feedback: Option<String>,
+        message: String,
+    ) -> ClaudeAnswered {
+        let current = self
+            .state
+            .with(|state| {
+                let active = state.active_turn.as_ref()?;
+                if active.interrupt_requested {
+                    return None;
+                }
+                Some((active.id, active.pending_exit_plan_mode.clone()))
+            })
+            .await;
+        let Some((turn_id, Some(pending))) = current else {
+            return ClaudeAnswered::Settled(Ok(false));
         };
         if pending.tool_call_id != tool_call_id {
             self.emit_error(&format!(
                 "ExitPlanMode response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {}.",
                 pending.tool_call_id
             ));
-            return Ok(true);
+            return ClaudeAnswered::Settled(Ok(true));
         }
 
         let normalized_feedback = feedback
@@ -3352,17 +3993,17 @@ impl ClaudeInner {
                 },
             )
             .await;
-            self.shutdown_process().await;
-            return Err(format!(
-                "Failed to send ExitPlanMode response to Claude: {err}"
-            ));
+            return ClaudeAnswered::WriteFailed {
+                error: format!("Failed to send ExitPlanMode response to Claude: {err}"),
+                outcome_tx: None,
+            };
         }
 
         let Some(_) = self
             .take_pending_exit_plan_mode(turn_id, &pending.request_id)
             .await
         else {
-            return Ok(true);
+            return ClaudeAnswered::Settled(Ok(true));
         };
 
         let plan = exit_plan_mode_plan_info_from_arguments(&pending.input);
@@ -3380,7 +4021,104 @@ impl ClaudeInner {
             None,
         );
         self.emit_typing_status(true);
-        Ok(true)
+        ClaudeAnswered::Settled(Ok(true))
+    }
+
+    /// Runs `job` where it cannot interleave with the stdout reader's handling
+    /// of a frame: on the reader of the live process, or here when no reader
+    /// is live, with process starts held back until it finishes. Admission
+    /// waits out a reserved start, whose reader is not reachable until its
+    /// runtime is installed. A job is offered again only if it never started;
+    /// one whose reader was torn down mid-run is reported abandoned.
+    async fn run_turn_job<R, F, Fut>(self: &Arc<Self>, job: F) -> Result<R, ClaudeTurnJobAbandoned>
+    where
+        R: Send + 'static,
+        F: Fn(Arc<ClaudeInner>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+    {
+        loop {
+            let (reply, result) = oneshot::channel();
+            let (started, mut started_rx) = oneshot::channel();
+            let queued = job.clone();
+            let offer: ClaudeTurnJob = Box::new(move |inner| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let _ = reply.send(queued(inner).await);
+                })
+            });
+            let on_caller = self
+                .state
+                .with_after(ClaudeHold::SpawnsReserved, move |state, inner| {
+                    if let Some(runtime) = state.runtime.as_ref()
+                        && runtime.turn_jobs.send(offer).is_ok()
+                    {
+                        return None;
+                    }
+                    state.caller_turn_jobs += 1;
+                    Some(ClaudeCallerTurnJob {
+                        state: inner.state.clone(),
+                    })
+                })
+                .await;
+            if let Some(admission) = on_caller {
+                let value = job(Arc::clone(self)).await;
+                drop(admission);
+                return Ok(value);
+            }
+            if let Ok(value) = result.await {
+                return Ok(value);
+            }
+            if started_rx.try_recv().is_ok() {
+                return Err(ClaudeTurnJobAbandoned);
+            }
+        }
+    }
+
+    /// Runs one state transition where it cannot interleave with the stdout
+    /// reader's handling of a frame. The reader enqueues it synchronously when
+    /// it takes the job, so the job has no await at which a teardown could
+    /// leave it half-applied; one dropped untaken is offered again.
+    async fn run_turn_transition<R, F>(self: &Arc<Self>, transition: F) -> R
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ClaudeState, &Arc<ClaudeInner>) -> R + Clone + Send + 'static,
+    {
+        loop {
+            let (reply, result) = oneshot::channel();
+            let queued = transition.clone();
+            let offer: ClaudeTurnJob = Box::new(move |inner| {
+                inner.state.apply(move |state, inner| {
+                    if reply.is_closed() {
+                        return;
+                    }
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        queued(state, inner)
+                    }));
+                    let _ = reply.send(outcome);
+                });
+                Box::pin(std::future::ready(()))
+            });
+            let here = transition.clone();
+            let on_caller = self
+                .state
+                .with_after(ClaudeHold::SpawnsReserved, move |state, inner| {
+                    if let Some(runtime) = state.runtime.as_ref()
+                        && runtime.turn_jobs.send(offer).is_ok()
+                    {
+                        return None;
+                    }
+                    Some(here(state, inner))
+                })
+                .await;
+            if let Some(value) = on_caller {
+                return value;
+            }
+            match result.await {
+                Ok(Ok(value)) => return value,
+                Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                Err(_) => {}
+            }
+        }
     }
 
     async fn take_pending_ask_user_question(
@@ -3388,20 +4126,24 @@ impl ClaudeInner {
         turn_id: u64,
         request_id: &str,
     ) -> Option<PendingAskUserQuestionControl> {
-        let mut state = self.state.lock().await;
-        let active = state.active_turn.as_mut()?;
-        if active.id != turn_id {
-            return None;
-        }
-        if active
-            .pending_ask_user_question
-            .as_ref()
-            .is_some_and(|pending| pending.request_id == request_id)
-        {
-            active.pending_ask_user_question.take()
-        } else {
-            None
-        }
+        let request_id = request_id.to_owned();
+        self.state
+            .with(move |state| {
+                let active = state.active_turn.as_mut()?;
+                if active.id != turn_id {
+                    return None;
+                }
+                if active
+                    .pending_ask_user_question
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    active.pending_ask_user_question.take()
+                } else {
+                    None
+                }
+            })
+            .await
     }
 
     async fn take_pending_exit_plan_mode(
@@ -3409,36 +4151,50 @@ impl ClaudeInner {
         turn_id: u64,
         request_id: &str,
     ) -> Option<PendingExitPlanModeControl> {
-        let mut state = self.state.lock().await;
-        let active = state.active_turn.as_mut()?;
-        if active.id != turn_id {
-            return None;
-        }
-        if active
-            .pending_exit_plan_mode
-            .as_ref()
-            .is_some_and(|pending| pending.request_id == request_id)
-        {
-            active.pending_exit_plan_mode.take()
-        } else {
-            None
-        }
+        let request_id = request_id.to_owned();
+        self.state
+            .with(move |state| {
+                let active = state.active_turn.as_mut()?;
+                if active.id != turn_id {
+                    return None;
+                }
+                if active
+                    .pending_exit_plan_mode
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    active.pending_exit_plan_mode.take()
+                } else {
+                    None
+                }
+            })
+            .await
     }
 
     async fn fail_pending_ask_user_question(&self, turn_id: u64, message: &str) -> bool {
-        let pending = {
-            let mut state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_mut() else {
-                return false;
-            };
-            if active.id != turn_id {
-                return false;
-            }
-            active.pending_ask_user_question.take()
-        };
-        let Some(pending) = pending else {
-            return false;
-        };
+        let message = message.to_owned();
+        self.state
+            .with_inner(move |state, inner| {
+                let Some(active) = state.active_turn.as_mut() else {
+                    return false;
+                };
+                if active.id != turn_id {
+                    return false;
+                }
+                let Some(pending) = active.pending_ask_user_question.take() else {
+                    return false;
+                };
+                inner.emit_ask_user_question_failed(&pending, &message);
+                true
+            })
+            .await
+    }
+
+    fn emit_ask_user_question_failed(
+        &self,
+        pending: &PendingAskUserQuestionControl,
+        message: &str,
+    ) {
         self.emit_tool_execution_completed(
             &pending.tool_call_id,
             &pending.tool_name,
@@ -3448,25 +4204,30 @@ impl ClaudeInner {
                 "short_message": "AskUserQuestion failed",
                 "detailed_message": message,
             }),
-            Some(message.to_string()),
+            Some(message.to_owned()),
         );
-        true
     }
 
     async fn fail_pending_exit_plan_mode(&self, turn_id: u64, message: &str) -> bool {
-        let pending = {
-            let mut state = self.state.lock().await;
-            let Some(active) = state.active_turn.as_mut() else {
-                return false;
-            };
-            if active.id != turn_id {
-                return false;
-            }
-            active.pending_exit_plan_mode.take()
-        };
-        let Some(pending) = pending else {
-            return false;
-        };
+        let message = message.to_owned();
+        self.state
+            .with_inner(move |state, inner| {
+                let Some(active) = state.active_turn.as_mut() else {
+                    return false;
+                };
+                if active.id != turn_id {
+                    return false;
+                }
+                let Some(pending) = active.pending_exit_plan_mode.take() else {
+                    return false;
+                };
+                inner.emit_exit_plan_mode_failed(&pending, &message);
+                true
+            })
+            .await
+    }
+
+    fn emit_exit_plan_mode_failed(&self, pending: &PendingExitPlanModeControl, message: &str) {
         self.emit_tool_execution_completed(
             &pending.tool_call_id,
             &pending.tool_name,
@@ -3476,86 +4237,95 @@ impl ClaudeInner {
                 "short_message": "ExitPlanMode failed",
                 "detailed_message": message,
             }),
-            Some(message.to_string()),
+            Some(message.to_owned()),
         );
-        true
     }
 
     async fn ensure_process_ready(self: &Arc<Self>) -> Result<(), String> {
-        if self.runtime.lock().await.is_some() {
+        let reserved = self
+            .state
+            .with_after(ClaudeHold::CallerTurnJobs, |state, inner| {
+                if state.runtime.is_some() {
+                    return Ok(None);
+                }
+                // A turn reserved just before shutdown must not respawn the CLI
+                // process after `shutdown_process` has killed it.
+                if state.closing {
+                    return Err("Claude backend is shutting down".to_string());
+                }
+                state.process_generation = state.process_generation.saturating_add(1);
+                let process_generation = state.process_generation;
+                state.compact_command_advertised = None;
+                state.provider_version = state.installed_provider_version.clone();
+                state
+                    .compaction_capability
+                    .send_replace(BackendCompactionCapability::unknown(
+                        BackendCompactionUnknownReason::ProcessNotInitialized,
+                        None,
+                        BackendCompactionCapabilityEvidence::None,
+                    ));
+                state.native_models = None;
+                state.native_tool_catalog = None;
+                let config = ClaudeProcessSpawnConfig {
+                    program: state.program.clone(),
+                    workspace_root: state.workspace_root.clone(),
+                    workspace_roots: state.workspace_roots.clone(),
+                    ssh_host: state.ssh_host.clone(),
+                    session_id: if state.ephemeral {
+                        None
+                    } else {
+                        state.session_id.clone()
+                    },
+                    fork_from_session_id: if state.ephemeral {
+                        None
+                    } else {
+                        state.fork_from_session_id.clone()
+                    },
+                    ephemeral: state.ephemeral,
+                    model: state.model.clone(),
+                    effort: state.effort,
+                    fast_mode: state.fast_mode,
+                    access_mode: state.access_mode,
+                    permission_mode: state.permission_mode.clone(),
+                    startup_mcp_config_json: state.startup_mcp_config_json.clone(),
+                    steering_content: state.steering_content.clone(),
+                    agent_identity: state.agent_identity.clone(),
+                    tool_policy: state.tool_policy.clone(),
+                    excluded_tool_categories: state.excluded_tool_categories.clone(),
+                    // Rebuilt from session state on every process start, so a
+                    // respawn after a crash or a post-turn restart points at the
+                    // root this session already materialized.
+                    skill_plugin_root: state
+                        .skill_plugin
+                        .as_ref()
+                        .map(|plugin| plugin.root().to_string_lossy().into_owned()),
+                };
+                let requires_resume_bootstrap = config.fork_from_session_id.is_some()
+                    || (config.session_id.is_some() && state.resume_bootstrap_required);
+                if requires_resume_bootstrap {
+                    state.resume_bootstrap = Some(ClaudeResumeBootstrap {
+                        generation: process_generation,
+                        fork_session: config.fork_from_session_id.is_some(),
+                        completions: Vec::new(),
+                        quarantined_frames: 0,
+                    });
+                    tracing::info!(
+                        process_generation,
+                        fork = config.fork_from_session_id.is_some(),
+                        "quarantining Claude CLI resume bootstrap until its terminal result"
+                    );
+                } else {
+                    state.resume_bootstrap = None;
+                }
+                state.spawns_reserved += 1;
+                let reservation = ClaudeSpawnReservation {
+                    state: Some(inner.state.clone()),
+                };
+                Ok(Some((config, process_generation, reservation)))
+            })
+            .await?;
+        let Some((config, process_generation, reservation)) = reserved else {
             return Ok(());
-        }
-
-        let (config, process_generation) = {
-            let mut state = self.state.lock().await;
-            // A turn reserved just before shutdown must not respawn the CLI
-            // process after `shutdown_process` has killed it.
-            if state.closing {
-                return Err("Claude backend is shutting down".to_string());
-            }
-            state.process_generation = state.process_generation.saturating_add(1);
-            let process_generation = state.process_generation;
-            state.compact_command_advertised = None;
-            state.provider_version = state.installed_provider_version.clone();
-            state.compaction_capability = BackendCompactionCapability::unknown(
-                BackendCompactionUnknownReason::ProcessNotInitialized,
-                None,
-                BackendCompactionCapabilityEvidence::None,
-            );
-            state.native_models = None;
-            state.native_tool_catalog = None;
-            let config = ClaudeProcessSpawnConfig {
-                program: state.program.clone(),
-                workspace_root: state.workspace_root.clone(),
-                workspace_roots: state.workspace_roots.clone(),
-                ssh_host: state.ssh_host.clone(),
-                session_id: if state.ephemeral {
-                    None
-                } else {
-                    state.session_id.clone()
-                },
-                fork_from_session_id: if state.ephemeral {
-                    None
-                } else {
-                    state.fork_from_session_id.clone()
-                },
-                ephemeral: state.ephemeral,
-                model: state.model.clone(),
-                effort: state.effort,
-                fast_mode: state.fast_mode,
-                access_mode: state.access_mode,
-                permission_mode: state.permission_mode.clone(),
-                startup_mcp_config_json: state.startup_mcp_config_json.clone(),
-                steering_content: state.steering_content.clone(),
-                agent_identity: state.agent_identity.clone(),
-                tool_policy: state.tool_policy.clone(),
-                excluded_tool_categories: state.excluded_tool_categories.clone(),
-                // Rebuilt from session state on every process start, so a
-                // respawn after a crash or a post-turn restart points at the
-                // root this session already materialized.
-                skill_plugin_root: state
-                    .skill_plugin
-                    .as_ref()
-                    .map(|plugin| plugin.root().to_string_lossy().into_owned()),
-            };
-            let requires_resume_bootstrap = config.fork_from_session_id.is_some()
-                || (config.session_id.is_some() && state.resume_bootstrap_required);
-            if requires_resume_bootstrap {
-                state.resume_bootstrap = Some(ClaudeResumeBootstrap {
-                    generation: process_generation,
-                    fork_session: config.fork_from_session_id.is_some(),
-                    completions: Vec::new(),
-                    quarantined_frames: 0,
-                });
-                tracing::info!(
-                    process_generation,
-                    fork = config.fork_from_session_id.is_some(),
-                    "quarantining Claude CLI resume bootstrap until its terminal result"
-                );
-            } else {
-                state.resume_bootstrap = None;
-            }
-            (config, process_generation)
         };
 
         // Re-armed per process: each process emits its own `init` frame, and a
@@ -3577,18 +4347,25 @@ impl ClaudeInner {
         let runtime = match self.spawn_process(config, process_generation).await {
             Ok(runtime) => runtime,
             Err(error) => {
+                drop(reservation);
                 self.fail_resume_bootstrap(process_generation, &error).await;
                 return Err(error);
             }
         };
-        {
-            let mut runtime_slot = self.runtime.lock().await;
-            if runtime_slot.is_some() {
-                drop(runtime_slot);
-                runtime.kill().await;
-                return Ok(());
-            }
-            *runtime_slot = Some(runtime);
+        let displaced = self
+            .state
+            .with(move |state| {
+                reservation.release(state);
+                if state.runtime.is_some() {
+                    return Some(runtime);
+                }
+                state.runtime = Some(runtime);
+                None
+            })
+            .await;
+        if let Some(runtime) = displaced {
+            runtime.kill().await;
+            return Ok(());
         }
         match tokio::time::timeout(
             CLAUDE_INITIALIZE_TIMEOUT,
@@ -3610,7 +4387,9 @@ impl ClaudeInner {
                             model_count = models.len(),
                             "Discovered Claude native models"
                         );
-                        self.state.lock().await.native_models = Some(models);
+                        self.state
+                            .with(move |state| state.native_models = Some(models))
+                            .await;
                     }
                     Ok(_) => {
                         self.shutdown_process().await;
@@ -3774,7 +4553,7 @@ impl ClaudeInner {
                 // A restart replaces every server this watcher was asked about,
                 // and the new process runs its own gate. Without this the old
                 // watcher reports against a process that no longer exists.
-                if this.state.lock().await.process_generation != process_generation {
+                if this.state.with(|state| state.process_generation).await != process_generation {
                     return;
                 }
                 let expired = tokio::time::Instant::now() >= deadline;
@@ -3837,37 +4616,44 @@ impl ClaudeInner {
         let terminal = value.get("type").and_then(Value::as_str) == Some("result");
         let init = value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("init");
-        let completions = {
-            let mut state = self.state.lock().await;
-            let Some(bootstrap) = state.resume_bootstrap.as_mut() else {
-                let startup_result =
-                    state.resume_empty_result_generation == Some(process_generation) && terminal;
-                let ignore_empty = startup_result
-                    && value
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .is_none_or(|result| result.trim().is_empty());
-                if startup_result {
-                    state.resume_empty_result_generation = None;
+        let empty_result = value
+            .get("result")
+            .and_then(Value::as_str)
+            .is_none_or(|result| result.trim().is_empty());
+        let completions = self
+            .state
+            .with(move |state| {
+                let Some(bootstrap) = state.resume_bootstrap.as_mut() else {
+                    let startup_result = state.resume_empty_result_generation
+                        == Some(process_generation)
+                        && terminal;
+                    let ignore_empty = startup_result && empty_result;
+                    if startup_result {
+                        state.resume_empty_result_generation = None;
+                    }
+                    return Err(ignore_empty);
+                };
+                if bootstrap.generation != process_generation {
+                    return Err(false);
                 }
-                return ignore_empty;
-            };
-            if bootstrap.generation != process_generation {
-                return false;
-            }
-            bootstrap.quarantined_frames = bootstrap.quarantined_frames.saturating_add(1);
-            if init {
-                let bootstrap = state
-                    .resume_bootstrap
-                    .take()
-                    .expect("matching Claude resume bootstrap disappeared");
-                if bootstrap.fork_session {
-                    state.resume_empty_result_generation = Some(process_generation);
+                bootstrap.quarantined_frames = bootstrap.quarantined_frames.saturating_add(1);
+                if init {
+                    let bootstrap = state
+                        .resume_bootstrap
+                        .take()
+                        .expect("matching Claude resume bootstrap disappeared");
+                    if bootstrap.fork_session {
+                        state.resume_empty_result_generation = Some(process_generation);
+                    }
+                    Ok(Some((bootstrap.completions, bootstrap.quarantined_frames)))
+                } else {
+                    Ok(None)
                 }
-                Some((bootstrap.completions, bootstrap.quarantined_frames))
-            } else {
-                None
-            }
+            })
+            .await;
+        let completions = match completions {
+            Ok(completions) => completions,
+            Err(quarantined) => return quarantined,
         };
         if let Some((completions, quarantined_frames)) = completions {
             tracing::info!(
@@ -3897,21 +4683,23 @@ impl ClaudeInner {
     }
 
     async fn fail_resume_bootstrap(&self, process_generation: u64, error: &str) {
-        let completions = {
-            let mut state = self.state.lock().await;
-            if state
-                .resume_bootstrap
-                .as_ref()
-                .is_some_and(|bootstrap| bootstrap.generation == process_generation)
-            {
-                state
+        let completions = self
+            .state
+            .with(move |state| {
+                if state
                     .resume_bootstrap
-                    .take()
-                    .map(|bootstrap| bootstrap.completions)
-            } else {
-                None
-            }
-        };
+                    .as_ref()
+                    .is_some_and(|bootstrap| bootstrap.generation == process_generation)
+                {
+                    state
+                        .resume_bootstrap
+                        .take()
+                        .map(|bootstrap| bootstrap.completions)
+                } else {
+                    None
+                }
+            })
+            .await;
         if let Some(completions) = completions {
             tracing::warn!(process_generation, error, "Claude resume bootstrap failed");
             for completion in completions {
@@ -3924,15 +4712,21 @@ impl ClaudeInner {
         let Some(commands) = claude_initialize_slash_commands(response) else {
             return;
         };
-        let mut state = self.state.lock().await;
-        state.initialize_slash_commands = Some(commands);
-        self.publish_slash_commands(&mut state);
+        self.state
+            .with_inner(move |state, inner| {
+                state.initialize_slash_commands = Some(commands);
+                inner.publish_slash_commands(state);
+            })
+            .await;
     }
 
     async fn record_init_slash_commands(&self, update: ClaudeInitSlashCommands) {
-        let mut state = self.state.lock().await;
-        state.init_slash_commands = Some(update);
-        self.publish_slash_commands(&mut state);
+        self.state
+            .with_inner(move |state, inner| {
+                state.init_slash_commands = Some(update);
+                inner.publish_slash_commands(state);
+            })
+            .await;
     }
 
     async fn record_native_tool_catalog(
@@ -3944,99 +4738,103 @@ impl ClaudeInner {
             return Ok(());
         }
         let reported = claude_init_frame_native_tool_catalog(value);
-        let mut state = self.state.lock().await;
-        if state.process_generation != process_generation || state.closing {
-            return Ok(());
-        }
-        let verification_required = state.access_mode == BackendAccessMode::EnforcedReadOnly
-            || !state.excluded_tool_categories.is_empty();
-        let Some(reported) = reported else {
-            if state.native_tool_catalog.is_none()
-                && state.resume_bootstrap.is_none()
-                && verification_required
-                && matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("assistant" | "stream_event" | "event" | "result" | "control_request")
-                )
-            {
-                return Err(
-                    "Claude began a restricted turn without confirming its native tool catalog"
-                        .to_owned(),
-                );
-            }
-            return Ok(());
-        };
-        state.native_tool_catalog = None;
-        let catalog = match reported {
-            Ok(catalog) => catalog,
-            Err(error) if verification_required => return Err(error),
-            Err(error) => {
-                tracing::warn!(
-                    process_generation,
-                    error,
-                    "Claude optional native tool catalog unavailable"
-                );
-                return Ok(());
-            }
-        };
-        if state
-            .session_id
-            .as_ref()
-            .is_some_and(|session_id| session_id != &catalog.session_id.0)
-        {
-            let error = "Claude native tool catalog belongs to a different provider session";
-            if verification_required {
-                return Err(error.to_owned());
-            }
-            tracing::warn!(
-                process_generation,
-                error,
-                "Claude optional native tool catalog unavailable"
-            );
-            return Ok(());
-        }
-        for tool in &catalog.tools {
-            if let NativeToolKind::Controlled { category } = tool.kind
-                && state.excluded_tool_categories.contains(&category)
-            {
-                return Err("Claude advertised an excluded native tool category".to_owned());
-            }
-            if state.access_mode == BackendAccessMode::EnforcedReadOnly
-                && !matches!(
-                    tool.name.as_str(),
-                    "Read"
-                        | "Glob"
-                        | "Grep"
-                        | "AskUserQuestion"
-                        | "ExitPlanMode"
-                        | "mcp__tyde-agent-control__tyde_swarm_describe"
-                        | "mcp__tyde-agent-control__tyde_swarm_list_threads"
-                        | "mcp__tyde-agent-control__tyde_swarm_read_summary"
-                        | "mcp__tyde-agent-control__tyde_swarm_read_deltas"
-                        | "mcp__tyde-agent-control__tyde_swarm_create_thread"
-                        | "mcp__tyde-agent-control__tyde_swarm_update_thread"
-                        | "mcp__tyde-agent-control__tyde_swarm_read_board"
-                        | "mcp__tyde-agent-control__tyde_swarm_read_thread"
-                        | "mcp__tyde-agent-control__tyde_swarm_read_image"
-                )
-            {
-                return Err(
-                    "Claude advertised a tool outside its enforced read-only allowance".to_owned(),
-                );
-            }
-        }
-        tracing::info!(
-            process_generation,
-            tool_count = catalog.tools.len(),
-            unknown_tool_count = catalog
-                .tools
-                .iter()
-                .filter(|tool| tool.kind == NativeToolKind::Unknown)
-                .count(),
-            "Observed Claude provider-native tool catalog"
+        let restricted_frame = matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("assistant" | "stream_event" | "event" | "result" | "control_request")
         );
-        state.native_tool_catalog = Some(catalog);
-        Ok(())
+        self.state
+            .with(move |state| {
+                if state.process_generation != process_generation || state.closing {
+                    return Ok(());
+                }
+                let verification_required = state.access_mode == BackendAccessMode::EnforcedReadOnly
+                    || !state.excluded_tool_categories.is_empty();
+                let Some(reported) = reported else {
+                    if state.native_tool_catalog.is_none()
+                        && state.resume_bootstrap.is_none()
+                        && verification_required
+                        && restricted_frame
+                    {
+                        return Err(
+                            "Claude began a restricted turn without confirming its native tool catalog"
+                                .to_owned(),
+                        );
+                    }
+                    return Ok(());
+                };
+                state.native_tool_catalog = None;
+                let catalog = match reported {
+                    Ok(catalog) => catalog,
+                    Err(error) if verification_required => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(
+                            process_generation,
+                            error,
+                            "Claude optional native tool catalog unavailable"
+                        );
+                        return Ok(());
+                    }
+                };
+                if state
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session_id| session_id != &catalog.session_id.0)
+                {
+                    let error = "Claude native tool catalog belongs to a different provider session";
+                    if verification_required {
+                        return Err(error.to_owned());
+                    }
+                    tracing::warn!(
+                        process_generation,
+                        error,
+                        "Claude optional native tool catalog unavailable"
+                    );
+                    return Ok(());
+                }
+                for tool in &catalog.tools {
+                    if let NativeToolKind::Controlled { category } = tool.kind
+                        && state.excluded_tool_categories.contains(&category)
+                    {
+                        return Err("Claude advertised an excluded native tool category".to_owned());
+                    }
+                    if state.access_mode == BackendAccessMode::EnforcedReadOnly
+                        && !matches!(
+                            tool.name.as_str(),
+                            "Read"
+                                | "Glob"
+                                | "Grep"
+                                | "AskUserQuestion"
+                                | "ExitPlanMode"
+                                | "mcp__tyde-agent-control__tyde_swarm_describe"
+                                | "mcp__tyde-agent-control__tyde_swarm_list_threads"
+                                | "mcp__tyde-agent-control__tyde_swarm_read_summary"
+                                | "mcp__tyde-agent-control__tyde_swarm_read_deltas"
+                                | "mcp__tyde-agent-control__tyde_swarm_create_thread"
+                                | "mcp__tyde-agent-control__tyde_swarm_update_thread"
+                                | "mcp__tyde-agent-control__tyde_swarm_read_board"
+                                | "mcp__tyde-agent-control__tyde_swarm_read_thread"
+                                | "mcp__tyde-agent-control__tyde_swarm_read_image"
+                        )
+                    {
+                        return Err(
+                            "Claude advertised a tool outside its enforced read-only allowance".to_owned(),
+                        );
+                    }
+                }
+                tracing::info!(
+                    process_generation,
+                    tool_count = catalog.tools.len(),
+                    unknown_tool_count = catalog
+                        .tools
+                        .iter()
+                        .filter(|tool| tool.kind == NativeToolKind::Unknown)
+                        .count(),
+                    "Observed Claude provider-native tool catalog"
+                );
+                state.native_tool_catalog = Some(catalog);
+                Ok(())
+            })
+            .await
     }
 
     /// Advertise the effective set once the `init` frame has arrived: it is
@@ -4071,10 +4869,8 @@ impl ClaudeInner {
     async fn configure_capacity_from_initialize(&self, response: &Value) {
         self.record_initialize_slash_commands(response).await;
         let access = claude_capacity_access_from_initialize(response);
-        let emitter = {
-            let mut state = self.state.lock().await;
-            state.capacity_access = access;
-            state.compact_command_advertised = response
+        let compact_command_advertised =
+            response
                 .get("commands")
                 .and_then(Value::as_array)
                 .map(|commands| {
@@ -4085,22 +4881,31 @@ impl ClaudeInner {
                             .is_some_and(|name| name.trim_start_matches('/') == "compact")
                     })
                 });
-            if state.provider_version.is_none() {
-                state.provider_version = response
-                    .get("claudeCodeVersion")
-                    .or_else(|| response.get("version"))
-                    .and_then(Value::as_str)
-                    .and_then(normalize_nonempty);
-            }
-            if state.provider_version.is_some() {
-                state.installed_provider_version = state.provider_version.clone();
-            }
-            state.compaction_capability = claude_compaction_capability(
-                state.compact_command_advertised,
-                state.provider_version.as_deref(),
-            );
-            state.subagent_emitter.clone()
-        };
+        let reported_version = response
+            .get("claudeCodeVersion")
+            .or_else(|| response.get("version"))
+            .and_then(Value::as_str)
+            .and_then(normalize_nonempty);
+        let emitter = self
+            .state
+            .with(move |state| {
+                state.capacity_access = access;
+                state.compact_command_advertised = compact_command_advertised;
+                if state.provider_version.is_none() {
+                    state.provider_version = reported_version;
+                }
+                if state.provider_version.is_some() {
+                    state.installed_provider_version = state.provider_version.clone();
+                }
+                state
+                    .compaction_capability
+                    .send_replace(claude_compaction_capability(
+                        state.compact_command_advertised,
+                        state.provider_version.as_deref(),
+                    ));
+                state.subagent_emitter.clone()
+            })
+            .await;
         let Some(emitter) = emitter else {
             return;
         };
@@ -4134,66 +4939,76 @@ impl ClaudeInner {
         if version.is_none() {
             return;
         }
-        let mut state = self.state.lock().await;
-        state.installed_provider_version = version.clone();
-        state.provider_version = version;
-        state.compaction_capability = claude_compaction_capability(
-            state.compact_command_advertised,
-            state.provider_version.as_deref(),
-        );
+        self.state
+            .with(move |state| {
+                state.installed_provider_version = version.clone();
+                state.provider_version = version;
+                state
+                    .compaction_capability
+                    .send_replace(claude_compaction_capability(
+                        state.compact_command_advertised,
+                        state.provider_version.as_deref(),
+                    ));
+            })
+            .await;
     }
 
     async fn schedule_capacity_refresh(self: &Arc<Self>) {
-        let should_refresh = {
-            let mut state = self.state.lock().await;
-            if state.capacity_access != ClaudeCapacityAccess::Subscription
-                || state.capacity_refresh_in_flight
-            {
-                false
-            } else {
-                state.capacity_refresh_in_flight = true;
-                true
-            }
-        };
-        if !should_refresh {
-            return;
-        }
         let this = Arc::clone(self);
-        crate::backend::subprocess::spawn(async move {
-            let result = this.send_control_request("get_usage").await;
-            let capacity = match result {
-                Ok(response) => map_claude_control_usage(&response),
-                Err(_) => Err(CapacityUnavailableReason::SourceUnreachable),
-            };
-            let (emitter, should_emit) = {
-                let mut state = this.state.lock().await;
+        self.state
+            .with(move |state| {
+                if state.capacity_access != ClaudeCapacityAccess::Subscription
+                    || state.capacity_refresh_in_flight
+                {
+                    return;
+                }
+                state.capacity_refresh_in_flight = true;
+                // Spawned in the admitting transition, so a caller aborted
+                // before its reply cannot leave the flag set with no refresh.
+                crate::backend::subprocess::spawn(this.refresh_capacity());
+            })
+            .await;
+    }
+
+    async fn refresh_capacity(self: Arc<Self>) {
+        let result = self.send_control_request("get_usage").await;
+        let capacity = match result {
+            Ok(response) => map_claude_control_usage(&response),
+            Err(_) => Err(CapacityUnavailableReason::SourceUnreachable),
+        };
+        let capacity_known = capacity.is_ok();
+        let (emitter, should_emit) = self
+            .state
+            .with(move |state| {
                 state.capacity_refresh_in_flight = false;
-                let should_emit = capacity.is_ok() || !state.capacity_report_emitted;
-                if capacity.is_ok() {
+                let should_emit = capacity_known || !state.capacity_report_emitted;
+                if capacity_known {
                     state.authoritative_capacity_emitted = true;
                     state.capacity_report_emitted = true;
                 }
                 (state.subagent_emitter.clone(), should_emit)
+            })
+            .await;
+        if should_emit && let Some(emitter) = emitter {
+            let capacity = match capacity {
+                Ok(report) => protocol::BackendCapacityState::Known { report },
+                Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
             };
-            if should_emit && let Some(emitter) = emitter {
-                let capacity = match capacity {
-                    Ok(report) => protocol::BackendCapacityState::Known { report },
-                    Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
-                };
-                emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
-            }
-        });
+            emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
+        }
     }
 
     async fn handle_passive_capacity(self: &Arc<Self>, frame: &Value) {
-        let (emitter, should_forward) = {
-            let mut state = self.state.lock().await;
-            let should_forward = !state.authoritative_capacity_emitted;
-            if should_forward {
-                state.capacity_report_emitted = true;
-            }
-            (state.subagent_emitter.clone(), should_forward)
-        };
+        let (emitter, should_forward) = self
+            .state
+            .with(|state| {
+                let should_forward = !state.authoritative_capacity_emitted;
+                if should_forward {
+                    state.capacity_report_emitted = true;
+                }
+                (state.subagent_emitter.clone(), should_forward)
+            })
+            .await;
         if should_forward && let Some(emitter) = emitter {
             forward_passive_rate_limit_event(frame, emitter.as_ref());
         }
@@ -4263,15 +5078,14 @@ impl ClaudeInner {
             .take_stderr()
             .ok_or_else(|| "Failed to capture Claude stderr".to_string())?;
 
-        let stdin = Arc::new(Mutex::new(stdin));
-        let child = Arc::new(Mutex::new(Some(child)));
-        let control_waiters = Arc::new(Mutex::new(HashMap::new()));
+        let stdin = ClaudeStdinWriter::spawn(stdin);
+        let (turn_jobs, turn_job_rx) = mpsc::unbounded_channel();
         self.activate_background_task_owner();
         let stdout_task = crate::backend::subprocess::spawn(read_claude_stdout_persistent(
             stdout,
             Arc::clone(self),
-            Arc::clone(&control_waiters),
-            Arc::clone(&stdin),
+            stdin.clone(),
+            turn_job_rx,
             process_generation,
         ));
         let stderr_task = crate::backend::subprocess::spawn(read_claude_stderr_persistent(
@@ -4282,22 +5096,26 @@ impl ClaudeInner {
         Ok(ClaudeProcessRuntime {
             generation: process_generation,
             stdin,
-            child,
-            control_waiters,
+            child: Some(child),
+            turn_jobs,
             stdout_task,
             stderr_task,
         })
     }
 
     async fn write_process_json_line(&self, value: &Value) -> Result<(), String> {
-        let stdin = {
-            let runtime = self.runtime.lock().await;
-            runtime
-                .as_ref()
-                .map(|runtime| Arc::clone(&runtime.stdin))
-                .ok_or_else(|| "Claude CLI process is not running".to_string())?
-        };
-        write_json_line_to_stdin(&stdin, value).await
+        let value = value.clone();
+        self.state
+            .with(move |state| {
+                state
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.stdin.submit(&value))
+                    .ok_or_else(|| "Claude CLI process is not running".to_string())
+            })
+            .await?
+            .result()
+            .await
     }
 
     async fn send_control_request(&self, subtype: &str) -> Result<Value, String> {
@@ -4328,21 +5146,32 @@ impl ClaudeInner {
         value: Value,
         timeout_duration: Duration,
     ) -> Result<Value, String> {
-        let (stdin, control_waiters) = {
-            let runtime = self.runtime.lock().await;
-            let runtime = runtime
-                .as_ref()
-                .ok_or_else(|| "Claude CLI process is not running".to_string())?;
-            (
-                Arc::clone(&runtime.stdin),
-                Arc::clone(&runtime.control_waiters),
-            )
-        };
-
         let (tx, rx) = oneshot::channel();
-        control_waiters.lock().await.insert(request_id.clone(), tx);
-        if let Err(err) = write_json_line_to_stdin(&stdin, &value).await {
-            control_waiters.lock().await.remove(&request_id);
+        let waiter_id = request_id.clone();
+        let written = self
+            .state
+            .with(move |state| {
+                let runtime = state
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| "Claude CLI process is not running".to_string())?;
+                let written = runtime.stdin.submit(&value);
+                let generation = runtime.generation;
+                state.control_waiters.insert(
+                    waiter_id,
+                    ClaudeControlWaiter {
+                        generation,
+                        reply: tx,
+                    },
+                );
+                Ok::<_, String>(written)
+            })
+            .await?;
+        if let Err(err) = written.result().await {
+            let waiter_id = request_id.clone();
+            self.state
+                .with(move |state| state.control_waiters.remove(&waiter_id))
+                .await;
             return Err(err);
         }
 
@@ -4352,7 +5181,10 @@ impl ClaudeInner {
                 "Claude control request '{request_id}' was dropped before a response"
             )),
             Err(_) => {
-                control_waiters.lock().await.remove(&request_id);
+                let waiter_id = request_id.clone();
+                self.state
+                    .with(move |state| state.control_waiters.remove(&waiter_id))
+                    .await;
                 Err(format!(
                     "Timed out waiting for Claude control response to '{request_id}'"
                 ))
@@ -4361,23 +5193,30 @@ impl ClaudeInner {
     }
 
     async fn active_turn_interrupted(&self, turn_id: u64) -> bool {
-        let state = self.state.lock().await;
-        state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.id == turn_id && active.interrupt_requested)
+        self.state
+            .with(move |state| {
+                state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.id == turn_id && active.interrupt_requested)
+            })
+            .await
     }
 
     async fn active_turn_pending_outcome_id(&self) -> Option<u64> {
-        let state = self.state.lock().await;
-        state.active_turn.as_ref().and_then(|active| {
-            if active.outcome_tx.is_some() || matches!(active.owner, ClaudeTurnOwner::Compaction(_))
-            {
-                Some(active.id)
-            } else {
-                None
-            }
-        })
+        self.state
+            .with(|state| {
+                state.active_turn.as_ref().and_then(|active| {
+                    if active.outcome_tx.is_some()
+                        || matches!(active.owner, ClaudeTurnOwner::Compaction(_))
+                    {
+                        Some(active.id)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .await
     }
 
     async fn complete_active_turn_with_outcome(&self, turn_id: u64, outcome: TurnOutcome) -> bool {
@@ -4394,30 +5233,32 @@ impl ClaudeInner {
         &self,
         turn_id: u64,
     ) -> Option<oneshot::Sender<TurnOutcome>> {
-        {
-            let mut state = self.state.lock().await;
-            let active = state.active_turn.as_mut()?;
-            if active.id != turn_id {
-                return None;
-            }
-            active.outcome_tx.take()
-        }
+        self.state
+            .with(move |state| {
+                let active = state.active_turn.as_mut()?;
+                if active.id != turn_id {
+                    return None;
+                }
+                active.outcome_tx.take()
+            })
+            .await
     }
 
     /// The identity to decide a skill gap against, taken now.
     async fn current_skill_failure_target(&self) -> SkillFailureTarget {
-        let state = self.state.lock().await;
-        SkillFailureTarget {
-            generation: state.skill_verification_generation,
-            turn_id: state.active_turn.as_ref().map(|active| active.id),
-        }
+        self.state
+            .with(|state| SkillFailureTarget {
+                generation: state.skill_verification_generation,
+                turn_id: state.active_turn.as_ref().map(|active| active.id),
+            })
+            .await
     }
 
     /// Commit a skill gap, or decline it.
     ///
-    /// Every check and every mutation happens in one critical section under the
-    /// state lock — the same lock a cancel takes. That makes the two linearize:
-    /// whichever acquires it first wins, and the loser's revalidation fails
+    /// Every check and every mutation happens in one state transition — the
+    /// same owner a cancel goes through. That makes the two linearize:
+    /// whichever reaches it first wins, and the loser's revalidation fails
     /// rather than half-applying. A gap declines when the process has moved on,
     /// when verification is no longer pending, when a cancel already marked
     /// abandonment, when the active turn is not the exact one the gap was
@@ -4431,54 +5272,60 @@ impl ClaudeInner {
         target: &SkillFailureTarget,
         reason: &str,
     ) -> Option<CommittedSkillFailure> {
-        let mut state = self.state.lock().await;
+        let target_generation = target.generation;
+        let target_turn_id = target.turn_id;
+        let reason = reason.to_string();
+        self.state
+            .with_inner(move |state, inner| {
+                if state.skill_verification_generation != target_generation {
+                    tracing::debug!(
+                        "Declining a Claude skill failure from generation {}; the session is on {}",
+                        target_generation,
+                        state.skill_verification_generation
+                    );
+                    return None;
+                }
+                if inner.skill_verification_abandoned.load(Ordering::Relaxed) {
+                    tracing::debug!("Declining a Claude skill failure; the turn was cancelled first");
+                    return None;
+                }
+                if !matches!(
+                    *inner.skill_readiness.borrow(),
+                    ClaudeSkillReadiness::Pending
+                ) {
+                    tracing::debug!("Declining a Claude skill failure; verification already settled");
+                    return None;
+                }
 
-        if state.skill_verification_generation != target.generation {
-            tracing::debug!(
-                "Declining a Claude skill failure from generation {}; the session is on {}",
-                target.generation,
-                state.skill_verification_generation
-            );
-            return None;
-        }
-        if self.skill_verification_abandoned.load(Ordering::Relaxed) {
-            tracing::debug!("Declining a Claude skill failure; the turn was cancelled first");
-            return None;
-        }
-        if !matches!(
-            *self.skill_readiness.borrow(),
-            ClaudeSkillReadiness::Pending
-        ) {
-            tracing::debug!("Declining a Claude skill failure; verification already settled");
-            return None;
-        }
+                let active_turn_id = state.active_turn.as_ref().map(|active| active.id);
+                if active_turn_id != target_turn_id {
+                    tracing::debug!(
+                        "Declining a Claude skill failure decided for turn {:?}; turn {:?} is active",
+                        target_turn_id,
+                        active_turn_id
+                    );
+                    return None;
+                }
+                if state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.interrupt_requested)
+                {
+                    tracing::debug!("Declining a Claude skill failure; that turn was interrupted");
+                    return None;
+                }
 
-        let active_turn_id = state.active_turn.as_ref().map(|active| active.id);
-        if active_turn_id != target.turn_id {
-            tracing::debug!(
-                "Declining a Claude skill failure decided for turn {:?}; turn {:?} is active",
-                target.turn_id,
-                active_turn_id
-            );
-            return None;
-        }
-        if state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.interrupt_requested)
-        {
-            tracing::debug!("Declining a Claude skill failure; that turn was interrupted");
-            return None;
-        }
-
-        // Committed. Transition and disown the watchdog. The turn's outcome
-        // sender is deliberately left alone: the turn is still the user's turn
-        // and still completes on its own terms. A skill Tyde could not expose
-        // does not make the model's answer void.
-        self.skill_readiness
-            .send_replace(ClaudeSkillReadiness::Degraded(reason.to_string()));
-        let watchdog = state.skill_watchdog.take();
-        Some(CommittedSkillFailure { watchdog })
+                // Committed. Transition and disown the watchdog. The turn's outcome
+                // sender is deliberately left alone: the turn is still the user's turn
+                // and still completes on its own terms. A skill Tyde could not expose
+                // does not make the model's answer void.
+                inner
+                    .skill_readiness
+                    .send_replace(ClaudeSkillReadiness::Degraded(reason));
+                let watchdog = state.skill_watchdog.take();
+                Some(CommittedSkillFailure { watchdog })
+            })
+            .await
     }
 
     /// Report a skill gap decided against `target`, and let the session run on.
@@ -4528,13 +5375,10 @@ impl ClaudeInner {
     /// out loud, because the alternative is a session that believes it has a
     /// skill it does not have.
     async fn record_skill_init_frame(&self, reported: Result<Option<Vec<String>>, String>) {
-        let expected = {
-            let state = self.state.lock().await;
-            if state.expected_skills.is_empty() {
-                return;
-            }
-            state.expected_skills.clone()
-        };
+        let expected = self.state.with(|state| state.expected_skills.clone()).await;
+        if expected.is_empty() {
+            return;
+        }
         if *self.skill_readiness.borrow() != ClaudeSkillReadiness::Pending {
             // Already settled for this process; a later frame does not re-open it.
             return;
@@ -4588,48 +5432,53 @@ impl ClaudeInner {
     /// would otherwise leave the session holding its output forever. This turns
     /// that into a visible failure on the same timeout the handshake uses.
     async fn watch_for_skill_verification(self: &Arc<Self>) {
-        // Everything under one lock, in the caller's task. The previous version
-        // spawned a task to read the generation and register the handle, which
-        // left a window: a cancel landing inside it found no handle to abort
-        // and then the spawned task read the *post-cancel* generation, so both
-        // guards passed and the timer fired on a cancelled turn.
-        let mut state = self.state.lock().await;
-        if !matches!(
-            *self.skill_readiness.borrow(),
-            ClaudeSkillReadiness::Pending
-        ) || self.skill_verification_abandoned.load(Ordering::Relaxed)
-        {
-            return;
-        }
-        // The identity this timer is for, captured now under the same lock that
-        // arms it. Revalidated by `commit_skill_failure` when it fires, so a
-        // timer that outlives its process or its turn declines instead of
-        // settling something it was never about.
-        let target = SkillFailureTarget {
-            generation: state.skill_verification_generation,
-            turn_id: state.active_turn.as_ref().map(|active| active.id),
-        };
-        let inner = Arc::clone(self);
-        let handle = crate::backend::subprocess::spawn(async move {
-            tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
-            // `abort_watchdog: false` — this task owns the handle it would be
-            // aborting, and cancelling itself would drop the settle.
-            inner
-                .report_skill_gap(
-                    &target,
-                    "Claude did not report which skills it loaded within the startup timeout.",
-                    false,
-                )
-                .await;
-        });
-        if let Some(previous) = state.skill_watchdog.replace(handle) {
-            previous.abort();
-        }
+        // Everything in one transition. The previous version spawned a task to
+        // read the generation and register the handle, which left a window: a
+        // cancel landing inside it found no handle to abort and then the
+        // spawned task read the *post-cancel* generation, so both guards
+        // passed and the timer fired on a cancelled turn.
+        self.state
+            .with_inner(|state, inner| {
+                if !matches!(
+                    *inner.skill_readiness.borrow(),
+                    ClaudeSkillReadiness::Pending
+                ) || inner.skill_verification_abandoned.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+                // The identity this timer is for, captured in the same
+                // transition that arms it. Revalidated by
+                // `commit_skill_failure` when it fires, so a timer that
+                // outlives its process or its turn declines instead of
+                // settling something it was never about.
+                let target = SkillFailureTarget {
+                    generation: state.skill_verification_generation,
+                    turn_id: state.active_turn.as_ref().map(|active| active.id),
+                };
+                let inner = Arc::clone(inner);
+                let handle = crate::backend::subprocess::spawn(async move {
+                    tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
+                    // `abort_watchdog: false` — this task owns the handle it
+                    // would be aborting, and cancelling itself would drop the
+                    // settle.
+                    inner
+                        .report_skill_gap(
+                            &target,
+                            "Claude did not report which skills it loaded within the startup timeout.",
+                            false,
+                        )
+                        .await;
+                });
+                if let Some(previous) = state.skill_watchdog.replace(handle) {
+                    previous.abort();
+                }
+            })
+            .await;
     }
 
     /// Stop the verification watchdog, if one is armed.
     async fn cancel_skill_watchdog(&self) {
-        let handle = self.state.lock().await.skill_watchdog.take();
+        let handle = self.state.with(|state| state.skill_watchdog.take()).await;
         if let Some(handle) = handle {
             handle.abort();
         }
@@ -4649,14 +5498,7 @@ impl ClaudeInner {
     /// real skill failure. Returns whether it marked, so the caller can retire
     /// the process that will now never report.
     async fn abandon_skill_verification_for_cancelled_turn(&self) -> bool {
-        let matching = {
-            let state = self.state.lock().await;
-            state
-                .active_turn
-                .as_ref()
-                .is_some_and(|active| active.interrupt_requested)
-        };
-        if !matching {
+        if !self.active_turn_is_interrupted().await {
             return false;
         }
         if !self.skills_awaiting_verification() {
@@ -4668,11 +5510,12 @@ impl ClaudeInner {
         // it and returns instead of failing the session.
         self.skill_verification_abandoned
             .store(true, Ordering::Relaxed);
-        {
-            let mut state = self.state.lock().await;
-            state.skill_verification_generation =
-                state.skill_verification_generation.wrapping_add(1);
-        }
+        self.state
+            .with(|state| {
+                state.skill_verification_generation =
+                    state.skill_verification_generation.wrapping_add(1);
+            })
+            .await;
         self.cancel_skill_watchdog().await;
         true
     }
@@ -4680,11 +5523,13 @@ impl ClaudeInner {
     /// Was the turn currently in flight interrupted by the user?
     async fn active_turn_is_interrupted(&self) -> bool {
         self.state
-            .lock()
+            .with(|state| {
+                state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.interrupt_requested)
+            })
             .await
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.interrupt_requested)
     }
 
     /// Arm skill verification for a session that materialized `expected`.
@@ -4697,11 +5542,13 @@ impl ClaudeInner {
     async fn arm_skill_verification(&self, expected: Vec<String>) {
         self.skill_verification_abandoned
             .store(false, Ordering::Relaxed);
-        let required = {
-            let mut state = self.state.lock().await;
-            state.expected_skills = expected;
-            !state.expected_skills.is_empty()
-        };
+        let required = self
+            .state
+            .with(move |state| {
+                state.expected_skills = expected;
+                !state.expected_skills.is_empty()
+            })
+            .await;
         self.skill_readiness.send_replace(if required {
             ClaudeSkillReadiness::Pending
         } else {
@@ -4716,14 +5563,16 @@ impl ClaudeInner {
         self.skill_verification_abandoned
             .store(false, Ordering::Relaxed);
         self.cancel_skill_watchdog().await;
-        let required = {
-            let mut state = self.state.lock().await;
-            // A new process gets a new generation, so any watchdog still
-            // sleeping for the old one can no longer act.
-            state.skill_verification_generation =
-                state.skill_verification_generation.wrapping_add(1);
-            !state.expected_skills.is_empty()
-        };
+        let required = self
+            .state
+            .with(|state| {
+                // A new process gets a new generation, so any watchdog still
+                // sleeping for the old one can no longer act.
+                state.skill_verification_generation =
+                    state.skill_verification_generation.wrapping_add(1);
+                !state.expected_skills.is_empty()
+            })
+            .await;
         if required {
             self.skill_readiness
                 .send_replace(ClaudeSkillReadiness::Pending);
@@ -4739,19 +5588,20 @@ impl ClaudeInner {
     /// and its readers are aborted first: its exit handling would otherwise
     /// treat the newly admitted turn, and any replacement runtime, as its own.
     async fn retire_stale_process(&self) {
-        let Some(stale) = self.state.lock().await.stale_process_generation else {
-            return;
-        };
-        let runtime = {
-            let mut slot = self.runtime.lock().await;
-            if !slot
-                .as_ref()
-                .is_some_and(|runtime| runtime.generation <= stale)
-            {
-                return;
-            }
-            slot.take()
-        };
+        let runtime = self
+            .state
+            .with(|state| {
+                let stale = state.stale_process_generation?;
+                if !state
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.generation <= stale)
+                {
+                    return None;
+                }
+                state.runtime.take()
+            })
+            .await;
         let Some(runtime) = runtime else {
             return;
         };
@@ -4773,14 +5623,16 @@ impl ClaudeInner {
     }
 
     async fn shutdown_process(&self) {
-        let resume_bootstrap_generation = {
-            let mut state = self.state.lock().await;
-            state.native_tool_catalog = None;
-            state
-                .resume_bootstrap
-                .as_ref()
-                .map(|bootstrap| bootstrap.generation)
-        };
+        let resume_bootstrap_generation = self
+            .state
+            .with(|state| {
+                state.native_tool_catalog = None;
+                state
+                    .resume_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.generation)
+            })
+            .await;
         if let Some(process_generation) = resume_bootstrap_generation {
             self.fail_resume_bootstrap(
                 process_generation,
@@ -4788,7 +5640,7 @@ impl ClaudeInner {
             )
             .await;
         }
-        let runtime = self.runtime.lock().await.take();
+        let runtime = self.state.with(|state| state.runtime.take()).await;
         self.drain_background_tasks();
         if let Some(runtime) = runtime {
             runtime.kill().await;
@@ -4803,8 +5655,13 @@ impl ClaudeInner {
     /// which is precisely why the group is signalled rather than the child alone.
     /// The requests could therefore only delay the kill, never change its result.
     async fn close_process(&self) {
-        self.state.lock().await.native_tool_catalog = None;
-        let runtime = self.runtime.lock().await.take();
+        let runtime = self
+            .state
+            .with(|state| {
+                state.native_tool_catalog = None;
+                state.runtime.take()
+            })
+            .await;
         if let Some(runtime) = runtime {
             runtime.kill().await;
         }
@@ -4816,8 +5673,13 @@ impl ClaudeInner {
     }
 
     async fn retire_process_for_replacement(&self) {
-        self.state.lock().await.native_tool_catalog = None;
-        let runtime = self.runtime.lock().await.take();
+        let runtime = self
+            .state
+            .with(|state| {
+                state.native_tool_catalog = None;
+                state.runtime.take()
+            })
+            .await;
         self.drain_background_tasks();
         if let Some(runtime) = runtime {
             runtime.abort_readers();
@@ -4826,18 +5688,19 @@ impl ClaudeInner {
     }
 
     async fn mark_process_exited(&self) {
-        self.state.lock().await.native_tool_catalog = None;
+        self.state
+            .with(|state| state.native_tool_catalog = None)
+            .await;
         self.drain_background_tasks();
         // Callers that know the real outcome (exited mid-turn, exited during a
         // compaction) have already delivered it and left `outcome_tx` empty, so
         // this is almost always just releasing the quiesce waiters.
         self.release_active_turn().await;
-        let runtime = self.runtime.lock().await.take();
-        if let Some(runtime) = runtime {
-            let mut child = runtime.child.lock().await;
-            if let Some(child) = child.as_mut() {
-                let _ = child.try_wait();
-            }
+        let runtime = self.state.with(|state| state.runtime.take()).await;
+        if let Some(mut runtime) = runtime
+            && let Some(child) = runtime.child.as_mut()
+        {
+            let _ = child.try_wait();
         }
     }
 
@@ -4897,71 +5760,73 @@ impl ClaudeInner {
         )
     }
 
-    async fn cancel_active_turn(&self) {
-        let (turn_id, quiesced_rx) = {
-            // Serialize the state transition with interactive responses, but
-            // release the event gate before awaiting provider quiescence: the
-            // stdout result that signals quiescence must acquire this gate.
-            let _turn_event_guard = self.turn_event_gate.lock().await;
-            let mut state = self.state.lock().await;
-            let foreground_already_quiescent = self
-                .background_work_active
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && state
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|active| active.outcome_tx.is_none());
-            if foreground_already_quiescent {
-                drop(state);
-                tracing::info!(
-                    "Claude interrupt observed a quiescent foreground turn while background work continues"
-                );
-                self.emit_operation_cancelled(
-                    "Claude foreground turn already ended; background work continues.",
-                );
-                return;
-            }
-            let Some(active) = state.active_turn.as_mut() else {
-                let message = if self
+    async fn cancel_active_turn(self: &Arc<Self>) {
+        // Ordered with interactive responses by the stdout reader, but the
+        // quiescence wait happens after the job: the stdout result that
+        // signals quiescence is handled by that same reader.
+        let target = self
+            .run_turn_transition(|state: &mut ClaudeState, inner: &Arc<Self>| {
+                let foreground_already_quiescent = inner
                     .background_work_active
                     .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    "Claude foreground turn already ended; background work continues."
-                } else {
-                    "No Claude foreground turn was running."
-                };
-                drop(state);
-                tracing::info!(
-                    background_work_active = self
+                    && state
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|active| active.outcome_tx.is_none());
+                if foreground_already_quiescent {
+                    tracing::info!(
+                        "Claude interrupt observed a quiescent foreground turn while background work continues"
+                    );
+                    inner.emit_operation_cancelled(
+                        "Claude foreground turn already ended; background work continues.",
+                    );
+                    return None;
+                }
+                let Some(active) = state.active_turn.as_mut() else {
+                    let message = if inner
                         .background_work_active
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    "Claude interrupt found no foreground turn"
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        "Claude foreground turn already ended; background work continues."
+                    } else {
+                        "No Claude foreground turn was running."
+                    };
+                    tracing::info!(
+                        background_work_active = inner
+                            .background_work_active
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        "Claude interrupt found no foreground turn"
+                    );
+                    inner.emit_operation_cancelled(message);
+                    return None;
+                };
+                let (quiesced_tx, quiesced_rx) = oneshot::channel();
+                active.quiesced_waiters.push(quiesced_tx);
+                active.interrupt_requested = true;
+                tracing::info!(
+                    turn_id = active.id,
+                    "Claude interrupt targeted foreground turn"
                 );
-                self.emit_operation_cancelled(message);
-                return;
-            };
-            let (quiesced_tx, quiesced_rx) = oneshot::channel();
-            active.quiesced_waiters.push(quiesced_tx);
-            active.interrupt_requested = true;
-            tracing::info!(
-                turn_id = active.id,
-                "Claude interrupt targeted foreground turn"
-            );
-            let target = (active.id, quiesced_rx);
-            drop(state);
-            // Keep terminalizing pending interactions in the same critical
-            // section that marks the turn interrupted, so no answer can be
-            // written to Claude between those two lifecycle transitions.
-            self.emitter
-                .cancel_pending_foreground_tools("Cancelled by user");
-            target
+                let target = (active.id, quiesced_rx);
+                // Terminalize pending interactions in the same
+                // transition that marks the turn interrupted, so no
+                // answer can be written to Claude between those two
+                // lifecycle transitions.
+                inner
+                    .emitter
+                    .cancel_pending_foreground_tools("Cancelled by user");
+                Some(target)
+            })
+            .await;
+        let Some((turn_id, quiesced_rx)) = target else {
+            return;
         };
 
         // Only now, with the turn confirmed interrupted, may verification be
         // abandoned — a cancelled turn is the user's doing, not the skills'.
         let abandoned_verification = self.abandon_skill_verification_for_cancelled_turn().await;
 
-        if self.runtime.lock().await.is_some()
+        if self.state.with(|state| state.runtime.is_some()).await
             && let Err(err) = self.send_control_request("interrupt").await
         {
             tracing::warn!("Failed to send Claude interrupt request: {err}");
@@ -4974,18 +5839,20 @@ impl ClaudeInner {
                     "Claude did not quiesce after interrupt; killing persistent process"
                 );
                 self.shutdown_process().await;
-                let fallback_rx = {
-                    let mut state = self.state.lock().await;
-                    state.active_turn.as_mut().and_then(|active| {
-                        if active.id == turn_id {
-                            let (tx, rx) = oneshot::channel();
-                            active.quiesced_waiters.push(tx);
-                            Some(rx)
-                        } else {
-                            None
-                        }
+                let fallback_rx = self
+                    .state
+                    .with(move |state| {
+                        state.active_turn.as_mut().and_then(|active| {
+                            if active.id == turn_id {
+                                let (tx, rx) = oneshot::channel();
+                                active.quiesced_waiters.push(tx);
+                                Some(rx)
+                            } else {
+                                None
+                            }
+                        })
                     })
-                };
+                    .await;
                 self.complete_active_turn_with_outcome(
                     turn_id,
                     TurnOutcome::Cancelled {
@@ -5038,7 +5905,7 @@ impl ClaudeInner {
     /// parked with no sender able to fire, making a dead CLI look exactly like a
     /// wedged one until a timeout expired.
     async fn release_active_turn(&self) {
-        let Some(active) = self.state.lock().await.active_turn.take() else {
+        let Some(active) = self.state.with(|state| state.active_turn.take()).await else {
             return;
         };
         if let Some(outcome_tx) = active.outcome_tx {
@@ -5050,44 +5917,50 @@ impl ClaudeInner {
     }
 
     async fn clear_active_turn(&self, turn_id: u64) -> Vec<oneshot::Sender<()>> {
-        let mut state = self.state.lock().await;
-        if state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.id == turn_id)
-        {
-            return state
-                .active_turn
-                .take()
-                .map(|active| active.quiesced_waiters)
-                .unwrap_or_default();
-        }
-        Vec::new()
+        self.state
+            .with(move |state| {
+                if state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.id == turn_id)
+                {
+                    return state
+                        .active_turn
+                        .take()
+                        .map(|active| active.quiesced_waiters)
+                        .unwrap_or_default();
+                }
+                Vec::new()
+            })
+            .await
     }
 
     async fn clear_active_turn_and_emit_idle(&self, turn_id: u64) -> Vec<oneshot::Sender<()>> {
-        let mut state = self.state.lock().await;
-        let cleared = state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.id == turn_id);
-        let waiters = if cleared {
-            state
-                .active_turn
-                .take()
-                .map(|active| active.quiesced_waiters)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        eprintln!(
-            "TYDE CLAUDE TURN FINALIZE IDLE turn={turn_id} cleared={cleared} stream_open={}",
-            self.emitter.is_stream_open()
-        );
-        if cleared {
-            self.emit_typing_status(false);
-        }
-        waiters
+        self.state
+            .with_inner(move |state, inner| {
+                let cleared = state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.id == turn_id);
+                let waiters = if cleared {
+                    state
+                        .active_turn
+                        .take()
+                        .map(|active| active.quiesced_waiters)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                eprintln!(
+                    "TYDE CLAUDE TURN FINALIZE IDLE turn={turn_id} cleared={cleared} stream_open={}",
+                    inner.emitter.is_stream_open()
+                );
+                if cleared {
+                    inner.emit_typing_status(false);
+                }
+                waiters
+            })
+            .await
     }
 
     /// Commit the Claude CLI session_id into backend state.
@@ -5098,38 +5971,39 @@ impl ClaudeInner {
     /// our session, which must never happen silently) and surfaces as a
     /// user-visible error.
     async fn set_session_id(&self, session_id: String) {
-        let mut state = self.state.lock().await;
-        match &state.session_id {
-            Some(existing) if existing == &session_id => {
-                state.fork_from_session_id = None;
-                state.resume_bootstrap_required = true;
-            }
-            Some(existing) => {
-                let existing = existing.clone();
-                drop(state);
-                self.emit_error(&format!(
-                    "Claude CLI rotated session id from {existing} to {session_id}; \
-                     session ids must be immutable. This turn's output is orphaned."
-                ));
-            }
-            None => {
-                state.session_id = Some(session_id);
-                state.fork_from_session_id = None;
-                state.resume_bootstrap_required = true;
-            }
-        }
+        self.state
+            .with_inner(move |state, inner| match &state.session_id {
+                Some(existing) if existing == &session_id => {
+                    state.fork_from_session_id = None;
+                    state.resume_bootstrap_required = true;
+                }
+                Some(existing) => {
+                    inner.emit_error(&format!(
+                        "Claude CLI rotated session id from {existing} to {session_id}; \
+                         session ids must be immutable. This turn's output is orphaned."
+                    ));
+                }
+                None => {
+                    state.session_id = Some(session_id);
+                    state.fork_from_session_id = None;
+                    state.resume_bootstrap_required = true;
+                }
+            })
+            .await;
     }
 
     async fn emit_settings(&self) {
-        let (model, effort, fast_mode, permission_mode) = {
-            let state = self.state.lock().await;
-            (
-                state.model.clone(),
-                state.effort.map(ClaudeEffort::as_str),
-                state.fast_mode,
-                state.permission_mode.clone(),
-            )
-        };
+        let (model, effort, fast_mode, permission_mode) = self
+            .state
+            .with(|state| {
+                (
+                    state.model.clone(),
+                    state.effort.map(ClaudeEffort::as_str),
+                    state.fast_mode,
+                    state.permission_mode.clone(),
+                )
+            })
+            .await;
 
         self.emitter.settings(json!({
             "model": model,
@@ -5142,10 +6016,10 @@ impl ClaudeInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
-        let (workspace_root, ssh_host) = {
-            let state = self.state.lock().await;
-            (state.workspace_root.clone(), state.ssh_host.clone())
-        };
+        let (workspace_root, ssh_host) = self
+            .state
+            .with(|state| (state.workspace_root.clone(), state.ssh_host.clone()))
+            .await;
 
         let sessions = if let Some(host) = &ssh_host {
             list_claude_sessions_remote(host, &workspace_root).await?
@@ -5159,14 +6033,17 @@ impl ClaudeInner {
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host) = {
-            let mut state = self.state.lock().await;
-            state.session_id = Some(normalized.clone());
-            state.fork_from_session_id = None;
-            state.cumulative_usage = None;
-            state.cumulative_usage_complete = true;
-            (state.workspace_root.clone(), state.ssh_host.clone())
-        };
+        let session_id = normalized.clone();
+        let (workspace_root, ssh_host) = self
+            .state
+            .with(move |state| {
+                state.session_id = Some(session_id);
+                state.fork_from_session_id = None;
+                state.cumulative_usage = None;
+                state.cumulative_usage_complete = true;
+                (state.workspace_root.clone(), state.ssh_host.clone())
+            })
+            .await;
 
         self.emitter.session_started(&normalized);
         self.emitter.conversation_cleared();
@@ -5213,11 +6090,16 @@ impl ClaudeInner {
             }
         }
 
-        let mut state = self.state.lock().await;
-        state.cumulative_usage = replay.cumulative_usage;
-        state.cumulative_usage_complete = replay.cumulative_usage_complete;
-        state.resume_bootstrap_required = resume_bootstrap_required;
-        self.emitter.resume_replay_complete();
+        let cumulative_usage = replay.cumulative_usage;
+        let cumulative_usage_complete = replay.cumulative_usage_complete;
+        self.state
+            .with_inner(move |state, inner| {
+                state.cumulative_usage = cumulative_usage;
+                state.cumulative_usage_complete = cumulative_usage_complete;
+                state.resume_bootstrap_required = resume_bootstrap_required;
+                inner.emitter.resume_replay_complete();
+            })
+            .await;
         tracing::info!("Claude history replay boundary emitted before process initialization");
         Ok(())
     }
@@ -5225,16 +6107,19 @@ impl ClaudeInner {
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host) = {
-            let mut state = self.state.lock().await;
-            if state.session_id.as_deref() == Some(normalized.as_str()) {
-                state.session_id = None;
-                state.fork_from_session_id = None;
-                state.cumulative_usage = None;
-                state.cumulative_usage_complete = true;
-            }
-            (state.workspace_root.clone(), state.ssh_host.clone())
-        };
+        let session_id = normalized.clone();
+        let (workspace_root, ssh_host) = self
+            .state
+            .with(move |state| {
+                if state.session_id.as_deref() == Some(session_id.as_str()) {
+                    state.session_id = None;
+                    state.fork_from_session_id = None;
+                    state.cumulative_usage = None;
+                    state.cumulative_usage_complete = true;
+                }
+                (state.workspace_root.clone(), state.ssh_host.clone())
+            })
+            .await;
 
         if let Some(host) = &ssh_host {
             delete_claude_session_remote(host, &workspace_root, &normalized).await?;
@@ -5421,7 +6306,7 @@ impl ClaudeInner {
 
     async fn shutdown(&self) {
         tracing::info!("Claude shutdown starting");
-        self.state.lock().await.closing = true;
+        self.state.with(|state| state.closing = true).await;
         self.cancel_skill_watchdog().await;
         // Resolve the turn here instead of interrupting the CLI and waiting for
         // it to confirm quiescence. The process is about to be killed, so its
@@ -5434,7 +6319,7 @@ impl ClaudeInner {
         // gone. Dropping the last `Arc` would do this anyway, but a session can
         // outlive its shutdown in a caller's hands, and leaving a root in
         // TMPDIR until then is a leak the user can see.
-        let plugin = self.state.lock().await.skill_plugin.take();
+        let plugin = self.state.with(|state| state.skill_plugin.take()).await;
         if let Some(plugin) = plugin
             && let Err(err) = plugin.cleanup()
         {
@@ -5691,10 +6576,17 @@ impl ClaudeInner {
     async fn normalize_usage_for_turn(&self, usage: Option<Value>) -> Option<ClaudeTurnUsage> {
         let turn = usage?;
 
-        let mut state = self.state.lock().await;
-        let cumulative = add_token_usage(state.cumulative_usage.as_ref(), &turn);
-        state.cumulative_usage = Some(cumulative.clone());
-        let cumulative = state.cumulative_usage_complete.then_some(cumulative);
+        let cumulative = self
+            .state
+            .with({
+                let turn = turn.clone();
+                move |state| {
+                    let cumulative = add_token_usage(state.cumulative_usage.as_ref(), &turn);
+                    state.cumulative_usage = Some(cumulative.clone());
+                    state.cumulative_usage_complete.then_some(cumulative)
+                }
+            })
+            .await;
         Some(ClaudeTurnUsage { turn, cumulative })
     }
 
@@ -5926,28 +6818,6 @@ async fn probe_plugin_dir_support() -> bool {
             false
         }
     }
-}
-
-async fn write_json_line_to_stdin(
-    stdin: &Arc<Mutex<ChildStdin>>,
-    value: &Value,
-) -> Result<(), String> {
-    let payload = serde_json::to_string(value)
-        .map_err(|err| format!("Failed to encode Claude input payload: {err}"))?;
-    let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(payload.as_bytes())
-        .await
-        .map_err(|err| format!("Failed to write Claude input: {err}"))?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|err| format!("Failed to finalize Claude input: {err}"))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|err| format!("Failed to flush Claude input: {err}"))?;
-    Ok(())
 }
 
 fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
@@ -6479,8 +7349,8 @@ async fn sync_persistent_background_activity(
 async fn read_claude_stdout_persistent(
     stdout: ChildStdout,
     inner: Arc<ClaudeInner>,
-    control_waiters: ClaudeControlWaiters,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: ClaudeStdinWriter,
+    mut turn_jobs: mpsc::UnboundedReceiver<ClaudeTurnJob>,
     process_generation: u64,
 ) {
     let mut turn_state = PersistentStdoutTurnState::default();
@@ -6518,7 +7388,14 @@ async fn read_claude_stdout_persistent(
         let value = match queue.pop_front() {
             Some(value) => value,
             None => {
-                let Ok(Some(line)) = lines.next_line().await else {
+                let line = loop {
+                    tokio::select! {
+                        biased;
+                        Some(job) = turn_jobs.recv() => job(Arc::clone(&inner)).await,
+                        line = lines.next_line() => break line,
+                    }
+                };
+                let Ok(Some(line)) = line else {
                     // EOF. A session that never confirmed its skills says so —
                     // unless the user cancelled, in which case this is the
                     // cancel taking effect and blaming the skills would be
@@ -6569,18 +7446,33 @@ async fn read_claude_stdout_persistent(
             }
         };
 
+        if inner
+            .state
+            .with(|state| state.workspace_relocation_in_flight)
+            .await
+        {
+            // Resolved before the macro: inside it, `Value` names `tracing`'s
+            // own field trait rather than `serde_json::Value`.
+            let frame_type = value.get("type").and_then(Value::as_str);
+            let subtype = value.get("subtype").and_then(Value::as_str);
+            tracing::debug!(
+                frame_type,
+                subtype,
+                "Claude frame during workspace relocation"
+            );
+        }
         // Control *responses* are the only inbound traffic that must flow
         // before verification: the `initialize` handshake Tyde itself issued is
         // answered this way, and blocking it would stall the CLI before it
         // could ever emit an `init` frame.
-        if route_control_response(&value, &control_waiters).await {
+        if route_control_response(&value, &inner, process_generation).await {
             continue;
         }
         if let Err(error) = inner
             .record_native_tool_catalog(process_generation, &value)
             .await
         {
-            inner.state.lock().await.closing = true;
+            inner.state.with(|state| state.closing = true).await;
             inner
                 .fail_resume_bootstrap(process_generation, &error)
                 .await;
@@ -6814,10 +7706,10 @@ async fn read_claude_stdout_persistent(
             continue;
         }
 
-        let subagent_emitter = {
-            let state = inner.state.lock().await;
-            state.subagent_emitter.clone()
-        };
+        let subagent_emitter = inner
+            .state
+            .with(|state| state.subagent_emitter.clone())
+            .await;
 
         if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
             inner.handle_passive_capacity(&value).await;
@@ -6875,7 +7767,6 @@ async fn read_claude_stdout_persistent(
             continue;
         }
 
-        let _turn_event_guard = inner.turn_event_gate.lock().await;
         let (turn_id, model_hint, owner) =
             match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
                 Some(turn) => turn,
@@ -7018,14 +7909,16 @@ async fn read_claude_stdout_persistent(
     }
     inner.set_background_work_active(false);
 
-    fail_pending_control_waiters(&control_waiters, "Claude CLI process exited").await;
-    let _turn_event_guard = inner.turn_event_gate.lock().await;
+    fail_pending_control_waiters(&inner, process_generation, "Claude CLI process exited").await;
     let active_turn_id = if let Some(turn_id) = turn_state.active_turn_id {
         Some(turn_id)
     } else {
         inner.active_turn_pending_outcome_id().await
     };
-    if let Some(turn_id) = active_turn_id {
+    'exited: {
+        let Some(turn_id) = active_turn_id else {
+            break 'exited;
+        };
         if matches!(
             inner.active_turn_owner(turn_id).await,
             Some(ClaudeTurnOwner::Compaction(_))
@@ -7038,8 +7931,7 @@ async fn read_claude_stdout_persistent(
                     false,
                 )
                 .await;
-            inner.mark_process_exited().await;
-            return;
+            break 'exited;
         }
         if turn_state.active_turn_id.is_some() {
             flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
@@ -7060,6 +7952,13 @@ async fn read_claude_stdout_persistent(
             .complete_active_turn_with_outcome(turn_id, outcome)
             .await;
     }
+    // Jobs queued behind the exit run here, still ordered after it; once the
+    // queue is closed, later jobs run on their callers.
+    turn_jobs.close();
+    while let Some(job) = turn_jobs.recv().await {
+        job(Arc::clone(&inner)).await;
+    }
+    // Taking the runtime aborts this task, so nothing may follow.
     inner.mark_process_exited().await;
 }
 
@@ -7191,21 +8090,24 @@ async fn prepare_persistent_stdout_turn(
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
 ) -> Option<(u64, Option<String>, ClaudeTurnOwner)> {
-    let (turn_id, model_hint, owner) = {
-        let state = inner.state.lock().await;
-        let active = state.active_turn.as_ref()?;
-        let owner = active.owner.clone();
-        // A user turn that has already handed off its outcome is finished; the
-        // finalizer that clears it runs concurrently with this reader, so
-        // without this check a wake turn arriving inside that window would be
-        // consumed against a message id the finalizer has already closed.
-        // Compaction turns have no user outcome channel and remain routable
-        // until their correlated terminal frame is observed.
-        if matches!(owner, ClaudeTurnOwner::User) {
-            active.outcome_tx.as_ref()?;
-        }
-        (active.id, state.model.clone(), owner)
-    };
+    let (turn_id, model_hint, owner) = inner
+        .state
+        .with(|state| {
+            let active = state.active_turn.as_ref()?;
+            let owner = active.owner.clone();
+            // A user turn that has already handed off its outcome is finished;
+            // the finalizer that clears it runs concurrently with this reader,
+            // so without this check a wake turn arriving inside that window
+            // would be consumed against a message id the finalizer has
+            // already closed. Compaction turns have no user outcome channel
+            // and remain routable until their correlated terminal frame is
+            // observed.
+            if matches!(owner, ClaudeTurnOwner::User) {
+                active.outcome_tx.as_ref()?;
+            }
+            Some((active.id, state.model.clone(), owner))
+        })
+        .await?;
     if turn_state.active_turn_id != Some(turn_id) {
         let base_message_id = format!("claude-msg-{turn_id}");
         turn_state.active_turn_id = Some(turn_id);
@@ -7253,7 +8155,11 @@ fn claude_result_turn_outcome(
     }
 }
 
-async fn route_control_response(value: &Value, control_waiters: &ClaudeControlWaiters) -> bool {
+async fn route_control_response(
+    value: &Value,
+    inner: &ClaudeInner,
+    process_generation: u64,
+) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("control_response") {
         return false;
     }
@@ -7270,8 +8176,23 @@ async fn route_control_response(value: &Value, control_waiters: &ClaudeControlWa
     } else {
         Err(control_response_error(value))
     };
-    if let Some(waiter) = control_waiters.lock().await.remove(&request_id) {
-        let _ = waiter.send(result);
+    let waiter_id = request_id.clone();
+    let waiter = inner
+        .state
+        .with(move |state| {
+            if state
+                .control_waiters
+                .get(&waiter_id)
+                .is_some_and(|waiter| waiter.generation == process_generation)
+            {
+                state.control_waiters.remove(&waiter_id)
+            } else {
+                None
+            }
+        })
+        .await;
+    if let Some(waiter) = waiter {
+        let _ = waiter.reply.send(result);
     } else {
         tracing::debug!("Dropping unmatched Claude control_response request_id={request_id}");
     }
@@ -7317,13 +8238,12 @@ async fn handle_ask_user_question_control_request(
     value: &Value,
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &ClaudeStdinWriter,
 ) -> bool {
     let Some(request) = ask_user_question_control_request(value) else {
         return false;
     };
     let request_id = request.request_id.clone();
-    let _turn_event_guard = inner.turn_event_gate.lock().await;
     let result = bridge_ask_user_question_control_request(inner, turn_state, request).await;
     if let Err(err) = result {
         tracing::warn!("Failed to bridge Claude AskUserQuestion control_request: {err}");
@@ -7334,7 +8254,7 @@ async fn handle_ask_user_question_control_request(
                 "message": err,
             }),
         );
-        if let Err(write_err) = write_json_line_to_stdin(stdin, &payload).await {
+        if let Err(write_err) = stdin.write_json_line(&payload).await {
             tracing::warn!("Failed to write Claude AskUserQuestion deny response: {write_err}");
         }
     }
@@ -7345,13 +8265,12 @@ async fn handle_exit_plan_mode_control_request(
     value: &Value,
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &ClaudeStdinWriter,
 ) -> bool {
     let Some(request) = exit_plan_mode_control_request(value) else {
         return false;
     };
     let request_id = request.request_id.clone();
-    let _turn_event_guard = inner.turn_event_gate.lock().await;
     let result = bridge_exit_plan_mode_control_request(inner, turn_state, request).await;
     if let Err(err) = result {
         tracing::warn!("Failed to bridge Claude ExitPlanMode control_request: {err}");
@@ -7362,7 +8281,7 @@ async fn handle_exit_plan_mode_control_request(
                 "message": err,
             }),
         );
-        if let Err(write_err) = write_json_line_to_stdin(stdin, &payload).await {
+        if let Err(write_err) = stdin.write_json_line(&payload).await {
             tracing::warn!("Failed to write Claude ExitPlanMode deny response: {write_err}");
         }
     }
@@ -7371,17 +8290,17 @@ async fn handle_exit_plan_mode_control_request(
 
 async fn respond_to_control_request(
     value: &Value,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &ClaudeStdinWriter,
     inner: &Arc<ClaudeInner>,
 ) -> bool {
-    let access_mode = inner.state.lock().await.access_mode;
+    let access_mode = inner.state.with(|state| state.access_mode).await;
     let Some(payload) = control_response_payload_for_request(value, access_mode) else {
         return false;
     };
     if payload.is_null() {
         return true;
     }
-    if let Err(err) = write_json_line_to_stdin(stdin, &payload).await {
+    if let Err(err) = stdin.write_json_line(&payload).await {
         tracing::warn!("Failed to write Claude control_response: {err}");
     }
     true
@@ -7923,14 +8842,102 @@ fn ask_user_question_answer_key(index: usize, question: &protocol::AskUserQuesti
         .unwrap_or_else(|| format!("question_{}", index + 1))
 }
 
-async fn fail_pending_control_waiters(control_waiters: &ClaudeControlWaiters, message: &str) {
-    let waiters = {
-        let mut guard = control_waiters.lock().await;
-        std::mem::take(&mut *guard)
-    };
-    for (_request_id, waiter) in waiters {
-        let _ = waiter.send(Err(message.to_string()));
+async fn fail_pending_control_waiters(inner: &ClaudeInner, process_generation: u64, message: &str) {
+    let waiters = inner
+        .state
+        .with(move |state| {
+            let (failed, kept): (HashMap<String, ClaudeControlWaiter>, _) =
+                std::mem::take(&mut state.control_waiters)
+                    .into_iter()
+                    .partition(|(_, waiter)| waiter.generation == process_generation);
+            state.control_waiters = kept;
+            failed
+        })
+        .await;
+    for waiter in waiters.into_values() {
+        let _ = waiter.reply.send(Err(message.to_string()));
     }
+}
+
+/// Moves the running CLI to `roots`. Runs in the relocation's owner task.
+async fn relocate_claude_workspace(
+    inner: &ClaudeInner,
+    roots: &[String],
+) -> Result<(), super::WorkspaceRelocationError> {
+    let cwd = &roots[0];
+    let request_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(roots = roots.len(), "Changing Claude workspace roots");
+    let response = inner
+        .send_control_request_value(
+            request_id.clone(),
+            json!({
+                "type": "control_request", "request_id": request_id,
+                // Tyde projects are trusted; pin consent to the validated canonical root.
+                "request": {
+                    "subtype": "set_cwd", "path": cwd,
+                    "trust_accepted": true, "trusted_directory": cwd,
+                },
+            }),
+            CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+        )
+        .await
+        .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
+    tracing::info!(
+        status = response.get("status").and_then(|status| status.as_str()),
+        "Claude answered trusted workspace relocation"
+    );
+    match response.get("status").and_then(Value::as_str) {
+        Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
+            let workspace_root = cwd.clone();
+            inner
+                .state
+                .with(move |state| state.workspace_root = workspace_root)
+                .await;
+            if response
+                .get("transcript_relocated")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(super::WorkspaceRelocationError::OutcomeUnknown("Claude changed directory but could not relocate its transcript; resume storage must be reconciled before continuing".to_owned()));
+            }
+        }
+        Some("needs_trust") => {
+            return Err(super::WorkspaceRelocationError::Rejected(format!(
+                "Claude did not accept trust for the validated workspace destination: {response}"
+            )));
+        }
+        Some("rejected") => {
+            return Err(super::WorkspaceRelocationError::Rejected(format!(
+                "Claude rejected workspace relocation: {response}"
+            )));
+        }
+        _ => {
+            return Err(super::WorkspaceRelocationError::OutcomeUnknown(format!(
+                "Claude did not confirm workspace relocation; provider state must be reconciled: {response}"
+            )));
+        }
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    inner
+        .send_control_request_value(
+            request_id.clone(),
+            json!({
+                "type": "control_request", "request_id": request_id,
+                "request": {"subtype": "apply_flag_settings", "settings": {
+                    "permissions": {"additionalDirectories": &roots[1..]}
+                }}
+            }),
+            CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+        )
+        .await
+        .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
+    let workspace_roots = roots.to_vec();
+    inner
+        .state
+        .with(move |state| state.workspace_roots = Some(workspace_roots))
+        .await;
+    tracing::info!(roots = roots.len(), "Claude confirmed workspace roots");
+    Ok(())
 }
 
 async fn read_claude_stderr_persistent(stderr: ChildStderr, inner: Arc<ClaudeInner>) {
@@ -8163,25 +9170,13 @@ async fn ensure_subagent_stream(
     );
 
     // Create a ClaudeInner that routes events to the sub-agent's channel.
-    let sa_inner = Arc::new(ClaudeInner {
-        emitter: Arc::new(TurnEmitter::new_for_agent(
+    let sa_inner = ClaudeInner::new(
+        Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
             AgentName(CLAUDE_AGENT_NAME),
         )),
-        active_response: StdMutex::new(None),
-        state: Mutex::new(ClaudeState::default()),
-        runtime: Mutex::new(None),
-        turn_event_gate: Mutex::new(()),
-        task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-        background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
-        native_subagent_tasks: StdMutex::new(HashSet::new()),
-        skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
-        skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
-        pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-        pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
-        background_work_active: std::sync::atomic::AtomicBool::new(false),
-        typing_active: std::sync::atomic::AtomicBool::new(false),
-    });
+        ClaudeState::default(),
+    );
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
     // Relay agents start active in the host registry, so mirror that state in
@@ -9383,7 +10378,6 @@ async fn confirm_subagent_spawns(
 
     // Native execution can precede message_stop. Declare the completed parent
     // calls without ending their response before registering/routing its child.
-    let _turn_event_guard = inner.turn_event_gate.lock().await;
     declare_open_response_tool_calls(
         &mut turn.summary,
         &mut turn.segment,
@@ -14322,7 +15316,7 @@ use super::{
     session_settings_to_json,
 };
 
-type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
+type ClaudeReadyTx = Option<oneshot::Sender<Result<(), String>>>;
 
 fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'static str {
     match access_mode {
@@ -14439,10 +15433,15 @@ impl ClaudeBackend {
                     return;
                 }
             };
-            session.inner.state.lock().await.excluded_tool_categories = config
+            let excluded_tool_categories = config
                 .resolved_spawn_config
                 .excluded_tool_categories
                 .clone();
+            session
+                .inner
+                .state
+                .with(move |state| state.excluded_tool_categories = excluded_tool_categories)
+                .await;
             session
                 .seed_installed_provider_version(config.provider_version.clone())
                 .await;
@@ -14494,17 +15493,34 @@ impl ClaudeBackend {
                 session.set_subagent_emitter(emitter).await;
             }
 
-            let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
-            let ready_tx_forward = Arc::clone(&ready_tx);
+            // The forward task is the sole owner of the readiness reply; an
+            // initial prompt failure reaches it as a message.
+            let mut ready_tx: ClaudeReadyTx = Some(ready_tx);
+            let (prompt_failed_tx, mut prompt_failed_rx) = oneshot::channel::<String>();
+            let mut prompt_failure_pending = true;
             let session_id_forward = Arc::clone(&session_id_task);
             let events_tx_forward = events_tx.clone();
             let forward_task = crate::backend::subprocess::spawn(async move {
-                while let Some(raw) = raw_events.recv().await {
+                loop {
+                    let raw = tokio::select! {
+                        biased;
+                        failure = &mut prompt_failed_rx, if prompt_failure_pending => {
+                            prompt_failure_pending = false;
+                            if let Ok(message) = failure {
+                                signal_ready(&mut ready_tx, Err(message));
+                            }
+                            continue;
+                        }
+                        raw = raw_events.recv() => raw,
+                    };
+                    let Some(raw) = raw else {
+                        break;
+                    };
                     if !forward_claude_backend_event(
                         raw,
                         &events_tx_forward,
                         &session_id_forward,
-                        Some(&ready_tx_forward),
+                        Some(&mut ready_tx),
                     )
                     .await
                     {
@@ -14512,10 +15528,9 @@ impl ClaudeBackend {
                     }
                 }
                 signal_ready(
-                    &ready_tx_forward,
+                    &mut ready_tx,
                     Err("Claude session ended before reporting a session_id".to_string()),
-                )
-                .await;
+                );
             });
 
             let initial_prompt = handle.send_message_payload(initial_input);
@@ -14530,11 +15545,8 @@ impl ClaudeBackend {
                 result = &mut initial_prompt => {
                     if let Err(err) = result {
                         tracing::error!("Failed to send initial Claude prompt: {err}");
-                        signal_ready(
-                            &ready_tx,
-                            Err(format!("Failed to send initial Claude prompt: {err}")),
-                        )
-                        .await;
+                        let _ = prompt_failed_tx
+                            .send(format!("Failed to send initial Claude prompt: {err}"));
                         session.shutdown().await;
                         let _ = forward_task.await;
                         return;
@@ -14805,7 +15817,7 @@ async fn forward_claude_backend_event(
     raw: Value,
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
     session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
-    ready_tx: Option<&ClaudeReadyTx>,
+    mut ready_tx: Option<&mut ClaudeReadyTx>,
 ) -> bool {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
         return events_tx.send(BackendEvent::Chat(event)).is_ok();
@@ -14847,8 +15859,8 @@ async fn forward_claude_backend_event(
                     .lock()
                     .expect("claude session_id mutex poisoned") =
                     Some(SessionId(session_id.to_string()));
-                if let Some(ready_tx) = ready_tx {
-                    signal_ready(ready_tx, Ok(())).await;
+                if let Some(ready_tx) = ready_tx.as_deref_mut() {
+                    signal_ready(ready_tx, Ok(()));
                 }
             }
         }
@@ -14863,7 +15875,7 @@ async fn forward_claude_backend_event(
                 .expect("claude session_id mutex poisoned")
                 .is_some();
             if !session_started && let Some(ready_tx) = ready_tx {
-                signal_ready(ready_tx, Err(message.clone())).await;
+                signal_ready(ready_tx, Err(message.clone()));
             }
             if events_tx
                 .send(BackendEvent::Chat(backend_error_message(message.clone())))
@@ -15443,25 +16455,23 @@ impl Backend for ClaudeBackend {
         )
         .await?;
         drop(events);
+        let program = context.program.clone();
         session
             .inner
             .state
-            .lock()
-            .await
-            .program
-            .clone_from(&context.program);
+            .with(move |state| state.program = program)
+            .await;
         let result = match session.inner.ensure_process_ready().await {
-            Ok(()) => {
-                let state = session.inner.state.lock().await;
-                state
-                    .native_models
-                    .as_ref()
-                    .ok_or_else(|| "Claude model catalog unavailable".to_owned())
-                    .map(|models| crate::backend::BackendDiscovery {
-                        schema: claude_session_schema(models),
-                        launch_profiles: Vec::new(),
-                    })
-            }
+            Ok(()) => session
+                .inner
+                .state
+                .with(|state| state.native_models.clone())
+                .await
+                .ok_or_else(|| "Claude model catalog unavailable".to_owned())
+                .map(|models| crate::backend::BackendDiscovery {
+                    schema: claude_session_schema(&models),
+                    launch_profiles: Vec::new(),
+                }),
             Err(error) => Err(error),
         };
         session.shutdown().await;
@@ -15509,10 +16519,15 @@ impl Backend for ClaudeBackend {
         )
         .await
         .map_err(|err| format!("Failed to spawn Claude resume session: {err}"))?;
-        session.inner.state.lock().await.excluded_tool_categories = config
+        let excluded_tool_categories = config
             .resolved_spawn_config
             .excluded_tool_categories
             .clone();
+        session
+            .inner
+            .state
+            .with(move |state| state.excluded_tool_categories = excluded_tool_categories)
+            .await;
         session
             .seed_installed_provider_version(config.provider_version.clone())
             .await;
@@ -15802,126 +16817,93 @@ impl Backend for ClaudeBackend {
                 super::WorkspaceRelocationError::Rejected("Claude session is not ready".to_owned())
             })?;
         let inner = &handle.inner;
-        let event_gate = inner.turn_event_gate.lock().await;
-        let state = inner.state.lock().await;
-        if state.ssh_host.is_some() || state.ephemeral {
-            return Err(super::WorkspaceRelocationError::Rejected(
-                "Claude workspace relocation requires a persistent local session".to_owned(),
-            ));
-        }
-        // The CLI wake latch permits late output; it is not outstanding work.
-        if state.closing
-            || state.active_turn.is_some()
-            || state.pending_compaction.is_some()
-            || inner
-                .typing_active
-                .load(std::sync::atomic::Ordering::Acquire)
-            || inner
-                .background_work_active
-                .load(std::sync::atomic::Ordering::Acquire)
-            || !inner
-                .native_subagent_tasks
-                .lock()
-                .expect("Claude native task mutex poisoned")
-                .is_empty()
-        {
-            tracing::info!(
-                closing = state.closing,
-                active_turn = state.active_turn.is_some(),
-                pending_outcome = state
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.outcome_tx.is_some()),
-                compaction = state.pending_compaction.is_some(),
-                typing = inner
-                    .typing_active
-                    .load(std::sync::atomic::Ordering::Acquire),
-                background = inner
-                    .background_work_active
-                    .load(std::sync::atomic::Ordering::Acquire),
-                cli_wake = inner
-                    .pending_cli_wake
-                    .load(std::sync::atomic::Ordering::Acquire),
-                native_tasks = inner
-                    .native_subagent_tasks
-                    .lock()
-                    .expect("Claude native task mutex poisoned")
-                    .len(),
-                "Deferring Claude workspace relocation until native work settles"
-            );
-            return Err(super::WorkspaceRelocationError::Busy);
-        }
-        let cwd = &roots[0];
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let session_id = state.session_id.clone();
-        drop(state);
-        drop(event_gate);
-        tracing::info!(?session_id, %cwd, "Changing Claude workspace roots");
-        let response = inner
-            .send_control_request_value(
-                request_id.clone(),
-                json!({
-                    "type": "control_request", "request_id": request_id,
-                    // Tyde projects are trusted; pin consent to the validated canonical root.
-                    "request": {
-                        "subtype": "set_cwd", "path": cwd,
-                        "trust_accepted": true, "trusted_directory": cwd,
-                    },
-                }),
-                CLAUDE_CONTROL_RESPONSE_TIMEOUT,
-            )
-            .await
-            .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
-        tracing::info!(
-            status = response.get("status").and_then(|status| status.as_str()),
-            "Claude answered trusted workspace relocation"
-        );
-        let mut state = inner.state.lock().await;
-        match response.get("status").and_then(Value::as_str) {
-            Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
-                state.workspace_root = cwd.clone();
-                if response
-                    .get("transcript_relocated")
-                    .and_then(Value::as_bool)
-                    != Some(true)
-                {
-                    return Err(super::WorkspaceRelocationError::OutcomeUnknown("Claude changed directory but could not relocate its transcript; resume storage must be reconciled before continuing".to_owned()));
+        // Admitted between stdout frames, so no frame handling interleaves
+        // with the busy check.
+        let relocation = inner
+            .run_turn_transition(|state: &mut ClaudeState, inner: &Arc<ClaudeInner>| {
+                if state.ssh_host.is_some() || state.ephemeral {
+                    return Err(super::WorkspaceRelocationError::Rejected(
+                        "Claude workspace relocation requires a persistent local session"
+                            .to_owned(),
+                    ));
                 }
+                // The CLI wake latch permits late output; it is not outstanding work.
+                if state.closing
+                    || state.workspace_relocation_in_flight
+                    || state.active_turn.is_some()
+                    || state.pending_compaction.is_some()
+                    || inner
+                        .typing_active
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || inner
+                        .background_work_active
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || !inner
+                        .native_subagent_tasks
+                        .lock()
+                        .expect("Claude native task mutex poisoned")
+                        .is_empty()
+                {
+                    tracing::info!(
+                        closing = state.closing,
+                        relocating = state.workspace_relocation_in_flight,
+                        active_turn = state.active_turn.is_some(),
+                        pending_outcome = state
+                            .active_turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.outcome_tx.is_some()),
+                        compaction = state.pending_compaction.is_some(),
+                        typing = inner
+                            .typing_active
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        background = inner
+                            .background_work_active
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        cli_wake = inner
+                            .pending_cli_wake
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        native_tasks = inner
+                            .native_subagent_tasks
+                            .lock()
+                            .expect("Claude native task mutex poisoned")
+                            .len(),
+                        "Deferring Claude workspace relocation until native work settles"
+                    );
+                    return Err(super::WorkspaceRelocationError::Busy);
+                }
+                // Admitted: from here the CLI exchange belongs to its
+                // owner task, so dropping this caller cannot strand a
+                // half-applied `set_cwd`.
+                state.workspace_relocation_in_flight = true;
+                Ok(ClaudeWorkspaceRelocation {
+                    state: inner.state.clone(),
+                })
+            })
+            .await?;
+        let inner = Arc::clone(inner);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        crate::backend::subprocess::spawn(async move {
+            let outcome = relocate_claude_workspace(&inner, &roots).await;
+            // Released before the caller wakes, so its immediate rollback of an
+            // unknown outcome is admitted rather than refused as busy.
+            drop(relocation);
+            if let Err(Err(error)) = outcome_tx.send(outcome) {
+                tracing::warn!(
+                    outcome = error.kind(),
+                    "Claude workspace relocation failed with no caller waiting"
+                );
+                inner.emit_error(&format!(
+                    "Claude could not finish changing workspace roots ({}) after the request was \
+                     abandoned; reopen the saved conversation before continuing.",
+                    error.kind()
+                ));
             }
-            Some("needs_trust") => {
-                return Err(super::WorkspaceRelocationError::Rejected(format!(
-                    "Claude did not accept trust for the validated workspace destination: {response}"
-                )));
-            }
-            Some("rejected") => {
-                return Err(super::WorkspaceRelocationError::Rejected(format!(
-                    "Claude rejected workspace relocation: {response}"
-                )));
-            }
-            _ => {
-                return Err(super::WorkspaceRelocationError::OutcomeUnknown(format!(
-                    "Claude did not confirm workspace relocation; provider state must be reconciled: {response}"
-                )));
-            }
-        }
-        drop(state);
-        let request_id = uuid::Uuid::new_v4().to_string();
-        inner
-            .send_control_request_value(
-                request_id.clone(),
-                json!({
-                    "type": "control_request", "request_id": request_id,
-                    "request": {"subtype": "apply_flag_settings", "settings": {
-                        "permissions": {"additionalDirectories": &roots[1..]}
-                    }}
-                }),
-                CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+        });
+        outcome_rx.await.map_err(|_| {
+            super::WorkspaceRelocationError::OutcomeUnknown(
+                "Claude workspace relocation task ended without an outcome".to_owned(),
             )
-            .await
-            .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
-        inner.state.lock().await.workspace_roots = Some(roots.clone());
-        tracing::info!(?session_id, ?roots, "Claude confirmed workspace roots");
-        Ok(())
+        })?
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
@@ -15931,11 +16913,15 @@ impl Backend for ClaudeBackend {
             .expect("Claude command handle slot poisoned")
             .clone()
             .ok_or_else(|| "Claude session has closed".to_owned())?;
-        let state = handle.inner.state.lock().await;
+        let (model, effort, fast_mode) = handle
+            .inner
+            .state
+            .with(|state| (state.model.clone(), state.effort, state.fast_mode))
+            .await;
         crate::backend::session_settings_from_json(json!({
-            "model": state.model,
-            "reasoning_effort": state.effort.map(ClaudeEffort::as_str),
-            "speed": state.fast_mode.map(|fast| if fast { "fast" } else { "standard" }),
+            "model": model,
+            "reasoning_effort": effort.map(ClaudeEffort::as_str),
+            "speed": fast_mode.map(|fast| if fast { "fast" } else { "standard" }),
         }))
     }
 
@@ -16001,8 +16987,7 @@ impl Backend for ClaudeBackend {
 }
 
 /// Write a user message to the claude CLI stdin in stream-json format.
-async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
-    let mut ready_tx = ready_tx.lock().await;
+fn signal_ready(ready_tx: &mut ClaudeReadyTx, result: Result<(), String>) {
     if let Some(tx) = ready_tx.take() {
         let _ = tx.send(result);
     }

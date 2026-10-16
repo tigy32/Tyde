@@ -13,7 +13,7 @@ pub mod adapters;
 pub mod backend;
 pub mod tools;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,13 +23,65 @@ use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
 use crate::process_env;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
+
+type AcpStateChange<T> = Box<dyn FnOnce(&mut T) + Send>;
+
+pub(super) struct AcpStateActor<T> {
+    transitions: mpsc::UnboundedSender<AcpStateChange<T>>,
+}
+
+impl<T> Clone for AcpStateActor<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transitions: self.transitions.clone(),
+        }
+    }
+}
+
+impl<T: Send + 'static> AcpStateActor<T> {
+    fn spawn(mut state: T) -> Self {
+        let (transitions, mut inbox) = mpsc::unbounded_channel::<AcpStateChange<T>>();
+        crate::backend::subprocess::spawn(async move {
+            while let Some(change) = inbox.recv().await {
+                change(&mut state);
+            }
+        });
+        Self { transitions }
+    }
+
+    async fn with<R: Send + 'static>(
+        &self,
+        transition: impl FnOnce(&mut T) -> R + Send + 'static,
+    ) -> R {
+        let (reply, result) = oneshot::channel();
+        self.transitions
+            .send(Box::new(move |state| {
+                if reply.is_closed() {
+                    return;
+                }
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transition(state)));
+                let _ = reply.send(outcome);
+            }))
+            .unwrap_or_else(|_| panic!("ACP state owner stopped while its adapter is live"));
+        match result.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("ACP state owner dropped a transition"),
+        }
+    }
+
+    fn apply(&self, transition: impl FnOnce(&mut T) + Send + 'static) {
+        let _ = self.transitions.send(Box::new(transition));
+    }
+}
 
 pub enum AcpInbound {
     Notification {
@@ -108,10 +160,105 @@ impl AcpSpawnSpec {
     }
 }
 
+struct AcpRpcWaiter {
+    id: u64,
+    restart: bool,
+    reply: oneshot::Sender<Arc<AcpRpc>>,
+}
+
+struct AcpRpcState {
+    rpc: Arc<AcpRpc>,
+    readers: HashSet<u64>,
+    restarting: Option<u64>,
+    waiting: VecDeque<AcpRpcWaiter>,
+}
+
+impl AcpRpcState {
+    fn admit(&mut self) {
+        while self.restarting.is_none() {
+            let Some(next) = self.waiting.front() else {
+                break;
+            };
+            if next.reply.is_closed() {
+                self.waiting.pop_front();
+                continue;
+            }
+            if next.restart && !self.readers.is_empty() {
+                break;
+            }
+            let next = self.waiting.pop_front().expect("RPC waiter is present");
+            if next.reply.send(Arc::clone(&self.rpc)).is_ok() {
+                if next.restart {
+                    self.restarting = Some(next.id);
+                } else {
+                    self.readers.insert(next.id);
+                }
+            }
+        }
+    }
+
+    fn release(&mut self, id: u64) {
+        self.waiting.retain(|waiter| waiter.id != id);
+        self.readers.remove(&id);
+        if self.restarting == Some(id) {
+            self.restarting = None;
+        }
+        self.admit();
+    }
+}
+
+struct AcpRpcOwner {
+    state: AcpStateActor<AcpRpcState>,
+    next_id: AtomicU64,
+}
+
+struct AcpRpcLease {
+    state: AcpStateActor<AcpRpcState>,
+    id: u64,
+}
+
+impl Drop for AcpRpcLease {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.state.apply(move |state| state.release(id));
+    }
+}
+
+impl AcpRpcOwner {
+    fn spawn(rpc: AcpRpc) -> Self {
+        Self {
+            state: AcpStateActor::spawn(AcpRpcState {
+                rpc: Arc::new(rpc),
+                readers: HashSet::new(),
+                restarting: None,
+                waiting: VecDeque::new(),
+            }),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    async fn acquire(&self, restart: bool) -> (AcpRpcLease, Arc<AcpRpc>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let lease = AcpRpcLease {
+            state: self.state.clone(),
+            id,
+        };
+        let (reply, result) = oneshot::channel();
+        self.state.apply(move |state| {
+            state.waiting.push_back(AcpRpcWaiter { id, restart, reply });
+            state.admit();
+        });
+        let rpc = result
+            .await
+            .expect("ACP RPC owner stopped while its bridge is live");
+        (lease, rpc)
+    }
+}
+
 pub struct AcpBridge {
-    rpc: RwLock<AcpRpc>,
+    rpc: AcpRpcOwner,
     inbound_tx: mpsc::UnboundedSender<AcpInbound>,
-    terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminal>>>>,
+    terminals: AcpStateActor<HashMap<String, Arc<AcpTerminal>>>,
     next_terminal_id: AtomicU64,
 }
 
@@ -123,9 +270,9 @@ impl AcpBridge {
         let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host, None).await?;
         Ok((
             Self {
-                rpc: RwLock::new(rpc),
+                rpc: AcpRpcOwner::spawn(rpc),
                 inbound_tx,
-                terminals: Mutex::new(HashMap::new()),
+                terminals: AcpStateActor::spawn(HashMap::new()),
                 next_terminal_id: AtomicU64::new(1),
             },
             inbound_rx,
@@ -143,19 +290,31 @@ impl AcpBridge {
         method: &str,
         params: Value,
     ) -> Result<Value, AcpRequestError> {
-        self.rpc.read().await.request(method, params).await
+        let (lease, rpc) = self.rpc.acquire(false).await;
+        let outcome = rpc.request(method, params).await;
+        drop(lease);
+        outcome
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        self.rpc.read().await.notify(method, params).await
+        let (lease, rpc) = self.rpc.acquire(false).await;
+        let outcome = rpc.notify(method, params).await;
+        drop(lease);
+        outcome
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<(), String> {
-        self.rpc.read().await.respond(id, result).await
+        let (lease, rpc) = self.rpc.acquire(false).await;
+        let outcome = rpc.respond(id, result).await;
+        drop(lease);
+        outcome
     }
 
     pub async fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), String> {
-        self.rpc.read().await.respond_error(id, code, message).await
+        let (lease, rpc) = self.rpc.acquire(false).await;
+        let outcome = rpc.respond_error(id, code, message).await;
+        drop(lease);
+        outcome
     }
 
     pub async fn sync_inbound(&self) -> Result<(), String> {
@@ -173,8 +332,8 @@ impl AcpBridge {
         spec: AcpSpawnSpec,
         prepare: impl std::future::Future<Output = Result<(), String>> + Send,
     ) -> Result<(), String> {
-        let mut rpc = self.rpc.write().await;
-        if !rpc.pending.lock().await.is_empty() {
+        let (lease, rpc) = self.rpc.acquire(true).await;
+        if !rpc.pending.with(|pending| pending.is_empty()).await {
             return Err("ACP process has outstanding requests and cannot restart".to_owned());
         }
         // An intentional retirement must not close the stable session event stream.
@@ -183,24 +342,31 @@ impl AcpBridge {
         rpc.shutdown().await;
         prepare.await?;
         let (replacement, _, _) = AcpRpc::spawn(spec, None, Some(self.inbound_tx.clone())).await?;
-        *rpc = replacement;
+        self.rpc
+            .state
+            .apply(move |state| state.rpc = Arc::new(replacement));
+        drop(lease);
         Ok(())
     }
 
     pub async fn trace_terminal_state(&self, reason: &str) {
-        let terminals = self.terminals.lock().await;
+        let terminals = self
+            .terminals
+            .with(|terminals| terminals.values().cloned().collect::<Vec<_>>())
+            .await;
         eprintln!(
             "TYDE ACP TERMINAL STATE reason={reason:?} terminal_count={}",
             terminals.len()
         );
-        for (terminal_id, terminal) in terminals.iter() {
-            let terminal = terminal.lock().await;
+        for terminal in terminals {
+            let status = terminal.child.inspect().await;
+            let (exit_code, exit_signal) = status
+                .as_ref()
+                .map(exit_status_pair)
+                .unwrap_or((None, None));
             eprintln!(
-                "TYDE ACP TERMINAL STATE terminal_id={terminal_id} reason={reason:?} \
-                 child_available={} exit_code={:?} exit_signal={:?}",
-                terminal.child.is_some(),
-                terminal.exit_code,
-                terminal.exit_signal,
+                "TYDE ACP TERMINAL STATE reason={reason:?} child_available={} exit_code={exit_code:?} exit_signal={exit_signal:?}",
+                status.is_none(),
             );
         }
     }
@@ -208,11 +374,8 @@ impl AcpBridge {
     pub async fn kill_active_terminals(&self) -> Result<(), String> {
         let terminals = self
             .terminals
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+            .with(|terminals| terminals.values().cloned().collect::<Vec<_>>())
+            .await;
         for terminal in terminals {
             kill_terminal(terminal).await?;
         }
@@ -229,30 +392,30 @@ impl AcpBridge {
             Ok(Some(result)) => result,
             Ok(None) => return Ok(false),
             Err(err) => {
-                self.rpc
-                    .read()
-                    .await
-                    .respond_error(id, -32_000, &err)
-                    .await?;
+                self.respond_error(id, -32_000, &err).await?;
                 return Ok(true);
             }
         };
 
-        self.rpc.read().await.respond(id, result).await?;
+        self.respond(id, result).await?;
         Ok(true)
     }
 
     pub async fn shutdown(&self) {
-        let terminals = {
-            let mut map = self.terminals.lock().await;
-            map.drain()
-                .map(|(_, terminal)| terminal)
-                .collect::<Vec<_>>()
-        };
+        let terminals = self
+            .terminals
+            .with(|map| {
+                map.drain()
+                    .map(|(_, terminal)| terminal)
+                    .collect::<Vec<_>>()
+            })
+            .await;
         for terminal in terminals {
             let _ = terminate_terminal(terminal).await;
         }
-        self.rpc.read().await.shutdown().await;
+        let (lease, rpc) = self.rpc.acquire(false).await;
+        rpc.shutdown().await;
+        drop(lease);
     }
 
     async fn handle_builtin_request(
@@ -436,14 +599,14 @@ impl AcpBridge {
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
 
-        let terminal = Arc::new(Mutex::new(AcpTerminal {
-            child: Some(child),
-            output: Vec::new(),
-            output_limit,
-            truncated: false,
-            exit_code: None,
-            exit_signal: None,
-        }));
+        let terminal = Arc::new(AcpTerminal {
+            child: AcpChildOwner::spawn(child),
+            output: AcpStateActor::spawn(AcpTerminalOutput {
+                output: Vec::new(),
+                output_limit,
+                truncated: false,
+            }),
+        });
 
         if let Some(reader) = stdout {
             crate::backend::subprocess::spawn(read_terminal_output(reader, Arc::clone(&terminal)));
@@ -456,10 +619,10 @@ impl AcpBridge {
             "term-{}",
             self.next_terminal_id.fetch_add(1, Ordering::Relaxed)
         );
-        self.terminals
-            .lock()
-            .await
-            .insert(terminal_id.clone(), terminal);
+        let registered_id = terminal_id.clone();
+        self.terminals.apply(move |terminals| {
+            terminals.insert(registered_id, terminal);
+        });
 
         Ok(json!({ "terminalId": terminal_id }))
     }
@@ -468,28 +631,27 @@ impl AcpBridge {
         let terminal_id = terminal_id_from_params(params)?;
         let terminal = self
             .terminals
-            .lock()
+            .with({
+                let terminal_id = terminal_id.clone();
+                move |terminals| terminals.get(&terminal_id).cloned()
+            })
             .await
-            .get(&terminal_id)
-            .cloned()
             .ok_or_else(|| format!("Unknown terminalId '{terminal_id}'"))?;
 
-        refresh_terminal_status(&terminal).await;
-
-        let guard = terminal.lock().await;
-        let output = String::from_utf8_lossy(&guard.output).to_string();
-        let exit_status = match (&guard.exit_code, &guard.exit_signal) {
-            (Some(exit_code), signal) => Some(json!({ "exitCode": exit_code, "signal": signal })),
-            (None, Some(signal)) => Some(json!({ "exitCode": Value::Null, "signal": signal })),
-            (None, None) => None,
-        };
-
-        let mut payload = json!({
-            "output": output,
-            "truncated": guard.truncated,
-        });
-        if let Some(status) = exit_status {
-            payload["exitStatus"] = status;
+        let status = terminal.child.inspect().await;
+        let (output, truncated) = terminal
+            .output
+            .with(|state| {
+                (
+                    String::from_utf8_lossy(&state.output).to_string(),
+                    state.truncated,
+                )
+            })
+            .await;
+        let mut payload = json!({ "output": output, "truncated": truncated });
+        if let Some(status) = status {
+            let (exit_code, signal) = exit_status_pair(&status);
+            payload["exitStatus"] = json!({ "exitCode": exit_code, "signal": signal });
         }
         Ok(payload)
     }
@@ -498,10 +660,11 @@ impl AcpBridge {
         let terminal_id = terminal_id_from_params(params)?;
         let terminal = self
             .terminals
-            .lock()
+            .with({
+                let terminal_id = terminal_id.clone();
+                move |terminals| terminals.get(&terminal_id).cloned()
+            })
             .await
-            .get(&terminal_id)
-            .cloned()
             .ok_or_else(|| format!("Unknown terminalId '{terminal_id}'"))?;
 
         let (exit_code, signal) = wait_for_terminal_exit(terminal).await?;
@@ -515,10 +678,11 @@ impl AcpBridge {
         let terminal_id = terminal_id_from_params(params)?;
         let terminal = self
             .terminals
-            .lock()
+            .with({
+                let terminal_id = terminal_id.clone();
+                move |terminals| terminals.get(&terminal_id).cloned()
+            })
             .await
-            .get(&terminal_id)
-            .cloned()
             .ok_or_else(|| format!("Unknown terminalId '{terminal_id}'"))?;
 
         kill_terminal(terminal).await?;
@@ -529,9 +693,11 @@ impl AcpBridge {
         let terminal_id = terminal_id_from_params(params)?;
         let terminal = self
             .terminals
-            .lock()
+            .with({
+                let terminal_id = terminal_id.clone();
+                move |terminals| terminals.remove(&terminal_id)
+            })
             .await
-            .remove(&terminal_id)
             .ok_or_else(|| format!("Unknown terminalId '{terminal_id}'"))?;
 
         terminate_terminal(terminal).await?;
@@ -920,39 +1086,134 @@ pub fn acp_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Vec<Val
     servers
 }
 
-struct AcpTerminal {
-    child: Option<AsyncGroupChild>,
-    output: Vec<u8>,
-    output_limit: usize,
-    truncated: bool,
-    exit_code: Option<i32>,
-    exit_signal: Option<String>,
+enum AcpChildCommand {
+    Inspect(oneshot::Sender<Option<std::process::ExitStatus>>),
+    Kill(oneshot::Sender<Result<(), String>>),
+    Shutdown(Option<oneshot::Sender<()>>),
 }
 
-impl Drop for AcpTerminal {
-    /// Last-ditch net. The real reaping is done explicitly by `kill_terminal`
-    /// (kill + `wait()`), invoked from `terminal/release` and from
-    /// `AcpRpc`-owner shutdown via `terminate_terminal` — both of which set
-    /// `child = None` before the terminal is dropped, so this is normally a
-    /// no-op.
-    ///
-    /// Caveat from the lifecycle review: while the terminal command is still
-    /// running, both output-reader tasks hold `Arc<Mutex<AcpTerminal>>` and are
-    /// blocked on `read()`, so the terminal is pinned alive and this Drop
-    /// cannot fire for a *running* child on a hard panic that skips shutdown.
-    /// Once the child exits, the readers observe EOF, return, and release their
-    /// Arcs — but by then the normal release/shutdown path has typically
-    /// already reaped it. This Drop therefore only meaningfully covers a path
-    /// that removes the terminal from its map without going through
-    /// `kill_terminal` (none exists today); it is kept as a cheap backstop.
+#[derive(Clone)]
+struct AcpChildOwner {
+    commands: mpsc::UnboundedSender<AcpChildCommand>,
+}
+
+struct AcpChildResource(Option<AsyncGroupChild>);
+
+impl Drop for AcpChildResource {
     fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
+        if let Some(child) = self.0.take() {
             crate::backend::subprocess::reap_group_child(child);
         }
     }
 }
 
-async fn read_terminal_output<R>(mut reader: R, terminal: Arc<Mutex<AcpTerminal>>)
+impl AcpChildOwner {
+    fn spawn(child: AsyncGroupChild) -> Self {
+        let (commands, mut inbox) = mpsc::unbounded_channel();
+        crate::backend::subprocess::spawn(async move {
+            let mut resource = AcpChildResource(Some(child));
+            let mut exit_status = None;
+            while let Some(command) = inbox.recv().await {
+                match command {
+                    AcpChildCommand::Inspect(reply) => {
+                        if let Some(child) = resource.0.as_mut()
+                            && let Ok(Some(status)) = child.try_wait()
+                        {
+                            exit_status = Some(status);
+                            resource.0 = None;
+                        }
+                        let _ = reply.send(exit_status);
+                    }
+                    AcpChildCommand::Kill(reply) => {
+                        let outcome = if let Some(child) = resource.0.as_mut() {
+                            match child.kill().await {
+                                Ok(()) => match child.wait().await {
+                                    Ok(status) => {
+                                        exit_status = Some(status);
+                                        resource.0 = None;
+                                        Ok(())
+                                    }
+                                    Err(err) => Err(format!(
+                                        "Failed to wait for killed terminal process: {err}"
+                                    )),
+                                },
+                                Err(err) => Err(format!("Failed to kill terminal process: {err}")),
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                    AcpChildCommand::Shutdown(reply) => {
+                        if let Some(child) = resource.0.as_mut() {
+                            let _ = child.start_kill();
+                            if let Ok(status) = child.wait().await {
+                                exit_status = Some(status);
+                            }
+                            resource.0 = None;
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+            }
+        });
+        Self { commands }
+    }
+
+    async fn inspect(&self) -> Option<std::process::ExitStatus> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(AcpChildCommand::Inspect(reply))
+            .unwrap_or_else(|_| panic!("ACP child owner stopped while its process handle is live"));
+        result.await.expect("ACP child owner dropped status reply")
+    }
+
+    async fn kill(&self) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(AcpChildCommand::Kill(reply))
+            .map_err(|_| "Failed to kill terminal process: process owner closed".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Failed to kill terminal process: process owner closed".to_owned())?
+    }
+
+    async fn shutdown(&self) {
+        let (reply, result) = oneshot::channel();
+        if self
+            .commands
+            .send(AcpChildCommand::Shutdown(Some(reply)))
+            .is_ok()
+        {
+            let _ = result.await;
+        }
+    }
+
+    fn retire(&self) {
+        let _ = self.commands.send(AcpChildCommand::Shutdown(None));
+    }
+}
+
+struct AcpTerminal {
+    child: AcpChildOwner,
+    output: AcpStateActor<AcpTerminalOutput>,
+}
+
+struct AcpTerminalOutput {
+    output: Vec<u8>,
+    output_limit: usize,
+    truncated: bool,
+}
+
+impl Drop for AcpTerminal {
+    fn drop(&mut self) {
+        self.child.retire();
+    }
+}
+
+async fn read_terminal_output<R>(mut reader: R, terminal: Arc<AcpTerminal>)
 where
     R: AsyncRead + Unpin,
 {
@@ -962,21 +1223,24 @@ where
             Ok(0) => return,
             Ok(n) => n,
             Err(err) => {
-                let mut guard = terminal.lock().await;
-                append_output_to_terminal(
-                    &mut guard,
-                    format!("\n[terminal stream read error: {err}]\n").as_bytes(),
-                );
+                terminal.output.apply(move |state| {
+                    append_output_to_terminal(
+                        state,
+                        format!("\n[terminal stream read error: {err}]\n").as_bytes(),
+                    );
+                });
                 return;
             }
         };
-
-        let mut guard = terminal.lock().await;
-        append_output_to_terminal(&mut guard, &buf[..read]);
+        let chunk = buf[..read].to_vec();
+        terminal
+            .output
+            .with(move |state| append_output_to_terminal(state, &chunk))
+            .await;
     }
 }
 
-fn append_output_to_terminal(terminal: &mut AcpTerminal, chunk: &[u8]) {
+fn append_output_to_terminal(terminal: &mut AcpTerminalOutput, chunk: &[u8]) {
     let output_limit = terminal.output_limit;
     append_terminal_output(
         &mut terminal.output,
@@ -1021,72 +1285,22 @@ fn trim_leading_utf8_continuations(output: &mut Vec<u8>) {
     }
 }
 
-async fn refresh_terminal_status(terminal: &Arc<Mutex<AcpTerminal>>) {
-    let status = {
-        let mut guard = terminal.lock().await;
-        if guard.exit_code.is_some() || guard.exit_signal.is_some() {
-            return;
-        }
-
-        let Some(child) = guard.child.as_mut() else {
-            return;
-        };
-
-        child.try_wait().unwrap_or_default()
-    };
-
-    if let Some(status) = status {
-        let (exit_code, signal) = exit_status_pair(&status);
-        let mut guard = terminal.lock().await;
-        guard.exit_code = exit_code;
-        guard.exit_signal = signal;
-        guard.child = None;
-    }
-}
-
 async fn wait_for_terminal_exit(
-    terminal: Arc<Mutex<AcpTerminal>>,
+    terminal: Arc<AcpTerminal>,
 ) -> Result<(Option<i32>, Option<String>), String> {
     loop {
-        refresh_terminal_status(&terminal).await;
-        {
-            let guard = terminal.lock().await;
-            if guard.exit_code.is_some() || guard.exit_signal.is_some() {
-                return Ok((guard.exit_code, guard.exit_signal.clone()));
-            }
+        if let Some(status) = terminal.child.inspect().await {
+            return Ok(exit_status_pair(&status));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
-async fn kill_terminal(terminal: Arc<Mutex<AcpTerminal>>) -> Result<(), String> {
-    let child_opt = {
-        let mut guard = terminal.lock().await;
-        if guard.exit_code.is_some() || guard.exit_signal.is_some() {
-            return Ok(());
-        }
-        guard.child.take()
-    };
-
-    if let Some(mut child) = child_opt {
-        child
-            .kill()
-            .await
-            .map_err(|err| format!("Failed to kill terminal process: {err}"))?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| format!("Failed to wait for killed terminal process: {err}"))?;
-        let (exit_code, signal) = exit_status_pair(&status);
-        let mut guard = terminal.lock().await;
-        guard.exit_code = exit_code;
-        guard.exit_signal = signal;
-    }
-
-    Ok(())
+async fn kill_terminal(terminal: Arc<AcpTerminal>) -> Result<(), String> {
+    terminal.child.kill().await
 }
 
-async fn terminate_terminal(terminal: Arc<Mutex<AcpTerminal>>) -> Result<(), String> {
+async fn terminate_terminal(terminal: Arc<AcpTerminal>) -> Result<(), String> {
     kill_terminal(terminal).await
 }
 
@@ -1160,13 +1374,110 @@ impl std::fmt::Display for AcpRequestError {
     }
 }
 
-type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpRequestError>>>>>;
+const ACP_STDIN_CLOSED: &str = "Acp process stdin is closed";
+
+struct AcpStdinWrite {
+    line: String,
+    written: oneshot::Sender<Result<(), String>>,
+}
+
+/// Sole owner of the process's stdin. Lines are written whole, in the
+/// order they were submitted; a close drops stdin even while a write is
+/// blocked on a full pipe, so teardown never waits behind the child.
+#[derive(Clone)]
+struct AcpStdinWriter {
+    writes: mpsc::UnboundedSender<AcpStdinWrite>,
+    closes: mpsc::UnboundedSender<oneshot::Sender<()>>,
+}
+
+impl AcpStdinWriter {
+    fn spawn(stdin: ChildStdin) -> Self {
+        let (writes, write_rx) = mpsc::unbounded_channel();
+        let (closes, close_rx) = mpsc::unbounded_channel();
+        crate::backend::subprocess::spawn(run_acp_stdin_writer(stdin, write_rx, close_rx));
+        Self { writes, closes }
+    }
+
+    fn enqueue_line(&self, line: String) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        let (written, result) = oneshot::channel();
+        self.writes
+            .send(AcpStdinWrite { line, written })
+            .map_err(|_| ACP_STDIN_CLOSED.to_owned())?;
+        Ok(result)
+    }
+
+    async fn write_line(&self, line: String) -> Result<(), String> {
+        self.enqueue_line(line)?
+            .await
+            .unwrap_or_else(|_| Err(ACP_STDIN_CLOSED.to_owned()))
+    }
+
+    async fn close(&self) {
+        let (closed, done) = oneshot::channel();
+        if self.closes.send(closed).is_ok() {
+            let _ = done.await;
+        }
+    }
+}
+
+async fn run_acp_stdin_writer(
+    mut stdin: ChildStdin,
+    mut writes: mpsc::UnboundedReceiver<AcpStdinWrite>,
+    mut closes: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+) {
+    let closed = loop {
+        let write = tokio::select! {
+            biased;
+            closed = closes.recv() => break closed,
+            write = writes.recv() => match write {
+                Some(write) => write,
+                None => break None,
+            },
+        };
+        tokio::select! {
+            biased;
+            closed = closes.recv() => {
+                let _ = write.written.send(Err(ACP_STDIN_CLOSED.to_owned()));
+                break closed;
+            }
+            result = stdin.write_all(write.line.as_bytes()) => {
+                let _ = write.written.send(
+                    result.map_err(|error| format!("Failed to write to Acp stdin: {error}")),
+                );
+            }
+        }
+    };
+    drop(stdin);
+    writes.close();
+    if let Some(closed) = closed {
+        let _ = closed.send(());
+    }
+    while let Ok(closed) = closes.try_recv() {
+        let _ = closed.send(());
+    }
+}
+
+type PendingRpcMap = AcpStateActor<HashMap<u64, oneshot::Sender<Result<Value, AcpRequestError>>>>;
+
+struct AcpPendingRequest {
+    pending: PendingRpcMap,
+    id: u64,
+}
+
+impl Drop for AcpPendingRequest {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.pending.apply(move |pending| {
+            pending.remove(&id);
+        });
+    }
+}
 
 struct AcpRpc {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: AcpStdinWriter,
     pending: PendingRpcMap,
     next_id: AtomicU64,
-    child: Arc<Mutex<Option<AsyncGroupChild>>>,
+    child: AcpChildOwner,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
 }
@@ -1219,21 +1530,21 @@ impl AcpRpc {
         let stdout = child.take_stdout().ok_or("Failed to capture ACP stdout")?;
         let stderr = child.take_stderr().ok_or("Failed to capture ACP stderr")?;
 
-        let child_ref = Arc::new(Mutex::new(Some(child)));
-        let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
+        let child_ref = AcpChildOwner::spawn(child);
+        let pending = PendingRpcMap::spawn(HashMap::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let inbound_tx = existing_inbound.unwrap_or(inbound_tx);
 
-        let stdout_pending = Arc::clone(&pending);
+        let stdout_pending = pending.clone();
         let stdout_inbound = inbound_tx.clone();
-        let stdout_child = Arc::clone(&child_ref);
+        let stdout_child = child_ref.clone();
         let stdout_task = crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let parsed = match serde_json::from_str::<Value>(&line) {
                     Ok(value) => value,
                     Err(err) => {
-                        tracing::warn!("Failed to parse ACP stdout JSON: {err}; line: {line}");
+                        tracing::warn!(error = %err, bytes = line.len(), "Failed to parse ACP stdout JSON");
                         continue;
                     }
                 };
@@ -1276,9 +1587,13 @@ impl AcpRpc {
                             Err(AcpRequestError::Rejected(message))
                         };
 
-                        if let Some(tx) = stdout_pending.lock().await.remove(&id) {
-                            let _ = tx.send(response);
-                        }
+                        stdout_pending
+                            .with(move |pending| {
+                                if let Some(tx) = pending.remove(&id) {
+                                    let _ = tx.send(response);
+                                }
+                            })
+                            .await;
                         continue;
                     }
                 }
@@ -1300,22 +1615,19 @@ impl AcpRpc {
                 }
             }
 
-            let exit_code = match stdout_child.lock().await.as_mut() {
-                Some(child) => child
-                    .try_wait()
-                    .ok()
-                    .flatten()
-                    .and_then(|status| status.code()),
-                None => None,
-            };
-
-            let mut pending = stdout_pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Err(AcpRequestError::Transport(
-                    "ACP process exited before response".to_string(),
-                )));
-            }
-            drop(pending);
+            let exit_code = stdout_child
+                .inspect()
+                .await
+                .and_then(|status| status.code());
+            stdout_pending
+                .with(|pending| {
+                    for (_, tx) in pending.drain() {
+                        let _ = tx.send(Err(AcpRequestError::Transport(
+                            "ACP process exited before response".to_string(),
+                        )));
+                    }
+                })
+                .await;
 
             let _ = stdout_inbound.send(AcpInbound::Closed { exit_code });
         });
@@ -1330,7 +1642,7 @@ impl AcpRpc {
 
         Ok((
             Self {
-                stdin: Arc::new(Mutex::new(stdin)),
+                stdin: AcpStdinWriter::spawn(stdin),
                 pending,
                 next_id: AtomicU64::new(1),
                 child: child_ref,
@@ -1352,19 +1664,45 @@ impl AcpRpc {
         });
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        let registration = AcpPendingRequest {
+            pending: self.pending.clone(),
+            id,
+        };
+        self.pending.apply(move |pending| {
+            pending.insert(id, tx);
+        });
 
-        if let Err(err) = self.send_json(&payload).await {
-            let _ = self.pending.lock().await.remove(&id);
-            return Err(AcpRequestError::Transport(err));
-        }
-
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(AcpRequestError::Transport(
+        let written = match self.stdin.enqueue_line(format!("{payload}\n")) {
+            Ok(written) => written,
+            Err(err) => {
+                drop(registration);
+                return Err(AcpRequestError::Transport(err));
+            }
+        };
+        let (reply, result) = oneshot::channel();
+        // A submitted request stays outstanding even if its caller disappears:
+        // restart must still refuse it until the provider answers or exits.
+        crate::backend::subprocess::spawn(async move {
+            let outcome = match written
+                .await
+                .unwrap_or_else(|_| Err(ACP_STDIN_CLOSED.to_owned()))
+            {
+                Ok(()) => match rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(AcpRequestError::Transport(
+                        "ACP response channel closed".to_string(),
+                    )),
+                },
+                Err(err) => Err(AcpRequestError::Transport(err)),
+            };
+            drop(registration);
+            let _ = reply.send(outcome);
+        });
+        result.await.unwrap_or_else(|_| {
+            Err(AcpRequestError::Transport(
                 "ACP response channel closed".to_string(),
-            )),
-        }
+            ))
+        })
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
@@ -1398,12 +1736,7 @@ impl AcpRpc {
     }
 
     async fn send_json(&self, value: &Value) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().await;
-        let line = format!("{value}\n");
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|err| format!("Failed to write to ACP stdin: {err}"))
+        self.stdin.write_line(format!("{value}\n")).await
     }
 
     async fn shutdown(&self) {
@@ -1413,19 +1746,9 @@ impl AcpRpc {
         // process never learns its client disconnected and becomes an
         // orphan (PPID=1). Closing stdin first lets the SSH slave
         // cleanly tear down the channel.
-        {
-            let mut stdin = self.stdin.lock().await;
-            let _ = stdin.shutdown().await;
-        }
+        self.stdin.close().await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let child = self.child.lock().await.take();
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
-            // Reap so the OS process slot and pipe fds are reclaimed; the bare
-            // start_kill() before never awaited, leaving a zombie.
-            let _ = child.wait().await;
-        }
+        self.child.shutdown().await;
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
         // parent-side stdio pipe fds are released even if EOF hasn't propagated.
         self.stdout_task.abort();
@@ -1441,6 +1764,6 @@ impl Drop for AcpRpc {
     fn drop(&mut self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
-        crate::backend::subprocess::reap_group_child_slot(&self.child);
+        self.child.retire();
     }
 }

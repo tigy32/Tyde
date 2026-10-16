@@ -2094,6 +2094,13 @@ impl Actor {
     async fn send(&mut self, input: AgentInput) -> SendOutcome {
         match input {
             AgentInput::SendMessage(payload) => {
+                if let Some(SendMessageToolResponse::AskUserQuestion { tool_call_id, .. }) =
+                    payload.tool_response.as_ref()
+                    && !self.pending_questions.contains_key(tool_call_id)
+                {
+                    self.reject_unpending_answer();
+                    return SendOutcome::Accepted;
+                }
                 if payload.tool_response.is_some() {
                     return match self.answer(payload).await {
                         Ok(()) => SendOutcome::Accepted,
@@ -2490,6 +2497,21 @@ impl Actor {
             self.read_native_settings().await?;
         }
         Ok(())
+    }
+
+    /// An answer to a question Muse no longer holds starts no provider work.
+    /// A running turn keeps its own lifecycle; otherwise the rejection is
+    /// bracketed as its own turn so the accepted answer settles.
+    fn reject_unpending_answer(&self) {
+        let bracketed = self.active_turn.is_none();
+        if bracketed {
+            self.emitter.typing_status_changed(true);
+        }
+        self.emitter
+            .error_message("Muse question is no longer pending");
+        if bracketed {
+            self.emitter.typing_status_changed(false);
+        }
     }
 
     async fn answer(&mut self, payload: SendMessagePayload) -> Result<(), String> {

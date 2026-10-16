@@ -2314,6 +2314,251 @@ pub async fn ask_until_marker_and_idle<B: Backend>(
     }
 }
 
+/// Where a hand-polled operation is dropped once it has returned `Pending`
+/// `boundary` times. Conformance runs on a current-thread runtime, so no
+/// backend task runs between that poll and the drop unless the test yields.
+#[derive(Clone, Copy, Debug)]
+pub enum CancelPoint {
+    /// Drop before any task woken by the operation runs.
+    BeforeOwnerRuns,
+    /// Let the runtime run until the operation is woken, then drop it
+    /// without observing what it was woken for.
+    AfterWake,
+}
+
+struct WakeFlag {
+    woken: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl std::task::Wake for WakeFlag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.woken.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+}
+
+/// Drives `operation` to completion, or drops it at its `boundary`th
+/// suspension. Returns its output when it finished first.
+pub async fn cancel_at_boundary<F: std::future::Future>(
+    operation: F,
+    boundary: usize,
+    point: CancelPoint,
+) -> Option<F::Output> {
+    let flag = std::sync::Arc::new(WakeFlag {
+        woken: std::sync::atomic::AtomicBool::new(false),
+        notify: tokio::sync::Notify::new(),
+    });
+    let waker = std::task::Waker::from(flag.clone());
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut operation = std::pin::pin!(operation);
+    let mut suspensions = 0;
+    loop {
+        flag.woken.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let std::task::Poll::Ready(output) = operation.as_mut().poll(&mut context) {
+            return Some(output);
+        }
+        if suspensions == boundary && matches!(point, CancelPoint::BeforeOwnerRuns) {
+            return None;
+        }
+        while !flag.woken.load(std::sync::atomic::Ordering::SeqCst) {
+            flag.notify.notified().await;
+        }
+        if suspensions == boundary {
+            return None;
+        }
+        suspensions += 1;
+    }
+}
+
+pub async fn cancel_send_at<B: Backend>(
+    host: &Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    boundary: usize,
+    point: CancelPoint,
+) -> Option<SendOutcome> {
+    let backend = host.backend.as_ref().expect("backend must be running");
+    assert!(
+        backend.session_id() == agent.session_id,
+        "input addressed the wrong session"
+    );
+    cancel_at_boundary(
+        backend.send_with_outcome(AgentInput::SendMessage(user_message(prompt))),
+        boundary,
+        point,
+    )
+    .await
+}
+
+pub async fn cancel_relocation_at<B: Backend>(
+    host: &mut Harness<B>,
+    roots: Vec<String>,
+    boundary: usize,
+    point: CancelPoint,
+) -> Option<Result<(), server::backend::WorkspaceRelocationError>> {
+    let backend = host.backend.as_mut().expect("live backend");
+    let session_id = backend.session_id();
+    let outcome = cancel_at_boundary(backend.set_workspace_roots(roots), boundary, point).await;
+    assert!(
+        backend.session_id() == session_id,
+        "workspace change replaced the conversation"
+    );
+    outcome
+}
+
+pub fn assert_no_error_after_cancellation(turn: &Turn) {
+    assert!(
+        !turn.events.iter().any(|event| matches!(
+            event,
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+        )),
+        "{}: the session reported an error after a cancelled operation",
+        turn.label()
+    );
+}
+
+pub async fn cancel_compaction_at<B: Backend>(
+    host: &Harness<B>,
+    boundary: usize,
+    point: CancelPoint,
+) -> Option<server::backend::compaction::BackendCompactionStart> {
+    let request = server::backend::compaction::BackendCompactionRequest {
+        operation_id: protocol::CompactionOperationId(uuid::Uuid::new_v4().to_string()),
+        trigger: protocol::CompactionTrigger::UserRequested,
+        focus: None,
+        transcript_authoritative: true,
+    };
+    let backend = host.backend.as_ref().expect("live backend");
+    cancel_at_boundary(backend.begin_compaction(request), boundary, point).await
+}
+
+/// Waits out the work that refused a probe: a turn ends when it goes idle
+/// with an assistant response, and a compaction whose caller was dropped
+/// ends when the backend reports it.
+async fn await_cancelled_work_end<B: Backend>(host: &mut Harness<B>) {
+    use server::backend::compaction::BackendCompactionEvent;
+    let mut running = host.turn("cancelled input");
+    let mut compaction_seen = false;
+    loop {
+        match host
+            .events
+            .as_mut()
+            .expect("live backend stream")
+            .recv_backend()
+            .await
+            .expect("backend stayed open awaiting the cancelled work")
+        {
+            BackendEvent::Chat(event) => {
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                running.events.push(event);
+                if idle {
+                    assert!(
+                        compaction_seen
+                            || running
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, ChatEvent::StreamEnd(_))),
+                        "{}: backend went idle without an assistant response",
+                        running.label()
+                    );
+                    break;
+                }
+            }
+            BackendEvent::Compaction(BackendCompactionEvent::Observed(_)) => {
+                eprintln!("ADMISSION PROBE cancelled compaction observed");
+                break;
+            }
+            BackendEvent::Compaction(_) => compaction_seen = true,
+            BackendEvent::ModelRequestTokenUsage(usage) => running.model_requests.push(usage),
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume while awaiting cancelled work")
+            }
+        }
+    }
+    assert_no_error_after_cancellation(&running);
+}
+
+/// Proves the session still admits a user turn: a busy refusal must be
+/// followed by the running turn going idle, and the admitted turn must
+/// answer with `marker` and go idle.
+pub async fn probe_admission<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    marker: &str,
+) -> Turn {
+    let prompt = format!("Reply with exactly {marker} and nothing else. Do not use tools.");
+    loop {
+        let outcome = try_send_prompt(host, agent, &prompt).await;
+        eprintln!(
+            "ADMISSION PROBE send outcome={}",
+            match &outcome {
+                SendOutcome::Accepted => "accepted",
+                SendOutcome::Busy(_) => "busy",
+                SendOutcome::Closed => "closed",
+            }
+        );
+        match outcome {
+            SendOutcome::Accepted => break,
+            SendOutcome::Busy(_) => {
+                eprintln!("ADMISSION PROBE busy; awaiting the running work's end");
+                await_cancelled_work_end(host).await;
+            }
+            SendOutcome::Closed => panic!("backend closed after a cancelled operation"),
+        }
+    }
+    let mut turn = host.turn(&prompt);
+    let mut answered = false;
+    loop {
+        match host
+            .events
+            .as_mut()
+            .expect("live backend stream")
+            .recv_backend()
+            .await
+            .expect("backend stayed open awaiting the admission probe")
+        {
+            BackendEvent::Chat(event) => {
+                answered |= matches!(&event, ChatEvent::StreamEnd(end) if end.message.content.contains(marker));
+                match &event {
+                    ChatEvent::StreamEnd(end) => eprintln!(
+                        "ADMISSION PROBE response bytes={} marker={} tools={}",
+                        end.message.content.len(),
+                        end.message.content.contains(marker),
+                        end.message.tool_calls.len()
+                    ),
+                    ChatEvent::TypingStatusChanged(typing) => {
+                        eprintln!("ADMISSION PROBE typing={typing} answered={answered}")
+                    }
+                    ChatEvent::MessageAdded(message) => {
+                        eprintln!("ADMISSION PROBE message sender={:?}", message.sender);
+                        assert!(
+                            !matches!(message.sender, MessageSender::Error),
+                            "{}: the session reported an error after a cancelled operation",
+                            turn.label()
+                        );
+                    }
+                    _ => {}
+                }
+                let done = answered && matches!(event, ChatEvent::TypingStatusChanged(false));
+                turn.events.push(event);
+                if done {
+                    return turn;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => turn.model_requests.push(usage),
+            BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume during the admission probe")
+            }
+        }
+    }
+}
+
 /// Collects runtime-initiated activity, with no user input sent, until a
 /// response carrying `marker` has settled idle.
 pub async fn await_agent_initiated_marker<B: Backend>(
@@ -2538,13 +2783,10 @@ impl Compaction {
 }
 
 pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compaction {
-    use server::backend::compaction::{
-        BackendCompactionEvent, BackendCompactionRequest, BackendCompactionStart,
-    };
+    use server::backend::compaction::{BackendCompactionRequest, BackendCompactionStart};
     let operation_id = protocol::CompactionOperationId(uuid::Uuid::new_v4().to_string());
     let mut events = Vec::new();
-    let mut observations = Vec::new();
-    let mut accepted = loop {
+    let accepted = loop {
         let request = BackendCompactionRequest {
             operation_id: operation_id.clone(),
             trigger: protocol::CompactionTrigger::UserRequested,
@@ -2569,12 +2811,15 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
                         .recv_backend()
                         .await
                         .expect("backend closed while compaction was deferred");
-                    let BackendEvent::Chat(event) = event else {
-                        assert!(
-                            !matches!(event, BackendEvent::ResumeReplayComplete(_)),
-                            "unexpected resume boundary while compaction was deferred"
-                        );
-                        continue;
+                    let event = match event {
+                        BackendEvent::Chat(event) => event,
+                        // The blocking compaction reported progress or its
+                        // end; ask the backend again whether it admits one.
+                        BackendEvent::Compaction(_) => break,
+                        BackendEvent::ResumeReplayComplete(_) => {
+                            panic!("unexpected resume boundary while compaction was deferred")
+                        }
+                        BackendEvent::ModelRequestTokenUsage(_) => continue,
                     };
                     let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
                     events.push(event);
@@ -2590,6 +2835,20 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
         }
     };
     assert_eq!(accepted.operation_id, operation_id);
+    finish_compaction(host, agent, accepted, events).await
+}
+
+/// Collects an accepted compaction through its terminal result, then lets
+/// its trailing events settle.
+pub async fn finish_compaction<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    mut accepted: server::backend::compaction::BackendAcceptedCompaction,
+    mut events: Vec<ChatEvent>,
+) -> Compaction {
+    use server::backend::compaction::BackendCompactionEvent;
+    let operation_id = accepted.operation_id.clone();
+    let mut observations = Vec::new();
     let terminal = loop {
         tokio::select! {
             terminal = &mut accepted.terminal => break terminal.expect("compaction terminal channel closed"),
