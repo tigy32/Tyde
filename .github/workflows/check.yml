@@ -57,6 +57,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Install Playwright WebKit host libraries
+        run: tools/install-playwright-webkit-host-deps.sh
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 

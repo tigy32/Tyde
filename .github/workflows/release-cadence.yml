@@ -101,6 +101,10 @@ jobs:
         if: needs.plan.outputs.action == 'promote'
         run: npm ci
 
+      - name: Install Playwright WebKit host libraries
+        if: needs.plan.outputs.action == 'promote'
+        run: tools/install-playwright-webkit-host-deps.sh
+
       - name: Install cargo-nextest
         if: needs.plan.outputs.action == 'promote'
         uses: taiki-e/install-action@nextest
