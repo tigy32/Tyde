@@ -16,8 +16,8 @@
 //! discovery is silent and absence surfaces as a typed
 //! `CodeIntelStatus { Unavailable }`.
 
+use crate::process_env::launch::{GroupCommand as Command, ProcessStdio as Stdio};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use settings_model::HostExecutablePath;
@@ -170,7 +170,7 @@ fn is_custom_toolchain_rustup_proxy_failure(stderr: Option<&str>) -> bool {
 }
 
 fn probe_rust_analyzer(path: &Path, workspace_root: &Path) -> Result<(), ProbeFailure> {
-    let mut command = crate::process_env::std_command(path).map_err(|reason| ProbeFailure {
+    let mut command = crate::process_env::command(path).map_err(|reason| ProbeFailure {
         binary: path.to_path_buf(),
         reason,
         exit_status: None,
@@ -206,7 +206,7 @@ fn probe_rust_analyzer(path: &Path, workspace_root: &Path) -> Result<(), ProbeFa
 /// toolchain.
 fn rustup_which_rust_analyzer(workspace_root: &Path) -> Option<PathBuf> {
     let rustup = process_env::find_executable_in_path("rustup")?;
-    let mut command = crate::process_env::std_command(rustup).ok()?;
+    let mut command = crate::process_env::command(rustup).ok()?;
     command
         .args(["which", "rust-analyzer"])
         .current_dir(workspace_root)
@@ -234,7 +234,7 @@ fn apply_child_path(command: &mut Command) {
 
 fn run_bounded(mut command: Command, timeout: Duration) -> Result<std::process::Output, String> {
     let mut child = command
-        .spawn()
+        .spawn_blocking()
         .map_err(|error| format!("failed to run probe: {error}"))?;
     let started = Instant::now();
     loop {

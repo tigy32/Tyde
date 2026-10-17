@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -677,28 +676,21 @@ async fn run_version_command_with_child_path(
 ) -> Result<VersionCommandOutput, VersionCommandFailure> {
     let started = Instant::now();
     trace_version_probe_stage(started, command, "function_started");
-    let mut command = crate::process_env::command(command).map_err(VersionCommandFailure::Start)?;
+    let mut command =
+        crate::backend::subprocess::command(command).map_err(VersionCommandFailure::Start)?;
     command
         .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
     if let Some(path) = child_path {
         command.env("PATH", path);
     }
-    let command_name = command
-        .as_std()
-        .get_program()
-        .to_string_lossy()
-        .into_owned();
+    let command_name = command.program().to_string_lossy().into_owned();
     trace_version_probe_stage(started, &command_name, "group_spawn_started");
-    // fork/exec can take tens of milliseconds even before the child runs.
-    // Inventory refresh must yield to the connection writer during that work.
-    let mut child = tokio::task::spawn_blocking(move || command.group_spawn())
+    let mut child = command
+        .group_spawn()
         .await
-        .map_err(|error| {
-            VersionCommandFailure::Start(format!("version probe spawn worker failed: {error}"))
-        })?
         .map_err(|error| VersionCommandFailure::Start(format!("failed to spawn: {error}")))?;
     trace_version_probe_stage(started, &command_name, "group_spawn_completed");
     let mut stdout_pipe = child.take_stdout().ok_or_else(|| {

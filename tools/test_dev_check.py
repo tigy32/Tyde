@@ -1568,6 +1568,9 @@ case "$*" in
     ;;
   "show active-toolchain") echo "stable-test-host (environment override by RUSTUP_TOOLCHAIN)" ;;
   "target list --installed") printf 'test-host\\nwasm32-unknown-unknown\\n' ;;
+  "target add x86_64-unknown-linux-musl"|"target add aarch64-unknown-linux-musl"|"target add x86_64-apple-darwin"|"target add aarch64-apple-darwin"|"target add x86_64-pc-windows-msvc")
+    echo "rustup $*" >> "$DEV_CHECK_TEST_LOG"
+    ;;
   *) exit 2 ;;
 esac
 """,
@@ -1721,8 +1724,17 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         # lints, so a separate `cargo check` pass is duplicated work, not extra
         # coverage.
         self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 0)
-        self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("cargo clippy --all-targets ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo build -p tyde-server --bin tyde-server ") for line in lines), 1)
+        if platform.system() == "Linux":
+            target = f"{platform.machine()}-unknown-linux-musl"
+            self.assertEqual(lines.count(f"rustup target add {target}"), 1)
+            for launch_target in ("x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"):
+                self.assertEqual(lines.count(f"rustup target add {launch_target}"), 1)
+                self.assertEqual(sum(line.startswith(f"cargo clippy --target {launch_target} -p tyde-process-env --lib -- -D warnings ") for line in lines), 1)
+
+            self.assertEqual(sum(line.startswith(f"cargo build --target {target} -p tyde-server --bin tyde-server ") for line in lines), 1)
+            self.assertIn("-p tauri-shell --bin tyde", next(line for line in lines if line.startswith("cargo build -p tyde-server ")))
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
         self.assertEqual(lines.count("npm-ci"), 1)
         self.assertLess(

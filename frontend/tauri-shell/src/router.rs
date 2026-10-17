@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use server::process_env::launch::{AsyncCommandGroup, AsyncGroupChild as Child, ProcessStdio};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -1003,27 +1003,23 @@ async fn setup_connection_transport(
                 ])
                 .arg(&ssh_destination)
                 .arg(&command)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+                .stdin(ProcessStdio::piped())
+                .stdout(ProcessStdio::piped())
+                .stderr(ProcessStdio::piped());
 
-            child.kill_on_drop(true);
-            let mut child = child.spawn().map_err(|err| {
+            let mut child = child.group_spawn().await.map_err(|err| {
                 format!("failed to start ssh transport for host {host_id}: {err}")
             })?;
 
             let stdout = child
-                .stdout
-                .take()
+                .take_stdout()
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stdout"))?;
             let stdin = child
-                .stdin
-                .take()
+                .take_stdin()
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
 
             let stderr = child
-                .stderr
-                .take()
+                .take_stderr()
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stderr"))?;
             let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
             let stderr_capture_for_task = stderr_capture.clone();
@@ -1093,11 +1089,14 @@ mod tests {
         process
             .arg("-c")
             .arg(script)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        let mut process = process.spawn().expect("spawn diagnostic process");
-        let stderr = process.stderr.take().expect("capture process stderr");
+            .stdin(ProcessStdio::null())
+            .stdout(ProcessStdio::null())
+            .stderr(ProcessStdio::piped());
+        let mut process = process
+            .group_spawn()
+            .await
+            .expect("spawn diagnostic process");
+        let stderr = process.take_stderr().expect("capture process stderr");
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let capture_for_task = stderr_capture.clone();
         let updates = Arc::new(Mutex::new(Vec::new()));

@@ -825,7 +825,7 @@ pub(crate) async fn read_capacity_from_spec(
         .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
         .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
     } else {
-        let mut command = match crate::process_env::command(&spec.local_program) {
+        let mut command = match crate::backend::subprocess::command(&spec.local_program) {
             Ok(command) => command,
             Err(_) => {
                 return BackendCapacityState::Unavailable {
@@ -841,14 +841,9 @@ pub(crate) async fn read_capacity_from_spec(
             command.env("PATH", path);
         }
         command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // A timeout drops the `output()` future, which does not reap the
-            // child unless it is killed on drop. Without this a hung usage
-            // command outlives every probe that gives up on it, and the poll
-            // runs on a timer.
-            .kill_on_drop(true);
+            .stdin(crate::backend::subprocess::ProcessStdio::Null)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
         tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
             .await
             .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
@@ -7286,34 +7281,48 @@ fn numeric_tokens(input: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
-    let Ok(mut command) = crate::process_env::std_command("kill") else {
-        return false;
-    };
-    command
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn is_pid_alive(pid: u32) -> Result<bool, String> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| "invalid session lock process identifier".to_owned())?;
+    if pid <= 0 {
+        return Err("invalid session lock process identifier".to_owned());
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(format!("query session lock process: {error}")),
+    }
 }
 
 #[cfg(windows)]
-fn is_pid_alive(pid: u32) -> bool {
-    let Ok(mut command) = crate::process_env::std_command("cmd") else {
-        return false;
+fn is_pid_alive(pid: u32) -> Result<bool, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
-    command
-        .args([
-            "/C",
-            &format!("tasklist /FI \"PID eq {pid}\" /NH | findstr {pid}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(false),
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Ok(true),
+            _ => Err(format!("query session lock process: {error}")),
+        };
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut status = 0;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut status) } == 0 {
+        return Err(format!(
+            "read session lock process status: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(status == 259)
 }
 
 pub(crate) async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
@@ -7327,7 +7336,7 @@ pub(crate) async fn clear_local_kiro_session_lock(session_id: &str) -> Result<()
         Err(_) => return Ok(()),
     };
     if let Ok(pid) = content.trim().parse::<u32>()
-        && is_pid_alive(pid)
+        && is_pid_alive(pid)?
     {
         return Ok(());
     }

@@ -189,6 +189,10 @@ impl MockBackend {
                 );
             }
         };
+        #[cfg(all(feature = "test-support", target_os = "linux"))]
+        if let Some(process) = launch_script.native_process.clone() {
+            Box::pin((*process).run()).await?;
+        }
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();

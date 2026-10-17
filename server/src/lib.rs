@@ -165,3 +165,5 @@ pub fn dots_connection_schema() -> Result<String, String> {
     }))
     .map_err(|_| "Cannot encode Dots connection schemas".to_owned())
 }
+
+pub mod host_launch;

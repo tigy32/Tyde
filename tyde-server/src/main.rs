@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing_subscriber::EnvFilter;
@@ -14,7 +13,7 @@ enum CliMode {
     HostStdio,
     HostUds { managed: bool },
     HostStatusUds,
-    HostLaunchUds,
+    HostLaunchUds { managed: bool },
     HostBridgeUds,
     McpBridge,
     DotsSchema,
@@ -24,6 +23,8 @@ enum CliMode {
 }
 
 fn main() {
+    #[cfg(unix)]
+    server::subprocess::exec_helper_entry();
     // Record this binary's real release version so the mobile Welcome/Reject/QR
     // payloads advertise the correct web/PWA bundle key.
     server::set_host_release_version(env!("CARGO_PKG_VERSION"));
@@ -36,7 +37,7 @@ fn main() {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),
         CliMode::HostUds { managed } => exit_on_error(run_host_uds(managed)),
         CliMode::HostStatusUds => exit_on_error(run_host_status_uds()),
-        CliMode::HostLaunchUds => exit_on_error(run_host_launch_uds()),
+        CliMode::HostLaunchUds { managed } => exit_on_error(run_host_launch_uds(managed)),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
         CliMode::McpBridge => exit_on_error(run_mcp_bridge()),
         CliMode::DotsSchema => {
@@ -118,6 +119,9 @@ where
         return CliMode::HostUds { managed: false };
     }
 
+    if args.as_slice() == ["host", "--launch-uds", "--managed"] {
+        return CliMode::HostLaunchUds { managed: true };
+    }
     if args.as_slice() == ["host", "--uds", "--managed"] {
         return CliMode::HostUds { managed: true };
     }
@@ -127,7 +131,7 @@ where
     }
 
     if args.as_slice() == ["host", "--launch-uds"] || args.as_slice() == ["--launch-uds"] {
-        return CliMode::HostLaunchUds;
+        return CliMode::HostLaunchUds { managed: false };
     }
 
     if args.as_slice() == ["host", "--bridge-uds"] || args.as_slice() == ["--bridge-uds"] {
@@ -250,6 +254,7 @@ fn run_host_uds(managed: bool) -> Result<(), String> {
 
     #[cfg(unix)]
     {
+        let notification = server::host_launch::take_notification();
         init_logging()?;
         server::init_process_env()?;
         let socket_path = resolve_socket_path()?;
@@ -265,6 +270,7 @@ fn run_host_uds(managed: bool) -> Result<(), String> {
             if managed {
                 record_managed_host_process()?;
             }
+            server::host_launch::notify_ready(notification)?;
             server::serve_uds(
                 listener,
                 server::ServerConfig::current(),
@@ -332,9 +338,10 @@ fn run_host_status_uds() -> Result<(), String> {
     }
 }
 
-fn run_host_launch_uds() -> Result<(), String> {
+fn run_host_launch_uds(managed: bool) -> Result<(), String> {
     #[cfg(not(unix))]
     {
+        let _ = managed;
         return Err("host UDS launch mode requires Unix domain sockets".to_string());
     }
 
@@ -344,7 +351,6 @@ fn run_host_launch_uds() -> Result<(), String> {
             return Ok(());
         }
 
-        let socket_path = resolve_socket_path()?;
         let home = home_dir()?;
         let log_dir = home.join(".tyde").join("logs");
         std::fs::create_dir_all(&log_dir).map_err(|err| {
@@ -353,39 +359,17 @@ fn run_host_launch_uds() -> Result<(), String> {
                 log_dir.display()
             )
         })?;
-        let log_path = log_dir.join("tyde-server-host.log");
-        let exe = std::env::current_exe()
-            .map_err(|err| format!("failed to locate current tyde-server executable: {err}"))?;
-        let command = format!(
-            "nohup {} host --uds >> {} 2>&1 < /dev/null &",
-            shell_quote_path(&exe),
-            shell_quote_path(&log_path)
-        );
-        let status = server::process_env::std_command("sh")?
-            .arg("-lc")
-            .arg(command)
-            .status()
-            .map_err(|err| format!("failed to launch Tyde UDS host: {err}"))?;
-        if !status.success() {
-            return Err(format!(
-                "failed to launch Tyde UDS host: shell exited with {status}"
-            ));
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Tyde UDS host did not become reachable at {} within 5s; see {}",
-                    socket_path.display(),
-                    log_path.display()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let log_path = std::env::var_os("TYDE_HOST_LOG_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| log_dir.join("tyde-server-host.log"));
+        let program = if managed {
+            home.join(".tyde/bin")
+                .join(env!("CARGO_PKG_VERSION"))
+                .join("tyde-server")
+        } else {
+            std::env::current_exe().map_err(|error| format!("locate host executable: {error}"))?
+        };
+        server::host_launch::launch_current(&program, &log_path, managed)
     }
 }
 
@@ -456,12 +440,6 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
 #[cfg(unix)]
 fn home_dir() -> Result<PathBuf, String> {
     server::paths::home_dir()
-}
-
-#[cfg(unix)]
-fn shell_quote_path(path: &std::path::Path) -> String {
-    let value = path.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 struct StdioTransport {

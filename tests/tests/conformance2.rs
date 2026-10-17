@@ -174,7 +174,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins"
+                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -10507,6 +10507,117 @@ async fn real_home_conversation<B: Backend>(host: &mut Harness<B>) {
 }
 
 conformance2_scenario!(real_home_conversation, [BackendCapability::ResumeSession]);
+
+// Launch coverage is deliberately smaller than real_conversation: every
+// provider exercises the same real startup, pipe round-trip and shutdown.
+async fn real_process_launch<B: Backend>(host: &mut Harness<B>) {
+    // Shipped entrypoints initialize PATH before creating a runtime. Keep that
+    // same prerequisite outside the held-provider-creation observation.
+    server::process_env::init_process_env().expect("initialize production launch environment");
+    #[cfg(target_os = "linux")]
+    {
+        use server::subprocess::test_support;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let roots = host.workspace_roots();
+        let config = host.config.clone();
+        let (operation, observer) = test_support::observe(async move {
+            B::spawn(
+                roots,
+                config,
+                user_message("Reply READY. Do not use tools."),
+            )
+            .await
+        })
+        .await
+        .expect("instrument real Backend startup");
+        let creation = observer
+            .hold_creation()
+            .await
+            .expect("hold real provider native creation");
+        assert!(
+            creation.shared_vm && creation.vfork,
+            "provider startup copied the host address space"
+        );
+        let (mut sender, mut receiver) =
+            tokio::net::UnixStream::pair().expect("real runtime progress socket");
+        let round_trip = tokio::spawn(async move {
+            let mut byte = [0];
+            receiver
+                .read_exact(&mut byte)
+                .await
+                .expect("receive while native startup held");
+            receiver
+                .write_all(&byte)
+                .await
+                .expect("reply while native startup held");
+        });
+        sender
+            .write_all(b"P")
+            .await
+            .expect("request progress while native startup held");
+        let mut byte = [0];
+        sender
+            .read_exact(&mut byte)
+            .await
+            .expect("runtime stalled with native startup");
+        assert_eq!(byte, *b"P");
+        round_trip.await.expect("progress task failed");
+        operation.cancel();
+        match operation
+            .finish()
+            .await
+            .expect("real startup operation task failed")
+        {
+            test_support::OperationResult::Cancelled => {}
+            test_support::OperationResult::Finished(Ok((backend, mut events))) => {
+                backend.shutdown().await;
+                while events.recv_backend().await.is_some() {}
+            }
+            test_support::OperationResult::Finished(Err(error)) => {
+                assert!(!error.is_empty(), "cancelled startup lost its error")
+            }
+        }
+        observer
+            .release(creation)
+            .expect("release cancelled real native creation");
+        let completion = observer
+            .until_reaped()
+            .await
+            .expect("reap cancelled real provider native launch");
+        assert!(
+            completion.native_returned && completion.cancelled,
+            "real pending startup cancellation lost ownership: returned={} cancelled={}",
+            completion.native_returned,
+            completion.cancelled
+        );
+        assert_eq!(
+            completion.child_pids.len(),
+            1,
+            "real late native child was not tracked"
+        );
+        for pid in completion.child_pids {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "real late provider child was not reaped"
+            );
+        }
+    }
+    let prompt = launch_prompt();
+    let agent = spawn_agent(host, &prompt).await;
+    let launched = collect_turn(host, &agent, &prompt).await;
+    assert_ready_handshake(&launched);
+    let round_trip = ask(
+        host,
+        &agent,
+        "Reply with exactly TYDE_LAUNCH_ROUND_TRIP. Do not use tools.",
+    )
+    .await;
+    assert_final_text_contains(&round_trip, "TYDE_LAUNCH_ROUND_TRIP");
+    assert_universal_contract(&[launched, round_trip]);
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(real_process_launch, []);
 
 async fn real_conversation<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();

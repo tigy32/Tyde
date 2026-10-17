@@ -139,33 +139,18 @@ tail_launch_log() {
     tail -n 80 "$log_file" >&2 || true
   fi
 }
-nohup "$bin" host --uds --managed >> "$log_file" 2>&1 < /dev/null &
-pid=$!
-i=0
-while [ "$i" -lt 150 ]; do
-  # The server records itself only after it has bound the socket, so a pid
-  # file naming this launch proves this process owns it.
-  if kill -0 "$pid" 2>/dev/null && [ "$(cat "$pid_file" 2>/dev/null || true)" = "$pid" ]; then
-    ln -sfn "$version" "$HOME/.tyde/bin/current"
-    release_launch_lock
-    exit 0
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    # A launch this lock does not exclude (an older app's) can win the bind.
-    if socket_is_live "$bin" && recorded_pid_alive; then
-      release_launch_lock
-      exit 0
-    fi
-    echo "managed tyde-server process exited before it owned $socket" >&2
-    tail_launch_log
-    exit 1
-  fi
-  i=$((i + 1))
-  sleep 0.1
-done
-echo "managed tyde-server did not take ownership of $socket" >&2
-tail_launch_log
-exit 1
+if ! TYDE_HOST_LOG_PATH="$log_file" "$bin" host --launch-uds --managed; then
+  tail_launch_log
+  exit 1
+fi
+if ! recorded_pid_alive || ! socket_is_live "$bin"; then
+  echo "managed host acknowledged startup without canonical socket ownership" >&2
+  exit 1
+fi
+ln -sfn "$version" "$HOME/.tyde/bin/current"
+release_launch_lock
+exit 0
+
 "#;
 
 const STOP_BODY: &str = r#"if [ ! -f "$pid_file" ]; then

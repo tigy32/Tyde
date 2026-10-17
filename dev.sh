@@ -774,13 +774,32 @@ run_check_stages() {
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
-    run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server -p tyde-dev-driver --bin tyde-dev-driver
+    run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server -p tyde-dev-driver --bin tyde-dev-driver -p tauri-shell --bin tyde
+    if [[ "$(uname -s)" == Linux ]]; then
+        local server_target
+        case "$(uname -m)" in
+            x86_64) server_target=x86_64-unknown-linux-musl ;;
+            aarch64) server_target=aarch64-unknown-linux-musl ;;
+            *) printf 'Unsupported Linux server architecture\n' >&2; return 1 ;;
+        esac
+        run_stage "Install Linux server target" 1 rustup target add "$server_target"
+        run_stage "Build shipped Linux server target" 1 \
+            cargo build --target "$server_target" -p tyde-server --bin tyde-server
+        local launch_target
+        for launch_target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            run_stage "Install process-launch target $launch_target" 1 rustup target add "$launch_target"
+            run_stage "Check process-launch target $launch_target" 1 \
+                cargo clippy --target "$launch_target" -p tyde-process-env --lib -- -D warnings
+        done
+    fi
     run_stage "Provision JavaScript test tools" 1 \
         npm ci --ignore-scripts --no-audit --no-fund
     # Avoid host /tmp churn, inherited Git roots, and long Unix socket paths.
     mkdir -p "$native_temp_dir"
     run_stage "cargo nextest run" "$repetitions" \
-        env TMPDIR="$native_temp_dir" cargo nextest run
+        env TMPDIR="$native_temp_dir" \
+            TYDE_TEST_PROCESS_EXECUTABLE="${CARGO_TARGET_DIR:-$PWD/target}/debug/tyde-server" \
+            cargo nextest run
 
     n_wasm=$((STAGE_NUMBER + 1))
     n_loader=$((STAGE_NUMBER + 2))
@@ -793,7 +812,9 @@ run_check_stages() {
     (
         trap - EXIT INT TERM HUP
         run_stage_at "$n_wasm" "wasm browser tests" "$repetitions" \
-            env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" tools/run-wasm-tests.sh
+            env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" \
+                TYDE_TEST_PROCESS_EXECUTABLE="${CARGO_TARGET_DIR:-$PWD/target}/debug/tyde-server" \
+                tools/run-wasm-tests.sh
     ) &
     wasm_pid=$!
 

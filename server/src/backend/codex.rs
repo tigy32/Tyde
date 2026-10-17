@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -141,8 +141,8 @@ fn parse_codex_goal(value: &Value) -> Result<protocol::NativeGoal, String> {
     })
 }
 
-fn codex_command() -> Result<Command, String> {
-    crate::process_env::command("codex")
+fn codex_command() -> Result<crate::backend::subprocess::GroupCommand, String> {
+    crate::backend::subprocess::command("codex")
 }
 
 #[derive(Clone)]
@@ -23452,10 +23452,10 @@ async fn prepare_codex_tool_catalog(
         return Ok(None);
     }
     let mut command = match local_program {
-        Some(program) => crate::process_env::command(program)?,
+        Some(program) => crate::backend::subprocess::command(program)?,
         None => codex_command()?,
     };
-    command.args(["debug", "models"]).kill_on_drop(true);
+    command.args(["debug", "models"]);
     let output = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await
         .map_err(|_| "Codex tool filtering model catalogue probe timed out".to_owned())?
@@ -23679,8 +23679,8 @@ impl CodexRpc {
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = match local_program {
-                Some(program) => crate::process_env::command(program)?,
-                None => codex_command()?,
+                Some(program) => crate::backend::subprocess::command(program)?,
+                None => crate::backend::subprocess::command("codex")?,
             };
             for arg in codex_app_server_args(access_mode, execution_mode, &config_overrides) {
                 cmd.arg(arg);
@@ -23691,10 +23691,11 @@ impl CodexRpc {
             if let Some(root) = rollout_trace_root.as_ref() {
                 cmd.env("CODEX_ROLLOUT_TRACE_ROOT", root.path());
             }
-            cmd.stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .group_spawn()
+            cmd.stdin(crate::backend::subprocess::ProcessStdio::Piped)
+                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+            cmd.group_spawn()
+                .await
                 .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?
         };
 
@@ -24290,7 +24291,9 @@ impl CodexBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
         let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
-        let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
+        let startup_processes = crate::backend::subprocess::ProcessOwner::child();
+        let mut startup_cancel_guard =
+            CodexStartupCancelGuard(Some(startup_cancel_tx), startup_processes.clone());
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
@@ -24308,29 +24311,30 @@ impl CodexBackend {
             } else {
                 config.resolved_spawn_config.skills.as_slice()
             };
-            let session_result = CodexSession::spawn_with_mode(
-                &workspace_roots,
-                None,
-                startup_mcp_servers,
-                combined_instructions.as_deref(),
-                CodexSessionSpawnOptions {
-                    ephemeral: false,
-                    access_mode: config.resolved_spawn_config.access_mode,
-                    subagent_emitter: initial_emitter,
-                    execution_mode: config.execution_mode,
-                    installed_provider_version: config.provider_version.as_deref(),
-                    excluded_tool_categories: &config
-                        .resolved_spawn_config
-                        .excluded_tool_categories,
-                    selected_skills,
-                    skill_selection: if inference_only {
-                        SkillSelection::Explicit
-                    } else {
-                        config.resolved_spawn_config.skill_selection
+            let session_result = startup_processes
+                .scope(CodexSession::spawn_with_mode(
+                    &workspace_roots,
+                    None,
+                    startup_mcp_servers,
+                    combined_instructions.as_deref(),
+                    CodexSessionSpawnOptions {
+                        ephemeral: false,
+                        access_mode: config.resolved_spawn_config.access_mode,
+                        subagent_emitter: initial_emitter,
+                        execution_mode: config.execution_mode,
+                        installed_provider_version: config.provider_version.as_deref(),
+                        excluded_tool_categories: &config
+                            .resolved_spawn_config
+                            .excluded_tool_categories,
+                        selected_skills,
+                        skill_selection: if inference_only {
+                            SkillSelection::Explicit
+                        } else {
+                            config.resolved_spawn_config.skill_selection
+                        },
                     },
-                },
-            )
-            .await;
+                ))
+                .await;
             let (session, mut raw_events) = match session_result {
                 Ok(value) => value,
                 Err(err) => {
@@ -25560,7 +25564,10 @@ fn codex_subprocess_exit_message(value: &Value) -> String {
     }
 }
 
-struct CodexStartupCancelGuard(Option<oneshot::Sender<()>>);
+struct CodexStartupCancelGuard(
+    Option<oneshot::Sender<()>>,
+    crate::backend::subprocess::ProcessOwner,
+);
 
 fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     crate::steering::write_codex_steering_tempfile(content)
@@ -25583,6 +25590,8 @@ impl CodexStartupCancelGuard {
 impl Drop for CodexStartupCancelGuard {
     fn drop(&mut self) {
         if let Some(cancel) = self.0.take() {
+            self.1.kill_all();
+            tracing::info!("Codex pending native startup cancelled");
             let _ = cancel.send(());
         }
     }
@@ -25973,29 +25982,32 @@ impl Backend for CodexBackend {
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
-        let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
+        let startup_processes = crate::backend::subprocess::ProcessOwner::child();
+        let mut startup_cancel_guard =
+            CodexStartupCancelGuard(Some(startup_cancel_tx), startup_processes.clone());
 
         crate::backend::subprocess::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
-            let (session, mut raw_events) = match CodexSession::fork_with_selected_skills(
-                &workspace_roots,
-                None,
-                &config.startup_mcp_servers,
-                combined_instructions.as_deref(),
-                config.resolved_spawn_config.access_mode,
-                &from_session_id.0,
-                CodexSelectedSkillContext {
-                    skills: &config.resolved_spawn_config.skills,
-                    selection: config.resolved_spawn_config.skill_selection,
-                    installed_provider_version: config.provider_version.as_deref(),
-                    excluded_tool_categories: &config
-                        .resolved_spawn_config
-                        .excluded_tool_categories,
-                },
-            )
-            .await
+            let (session, mut raw_events) = match startup_processes
+                .scope(CodexSession::fork_with_selected_skills(
+                    &workspace_roots,
+                    None,
+                    &config.startup_mcp_servers,
+                    combined_instructions.as_deref(),
+                    config.resolved_spawn_config.access_mode,
+                    &from_session_id.0,
+                    CodexSelectedSkillContext {
+                        skills: &config.resolved_spawn_config.skills,
+                        selection: config.resolved_spawn_config.skill_selection,
+                        installed_provider_version: config.provider_version.as_deref(),
+                        excluded_tool_categories: &config
+                            .resolved_spawn_config
+                            .excluded_tool_categories,
+                    },
+                ))
+                .await
             {
                 Ok(value) => value,
                 Err(err) => {

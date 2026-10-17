@@ -3534,7 +3534,8 @@ fn project_git_preserves_path_wrapper_without_forking_host() {
     #[cfg(target_env = "gnu")]
     {
         // glibc execvp accepts executable shell wrappers without a shebang.
-        // The optimization must fall back rather than break an existing host setup.
+        // The trusted helper's execvp preserves this shell-wrapper behavior
+        // without copying the host address space or running its fork handlers.
         let wrapper_script = fs::read_to_string(&wrapper).expect("read wrapper");
         executable(
             &wrapper,
@@ -3548,8 +3549,8 @@ fn project_git_preserves_path_wrapper_without_forking_host() {
             .expect("fallback runtime")
             .block_on(assert_project_stage_file_updates_git_status_and_diffs());
         assert!(
-            FORKS.load(Ordering::Relaxed) > 0,
-            "legacy shell fallback must remain available"
+            FORKS.load(Ordering::Relaxed) == 0,
+            "legacy shell wrappers must not fork the host"
         );
 
         executable(&wrapper, &wrapper_script);

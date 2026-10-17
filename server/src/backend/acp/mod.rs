@@ -579,11 +579,11 @@ impl AcpBridge {
             .unwrap_or(ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT)
             .max(1);
 
-        let mut cmd = crate::process_env::command(command)?;
+        let mut cmd = crate::backend::subprocess::command(command)?;
         cmd.args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(crate::backend::subprocess::ProcessStdio::Null)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
 
         if let Some(path) = cwd.as_ref() {
             cmd.current_dir(path);
@@ -594,6 +594,7 @@ impl AcpBridge {
 
         let mut child = cmd
             .group_spawn()
+            .await
             .map_err(|err| format!("Failed to spawn terminal command '{command}': {err}"))?;
 
         let stdout = child.take_stdout();
@@ -1505,11 +1506,11 @@ impl AcpRpc {
             .await
             .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
         } else {
-            let mut cmd = crate::process_env::command(&spec.local_program)?;
+            let mut cmd = crate::backend::subprocess::command(&spec.local_program)?;
             cmd.args(&spec.local_args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+                .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
             }
@@ -1523,6 +1524,7 @@ impl AcpRpc {
                 cmd.current_dir(path);
             }
             cmd.group_spawn()
+                .await
                 .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
         };
 

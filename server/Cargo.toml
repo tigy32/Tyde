@@ -5,7 +5,7 @@ edition.workspace = true
 [features]
 default = []
 full-backends = []
-test-support = []
+test-support = ["tyde-process-env/test-support"]
 
 [dependencies]
 tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613" }
@@ -96,3 +96,6 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"

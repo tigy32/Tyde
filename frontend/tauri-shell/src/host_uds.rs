@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 const HOST_SOCKET_PATH_ENV: &str = "TYDE_SOCKET_PATH";
 
@@ -26,6 +25,8 @@ pub fn run() -> Result<(), String> {
 
     #[cfg(unix)]
     {
+        let notification = server::host_launch::take_notification();
+        server::init_process_env()?;
         if let Err(err) = super::logging::init_host_uds_logging() {
             eprintln!("warning: failed to initialize host UDS logging: {err}");
         }
@@ -54,6 +55,7 @@ pub fn run() -> Result<(), String> {
             })
             .await?;
 
+            server::host_launch::notify_ready(notification)?;
             server::serve_uds(
                 listener,
                 server::ServerConfig::current(),
@@ -102,7 +104,6 @@ pub fn launch() -> Result<(), String> {
             return Ok(());
         }
 
-        let socket_path = resolve_socket_path()?;
         let log_dir = server::paths::home_dir()?.join(".tyde").join("logs");
         std::fs::create_dir_all(&log_dir).map_err(|err| {
             format!(
@@ -111,45 +112,10 @@ pub fn launch() -> Result<(), String> {
             )
         })?;
         let log_path = log_dir.join("tyde-host.log");
-        let exe = std::env::current_exe()
-            .map_err(|err| format!("failed to locate current Tyde executable: {err}"))?;
-        let command = format!(
-            "nohup {} host --uds >> {} 2>&1 < /dev/null &",
-            shell_quote_path(&exe),
-            shell_quote_path(&log_path)
-        );
-        let status = server::process_env::std_command("sh")?
-            .arg("-lc")
-            .arg(command)
-            .status()
-            .map_err(|err| format!("failed to launch Tyde UDS host: {err}"))?;
-        if !status.success() {
-            return Err(format!(
-                "failed to launch Tyde UDS host: shell exited with {status}"
-            ));
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Tyde UDS host did not become reachable at {} within 5s; see {}",
-                    socket_path.display(),
-                    log_path.display()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let program =
+            std::env::current_exe().map_err(|error| format!("locate host executable: {error}"))?;
+        server::host_launch::launch_current(&program, &log_path, false)
     }
-}
-
-#[cfg(unix)]
-fn shell_quote_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]

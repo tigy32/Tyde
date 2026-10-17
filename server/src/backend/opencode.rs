@@ -1,3 +1,4 @@
+use crate::process_env::launch::{AsyncCommandGroup, ProcessStdio};
 use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SessionId};
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
@@ -63,10 +64,10 @@ pub(crate) async fn export_session(
         .args(["export", session_id])
         .current_dir(workspace_root)
         .stdout(stdout)
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(ProcessStdio::piped());
     let child = command
-        .spawn()
+        .group_spawn()
+        .await
         .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
     let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
         .await

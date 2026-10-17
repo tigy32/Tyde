@@ -2103,6 +2103,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tyde-process-env",
  "url",
 ]
 
@@ -7671,6 +7673,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake2",
+ "cc",
  "chrono",
  "client",
  "command-group",
@@ -8667,6 +8670,7 @@ dependencies = [
  "image",
  "libc",
  "opus",
+ "plist",
  "protocol",
  "reqwest 0.12.28",
  "semver",
@@ -9459,9 +9463,15 @@ dependencies = [
 name = "tyde-process-env"
 version = "0.0.0"
 dependencies = [
- "rustix",
+ "anyhow",
+ "command-group",
+ "libc",
+ "nix 0.25.1",
+ "portable-pty",
  "tokio",
+ "tokio-util",
  "tracing",
+ "winapi",
 ]
 
 [[package]]

@@ -12,8 +12,7 @@ use rmcp::model::{
 };
 use rmcp::service::{Peer, RequestContext, RoleClient, RoleServer, RunningService, ServiceExt};
 use rmcp::transport::{
-    StreamableHttpClientTransport, TokioChildProcess,
-    streamable_http_client::StreamableHttpClientTransportConfig,
+    StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
 };
 use rmcp::{ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
@@ -561,8 +560,16 @@ async fn connect(server: &BridgeServerConfig) -> Result<RunningService<RoleClien
         BridgeTransport::Stdio { command, args, env } => {
             let mut child = crate::process_env::command(command)?;
             child.args(args).envs(env);
-            let transport = TokioChildProcess::new(child)
-                .map_err(|error| format!("failed to spawn '{command}': {error}"))?;
+            use crate::process_env::launch::{AsyncCommandGroup, ProcessStdio};
+            child
+                .stdin(ProcessStdio::Piped)
+                .stdout(ProcessStdio::Piped)
+                .stderr(ProcessStdio::Inherit);
+            let transport = child
+                .group_spawn()
+                .await
+                .and_then(|child| child.into_owned_pipes())
+                .map_err(|error| format!("failed to spawn MCP child: {error}"))?;
             ().serve(transport).await.map_err(|error| error.to_string())
         }
     }

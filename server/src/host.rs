@@ -13508,6 +13508,7 @@ impl HostHandle {
         };
         let project = load_project(&project_store, &project_id, OPERATION).await?;
         crate::project_stream::open_project_path(&project, payload, opener_program.as_deref())
+            .await
             .map_err(|error| project_command_error(OPERATION, error))
     }
 

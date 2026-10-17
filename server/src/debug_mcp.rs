@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::process_env::launch::{
+    AsyncCommandGroup, AsyncGroupChild, GroupCommand as Command, ProcessStdio as Stdio,
+};
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{
     BoundedDebugOutput, CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV, DEV_INSTANCE_DENY_PROXY_URL,
     DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_HOME_ENV,
@@ -35,8 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -52,7 +52,129 @@ pub struct DebugMcpHandle {
 
 #[derive(Debug)]
 struct DebugMcpState {
-    instances: Mutex<HashMap<String, DevInstanceRecord>>,
+    instances: mpsc::UnboundedSender<InstanceCommand>,
+}
+
+enum InstanceCommand {
+    Insert {
+        record: Box<DevInstanceRecord>,
+        reply: oneshot::Sender<()>,
+    },
+    Remove {
+        id: String,
+        reply: oneshot::Sender<Option<DevInstanceRecord>>,
+    },
+    List {
+        reply: oneshot::Sender<Vec<DevInstanceSummary>>,
+    },
+    Address {
+        id: String,
+        reply: oneshot::Sender<Result<SocketAddr, String>>,
+    },
+    Output {
+        id: String,
+        cursor: Option<u64>,
+        max_bytes: usize,
+        reply: oneshot::Sender<Result<DebugOutputSlice, String>>,
+    },
+    Snapshot {
+        id: String,
+        reply: oneshot::Sender<Result<DebugSnapshotResult, String>>,
+    },
+}
+
+fn start_instance_registry() -> mpsc::UnboundedSender<InstanceCommand> {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut records = HashMap::<String, DevInstanceRecord>::new();
+        while let Some(command) = receiver.recv().await {
+            match command {
+                InstanceCommand::Insert { record, reply } => {
+                    assert!(
+                        records
+                            .insert(record.instance_id.clone(), *record)
+                            .is_none(),
+                        "duplicate dev instance id inserted"
+                    );
+                    let _ = reply.send(());
+                }
+                InstanceCommand::Remove { id, reply } => {
+                    let _ = reply.send(records.remove(&id));
+                }
+                InstanceCommand::List { reply } => {
+                    let mut summaries = records
+                        .values_mut()
+                        .map(dev_instance_summary)
+                        .collect::<Vec<_>>();
+                    summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+                    let _ = reply.send(summaries);
+                }
+                InstanceCommand::Address { id, reply } => {
+                    let _ = reply.send(
+                        records
+                            .get(&id)
+                            .map(|record| record.ui_debug_addr)
+                            .ok_or_else(|| format!("unknown instance_id '{id}'")),
+                    );
+                }
+                InstanceCommand::Output {
+                    id,
+                    cursor,
+                    max_bytes,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        records
+                            .get(&id)
+                            .map(|record| {
+                                record
+                                    .startup_output
+                                    .lock()
+                                    .expect("startup output mutex poisoned")
+                                    .read(cursor, max_bytes)
+                            })
+                            .ok_or_else(|| format!("unknown instance_id '{id}'")),
+                    );
+                }
+                InstanceCommand::Snapshot { id, reply } => {
+                    let result = records
+                        .get_mut(&id)
+                        .map(|record| {
+                            let output_cursor = record
+                                .startup_output
+                                .lock()
+                                .expect("startup output mutex poisoned")
+                                .next_cursor();
+                            let instance = dev_instance_summary(record);
+                            DebugSnapshotResult {
+                                ready: instance.status == "running",
+                                instance,
+                                output_cursor,
+                                capabilities: debug_capabilities(),
+                            }
+                        })
+                        .ok_or_else(|| format!("unknown instance_id '{id}'"));
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    });
+    sender
+}
+
+impl DebugMcpState {
+    async fn instance_request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> InstanceCommand,
+    ) -> Result<T, String> {
+        let (reply, response) = oneshot::channel();
+        self.instances
+            .send(command(reply))
+            .map_err(|_| "dev instance registry closed".to_string())?;
+        response
+            .await
+            .map_err(|_| "dev instance registry dropped response".to_string())
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +191,7 @@ struct DevInstanceRecord {
     startup_output: Arc<StdMutex<BoundedDebugOutput>>,
     startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
+    frontend_child: AsyncGroupChild,
     started_at_ms: u64,
 }
 
@@ -374,9 +497,6 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
     let local_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read debug MCP listener addr: {err}"))?;
-    let state = Arc::new(DebugMcpState {
-        instances: Mutex::new(HashMap::new()),
-    });
     std::thread::Builder::new()
         .name("tyde-debug-mcp".to_string())
         .spawn(move || {
@@ -385,6 +505,9 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
                 .build()
                 .expect("failed to build debug MCP runtime");
             runtime.block_on(async move {
+                let state = Arc::new(DebugMcpState {
+                    instances: start_instance_registry(),
+                });
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio debug MCP listener");
                 let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
@@ -454,6 +577,40 @@ async fn start_instance(
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
+    let mut frontend_command =
+        devtools_protocol::frontend::command(&project_dir, &store_dir, frontend_port)?;
+    frontend_command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_dev_instance_environment(
+        &mut frontend_command,
+        &store_dir,
+        prepared_hermes.as_ref(),
+    )?;
+    let mut frontend_child = frontend_command
+        .group_spawn()
+        .await
+        .map_err(|error| format!("failed to spawn dev frontend: {error}"))?;
+    let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
+        STARTUP_LOG_TAIL_BYTES,
+    )));
+    let stdout = frontend_child
+        .take_stdout()
+        .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
+    let stderr = frontend_child
+        .take_stderr()
+        .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
+    let mut startup_capture_tasks = vec![
+        tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
+        tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+    ];
+
+    if let Err(error) =
+        devtools_protocol::frontend::wait_until_ready(&mut frontend_child, frontend_port).await
+    {
+        return Err(with_startup_diagnostics(error, &startup_output));
+    }
+    tracing::debug!("dev frontend ready before desktop launch");
     let mut command = tauri_dev_command(&config_path)?;
     command
         .current_dir(&project_dir)
@@ -461,30 +618,24 @@ async fn start_instance(
         .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
         .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
 
     let mut child = command
         .group_spawn()
+        .await
         .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
-    let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
-        STARTUP_LOG_TAIL_BYTES,
-    )));
+
     let stdout = child
-        .inner()
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
     let stderr = child
-        .inner()
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
-    let startup_capture_tasks = vec![
+    startup_capture_tasks.extend([
         tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
         tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
-    ];
+    ]);
 
     let mut record = DevInstanceRecord {
         instance_id: instance_id.clone(),
@@ -499,6 +650,7 @@ async fn start_instance(
         startup_output,
         startup_capture_tasks,
         child,
+        frontend_child,
         started_at_ms: now_ms(),
     };
 
@@ -520,8 +672,12 @@ async fn start_instance(
         ui_debug_addr: record.ui_debug_addr.to_string(),
     };
 
-    let previous = state.instances.lock().await.insert(instance_id, record);
-    assert!(previous.is_none(), "duplicate dev instance id inserted");
+    state
+        .instance_request(|reply| InstanceCommand::Insert {
+            record: Box::new(record),
+            reply,
+        })
+        .await?;
     startup_cleanup.disarm();
 
     Ok(result)
@@ -751,41 +907,43 @@ async fn stop_instance(
     instance_id: &str,
 ) -> Result<DevInstanceSummary, String> {
     let mut record = state
-        .instances
-        .lock()
-        .await
-        .remove(instance_id)
+        .instance_request(|reply| InstanceCommand::Remove {
+            id: instance_id.to_owned(),
+            reply,
+        })
+        .await?
         .ok_or_else(|| format!("unknown instance_id '{instance_id}'"))?;
-    let _ = record.child.kill().await;
+    record
+        .child
+        .kill()
+        .await
+        .map_err(|error| format!("failed to stop dev desktop: {error}"))?;
+    record
+        .frontend_child
+        .kill()
+        .await
+        .map_err(|error| format!("failed to stop dev frontend: {error}"))?;
     let _ = tokio::fs::remove_file(&record.config_path).await;
     let _ = tokio::fs::remove_dir_all(&record.store_dir).await;
-    Ok(dev_instance_summary(&mut record).await)
+    Ok(dev_instance_summary(&mut record))
 }
 
 async fn list_instances(state: &Arc<DebugMcpState>) -> Result<Vec<DevInstanceSummary>, String> {
-    let mut instances = state.instances.lock().await;
-    let mut summaries = Vec::with_capacity(instances.len());
-
-    for record in instances.values_mut() {
-        let summary = dev_instance_summary(record).await;
-        summaries.push(summary);
-    }
-
-    summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
-    Ok(summaries)
+    state
+        .instance_request(|reply| InstanceCommand::List { reply })
+        .await
 }
 
 async fn evaluate_instance(
     state: &Arc<DebugMcpState>,
     input: EvaluateToolInput,
 ) -> Result<Value, String> {
-    let ui_debug_addr = {
-        let instances = state.instances.lock().await;
-        let record = instances
-            .get(&input.instance_id)
-            .ok_or_else(|| format!("unknown instance_id '{}'", input.instance_id))?;
-        record.ui_debug_addr
-    };
+    let ui_debug_addr = state
+        .instance_request(|reply| InstanceCommand::Address {
+            id: input.instance_id,
+            reply,
+        })
+        .await??;
 
     let response = send_ui_debug_request(
         ui_debug_addr,
@@ -813,17 +971,14 @@ async fn debug_events(
             "max_bytes must be between 1 and {STARTUP_LOG_TAIL_BYTES}"
         ));
     }
-    let output = {
-        let instances = state.instances.lock().await;
-        let record = instances
-            .get(&input.instance_id)
-            .ok_or_else(|| format!("unknown instance_id '{}'", input.instance_id))?;
-        record
-            .startup_output
-            .lock()
-            .expect("startup output mutex poisoned")
-            .read(input.cursor, max_bytes)
-    };
+    let output = state
+        .instance_request(|reply| InstanceCommand::Output {
+            id: input.instance_id.clone(),
+            cursor: input.cursor,
+            max_bytes,
+            reply,
+        })
+        .await??;
     Ok(debug_events_result(input.instance_id, output))
 }
 
@@ -849,27 +1004,31 @@ async fn debug_snapshot(
     state: &Arc<DebugMcpState>,
     instance_id: &str,
 ) -> Result<DebugSnapshotResult, String> {
-    let mut instances = state.instances.lock().await;
-    let record = instances
-        .get_mut(instance_id)
-        .ok_or_else(|| format!("unknown instance_id '{instance_id}'"))?;
-    let output_cursor = record
-        .startup_output
-        .lock()
-        .expect("startup output mutex poisoned")
-        .next_cursor();
-    let instance = dev_instance_summary(record).await;
-    let ready = instance.status == "running";
-    Ok(DebugSnapshotResult {
-        instance,
-        ready,
-        output_cursor,
-        capabilities: debug_capabilities(),
-    })
+    state
+        .instance_request(|reply| InstanceCommand::Snapshot {
+            id: instance_id.to_owned(),
+            reply,
+        })
+        .await?
 }
 
 async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), String> {
     loop {
+        match record.frontend_child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return Err(with_startup_diagnostics(
+                    format!("dev frontend exited before desktop ready: {status}"),
+                    &record.startup_output,
+                ));
+            }
+            Err(error) => {
+                return Err(with_startup_diagnostics(
+                    format!("failed to inspect dev frontend: {error}"),
+                    &record.startup_output,
+                ));
+            }
+        }
         match record.child.try_wait() {
             Ok(Some(exit_status)) => {
                 for mut task in record.startup_capture_tasks.drain(..) {
@@ -926,7 +1085,7 @@ async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), S
     }
 }
 
-async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSummary {
+fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSummary {
     let status = match record.child.try_wait() {
         Ok(Some(exit_status)) => format!("exited({exit_status})"),
         Ok(None) => "running".to_string(),
@@ -1036,15 +1195,11 @@ fn write_dev_config(
     instance_id: &str,
 ) -> Result<PathBuf, String> {
     let source_path = repo_root.join("frontend/tauri-shell/tauri.conf.json");
-    let trunk_command_path = repo_root.join("tools/trunk-command.mjs");
     let contents = std::fs::read_to_string(&source_path)
         .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
     let mut json: Value = serde_json::from_str(&contents)
         .map_err(|err| format!("failed to parse {}: {err}", source_path.display()))?;
-    json["build"]["beforeDevCommand"] = Value::String(format!(
-        "node {} serve --port {frontend_port} --no-autoreload",
-        shell_single_quote(&trunk_command_path.display().to_string())
-    ));
+    json["build"]["beforeDevCommand"] = Value::Null;
     json["build"]["devUrl"] = Value::String(format!("http://127.0.0.1:{frontend_port}"));
 
     let output_path = dev_instance_config_path(instance_id);
@@ -1110,10 +1265,6 @@ fn with_startup_diagnostics(message: String, output: &StdMutex<BoundedDebugOutpu
         )
     };
     format!("{message}\n{diagnostics}")
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn now_ms() -> u64 {

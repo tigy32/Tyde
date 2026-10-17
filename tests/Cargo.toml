@@ -39,3 +39,6 @@ sha2 = "0.10"
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "visit"] }
 tracing = "0.1"
+
+[build-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

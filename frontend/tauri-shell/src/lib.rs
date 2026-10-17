@@ -17,7 +17,6 @@ mod voice_media;
 
 use std::{
     collections::HashMap,
-    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -477,6 +476,13 @@ impl QuitConfirmation {
     }
 }
 
+pub(crate) fn exit_after_relaunch(app: &AppHandle) {
+    app.state::<Arc<QuitConfirmation>>()
+        .confirmed_exit
+        .store(true, Ordering::SeqCst);
+    app.exit(0);
+}
+
 fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfirmation>) {
     if !confirmation.try_open_dialog() {
         return;
@@ -597,7 +603,19 @@ fn show_web_content_recovery_notice(
     }
     dialog.show_with_result(move |result| {
         match recovery_dialog_action(failure, result) {
-            RecoveryDialogAction::Restart => { shutdown_managed_host(&app); app.request_restart(); },
+            RecoveryDialogAction::Restart => {
+                tauri::async_runtime::spawn(async move {
+                    app.state::<ShellState>().host.shutdown_for_restart().await;
+                    #[cfg(desktop)]
+                    let result=updates::restart_current_application(&app).await;
+                    #[cfg(not(desktop))]
+                    let result:Result<(),String>=Err("application relaunch is not supported on this platform".to_owned());
+                    if let Err(error)=result {
+                        tracing::error!(%error,"application recovery relaunch failed");
+                        app.dialog().message(error).kind(MessageDialogKind::Error).show(|_|{});
+                    }
+                });
+            },
             RecoveryDialogAction::KeepWaiting => tracing::info!(
                 "webview.recovery event=recovery_prompt_dismissed label={label} generation={generation} failure={failure:?} action=keep_waiting"
             ),
@@ -730,10 +748,15 @@ fn parse_external_url(value: &str, dev_url: Option<&Url>) -> Result<Url, String>
 
 fn open_url_with_system_handler(url: &Url, dev_url: Option<&Url>) -> Result<(), String> {
     let url = parse_external_url(url.as_str(), dev_url)?;
-    spawn_system_url_handler(url.as_str())
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = spawn_system_url_handler(url.as_str()).await {
+            tracing::warn!(%error,"failed to open external navigation");
+        }
+    });
+    Ok(())
 }
 
-fn spawn_system_url_handler(url: &str) -> Result<(), String> {
+async fn spawn_system_url_handler(url: &str) -> Result<(), String> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = url;
@@ -742,24 +765,31 @@ fn spawn_system_url_handler(url: &str) -> Result<(), String> {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let mut command = system_url_handler_command(url)?;
+        let command = system_url_handler_command(url)?;
         command
-            .spawn()
+            .launch_independent(
+                server::process_env::launch::IndependentProcess::ExternalApplication,
+            )
+            .await
             .map(|_| ())
             .map_err(|err| format!("failed to launch system URL handler: {err}"))
     }
 }
 
 #[cfg(target_os = "macos")]
-fn system_url_handler_command(url: &str) -> Result<Command, String> {
-    let mut command = server::process_env::std_command("open")?;
+fn system_url_handler_command(
+    url: &str,
+) -> Result<server::process_env::launch::GroupCommand, String> {
+    let mut command = server::process_env::command("open")?;
     command.arg(url);
     Ok(command)
 }
 
 #[cfg(target_os = "windows")]
-fn system_url_handler_command(url: &str) -> Result<Command, String> {
-    let mut command = server::process_env::std_command("rundll32.exe")?;
+fn system_url_handler_command(
+    url: &str,
+) -> Result<server::process_env::launch::GroupCommand, String> {
+    let mut command = server::process_env::command("rundll32.exe")?;
     command.arg("url.dll,FileProtocolHandler").arg(url);
     Ok(command)
 }
@@ -769,16 +799,18 @@ fn system_url_handler_command(url: &str) -> Result<Command, String> {
     not(target_os = "windows"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-fn system_url_handler_command(url: &str) -> Result<Command, String> {
-    let mut command = server::process_env::std_command("xdg-open")?;
+fn system_url_handler_command(
+    url: &str,
+) -> Result<server::process_env::launch::GroupCommand, String> {
+    let mut command = server::process_env::command("xdg-open")?;
     command.arg(url);
     Ok(command)
 }
 
 #[tauri::command]
-fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let url = parse_external_url(&url, dev_server_url(app.config()))?;
-    spawn_system_url_handler(url.as_str())
+    spawn_system_url_handler(url.as_str()).await
 }
 
 #[tauri::command]
@@ -1299,6 +1331,11 @@ fn install_linux_edit_history_keys(window: &tauri::WebviewWindow) -> tauri::Resu
 }
 
 pub fn run() {
+    #[cfg(desktop)]
+    if let Err(error) = server::init_process_env() {
+        eprintln!("Failed to initialize child process environment: {error}");
+        std::process::exit(1);
+    }
     #[cfg(target_os = "macos")]
     macos_webview_defaults::apply();
 
@@ -1317,6 +1354,7 @@ pub fn run() {
     let recovery_for_setup = web_content_recovery.clone();
 
     let builder = tauri::Builder::default()
+        .manage(quit_confirmation)
         .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())

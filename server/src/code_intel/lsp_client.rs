@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +34,6 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::lsp_codec::{LspDecoder, encode};
-use crate::backend::subprocess::reap_group_child_slot;
 
 /// Upper bound for a single LSP request. A language server that accepts a
 /// request but never answers must not keep a pending-map entry and a provider
@@ -327,17 +325,18 @@ impl LspClient {
         cwd: &Path,
         env_path: Option<&OsStr>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<LspEvent>), String> {
-        let mut cmd = crate::process_env::command(binary)?;
+        let mut cmd = crate::backend::subprocess::command(binary)?;
         cmd.args(args)
             .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
         if let Some(path) = env_path {
             cmd.env("PATH", path);
         }
         let mut child = cmd
             .group_spawn()
+            .await
             .map_err(|e| format!("failed to spawn language server {binary:?}: {e}"))?;
 
         let stdin = child.take_stdin().ok_or("failed to capture stdin")?;
@@ -476,9 +475,8 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         self.reader_task.abort();
         self.actor_task.abort();
-        if let Some(child) = &self.child {
-            reap_group_child_slot(child);
-        }
+        // Aborted owners drop their canonical child leases; native cleanup
+        // does not depend on a runtime or acquiring this client's async slot.
     }
 }
 

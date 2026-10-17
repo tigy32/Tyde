@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -322,7 +321,7 @@ impl AgyProcess {
         if launch.access_mode == BackendAccessMode::EnforcedReadOnly {
             return Err("Antigravity cannot enforce read-only workspace access".into());
         }
-        let mut command = crate::process_env::command("agy")?;
+        let mut command = crate::backend::subprocess::command("agy")?;
         command.args(launch.args(resume));
         if let Some(path) = process_env::resolved_child_process_path() {
             command.env("PATH", path);
@@ -332,12 +331,13 @@ impl AgyProcess {
         }
         command
             .current_dir(&launch.primary_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
 
         let mut child = command
             .group_spawn()
+            .await
             .map_err(|err| format!("Failed to start Antigravity CLI: {err:?}"))?;
         let stdin = child
             .take_stdin()
@@ -1877,7 +1877,7 @@ async fn run_antigravity_cli_command(
     cwd: Option<&Path>,
     command: &str,
 ) -> Result<AgyCommandOutput, String> {
-    let mut process = crate::process_env::command(program)
+    let mut process = crate::backend::subprocess::command(program)
         .map_err(|err| format!("Antigravity CLI is unavailable: {err:?}"))?;
     process.args(["--output-format", "stream-json", "-p", command]);
     if let Some(model) = model {
@@ -1890,10 +1890,9 @@ async fn run_antigravity_cli_command(
         process.current_dir(cwd);
     }
     process
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Null);
     let output = tokio::time::timeout(ANTIGRAVITY_COMMAND_TIMEOUT, process.output())
         .await
         .map_err(|_| {
@@ -1991,20 +1990,20 @@ pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityStat
 /// `/usage` is answered by print mode directly — no model request, no turn,
 /// zero tokens — so this costs a short-lived process and nothing else.
 async fn read_antigravity_capacity() -> Result<CapacityReport, CapacityUnavailableReason> {
-    let mut command = crate::process_env::command("agy")
+    let mut command = crate::backend::subprocess::command("agy")
         .map_err(|_| CapacityUnavailableReason::SourceUnreachable)?;
     command.args(["--output-format", "stream-json", "-p", "/usage"]);
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
     }
     command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Null)
         // A timeout drops the `output()` future, which does not reap the child
         // unless it is killed on drop. Without this a hung `agy` outlives every
         // probe that gives up on it, and the poll runs on a timer.
-        .kill_on_drop(true);
+        ;
 
     let output = tokio::time::timeout(ANTIGRAVITY_CAPACITY_TIMEOUT, command.output())
         .await
@@ -3331,14 +3330,13 @@ pub(crate) fn resolve_antigravity_conversations_dir(
 }
 
 async fn antigravity_model_catalog(program: &str, cwd: &Path) -> Result<Vec<SelectOption>, String> {
-    let mut command = crate::process_env::command(program)?;
+    let mut command = crate::backend::subprocess::command(program)?;
     command
         .arg("models")
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Null);
     let output = tokio::time::timeout(ANTIGRAVITY_COMMAND_TIMEOUT, command.output())
         .await
         .map_err(|_| "Antigravity model catalog timed out".to_owned())?

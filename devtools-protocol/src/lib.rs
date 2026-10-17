@@ -1,4 +1,7 @@
 #[cfg(feature = "launcher")]
+pub mod frontend;
+
+#[cfg(feature = "launcher")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

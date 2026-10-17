@@ -8,6 +8,7 @@ use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CREDENTIAL_SENTINEL: &str = "parent-claude-credential";
 
@@ -26,6 +27,13 @@ fn shell_quote(path: &Path) -> String {
 // and state; CLAUDE_SECURESTORAGE_CONFIG_DIR, when set, holds credentials
 // (empty means ~/.claude), otherwise credentials live in the config dir.
 const FAKE_CARGO_TAURI: &str = r#"#!/bin/sh
+# Starting this CLI must follow frontend readiness, not initiate it.
+/usr/bin/python3 - "$@" <<'PYCONFIG' || exit 89
+import json,pathlib,sys,os
+path=sys.argv[sys.argv.index('--config')+1]
+assert json.load(open(path))['build']['beforeDevCommand'] is None
+pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).touch()
+PYCONFIG
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 if [ "${CLAUDE_SECURESTORAGE_CONFIG_DIR+set}" = set ]; then
   credentials="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-$HOME/.claude}"
@@ -40,6 +48,22 @@ printf 'CLAUDE_CREDENTIAL_MATCH=1\n'
 exit 3
 "#;
 
+const FAKE_NODE: &str = r#"#!/usr/bin/python3
+import http.server,os,socket,sys
+assert sys.argv[1].endswith('/tools/trunk-command.mjs')
+assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv
+port=int(sys.argv[sys.argv.index('--port')+1])
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
+control.sendall(b'B')
+assert control.recv(1)==b'R'
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200);self.end_headers();self.wfile.write(b'<html>fixture</html>')
+    def log_message(self,*args):pass
+http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
+"#;
+
 // Nextest isolates each test in its own process, so the process environment
 // below belongs to this test alone. It is set before any runtime starts.
 #[test]
@@ -48,6 +72,13 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     let bin = tools.path().join("bin");
     std::fs::create_dir(&bin).expect("fake bin dir");
     executable(&bin.join("cargo-tauri"), FAKE_CARGO_TAURI);
+    executable(&bin.join("node"), FAKE_NODE);
+    let control_dir = tempfile::Builder::new()
+        .prefix("tyde-front-")
+        .tempdir_in("/tmp")
+        .expect("short frontend control directory");
+    let control_path = control_dir.path().join("control");
+    let desktop_marker = control_dir.path().join("desktop-started");
     let original_path = std::env::var_os("PATH").expect("test PATH");
     let resolved_path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
@@ -69,6 +100,8 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     )
     .expect("parent Claude credentials");
     unsafe {
+        std::env::set_var("TYDE_TEST_FRONTEND_CONTROL", &control_path);
+        std::env::set_var("TYDE_TEST_DESKTOP_MARKER", &desktop_marker);
         std::env::set_var("SHELL", &shell);
         std::env::set_var("CLAUDE_CONFIG_DIR", &parent_claude_home);
         std::env::set_var("TYDE_TEST_CLAUDE_CREDENTIAL", CREDENTIAL_SENTINEL);
@@ -80,7 +113,10 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         .enable_all()
         .build()
         .expect("test runtime")
-        .block_on(start_dev_instance_expecting_exit());
+        .block_on(start_dev_instance_expecting_exit(
+            &control_path,
+            &desktop_marker,
+        ));
 
     assert!(
         error.contains("exited before ready"),
@@ -115,7 +151,9 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     );
 }
 
-async fn start_dev_instance_expecting_exit() -> String {
+async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: &Path) -> String {
+    let control =
+        tokio::net::UnixListener::bind(control_path).expect("bind frontend readiness gate");
     // Let the server retain its ephemeral listener: reserving then releasing a
     // port raced other tests and failed with AddressAlreadyInUse.
     let fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
@@ -137,17 +175,47 @@ async fn start_dev_instance_expecting_exit() -> String {
         fixture.host_for_test().debug_mcp_url_for_test().await,
     );
     let service = ().serve(transport).await.expect("connect to debug MCP");
-    let result = service
-        .call_tool(CallToolRequestParams {
+    let mut start = Box::pin(
+        service.call_tool(CallToolRequestParams {
             meta: None,
             name: "tyde_dev_instance_start".into(),
             arguments: json!({ "project_dir": repo_root.display().to_string() })
                 .as_object()
                 .cloned(),
             task: None,
-        })
+        }),
+    );
+    let (mut control, _) = tokio::select! {
+        result = &mut start => panic!("dev start settled before frontend readiness gate: tool_completed={}", result.is_ok()),
+        connected = control.accept() => connected.expect("frontend entered actual readiness gate"),
+    };
+    assert_eq!(
+        control.read_u8().await.expect("frontend control gate"),
+        b'B'
+    );
+    assert!(
+        !desktop_marker.exists(),
+        "desktop started before frontend was ready"
+    );
+    control
+        .write_all(b"R")
         .await
-        .expect("call tyde_dev_instance_start");
+        .expect("release actual frontend readiness");
+    let result = start.as_mut().await.expect("call tyde_dev_instance_start");
+    drop(start);
+    assert!(
+        desktop_marker.exists(),
+        "desktop did not start after frontend became ready"
+    );
+    let mut byte = [0];
+    assert_eq!(
+        control
+            .read(&mut byte)
+            .await
+            .expect("frontend exit observation"),
+        0,
+        "failed dev start must stop its owned frontend"
+    );
     service.cancel().await.expect("cancel debug MCP client");
     assert_eq!(
         result.is_error,

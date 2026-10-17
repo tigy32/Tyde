@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process::Stdio, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -80,14 +80,15 @@ impl Connection {
         args: &[String],
         customization: Option<tempfile::TempDir>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Incoming>), String> {
-        let mut command = crate::process_env::command(program)?;
+        let mut command = crate::backend::subprocess::command(program)?;
         command
             .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
         let mut child = command
             .group_spawn()
+            .await
             .map_err(|error| format!("Cannot start Muse serve: {error}"))?;
         let stdin = child.take_stdin().ok_or("Muse stdin was not captured")?;
         let stdout = child.take_stdout().ok_or("Muse stdout was not captured")?;

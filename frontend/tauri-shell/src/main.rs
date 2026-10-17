@@ -12,6 +12,8 @@ enum CliMode {
 }
 
 fn main() {
+    #[cfg(unix)]
+    server::subprocess::exec_helper_entry();
     // Record this binary's real release version so the mobile Welcome/Reject/QR
     // payloads advertise the correct web/PWA bundle key.
     server::set_host_release_version(env!("CARGO_PKG_VERSION"));
@@ -53,6 +55,10 @@ fn main() {
             }
         }
         CliMode::McpBridge => {
+            if let Err(error) = server::init_process_env() {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

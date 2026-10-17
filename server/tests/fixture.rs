@@ -164,7 +164,67 @@ pub struct Fixture {
     antigravity_conversations_dir: tempfile::TempDir,
 }
 
+// Every integration binary includes this shared fixture; UDS launch flows use it.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub struct FixtureUds {
+    directory: tempfile::TempDir,
+    shutdown: tokio_util::sync::CancellationToken,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl FixtureUds {
+    pub async fn connect(&self) -> client::Connection {
+        self.connect_with_bootstrap().await.0
+    }
+
+    pub async fn connect_with_bootstrap(&self) -> (client::Connection, HostBootstrapPayload) {
+        let mut client = client::connect_uds(
+            self.directory.path().join("host.sock"),
+            &client::ClientConfig::current(),
+        )
+        .await
+        .expect("connect real fixture UDS");
+        let bootstrap = read_initial_host_bootstrap(&mut client).await;
+        (client, bootstrap)
+    }
+
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        self.server
+            .await
+            .expect("UDS fixture task failed")
+            .expect("UDS fixture failed");
+    }
+}
+
 impl Fixture {
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub async fn serve_uds(&self) -> FixtureUds {
+        let directory = tempfile::Builder::new()
+            .prefix("tyde-uds-")
+            .tempdir_in("/tmp")
+            .expect("create short fixture socket directory");
+        let listener = server::bind_uds(directory.path().join("host.sock"))
+            .await
+            .expect("bind fixture UDS");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(server::serve_uds(
+            listener,
+            server::ServerConfig::current(),
+            self.host.clone(),
+            shutdown.clone(),
+        ));
+        FixtureUds {
+            directory,
+            shutdown,
+            server,
+        }
+    }
+
     // Every integration binary compiles this fixture; only Tychat flows use these hooks.
     #[allow(dead_code)]
     pub fn tychat_host(&self) -> server::HostHandle {

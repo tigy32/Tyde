@@ -50,11 +50,19 @@ pub fn ssh_control_args() -> Result<Vec<String>, String> {
 }
 
 pub async fn run_ssh_raw(host: &str, command: &str) -> Result<Output, String> {
-    crate::process_env::command("ssh")?
+    let mut process = crate::backend::subprocess::command("ssh")?;
+    process
         .arg("-T")
         .arg(host)
         .arg(command)
-        .output()
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+    process
+        .group_spawn()
+        .await
+        .map_err(|err| format!("ssh process launch failed: {err}"))?
+        .wait_with_output()
         .await
         .map_err(|err| format!("ssh command failed: {err}"))
 }
@@ -95,13 +103,16 @@ pub(crate) async fn spawn_remote_process_with_env(
     }
     let remote_cmd = remote_parts.join(" ");
 
-    crate::process_env::command("ssh")?
+    let mut process = crate::backend::subprocess::command("ssh")?;
+    process
         .arg("-T")
         .arg(host)
         .arg(remote_cmd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+    process
         .group_spawn()
+        .await
         .map_err(|err| format!("Failed to spawn remote process over ssh: {err}"))
 }

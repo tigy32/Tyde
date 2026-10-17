@@ -24,10 +24,10 @@ fn login_shell_initialization_from_background_terminal() {
                     .collect();
                 assert!(!paths[0].is_empty());
                 assert!(paths.iter().all(|path| *path == paths[0]));
-                let output = tyde_process_env::std_command("/bin/sh")
+                let output = tyde_process_env::command("/bin/sh")
                     .expect("create child command")
                     .args(["-c", "printf '%s' \"$PATH\""])
-                    .output()
+                    .output_blocking()
                     .expect("run child with resolved PATH");
                 assert!(output.status.success());
                 use std::os::unix::ffi::OsStrExt;

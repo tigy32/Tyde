@@ -1,5 +1,17 @@
+fn main() {
+    #[cfg(unix)]
+    tyde_dev_driver::process_env::launch::exec_helper_entry();
+    if std::env::args().nth(1).as_deref() == Some("debug")
+        && let Err(error) = tyde_dev_driver::process_env::init_process_env()
+    {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = match args.first().map(String::as_str) {
         Some("agent-control") => {

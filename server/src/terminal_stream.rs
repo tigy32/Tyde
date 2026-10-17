@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use crate::process_env::launch::GroupCommand;
+use portable_pty::{ExitStatus, MasterPty, PtySize};
 use protocol::{
     FrameKind, NewTerminalPayload, ProjectId, ProjectRootPath, TerminalBootstrapPayload,
     TerminalErrorCode, TerminalErrorPayload, TerminalExitPayload, TerminalId,
@@ -324,21 +325,17 @@ pub(crate) async fn create_terminal(
 }
 
 fn create_terminal_session(launch: &TerminalLaunchInfo) -> Result<CreatedTerminalSession, String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
+    let (command, shell) = build_terminal_command(launch)?;
+    let pair = process_env::launch::pty::spawn(
+        command,
+        PtySize {
             rows: launch.rows,
             cols: launch.cols,
             pixel_width: 0,
             pixel_height: 0,
-        })
-        .map_err(|err| format!("failed to allocate PTY: {err}"))?;
-
-    let (command, shell) = build_terminal_command(launch)?;
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|err| format!("failed to spawn terminal process: {err}"))?;
+        },
+    )
+    .map_err(|error| format!("failed to create terminal process: {error}"))?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -351,7 +348,7 @@ fn create_terminal_session(launch: &TerminalLaunchInfo) -> Result<CreatedTermina
     Ok(CreatedTerminalSession {
         master: pair.master,
         writer,
-        child,
+        child: pair.child,
         reader,
         shell,
     })
@@ -482,25 +479,25 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn build_terminal_command(launch: &TerminalLaunchInfo) -> Result<(CommandBuilder, String), String> {
+fn build_terminal_command(launch: &TerminalLaunchInfo) -> Result<(GroupCommand, String), String> {
     let (mut command, program) = match &launch.command {
         TerminalLaunchCommand::DefaultShell => {
             let shell = default_shell();
-            let mut command = CommandBuilder::new(shell.clone());
+            let mut command = process_env::command(&shell)?;
             if !cfg!(target_os = "windows") {
                 command.arg("-l");
             }
             (command, shell)
         }
         TerminalLaunchCommand::Trusted { program, arguments } => {
-            let mut command = CommandBuilder::new(program);
+            let mut command = process_env::command(program)?;
             command.args(arguments);
             (command, program.clone())
         }
     };
     command.env("TERM", "xterm-256color");
     command.env("PATH", process_env::initialize_process_env()?);
-    command.cwd(&launch.cwd);
+    command.current_dir(&launch.cwd);
     Ok((command, program))
 }
 

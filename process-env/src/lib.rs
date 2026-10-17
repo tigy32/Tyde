@@ -1,19 +1,11 @@
+pub mod launch;
+
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-#[cfg(unix)]
-use std::time::{Duration, Instant};
 
 static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Result<OsString, String>> = OnceLock::new();
-#[cfg(unix)]
-const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const PROBE_SENTINEL_BEGIN: &str = "TYDE_SHELL_PROBE_BEGIN_7f3c9a2e=";
 #[cfg(unix)]
@@ -31,16 +23,8 @@ pub fn initialize_process_env() -> Result<&'static OsStr, String> {
         .map_err(Clone::clone)
 }
 
-pub fn command(program: impl AsRef<OsStr>) -> Result<tokio::process::Command, String> {
-    let mut command = tokio::process::Command::new(program);
-    command.env("PATH", initialize_process_env()?);
-    Ok(command)
-}
-
-pub fn std_command(program: impl AsRef<OsStr>) -> Result<std::process::Command, String> {
-    let mut command = std::process::Command::new(program);
-    command.env("PATH", initialize_process_env()?);
-    Ok(command)
+pub fn command(program: impl AsRef<OsStr>) -> Result<launch::GroupCommand, String> {
+    launch::command(program)
 }
 
 pub fn resolved_child_process_path() -> Option<&'static OsStr> {
@@ -113,83 +97,31 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) -> Result<(), String> {
         begin = PROBE_SENTINEL_BEGIN,
         end = PROBE_SENTINEL_END,
     );
-    let mut command = Command::new(&shell);
+    let mut command = launch::raw_command(&shell);
     command
         .arg("-ilc")
         .arg(&script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // Interactive Bash can stop on SIGTTIN in a terminal's background group.
-    // SAFETY: the child hook only calls the async-signal-safe setsid syscall.
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid()?;
-            Ok(())
-        });
+        .new_session()
+        .stdin(launch::ProcessStdio::Null)
+        .stdout(launch::ProcessStdio::Piped)
+        .stderr(launch::ProcessStdio::Null);
+    let output = command
+        .output_blocking()
+        .map_err(|error| format!("failed to query login-shell PATH via {shell}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "login-shell PATH query via {shell} exited with status {}",
+            output.status
+        ));
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            let message = format!("failed to query login-shell PATH via {shell}: {err}");
-            tracing::error!("{message}");
-            return Err(message);
-        }
-    };
-
-    let started = Instant::now();
-    let timeout = LOGIN_SHELL_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    let message =
-                        format!("login-shell PATH query via {shell} exited with status {status}");
-                    tracing::error!("{message}");
-                    return Err(message);
-                }
-                let stdout = match read_child_stdout(child, "login-shell PATH query") {
-                    Some(stdout) => stdout,
-                    None => {
-                        let message = format!("failed to read stdout from login shell {shell}");
-                        tracing::error!("{message}");
-                        return Err(message);
-                    }
-                };
-                let text = String::from_utf8_lossy(&stdout);
-                let Some(value) = extract_probe_value(&text) else {
-                    let message =
-                        format!("login-shell PATH probe output missing sentinels via {shell}");
-                    tracing::error!("{message}");
-                    return Err(message);
-                };
-                if value.is_empty() {
-                    let message = format!("login-shell PATH via {shell} was empty");
-                    tracing::error!("{message}");
-                    return Err(message);
-                }
-                extend_from_path_value(segments, Some(OsString::from(value)));
-                return Ok(());
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let message =
-                        format!("timed out querying login-shell PATH via {shell} (deadline 60s)");
-                    tracing::error!("{message}");
-                    return Err(message);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => {
-                let message =
-                    format!("failed to wait for login-shell PATH query via {shell}: {err}");
-                tracing::error!("{message}");
-                return Err(message);
-            }
-        }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = extract_probe_value(&text)
+        .ok_or_else(|| format!("login-shell PATH probe output missing sentinels via {shell}"))?;
+    if value.is_empty() {
+        return Err(format!("login-shell PATH via {shell} was empty"));
     }
+    extend_from_path_value(segments, Some(OsString::from(value)));
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -213,18 +145,6 @@ fn extract_probe_value(output: &str) -> Option<&str> {
     let rest = output.get(start..)?;
     let end = rest.find(PROBE_SENTINEL_END)?;
     Some(rest[..end].trim())
-}
-
-#[cfg(unix)]
-fn read_child_stdout(mut child: std::process::Child, context: &str) -> Option<Vec<u8>> {
-    let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take()
-        && let Err(err) = pipe.read_to_end(&mut stdout)
-    {
-        tracing::debug!("failed to read stdout for {context}: {err}");
-        return None;
-    }
-    Some(stdout)
 }
 
 fn find_matching_executable_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {

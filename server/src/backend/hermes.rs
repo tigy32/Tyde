@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -5011,7 +5010,7 @@ async fn register_hermes_mcp_bridge(
     bridge_program: &str,
     supports_parallel_tool_calls: bool,
 ) -> Result<Option<Vec<String>>, String> {
-    let mut command = crate::process_env::command(&target.program)?;
+    let mut command = crate::backend::subprocess::command(&target.program)?;
     command.args([
         "-c",
         HERMES_BRIDGE_REGISTRATION,
@@ -5105,7 +5104,7 @@ async fn register_hermes_skill_dir(
     skills_root: &Path,
 ) -> Result<(), String> {
     let skills_root = skills_root.to_string_lossy().to_string();
-    let mut command = crate::process_env::command(&target.program)?;
+    let mut command = crate::backend::subprocess::command(&target.program)?;
     command.args(["-c", HERMES_SKILLS_DIR_REGISTRATION, &skills_root]);
     // Same reason the MCP bridge registration does this: `target.env` carries
     // the selected profile's HERMES_HOME, and without it the script would edit
@@ -5281,7 +5280,7 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         "TYDE HERMES SPAWN ENV https_proxy={:?}",
         std::env::var("HTTPS_PROXY")
     );
-    let mut command = crate::process_env::command(&target.program)?;
+    let mut command = crate::backend::subprocess::command(&target.program)?;
     command.args(&target.args);
     command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
     command.envs(&target.env);
@@ -5298,16 +5297,15 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
     // unconditional hardline blocks before this flag.
     command.env(HERMES_YOLO_MODE_ENV, "1");
     command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .group_spawn()
-        .map_err(|err| {
-            format!(
-                "Failed to spawn Hermes gateway {}: {err}",
-                target.display_program
-            )
-        })
+        .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+    command.group_spawn().await.map_err(|err| {
+        format!(
+            "Failed to spawn Hermes gateway {}: {err}",
+            target.display_program
+        )
+    })
 }
 
 impl HermesEventMapper {
@@ -8722,24 +8720,17 @@ fn split_shell_words(input: &str) -> Option<Vec<String>> {
 async fn run_hermes_version_command(
     command: &str,
 ) -> Result<HermesVersionOutput, HermesProbeFailure> {
-    let mut command_proc = crate::process_env::command(command).map_err(|error| {
+    let mut command_proc = crate::backend::subprocess::command(command).map_err(|error| {
         HermesProbeFailure::new(BackendSetupDiagnosticCode::CommandFailed, error)
     })?;
     command_proc
         .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
     if let Some(path) = process_env::resolved_child_process_path() {
         command_proc.env("PATH", path);
     }
-    let spawned = tokio::task::spawn_blocking(move || command_proc.group_spawn())
-        .await
-        .map_err(|error| {
-            HermesProbeFailure::new(
-                BackendSetupDiagnosticCode::CommandFailed,
-                format!("Hermes version probe spawn worker failed: {error}"),
-            )
-        })?;
+    let spawned = command_proc.group_spawn().await;
     let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
@@ -8914,36 +8905,28 @@ pub(crate) async fn probe_hermes_python_gateway_import(
         "import importlib.util\nimport sys\ntry:\n    spec = importlib.util.find_spec({module:?})\nexcept Exception:\n    spec = None\nsys.exit(0 if spec else 1)\n",
         module = HERMES_PYTHON_MODULE
     );
-    let mut command_proc = crate::process_env::command(command).map_err(|error| {
+    let mut command_proc = crate::backend::subprocess::command(command).map_err(|error| {
         HermesProbeFailure::new(BackendSetupDiagnosticCode::CommandFailed, error)
     })?;
     command_proc
         .arg("-c")
         .arg(script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
     if let Some(path) = process_env::resolved_child_process_path() {
         command_proc.env("PATH", path);
     }
-    let mut child = tokio::task::spawn_blocking(move || command_proc.group_spawn())
-        .await
-        .map_err(|error| {
-            HermesProbeFailure::new(
-                BackendSetupDiagnosticCode::CommandFailed,
-                format!("Hermes import probe spawn worker failed: {error}"),
-            )
-        })?
-        .map_err(|err| {
-            let code = if err.kind() == io::ErrorKind::NotFound {
-                BackendSetupDiagnosticCode::CommandNotFound
-            } else {
-                BackendSetupDiagnosticCode::CommandFailed
-            };
-            HermesProbeFailure::new(
-                code,
-                format!("Failed to run Hermes gateway import probe with {command}: {err}"),
-            )
-        })?;
+    let mut child = command_proc.group_spawn().await.map_err(|err| {
+        let code = if err.kind() == io::ErrorKind::NotFound {
+            BackendSetupDiagnosticCode::CommandNotFound
+        } else {
+            BackendSetupDiagnosticCode::CommandFailed
+        };
+        HermesProbeFailure::new(
+            code,
+            format!("Failed to run Hermes gateway import probe with {command}: {err}"),
+        )
+    })?;
     let mut stdout_pipe = child.take_stdout().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,

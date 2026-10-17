@@ -320,8 +320,15 @@ async fn claude_prepare_skills(
         ));
     }
 
-    if !claude_supports_plugin_dir().await {
-        return without_skills(unsupported_plugin_dir_notice());
+    match claude_supports_plugin_dir().await {
+        Ok(true) => {}
+        Ok(false) => return without_skills(unsupported_plugin_dir_notice()),
+        Err(error) => {
+            return without_skills(format!(
+                "Tyde started this Claude session without its {} selected skill(s): {error}",
+                selected.len()
+            ));
+        }
     }
 
     let outcome = match ClaudeSkillPlugin::prepare(None, selected) {
@@ -918,6 +925,7 @@ struct ClaudeInner {
     emitter: Arc<TurnEmitter>,
     active_response: StdMutex<Option<(String, ResponseHandle)>>,
     state: ClaudeStateActor,
+    process_start_cancellation: tokio_util::sync::CancellationToken,
     /// Published by the state owner; read by the synchronous capability probe.
     compaction_capability: watch::Receiver<BackendCompactionCapability>,
     task_tracker: StdMutex<ClaudeTaskTracker>,
@@ -962,6 +970,7 @@ impl ClaudeInner {
             emitter,
             active_response: StdMutex::new(None),
             state: ClaudeStateActor::spawn(state, inner.clone()),
+            process_start_cancellation: tokio_util::sync::CancellationToken::new(),
             compaction_capability,
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
             background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
@@ -1273,6 +1282,12 @@ enum ClaudeSkillReadiness {
     /// have them. It keeps running — this message is the notice the user gets,
     /// not a startup error.
     Degraded(String),
+}
+
+enum ClaudeProcessAdmission {
+    Installed,
+    Displaced(ClaudeProcessRuntime),
+    Closed(ClaudeProcessRuntime),
 }
 
 struct ClaudeProcessRuntime {
@@ -4358,7 +4373,15 @@ impl ClaudeInner {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        let runtime = match self.spawn_process(config, process_generation).await {
+        let spawned = tokio::select! {
+            biased;
+            _ = self.process_start_cancellation.cancelled() => {
+                tracing::info!(process_generation, "Claude pending process start cancelled");
+                Err("Claude backend is shutting down".to_owned())
+            }
+            result = self.spawn_process(config, process_generation) => result,
+        };
+        let runtime = match spawned {
             Ok(runtime) => runtime,
             Err(error) => {
                 drop(reservation);
@@ -4366,20 +4389,34 @@ impl ClaudeInner {
                 return Err(error);
             }
         };
-        let displaced = self
+        let admission = self
             .state
             .with(move |state| {
                 reservation.release(state);
+                if state.closing {
+                    return ClaudeProcessAdmission::Closed(runtime);
+                }
                 if state.runtime.is_some() {
-                    return Some(runtime);
+                    return ClaudeProcessAdmission::Displaced(runtime);
                 }
                 state.runtime = Some(runtime);
-                None
+                ClaudeProcessAdmission::Installed
             })
             .await;
-        if let Some(runtime) = displaced {
-            runtime.kill().await;
-            return Ok(());
+        match admission {
+            ClaudeProcessAdmission::Installed => {}
+            ClaudeProcessAdmission::Displaced(runtime) => {
+                runtime.kill().await;
+                return Ok(());
+            }
+            ClaudeProcessAdmission::Closed(runtime) => {
+                tracing::info!(
+                    process_generation,
+                    "Claude late process installation rejected"
+                );
+                runtime.kill().await;
+                return Err("Claude backend is shutting down".to_owned());
+            }
         }
         match tokio::time::timeout(
             CLAUDE_INITIALIZE_TIMEOUT,
@@ -5059,7 +5096,7 @@ impl ClaudeInner {
             .map_err(|err| format!("Failed to start Claude CLI over SSH: {err}"))?
         } else {
             let program = config.program.clone().unwrap_or_else(claude_binary);
-            let mut cmd = crate::process_env::command(program)?;
+            let mut cmd = crate::backend::subprocess::command(program)?;
             for arg in &cli_args {
                 cmd.arg(arg);
             }
@@ -5076,10 +5113,11 @@ impl ClaudeInner {
                 eprintln!("TYDE CLAUDE EXPLICIT MODEL PIN model={model}");
             }
             cmd.current_dir(&config.workspace_root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+                .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
             cmd.group_spawn()
+                .await
                 .map_err(|err| format!("Failed to start Claude CLI: {err}"))?
         };
 
@@ -6321,7 +6359,18 @@ impl ClaudeInner {
 
     async fn shutdown(&self) {
         tracing::info!("Claude shutdown starting");
-        self.state.with(|state| state.closing = true).await;
+        let pending_starts = self
+            .state
+            .with(|state| {
+                state.closing = true;
+                state.spawns_reserved
+            })
+            .await;
+        tracing::info!(
+            pending_starts,
+            "Claude shutdown cancelling pending process starts"
+        );
+        self.process_start_cancellation.cancel();
         self.cancel_skill_watchdog().await;
         // Resolve the turn here instead of interrupting the CLI and waiting for
         // it to confirm quiescence. The process is about to be killed, so its
@@ -6763,7 +6812,7 @@ fn claude_binary() -> String {
 /// neither can carry a gate. Per-skill verification therefore happens later,
 /// against the `init` frame.
 async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Result<(), String> {
-    let mut cmd = crate::process_env::command(claude_binary())?;
+    let mut cmd = crate::backend::subprocess::command(claude_binary())?;
     cmd.arg(CLAUDE_PLUGIN_DIR_FLAG)
         .arg(root)
         .arg("plugin")
@@ -6797,42 +6846,29 @@ async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Resul
     verify_plugin_inventory(&String::from_utf8_lossy(&output.stdout), root)
 }
 
-/// Does the local CLI advertise `--plugin-dir`?
-///
-/// Cached per server process. A missing binary or a failed probe is reported as
-/// "unsupported" rather than assumed working, so the failure surfaces as a
-/// named capability error instead of an opaque CLI exit at spawn time.
-async fn claude_supports_plugin_dir() -> bool {
-    // The CLI does not change underneath a running server process.
-    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *SUPPORTED.get_or_init(probe_plugin_dir_support).await
-}
-
-async fn probe_plugin_dir_support() -> bool {
-    let Ok(mut cmd) = crate::process_env::command(claude_binary()) else {
-        return false;
-    };
+/// Does the installed CLI advertise `--plugin-dir`?
+async fn claude_supports_plugin_dir() -> Result<bool, String> {
+    // A cancelled native launch is not a negative CLI capability to cache.
+    let mut cmd = crate::backend::subprocess::command(claude_binary())?;
     cmd.arg("--help");
     if let Some(path) = process_env::resolved_child_process_path() {
         cmd.env("PATH", path);
     }
-    match cmd.output().await {
-        Ok(output) => {
-            let help = String::from_utf8_lossy(&output.stdout);
-            let supported = help_text_supports_plugin_dir(&help);
-            if !supported {
-                tracing::warn!(
-                    "Claude CLI --help does not advertise --plugin-dir; Tyde skills cannot be \
-                     exposed natively"
-                );
-            }
-            supported
-        }
-        Err(err) => {
-            tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
-            false
-        }
+    let output = cmd.output().await.map_err(|err| {
+        tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
+        format!("Failed to probe Claude CLI for --plugin-dir support: {err}")
+    })?;
+    if !output.status.success() {
+        return Err(format!("Claude CLI --help exited {}", output.status));
     }
+    let help = String::from_utf8_lossy(&output.stdout);
+    let supported = help_text_supports_plugin_dir(&help);
+    if !supported {
+        tracing::warn!(
+            "Claude CLI --help does not advertise --plugin-dir; Tyde skills cannot be exposed natively"
+        );
+    }
+    Ok(supported)
 }
 
 fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
@@ -15402,8 +15438,11 @@ impl ClaudeBackend {
             // see `claude_prepare_skills`.
             // `ClaudeBackend` spawns the CLI locally; the low-level session is
             // the only layer that takes an ssh host, and it is given none here.
-            let (skills, skill_steering) =
-                claude_prepare_skills(&config, None, &probe_workspace_root).await;
+            let (skills, skill_steering) = tokio::select! {
+                biased;
+                _ = &mut startup_cancel_rx => return,
+                skills = claude_prepare_skills(&config, None, &probe_workspace_root) => skills,
+            };
             let steering = match claude_steering_content(&config, skill_steering) {
                 Ok(steering) => steering,
                 Err(err) => {
@@ -15632,11 +15671,10 @@ impl ClaudeBackend {
             let _ = forward_task.await;
         });
 
-        match tokio::time::timeout(Duration::from_secs(120), ready_rx).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(err))) => return Err(err),
-            Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
-            Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err("Claude spawn initialization task ended early".to_string()),
         }
         let startup_cancel_tx = startup_cancel_guard.disarm();
 
@@ -16230,7 +16268,7 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
     let unreachable = protocol::BackendCapacityState::Unavailable {
         reason: CapacityUnavailableReason::SourceUnreachable,
     };
-    let mut command = match crate::process_env::command(claude_binary()) {
+    let mut command = match crate::backend::subprocess::command(claude_binary()) {
         Ok(command) => command,
         Err(error) => {
             tracing::debug!("Claude capacity probe could not resolve the CLI: {error}");
@@ -16250,11 +16288,11 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
         command.env("PATH", path);
     }
     command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Null);
 
-    let mut child = match command.group_spawn() {
+    let mut child = match command.group_spawn().await {
         Ok(child) => child,
         Err(error) => {
             tracing::debug!("Claude capacity probe failed to spawn: {error}");

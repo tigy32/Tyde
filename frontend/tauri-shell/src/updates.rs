@@ -30,7 +30,7 @@ struct Inner {
 
 struct Updates {
     inner: Mutex<Inner>,
-    operation: tokio::sync::Mutex<()>,
+    operation: AtomicBool,
     host_stopped: AtomicBool,
     preferences_path: PathBuf,
 }
@@ -42,7 +42,20 @@ fn now() -> u64 {
         .as_secs()
 }
 
+struct UpdateOperation<'a>(&'a AtomicBool);
+impl Drop for UpdateOperation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Updates {
+    fn begin_operation(&self) -> Result<UpdateOperation<'_>, &'static str> {
+        self.operation
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| UpdateOperation(&self.operation))
+            .map_err(|_| "An update operation is in progress")
+    }
     fn change(&self, app: &AppHandle, change: impl FnOnce(&mut Inner)) -> AppUpdateStatus {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         change(&mut inner);
@@ -154,7 +167,7 @@ async fn release_endpoint(
 
 async fn check(app: &AppHandle, manual: bool) -> Result<AppUpdateStatus, String> {
     let updates = app.state::<Updates>();
-    let Ok(_operation) = updates.operation.try_lock() else {
+    let Ok(_operation) = updates.begin_operation() else {
         return Ok(updates.snapshot());
     };
     let before = updates.snapshot();
@@ -246,10 +259,7 @@ async fn configure(
 ) -> Result<AppUpdateStatus, String> {
     {
         let updates = app.state::<Updates>();
-        let _operation = updates
-            .operation
-            .try_lock()
-            .map_err(|_| "An update operation is in progress")?;
+        let _operation = updates.begin_operation()?;
         let preferences = UpdatePreferences {
             channel,
             automatic,
@@ -274,10 +284,7 @@ async fn configure(
 #[tauri::command]
 async fn dismiss(app: AppHandle, choice: UpdateDismissal) -> Result<AppUpdateStatus, String> {
     let updates = app.state::<Updates>();
-    let _operation = updates
-        .operation
-        .try_lock()
-        .map_err(|_| "An update operation is in progress")?;
+    let _operation = updates.begin_operation()?;
     let mut preferences = updates.snapshot().preferences;
     match choice {
         UpdateDismissal::Never => preferences.automatic = false,
@@ -322,10 +329,7 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
         return Err("In-place updates require an installed Tyde package. Development builds cannot replace themselves.".into());
     }
     let updates = app.state::<Updates>();
-    let _operation = updates
-        .operation
-        .try_lock()
-        .map_err(|_| "An update operation is in progress")?;
+    let _operation = updates.begin_operation()?;
     if updates.host_stopped.load(Ordering::Acquire) {
         return Err("Tyde is restarting to bring local agents back.".into());
     }
@@ -347,6 +351,8 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
         inner.status.prompt = true;
         inner.status.error = None;
     });
+    #[cfg(target_os = "macos")]
+    let mut prepared_relaunch = None;
     let result = async {
         let mut last_progress = std::time::Instant::now();
         let mut downloaded = 0;
@@ -375,11 +381,32 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
             .host
             .shutdown_for_restart()
             .await;
+        #[cfg(target_os = "macos")]
+        {
+            let environment = app.env();
+            let program = tauri::process::current_binary(&environment)
+                .map_err(|error| format!("resolve helper executable before install: {error}"))?;
+            let mut command = server::process_env::command(program)?;
+            command.args(environment.args_os.iter().skip(1));
+            prepared_relaunch = Some(
+                command
+                    .prepare_independent(
+                        server::process_env::launch::IndependentProcess::ExternalApplication,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("prepare relaunch before replacing application: {error}")
+                    })?,
+            );
+        }
         tauri::async_runtime::spawn_blocking(move || update.install(bytes))
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        app.request_restart();
+        #[cfg(target_os = "macos")]
+        restart_application(&app, prepared_relaunch.take()).await?;
+        #[cfg(not(target_os = "macos"))]
+        restart_application(&app).await?;
         Ok::<_, String>(())
     }
     .await;
@@ -396,6 +423,9 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
             inner.status.error = Some(error.clone());
         });
         if host_stopped {
+            #[cfg(target_os = "macos")]
+            restart_after_failed_install(&app, error, prepared_relaunch.take());
+            #[cfg(not(target_os = "macos"))]
             restart_after_failed_install(&app, error);
         }
         return Ok(status);
@@ -406,14 +436,95 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
 // The embedded host cannot serve again after its restart shutdown, so a
 // failed install relaunches the unchanged app, whose normal startup
 // reconstructs the host and continues the interrupted turns.
-fn restart_after_failed_install(app: &AppHandle, message: String) {
+fn restart_after_failed_install(
+    app: &AppHandle,
+    message: String,
+    #[cfg(target_os = "macos")] prepared: Option<server::process_env::launch::PreparedIndependent>,
+) {
     let restart = app.clone();
     app.dialog()
         .message(message)
         .title("Tyde update failed")
         .kind(MessageDialogKind::Error)
         .buttons(MessageDialogButtons::OkCustom("Restart Tyde".to_owned()))
-        .show(move |_| restart.request_restart());
+        .show(move |_| {
+            tauri::async_runtime::spawn(async move {
+                #[cfg(target_os = "macos")]
+                let result = restart_application(&restart, prepared).await;
+                #[cfg(not(target_os = "macos"))]
+                let result = restart_application(&restart).await;
+                if let Err(error) = result {
+                    tracing::error!(%error,"failed to relaunch after update installation failure");
+                    let updates = restart.state::<Updates>();
+                    updates.change(&restart, |inner| inner.status.error = Some(error));
+                }
+            });
+        });
+}
+
+pub(crate) async fn restart_current_application(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        restart_application(app, None).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        restart_application(app).await
+    }
+}
+
+async fn restart_application(
+    app: &AppHandle,
+    #[cfg(target_os = "macos")] prepared: Option<server::process_env::launch::PreparedIndependent>,
+) -> Result<(), String> {
+    let environment = app.env();
+    let program = tauri::process::current_binary(&environment)
+        .map_err(|error| format!("resolve application relaunch executable: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let program = match program
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("MacOS")))
+    {
+        Some(directory) => {
+            let contents = directory
+                .parent()
+                .ok_or("application bundle has no Contents directory")?;
+            let dictionary: plist::Dictionary = plist::from_file(contents.join("Info.plist"))
+                .map_err(|error| format!("read updated application bundle: {error}"))?;
+            let executable = dictionary
+                .get("CFBundleExecutable")
+                .and_then(plist::Value::as_string)
+                .ok_or("application bundle has no executable name")?;
+            let mut components = std::path::Path::new(executable).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                return Err("application bundle executable name is not a filename".to_owned());
+            }
+            directory.join(executable)
+        }
+        None => program,
+    };
+    let mut command = server::process_env::command(&program)?;
+    command.args(environment.args_os.iter().skip(1));
+    #[cfg(target_os = "macos")]
+    let result = match prepared {
+        Some(prepared) => prepared.commit(program).await,
+        None => {
+            command
+                .launch_independent(
+                    server::process_env::launch::IndependentProcess::ExternalApplication,
+                )
+                .await
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let result = command
+        .launch_independent(server::process_env::launch::IndependentProcess::ExternalApplication)
+        .await;
+    result.map_err(|error| format!("relaunch application: {error}"))?;
+    crate::exit_after_relaunch(app);
+    Ok(())
 }
 
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -463,7 +574,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             next_check: 0,
             seen_servers: Default::default(),
         }),
-        operation: tokio::sync::Mutex::new(()),
+        operation: AtomicBool::new(false),
         host_stopped: AtomicBool::new(false),
         preferences_path,
     });

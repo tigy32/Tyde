@@ -1,8 +1,8 @@
+use crate::process_env::launch::{GroupCommand as Command, ProcessStdio as Stdio};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2143,6 +2143,14 @@ where
             GitAccessMode::ReadOnly,
         ) {
             Ok(output) => output,
+            // Match the file scanner's disappearance race: availability is
+            // reported by the root listing, not as a failed healthy project.
+            Err(_) if root_unavailable_reason(&root).is_some() => {
+                tracing::debug!(
+                    "project root disappeared during Git status; root listing owns availability"
+                );
+                continue;
+            }
             Err(err) if is_not_git_repository_error(&err) => {
                 if root_is_git_repository(&root.0) {
                     tracing::warn!(
@@ -2473,7 +2481,7 @@ pub(crate) fn read_file(
     }
 }
 
-pub(crate) fn open_project_path(
+pub(crate) async fn open_project_path(
     project: &Project,
     payload: ProjectOpenPathPayload,
     opener_program: Option<&Path>,
@@ -2491,22 +2499,20 @@ pub(crate) fn open_project_path(
         ));
     }
 
-    let mut command = project_path_command(&canonical_path, payload.action, opener_program)?;
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "Failed to {} '{}': {error}",
-            match payload.action {
-                ProjectOpenPathAction::OpenExternally => "open",
-                ProjectOpenPathAction::Reveal => "reveal",
-            },
-            payload.path.relative_path
-        )
-    })?;
-    tokio::task::spawn_blocking(move || {
-        if let Err(error) = child.wait() {
-            tracing::debug!(%error, "failed to reap project path opener process");
-        }
-    });
+    let command = project_path_command(&canonical_path, payload.action, opener_program)?;
+    command
+        .launch_independent(crate::process_env::launch::IndependentProcess::ExternalApplication)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to {} '{}': {error}",
+                match payload.action {
+                    ProjectOpenPathAction::OpenExternally => "open",
+                    ProjectOpenPathAction::Reveal => "reveal",
+                },
+                payload.path.relative_path
+            )
+        })?;
     Ok(())
 }
 
@@ -2551,7 +2557,7 @@ fn project_path_command(
     opener_program: Option<&Path>,
 ) -> Result<Command, String> {
     if let Some(program) = opener_program {
-        let mut command = crate::process_env::std_command(program)?;
+        let mut command = crate::process_env::command(program)?;
         command
             .arg(match action {
                 ProjectOpenPathAction::OpenExternally => "open",
@@ -2563,7 +2569,7 @@ fn project_path_command(
 
     #[cfg(target_os = "macos")]
     {
-        let mut command = crate::process_env::std_command("open")?;
+        let mut command = crate::process_env::command("open")?;
         if matches!(action, ProjectOpenPathAction::Reveal) {
             command.arg("-R");
         }
@@ -2575,14 +2581,14 @@ fn project_path_command(
         use std::ffi::OsString;
         match action {
             ProjectOpenPathAction::OpenExternally => {
-                let mut command = crate::process_env::std_command("rundll32.exe")?;
+                let mut command = crate::process_env::command("rundll32.exe")?;
                 command.arg("url.dll,FileProtocolHandler").arg(path);
                 Ok(command)
             }
             ProjectOpenPathAction::Reveal => {
                 let mut argument = OsString::from("/select,");
                 argument.push(path);
-                let mut command = crate::process_env::std_command("explorer.exe")?;
+                let mut command = crate::process_env::command("explorer.exe")?;
                 command.arg(argument);
                 Ok(command)
             }
@@ -2590,7 +2596,7 @@ fn project_path_command(
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let mut command = crate::process_env::std_command("xdg-open")?;
+        let mut command = crate::process_env::command("xdg-open")?;
         command.arg(match action {
             ProjectOpenPathAction::OpenExternally => path,
             ProjectOpenPathAction::Reveal => path.parent().ok_or_else(|| {
@@ -3917,58 +3923,17 @@ fn spawn_git_command(
     args: &[&str],
     access_mode: GitAccessMode,
     pipe_stdin: bool,
-) -> Result<std::process::Child, String> {
-    let git_binary = git_binary.as_ref();
-    let spawn = |program: &std::ffi::OsStr| {
-        let mut command = git_command(program, root, args, access_mode)?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            command.arg0(git_binary);
-        }
-        command
-            .stdin(if pipe_stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| format!("Failed to start git in '{root}': {err}"))
-    };
-    #[cfg(target_os = "linux")]
-    if !git_binary.as_encoded_bytes().contains(&b'/') {
-        // A bare program plus an overridden PATH makes Rust fall back from
-        // posix_spawn to fork. Resolve against the same login PATH, retaining
-        // symlinks so custom Git launchers keep their selected invocation path.
-        let path = crate::process_env::initialize_process_env()?;
-        let program = std::env::split_paths(path)
-            .map(|dir| dir.join(git_binary))
-            .find(|candidate| {
-                candidate.is_file()
-                    && rustix::fs::accessat(
-                        rustix::fs::CWD,
-                        candidate,
-                        rustix::fs::Access::EXEC_OK,
-                        rustix::fs::AtFlags::EACCESS,
-                    )
-                    .is_ok()
-            })
-            .and_then(|candidate| std::path::absolute(candidate).ok());
-        if let Some(program) = program {
-            match spawn(program.as_os_str()) {
-                Ok(child) => return Ok(child),
-                // Preserve execvp's PATH search and shell fallback for unusual
-                // launchers (e.g. no shebang or a missing interpreter). Retry
-                // only a failed spawn, never a Git command that ran and failed.
-                Err(error) => {
-                    tracing::debug!(%error, "absolute Git spawn failed; retrying PATH launch")
-                }
-            }
-        }
-    }
-    spawn(git_binary)
+) -> Result<crate::process_env::launch::BlockingChild, String> {
+    git_command(git_binary, root, args, access_mode)?
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_blocking()
+        .map_err(|error| format!("Failed to start git in '{root}': {error}"))
 }
 
 fn git_command(
@@ -3977,7 +3942,7 @@ fn git_command(
     args: &[&str],
     access_mode: GitAccessMode,
 ) -> Result<Command, String> {
-    let mut command = crate::process_env::std_command(git_binary)?;
+    let mut command = crate::process_env::command(git_binary)?;
     command.env("LC_ALL", "C");
     if matches!(access_mode, GitAccessMode::ReadOnly) {
         command.arg("--no-optional-locks");

@@ -37,6 +37,8 @@ pub enum AbandonedResponse {
 
 #[derive(Debug, Clone, Default)]
 pub struct MockScript {
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    pub(super) native_process: Option<Box<crate::backend::subprocess::test_support::Fixture>>,
     pub(super) compaction_availability: Option<crate::backend::BackendCompactionAvailability>,
     pub(super) compaction_failure: Option<MockCompactionFailure>,
     pub(super) turns: Vec<MockTurn>,
@@ -56,6 +58,14 @@ pub struct MockScript {
 }
 
 impl MockScript {
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    pub fn with_native_process(
+        mut self,
+        fixture: crate::backend::subprocess::test_support::Fixture,
+    ) -> Self {
+        self.native_process = Some(Box::new(fixture));
+        self
+    }
     pub fn new() -> Self {
         Self::default()
     }

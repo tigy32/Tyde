@@ -243,7 +243,10 @@ impl TydeReviewMcpServer {
         }
         let valid_oid =
             |oid: &str| (4..=64).contains(&oid.len()) && oid.bytes().all(|c| c.is_ascii_hexdigit());
-        let mut command = tokio::process::Command::new("git");
+        let mut command = match crate::backend::subprocess::command("git") {
+            Ok(command) => command,
+            Err(error) => return Ok(err_text(format!("Git failed: {error}"))),
+        };
         command.args([
             "--no-optional-locks",
             "-c",
@@ -288,7 +291,6 @@ impl TydeReviewMcpServer {
                 command.args(["log", "--format=%H %s", &format!("-{count}"), "--"]);
             }
         }
-        command.kill_on_drop(true);
         let output = match command.output().await {
             Ok(output) => output,
             Err(e) => return Ok(err_text(format!("Git failed: {e}"))),
