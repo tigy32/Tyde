@@ -347,8 +347,9 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64) -> bool {
 ///
 /// Composition rules:
 /// - The header surfaces the agent name plus the current backend in the
-///   subtitle, and exposes Stop while a turn is active. The back button is
-///   small but always has an accessible label.
+///   subtitle, and exposes Stop while a turn is active. Stop sits beside the
+///   agent-actions menu; it does not replace it. The back button is small but
+///   always has an accessible label.
 /// - The transcript shows task list → messages → streaming →
 ///   transient events, in that order, because that is the
 ///   order users perceive them happening.
@@ -360,6 +361,16 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64) -> bool {
 pub fn ChatView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let more_open: RwSignal<bool> = RwSignal::new(false);
+    let menu_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let more_button_ref: NodeRef<leptos::html::Button> = NodeRef::new();
+    // The menu mounts from this same signal, so the node is present when focus runs.
+    Effect::new(move |_| {
+        if more_open.get()
+            && let Some(menu) = menu_ref.get()
+        {
+            let _ = menu.focus();
+        }
+    });
 
     let s_back = state.clone();
     let on_back = move |_| {
@@ -847,27 +858,36 @@ pub fn ChatView() -> impl IntoView {
                             </div>
                             <div class="chat-header-actions">
                                 {move || {
-                                    if is_turn_active() {
-                                        view! {
+                                    // A running turn used to swap the whole menu
+                                    // for Stop. The menu is how this chat reaches
+                                    // session settings, so Stop stays a separate
+                                    // control and the menu stays mounted.
+                                    if !has_active_agent() {
+                                        return view! { <div class="chat-header-action-spacer"></div> }
+                                            .into_any();
+                                    }
+                                    let rename_cb = on_rename_open;
+                                    let close_cb = on_close_agent;
+                                    let settings_cb = on_open_session_settings;
+                                    let stop_cb = on_interrupt;
+                                    view! {
+                                        <Show when=move || is_turn_active()>
                                             <Button
                                                 label="Stop"
                                                 variant=ButtonVariant::Destructive
                                                 size=ButtonSize::Compact
                                                 data_mobile_test="chat-stop"
                                                 aria_label="Stop current turn".to_string()
-                                                on_click=on_interrupt
+                                                on_click=stop_cb
                                             />
-                                        }.into_any()
-                                    } else if has_active_agent() {
-                                        let rename_cb = on_rename_open;
-                                        let close_cb = on_close_agent;
-                                        let settings_cb = on_open_session_settings;
-                                        view! {
-                                            <div class="chat-more-menu-wrap">
+                                        </Show>
+                                        <div class="chat-more-menu-wrap">
                                                 <button
                                                     type="button"
                                                     class="chat-more-button"
+                                                    node_ref=more_button_ref
                                                     aria-label="More agent actions"
+                                                    aria-haspopup="menu"
                                                     aria-expanded=move || more_open.get().to_string()
                                                     data-mobile-test="chat-more"
                                                     on:click=move |_| more_open.update(|open| *open = !*open)
@@ -875,7 +895,23 @@ pub fn ChatView() -> impl IntoView {
                                                     "\u{2026}"
                                                 </button>
                                                 <Show when=move || more_open.get()>
-                                                    <div class="chat-action-menu" role="menu" data-mobile-test="chat-action-menu">
+                                                    <div
+                                                        class="chat-action-menu"
+                                                        node_ref=menu_ref
+                                                        role="menu"
+                                                        aria-label="Agent actions"
+                                                        tabindex="-1"
+                                                        data-mobile-test="chat-action-menu"
+                                                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                                            if ev.key() == "Escape" {
+                                                                ev.prevent_default();
+                                                                more_open.set(false);
+                                                                if let Some(button) = more_button_ref.get_untracked() {
+                                                                    let _ = button.focus();
+                                                                }
+                                                            }
+                                                        }
+                                                    >
                                                         <button
                                                             type="button"
                                                             class="chat-action-menu-item"
@@ -906,10 +942,7 @@ pub fn ChatView() -> impl IntoView {
                                                     </div>
                                                 </Show>
                                             </div>
-                                        }.into_any()
-                                    } else {
-                                        view! { <div class="chat-header-action-spacer"></div> }.into_any()
-                                    }
+                                    }.into_any()
                                 }}
                             </div>
                         }.into_any()
@@ -3464,9 +3497,15 @@ mod wasm_tests {
     /// compact More menu instead of text buttons.
     #[wasm_bindgen_test]
     async fn chat_header_uses_ios_nav_and_more_menu_when_idle() {
+        crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
+        container.style().set_property("position", "fixed").unwrap();
+        container.style().set_property("top", "0").unwrap();
+        container.style().set_property("left", "0").unwrap();
+        container.style().set_property("width", "390px").unwrap();
+        container.style().set_property("height", "700px").unwrap();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
             seed_connected_agent(&state, &host_clone);
@@ -3547,6 +3586,118 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "close should move into the More menu"
+        );
+        let settings_item: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='chat-menu-session-settings']")
+            .unwrap()
+            .expect("session settings belongs in the top menu")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            settings_item.get_attribute("role").as_deref(),
+            Some("menuitem")
+        );
+        assert_eq!(
+            settings_item.text_content().as_deref().map(str::trim),
+            Some("Session Settings")
+        );
+        let menu = container
+            .query_selector("[data-mobile-test='chat-action-menu']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            menu.get_attribute("aria-label").as_deref(),
+            Some("Agent actions")
+        );
+        let bounds = settings_item.get_bounding_client_rect();
+        assert!(
+            bounds.width() >= 44.0 && bounds.height() >= 44.0,
+            "session settings must be a touch target, got {}x{}",
+            bounds.width(),
+            bounds.height()
+        );
+        let viewport_width = web_sys::window()
+            .unwrap()
+            .inner_width()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        let viewport_height = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            bounds.left() >= 0.0
+                && bounds.top() >= 0.0
+                && bounds.right() <= viewport_width + 1.0
+                && bounds.bottom() <= viewport_height + 1.0,
+            "session settings must stay on screen: left={} top={} right={} bottom={} viewport={}x{}",
+            bounds.left(),
+            bounds.top(),
+            bounds.right(),
+            bounds.bottom(),
+            viewport_width,
+            viewport_height
+        );
+        let hit = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .element_from_point(
+                (bounds.x() + bounds.width() / 2.0) as f32,
+                (bounds.y() + bounds.height() / 2.0) as f32,
+            );
+        let settings_el: &web_sys::Element = settings_item.unchecked_ref();
+        assert!(
+            hit.as_ref()
+                .is_some_and(|node| node == settings_el || settings_el.contains(Some(node))),
+            "the session settings row must not be covered or clipped"
+        );
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element();
+        assert!(
+            active
+                .as_ref()
+                .is_some_and(|node| node == &menu || menu.contains(Some(node))),
+            "opening the menu moves focus into it"
+        );
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"key".into(), &"Escape".into()).unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(&init, &"cancelable".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        let ctor: js_sys::Function =
+            js_sys::Reflect::get(&js_sys::global(), &"KeyboardEvent".into())
+                .unwrap()
+                .unchecked_into();
+        let event: web_sys::Event =
+            js_sys::Reflect::construct(&ctor, &js_sys::Array::of2(&"keydown".into(), &init))
+                .unwrap()
+                .unchecked_into();
+        menu.dispatch_event(&event).unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-action-menu']")
+                .unwrap()
+                .is_none(),
+            "escape dismisses the agent menu"
+        );
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .as_ref()
+                .is_some_and(|node| {
+                    node.get_attribute("data-mobile-test").as_deref() == Some("chat-more")
+                }),
+            "escape returns focus to the top menu button"
         );
     }
 

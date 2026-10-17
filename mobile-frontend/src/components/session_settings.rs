@@ -531,23 +531,47 @@ fn SessionSettingsControls(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AgentInfo, AppState};
+    use crate::state::{AgentInfo, AppMode, AppState, StreamingState};
     use leptos::mount::mount_to;
+    use leptos::prelude::ArcRwSignal;
     use protocol::{
         AgentId, AgentOrigin, SelectOption, SelectOptionsBySetting, SelectOptionsForValue,
         SessionSettingField, StreamPath,
     };
     use settings_model::HostSettings;
     use wasm_bindgen_test::*;
-    use web_sys::{HtmlElement, HtmlSelectElement};
+    use web_sys::{HtmlElement, HtmlSelectElement, HtmlTextAreaElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn make_container() -> HtmlElement {
+    /// Removes the node when the test returns. These tests share one document,
+    /// and an open sheet's backdrop is `position: fixed` at z-index 1000, so a
+    /// mount left behind covers every later hit test.
+    struct TestRoot {
+        node: HtmlElement,
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            self.node.remove();
+        }
+    }
+
+    impl std::ops::Deref for TestRoot {
+        type Target = HtmlElement;
+
+        fn deref(&self) -> &HtmlElement {
+            &self.node
+        }
+    }
+
+    fn make_container() -> TestRoot {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        TestRoot {
+            node: container.dyn_into::<HtmlElement>().unwrap(),
+        }
     }
 
     async fn next_tick() {
@@ -661,13 +685,100 @@ mod wasm_tests {
         active
     }
 
-    fn mount_sheet(container: &HtmlElement, state: AppState) {
+    fn mount_sheet(container: &HtmlElement, state: AppState) -> impl Drop {
         let state_for_mount = state.clone();
-        let handle = mount_to(container.clone(), move || {
+        mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
             view! { <SessionSettingsSheet /> }
-        });
-        std::mem::forget(handle);
+        })
+    }
+
+    fn mount_chat_with_sheet(container: &HtmlElement, state: AppState) -> impl Drop {
+        // AppSurface is the routing boundary: the chat is mounted only while
+        // `viewing_chat` is set. Mounting ChatView by itself would stay on
+        // screen after a navigation the user would have left.
+        let state_for_mount = state.clone();
+        mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::app::AppSurface /> }
+        })
+    }
+
+    fn composer_text(container: &HtmlElement) -> String {
+        container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .expect("the composer stays on the active chat")
+            .dyn_into::<HtmlTextAreaElement>()
+            .unwrap()
+            .value()
+    }
+
+    fn visible_chat_name(container: &HtmlElement) -> String {
+        container
+            .query_selector("[data-mobile-test='chat-title']")
+            .unwrap()
+            .expect("the active chat's title stays on screen")
+            .text_content()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    fn assert_still_on_chat(container: &HtmlElement) {
+        assert_eq!(
+            composer_text(container),
+            "unsent draft",
+            "the typed draft stays in the composer"
+        );
+        assert_eq!(
+            visible_chat_name(container),
+            "Agent",
+            "the open chat stays the one being edited"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='bottom-nav']")
+                .unwrap()
+                .is_none(),
+            "leaving the chat would show the tab dock"
+        );
+    }
+
+    fn dispatch_escape(target: &web_sys::Element) {
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"key".into(), &"Escape".into()).unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(&init, &"cancelable".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        let ctor: js_sys::Function =
+            js_sys::Reflect::get(&js_sys::global(), &"KeyboardEvent".into())
+                .unwrap()
+                .unchecked_into();
+        let event: web_sys::Event =
+            js_sys::Reflect::construct(&ctor, &js_sys::Array::of2(&"keydown".into(), &init))
+                .unwrap()
+                .unchecked_into();
+        target.dispatch_event(&event).unwrap();
+    }
+
+    fn option_pairs(select: &HtmlSelectElement) -> Vec<(String, bool)> {
+        let options = select.query_selector_all("option").unwrap();
+        (0..options.length())
+            .filter_map(|index| options.item(index))
+            .map(|node| {
+                let option: web_sys::HtmlOptionElement = node.dyn_into().unwrap();
+                (option.text(), option.disabled())
+            })
+            .collect()
+    }
+
+    fn in_flight_response(container: &HtmlElement) -> String {
+        container
+            .query_selector("[data-mobile-test='chat-streaming']")
+            .unwrap()
+            .expect("the response already on screen stays visible")
+            .text_content()
+            .unwrap_or_default()
     }
 
     fn control(container: &HtmlElement, key: &str) -> HtmlSelectElement {
@@ -724,7 +835,7 @@ mod wasm_tests {
         )
         .unwrap();
         crate::dispatch::dispatch_envelope(&state, &active.local_host_id, envelope);
-        mount_sheet(&container, state.clone());
+        let _mount = mount_sheet(&container, state.clone());
         state.session_settings_open.set(true);
         next_tick().await;
 
@@ -745,12 +856,12 @@ mod wasm_tests {
         );
     }
 
-    /// **A live agent's settings can be changed from the sheet, and the change
-    /// actually reaches that agent's stream.**
+    /// **A responding agent's settings stay reachable from the top menu, and
+    /// the edit reaches that agent's stream without rewriting the response.**
     ///
-    /// The whole surface exists to send this one frame; before it, mobile
-    /// received schemas and settings and rendered neither, so a phone could not
-    /// move a running chat off whatever model it was spawned on.
+    /// Stop used to replace the menu, so session settings disappeared until
+    /// the turn ended. The sheet still edits the settings the server advertised
+    /// for this chat. It does not retarget the response already on screen.
     #[wasm_bindgen_test]
     async fn editing_a_live_agents_setting_sends_it_to_that_agent() {
         // Previously mounted flows can still have queued error sends. Settle
@@ -774,8 +885,52 @@ mod wasm_tests {
                 ),
             );
         });
-        mount_sheet(&container, state.clone());
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host_id(), crate::state::ConnectionStatus::Connected);
+        });
+        state.app_mode.set(AppMode::Workspace);
+        state.viewing_chat.set(true);
+        state.chat_input.set("unsent draft".to_owned());
+        state.agent_turn_active.update(|turns| {
+            turns.insert(active.as_agent_ref(), true);
+        });
+        state.streaming_text.update(|streams| {
+            streams.insert(
+                active.as_agent_ref(),
+                StreamingState {
+                    agent_name: "Agent".to_owned(),
+                    model: Some("haiku".to_owned()),
+                    text: ArcRwSignal::new("partial answer still arriving".to_owned()),
+                    reasoning: ArcRwSignal::new(String::new()),
+                    tool_requests: ArcRwSignal::new(Vec::new()),
+                },
+            );
+        });
+        crate::components::test_styles::ensure_styles_loaded();
+        let style = container.style();
+        style.set_property("position", "fixed").unwrap();
+        style.set_property("top", "0").unwrap();
+        style.set_property("left", "0").unwrap();
+        style.set_property("width", "390px").unwrap();
+        style.set_property("height", "700px").unwrap();
+        let _mount = mount_chat_with_sheet(&container, state.clone());
         next_tick().await;
+
+        let stop: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-stop']")
+            .unwrap()
+            .expect("Stop stays visible while the agent is responding")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(stop.text_content().as_deref().map(str::trim), Some("Stop"));
+        assert!(
+            in_flight_response(&container).contains("partial answer still arriving"),
+            "the response in progress is on screen before settings open"
+        );
+        assert!(
+            in_flight_response(&container).contains("haiku"),
+            "the response keeps the model that produced it"
+        );
 
         assert!(
             container
@@ -784,9 +939,119 @@ mod wasm_tests {
                 .is_none(),
             "the sheet stays closed until the overflow menu asks for it"
         );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-menu-session-settings']")
+                .unwrap()
+                .is_none(),
+            "session settings stays inside the closed top menu"
+        );
 
-        state.session_settings_open.set(true);
+        let more: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='chat-more']")
+            .unwrap()
+            .expect("the active chat's top menu")
+            .dyn_into()
+            .unwrap();
+        more.click();
         next_tick().await;
+        let settings_item: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='chat-menu-session-settings']")
+            .unwrap()
+            .expect("session settings belongs in the top menu")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            settings_item.text_content().as_deref().map(str::trim),
+            Some("Session Settings")
+        );
+        let settings_bounds = settings_item.get_bounding_client_rect();
+        assert!(
+            settings_bounds.width() >= 44.0 && settings_bounds.height() >= 44.0,
+            "session settings must stay a touch target while Stop is showing"
+        );
+        let stop_bounds = stop.get_bounding_client_rect();
+        assert!(
+            stop_bounds.height() >= 40.0 && stop_bounds.width() >= 40.0,
+            "Stop must stay a separate control, got {}x{}",
+            stop_bounds.width(),
+            stop_bounds.height()
+        );
+        let hit = |target: &web_sys::Element| {
+            let bounds = target.get_bounding_client_rect();
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .element_from_point(
+                    (bounds.x() + bounds.width() / 2.0) as f32,
+                    (bounds.y() + bounds.height() / 2.0) as f32,
+                )
+                .is_some_and(|node| &node == target || target.contains(Some(&node)))
+        };
+        assert!(
+            hit(settings_item.unchecked_ref()),
+            "the session settings row must be reachable while the turn is running"
+        );
+        assert!(
+            hit(stop.unchecked_ref()),
+            "opening the menu must not cover Stop"
+        );
+        settings_item.click();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-action-menu']")
+                .unwrap()
+                .is_none(),
+            "choosing session settings closes the menu"
+        );
+        let sheet = container
+            .query_selector("[data-mobile-test='session-settings-sheet']")
+            .unwrap()
+            .expect("the top menu opens the canonical session-settings sheet");
+        let scope = container
+            .query_selector("[data-mobile-test='session-settings-scope']")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            scope.contains("this chat"),
+            "the sheet must target the active chat, got {scope}"
+        );
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .as_ref()
+                .is_some_and(|node| node == &sheet || sheet.contains(Some(node))),
+            "the sheet takes focus when opened from the menu"
+        );
+        let model = control(&container, "model");
+        let profile = control(&container, "profile");
+        assert!(
+            !model.disabled() && !profile.disabled(),
+            "a running turn does not disable settings the server still accepts"
+        );
+        assert_eq!(
+            option_pairs(&profile),
+            vec![("Fast".to_owned(), false), ("Deep".to_owned(), false)],
+            "profile choices must be the server's, not a client fast-mode stand-in"
+        );
+        assert_eq!(
+            option_pairs(&model),
+            vec![("Auto".to_owned(), false), ("Haiku".to_owned(), false)],
+            "the model list must be the one this profile offers"
+        );
+        assert_still_on_chat(&container);
+        assert!(
+            in_flight_response(&container).contains("partial answer still arriving"),
+            "opening settings must not replace the response"
+        );
 
         let profile = control(&container, "profile");
         assert_eq!(
@@ -836,6 +1101,72 @@ mod wasm_tests {
             "deep",
             "the echoed settings must be what the control reports"
         );
+        assert_still_on_chat(&container);
+        assert!(state.draft_session_settings.get_untracked().0.is_empty());
+        assert_eq!(
+            state
+                .active_agent
+                .get_untracked()
+                .as_ref()
+                .map(|agent| agent.agent_id.0.as_str()),
+            Some("settings-agent")
+        );
+        dispatch_escape(&sheet);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='session-settings-sheet']")
+                .unwrap()
+                .is_none(),
+            "escape dismisses the sheet"
+        );
+        assert_still_on_chat(&container);
+        assert!(
+            in_flight_response(&container).contains("partial answer still arriving")
+                && in_flight_response(&container).contains("haiku"),
+            "the settings edit must not rewrite the response already arriving"
+        );
+
+        stop_button_after_edit(&container).click();
+        next_tick().await;
+        next_tick().await;
+        next_tick().await;
+        let lines = crate::bridge::test_sent_lines();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Stop is its own frame after the settings edit"
+        );
+        let interrupt: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(interrupt["kind"], "interrupt");
+        assert_eq!(
+            interrupt["stream"], "/agent/settings/inst",
+            "Stop still addresses the agent that is responding: {interrupt}"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-stop']")
+                .unwrap()
+                .is_some(),
+            "admission is not interruption, so Stop stays until the server clears the turn"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-more']")
+                .unwrap()
+                .is_some(),
+            "the menu stays reachable after Stop is pressed"
+        );
+        assert_still_on_chat(&container);
+    }
+
+    fn stop_button_after_edit(container: &HtmlElement) -> HtmlElement {
+        container
+            .query_selector("[data-mobile-test='chat-stop']")
+            .unwrap()
+            .expect("Stop is still beside the menu")
+            .dyn_into()
+            .unwrap()
     }
 
     /// **An edit that never left the client must not sit on screen looking
@@ -865,7 +1196,7 @@ mod wasm_tests {
                 ),
             );
         });
-        mount_sheet(&container, state.clone());
+        let _mount = mount_sheet(&container, state.clone());
         state.session_settings_open.set(true);
         next_tick().await;
 
@@ -918,7 +1249,7 @@ mod wasm_tests {
                 ),
             );
         });
-        mount_sheet(&container, state.clone());
+        let _mount = mount_sheet(&container, state.clone());
         state.session_settings_open.set(true);
         next_tick().await;
 
@@ -981,7 +1312,7 @@ mod wasm_tests {
             .into_iter()
             .collect(),
         ));
-        mount_sheet(&container, state.clone());
+        let _mount = mount_sheet(&container, state.clone());
         state.session_settings_open.set(true);
         next_tick().await;
 

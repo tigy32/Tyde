@@ -62,7 +62,7 @@ pub fn FixtureApp() -> impl IntoView {
 }
 
 #[component]
-fn AppSurface() -> impl IntoView {
+pub(crate) fn AppSurface() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     crate::bundle::install(state.clone());
     mirror_theme_to_document(state.clone());

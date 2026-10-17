@@ -1305,6 +1305,8 @@ input, textarea, select {
     display: flex;
     justify-content: flex-end;
     align-items: center;
+    flex-shrink: 0;
+    gap: var(--space-1);
 }
 
 .chat-header-action-spacer {
