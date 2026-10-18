@@ -43,18 +43,24 @@ enum Stage {
     Session = 5,
 }
 
+#[track_caller]
 fn syscall(value: libc::c_int) -> io::Result<libc::c_int> {
     if value < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        tracing::debug!(%error, location=%std::panic::Location::caller(), "native process syscall failed");
+        Err(error)
     } else {
         Ok(value)
     }
 }
+#[track_caller]
 fn posix(value: libc::c_int) -> io::Result<()> {
     if value == 0 {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(value))
+        let error = io::Error::from_raw_os_error(value);
+        tracing::debug!(%error, location=%std::panic::Location::caller(), "native process POSIX call failed");
+        Err(error)
     }
 }
 fn cstring(value: &std::ffi::OsStr) -> io::Result<CString> {
