@@ -746,6 +746,12 @@ fn ProjectContextMenuItems(
         })
     };
 
+    let editor_target = project.clone();
+    let editor = state.project_editor;
+    let on_edit = move |_| {
+        context_menu.set(None);
+        editor.set(Some(editor_target.clone()));
+    };
     let host_id_for_rename = project.host_id.clone();
     let project_id_for_rename = project.project_id.clone();
     let on_rename = move |_| {
@@ -842,6 +848,7 @@ fn ProjectContextMenuItems(
 
     view! {
         <>
+            <button class="context-menu-item" on:click=on_edit>"Edit project…"</button>
             <button class="context-menu-item" on:click=on_rename>"Rename"</button>
             {move || (!is_workbench()).then(|| view! {
                 <button class="context-menu-item" on:click=on_new_workbench.clone()>
@@ -1256,6 +1263,141 @@ fn drag_drop_placement(ev: &web_sys::DragEvent) -> DropPlacement {
         DropPlacement::After
     } else {
         DropPlacement::Before
+    }
+}
+
+#[component]
+pub fn ProjectEditor() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let target = state.project_editor;
+    view! {
+        {move || target.get().map(|project| view! { <ProjectEditorDialog project /> })}
+    }
+}
+
+#[component]
+fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let info = {
+        let state = state.clone();
+        let target = project.clone();
+        Memo::new(move |_| {
+            state.projects.with(|projects| {
+                projects
+                    .iter()
+                    .find(|info| {
+                        info.host_id == target.host_id && info.project.id == target.project_id
+                    })
+                    .cloned()
+            })
+        })
+    };
+    let name = RwSignal::new(match info.get_untracked() {
+        Some(info) => info.project.name,
+        None => String::new(),
+    });
+    let can_edit_roots = {
+        let state = state.clone();
+        let project = project.clone();
+        Memo::new(move |_| state.can_manage_project_roots(&project.host_id, &project.project_id))
+    };
+    let save_state = state.clone();
+    let save_project = project.clone();
+    let save = move |_| {
+        rename_project(
+            &save_state,
+            save_project.host_id.clone(),
+            save_project.project_id.clone(),
+            name.get_untracked(),
+        )
+    };
+    let add_state = state.clone();
+    let add_project = project.clone();
+    let close = state.project_editor;
+    let roots_state = state.clone();
+    let roots_project = project.clone();
+    let dialog_ref = NodeRef::<leptos::html::Div>::new();
+    let input = NodeRef::<leptos::html::Input>::new();
+    let previous_focus = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+    on_cleanup(move || {
+        if let Some(element) = previous_focus {
+            let _ = element.focus();
+        }
+    });
+    let browser_dialog = state.browse_dialog;
+    Effect::new(move |_| {
+        if browser_dialog.with(|dialog| dialog.is_none())
+            && let Some(input) = input.get()
+        {
+            let _ = input.focus();
+        }
+    });
+    view! {
+        <div class="modal-overlay project-editor-overlay" on:click=move |_| close.set(None)>
+            <div class="workbench-create-modal project-editor" node_ref=dialog_ref role="dialog" aria-modal="true" aria-label="Edit project"
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=move |ev: web_sys::KeyboardEvent| {
+                    ev.stop_propagation();
+                    if ev.key() == "Escape" { close.set(None); }
+                    if ev.key() == "Tab" {
+                        let Some(dialog) = dialog_ref.get_untracked() else { return; };
+                        let Ok(nodes) = dialog.query_selector_all("button:not([disabled]), input:not([disabled])") else { return; };
+                        let Some(first) = nodes.item(0).and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok()) else { return; };
+                        let Some(last) = nodes.item(nodes.length().saturating_sub(1)).and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok()) else { return; };
+                        let active = web_sys::window().and_then(|w| w.document()).and_then(|d| d.active_element());
+                        if ev.shift_key() && active.as_ref().is_some_and(|e| e.is_same_node(Some(&first))) { ev.prevent_default(); let _ = last.focus(); }
+                        else if !ev.shift_key() && active.as_ref().is_some_and(|e| e.is_same_node(Some(&last))) { ev.prevent_default(); let _ = first.focus(); }
+                    }
+                }
+            >
+                <h2 class="modal-title">"Edit project"</h2>
+                <div class="modal-body">
+                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser, crate::notices::NoticeScope::Project(project.host_id.clone(), project.project_id.clone())] />
+                    <p>{move || info.get().map(|info| format!("Project: {}", info.project.name)).unwrap_or_else(|| "Project is no longer available".into())}</p>
+                    <label class="modal-label" for="project-editor-name">"Project name"</label>
+                    <input id="project-editor-name" class="modal-input" node_ref=input prop:value=move || name.get()
+                        on:input=move |ev| name.set(event_target_value(&ev)) />
+                    <button class="modal-button" disabled=move || name.get().trim().is_empty() || info.get().is_none() on:click=save>"Save name"</button>
+                    <h3>"Source roots"</h3>
+                    <p class="project-roots-help">"Removing a source root disconnects it from this project. Files stay on disk."</p>
+                    {move || info.get().map(|info| {
+                        let roots = info.project.root_paths();
+                        let count = roots.len();
+                        roots.into_iter().map(|root| {
+                            let remove_state = roots_state.clone();
+                            let remove_project = roots_project.clone();
+                            let root_label = root.0.clone();
+                            let status_state = roots_state.clone();
+                            let status_project = roots_project.project_id.clone();
+                            let status_root = root.clone();
+                            let status = move || status_state.file_tree.with(|trees| trees.get(&status_project).and_then(|roots| roots.iter().find(|entry| entry.root == status_root)).and_then(|entry| match &entry.status {
+                                protocol::ProjectRootStatus::Available => None,
+                                protocol::ProjectRootStatus::Unavailable { message } => Some(message.clone()),
+                            }));
+                            view! {
+                                <div class="project-editor-root">
+                                    <span>{root_label.clone()}<span class="project-root-error" role="status">{status}</span></span>
+                                    <button class="modal-button" aria-label=format!("Remove source root {root_label}")
+                                        disabled=move || !can_edit_roots.get() || count <= 1
+                                        title=move || if count <= 1 { "A project must keep at least one source root" } else { "Remove root from project; keep files" }
+                                        on:click=move |_| crate::actions::delete_project_root(&remove_state, remove_project.host_id.clone(), remove_project.project_id.clone(), root.clone())
+                                    >"Remove"</button>
+                                </div>
+                            }
+                        }).collect_view()
+                    })}
+                    <button class="modal-button" disabled=move || !can_edit_roots.get()
+                        on:click=move |_| crate::components::host_browser::open_add_root_browser_for(&add_state, add_project.clone())>"Add source root…"</button>
+                    <Show when=move || !can_edit_roots.get()>
+                        <p>"Roots are managed by workbench creation while this project is a workbench or has workbenches."</p>
+                    </Show>
+                </div>
+                <div class="modal-actions"><button class="modal-button primary" on:click=move |_| close.set(None)>"Done"</button></div>
+            </div>
+        </div>
     }
 }
 

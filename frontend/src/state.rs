@@ -518,9 +518,13 @@ struct DraftPersistenceOutcome {
 }
 
 #[cfg(target_arch = "wasm32")]
+type ComposerDraftSchedule =
+    std::rc::Rc<dyn Fn(&js_sys::Function, i32) -> Result<i32, wasm_bindgen::JsValue>>;
+
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
 struct ComposerDraftScheduler {
-    schedule: std::rc::Rc<dyn Fn(&js_sys::Function, i32) -> Result<i32, wasm_bindgen::JsValue>>,
+    schedule: ComposerDraftSchedule,
     cancel: std::rc::Rc<dyn Fn(i32)>,
 }
 
@@ -2106,28 +2110,7 @@ pub enum DockVisibility {
     Hidden,
 }
 
-/// Which tab of the left dock is currently shown. Stored in `AppState` (rather
-/// than locally in the dock component) so a keyboard shortcut and the
-/// "search in folder" file-explorer action can switch to the Search tab.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeftTab {
-    Files,
-    Git,
-    Search,
-    /// Find-references results panel (M5). Auto-activated when a Shift+F12
-    /// find-references query runs.
-    References,
-}
-
-/// Which tab of the right dock is currently shown. Stored in `AppState` so
-/// global UI actions such as command-palette entries can open a specific panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RightTab {
-    Agents,
-    Sessions,
-    Swarms,
-    Workflows,
-}
+pub use crate::sidebar_layout::{SidebarSide, SidebarTab};
 
 /// All persistent state for the project-wide search panel. Lives in `AppState`
 /// so streamed results survive the panel being display-toggled (or its dock
@@ -3801,9 +3784,10 @@ pub struct AppState {
     pub tab_scroll_state: RwSignal<HashMap<TabId, TabScrollState>>,
     pub tabs_enabled: RwSignal<bool>,
     pub sidebar_backend_labels: RwSignal<bool>,
-    pub left_dock: RwSignal<DockVisibility>,
-    pub right_dock: RwSignal<DockVisibility>,
-    pub right_tab: RwSignal<RightTab>,
+    pub sidebar_layout: RwSignal<crate::sidebar_layout::ClientLayouts>,
+    pub sidebar_storage_blocked: RwSignal<bool>,
+    pub sidebar_drag: RwSignal<Option<SidebarTab>>,
+    pub project_editor: RwSignal<Option<ActiveProjectRef>>,
     pub bottom_dock: RwSignal<DockVisibility>,
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
@@ -3877,7 +3861,6 @@ pub struct AppState {
     pub feedback_open: RwSignal<bool>,
     pub find_bar_open: RwSignal<bool>,
     /// Which left-dock tab is active (Files / Git / Search).
-    pub left_tab: RwSignal<LeftTab>,
     /// Persistent state for the project-wide Search panel.
     pub search_state: RwSignal<ProjectSearchUiState>,
     /// Persistent state for the find-references results panel (M5).
@@ -4362,9 +4345,10 @@ impl AppState {
             tab_scroll_state: RwSignal::new(HashMap::new()),
             tabs_enabled: RwSignal::new(true),
             sidebar_backend_labels: RwSignal::new(true),
-            left_dock: RwSignal::new(DockVisibility::Visible),
-            right_dock: RwSignal::new(DockVisibility::Visible),
-            right_tab: RwSignal::new(RightTab::Agents),
+            sidebar_layout: RwSignal::new(crate::sidebar_layout::ClientLayouts::default()),
+            sidebar_storage_blocked: RwSignal::new(false),
+            sidebar_drag: RwSignal::new(None),
+            project_editor: RwSignal::new(None),
             bottom_dock: RwSignal::new(DockVisibility::Hidden),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
@@ -4392,7 +4376,6 @@ impl AppState {
             getting_started_open: RwSignal::new(false),
             feedback_open: RwSignal::new(false),
             find_bar_open: RwSignal::new(false),
-            left_tab: RwSignal::new(LeftTab::Files),
             search_state: RwSignal::new(ProjectSearchUiState::default()),
             references_state: RwSignal::new(ProjectReferencesUiState::default()),
             search_focus_seq: RwSignal::new(0),
@@ -6494,7 +6477,7 @@ impl AppState {
         for composer in self.composers_for_flush() {
             if composer
                 .draft_owner
-                .with_untracked(|owner| owner.as_ref().is_some_and(&matches))
+                .with_untracked(|owner| owner.as_ref().is_some_and(matches))
             {
                 composer.draft_owner.set(Some(next.clone()));
             }

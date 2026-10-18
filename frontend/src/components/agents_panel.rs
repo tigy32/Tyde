@@ -534,6 +534,7 @@ struct SidebarSwarmRef {
 struct AgentProjectSection {
     key: String,
     label: String,
+    project: Option<ActiveProjectRef>,
     swarms: Vec<SidebarSwarmRef>,
     groups: Vec<AgentTreeGroup>,
 }
@@ -553,9 +554,14 @@ impl AgentProjectSection {
 struct AgentHostSection {
     key: String,
     label: String,
-    pinned: Vec<AgentTreeGroup>,
     custom_groups: Vec<AgentCustomGroupSection>,
     projects: Vec<AgentProjectSection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarProjection {
+    pinned: Vec<AgentTreeGroup>,
+    hosts: Vec<AgentHostSection>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -581,7 +587,8 @@ enum SidebarKeyboardTarget {
 struct AgentsPanelInteractions {
     editing_agent: RwSignal<Option<protocol::AgentId>>,
     edit_value: RwSignal<String>,
-    collapsed_parents: RwSignal<HashSet<AgentId>>,
+    expanded_parents: RwSignal<HashSet<SidebarAgentRef>>,
+    inactive_parents: RwSignal<HashSet<SidebarAgentRef>>,
     dragged_agent: RwSignal<Option<SidebarAgentRef>>,
     keyboard_agent: RwSignal<Option<SidebarAgentRef>>,
     keyboard_target: RwSignal<Option<SidebarKeyboardTarget>>,
@@ -758,15 +765,7 @@ fn build_sidebar_sections(
                 }
             }
 
-            project_order.sort_by_key(|project| {
-                !leaf_agents
-                    .get(&(host_id.clone(), project.clone()))
-                    .is_some_and(|(_, groups)| {
-                        groups
-                            .iter()
-                            .any(|group| group.parent.origin == AgentOrigin::Tychat)
-                    })
-            });
+            project_order.sort_by_key(Option::is_some);
             let sections: Vec<AgentProjectSection> = project_order
                 .into_iter()
                 .filter_map(|project_id| {
@@ -780,6 +779,10 @@ fn build_sidebar_sections(
                             .map(|id| format!("{}:{}", host_id, id.0))
                             .unwrap_or_else(|| format!("{host_id}:no-project")),
                         label,
+                        project: project_id.map(|project_id| ActiveProjectRef {
+                            host_id: host_id.clone(),
+                            project_id,
+                        }),
                         swarms,
                         groups,
                     })
@@ -789,7 +792,6 @@ fn build_sidebar_sections(
             (!sections.is_empty()).then(|| AgentHostSection {
                 key: host_id.clone(),
                 label: host_label(&host_labels, &host_id),
-                pinned: Vec::new(),
                 custom_groups: Vec::new(),
                 projects: sections,
             })
@@ -811,7 +813,7 @@ fn build_sidebar_projection(
     projects: Vec<ProjectInfo>,
     groups_snapshot: AgentGroupsSnapshot,
     pins: AgentPinsSnapshot,
-) -> Vec<AgentHostSection> {
+) -> SidebarProjection {
     // Keep unpinned descendants with their owner; independently pinned children
     // become roots exactly once and rejoin that owner on unpin.
     fn extract_pins(
@@ -901,14 +903,9 @@ fn build_sidebar_projection(
             .into_iter()
             .map(|host| (host.key.clone(), host.projects))
             .collect();
-    host_order
+    let hosts = host_order
         .into_iter()
         .filter_map(|host_id| {
-            let host_pinned = pinned
-                .iter()
-                .filter(|tree| tree.parent.host_id == host_id)
-                .cloned()
-                .collect::<Vec<_>>();
             let host_custom = custom_groups
                 .iter()
                 .filter_map(|section| {
@@ -925,17 +922,15 @@ fn build_sidebar_projection(
                 })
                 .collect::<Vec<_>>();
             let projects = default_hosts.remove(&host_id).unwrap_or_default();
-            (!host_pinned.is_empty() || !host_custom.is_empty() || !projects.is_empty()).then(
-                || AgentHostSection {
-                    label: host_label(&host_labels, &host_id),
-                    key: host_id,
-                    pinned: host_pinned,
-                    custom_groups: host_custom,
-                    projects,
-                },
-            )
+            (!host_custom.is_empty() || !projects.is_empty()).then(|| AgentHostSection {
+                label: host_label(&host_labels, &host_id),
+                key: host_id,
+                custom_groups: host_custom,
+                projects,
+            })
         })
-        .collect()
+        .collect();
+    SidebarProjection { pinned, hosts }
 }
 
 fn agent_for_ref(state: &AppState, agent_ref: &SidebarAgentRef) -> Option<AgentInfo> {
@@ -1203,7 +1198,7 @@ fn render_ungroup_drop_target(
     }
 }
 
-const COLLAPSED_FOLDERS_STORAGE_KEY: &str = "tyde.agents.collapsed-folders.v1";
+pub(crate) const COLLAPSED_FOLDERS_STORAGE_KEY: &str = "tyde.agents.collapsed-folders.v1";
 
 fn load_collapsed_folders() -> HashSet<String> {
     #[cfg(target_arch = "wasm32")]
@@ -1359,8 +1354,9 @@ pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
     let collapsed_folders = RwSignal::new(load_collapsed_folders());
-    // Per-parent collapse state: parents whose children are hidden.
-    let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
+    // Disclosure state is presentation only; children start collapsed.
+    let expanded_parents = RwSignal::new(HashSet::new());
+    let inactive_parents = RwSignal::new(HashSet::new());
     // Editing state lives here so it survives agent list re-renders caused by
     // streaming / turn-active updates. Only one agent can be renamed at a time.
     let editing_agent: RwSignal<Option<protocol::AgentId>> = RwSignal::new(None);
@@ -1376,7 +1372,8 @@ pub fn AgentsPanel() -> impl IntoView {
     let interactions = AgentsPanelInteractions {
         editing_agent,
         edit_value,
-        collapsed_parents,
+        expanded_parents,
+        inactive_parents,
         dragged_agent,
         keyboard_agent,
         keyboard_target,
@@ -1419,6 +1416,7 @@ pub fn AgentsPanel() -> impl IntoView {
         let projects = filter_state.projects.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
+        let pins = filter_state.agents_view_preferences.get().pins.pinned;
 
         // Read the noisy maps in place via `with` rather than cloning
         // them up-front. The Memo re-runs on every keystroke in the
@@ -1433,6 +1431,10 @@ pub fn AgentsPanel() -> impl IntoView {
                         agents
                             .iter()
                             .filter(|a| {
+                                if pins.contains(&agent_annotation_target(a)) {
+                                    return query.is_empty()
+                                        || a.name.to_lowercase().contains(&query);
+                                }
                                 !swarm_owned.contains(&agent_ref(a))
                                     && agent_passes_filters(
                                         a,
@@ -1574,7 +1576,9 @@ pub fn AgentsPanel() -> impl IntoView {
                     autocomplete="off"
                 />
             </div>
-            <div class="panel-filters">
+            <details class="agents-filter-menu">
+                <summary aria-label="Filter agents" title="Filter agents">"▽"</summary>
+                <div class="panel-filters">
                 <button
                     class=move || if current_filters.get().hide_inactive { "filter-toggle active" } else { "filter-toggle" }
                     on:click=toggle_inactive
@@ -1593,20 +1597,29 @@ pub fn AgentsPanel() -> impl IntoView {
                 >
                     "Show other projects"
                 </button>
-            </div>
+                </div>
+            </details>
             <AgentRestorationNotice />
             <div class="panel-content">
                 {move || {
                     let projection = projection.get();
-                    if projection.is_empty() {
+                    if projection.pinned.is_empty() && projection.hosts.is_empty() {
                         view! {
                             <div class="panel-empty">"No agents yet"</div>
                         }.into_any()
                     } else {
                         let has_custom_groups = !state.agents_view_preferences.get_untracked().groups.groups.is_empty();
                         let ungroup_target_state = state.clone();
-                        let hosts = projection.into_iter().map(|host| {
+                        let pinned = (!projection.pinned.is_empty()).then(|| view! {
+                            <section class="agent-sidebar-pinned" aria-label="Pinned">
+                                <div class="agent-sidebar-groups-heading">"Pinned"</div>
+                                {projection.pinned.into_iter().map(|tree| render_agent_tree_group(state.clone(), tree, interactions.clone())).collect_view()}
+                            </section>
+                        });
+                        let hosts = projection.hosts.into_iter().map(|host| {
                         let default_drop_state = state.clone();
+                        let first_project = host.projects.iter().find(|project| project.project.is_some()).map(|project| project.key.clone());
+                        let no_projects = first_project.is_none();
                         let custom_groups = host.custom_groups;
                         let custom_groups_view = if custom_groups.is_empty() {
                             ().into_any()
@@ -1836,13 +1849,6 @@ pub fn AgentsPanel() -> impl IntoView {
                         view! {
                             <section class="agent-sidebar-host-section" data-host-id=host.key>
                                 <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
-                                {(!host.pinned.is_empty()).then(|| view! {
-                                    <section class="agent-sidebar-pinned" aria-label="Pinned">
-                                        <div class="agent-sidebar-groups-heading">"Pinned"</div>
-                                        {host.pinned.into_iter().map(|tree| render_agent_tree_group(state.clone(), tree, interactions.clone())).collect_view()}
-                                    </section>
-                                })}
-                                {custom_groups_view}
                                 <div
                                     class="agent-sidebar-default-tree"
                                     on:dragover=move |ev: web_sys::DragEvent| {
@@ -1861,20 +1867,36 @@ pub fn AgentsPanel() -> impl IntoView {
                                             {host.projects.into_iter().map(|project| {
                                                 let folder_key = format!("project:{}", project.key);
                                                 let member_count = project.row_count();
+                                                let editor = state.project_editor;
+                                                let target = project.project.clone();
+                                                let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
+                                                let edit_name = format!("Edit project {}", project.label);
+                                                let projects_heading = (first_project.as_ref() == Some(&project.key)).then(|| view! {
+                                                    <div class="agent-projects-heading"><span>"Projects"</span><button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button></div>
+                                                });
                                                 view! {
+                                                    {projects_heading}
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">
-                                                            {folder_toggle(collapsed_folders, folder_key.clone(), format!("Project: {}", project.label), member_count)}
+                                                            {folder_toggle(collapsed_folders, folder_key.clone(), heading, member_count)}
+                                                            {target.map(|target| view! {
+                                                                <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
+                                                                    on:click=move |_| editor.set(Some(target.clone()))>"✎"</button>
+                                                            })}
+                                                            <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span>
                                                         </div>
                                                         {folder_members(state.clone(), project.swarms, project.groups, interactions.clone(), collapsed_folders, folder_key)}
                                                     </section>
                                                 }
                                             }).collect_view()}
                                 </div>
+                                {custom_groups_view}
+                                {no_projects.then(|| view! { <button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button> })}
                             </section>
                         }
                         }).collect_view();
                         view! { <div class="agent-card-list">
+                                {pinned}
                                 <div class="agent-group-live-status" aria-live="polite">
                                     {move || group_live_status.get()}
                                 </div>
@@ -1911,37 +1933,91 @@ fn render_agent_tree_group(
     wasm_tests::trace_sidebar_stack("tree group", std::ptr::addr_of!(state) as usize);
     let parent = group.parent;
     let children = group.children;
-    let parent_id = parent.agent_id.clone();
-    let group_id = parent_id.0.clone();
+    let parent_ref = agent_ref(&parent);
+    let group_id = parent.agent_id.0.clone();
+    let expanded_parents = interactions.expanded_parents;
+    let inactive_parents = interactions.inactive_parents;
+    let children_agents = children
+        .iter()
+        .map(|child| child.parent.clone())
+        .collect::<Vec<_>>();
+    let running = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            children_agents
+                .iter()
+                .filter(|agent| child_is_running(&state, agent))
+                .count()
+        })
+    };
     let child_count = children.len();
-    let collapsed_parents = interactions.collapsed_parents;
-    let parent_view = agent_card(state.clone(), parent, child_count, interactions.clone());
+    let parent_ref_host = parent.host_id.clone();
+    let parent_view = agent_card(
+        state.clone(),
+        parent,
+        child_count,
+        running,
+        interactions.clone(),
+    );
+    let related = {
+        fn refs(tree: &AgentTreeGroup, items: &mut Vec<SidebarAgentRef>) {
+            items.push(agent_ref(&tree.parent));
+            for child in &tree.children {
+                refs(child, items);
+            }
+        }
+        let mut items = vec![parent_ref.clone()];
+        for child in &children {
+            refs(child, &mut items);
+        }
+        let active = state.active_agent;
+        Memo::new(move |_| {
+            active.get().is_some_and(|selected| {
+                items.iter().any(|item| {
+                    item.host_id == selected.host_id && item.agent_id == selected.agent_id
+                })
+            })
+        })
+    };
     let children_view = children
         .into_iter()
         .map(|child| {
-            let pid = parent_id.clone();
+            let parent = parent_ref.clone();
+            let child_agent = child.parent.clone();
+            let child_state = state.clone();
+            let visible = move || {
+                expanded_parents.with(|set| set.contains(&parent))
+                    && (child_is_running(&child_state, &child_agent)
+                        || inactive_parents.with(|set| set.contains(&parent)))
+            };
             view! {
-                <div
-                    class=move || {
-                        if collapsed_parents.with(|s| s.contains(&pid)) {
-                            "agent-card-child agent-card-child-hidden"
-                        } else {
-                            "agent-card-child"
-                        }
-                    }
-                >
+                <div class="agent-card-child" class:agent-card-child-hidden=move || !visible()>
                     {render_agent_tree_group(state.clone(), child, interactions.clone())}
                 </div>
             }
         })
         .collect_view();
+    let parent_expanded = parent_ref.clone();
+    let toggle_parent = parent_ref.clone();
+    let inactive_open = parent_ref;
+    let has_inactive = Memo::new(move |_| {
+        child_count > running.get() && expanded_parents.with(|set| set.contains(&parent_expanded))
+    });
+    let inactive_expanded =
+        Memo::new(move |_| inactive_parents.with(|set| set.contains(&inactive_open)));
+    let inactive_button = (child_count > 0).then(|| view! {
+        <button class="agent-show-inactive" style=move || if has_inactive.get() { "" } else { "display:none" } aria-expanded=move || inactive_expanded.get().to_string()
+            on:click=move |_| inactive_parents.update(|set| { if !set.remove(&toggle_parent) { set.insert(toggle_parent.clone()); } })>
+            {move || format!("{} {} inactive", if inactive_expanded.get() { "Hide" } else { "Show" }, child_count - running.get())}
+        </button>
+    });
     view! {
-        <div class="agent-card-group" data-agent-id=group_id>
+        <div class="agent-card-group" data-host-id=parent_ref_host data-agent-id=group_id data-related=move || related.get().to_string()>
             {parent_view}
             {children_view}
+            {inactive_button}
         </div>
-    }
-    .into_any()
+    }.into_any()
 }
 
 /// Switch the active project (and host) to the project the clicked agent
@@ -2008,10 +2084,18 @@ fn parent_agent_project_ref(state: &AppState, agent: &AgentInfo) -> Option<Activ
 }
 
 // Erase the large view before recursive groups retain it on the Wasm stack.
+fn child_is_running(state: &AppState, agent: &AgentInfo) -> bool {
+    // Count the server's current turn, never transcript or tool history.
+    state
+        .agent_turn_active
+        .with(|turns| turns.get(&agent.agent_id).copied().unwrap_or(false))
+}
+
 fn agent_card(
     state: AppState,
     agent: AgentInfo,
     child_count: usize,
+    running: Memo<usize>,
     interactions: AgentsPanelInteractions,
 ) -> AnyView {
     #[cfg(all(test, target_arch = "wasm32"))]
@@ -2021,7 +2105,7 @@ fn agent_card(
     let move_project_state = state.clone();
     let editing_agent = interactions.editing_agent;
     let edit_value = interactions.edit_value;
-    let collapsed_parents = interactions.collapsed_parents;
+    let expanded_parents = interactions.expanded_parents;
     let dragged_agent = interactions.dragged_agent;
     let keyboard_agent = interactions.keyboard_agent;
     let keyboard_target = interactions.keyboard_target;
@@ -2044,6 +2128,18 @@ fn agent_card(
                 })
         })
     });
+    let pin_host_id = agent.host_id.clone();
+    let pin_host_state = state.clone();
+    let pin_host_label = Memo::new(move |_| {
+        pin_host_state.configured_hosts.with(|hosts| {
+            hosts
+                .iter()
+                .find(|host| host.id == pin_host_id)
+                .map(|host| host.label.clone())
+        })
+    });
+    let pin_settings_open = state.settings_open;
+    let pin_settings_request = state.settings_tab_request;
     let pin_click_state = state.clone();
     let pin_click_ref = agent_ref(&agent);
     let toggle_pin = move |ev: web_sys::MouseEvent| {
@@ -2369,7 +2465,13 @@ fn agent_card(
             ));
         }
     };
+    let agent_ref_for_disclosure = agent_ref(&agent);
     let show_backend_labels = state.sidebar_backend_labels;
+    let selected_agent = agent_chat_ref(&agent);
+    let selected = {
+        let active = state.active_agent;
+        Memo::new(move |_| active.get().as_ref() == Some(&selected_agent))
+    };
     let details_name = name.clone();
     let details_host = agent.host_id.clone();
     let details_workspace = agent.workspace_roots.join(" · ");
@@ -2398,6 +2500,7 @@ fn agent_card(
             }
             node_ref=card_anchor
             data-sidebar-backend=backend_label(backend)
+            aria-current=move || if selected.get() { "true" } else { "false" }
             data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
@@ -2431,17 +2534,10 @@ fn agent_card(
                     }
                     on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
                 >
-                    {move || if expanded.get() { "\u{25BE}" } else { "\u{25B8}" }}
+                    "⋯"
                 </button>
-                <span class=status_class_sig title=status_title_sig>
-                    <span aria-hidden="true">{status_icon_sig}</span>
-                    <span class=move || {
-                        if status_label_visible_sig() {
-                            "agent-card-status-text"
-                        } else {
-                            "visually-hidden"
-                        }
-                    }>{status_label_sig}</span>
+                <span class="agent-backend-glyph" role="img" aria-label=backend_label(backend) title=backend_label(backend)>
+                    {crate::components::launch_menu::backend_icon(backend)}
                 </span>
 
                 <div class="agent-card-top-main">
@@ -2530,39 +2626,56 @@ fn agent_card(
                     }
                 }}
                 {(child_count > 0).then(|| {
-                    let agent_id_col = agent_id.clone();
-                    let agent_id_icon = agent_id.clone();
-                    let toggle = move |ev: web_sys::MouseEvent| {
-                        ev.stop_propagation();
-                        let id = agent_id_col.clone();
-                        collapsed_parents.update(|set| {
-                            if set.contains(&id) {
-                                set.remove(&id);
-                            } else {
-                                set.insert(id);
-                            }
-                        });
-                    };
+                    let parent_ref = agent_ref(&agent);
+                    let expanded_ref = parent_ref.clone();
                     view! {
-                        <span class="agent-card-child-badge">
-                            <span class="agent-child-count">{child_count}</span>
-                            <button
-                                type="button"
-                                class="agent-card-collapse-toggle"
-                                title="Toggle sub-agents"
-                                on:click=toggle
-                                on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                            >
-                                {move || if collapsed_parents.with(|s| s.contains(&agent_id_icon)) {
-                                    "\u{25B6}"
-                                } else {
-                                    "\u{25BC}"
-                                }}
-                            </button>
-                        </span>
+                        <button type="button" class="agent-card-collapse-toggle"
+                            title="Toggle sub-agents" aria-label="Toggle sub-agents"
+                            aria-expanded=move || expanded_parents.with(|set| set.contains(&expanded_ref)).to_string()
+                            on:click=move |ev: web_sys::MouseEvent| {
+                                ev.stop_propagation();
+                                expanded_parents.update(|set| { if !set.remove(&parent_ref) { set.insert(parent_ref.clone()); } });
+                            }
+                            on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                        >
+                            {move || format!("{} running", running.get())}
+                            <span aria-hidden="true">{move || if expanded_parents.with(|set| set.contains(&agent_ref_for_disclosure)) { " ▾" } else { " ▸" }}</span>
+                        </button>
                     }
                 })}
                 </div>
+                <Show when=move || is_pinned.get()>
+                    {move || match pin_host_label.get() {
+                        Some(label) => {
+                            let title = label.clone();
+                            view! { <span class="agent-pin-host" title=title>{label}</span> }.into_any()
+                        },
+                        None => {
+                            view! {
+                                <button class="agent-pin-host agent-pin-host-error"
+                                    title="Host label unavailable. Open Settings → Hosts to check host configuration."
+                                    aria-label="Host label unavailable. Open host settings"
+                                    on:click=move |ev: web_sys::MouseEvent| {
+                                        ev.stop_propagation();
+                                        pin_settings_request.set(Some("Hosts"));
+                                        pin_settings_open.set(true);
+                                    }
+                                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                                >"Host label missing"</button>
+                            }.into_any()
+                        }
+                    }}
+                </Show>
+                <span class=status_class_sig title=status_title_sig>
+                    <span aria-hidden="true">{status_icon_sig}</span>
+                    <span class=move || {
+                        if status_label_visible_sig() {
+                            "agent-card-status-text"
+                        } else {
+                            "visually-hidden"
+                        }
+                    }>{status_label_sig}</span>
+                </span>
                 <button
                     type="button"
                     class="agent-card-pin"
@@ -2578,13 +2691,7 @@ fn agent_card(
                         <path d="m16 3 5 5-4 1-3 5v3l-3-3-6 6-1-1 6-6-3-3h3l5-3z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
                     </svg>
                 </button>
-                <span class="agent-tyde-permissions" title=move || format!("Tyde permissions: {}", tyde_permissions.get().label())
-                    aria-label=move || format!("Tyde permissions: {}", tyde_permissions.get().label())>
-                    <crate::components::chat_view::TydePermissionsIcon permissions=tyde_permissions />
-                </span>
-                <Show when=move || show_backend_labels.get()>
-                    <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
-                </Show>
+
             </div>
             {error_msg.map(|msg| view! {
                 <div class="agent-card-error">{msg}</div>
@@ -2596,6 +2703,13 @@ fn agent_card(
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
+                <span class="agent-tyde-permissions" title=move || format!("Tyde permissions: {}", tyde_permissions.get().label())
+                    aria-label=move || format!("Tyde permissions: {}", tyde_permissions.get().label())>
+                    <crate::components::chat_view::TydePermissionsIcon permissions=tyde_permissions />
+                </span>
+                <Show when=move || show_backend_labels.get()>
+                    <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
+                </Show>
                 <strong>{details_name}</strong>
                 <div>{backend_label(backend)}" · "{move || status_label(&derived.get())}</div>
                 <div>{details_host}</div>
@@ -3498,7 +3612,10 @@ mod wasm_tests {
         let state_for_mount = state;
         mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <AgentsPanel /> }
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <AgentsPanel />
+            }
         })
     }
 
@@ -3645,12 +3762,28 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
+        assert!(
+            agent
+                .query_selector("[role='img'][aria-label='Claude'] svg")
+                .unwrap()
+                .is_some(),
+            "Agent identity uses the shared backend glyph"
+        );
+        assert!(
+            agent
+                .query_selector(".agent-card-top .backend-badge")
+                .unwrap()
+                .is_none(),
+            "Agent heading does not duplicate backend identity"
+        );
         for card in [&agent, &history] {
             let height = card.get_bounding_client_rect().height();
             assert!(
                 (30.0..=40.0).contains(&height),
                 "a normal row must fit on one compact line, got {height}px"
             );
+        }
+        for card in [&history] {
             let label = card.query_selector(".backend-badge").unwrap().unwrap();
             let window = web_sys::window().unwrap();
             let edge = window
@@ -4236,6 +4369,9 @@ mod wasm_tests {
         let container = make_container();
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
+        for host in ["local", "remote"] {
+            push_agent(&state, host, "unscoped", "Unscoped chat", true);
+        }
 
         let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
@@ -4271,6 +4407,35 @@ mod wasm_tests {
         assert!(text_position(&text, "Project: Beta Project") < text_position(&text, "Beta Agent"));
         assert!(text_position(&text, "Beta Agent") < text_position(&text, "Host: Remote Host"));
         assert!(text_position(&text, "Host: Remote Host") < text_position(&text, "Gamma Agent"));
+
+        for host in ["local", "remote"] {
+            let section = container
+                .query_selector(&format!(
+                    ".agent-sidebar-host-section[data-host-id='{host}']"
+                ))
+                .unwrap()
+                .unwrap();
+            let headings = section
+                .query_selector_all(".agent-sidebar-project-header")
+                .unwrap();
+            assert!(
+                headings
+                    .item(0)
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+                    .contains("No project"),
+                "No-project chats precede projects on every host, regardless of roster order"
+            );
+            assert!(
+                !headings
+                    .item(0)
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+                    .contains("Project:")
+            );
+        }
 
         state.projects.update(|projects| {
             for id in ["alpha-workbench", "alpha-workbench-two"] {
@@ -4372,11 +4537,50 @@ mod wasm_tests {
     /// under the same project before the next project section starts.
     #[wasm_bindgen_test]
     async fn sidebar_preserves_parent_child_nesting_within_project_leaf() {
+        crate::dispatch::clear_host_seqs("local");
         let container = make_container();
+        // Shared-document geometry fixtures leave fixed max-z-index boxes.
+        // Own this page just as CenterZone does, so the hit test measures
+        // our two modal layers rather than an earlier empty fixture DIV.
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; inset: 0; z-index: 2147483647; background: var(--surface-1);",
+            )
+            .unwrap();
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
 
-        let _handle = mount_panel(&container, state);
+        let calls = install_send_stub_with_dialog_ok();
+        push_agent_with_scope(
+            &state,
+            "local",
+            "inactive-alpha",
+            "Quiet child",
+            true,
+            Some("alpha"),
+            Some("parent-alpha"),
+        );
+        state.agent_turn_active.update(|turns| {
+            turns.insert(AgentId("child-alpha".into()), true);
+        });
+        state.projects.update(|projects| {
+            let alpha = projects
+                .iter_mut()
+                .find(|info| info.project.id.0 == "alpha" && info.host_id == "local")
+                .unwrap();
+            alpha.project.source = ProjectSource::Standalone {
+                roots: vec![
+                    ProjectRootPath("/tmp/alpha".into()),
+                    ProjectRootPath("/tmp/second".into()),
+                ],
+            };
+        });
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            view! { <style>{include_str!("../../styles.css")}</style><AgentsPanel /><crate::components::project_rail::ProjectEditor /><crate::components::host_browser::HostBrowser /> }
+        });
         for _ in 0..4 {
             next_tick().await;
         }
@@ -4399,9 +4603,301 @@ mod wasm_tests {
         assert!(
             group_text.contains("Parent Alpha Agent")
                 && group_text.contains("Child Alpha Agent")
-                && group_text.contains('1'),
+                && group_text.contains("1 running"),
             "parent group should show parent, child, and visible child count; got {group_text:?}"
         );
+        let parent = agent_card_el(&container, "parent-alpha");
+        let child = agent_card_el(&container, "child-alpha");
+        let quiet = agent_card_el(&container, "inactive-alpha");
+        assert_eq!(
+            child.get_bounding_client_rect().height(),
+            0.0,
+            "Children start collapsed"
+        );
+        let disclosure = parent
+            .query_selector(".agent-card-collapse-toggle")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            disclosure.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        disclosure.click();
+        next_tick().await;
+        assert!(
+            child.get_bounding_client_rect().height() > 0.0,
+            "Running child is revealed"
+        );
+        assert_eq!(
+            quiet.get_bounding_client_rect().height(),
+            0.0,
+            "Inactive child stays quiet"
+        );
+        let inactive = parent_group
+            .query_selector(".agent-show-inactive")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(inactive.text_content().unwrap().trim(), "Show 1 inactive");
+        inactive.click();
+        next_tick().await;
+        assert!(quiet.get_bounding_client_rect().height() > 0.0);
+        state.agent_turn_active.update(|turns| {
+            turns.insert(AgentId("child-alpha".into()), false);
+        });
+        next_tick().await;
+        assert!(
+            parent.text_content().unwrap().contains("0 running"),
+            "Count reacts to authoritative activity"
+        );
+        assert_eq!(
+            child
+                .query_selector(".agent-card-status")
+                .unwrap()
+                .unwrap()
+                .get_attribute("title")
+                .as_deref(),
+            Some("Idle")
+        );
+        // Project editing uses the same domain commands as the project rail,
+        // and renders only the roots in the server's project snapshot.
+        let pencil = container
+            .query_selector("[aria-label='Edit project Alpha Project']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        pencil.focus().unwrap();
+        pencil.click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[role='dialog'][aria-label='Edit project']")
+            .unwrap()
+            .unwrap();
+        assert!(editor.text_content().unwrap().contains("/tmp/second"));
+        let input = editor
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value("Renamed Alpha");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        editor
+            .query_selector("button")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let frames = recorded_frames(&calls);
+        assert!(frames.iter().any(
+            |(kind, payload, _)| kind == "project_rename" && payload["name"] == "Renamed Alpha"
+        ));
+        editor
+            .query_selector("[aria-label='Remove source root /tmp/second']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .any(|(kind, payload, _)| kind == "project_delete_root"
+                    && payload["root"] == "/tmp/second")
+        );
+        assert!(
+            editor.text_content().unwrap().contains("/tmp/second"),
+            "Sending a command must not fabricate a successful root removal"
+        );
+        let mut updated = state
+            .projects
+            .get_untracked()
+            .into_iter()
+            .find(|info| info.host_id == "local" && info.project.id.0 == "alpha")
+            .unwrap()
+            .project;
+        updated.name = "Renamed Alpha".into();
+        updated.source = ProjectSource::Standalone {
+            roots: vec![ProjectRootPath("/tmp/alpha".into())],
+        };
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectNotify,
+            0,
+            &protocol::ProjectNotifyPayload::Upsert { project: updated },
+        );
+        next_tick().await;
+        assert!(!editor.text_content().unwrap().contains("/tmp/second"));
+        assert!(editor.text_content().unwrap().contains("Renamed Alpha"));
+        // Open the existing host browser without switching the selected project.
+        let before = state.active_project.get_untracked();
+        let add = editor.query_selector_all("button").unwrap();
+        let add = (0..add.length())
+            .filter_map(|i| add.item(i))
+            .find(|node| node.text_content().unwrap().contains("Add source root"))
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        add.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='dialog'][aria-label='Folder browser']")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(state.active_project.get_untracked(), before);
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .any(|(kind, _, _)| kind == "host_browse_start")
+        );
+        let browse = state.browse_dialog.get_untracked().unwrap();
+        let stream = browse.browse_stream.get_untracked();
+        dispatch_frame(
+            &state,
+            "local",
+            stream.clone(),
+            FrameKind::HostBrowseOpened,
+            0,
+            &protocol::HostBrowseOpenedPayload {
+                home: protocol::HostAbsPath("/tmp".into()),
+                root: protocol::HostAbsPath("/".into()),
+                separator: '/',
+                platform: protocol::HostPlatform::Linux,
+            },
+        );
+        dispatch_frame(
+            &state,
+            "local",
+            stream,
+            FrameKind::HostBrowseEntries,
+            1,
+            &protocol::HostBrowseEntriesPayload {
+                path: protocol::HostAbsPath("/tmp/added".into()),
+                parent: Some(protocol::HostAbsPath("/tmp".into())),
+                entries: vec![],
+            },
+        );
+        next_tick().await;
+        let browser_button = container
+            .query_selector(".browser-btn-primary")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert!(
+            !browser_button.disabled(),
+            "A real folder response must enable selection before hit-testing"
+        );
+        let bounds = browser_button.get_bounding_client_rect();
+        let hit = document()
+            .element_from_point(
+                (bounds.left() + bounds.right()) as f32 / 2.0,
+                (bounds.top() + bounds.bottom()) as f32 / 2.0,
+            )
+            .unwrap();
+        wasm_bindgen_test::console_log!(
+            "Folder selection hit: tag={}, class={}, bounds=({},{},{},{}), browser_z={}, editor_z={}",
+            hit.tag_name(),
+            hit.class_name(),
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(
+                    &container
+                        .query_selector(".browser-backdrop")
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .get_property_value("z-index")
+                .unwrap(),
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(
+                    &container
+                        .query_selector(".project-editor-overlay")
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .get_property_value("z-index")
+                .unwrap()
+        );
+        assert!(
+            hit.is_same_node(Some(&browser_button)),
+            "Folder selection must be pointer-reachable above the project editor after the folder response settles"
+        );
+        container
+            .query_selector(".browser-btn-primary")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .any(|(kind, payload, _)| kind == "project_add_root"
+                    && payload["root"] == "/tmp/added"
+                    && payload["id"] == "alpha")
+        );
+        assert!(
+            !editor.text_content().unwrap().contains("/tmp/added"),
+            "The editor waits for authoritative roots"
+        );
+        let mut updated = state
+            .projects
+            .get_untracked()
+            .into_iter()
+            .find(|info| info.host_id == "local" && info.project.id.0 == "alpha")
+            .unwrap()
+            .project;
+        updated.source = ProjectSource::Standalone {
+            roots: vec![
+                ProjectRootPath("/tmp/alpha".into()),
+                ProjectRootPath("/tmp/added".into()),
+            ],
+        };
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectNotify,
+            1,
+            &protocol::ProjectNotifyPayload::Upsert { project: updated },
+        );
+        next_tick().await;
+        assert!(editor.text_content().unwrap().contains("/tmp/added"));
+        assert!(
+            container
+                .query_selector(".browser-modal")
+                .unwrap()
+                .is_none()
+        );
+        state.project_editor.set(None);
+        next_tick().await;
+        crate::dispatch::reset_inbound_state_for_host("local");
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen::prelude::wasm_bindgen(
@@ -4535,6 +5031,20 @@ mod wasm_tests {
                 .closest(".agent-card")
                 .unwrap()
                 .expect("child card");
+            // The approved disclosure now starts collapsed and separates
+            // inactive children. Reveal both before measuring indentation.
+            let disclosure: HtmlElement = parent
+                .query_selector("button[title='Toggle sub-agents']")
+                .unwrap()
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            disclosure.click();
+            next_tick().await;
+            if let Some(inactive) = container.query_selector(".agent-show-inactive").unwrap() {
+                inactive.dyn_into::<HtmlElement>().unwrap().click();
+                next_tick().await;
+            }
             let parent_box = parent.get_bounding_client_rect();
             let child_box = child.get_bounding_client_rect();
             let toggle = parent
@@ -4575,7 +5085,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn custom_group_renders_members_only_in_groups_section() {
+    async fn sidebar_global_pins_preserve_custom_groups_and_host_routing() {
         let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
@@ -4592,6 +5102,7 @@ mod wasm_tests {
             provide_context(mounted_state.clone());
             view! {
                 <style>{include_str!("../../styles.css")}</style>
+                <crate::components::header::Header />
                 <AgentsPanel />
             }
         });
@@ -4624,18 +5135,14 @@ mod wasm_tests {
         let pin_button = |host: &str, id: &str| -> HtmlElement {
             container
                 .query_selector(&format!(
-                    "[data-host-id='{host}'] [data-agent-id='{id}'] .agent-card-pin"
+                    ".agent-card-group[data-host-id='{host}'][data-agent-id='{id}'] > .agent-card .agent-card-pin"
                 ))
                 .unwrap()
                 .expect("every sidebar chat offers a pin action")
                 .dyn_into()
                 .unwrap()
         };
-        let pinned_section = |host: &str| {
-            container
-                .query_selector(&format!("[data-host-id='{host}'] [aria-label='Pinned']"))
-                .unwrap()
-        };
+        let pinned_section = || container.query_selector("[aria-label='Pinned']").unwrap();
         let notify_seq = std::cell::Cell::new(0);
         let notify = |snapshot: AgentsViewPreferencesSnapshot| {
             dispatch_frame(
@@ -4656,7 +5163,7 @@ mod wasm_tests {
                 .next_back()
                 .expect("pin frame")
         };
-        assert!(pinned_section("local").is_none());
+        assert!(pinned_section().is_none());
         let pin = pin_button("local", "beta-agent");
         assert_eq!(pin.get_attribute("aria-label").as_deref(), Some("Pin chat"));
         assert_eq!(pin.get_attribute("aria-pressed").as_deref(), Some("false"));
@@ -4678,7 +5185,7 @@ mod wasm_tests {
         assert!(state.active_agent.get_untracked().is_none());
         assert!(state.active_project.get_untracked().is_none());
         assert!(
-            pinned_section("local").is_none(),
+            pinned_section().is_none(),
             "wait for authoritative pin state"
         );
         assert_eq!(
@@ -4710,14 +5217,27 @@ mod wasm_tests {
         snapshot.pins.pinned = vec![local_target("beta-agent")];
         notify(snapshot.clone());
         next_tick().await;
-        assert!(pinned_section("remote").is_none());
+        assert_eq!(
+            container
+                .query_selector_all("[aria-label='Pinned']")
+                .unwrap()
+                .length(),
+            1
+        );
         assert_eq!(
             pin_button("remote", "beta-agent")
                 .get_attribute("aria-pressed")
                 .as_deref(),
             Some("false")
         );
-        let section = pinned_section("local").expect("Pinned section");
+        let section = pinned_section().expect("Pinned section");
+        assert!(
+            section
+                .closest(".agent-sidebar-host-section")
+                .unwrap()
+                .is_none(),
+            "One global Pinned section must precede every host, not belong to a host"
+        );
         assert!(section.text_content().unwrap().contains("Pinned"));
         assert!(section.text_content().unwrap().contains("Beta Agent"));
         assert!(
@@ -4748,7 +5268,9 @@ mod wasm_tests {
         assert!(local_text.find("Pinned").unwrap() < local_text.find("Review Group").unwrap());
         assert_eq!(
             container
-                .query_selector_all("[data-host-id='local'] [data-agent-id='beta-agent']")
+                .query_selector_all(
+                    ".agent-card-group[data-host-id='local'][data-agent-id='beta-agent']"
+                )
                 .unwrap()
                 .length(),
             1
@@ -4785,7 +5307,183 @@ mod wasm_tests {
         assert_eq!(last_group_update_json(&calls)["kind"], "move_targets");
         assert!(state.active_agent.get_untracked().is_none());
 
-        // Search, inactive, sub-agent and project filters still govern pins.
+        state
+            .configured_hosts
+            .update(|hosts| hosts.push(configured_host("offline", "Unavailable Host")));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "offline".to_owned(),
+                crate::state::ConnectionStatus::Disconnected,
+            );
+        });
+        snapshot
+            .pins
+            .pinned
+            .push(AgentAnnotationTarget::TransientAgent {
+                host_id: HostFilterId("offline".to_owned()),
+                agent_id: AgentId("absent".to_owned()),
+            });
+        let remote_beta = AgentAnnotationTarget::TransientAgent {
+            host_id: HostFilterId("remote".to_owned()),
+            agent_id: AgentId("beta-agent".to_owned()),
+        };
+        snapshot.pins.pinned.push(remote_beta.clone());
+        notify(snapshot.clone());
+        next_tick().await;
+        let global = pinned_section().unwrap();
+        let host_labels = global.query_selector_all(".agent-pin-host").unwrap();
+        assert_eq!(
+            host_labels.length(),
+            2,
+            "Each global pin identifies its host"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Unavailable Host"),
+            "A saved pin never fabricates a disconnected host roster"
+        );
+        assert_eq!(
+            host_labels.item(0).unwrap().text_content().as_deref(),
+            Some("Local Host")
+        );
+        assert_eq!(
+            host_labels.item(1).unwrap().text_content().as_deref(),
+            Some("Remote Host")
+        );
+        let configured = state.configured_hosts.get_untracked();
+        state
+            .configured_hosts
+            .update(|hosts| hosts.retain(|host| host.id != "remote"));
+        next_tick().await;
+        let missing_label = container
+            .query_selector("[aria-label='Host label unavailable. Open host settings']")
+            .unwrap()
+            .expect("Missing canonical host labels must be an actionable error, not an ID fallback")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            missing_label.text_content().as_deref(),
+            Some("Host label missing")
+        );
+        missing_label.click();
+        next_tick().await;
+        assert!(state.settings_open.get_untracked());
+        assert_eq!(state.settings_tab_request.get_untracked(), Some("Hosts"));
+        assert!(
+            state.active_agent.get_untracked().is_none(),
+            "Host-configuration error action must not open a chat"
+        );
+        state.settings_open.set(false);
+        state.settings_tab_request.set(None);
+        state.configured_hosts.set(configured);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Host label unavailable. Open host settings']")
+                .unwrap()
+                .is_none()
+        );
+        for host in ["local", "remote"] {
+            assert_eq!(
+                container
+                    .query_selector_all(&format!(
+                        "[data-host-id='{host}'][data-agent-id='beta-agent']"
+                    ))
+                    .unwrap()
+                    .length(),
+                1
+            );
+            assert!(container.query_selector(&format!(".agent-sidebar-host-section [data-host-id='{host}'][data-agent-id='beta-agent']")).unwrap().is_none(), "Pins are never duplicated in ordinary groups");
+        }
+        for mode in ["vibe", "dinosaur"] {
+            let select = container
+                .query_selector("[aria-label='Interface mode']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlSelectElement>()
+                .unwrap();
+            select.set_value(mode);
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_eq!(
+                container
+                    .query_selector_all("[aria-label='Pinned']")
+                    .unwrap()
+                    .length(),
+                1
+            );
+            let global = pinned_section().unwrap();
+            let host = container
+                .query_selector(".agent-sidebar-host-section")
+                .unwrap()
+                .unwrap();
+            assert!(
+                global.get_bounding_client_rect().bottom() <= host.get_bounding_client_rect().top(),
+                "All pins precede every host in either mode"
+            );
+            for host in ["remote", "local"] {
+                let card = pin_button(host, "beta-agent")
+                    .closest(".agent-card")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap();
+                card.click();
+                next_tick().await;
+                let active = state.active_agent.get_untracked().unwrap();
+                assert_eq!(
+                    active.host_id, host,
+                    "Opening a global pin routes by host, not raw agent id"
+                );
+                assert_eq!(active.agent_id.0, "beta-agent");
+                assert_eq!(card.get_attribute("aria-current").as_deref(), Some("true"));
+                let other = if host == "local" { "remote" } else { "local" };
+                assert_eq!(
+                    pin_button(other, "beta-agent")
+                        .closest(".agent-card")
+                        .unwrap()
+                        .unwrap()
+                        .get_attribute("aria-current")
+                        .as_deref(),
+                    Some("false")
+                );
+            }
+        }
+        // Explicitly scoped unpin payloads still go to the canonical preferences owner.
+        pin_button("remote", "beta-agent").click();
+        next_tick().await;
+        assert_eq!(
+            last_pin_update().0,
+            serde_json::json!({"kind":"unpin", "target":remote_beta})
+        );
+        assert_eq!(last_pin_update().1, "/host/local");
+        assert!(
+            pinned_section()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Remote Beta"),
+            "Do not relocate until the authoritative snapshot"
+        );
+        snapshot.pins.pinned.retain(|target| target != &remote_beta);
+        notify(snapshot.clone());
+        next_tick().await;
+        assert!(
+            !pinned_section()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Remote Beta")
+        );
+        assert_eq!(container.query_selector_all(".agent-sidebar-host-section [data-host-id='remote'][data-agent-id='beta-agent']").unwrap().length(), 1);
+        state.switch_active_project(None);
+        next_tick().await;
+
+        // Search narrows pins; automatic inactive/project/subagent hiding never hides explicit pins.
         let search: web_sys::HtmlInputElement = container
             .query_selector("input[placeholder='Filter agents...']")
             .unwrap()
@@ -4797,7 +5495,7 @@ mod wasm_tests {
             .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
         next_tick().await;
-        assert!(pinned_section("local").is_none());
+        assert!(pinned_section().is_none());
         search.set_value("");
         search
             .dispatch_event(&web_sys::Event::new("input").unwrap())
@@ -4805,7 +5503,7 @@ mod wasm_tests {
         snapshot.sidebar.hide_inactive = true;
         notify(snapshot.clone());
         next_tick().await;
-        assert!(pinned_section("local").is_none());
+        assert!(pinned_section().is_some());
         snapshot.sidebar.hide_inactive = false;
         snapshot.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
         state.active_project.set(Some(ActiveProjectRef {
@@ -4814,7 +5512,7 @@ mod wasm_tests {
         }));
         notify(snapshot.clone());
         next_tick().await;
-        assert!(pinned_section("local").is_none());
+        assert!(pinned_section().is_some());
         snapshot.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects;
         state.active_project.set(None);
 
@@ -4847,14 +5545,14 @@ mod wasm_tests {
         notify(snapshot.clone());
         next_tick().await;
         assert!(
-            pinned_section("remote")
+            pinned_section()
                 .unwrap()
                 .text_content()
                 .unwrap()
                 .contains("Gamma Agent")
         );
         assert!(
-            pinned_section("local")
+            pinned_section()
                 .unwrap()
                 .text_content()
                 .unwrap()
@@ -4871,7 +5569,7 @@ mod wasm_tests {
         notify(snapshot.clone());
         next_tick().await;
         assert!(
-            !pinned_section("local")
+            pinned_section()
                 .unwrap()
                 .text_content()
                 .unwrap()
@@ -4903,7 +5601,7 @@ mod wasm_tests {
         notify(snapshot.clone());
         next_tick().await;
         assert!(
-            pinned_section("local")
+            pinned_section()
                 .unwrap()
                 .text_content()
                 .unwrap()
@@ -4961,7 +5659,7 @@ mod wasm_tests {
         );
         assert!(state.active_agent.get_untracked().is_none());
         assert!(
-            pinned_section("local")
+            pinned_section()
                 .unwrap()
                 .text_content()
                 .unwrap()
@@ -4974,8 +5672,7 @@ mod wasm_tests {
         unpinned.pins.pinned.clear();
         notify(unpinned);
         next_tick().await;
-        assert!(pinned_section("local").is_none());
-        assert!(pinned_section("remote").is_none());
+        assert!(pinned_section().is_none());
         let custom = container
             .query_selector(".agent-sidebar-custom-group")
             .unwrap()
@@ -4986,7 +5683,9 @@ mod wasm_tests {
         );
         assert_eq!(
             container
-                .query_selector_all("[data-host-id='local'] [data-agent-id='beta-agent']")
+                .query_selector_all(
+                    ".agent-card-group[data-host-id='local'][data-agent-id='beta-agent']"
+                )
                 .unwrap()
                 .length(),
             1
@@ -5803,6 +6502,10 @@ mod wasm_tests {
             Some("a-source"),
         );
         push_agent(&state, "h", "a-btw", "BTW: why is this slow?", true);
+        state.agent_turn_active.update(|turns| {
+            turns.insert(AgentId("a-owned".into()), true);
+            turns.insert(AgentId("a-btw".into()), true);
+        });
         let _handle = mount_panel(&container, state);
         for _ in 0..4 {
             next_tick().await;
@@ -5831,14 +6534,14 @@ mod wasm_tests {
             "the fork must never render inside another agent's child list; got {nested:?}"
         );
         let counted = container
-            .query_selector(".agent-child-count")
+            .query_selector(".agent-card-collapse-toggle")
             .unwrap()
             .expect("the owning agent still shows its child count")
             .text_content()
             .unwrap_or_default();
         assert_eq!(
             counted.trim(),
-            "1",
+            "1 running ▸",
             "the fork must not be counted as a child of the agent it forked from"
         );
     }

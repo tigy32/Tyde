@@ -3,9 +3,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AppState, ComposerHandle, DockVisibility, FileResourceKey,
-    LeftTab, OpenTarget, PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination,
-    PendingWorkbenchCreate, PendingWorkbenchRemove, TabContent, TabId, sort_project_infos,
+    ActiveAgentRef, ActiveProjectRef, AppState, ComposerHandle, FileResourceKey, OpenTarget,
+    PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination, PendingWorkbenchCreate,
+    PendingWorkbenchRemove, SidebarTab, TabContent, TabId, sort_project_infos,
 };
 
 use protocol::{
@@ -1180,7 +1180,7 @@ pub fn start_find_references(
             symbol,
             ..Default::default()
         });
-    state.left_tab.set(LeftTab::References);
+    state.activate_sidebar_tab(SidebarTab::References);
 
     let payload = CodeIntelFindReferencesPayload {
         references_id,
@@ -1358,8 +1358,7 @@ pub fn cancel_project_search(state: &AppState) {
 
 /// Reveal and focus the Search panel in the left dock (Cmd/Ctrl+Shift+F).
 pub fn open_search_panel(state: &AppState) {
-    state.left_dock.set(DockVisibility::Visible);
-    state.left_tab.set(LeftTab::Search);
+    state.activate_sidebar_tab(SidebarTab::Search);
     state
         .search_focus_seq
         .update(|seq| *seq = seq.wrapping_add(1));

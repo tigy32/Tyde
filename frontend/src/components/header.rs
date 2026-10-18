@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use leptos::prelude::*;
 
+use crate::sidebar_layout::{InterfaceMode, SidebarSide};
 use crate::state::{AppState, ConnectionStatus, DockVisibility};
 
 /// ssh reports a dropped connection on stderr before the transport loss reaches
@@ -199,24 +200,14 @@ pub fn Header() -> impl IntoView {
             },
         );
 
-    let toggle_left = move |_| {
-        state.left_dock.update(|dock| {
-            *dock = match dock {
-                DockVisibility::Visible => DockVisibility::Hidden,
-                DockVisibility::Hidden => DockVisibility::Visible,
-            }
-        });
-    };
-
-    let toggle_right = move |_| {
-        state.right_dock.update(|dock| {
-            *dock = match dock {
-                DockVisibility::Visible => DockVisibility::Hidden,
-                DockVisibility::Hidden => DockVisibility::Visible,
-            }
-        });
-    };
-
+    let layouts = state.sidebar_layout;
+    let layout_blocked = state.sidebar_storage_blocked;
+    let feedback = state.feedback_open;
+    let settings = state.settings_open;
+    let left_state = state.clone();
+    let toggle_left = move |_| left_state.toggle_sidebar(SidebarSide::Left);
+    let right_state = state.clone();
+    let toggle_right = move |_| right_state.toggle_sidebar(SidebarSide::Right);
     let toggle_bottom = move |_| {
         state.bottom_dock.update(|dock| {
             *dock = match dock {
@@ -264,15 +255,33 @@ pub fn Header() -> impl IntoView {
             <header class="header">
                 <div class="header-left">
                     <span class="header-title">"Tyde"</span>
+                    <select class="header-mode" disabled=move || layout_blocked.get() aria-label="Interface mode" aria-describedby="interface-mode-description" title="Vibe: agents and history. Dinosaur: full developer tools."
+                        prop:value=move || if layout_blocked.get() { "unavailable" } else { match layouts.get().mode { InterfaceMode::Vibe => "vibe", InterfaceMode::Dinosaur => "dinosaur" } }
+                        on:change=move |ev| {
+                            let mode = match event_target_value(&ev).as_str() {
+                                "vibe" => InterfaceMode::Vibe,
+                                "dinosaur" => InterfaceMode::Dinosaur,
+                                _ => { report_user_error("Unknown interface mode"); return; }
+                            };
+                            layouts.update(|layouts| layouts.mode = mode);
+                        }
+                    >
+                        <option value="unavailable" disabled=true hidden=true>"Layout unavailable"</option>
+                        <option value="vibe">"Vibe"</option>
+                        <option value="dinosaur">"Dinosaur"</option>
+                    </select>
+                    <span id="interface-mode-description" class="visually-hidden">"Vibe shows Agents and History. Dinosaur includes Files, Git, Search, Refs and advanced tools."</span>
                     <div class="header-status">
                         <span class={status_class}></span>
                         <span class="status-text" title={status_text}>{status_text}</span>
                     </div>
                 </div>
                 <div class="header-right">
-                    <button class="header-btn" title="Toggle Left Dock" on:click=toggle_left>"Left"</button>
+                    <button class="header-btn" title="Toggle Left Dock" disabled=move || layout_blocked.get() on:click=toggle_left>"Left"</button>
                     <button class="header-btn" title="Toggle Bottom Dock" on:click=toggle_bottom>"Bottom"</button>
-                    <button class="header-btn" title="Toggle Right Dock" on:click=toggle_right>"Right"</button>
+                    <button class="header-btn" title="Toggle Right Dock" disabled=move || layout_blocked.get() on:click=toggle_right>"Right"</button>
+                    <button class="header-btn" title="Settings" on:click=move |_| settings.set(true)>"⚙ Settings"</button>
+                    <button class="header-btn" title="Send feedback" on:click=move |_| feedback.set(true)>"Feedback"</button>
                 </div>
             </header>
             <Show when=move || user_notice_for_show.get().is_some()>

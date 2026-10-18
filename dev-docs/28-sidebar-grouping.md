@@ -155,3 +155,66 @@ not close or kill agents. The sidebar does not use `window.confirm`,
 Agents Center still no longer renders Hide finished and no longer applies
 `hide_finished` when filtering rows. Smart Views may still contain the field from
 older persisted data, but it is ignored by the frontend projection.
+
+## Desktop presentation modes and layout
+
+The existing Agents panel is shared by **Vibe** (Agents and History) and
+**Dinosaur** (the existing developer and advanced panels too). The top chrome
+selects the mode and exposes Settings and the existing Feedback flow. Neither
+mode changes chat tabs, the composer, transcripts, or server subscriptions.
+
+Sidebar tab headers can move between left and right, or reorder within a side.
+Their tab menu offers the same operations; Ctrl+Shift+Left/Right moves sides
+and Ctrl+Shift+Up/Down reorders. Escape or an abandoned drag makes no change.
+An empty side retains its tab-header drop target. This is separate from agent
+row grouping, project ordering, and center/bottom docking.
+
+`sidebar_layout::ClientLayouts` owns presentation. The versioned client-local
+`tyde.desktop-layout.v1` record stores the last mode and independent tab order,
+side, active tab, visibility, and preferred width for each mode. The known legacy
+`tyde.agents.collapsed-folders.v1` record is explicitly parsed as its original
+set of folder keys. Those clients retain the previous fixed pane arrangement
+as Dinosaur (Files left, Agents right, both 320px); the folder record stays
+on its existing canonical path. Clients with neither record start in Vibe.
+Project/session history and unrelated preferences never determine migration.
+Once v1 exists, its explicit last mode wins. Invalid/unknown records
+produce a visible error and block writes rather than guessing a replacement.
+Settings → Appearance → Reset sidebar layout resets the current mode and
+unblocks persistence. Server-owned agent filters, pins, project membership,
+and selection keep their existing canonical paths. Persistent panel mounts
+use CSS grid placement, not panel copies or remounts, when moving or hiding.
+
+Agent rows use the existing vector backend glyphs, with status on the right.
+The selected conversation has the strongest flat tint; related rows have a
+quieter shared tint, without backend-colored rails or a group outline.
+Subagents start collapsed. The count is the number of immediate children with
+an authoritative active turn; expanding shows those children, with a separate
+inactive disclosure. It never derives parentage or activity from transcripts.
+
+A pencil immediately after a project heading's name opens the shared project
+editor, also reachable through the project rail menu. Keyboard focus reveals
+the pencil; touch keeps it visible. The editor uses existing rename and root
+commands and the host folder browser, rendering roots from project events
+without optimistic domain copies. Removing a source root removes its project
+association, not its directory. Workbench/parent root restrictions still apply.
+
+## Global pins and host order
+
+The shared Agents panel has one **Pinned** section before every host, in both
+modes. It projects the primary server's existing `AgentPinsSnapshot` onto all
+currently known live agents using the full host-scoped annotation target. Each
+pin shows its configured host label. Opening keeps the agent's host/project;
+unpin mutations keep the host-scoped target and use the existing primary
+preferences owner. There is no second pin store and no history-derived or
+fabricated disconnected-host roster.
+
+Explicit pins bypass automatic inactive, subagent and other-project hiding;
+text search still narrows them. Unpinned descendants stay with their tree;
+independently pinned children float out exactly once and return on unpin.
+Pinned trees are absent from ordinary host/project/custom groups. Within each
+remaining host, **No project** comes first, followed by the existing project
+order, then custom groups. Empty pin/host/project/custom groups are omitted.
+Existing vector backend identities, status glyphs, active/inactive child
+revelation and project/root actions are unchanged.
+If the canonical configured-host list cannot provide a pin's label, its badge
+shows an explicit error linking to Settings → Hosts, not an opaque-ID substitute.

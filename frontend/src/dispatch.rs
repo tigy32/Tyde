@@ -3757,7 +3757,7 @@ pub(crate) fn apply_code_intel_navigate_result(
         cancelled: false,
         error: None,
     });
-    state.left_tab.set(crate::state::LeftTab::References);
+    state.activate_sidebar_tab(crate::state::SidebarTab::References);
 }
 
 /// Apply a `code_intel_hover_result`. Ignored if superseded. Honors the
@@ -10444,8 +10444,10 @@ mod wasm_tests {
             Some("foo".to_owned())
         );
         assert_eq!(
-            state.left_tab.get_untracked(),
-            crate::state::LeftTab::References
+            state
+                .sidebar_layout
+                .with_untracked(|l| l.dinosaur.left.active),
+            Some(crate::state::SidebarTab::References)
         );
 
         // The frame went out with the requested offset and the minted id.

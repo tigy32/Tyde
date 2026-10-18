@@ -9,7 +9,8 @@ use crate::components::sessions_panel::SessionsPanel;
 use crate::components::swarms_panel::SwarmsPanel;
 use crate::components::terminal_view::TerminalView;
 use crate::components::workflows_panel::WorkflowsPanel;
-use crate::state::{AppState, LeftTab, RightTab};
+use crate::sidebar_layout::{SidebarSide, SidebarTab};
+use crate::state::AppState;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DockPosition {
@@ -21,149 +22,145 @@ pub enum DockPosition {
 #[component]
 pub fn DockZone(position: DockPosition) -> impl IntoView {
     match position {
-        DockPosition::Right => view! { <RightDock /> }.into_any(),
-        DockPosition::Left => view! { <LeftDock /> }.into_any(),
+        DockPosition::Left => view! { <SidebarTabs side=SidebarSide::Left /> }.into_any(),
+        DockPosition::Right => view! { <SidebarTabs side=SidebarSide::Right /> }.into_any(),
         DockPosition::Bottom => view! { <TerminalView /> }.into_any(),
     }
 }
 
 #[component]
-fn RightDock() -> impl IntoView {
-    let active_tab = expect_context::<AppState>().right_tab;
-
-    let tab_class = move |target: RightTab| {
-        move || {
-            if active_tab.get() == target {
-                "dock-tab active"
-            } else {
-                "dock-tab"
-            }
-        }
-    };
-
-    // Mount-and-hide both panels so per-component state (selection, scroll
-    // position, expanded rows) survives a tab switch. Switching tabs only
-    // toggles CSS visibility — no remount, no reactive subscription
-    // teardown.
-    let agents_style = move || {
-        if active_tab.get() == RightTab::Agents {
-            ""
-        } else {
-            "display: none;"
-        }
-    };
-    let sessions_style = move || {
-        if active_tab.get() == RightTab::Sessions {
-            ""
-        } else {
-            "display: none;"
-        }
-    };
-    let swarms_style = move || {
-        if active_tab.get() == RightTab::Swarms {
-            ""
-        } else {
-            "display: none;"
-        }
-    };
-    let workflows_style = move || {
-        if active_tab.get() == RightTab::Workflows {
-            ""
-        } else {
-            "display: none;"
-        }
-    };
-
+fn SidebarTabs(side: SidebarSide) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let layouts = state.sidebar_layout;
+    let blocked = state.sidebar_storage_blocked;
+    let dragged = state.sidebar_drag;
+    let hover = RwSignal::new(None::<SidebarTab>);
+    let over = RwSignal::new(false);
+    let move_state = state.clone();
     view! {
-        <div class="dock-inner">
-            <div class="dock-tab-bar">
-                <button class={tab_class(RightTab::Agents)} on:click=move |_| active_tab.set(RightTab::Agents)>
-                    "Agents"
-                </button>
-                <button class={tab_class(RightTab::Sessions)} on:click=move |_| active_tab.set(RightTab::Sessions)>
-                    "History"
-                </button>
-                <button class={tab_class(RightTab::Swarms)} on:click=move |_| active_tab.set(RightTab::Swarms)>
-                    "Swarms"
-                </button>
-                <button class={tab_class(RightTab::Workflows)} on:click=move |_| active_tab.set(RightTab::Workflows)>
-                    "Workflows"
-                </button>
-            </div>
-            <div class="dock-tab-content">
-                <div class="dock-tab-mount" style=agents_style>
-                    <AgentsPanel />
-                </div>
-                <div class="dock-tab-mount" style=sessions_style>
-                    <SessionsPanel />
-                </div>
-                <div class="dock-tab-mount" style=swarms_style>
-                    <SwarmsPanel />
-                </div>
-                <div class="dock-tab-mount" style=workflows_style>
-                    <WorkflowsPanel />
-                </div>
-            </div>
+        <div class="dock-tab-bar" style=move || if blocked.get() { "display:none" } else { "" } class:sidebar-drop-over=move || over.get() && dragged.get().is_some()
+            aria-label=format!("{} sidebar tabs", side.label())
+            on:dragover=move |ev: web_sys::DragEvent| {
+                if dragged.get_untracked().is_some() { ev.prevent_default(); over.set(true); hover.set(None); }
+            }
+            on:dragleave=move |_| { over.set(false); hover.set(None); }
+            on:drop=move |ev: web_sys::DragEvent| {
+                if let Some(tab) = dragged.get_untracked() {
+                    ev.prevent_default(); ev.stop_propagation();
+                    move_state.move_sidebar_tab(tab, side, hover.get_untracked());
+                }
+                dragged.set(None); over.set(false); hover.set(None);
+            }
+        >
+            <For each=move || layouts.with(|layouts| layouts.current().pane(side).tabs.clone()) key=|tab| *tab children=move |tab| {
+                let activate = state.clone();
+                let keys = state.clone();
+                let menu_left = state.clone();
+                let menu_right = state.clone();
+                let menu_previous = state.clone();
+                let menu_next = state.clone();
+                view! {
+                    <div class="dock-tab-item" class:sidebar-drop-before=move || dragged.get().is_some() && hover.get() == Some(tab)
+                        on:dragover=move |ev: web_sys::DragEvent| {
+                            if dragged.get_untracked().is_some() { ev.prevent_default(); ev.stop_propagation(); hover.set(Some(tab)); over.set(true); }
+                        }
+                    >
+                        <button type="button" class="dock-tab" class:active=move || layouts.with(|l| l.current().pane(side).active == Some(tab))
+                            draggable="true" aria-label=tab.label()
+                            title="Drag to either sidebar. Ctrl+Shift+Left/Right moves sides; Ctrl+Shift+Up/Down reorders."
+                            on:click=move |_| activate.activate_sidebar_tab(tab)
+                            on:dragstart=move |ev: web_sys::DragEvent| {
+                                ev.stop_propagation();
+                                if let Some(data) = ev.data_transfer() {
+                                    if let Err(error) = data.set_data("application/x-tyde-sidebar-tab", tab.label()) {
+                                        ev.prevent_default(); crate::components::header::report_user_error(format!("Cannot drag sidebar tab: {error:?}")); return;
+                                    }
+                                    data.set_effect_allowed("move");
+                                }
+                                dragged.set(Some(tab));
+                            }
+                            on:dragend=move |_| { dragged.set(None); hover.set(None); over.set(false); }
+                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                if ev.key() == "Escape" { dragged.set(None); hover.set(None); over.set(false); }
+                                if ev.ctrl_key() && ev.shift_key() {
+                                    match ev.key().as_str() {
+                                        "ArrowLeft" => { ev.prevent_default(); keys.move_sidebar_tab(tab, SidebarSide::Left, None); },
+                                        "ArrowRight" => { ev.prevent_default(); keys.move_sidebar_tab(tab, SidebarSide::Right, None); },
+                                        "ArrowUp" => { ev.prevent_default(); reorder(&keys, tab, side, false); },
+                                        "ArrowDown" => { ev.prevent_default(); reorder(&keys, tab, side, true); },
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        >{tab.label()}</button>
+                        <details class="sidebar-tab-menu">
+                            <summary aria-label=format!("{} tab actions", tab.label()) title="Move or reorder tab">"⋯"</summary>
+                            <div class="sidebar-tab-actions">
+                                <button on:click=move |_| menu_left.move_sidebar_tab(tab, SidebarSide::Left, None)>"Move left"</button>
+                                <button on:click=move |_| menu_right.move_sidebar_tab(tab, SidebarSide::Right, None)>"Move right"</button>
+                                <button on:click=move |_| reorder(&menu_previous, tab, side, false)>"Move earlier"</button>
+                                <button on:click=move |_| reorder(&menu_next, tab, side, true)>"Move later"</button>
+                            </div>
+                        </details>
+                    </div>
+                }
+            } />
+            <span class="sidebar-empty-target" style=move || if layouts.with(|l| l.current().pane(side).tabs.is_empty()) { "" } else { "display:none" } title="Drag sidebar tabs here">"⋮"</span>
         </div>
     }
 }
 
+fn reorder(state: &AppState, tab: SidebarTab, side: SidebarSide, later: bool) {
+    let tabs = state
+        .sidebar_layout
+        .with_untracked(|l| l.current().pane(side).tabs.clone());
+    let Some(index) = tabs.iter().position(|item| *item == tab) else {
+        return;
+    };
+    if later {
+        if index + 1 < tabs.len() {
+            state.move_sidebar_tab(tab, side, tabs.get(index + 2).copied());
+        }
+    } else if index > 0 {
+        state.move_sidebar_tab(tab, side, Some(tabs[index - 1]));
+    }
+}
+
 #[component]
-fn LeftDock() -> impl IntoView {
-    // The active left tab lives in AppState so the Cmd/Ctrl+Shift+F shortcut
-    // and the file-explorer "search in folder" action can switch to Search.
-    let active_tab = expect_context::<AppState>().left_tab;
-
-    let tab_class = move |target: LeftTab| {
-        move || {
-            if active_tab.get() == target {
-                "dock-tab active"
-            } else {
-                "dock-tab"
-            }
-        }
-    };
-
-    let tab_style = move |target: LeftTab| {
-        move || {
-            if active_tab.get() == target {
-                ""
-            } else {
-                "display: none;"
-            }
-        }
-    };
-
+pub fn SidebarPanels() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let layouts = state.sidebar_layout;
+    let blocked = state.sidebar_storage_blocked;
     view! {
-        <div class="dock-inner">
-            <div class="dock-tab-bar">
-                <button class={tab_class(LeftTab::Files)} on:click=move |_| active_tab.set(LeftTab::Files)>
-                    "Files"
-                </button>
-                <button class={tab_class(LeftTab::Git)} on:click=move |_| active_tab.set(LeftTab::Git)>
-                    "Git"
-                </button>
-                <button class={tab_class(LeftTab::Search)} on:click=move |_| active_tab.set(LeftTab::Search)>
-                    "Search"
-                </button>
-                <button class={tab_class(LeftTab::References)} on:click=move |_| active_tab.set(LeftTab::References)>
-                    "Refs"
-                </button>
-            </div>
-            <div class="dock-tab-content">
-                <div class="dock-tab-mount" style=tab_style(LeftTab::Files)>
-                    <FileExplorer />
-                </div>
-                <div class="dock-tab-mount" style=tab_style(LeftTab::Git)>
-                    <GitPanel />
-                </div>
-                <div class="dock-tab-mount" style=tab_style(LeftTab::Search)>
-                    <SearchPanel />
-                </div>
-                <div class="dock-tab-mount" style=tab_style(LeftTab::References)>
-                    <ReferencesPanel />
-                </div>
-            </div>
-        </div>
+        <For each=|| SidebarTab::ALL key=|tab| *tab children=move |tab| {
+            // Every component has one lifetime; CSS grid placement moves its
+            // existing DOM instead of recreating subscriptions or local state.
+            let style = move || {
+                if blocked.get() { return "display:none".into(); }
+                layouts.with(|layouts| {
+                match layouts.current().side(tab) {
+                    Some(side) => {
+                        let pane = layouts.current().pane(side);
+                        if pane.visible && pane.active == Some(tab) { format!("grid-column:{};grid-row:2", side.column()) } else { "display:none".into() }
+                    },
+                    None => "display:none".into(),
+                }
+                })
+            };
+            view! {
+                <section class="dock-tab-mount sidebar-panel" aria-label=format!("{} panel", tab.label()) style=style>
+                    {match tab {
+                        SidebarTab::Agents => view! { <AgentsPanel /> }.into_any(),
+                        SidebarTab::Sessions => view! { <SessionsPanel /> }.into_any(),
+                        SidebarTab::Files => view! { <FileExplorer /> }.into_any(),
+                        SidebarTab::Git => view! { <GitPanel /> }.into_any(),
+                        SidebarTab::Search => view! { <SearchPanel /> }.into_any(),
+                        SidebarTab::References => view! { <ReferencesPanel /> }.into_any(),
+                        SidebarTab::Swarms => view! { <SwarmsPanel /> }.into_any(),
+                        SidebarTab::Workflows => view! { <WorkflowsPanel /> }.into_any(),
+                    }}
+                </section>
+            }
+        } />
     }
 }

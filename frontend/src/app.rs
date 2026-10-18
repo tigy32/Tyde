@@ -798,6 +798,8 @@ pub fn App() -> impl IntoView {
     // therefore has an executor, rather than inside the constructor.
     #[cfg(target_arch = "wasm32")]
     state.install_browser_effects();
+    #[cfg(target_arch = "wasm32")]
+    state.install_sidebar_persistence();
     provide_context(state.clone());
     let voice_support_state = state.clone();
     spawn_local(async move {
@@ -957,11 +959,6 @@ pub fn App() -> impl IntoView {
         install_hover_dismiss_listeners(state_for_hover_dismiss.clone());
     });
 
-    let state_for_feedback = state.clone();
-    let open_feedback = move |_| {
-        state_for_feedback.feedback_open.set(true);
-    };
-
     view! {
         <div class="app-shell" node_ref=app_shell_ref>
             <Header />
@@ -971,17 +968,11 @@ pub fn App() -> impl IntoView {
                 <ProjectRail />
                 <Workbench />
             </div>
-            <button
-                class="feedback-fab"
-                title="Send feedback"
-                on:click=open_feedback
-            >
-                "Send feedback"
-            </button>
             <CommandPalette />
             <WorkflowRunModal />
             <FeedbackModal />
             <HostBrowser />
+            <crate::components::project_rail::ProjectEditor />
             <HelpTour />
             <crate::components::home_view::GettingStarted />
             <HoverPopover />

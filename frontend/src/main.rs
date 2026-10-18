@@ -12,6 +12,7 @@ mod markdown;
 mod notices;
 mod perf;
 mod send;
+mod sidebar_layout;
 mod state;
 mod syntax_highlight;
 mod term_bridge;

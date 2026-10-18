@@ -528,6 +528,9 @@ impl SettingsTab {
                 "Claude",
                 "Codex",
                 "Card colors",
+                "Reset sidebar layout",
+                "Vibe",
+                "Dinosaur",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
             ],
@@ -1879,6 +1882,7 @@ fn managed_lifecycle_button_disabled(status: &bridge::RemoteHostLifecycleStatus)
 #[component]
 fn AppearanceTab() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let layout_state = state.clone();
 
     let on_theme = move |ev: web_sys::Event| {
         let select: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
@@ -1905,6 +1909,14 @@ fn AppearanceTab() -> impl IntoView {
 
     view! {
         <h2 class="settings-panel-title">"Appearance"</h2>
+        <div class="settings-field">
+            <label class="settings-label">"Sidebar layout"</label>
+            <p class="settings-description">"Vibe keeps agents and history in focus. Dinosaur includes developer tools. Each mode remembers its own sidebar layout on this client."</p>
+            <button class="settings-btn" on:click=move |_| {
+                layout_state.sidebar_layout.update(|layouts| *layouts.current_mut() = crate::sidebar_layout::SidebarLayout::new(layouts.mode));
+                layout_state.sidebar_storage_blocked.set(false);
+            }>"Reset sidebar layout"</button>
+        </div>
 
         <p class="settings-description settings-panel-intro">
             "How the Tyde window looks on this device, whichever host you connect to."
@@ -1914,7 +1926,7 @@ fn AppearanceTab() -> impl IntoView {
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
-                    <p class="settings-description">"Show the backend name next to the colored edge on agent and history cards."</p>
+                    <p class="settings-description">"Show backend names in agent details and on history cards. Agent glyphs always identify the backend."</p>
                 </div>
                 <label class="settings-toggle">
                     <input id="sidebar-backend-labels" type="checkbox"

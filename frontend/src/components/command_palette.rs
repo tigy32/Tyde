@@ -7,7 +7,7 @@ use crate::components::center_zone::{MIN_SPLIT_WIDTH, announce, reveal_tab, work
 use crate::send;
 use crate::state::{
     AppState, CENTER_TABS_DISABLED_REASON, DockVisibility, MoveTabEligibility, MoveTabResult,
-    OpenTarget, PaneId, RightTab, TabContent, TabId, root_display_name,
+    OpenTarget, PaneId, SidebarTab, TabContent, TabId, root_display_name,
 };
 
 use protocol::{
@@ -540,12 +540,11 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         CommandId::NewChat => {
             begin_new_chat(state, None);
         }
-        CommandId::ToggleLeftPanel => toggle_dock(state.left_dock),
-        CommandId::ToggleRightPanel => toggle_dock(state.right_dock),
+        CommandId::ToggleLeftPanel => state.toggle_sidebar(crate::state::SidebarSide::Left),
+        CommandId::ToggleRightPanel => state.toggle_sidebar(crate::state::SidebarSide::Right),
         CommandId::ToggleBottomPanel => toggle_dock(state.bottom_dock),
         CommandId::OpenWorkflows => {
-            state.right_dock.set(DockVisibility::Visible);
-            state.right_tab.set(RightTab::Workflows);
+            state.activate_sidebar_tab(SidebarTab::Workflows);
         }
         CommandId::OpenAgentMonitor => {
             state.open_tab(TabContent::AgentMonitor, "Agent Monitor".to_owned(), true);

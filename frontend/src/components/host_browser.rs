@@ -94,6 +94,10 @@ pub fn open_add_root_browser(state: &AppState) {
         );
         return;
     };
+    open_add_root_browser_for(state, active_project);
+}
+
+pub fn open_add_root_browser_for(state: &AppState, active_project: crate::state::ActiveProjectRef) {
     // §6.5: ProjectAddRoot is invalid on a workbench and on a parent that
     // already has workbench children. The button that opens this browser
     // is gated, but guard here too so a stale click (or a key shortcut

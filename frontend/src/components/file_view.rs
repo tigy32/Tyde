@@ -5722,7 +5722,7 @@ mod wasm_tests {
     /// the left dock, and closes the menu.
     #[wasm_bindgen_test]
     async fn right_click_show_references_dispatches_find_references() {
-        use crate::state::{ActiveProjectRef, LeftTab};
+        use crate::state::{ActiveProjectRef, SidebarTab};
         use protocol::ProjectId;
 
         ensure_styles_loaded();
@@ -5822,8 +5822,10 @@ mod wasm_tests {
         // The action also reveals the References tab in the left dock.
         let state = captured.borrow().clone().unwrap();
         assert_eq!(
-            state.left_tab.get_untracked(),
-            LeftTab::References,
+            state
+                .sidebar_layout
+                .with_untracked(|l| l.dinosaur.left.active),
+            Some(SidebarTab::References),
             "Show References should switch the left dock to the References tab"
         );
 
