@@ -459,3 +459,88 @@ idle events before making the original HTTP idle assertion. The adjacent gated
 scenario still checks that await stays active during approval execution. These
 are fixture-ordering corrections, not server/provider behavior changes or
 weakened assertions; the new ordering diagnostic remains privacy-safe.
+
+## Unwanted focus zoom (2026-10-17)
+
+The composer was not undersized: its shared-shell rule already rendered 16px.
+Tyde's session search and rename inputs rendered 15px; manual pairing and
+review comment/instruction textareas explicitly requested 13px. Custom-answer
+and plan-feedback fields inherited surrounding small text. New-chat pickers,
+appearance selectors, schema-driven session settings, queued editing and swarm
+composition already requested 16px. Both mobile entry points retain
+`width=device-width, initial-scale=1, viewport-fit=cover,
+interactive-widget=resizes-content`, without a user-zoom restriction.
+
+The responsible source is **Tyde's editing typography**, not the shared viewport
+algorithm. A scalable `--text-input` floor now covers inherited editing text and
+replaces the undersized search, rename, pairing and review declarations. It
+retains larger parent/root text. Body/transcript typography, viewport metadata,
+focus/blur/resume handlers and touch handling are unchanged. The vendored shell
+and its upstream pin are unchanged: it still freezes geometry at non-unit scale
+so intentional browser zoom/pan is not fought by another viewport controller.
+
+### Native browser evidence and its limits
+
+Evidence is retained on the development host under
+`/home/tyggs/Tyde/mobile-zoom-evidence/`, especially `evidence-summary.json`,
+`interactive/`, `rendered-control-provenance.json` and the reduction/source
+scripts. Device: Device Farm iPhone 12, iOS 26.6, Safari 26.6/604.1, ordinary
+browser mode, not an installed PWA.
+
+The native reproducer uses **reduced DOM captured from the real compiled Leptos
+fixture**, the exact source stylesheet and the byte-identical shared shell with
+Tyde's explicit region bindings. Input values and message bodies are not part of
+the reduction. It is not a running-Wasm/mobile-protocol certification. Native
+full-Wasm attempts failed during bootstrap/automation and yielded no zoom
+samples; an early stripped-Wasm fixture also had a stale preload integrity hash.
+Those failed attempts are retained, not counted as passes. Desktop dev-instance
+launch separately hit Tauri's existing 180-second frontend readiness deadline.
+Neither startup problem is claimed fixed here. The eight device allocations,
+including failed setup attempts, consumed 50.82 metered device minutes. All owned
+farm resources, tunnels and temporary credentials were removed after capture.
+
+Native coordinate taps, keyboard screenshots and the viewport probe established:
+
+| Rendered control | Before font / focus scale | After font / focus scale |
+| --- | --- | --- |
+| Composer (negative control) | 16px / 1 | 16px / 1 |
+| Rename | 15px / 1.066667 | 16px / 1 |
+| Session search | 15px / 1.066667 | 16px / 1 |
+| Manual pairing | 13px / 1.230769 | 16px / 1 |
+
+All pages started at scale 1. Before the fix, computed text sizes stayed small
+while the *browser scale* rose and the layout clipped. Afterward, the keyboard
+remained open and the applied shell/visual viewport heights both measured 389px;
+the composer also retained its normal 310px keyboard-pan offset. This is not a
+scale reset or an artificial blur.
+
+With the fixed stylesheet, landscape measured 844×326 and portrait 390×699,
+both at scale 1 with matching shell geometry. A short Settings → Safari trip
+with search focused retained scale 1 and 389px shell/viewport height. Intentional
+native pinch-in reached 1.948789 and retained that exact scale after the same
+app switch. The automated pinch-out command did not reduce scale, so it is not
+claimed as a certified zoom-out test. No image-viewer pinch feature was added.
+
+The former long-background/PWA keyboard-resume investigation remains
+**unconfirmed and separate**. Its prior composer observations were already at
+scale 1; this typography fix does not establish a shared cause or certify those
+unmeasured trips.
+
+### Regression and scoped diagnostics
+
+The existing mounted `AppSurface` Wasm flow now checks real rendered composer,
+rename, search, appearance selectors and pairing text, retains the same focused
+control through `pageshow`, retains a search query, and checks larger root and
+inherited editing text. Before the CSS fix, `./dev.sh check` failed this flow
+specifically on the rendered 15px rename input; the remaining 324 mobile Wasm
+cases passed. Native/backend behavior is unchanged; paid AI conformance is not
+part of this UI-only change.
+
+`mobile-frontend/e2e/viewport-probe.js` is a **dev/device injection script only**,
+not imported into the shipped application. Its bounded, in-memory samples record
+visual viewport scale/size/offset, layout and shell geometry, visibility/focus,
+and computed font/line-height/text-adjust/transform/zoom. They never read input
+values, identifiers, attributes containing user content, or conversation text.
+The script has no network, storage, console logging or collection/export UI.
+This separates browser zoom from text inflation, keyboard pan and stale layout
+without adding a second viewport owner or shipped client telemetry.

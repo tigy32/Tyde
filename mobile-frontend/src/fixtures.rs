@@ -80,6 +80,12 @@ pub fn seed_state(state: &AppState) {
         state.app_mode.set(AppMode::Onboarding);
         return;
     }
+    if name == "pairing-paste" {
+        state
+            .app_mode
+            .set(AppMode::Pairing(crate::state::PairingScreen::ManualPaste));
+        return;
+    }
 
     let host = LocalHostId("fixture-host".to_owned());
     let agent_id = AgentId("fixture-agent".to_owned());

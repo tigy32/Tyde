@@ -14,6 +14,7 @@
     --radius-full: 9999px;
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
     --font-mono: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+    --text-input: max(1em, 1rem, 16px);
     --header-height: 44px;
     --nav-height: 52px;
     --search-bar-height: 40px;
@@ -146,6 +147,11 @@ button {
 input, textarea, select {
     font: inherit;
     color: inherit;
+}
+
+/* Undersized editing text makes iOS magnify the whole page on focus. */
+.mobile-app :where(input, textarea, select) {
+    font-size: var(--text-input);
 }
 
 /* ── App Shell ──────────────────────────────────────────────────────── */
@@ -861,7 +867,7 @@ input, textarea, select {
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--text-input);
     color: var(--text-primary);
     line-height: 1.4;
     resize: vertical;
@@ -3680,7 +3686,7 @@ input, textarea, select {
     border: none;
     border-radius: var(--radius-full);
     box-shadow: var(--rim-float), var(--shadow-float);
-    font-size: var(--text-base);
+    font-size: var(--text-input);
     outline: none;
     transition: box-shadow var(--motion-fast) var(--ease-standard);
 }
@@ -3847,7 +3853,7 @@ input, textarea, select {
     border: 1px solid var(--accent-primary);
     border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
-    font-size: var(--text-base, 15px);
+    font-size: var(--text-input);
     color: var(--text-primary);
     outline: none;
     min-width: 0;
@@ -4149,7 +4155,7 @@ input, textarea, select {
     min-height: 64px;
     resize: vertical;
     padding: var(--space-2);
-    font-size: 13px;
+    font-size: var(--text-input);
     font-family: inherit;
     background: var(--bg-base, var(--bg-surface));
     color: var(--text-primary);
@@ -4205,7 +4211,7 @@ input, textarea, select {
     min-height: 3em;
     resize: vertical;
     font: inherit;
-    font-size: 13px;
+    font-size: var(--text-input);
     color: var(--text-primary);
     background: var(--bg-input, var(--bg-surface));
     border: 1px solid var(--border-default);

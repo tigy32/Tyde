@@ -2763,6 +2763,134 @@ mod wasm_tests {
             "tabs return after expansion"
         );
         assert_bottom_gap(&nav, 8.0);
+
+        async fn focus_readable_control(
+            document: &web_sys::Document,
+            selector: &str,
+            minimum_font: f64,
+        ) -> HtmlElement {
+            let control = document
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            let window = document.default_view().unwrap();
+            let font = window
+                .get_computed_style(&control)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-size")
+                .unwrap();
+            assert!(
+                font.trim_end_matches("px").parse::<f64>().unwrap() >= minimum_font,
+                "native editing text must not trigger iOS focus magnification: {selector}, {font}"
+            );
+            control.focus().unwrap();
+            next_tick().await;
+            window
+                .dispatch_event(&web_sys::Event::new("pageshow").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert!(
+                document
+                    .active_element()
+                    .unwrap()
+                    .is_same_node(Some(&control)),
+                "page restoration must retain the same focused control"
+            );
+            assert!(control.get_bounding_client_rect().height() > 0.0);
+            control
+        }
+
+        state.viewing_chat.set(true);
+        next_tick().await;
+        focus_readable_control(&frame_document, "[data-mobile-test='chat-input']", 16.0).await;
+        for selector in [
+            "[data-mobile-test='chat-more']",
+            "[data-mobile-test='chat-menu-rename']",
+        ] {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+        }
+        focus_readable_control(
+            &frame_document,
+            "[data-mobile-test='chat-rename-input']",
+            16.0,
+        )
+        .await;
+        container
+            .query_selector("[data-mobile-test='chat-rename-cancel']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        state.viewing_chat.set(false);
+        state.active_tab.set(MobileTab::Sessions);
+        next_tick().await;
+        let search = focus_readable_control(
+            &frame_document,
+            "[data-mobile-test='sessions-search']",
+            16.0,
+        )
+        .await;
+        let search = search.dyn_into::<web_sys::HtmlInputElement>().unwrap();
+        search.set_value("No matching session");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        focus_readable_control(
+            &frame_document,
+            "[data-mobile-test='sessions-search']",
+            16.0,
+        )
+        .await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-empty-search']")
+                .unwrap()
+                .is_some()
+        );
+        assert!(search.value() == "No matching session");
+        state.active_tab.set(MobileTab::Settings);
+        next_tick().await;
+        for selector in [
+            "[data-mobile-test='settings-theme']",
+            "[data-mobile-test='settings-tool-output']",
+        ] {
+            focus_readable_control(&frame_document, selector, 16.0).await;
+        }
+        state
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::ManualPaste));
+        next_tick().await;
+        focus_readable_control(&frame_document, ".pairing-paste-input", 16.0).await;
+        frame_document
+            .document_element()
+            .unwrap()
+            .unchecked_ref::<HtmlElement>()
+            .style()
+            .set_property("font-size", "20px")
+            .unwrap();
+        focus_readable_control(&frame_document, ".pairing-paste-input", 20.0).await;
+        container
+            .query_selector(".mobile-app")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .style()
+            .set_property("font-size", "24px")
+            .unwrap();
+        focus_readable_control(&frame_document, ".pairing-paste-input", 24.0).await;
         drop(mount);
         assert!(
             !frame_document
