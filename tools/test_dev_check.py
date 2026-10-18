@@ -4115,33 +4115,79 @@ class WasmToolScriptTests(unittest.TestCase):
                     json.loads(invocation["argv"])[3:],
                     ["--target", "wasm32-unknown-unknown", "components::chat_view"],
                 )
-    def test_mobile_ui_setup_waits_for_its_server_and_reports_process_death(self) -> None:
+    def test_mobile_ui_setup_isolates_concurrent_servers_and_awaits_teardown(self) -> None:
         setup = REPO_ROOT / "tools" / "mobile-ui-server.mjs"
         with tempfile.TemporaryDirectory() as temp_name:
             root = pathlib.Path(temp_name)
-            npm = root / "npm"
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                port = reservation.getsockname()[1]
-            npm.write_text(
-                f"#!{sys.executable}\n"
-                "import http.server,time\n"
-                "time.sleep(1.2)\n"
-                f"http.server.HTTPServer(('127.0.0.1',{port}),http.server.SimpleHTTPRequestHandler).serve_forever()\n"
+            for name in ("first", "second"):
+                dist = root / name / "mobile-frontend" / "dist"
+                dist.mkdir(parents=True)
+                (dist / "index.html").write_text(f"<title>{name}</title>")
+                (dist / "app.wasm").write_bytes(b"\0asm\x01\0\0\0")
+            (root / "missing").mkdir()
+            command = ["node", "--input-type=module", "-e", f"""
+import setup from {json.dumps(setup.as_uri())};
+import assert from 'node:assert/strict';
+import {{once}} from 'node:events';
+import {{createServer}} from 'node:http';
+import {{connect}} from 'node:net';
+const root={json.dumps(str(root))};
+const competing=createServer((request,response)=>response.end('competing server'));
+const listening=once(competing,'listening');
+competing.listen(0,'127.0.0.1');
+await listening;
+const occupied='http://127.0.0.1:'+competing.address().port;
+const config={{projects:[{{use:{{baseURL:occupied}}}}]}};
+const closed=async url=>await new Promise((resolve,reject)=>{{
+  const socket=connect(new URL(url).port,'127.0.0.1');
+  socket.once('error',error=>error.code==='ECONNREFUSED'?resolve():reject(error));
+  socket.once('connect',()=>{{socket.end();reject(Error('Fixture listener still open'));}});
+}});
+let stopFirst,stopSecond;
+try {{
+  // Keep the competing listener bound throughout: the old HTTP probe adopts
+  // or rejects its response instead of starting an independent fixture.
+  process.chdir(root+'/first');
+  stopFirst=await setup(config);
+  const first=process.env.PLAYWRIGHT_TEST_BASE_URL;
+  process.chdir(root+'/second');
+  stopSecond=await setup(config);
+  const second=process.env.PLAYWRIGHT_TEST_BASE_URL;
+  assert.equal(new Set([occupied,first,second]).size,3);
+  const bodies=await Promise.all([first,second].map(async url=>
+    await (await fetch(url+'/?tyde-fixture=images')).text()));
+  assert.deepEqual(bodies,['<title>first</title>','<title>second</title>']);
+  const wasm=await fetch(first+'/app.wasm');
+  assert.equal(wasm.headers.get('content-type'),'application/wasm');
+  assert.deepEqual(new Uint8Array(await wasm.arrayBuffer()),new Uint8Array([0,97,115,109,1,0,0,0]));
+  assert.equal((await fetch(first+'/missing.wasm')).status,404);
+  const traversal=await fetch(first+'/%2e%2e%2f%2e%2e%2foutside');
+  assert.equal(traversal.status,400);
+  await stopFirst(); stopFirst=undefined;
+  await closed(first);
+  assert.equal(process.env.PLAYWRIGHT_TEST_BASE_URL,second);
+  assert.equal(await (await fetch(second)).text(),'<title>second</title>');
+  await stopSecond(); stopSecond=undefined;
+  await closed(second);
+  assert.equal(process.env.PLAYWRIGHT_TEST_BASE_URL,undefined);
+  assert.equal(await (await fetch(occupied)).text(),'competing server');
+  process.chdir(root+'/missing');
+  await assert.rejects(setup(config),{{code:'ENOENT'}});
+  console.log(JSON.stringify({{concurrentFixturePorts:[new URL(first).port,new URL(second).port],
+    distinctBoundAddresses:true,checkoutOutputIsolated:true,wasmMimeAndBytes:true,
+    missingAsset404:true,traversalRejected:true,bothListenersJoined:true,
+    competingListenerUntouched:true,missingBuildRejectedBeforeListen:true}}));
+}} finally {{
+  if(stopFirst)await stopFirst();
+  if(stopSecond)await stopSecond();
+  await new Promise((resolve,reject)=>competing.close(error=>error?reject(error):resolve()));
+}}
+"""]
+            ready = subprocess.run(
+                command, cwd=root, text=True, capture_output=True, check=False
             )
-            npm.chmod(0o755)
-            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
-            command = ["node", "--input-type=module", "-e",
-                       f"import setup from {json.dumps(setup.as_uri())}; const stop = await setup({{projects:[{{use:{{baseURL:'http://127.0.0.1:{port}'}}}}]}}); console.log('READY'); stop();"]
-            started = time.monotonic()
-            ready = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
             self.assertEqual(ready.returncode, 0, ready.stderr)
-            self.assertIn("READY", ready.stdout)
-            self.assertGreater(time.monotonic() - started, 1.2)
-            npm.write_text("#!/bin/sh\nexit 7\n")
-            dead = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
-            self.assertNotEqual(dead.returncode, 0)
-            self.assertIn("exited before readiness: 7", dead.stderr)
+            print(ready.stdout.strip())
 
     def test_streaming_browser_guard_preserves_work_and_stops_a_hung_case(self) -> None:
         guard = REPO_ROOT / "tools" / "run-test-hang-guard.py"

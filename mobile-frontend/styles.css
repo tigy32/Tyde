@@ -1591,9 +1591,20 @@ input, textarea, select {
     margin-top: 8px;
 }
 
-.chat-message-image-link {
+.chat-message-image-button {
     display: block;
     min-width: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    cursor: zoom-in;
+    touch-action: manipulation;
+}
+
+.chat-message-image-button:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 3px;
 }
 
 .chat-message-image {
@@ -1604,6 +1615,98 @@ input, textarea, select {
     border-radius: 8px;
     object-fit: contain;
 }
+
+/* The native modal top layer escapes transcript clipping without remounting chat. */
+.phone-image-viewer {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: #080b10;
+    color: #f5f7fb;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    font-family: var(--font-sans);
+}
+
+.phone-image-viewer::backdrop { background: #080b10; }
+
+.phone-image-stage {
+    position: absolute;
+    inset: calc(64px + env(safe-area-inset-top)) 0 calc(104px + env(safe-area-inset-bottom));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.phone-image-viewer[open] .phone-image-stage { touch-action: none; }
+
+.phone-image-stage img {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    transform-origin: center;
+    pointer-events: none;
+}
+
+.phone-image-header, .phone-image-footer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    padding: 12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left));
+}
+
+.phone-image-header {
+    top: 0;
+    padding-top: max(12px, env(safe-area-inset-top));
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 16px;
+    font-variant-numeric: tabular-nums;
+}
+
+.phone-image-footer {
+    bottom: 0;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+    text-align: center;
+}
+
+.phone-image-controls { display: flex; justify-content: center; gap: 8px; }
+
+.phone-image-viewer button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid #ffffff24;
+    border-radius: 999px;
+    background: #ffffff10;
+    color: inherit;
+    font: inherit;
+    font-size: 20px;
+    cursor: pointer;
+    touch-action: manipulation;
+}
+
+.phone-image-viewer button[data-image-reset] { min-width: 76px; font-size: 16px; font-variant-numeric: tabular-nums; }
+.phone-image-viewer button:disabled { opacity: .35; cursor: default; }
+.phone-image-viewer button:focus-visible { outline: 2px solid #a7c5ff; outline-offset: 3px; }
+.phone-image-footer p { margin: 12px 0 0; font-size: 12px; color: #b1bac9; }
+.phone-image-error { position: absolute; padding: 24px; text-align: center; }
 
 :is(.message-content, .tool-md) pre {
     background: var(--bg-surface-3);

@@ -3,29 +3,7 @@ use leptos::prelude::*;
 use crate::state::{AgentRef, ChatMessageEntry};
 
 pub(crate) fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
-    view! {
-        <div class="chat-message-images" data-mobile-test="chat-message-images">
-            {images.into_iter().map(|image| {
-                let src = format!("data:{};base64,{}", image.media_type, image.data);
-                let href = matches!(
-                    image.media_type.as_str(),
-                    "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
-                )
-                .then(|| src.clone());
-                view! {
-                    <a
-                        class="chat-message-image-link"
-                        href=href
-                        target="_blank"
-                        rel="noopener"
-                        aria-label="Open image full size"
-                    >
-                        <img class="chat-message-image" src=src alt="Chat image" loading="lazy" />
-                    </a>
-                }
-            }).collect::<Vec<_>>()}
-        </div>
-    }
+    view! { <super::image_viewer::ImageGallery images=images /> }
 }
 
 fn compact_token_count(tokens: u64) -> String {
@@ -463,30 +441,6 @@ mod wasm_tests {
             .query_selector_all("[data-mobile-test='chat-message-token-detail']")
             .unwrap()
             .length()
-    }
-
-    #[wasm_bindgen_test]
-    async fn mobile_chat_renders_generated_image_as_full_size_link() {
-        let mut entry = assistant_entry(None);
-        entry.message.content.clear();
-        entry.message.images = Some(vec![protocol::ImageData {
-            media_type: "image/png".to_owned(),
-            data: "iVBORw0KGgo=".to_owned(),
-        }]);
-        let container = mount(entry);
-        next_tick().await;
-
-        assert!(
-            container
-                .query_selector("[data-mobile-test='chat-message-images']")
-                .unwrap()
-                .is_some()
-        );
-        let link = container
-            .query_selector(".chat-message-image-link")
-            .unwrap()
-            .expect("generated image has a full-size link");
-        assert_eq!(link.get_attribute("target").as_deref(), Some("_blank"));
     }
 
     /// A message that carries all three scopes shows the REQUEST figure only by

@@ -360,6 +360,7 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64) -> bool {
 #[component]
 pub fn ChatView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    let image_viewer = crate::components::image_viewer::image_viewer();
     let more_open: RwSignal<bool> = RwSignal::new(false);
     let menu_ref: NodeRef<leptos::html::Div> = NodeRef::new();
     let more_button_ref: NodeRef<leptos::html::Button> = NodeRef::new();
@@ -781,6 +782,7 @@ pub fn ChatView() -> impl IntoView {
     };
 
     view! {
+        {image_viewer}
         <div
             class="view chat-view"
             data-mobile-test="chat-view"
@@ -3000,6 +3002,516 @@ mod wasm_tests {
                     .collect(),
             );
         });
+    }
+
+    fn image_pointer(target: &web_sys::Element, kind: &str, id: i32, x: f64, y: f64, time: f64) {
+        let init = web_sys::PointerEventInit::new();
+        init.set_pointer_id(id);
+        init.set_pointer_type("touch");
+        init.set_client_x(x as i32);
+        init.set_client_y(y as i32);
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        let event = web_sys::PointerEvent::new_with_event_init_dict(kind, &init).unwrap();
+        js_sys::Object::define_property(
+            event.as_ref(),
+            &"timeStamp".into(),
+            &js_sys::Object::from_entries(&js_sys::Array::of1(&js_sys::Array::of2(
+                &"value".into(),
+                &time.into(),
+            )))
+            .unwrap(),
+        );
+        target.dispatch_event(&event).unwrap();
+    }
+
+    fn next_history_event() -> js_sys::Promise {
+        js_sys::Function::new_no_args(
+            "return new Promise(resolve => window.addEventListener('popstate', resolve, {once:true}));",
+        ).call0(&wasm_bindgen::JsValue::NULL).unwrap().unchecked_into()
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_images_keep_chat_intact_in_a_phone_viewer() {
+        use crate::state::{ToolOutputMode, ToolRequestEntry};
+        use protocol::{
+            ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+            ToolRequestType,
+        };
+        crate::components::test_styles::ensure_styles_loaded();
+        let container = make_container();
+        container.set_class_name("mobile-app");
+        container.style().set_property("width", "393px").unwrap();
+        container.style().set_property("height", "100dvh").unwrap();
+        container.style().set_property("position", "fixed").unwrap();
+        container.style().set_property("top", "0").unwrap();
+        container.style().set_property("left", "0").unwrap();
+        let state = AppState::new();
+        let host = LocalHostId("host-1".to_owned());
+        seed_connected_agent(&state, &host);
+        state.tool_output_mode.set(ToolOutputMode::Summary);
+        fill_chat(&state, 20);
+        let owner = state.active_agent.get_untracked().unwrap().as_agent_ref();
+        state.agent_loaded.update(|loaded| {
+            loaded.insert(owner.clone());
+        });
+        let images = ["#dc4040", "#4080dc"].into_iter().map(|fill| {
+            let svg = format!("<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='900'><rect width='1200' height='900' fill='{fill}'/></svg>");
+            protocol::ImageData { media_type: "image/svg+xml".to_owned(), data: web_sys::window().unwrap().btoa(&svg).unwrap() }
+        }).collect::<Vec<_>>();
+        let mut output = make_message(
+            MessageSender::Assistant {
+                agent: "Coder".to_owned(),
+            },
+            "Your images",
+        );
+        output.tool_requests.push(ToolRequestEntry {
+            tool_name: "generate_image".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "generated-images".to_owned(),
+                tool_name: "generate_image".to_owned(),
+                tool_type: ToolRequestType::GenerateImage {
+                    prompt: Some("Two color studies".to_owned()),
+                },
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: "generated-images".to_owned(),
+                outcome: ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::NativeContent {
+                        text: "Two color studies".to_owned(),
+                        images: images.clone(),
+                    },
+                },
+            }),
+        });
+        state.push_chat_message_entry(&owner, output);
+        // Attached/message images use the exact same gallery as native tool images.
+        let mut attached = make_message(MessageSender::User, "Reference");
+        attached.message.images = Some(vec![images[1].clone()]);
+        state.push_chat_message_entry(&owner, attached);
+        state.chat_input.set("preserved image draft".to_owned());
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatView /> }
+        });
+        settle_autoscroll().await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        let window = web_sys::window().unwrap();
+        let history = window.history().unwrap();
+        let original_url = window.location().href().unwrap();
+        let original_history = history.state().unwrap();
+        let input = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        assert!(
+            window
+                .get_computed_style(&input)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-size")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+                >= 16.0,
+            "returning to the draft must retain the mobile focus-autozoom protection"
+        );
+        let scroller = chat_scroller(&container);
+        for surface in [container.as_ref(), scroller.as_ref(), input.as_ref()] {
+            assert_eq!(
+                window
+                    .get_computed_style(surface)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("touch-action")
+                    .unwrap(),
+                "manipulation",
+                "viewer integration must retain normal app double-tap protection"
+            );
+        }
+        let page_scale = window.visual_viewport().unwrap().scale();
+        let buttons = container
+            .query_selector_all("button[aria-label='Open image full size']")
+            .unwrap();
+        assert_eq!(
+            buttons.length(),
+            3,
+            "both typed delivery surfaces remain visible"
+        );
+        let first = buttons.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let thumbnail = first
+            .query_selector("img")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlImageElement>()
+            .unwrap();
+        thumbnail.scroll_into_view();
+        wasm_bindgen_futures::JsFuture::from(thumbnail.decode())
+            .await
+            .unwrap();
+        let thumb_rect = thumbnail.get_bounding_client_rect();
+        assert!(
+            thumb_rect.width() > 0.0 && thumb_rect.height() > 0.0,
+            "Summary must display generated pixels before any disclosure interaction"
+        );
+        let source = thumbnail.get_attribute("src");
+        input.focus().unwrap();
+        input.set_selection_range(2, 9).unwrap();
+        scroller.set_scroll_top(100);
+        let saved_scroll = scroller.scroll_top();
+        assert!(saved_scroll > 0, "the flow really is reading chat history");
+        let loading_picture = container.query_selector("dialog img").unwrap().unwrap();
+        // Decode alone can resolve before the load listener initializes the transform.
+        let image_loaded: js_sys::Promise = js_sys::Function::new_with_args(
+            "image",
+            "return new Promise(resolve => image.addEventListener('load', resolve, {once:true}));",
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, &loading_picture)
+        .unwrap()
+        .unchecked_into();
+        first.click();
+        next_tick().await;
+        wasm_bindgen_futures::JsFuture::from(image_loaded)
+            .await
+            .unwrap();
+        let viewer = document
+            .query_selector("dialog[open][aria-label='Image viewer']")
+            .unwrap()
+            .expect("thumbnail opens an in-app modal");
+        let picture = viewer
+            .query_selector("img")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlImageElement>()
+            .unwrap();
+        wasm_bindgen_futures::JsFuture::from(picture.decode())
+            .await
+            .unwrap();
+        assert_eq!(
+            picture.get_attribute("src"),
+            source,
+            "no alternate delivery URL is introduced"
+        );
+        let viewport = document.document_element().unwrap();
+        let bounds = viewer.get_bounding_client_rect();
+        assert_eq!((bounds.left(), bounds.top()), (0.0, 0.0));
+        assert_eq!(
+            (bounds.width(), bounds.height()),
+            (
+                viewport.client_width() as f64,
+                viewport.client_height() as f64
+            )
+        );
+        assert!(
+            document
+                .active_element()
+                .is_some_and(|active| viewer.contains(Some(&active))),
+            "focus enters the modal"
+        );
+        assert!(
+            viewer.matches(":modal").unwrap(),
+            "native modality makes the underlying chat inert"
+        );
+        let close = viewer
+            .query_selector("[aria-label='Close image viewer']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let close_bounds = close.get_bounding_client_rect();
+        assert!(close_bounds.width() >= 44.0 && close_bounds.height() >= 44.0);
+        let stage = viewer
+            .query_selector(".phone-image-stage")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            window
+                .get_computed_style(&stage)
+                .unwrap()
+                .unwrap()
+                .get_property_value("touch-action")
+                .unwrap(),
+            "none"
+        );
+        let rect = stage.get_bounding_client_rect();
+        let (cx, cy) = (
+            rect.x() + rect.width() / 2.0,
+            rect.y() + rect.height() / 2.0,
+        );
+        let base = picture.get_bounding_client_rect();
+        assert!(
+            base.width() > thumb_rect.width(),
+            "fullscreen image expands beyond the preview"
+        );
+        let zoom_label = || {
+            viewer
+                .query_selector("[aria-label='Reset zoom']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+        };
+        for time in [1000.0, 1100.0] {
+            image_pointer(&stage, "pointerdown", 1, cx, cy, time);
+            image_pointer(&stage, "pointerup", 1, cx, cy, time + 10.0);
+        }
+        assert_eq!(
+            zoom_label(),
+            "250%",
+            "double-tap zoom is intentional and image-local"
+        );
+        assert!((picture.get_bounding_client_rect().width() - base.width() * 2.5).abs() < 1.0);
+        let zoomed = picture.get_bounding_client_rect();
+        image_pointer(&stage, "pointerdown", 1, cx, cy, 1200.0);
+        image_pointer(&stage, "pointermove", 1, cx + 40.0, cy + 30.0, 1210.0);
+        image_pointer(&stage, "pointerup", 1, cx + 40.0, cy + 30.0, 1220.0);
+        let panned = picture.get_bounding_client_rect();
+        assert!(
+            (panned.x() - zoomed.x() - 40.0).abs() < 1.0,
+            "drag actually moves the magnified image"
+        );
+        assert_eq!(
+            scroller.scroll_top(),
+            saved_scroll,
+            "image gestures must not scroll chat"
+        );
+        for time in [2000.0, 2100.0] {
+            image_pointer(&stage, "pointerdown", 1, cx, cy, time);
+            image_pointer(&stage, "pointerup", 1, cx, cy, time + 10.0);
+        }
+        assert_eq!(zoom_label(), "100%", "double-tap resets a zoomed image");
+        assert!((picture.get_bounding_client_rect().x() - base.x()).abs() < 1.0);
+        image_pointer(&stage, "pointerdown", 1, cx - 40.0, cy, 3000.0);
+        image_pointer(&stage, "pointerdown", 2, cx + 40.0, cy, 3010.0);
+        image_pointer(&stage, "pointermove", 1, cx - 80.0, cy, 3020.0);
+        image_pointer(&stage, "pointermove", 2, cx + 80.0, cy, 3030.0);
+        image_pointer(&stage, "pointerup", 1, cx - 80.0, cy, 3040.0);
+        image_pointer(&stage, "pointercancel", 2, cx + 80.0, cy, 3050.0);
+        assert_eq!(
+            zoom_label(),
+            "200%",
+            "two contacts magnify the image, not the page"
+        );
+        assert!((picture.get_bounding_client_rect().width() - base.width() * 2.0).abs() < 1.0);
+        let open_entry = js_sys::JSON::stringify(&history.state().unwrap()).unwrap();
+        let transform = picture.get_attribute("style");
+        state.push_chat_message_entry(
+            &owner,
+            make_message(
+                MessageSender::Assistant {
+                    agent: "Coder".to_owned(),
+                },
+                "A later response arrived while viewing the image",
+            ),
+        );
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            viewer.is_connected(),
+            "incoming chat must retain the active viewer node"
+        );
+        assert!(
+            viewer.has_attribute("open"),
+            "incoming chat must not dismiss an image"
+        );
+        assert_eq!(picture.get_attribute("style"), transform);
+        assert_eq!(
+            js_sys::JSON::stringify(&history.state().unwrap()).unwrap(),
+            open_entry
+        );
+        let next = viewer
+            .query_selector("[aria-label='Next image']")
+            .unwrap()
+            .unwrap();
+        web_sys::console::log_1(
+            &format!(
+                "viewer navigation after update: disabled={} header={}",
+                next.has_attribute("disabled"),
+                viewer
+                    .query_selector("header span")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+            )
+            .into(),
+        );
+        assert!(
+            !next.has_attribute("disabled"),
+            "the second image remains navigable after incoming chat"
+        );
+        next.dyn_into::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        wasm_bindgen_futures::JsFuture::from(picture.decode())
+            .await
+            .unwrap();
+        assert_eq!(zoom_label(), "100%", "changing images resets the transform");
+        assert!(viewer.text_content().unwrap().contains("Image 2 / 2"));
+        assert_ne!(picture.get_attribute("src"), source);
+        viewer
+            .query_selector("[aria-label='Zoom in']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        assert_eq!(zoom_label(), "150%");
+        viewer
+            .query_selector("[aria-label='Reset zoom']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        assert_eq!(
+            zoom_label(),
+            "100%",
+            "zoom controls are an alternative to multi-touch gestures"
+        );
+        assert_eq!(
+            (
+                viewer.get_bounding_client_rect().width(),
+                viewer.get_bounding_client_rect().height()
+            ),
+            (bounds.width(), bounds.height()),
+            "image zoom never magnifies the page"
+        );
+        assert_eq!(
+            window.visual_viewport().unwrap().scale(),
+            page_scale,
+            "intentional image gestures must leave browser zoom unchanged"
+        );
+        let pop = next_history_event();
+        history.back().unwrap();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        assert!(
+            !viewer.has_attribute("open"),
+            "browser Back dismisses the top layer only"
+        );
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&input))
+        );
+        assert_eq!(
+            (
+                input.selection_start().unwrap(),
+                input.selection_end().unwrap()
+            ),
+            (Some(2), Some(9))
+        );
+        assert_eq!(input.value(), "preserved image draft");
+        assert_eq!(state.chat_input.get_untracked(), "preserved image draft");
+        assert_eq!(scroller.scroll_top(), saved_scroll);
+        assert_eq!(window.location().href().unwrap(), original_url);
+        assert_eq!(
+            js_sys::JSON::stringify(&history.state().unwrap())
+                .unwrap()
+                .as_string(),
+            js_sys::JSON::stringify(&original_history)
+                .unwrap()
+                .as_string()
+        );
+        let pop = next_history_event();
+        history.forward().unwrap();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        assert!(
+            viewer.has_attribute("open"),
+            "Forward restores the same viewer without duplicating navigation"
+        );
+        let pop = next_history_event();
+        close.click();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        assert!(!viewer.has_attribute("open"));
+        let first = container
+            .query_selector("button[aria-label='Open image full size']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        first.focus().unwrap();
+        // Keyboard focus reveals the offscreen thumbnail before the modal opens.
+        let keyboard_scroll = scroller.scroll_top();
+        first.click();
+        let pop = next_history_event();
+        let key = web_sys::KeyboardEventInit::new();
+        key.set_key("Escape");
+        key.set_bubbles(true);
+        key.set_cancelable(true);
+        close
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &key)
+                    .unwrap(),
+            )
+            .unwrap();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        assert!(!viewer.has_attribute("open"));
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&first)),
+            "keyboard activation restores the thumbnail"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input']")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(&input)),
+            "the composer never remounts"
+        );
+        assert_eq!(scroller.scroll_top(), keyboard_scroll);
+        let mut invalid = make_message(MessageSender::User, "Undecodable image");
+        invalid.message.images = Some(vec![protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "bm90LWFuLWltYWdl".to_owned(),
+        }]);
+        state.push_chat_message_entry(&owner, invalid);
+        next_tick().await;
+        let failed_load: js_sys::Promise = js_sys::Function::new_with_args(
+            "image",
+            "return new Promise(resolve => image.addEventListener('error', resolve, {once:true}));",
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, &picture)
+        .unwrap()
+        .unchecked_into();
+        let thumbnails = container
+            .query_selector_all("button[aria-label='Open image full size']")
+            .unwrap();
+        thumbnails
+            .item(thumbnails.length() - 1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        wasm_bindgen_futures::JsFuture::from(failed_load)
+            .await
+            .unwrap();
+        let failure = viewer.query_selector("[role=alert]").unwrap().unwrap();
+        assert!(!failure.has_attribute("hidden"));
+        assert!(failure.get_bounding_client_rect().height() > 0.0);
+        let pop = next_history_event();
+        history.back().unwrap();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        let pop = next_history_event();
+        history.forward().unwrap();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        assert!(
+            !failure.has_attribute("hidden"),
+            "Forward retains the actual image decode failure"
+        );
+        assert!(failure.get_bounding_client_rect().height() > 0.0);
+        let pop = next_history_event();
+        close.click();
+        wasm_bindgen_futures::JsFuture::from(pop).await.unwrap();
+        drop(handle);
+        container.remove();
     }
 
     fn distance_from_bottom(el: &HtmlElement) -> i32 {

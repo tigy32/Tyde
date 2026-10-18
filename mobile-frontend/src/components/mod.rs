@@ -9,6 +9,7 @@ mod connection_banner;
 mod error_banner;
 mod home_view;
 mod host_browser;
+mod image_viewer;
 mod onboarding_view;
 mod paired_hosts_picker;
 mod pairing_flow;

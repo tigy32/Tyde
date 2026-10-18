@@ -138,3 +138,52 @@ test('iOS standalone has no device recorder or diagnostics export', async ({page
     await noCapture();
   }
 });
+
+
+test('generated images open on a completed phone tap and retain the chat', async ({page}) => {
+  await page.goto('/?tyde-fixture=images');
+  await page.waitForFunction(() => window.__TYDE_FIXTURE_READY__ === true);
+  const thumbnail = page.getByRole('button', {name:'Open image full size'}).first();
+  await thumbnail.scrollIntoViewIfNeeded();
+  await thumbnail.locator('img').evaluate(image => image.decode());
+  const input = page.locator('[data-mobile-test=chat-input]');
+  await input.fill('Preserve the image draft');
+  await input.focus();
+  const before = await input.evaluate(field => {
+    field.setSelectionRange(2,9);
+    window.__imageFlowField = field;
+    return {scroll:document.querySelector('[data-mobile-test=chat-messages]').scrollTop,
+      scale:visualViewport.scale};
+  });
+  expect(await page.evaluate(() => {
+    const app=document.querySelector('.mobile-app');
+    return typeof app.onclick==='function' &&
+      ['.mobile-app','.chat-messages','[data-mobile-test=chat-input]','.chat-message-image-button'].every(selector =>
+        getComputedStyle(document.querySelector(selector)).touchAction==='manipulation');
+  }), 'normal chat retains the landed WebKit double-tap protection').toBe(true);
+  await thumbnail.tap();
+  const viewer = page.getByRole('dialog', {name:'Image viewer'});
+  await expect(viewer).toBeVisible();
+  await expect(viewer.getByRole('button', {name:'Close image viewer'})).toBeVisible();
+  await viewer.locator('img').evaluate(image => image.decode());
+  expect(await viewer.evaluate(dialog => {
+    const r=dialog.getBoundingClientRect();
+    return dialog.matches(':modal') && r.width===innerWidth && r.height===innerHeight &&
+      getComputedStyle(dialog.querySelector('.phone-image-stage')).touchAction==='none' &&
+      getComputedStyle(dialog.querySelector('[data-image-close]')).touchAction==='manipulation';
+  })).toBe(true);
+  await viewer.getByRole('button', {name:'Zoom in'}).tap();
+  await expect(viewer.getByRole('button', {name:'Reset zoom'})).toHaveText('150%');
+  await viewer.getByRole('button', {name:'Next image'}).tap();
+  await expect(viewer.getByRole('button', {name:'Reset zoom'})).toHaveText('100%');
+  await page.evaluate(() => new Promise(resolve => {
+    window.addEventListener('popstate', resolve, {once:true});
+    history.back();
+  }));
+  await expect(viewer).toBeHidden();
+  expect(await input.evaluate((field,before) => field===window.__imageFlowField &&
+    field===document.activeElement && field.value==='Preserve the image draft' &&
+    field.selectionStart===2 && field.selectionEnd===9 &&
+    document.querySelector('[data-mobile-test=chat-messages]').scrollTop===before.scroll &&
+    visualViewport.scale===before.scale, before)).toBe(true);
+});

@@ -239,7 +239,14 @@ pub fn seed_state(state: &AppState) {
         loaded.insert(agent_ref.clone());
     });
     state.chat_messages.update(|messages| {
-        messages.insert(agent_ref.clone(), fixture_messages());
+        messages.insert(
+            agent_ref.clone(),
+            if name == "images" {
+                image_messages()
+            } else {
+                fixture_messages()
+            },
+        );
     });
     // Puts the header's context bar on screen. The fixtures are how this
     // chrome gets reviewed, and a bar that only ever appears against a live
@@ -364,13 +371,18 @@ pub fn seed_state(state: &AppState) {
             state.active_agent.set(None);
             state.viewing_chat.set(true);
         }
-        "chat" | "chat-light" | "disconnected" | "error" | "voice" => {
+        "chat" | "chat-light" | "disconnected" | "error" | "voice" | "images" => {
             state.viewing_chat.set(true);
         }
         _ => {
             state.active_tab.set(MobileTab::Home);
             state.viewing_chat.set(false);
         }
+    }
+    if name == "images" {
+        state
+            .tool_output_mode
+            .set(crate::state::ToolOutputMode::Summary);
     }
     if name == "chat-light" {
         state.theme.set("light".to_owned());
@@ -424,4 +436,44 @@ fn fixture_messages() -> Vec<ChatMessageEntry> {
             tool_requests: Vec::new(),
         },
     ]
+}
+
+fn image_messages() -> Vec<ChatMessageEntry> {
+    let images = ["#ea7b54", "#78a7c5"].into_iter().map(|color| {
+        let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1000" viewBox="0 0 1400 1000"><rect width="1400" height="1000" fill="{color}"/><circle cx="1050" cy="260" r="160" fill="#ffe7b0"/><path d="M0 800 400 300 850 850 1150 530 1400 800V1000H0Z" fill="#1c4053"/><path d="m0 920 500-350 600 430" fill="#427183"/></svg>"##);
+        protocol::ImageData { media_type: "image/svg+xml".to_owned(), data: web_sys::window().unwrap().btoa(&svg).unwrap() }
+    }).collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for index in 0..8 {
+        for (role, mut entry) in fixture_messages().into_iter().enumerate() {
+            entry.message.message_id = Some(ChatMessageId(format!(
+                "fixture-image-history-{index}-{role}"
+            )));
+            messages.push(entry);
+        }
+    }
+    let mut output = fixture_messages().remove(1);
+    output.message.message_id = Some(ChatMessageId("fixture-generated-images".to_owned()));
+    output.message.content = "Two landscape studies".to_owned();
+    output.tool_requests.push(crate::state::ToolRequestEntry {
+        tool_name: "generate_image".to_owned(),
+        request: protocol::ToolRequest {
+            tool_call_id: "fixture-image-output".to_owned(),
+            tool_name: "generate_image".to_owned(),
+            tool_type: protocol::ToolRequestType::GenerateImage {
+                prompt: Some("Two landscape studies".to_owned()),
+            },
+        },
+        result: Some(protocol::ToolExecutionCompletedData {
+            tool_call_id: "fixture-image-output".to_owned(),
+            outcome: protocol::ToolExecutionOutcome::Succeeded {
+                result: protocol::ToolExecutionResult::NativeContent {
+                    text: "Generated landscapes".to_owned(),
+                    images,
+                },
+            },
+        }),
+    });
+    messages.push(output);
+    messages
 }

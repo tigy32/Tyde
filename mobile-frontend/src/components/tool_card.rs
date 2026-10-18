@@ -365,6 +365,19 @@ fn render_generic_card(
         )
     );
 
+    let has_native_images = match &outcome {
+        Some(
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::NativeContent { images, .. },
+            }
+            | ToolExecutionOutcome::Failed {
+                result: Some(ToolExecutionResult::NativeContent { images, .. }),
+                ..
+            },
+        ) => !images.is_empty(),
+        _ => false,
+    };
+
     // A canonical-request normalization marker pairs with the preserved `Other`
     // request. Surface a sanitized copy in every mode; never infer this state
     // from a tool name, result shape, or error prose.
@@ -466,7 +479,7 @@ fn render_generic_card(
                                     class="tool-result"
                                     data-mobile-test="tool-card-result"
                                     prop:open=move || {
-                                        force_show || tool_output_mode.get() == ToolOutputMode::Full
+                                        force_show || has_native_images || tool_output_mode.get() == ToolOutputMode::Full
                                     }
                                 >
                                     <summary>"Result"</summary>
@@ -5266,7 +5279,8 @@ mod wasm_tests {
                 container.style().set_property("width", "320px").unwrap();
                 let handle = mount_to(container.clone(), move || {
                     provide_context(state);
-                    move || view! { <ToolCardView owner_agent_ref=owner_ref() entry=entry.get() /> }
+                    let viewer = crate::components::image_viewer::image_viewer();
+                    view! { {viewer} {move || view! { <ToolCardView owner_agent_ref=owner_ref() entry=entry.get() /> }} }
                 });
                 next_tick().await;
                 let assert_parameters = || {
@@ -5294,7 +5308,9 @@ mod wasm_tests {
                 entry.update(|entry| entry.result = Some(completion));
                 next_tick().await;
                 next_tick().await;
-                let card = container.query_selector("[aria-label]").unwrap().unwrap();
+                let card = container
+                    .query_selector("[data-mobile-test='tool-card-success'], [data-mobile-test='tool-card-failed']")
+                    .unwrap().unwrap();
                 assert_eq!(
                     card.get_attribute("aria-label").as_deref(),
                     Some(if failed {
@@ -5311,32 +5327,27 @@ mod wasm_tests {
                 );
                 let disclosure = details(&container, "tool-card-result")
                     .expect("native output remains reachable in every output mode");
-                assert_eq!(disclosure.open(), failed || mode == ToolOutputMode::Full);
-                if !disclosure.open() {
-                    disclosure
-                        .query_selector("summary")
-                        .unwrap()
-                        .unwrap()
-                        .dyn_into::<HtmlElement>()
-                        .unwrap()
-                        .click();
-                    next_tick().await;
-                }
-                assert!(disclosure.open());
+                assert!(
+                    disclosure.open(),
+                    "typed images are visible without disclosure taps in every mode"
+                );
                 assert_parameters();
                 let output = container
                     .query_selector(".tool-native-content")
                     .unwrap()
                     .expect("typed native output is not discarded by request dispatch");
+                let blocks = output.query_selector_all("pre").unwrap();
+                let retained_text = (0..blocks.length())
+                    .map(|index| blocks.item(index).unwrap().text_content().unwrap())
+                    .collect::<String>();
                 assert_eq!(
-                    output.text_content().unwrap(),
+                    retained_text,
                     if failed {
                         format!("{failure_message}{failure_details}{native_text}")
                     } else {
                         native_text.to_owned()
                     }
                 );
-                let blocks = output.query_selector_all("pre").unwrap();
                 assert_eq!(blocks.length(), if failed { 3 } else { 1 });
                 let text_block = blocks
                     .item(blocks.length() - 1)
@@ -5345,7 +5356,9 @@ mod wasm_tests {
                     .unwrap();
                 assert_eq!(text_block.text_content().unwrap(), native_text);
                 assert!(text_block.get_bounding_client_rect().height() > 0.0);
-                let previews = output.query_selector_all("img").unwrap();
+                let previews = output
+                    .query_selector_all("button[aria-label='Open image full size'] img")
+                    .unwrap();
                 assert_eq!(previews.length(), 2);
                 for (index, expected) in
                     [[255, 0, 0, 255], [0, 0, 255, 255]].into_iter().enumerate()

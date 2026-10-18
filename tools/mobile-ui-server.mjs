@@ -1,61 +1,63 @@
-import { spawn, spawnSync } from "node:child_process";
-import { setTimeout } from "node:timers/promises";
+import { once } from "node:events";
+import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { extname, resolve, sep } from "node:path";
 
-export default async function startMobileUiServer(config) {
-  const url = new URL(config.projects[0].use.baseURL);
-  // Playwright's webServer treats timeout: 0 as its default 60-second cutoff.
-  // Own this foreground server through teardown instead of timing its build.
-  try {
-    const existing = await fetch(url);
-    await existing.body?.cancel();
-    throw new Error(`Mobile UI port ${url.port} is already in use; refusing to reuse a server`);
-  } catch (error) {
-    if (error.cause?.code !== "ECONNREFUSED") throw error;
-  }
-  const child = spawn("npm", ["run", "mobile:ui:serve"], {
-    cwd: process.cwd(),
-    stdio: "inherit",
-    env: { ...process.env, TYDE_MOBILE_UI_TEST_PORT: url.port },
-    detached: process.platform !== "win32",
+const contentTypes = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".wasm": "application/wasm",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+};
+
+export default async function startMobileUiServer() {
+  const dist = resolve("mobile-frontend/dist");
+  await readFile(resolve(dist, "index.html"));
+  const server = createServer(async (request, response) => {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405).end();
+      return;
+    }
+    let file;
+    try {
+      const path = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+      file = resolve(dist, `.${path === "/" ? "/index.html" : path}`);
+      if (!file.startsWith(dist + sep)) throw new Error("Path outside fixture output");
+    } catch {
+      response.writeHead(400).end();
+      return;
+    }
+    try {
+      const body = await readFile(file);
+      response.writeHead(200, {
+        "Content-Type": contentTypes[extname(file)] ?? "application/octet-stream",
+        "Cache-Control": "no-store",
+      });
+      response.end(request.method === "HEAD" ? undefined : body);
+    } catch (error) {
+      const missing = error.code === "ENOENT" || error.code === "EISDIR";
+      if (!missing) console.error("Mobile UI fixture read failed", error);
+      response.writeHead(missing ? 404 : 500).end();
+    }
   });
-  let stopping = false;
-  const exited = new Promise((_, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      if (!stopping) reject(new Error(`Mobile UI server exited before readiness: ${signal ?? code}`));
+  const listening = once(server, "listening");
+  server.listen(0, "127.0.0.1");
+  await listening;
+  const url = `http://127.0.0.1:${server.address().port}`;
+  // Playwright's builtin baseURL fixture reads this after global setup.
+  process.env.PLAYWRIGHT_TEST_BASE_URL = url;
+  console.log(`Mobile UI fixture listening at ${url}`);
+  return async () => {
+    await new Promise((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
     });
-  });
-  const stop = () => {
-    stopping = true;
-    if (!child.pid) return;
-    if (process.platform === "win32") {
-      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
-    } else {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
+    if (process.env.PLAYWRIGHT_TEST_BASE_URL === url) delete process.env.PLAYWRIGHT_TEST_BASE_URL;
+    console.log(`Mobile UI fixture closed at ${url}`);
   };
-  try {
-    while (true) {
-      const available = await Promise.race([
-        fetch(new URL("/?tyde-fixture=onboarding", url))
-          .then(async response => {
-            await response.body?.cancel();
-            return response.ok;
-          }, () => false),
-        exited,
-      ]);
-      if (available) {
-        exited.catch(error => console.error(error.message));
-        return stop;
-      }
-      await Promise.race([setTimeout(100), exited]);
-    }
-  } catch (error) {
-    stop();
-    throw error;
-  }
 }
