@@ -597,3 +597,28 @@ target or retry.
 - Do not create per-root active reviews from bootstrap or summary handling.
 - Do not clear the workspace review just because one root became clean.
 - Do not add migration or comment-merging logic for old per-root drafts.
+
+### Cancellation and startup-close ordering
+
+The review actor records Stop before the host interrupts its reviewers. Stop
+fails reviewers that are still running when the actor processes it; it does
+not rewrite an already completed round. `TypingStatusChanged(false)` is the
+completion boundary, not a completed text message or a test gate release.
+
+The beta23-source cancellation regression released `gated_held_text`, whose
+old implementation incorrectly included that idle event. A protocol drain
+marker followed by fresh agent bootstraps observed Idle before Stop. The sim
+now keeps held turns active after output, checks Thinking at that same
+boundary, and asserts both Stop-during-running failure and Stop-after-complete
+preservation. Wait cancellation, reattachment and configured context reuse
+remain part of the same flow.
+
+Startup recovery persistence runs on a bounded actor mailbox. A startup
+future may be suspended while its agent services Close or StopForRestart;
+that future must never own recovery state needed by those commands. On
+`9735cad7`, forcing Close during recovery admission left the actor waiting on
+its own suspended mutex owner. The host then timed out, published AgentClosed,
+and left one durable startup reservation. The protocol regression now holds
+that admission boundary, observes Close entering withdrawal, releases the
+boundary, and requires acknowledged closure to remove the reservation. Host
+close waits for actor completion rather than reporting timeout-based success.

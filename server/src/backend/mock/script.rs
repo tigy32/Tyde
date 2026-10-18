@@ -393,21 +393,13 @@ impl MockTurn {
         ))
     }
 
-    /// [`MockTurn::gated_text`] that spawns a backend-native child **mid
-    /// turn** — after the parent's stream end but before the gate and the
-    /// trailing idle. Gate entry is therefore causally after the child's
-    /// full lifecycle has been emitted, while the parent is still provably
-    /// busy: the shape for busy-parent child-completion tests.
-    /// ([`MockTurn::with_native_child`] runs the child after the parent
-    /// idles, matching the legacy sentinel placement.)
     pub fn gated_held_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
-        let mut turn = Self::gated_text(text, gate);
-        turn.finish = MockTurnFinish::Held {
-            interruptible: true,
-        };
-        turn
+        let mut steps = held_steps(text.into());
+        steps.push(MockStep::Gate(gate.gate()));
+        Self::held(steps, true)
     }
 
+    /// Spawns a backend-native child mid-turn, before the gate and idle.
     pub fn gated_text_with_busy_native_child(
         text: impl Into<String>,
         child_name: impl Into<String>,

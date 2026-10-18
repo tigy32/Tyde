@@ -8,7 +8,7 @@ use protocol::{
     SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
     TeamId, TeamMemberId,
 };
-use tokio::sync::{Mutex, broadcast, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
@@ -277,14 +277,245 @@ enum RecoveryBinding {
     },
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) struct RecoveryDispatchTestGates {
+    pub dispatch: Arc<crate::host::SpawnOperationTestGateInner>,
+    pub withdrawing: Arc<crate::host::SpawnOperationTestGateInner>,
+}
+
+// Recovery I/O must keep making progress when startup is suspended to
+// service Close or StopForRestart. Only this mailbox owns the binding.
+enum RecoveryCommand {
+    Bind {
+        store: Arc<crate::store::session::SessionStoreHandle>,
+        id: SessionId,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Reserve {
+        store: Arc<crate::store::session::SessionStoreHandle>,
+        reservation: Box<crate::store::session::StartupReservation>,
+        reply: oneshot::Sender<Result<Vec<protocol::QueuedMessageEntry>, String>>,
+    },
+    Promote {
+        store: Arc<crate::store::session::SessionStoreHandle>,
+        id: SessionId,
+        restore_state: Option<crate::store::session::SessionRestoreState>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Queue {
+        messages: Vec<protocol::QueuedMessageEntry>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Withdraw {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Admit {
+        class: DispatchClass,
+        reply: oneshot::Sender<Result<DispatchAdmission, String>>,
+    },
+    Persist {
+        marker: Option<crate::store::session::TurnRecovery>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    PrepareRestart {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+async fn write_recovery_marker(
+    binding: &Option<RecoveryBinding>,
+    agent_id: &AgentId,
+    marker: Option<crate::store::session::TurnRecovery>,
+) -> Result<(), String> {
+    match binding {
+        Some(RecoveryBinding::Session { store, id }) => {
+            store
+                .update(id, move |record| record.turn_recovery = marker)
+                .await
+        }
+        Some(RecoveryBinding::Reservation { store }) => {
+            store
+                .update_startup_reservation(agent_id, move |reservation| {
+                    reservation.turn_recovery = marker
+                })
+                .await
+        }
+        None if marker.is_none() => Ok(()),
+        None => Err("the agent has no durable session or startup reservation".to_owned()),
+    }
+}
+
+async fn run_recovery_actor(
+    mut commands: mpsc::Receiver<RecoveryCommand>,
+    agent_id: AgentId,
+    restarting: Arc<std::sync::atomic::AtomicBool>,
+    restoration: Arc<std::sync::OnceLock<Arc<RestorationAdmission>>>,
+    restart_requested: tokio_util::sync::CancellationToken,
+    #[cfg(feature = "test-support")] recovery_test_gates: Arc<
+        std::sync::OnceLock<RecoveryDispatchTestGates>,
+    >,
+) {
+    let mut binding = None;
+    while let Some(command) = commands.recv().await {
+        match command {
+            RecoveryCommand::Bind { store, id, reply } => {
+                binding = Some(RecoveryBinding::Session { store, id });
+                let _ = reply.send(Ok(()));
+            }
+            RecoveryCommand::Reserve {
+                store,
+                reservation,
+                reply,
+            } => {
+                let result = store.reserve_startup(*reservation).await;
+                if result.is_ok() {
+                    binding = Some(RecoveryBinding::Reservation { store });
+                }
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::Promote {
+                store,
+                id,
+                restore_state,
+                reply,
+            } => {
+                let result = if matches!(binding, Some(RecoveryBinding::Reservation { .. })) {
+                    store
+                        .promote_startup_reservation(&agent_id, &id, restore_state)
+                        .await
+                } else if let Some(restore_state) = restore_state {
+                    store.set_restore_state(&id, restore_state).await
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    binding = Some(RecoveryBinding::Session { store, id });
+                }
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::Queue { messages, reply } => {
+                let result = match &binding {
+                    Some(RecoveryBinding::Session { store, id }) => {
+                        store
+                            .update(id, move |record| record.queued_messages = messages)
+                            .await
+                    }
+                    Some(RecoveryBinding::Reservation { store }) => {
+                        store
+                            .update_startup_reservation(&agent_id, move |reservation| {
+                                reservation.queued_messages = messages
+                            })
+                            .await
+                    }
+                    None => {
+                        Err("the agent has no durable session or startup reservation".to_owned())
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::Withdraw { reply } => {
+                let result = match &binding {
+                    Some(RecoveryBinding::Session { .. }) => {
+                        write_recovery_marker(&binding, &agent_id, None).await
+                    }
+                    Some(RecoveryBinding::Reservation { store }) => {
+                        let result = store.remove_startup_reservation(&agent_id).await;
+                        if result.is_ok() {
+                            binding = None;
+                        }
+                        result
+                    }
+                    None => Ok(()),
+                };
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::Admit { class, reply } => {
+                let result = if restarting.load(Ordering::Acquire) {
+                    Ok(DispatchAdmission::HostStopping)
+                } else if matches!(
+                    class,
+                    DispatchClass::Turn | DispatchClass::Internal | DispatchClass::Redirect
+                ) && restoration.get().is_some_and(|admission| {
+                    admission.continuation_state() == ContinuationState::Pending
+                }) {
+                    Ok(DispatchAdmission::RecoveryPending)
+                } else if matches!(
+                    class,
+                    DispatchClass::Turn | DispatchClass::RestartContinuation
+                ) {
+                    #[cfg(feature = "test-support")]
+                    if let Some(gates) = recovery_test_gates.get() {
+                        tracing::info!("recovery dispatch boundary entered");
+                        crate::host::wait_for_spawn_operation_test_gate_inner(&gates.dispatch)
+                            .await;
+                        tracing::info!("recovery dispatch boundary released");
+                    }
+                    write_recovery_marker(
+                        &binding,
+                        &agent_id,
+                        Some(crate::store::session::TurnRecovery::InFlight),
+                    )
+                    .await
+                    .map(|()| DispatchAdmission::Admitted)
+                } else {
+                    Ok(DispatchAdmission::Admitted)
+                };
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::Persist { marker, reply } => {
+                let result = if restarting.load(Ordering::Acquire)
+                    && marker != Some(crate::store::session::TurnRecovery::InterruptedByRestart)
+                {
+                    Ok(())
+                } else {
+                    write_recovery_marker(&binding, &agent_id, marker).await
+                };
+                let _ = reply.send(result);
+            }
+            RecoveryCommand::PrepareRestart { reply } => {
+                restarting.store(true, Ordering::Release);
+                let result = match &binding {
+                    Some(RecoveryBinding::Session { store, id }) => {
+                        store
+                            .update(id, |record| {
+                                if record.turn_recovery.is_some() {
+                                    record.turn_recovery = Some(
+                                        crate::store::session::TurnRecovery::InterruptedByRestart,
+                                    );
+                                }
+                            })
+                            .await
+                    }
+                    Some(RecoveryBinding::Reservation { store }) => {
+                        store
+                            .update_startup_reservation(&agent_id, |reservation| {
+                                if reservation.turn_recovery.is_some() {
+                                    reservation.turn_recovery = Some(
+                                        crate::store::session::TurnRecovery::InterruptedByRestart,
+                                    );
+                                }
+                            })
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                restart_requested.cancel();
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentStatusHandle {
-    recovery_binding: Arc<Mutex<Option<RecoveryBinding>>>,
+    #[cfg(feature = "test-support")]
+    pub recovery_test_gates: Arc<std::sync::OnceLock<RecoveryDispatchTestGates>>,
+    recovery: mpsc::Sender<RecoveryCommand>,
     restoration: Arc<std::sync::OnceLock<Arc<RestorationAdmission>>>,
     restarting: Arc<std::sync::atomic::AtomicBool>,
     restart_requested: tokio_util::sync::CancellationToken,
     agent_id: AgentId,
-    status: Arc<Mutex<AgentStatus>>,
+    status: watch::Sender<AgentStatus>,
     status_change_tx: watch::Sender<u64>,
     status_change_counter: Arc<AtomicU64>,
     transition_tx: broadcast::Sender<AgentStatusTransition>,
@@ -297,17 +528,30 @@ impl AgentStatusHandle {
         status_change_counter: Arc<AtomicU64>,
         transition_tx: broadcast::Sender<AgentStatusTransition>,
     ) -> Self {
-        Self {
-            recovery_binding: Arc::new(Mutex::new(None)),
+        let (recovery, commands) = mpsc::channel(32);
+        let handle = Self {
+            #[cfg(feature = "test-support")]
+            recovery_test_gates: Arc::new(std::sync::OnceLock::new()),
+            recovery,
             restoration: Arc::new(std::sync::OnceLock::new()),
             restarting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             restart_requested: tokio_util::sync::CancellationToken::new(),
             agent_id,
-            status: Arc::new(Mutex::new(AgentStatus::default())),
+            status: watch::channel(AgentStatus::default()).0,
             status_change_tx,
             status_change_counter,
             transition_tx,
-        }
+        };
+        tokio::spawn(run_recovery_actor(
+            commands,
+            handle.agent_id.clone(),
+            Arc::clone(&handle.restarting),
+            Arc::clone(&handle.restoration),
+            handle.restart_requested.clone(),
+            #[cfg(feature = "test-support")]
+            Arc::clone(&handle.recovery_test_gates),
+        ));
+        handle
     }
 
     pub fn bind_restoration(
@@ -366,222 +610,129 @@ impl AgentStatusHandle {
             .unwrap_or_default()
     }
 
-    /// Records the session this actor persists recovery to.
+    async fn recovery_request<T>(
+        &self,
+        request: impl FnOnce(oneshot::Sender<Result<T, String>>) -> RecoveryCommand,
+    ) -> Result<T, String> {
+        let (reply, result) = oneshot::channel();
+        self.recovery
+            .send(request(reply))
+            .await
+            .map_err(|_| "agent recovery actor stopped".to_owned())?;
+        result
+            .await
+            .map_err(|_| "agent recovery operation was not acknowledged".to_owned())?
+    }
+
+    async fn report_recovery_failure(&self, error: String) {
+        tracing::error!(%error, "agent recovery persistence failed");
+        self.update(|status| {
+            status.last_error = Some(format!("Cannot persist agent recovery: {error}"))
+        })
+        .await;
+    }
+
     pub async fn bind_recovery(
         &self,
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
     ) {
-        *self.recovery_binding.lock().await = Some(RecoveryBinding::Session { store, id });
+        if let Err(error) = self
+            .recovery_request(|reply| RecoveryCommand::Bind { store, id, reply })
+            .await
+        {
+            self.report_recovery_failure(error).await;
+        }
     }
 
-    /// Durably reserves a new or forked agent before anything is admitted to
-    /// its provider, and returns the messages an earlier reservation of the
-    /// same agent still holds.
     pub async fn reserve_startup(
         &self,
         store: Arc<crate::store::session::SessionStoreHandle>,
         reservation: crate::store::session::StartupReservation,
     ) -> Result<Vec<protocol::QueuedMessageEntry>, String> {
-        let mut binding = self.recovery_binding.lock().await;
-        let queued = store.reserve_startup(reservation).await?;
-        *binding = Some(RecoveryBinding::Reservation { store });
-        Ok(queued)
+        self.recovery_request(|reply| RecoveryCommand::Reserve {
+            store,
+            reservation: Box::new(reservation),
+            reply,
+        })
+        .await
     }
 
-    /// Moves the startup reservation's recovery state onto the session the
-    /// provider created, under the barrier so a concurrent restart stop
-    /// converts exactly one of them. If the move cannot be recorded the
-    /// reservation stays authoritative.
     pub async fn promote_reservation(
         &self,
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
         restore_state: Option<crate::store::session::SessionRestoreState>,
     ) {
-        let mut binding = self.recovery_binding.lock().await;
-        if !matches!(binding.as_ref(), Some(RecoveryBinding::Reservation { .. })) {
-            if let Some(restore_state) = restore_state
-                && let Err(error) = store.set_restore_state(&id, restore_state).await
-            {
-                tracing::error!(%error, "cannot record the session's restore state");
-            }
-            *binding = Some(RecoveryBinding::Session { store, id });
-            return;
-        }
-        if let Err(error) = store
-            .promote_startup_reservation(&self.agent_id, &id, restore_state)
+        if let Err(error) = self
+            .recovery_request(|reply| RecoveryCommand::Promote {
+                store,
+                id,
+                restore_state,
+                reply,
+            })
             .await
         {
-            tracing::error!(%error, "cannot move the startup reservation onto the session");
-            self.update(|status| {
-                status.last_error = Some(format!("Cannot record the agent's session: {error}"))
-            })
-            .await;
-            return;
+            self.report_recovery_failure(error).await;
         }
-        *binding = Some(RecoveryBinding::Session { store, id });
     }
 
-    /// Persists the durable queue where a restart restores it from.
     pub async fn persist_queued_messages(
         &self,
         messages: Vec<protocol::QueuedMessageEntry>,
     ) -> Result<(), String> {
-        let binding = self.recovery_binding.lock().await;
-        let result = match binding.as_ref() {
-            Some(RecoveryBinding::Session { store, id }) => {
-                store
-                    .update(id, move |record| record.queued_messages = messages)
-                    .await
-            }
-            Some(RecoveryBinding::Reservation { store }) => {
-                store
-                    .update_startup_reservation(&self.agent_id, move |reservation| {
-                        reservation.queued_messages = messages
-                    })
-                    .await
-            }
-            None => Err("the agent has no durable session or startup reservation".to_owned()),
-        };
+        let result = self
+            .recovery_request(|reply| RecoveryCommand::Queue { messages, reply })
+            .await;
         if let Err(error) = &result {
             tracing::error!(%error, "cannot persist queued messages");
         }
         result
     }
 
-    /// An explicit close wins over a restart in progress: the agent must not
-    /// be continued or reconstructed, whatever the stop already recorded.
     pub async fn withdraw_recovery(&self) {
-        let mut binding = self.recovery_binding.lock().await;
-        let result = match binding.as_ref() {
-            Some(RecoveryBinding::Session { store, id }) => {
-                store.update(id, |record| record.turn_recovery = None).await
-            }
-            Some(RecoveryBinding::Reservation { store }) => {
-                let result = store.remove_startup_reservation(&self.agent_id).await;
-                if result.is_ok() {
-                    *binding = None;
-                }
-                result
-            }
-            None => Ok(()),
-        };
-        if let Err(error) = result {
-            tracing::error!(%error, "cannot withdraw turn recovery state");
+        tracing::debug!("withdrawing agent recovery");
+        #[cfg(feature = "test-support")]
+        if let Some(gates) = self.recovery_test_gates.get() {
+            crate::host::notify_spawn_operation_test_gate_inner(&gates.withdrawing);
+        }
+        if let Err(error) = self
+            .recovery_request(|reply| RecoveryCommand::Withdraw { reply })
+            .await
+        {
+            self.report_recovery_failure(error).await;
         }
     }
 
-    /// The single restart dispatch barrier. Every path that hands work to the
-    /// provider crosses it, serialized with `prepare_restart`, so a turn is
-    /// either recorded in flight before the stop converts it, or refused.
     pub async fn admit_dispatch(&self, class: DispatchClass) -> DispatchAdmission {
-        let binding = self.recovery_binding.lock().await;
-        if self.restarting() {
-            return DispatchAdmission::HostStopping;
-        }
-        if matches!(
-            class,
-            DispatchClass::Turn | DispatchClass::Internal | DispatchClass::Redirect
-        ) && self.pending_restart_continuation()
-        {
-            return DispatchAdmission::RecoveryPending;
-        }
-        if matches!(
-            class,
-            DispatchClass::Turn | DispatchClass::RestartContinuation
-        ) && self
-            .write_recovery(
-                &binding,
-                Some(crate::store::session::TurnRecovery::InFlight),
-            )
+        match self
+            .recovery_request(|reply| RecoveryCommand::Admit { class, reply })
             .await
-            .is_err()
         {
-            return DispatchAdmission::Unrecorded;
+            Ok(admission) => admission,
+            Err(error) => {
+                self.report_recovery_failure(error).await;
+                DispatchAdmission::Unrecorded
+            }
         }
-        DispatchAdmission::Admitted
     }
 
     pub async fn persist_recovery(&self, marker: Option<crate::store::session::TurnRecovery>) {
-        let binding = self.recovery_binding.lock().await;
-        if self.restarting()
-            && marker != Some(crate::store::session::TurnRecovery::InterruptedByRestart)
+        if let Err(error) = self
+            .recovery_request(|reply| RecoveryCommand::Persist { marker, reply })
+            .await
         {
-            return;
+            self.report_recovery_failure(error).await;
         }
-        let _ = self.write_recovery(&binding, marker).await;
-    }
-
-    async fn write_recovery(
-        &self,
-        binding: &Option<RecoveryBinding>,
-        marker: Option<crate::store::session::TurnRecovery>,
-    ) -> Result<(), String> {
-        let result = match binding.as_ref() {
-            Some(RecoveryBinding::Session { store, id }) => {
-                store
-                    .update(id, move |record| record.turn_recovery = marker)
-                    .await
-            }
-            Some(RecoveryBinding::Reservation { store }) => {
-                store
-                    .update_startup_reservation(&self.agent_id, move |reservation| {
-                        reservation.turn_recovery = marker
-                    })
-                    .await
-            }
-            // Nothing is recorded, so there is no marker to clear; a turn that
-            // must be recorded in flight has nowhere to go.
-            None if marker.is_none() => Ok(()),
-            None => Err("the agent has no durable session or startup reservation".to_owned()),
-        };
-        if let Err(error) = result {
-            tracing::error!(%error, "cannot persist turn recovery state");
-            self.update(|status| {
-                status.last_error = Some(format!("Cannot persist turn recovery state: {error}"))
-            })
-            .await;
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub async fn prepare_restart(&self) {
-        let binding = self.recovery_binding.lock().await;
-        self.restarting.store(true, Ordering::Release);
-        let result = match binding.as_ref() {
-            Some(RecoveryBinding::Session { store, id }) => {
-                store
-                    .update(id, |record| {
-                        if record.turn_recovery.is_some() {
-                            record.turn_recovery =
-                                Some(crate::store::session::TurnRecovery::InterruptedByRestart);
-                        }
-                    })
-                    .await
-            }
-            Some(RecoveryBinding::Reservation { store }) => {
-                store
-                    .update_startup_reservation(&self.agent_id, |reservation| {
-                        if reservation.turn_recovery.is_some() {
-                            reservation.turn_recovery =
-                                Some(crate::store::session::TurnRecovery::InterruptedByRestart);
-                        }
-                    })
-                    .await
-            }
-            None => Ok(()),
-        };
-        if let Err(error) = result {
-            tracing::error!(%error, "cannot persist restart interruption");
-            self.update(|status| {
-                status.last_error = Some(format!("Cannot persist restart interruption: {error}"))
-            })
-            .await;
+        if let Err(error) = self
+            .recovery_request(|reply| RecoveryCommand::PrepareRestart { reply })
+            .await
+        {
+            self.report_recovery_failure(error).await;
         }
-        drop(binding);
-        self.restart_requested.cancel();
     }
 
     pub async fn wait_for_restart(&self) {
@@ -598,50 +749,40 @@ impl AgentStatusHandle {
     where
         F: FnOnce(&mut AgentStatus),
     {
-        let mut status = self.status.lock().await;
-        let from = status.status();
-        let was_active = status.is_active();
-        let had_background_work = status.has_background_work;
-        let prior_goal_status = status.goal.as_ref().map(|goal| goal.status);
-        update(&mut status);
-        let to = status.status();
-        let turn_active = status.is_active();
-        let pending_user_response = status.pending_user_response;
-        let has_queued_messages = status.has_queued_messages;
-        let has_background_work = status.has_background_work;
-        let restored_without_live_turn = status.restored_without_live_turn;
-        let goal = status.goal.clone();
-        let goal_status_changed = prior_goal_status.is_some()
-            && prior_goal_status != goal.as_ref().map(|goal| goal.status);
-        drop(status);
-
-        if from != to
-            || was_active != turn_active
-            || goal_status_changed
-            || had_background_work != has_background_work
-        {
-            // A send fails only with no live receivers, which is the normal
-            // state; a receiver that falls behind learns about it from its own
-            // `Lagged` error rather than from here.
-            let _ = self.transition_tx.send(AgentStatusTransition {
-                agent_id: self.agent_id.clone(),
-                from,
-                to,
-                goal,
-                goal_status_changed,
-                pending_user_response,
-                has_queued_messages,
-                has_background_work,
-                restored_without_live_turn,
-            });
-        }
+        self.status.send_modify(|status| {
+            let from = status.status();
+            let was_active = status.is_active();
+            let had_background_work = status.has_background_work;
+            let prior_goal_status = status.goal.as_ref().map(|goal| goal.status);
+            update(status);
+            let to = status.status();
+            let goal_status_changed = prior_goal_status.is_some()
+                && prior_goal_status != status.goal.as_ref().map(|goal| goal.status);
+            if from != to
+                || was_active != status.is_active()
+                || goal_status_changed
+                || had_background_work != status.has_background_work
+            {
+                let _ = self.transition_tx.send(AgentStatusTransition {
+                    agent_id: self.agent_id.clone(),
+                    from,
+                    to,
+                    goal: status.goal.clone(),
+                    goal_status_changed,
+                    pending_user_response: status.pending_user_response,
+                    has_queued_messages: status.has_queued_messages,
+                    has_background_work: status.has_background_work,
+                    restored_without_live_turn: status.restored_without_live_turn,
+                });
+            }
+        });
 
         let next = self.status_change_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.status_change_tx.send(next);
     }
 
     pub async fn snapshot(&self) -> AgentStatus {
-        self.status.lock().await.clone()
+        self.status.borrow().clone()
     }
 }
 

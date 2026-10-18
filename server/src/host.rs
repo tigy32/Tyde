@@ -504,14 +504,6 @@ const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTORED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const AGENT_NAME_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a subtree teardown waits on one agent before moving on.
-///
-/// Comfortably longer than the actor's own close grace plus its backend
-/// shutdown budget, so a healthy agent always answers first and this only
-/// fires for an actor that is genuinely stuck. Teardown must finish either
-/// way: the registry removal and session-list refresh that make a closed agent
-/// disappear from the UI run after the loop.
-const AGENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long the host waits for an auto-compaction an agent requested to
 /// reach a terminal notify before giving up on observing it (the compaction
 /// itself keeps running server-side either way).
@@ -2402,6 +2394,35 @@ impl HostHandle {
 
     pub fn install_non_cancellable_agent_startup(&self, agent_name: &str) {
         crate::agent::install_non_cancellable_startup_test_agent(agent_name.to_owned());
+    }
+
+    pub async fn install_agent_recovery_dispatch_test_gates(
+        &self,
+        agent_id: &AgentId,
+    ) -> (
+        InstalledSpawnOperationTestGate,
+        InstalledSpawnOperationTestGate,
+    ) {
+        let dispatch = new_spawn_operation_test_gate();
+        let withdrawing = new_spawn_operation_test_gate();
+        let status = self
+            .state
+            .lock()
+            .await
+            .registry
+            .agent_status_handle(agent_id)
+            .expect("agent must exist before installing recovery gates");
+        assert!(
+            status
+                .recovery_test_gates
+                .set(crate::agent::registry::RecoveryDispatchTestGates {
+                    dispatch: dispatch.shared(),
+                    withdrawing: withdrawing.shared(),
+                })
+                .is_ok(),
+            "recovery gates already installed"
+        );
+        (dispatch, withdrawing)
     }
 
     pub fn install_agent_startup_completion_test_gate(
@@ -10856,24 +10877,10 @@ impl HostHandle {
         }
 
         for (target_agent_id, agent_handle) in close_targets {
-            // Targets close in post-order so children are torn down before the
-            // parents that may be awaiting them, which is why this stays
-            // sequential. The timeout is what keeps that ordering safe: one
-            // actor that never answers used to strand every later target,
-            // including the parent, so nothing was removed from the registry
-            // and the session list never refreshed. The agent's own close
-            // deadline should always fire first; this is the backstop for when
-            // it does not.
-            if tokio::time::timeout(AGENT_CLOSE_TIMEOUT, agent_handle.close())
-                .await
-                .is_err()
-            {
-                tracing::error!(
-                    agent_id = %target_agent_id,
-                    timeout_ms = AGENT_CLOSE_TIMEOUT.as_millis(),
-                    "agent did not acknowledge close; continuing teardown without it"
-                );
-            }
+            // Recovery I/O belongs to its own actor, not the suspended startup
+            // future. Wait for teardown instead of announcing a timed-out close.
+            let acknowledged = agent_handle.close().await;
+            tracing::debug!(acknowledged, "agent close command settled");
 
             // The bulk clear above races the actor's own teardown: a startup or
             // turn that persists its session after the clear puts the marker

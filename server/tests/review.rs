@@ -2711,6 +2711,9 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
         ..Default::default()
     })
     .await;
+    let backend_startup = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("AI Review");
     let reviewer_reservation = fixture
         .reserve_mock_launches(vec![
             (
@@ -2731,6 +2734,7 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
         seed_repo(repo);
     }
 
+    let host = fixture.host_for_test();
     let client = &mut fixture.client;
     set_default_backend(client, BackendKind::Claude).await;
     let project_a = create_project(client, &repo_a).await;
@@ -2959,7 +2963,52 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
     .await;
     let reviewer = reviewer.expect("project A reviewer");
     assert_eq!(reviewer.project_id, Some(project_a.id.clone()));
-    close_agent_and_wait(client, &reviewer.instance_stream).await;
+    backend_startup.wait_until_entered().await;
+    let (dispatch, withdrawing) = host
+        .install_agent_recovery_dispatch_test_gates(&reviewer.agent_id)
+        .await;
+    backend_startup.release_one();
+    dispatch.wait_until_entered().await;
+    let client = &mut fixture.client;
+    client.close_agent(&reviewer.instance_stream).await.unwrap();
+    withdrawing.wait_until_entered().await;
+    eprintln!("REVIEW_STARTUP close owns command loop while startup recovery is suspended");
+    dispatch.release_one();
+    next_frame_matching_on(
+        client,
+        "close completes after recovery dispatch is released",
+        |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::CommandError,
+                "startup close must succeed"
+            );
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .unwrap()
+                    .agent_id
+                    == reviewer.agent_id
+        },
+    )
+    .await;
+    let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+        &fixture.session_store_path(),
+    ))
+    .unwrap();
+    let reservations: u32 = database
+        .query_row(
+            "SELECT COUNT(*) FROM startup_reservations WHERE id=?1",
+            [&reviewer.agent_id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    eprintln!("REVIEW_STARTUP closed reviewer durable reservation count={reservations}");
+    assert_eq!(
+        reservations, 0,
+        "acknowledged startup close must not resurrect on restart"
+    );
+    let client = &mut fixture.client;
     let completed = subscribe_review(client, &review_a.id).await;
     eprintln!(
         "REVIEW_STARTUP closed-first status={:?}",
@@ -5677,7 +5726,22 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     )
     .await;
     assert_eq!(again, done);
+    client
+        .review_action(&review.id, ReviewActionPayload::StopAiReview)
+        .await
+        .unwrap();
     let state = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(
+        state.ai_reviewer.status,
+        ReviewAiReviewerStatus::Completed,
+        "Stop after observed completion must not retroactively fail a round"
+    );
+    assert!(
+        state.ai_reviewer.rounds[0]
+            .reviewers
+            .iter()
+            .all(|reviewer| reviewer.status == ReviewAiReviewerStatus::Completed)
+    );
     assert_eq!(
         state.ai_reviewer.rounds.len(),
         1,
@@ -5694,9 +5758,17 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         fixture
             .mock_by_id(id)
             .await
-            .enqueue(MockTurn::gated_held_text("Cancelled by user", &gate))
+            .enqueue(MockTurn::gated_held_text("Cancelled by user", &gate).with_goal_state(None))
             .await;
     }
+    let (mut reviewer_observer, host) = fixture.connect_with_bootstrap().await;
+    let reviewer_streams = host
+        .agents
+        .iter()
+        .filter(|agent| first_ids.contains(&agent.agent_id))
+        .map(|agent| agent.instance_stream.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(reviewer_streams.len(), 4);
     let stopped = start_review_call(&caller, "stop", "deep");
     for _ in 0..4 {
         gate.wait_until_entered().await;
@@ -5704,6 +5776,57 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     for _ in 0..4 {
         gate.release_one();
     }
+    // GoalChanged follows every scripted output step, including any idle.
+    // Observe it on the real protocol before inspecting canonical status.
+    let mut drained = std::collections::HashSet::new();
+    next_frame_matching_on(&mut reviewer_observer, "reviewer output drained", |env| {
+        if reviewer_streams.contains(&env.stream)
+            && env.kind == FrameKind::ChatEvent
+            && matches!(
+                env.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::GoalChanged(None))
+            )
+        {
+            drained.insert(env.stream.clone());
+        }
+        drained.len() == 4
+    })
+    .await;
+    eprintln!(
+        "REVIEW_CANCEL scripted output drained for {} reviewers",
+        drained.len()
+    );
+    let (mut status_observer, status_host) = fixture.connect_with_bootstrap().await;
+    let status_streams = status_host
+        .agents
+        .iter()
+        .filter(|agent| first_ids.contains(&agent.agent_id))
+        .map(|agent| agent.instance_stream.clone())
+        .collect::<Vec<_>>();
+    let mut checked = std::collections::HashSet::new();
+    next_frame_matching_on(
+        &mut status_observer,
+        "held reviewers stay active after output",
+        |env| {
+            if status_streams.contains(&env.stream) && env.kind == FrameKind::AgentBootstrap {
+                let bootstrap = env
+                    .parse_payload::<protocol::AgentBootstrapPayload>()
+                    .unwrap();
+                eprintln!(
+                    "REVIEW_CANCEL drained reviewer status={:?}",
+                    bootstrap.status
+                );
+                assert_eq!(
+                    bootstrap.status,
+                    protocol::AgentControlStatus::Thinking,
+                    "held output must not emit idle before StopAiReview"
+                );
+                checked.insert(env.stream.clone());
+            }
+            checked.len() == 4
+        },
+    )
+    .await;
     let running = wait_review_execution(&mut client, &review.id, 2).await;
     assert!(
         running.ai_reviewer.rounds[1]
