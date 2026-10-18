@@ -26,7 +26,10 @@ jobs:
       - name: Build the production exec-helper entrypoint
         run: cargo build --locked -p tyde-process-env --example launch_probe --features test-support
       - name: Initialize the login-shell PATH
-        run: target/debug/examples/launch_probe
+        run: |
+          for login_shell in /bin/bash /bin/zsh; do
+            SHELL="$login_shell" target/debug/examples/launch_probe
+          done
       - name: Exercise startup from a background terminal
         shell: bash
         run: |
