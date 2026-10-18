@@ -90,6 +90,16 @@ filter = 'binary_id(server::session_resume) & test(mobile_open_many_agents_keeps
 threads-required = "num-test-threads"
 success-output = "final"
 
+# Retain content-safe native-loss/protocol milestones for this regression.
+[[profile.default.overrides]]
+filter = 'binary_id(server::projects) & test(project_watcher_follows_worktree_git_metadata)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::projects) & test(project_watcher_follows_worktree_git_metadata)'
+success-output = "final"
+retries = 0
+
 [profile.default]
 # Five minutes is a suite optimization target, not a deadline. Only an
 # individual test running for ten minutes is terminated as hung.

@@ -163,7 +163,7 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
         fingerprints.owner == owner.fingerprint(),
         "pairing pins the actual owner"
     );
-    let (generation, _, secret) = host.tychat_bot_state().await.unwrap();
+    let (generation, _, secret) = host.tychat_bot_state().await.unwrap().unwrap();
     let saved: BotState = serde_json::from_slice(&secret.0).unwrap();
     assert!(
         saved.bot_id() == created.bot.bot_id,
@@ -294,7 +294,7 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
     })
     .await;
     assert!(
-        host.tychat_bot_state().await.is_none(),
+        host.tychat_bot_state().await.unwrap().is_none(),
         "revocation erases secret bot state"
     );
     eprintln!("PASS subsequent turn and owner revocation remove the singleton and credentials");
@@ -344,13 +344,13 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
     })
     .await;
     assert!(
-        host.tychat_bot_state().await.is_none(),
+        host.tychat_bot_state().await.unwrap().is_none(),
         "unpair stops the real SDK and erases its state"
     );
     fixture.restart_host().await;
     let host = fixture.tychat_host();
     assert!(
-        host.tychat_bot_state().await.is_none(),
+        host.tychat_bot_state().await.unwrap().is_none(),
         "unpair remains erased after restart"
     );
     assert!(

@@ -880,7 +880,7 @@ pub(crate) struct RelaySpawnRequest {
 pub(crate) struct SpawnedAgent {
     pub start: AgentStartPayload,
     pub handle: AgentHandle,
-    pub startup_rx: oneshot::Receiver<Result<SessionId, String>>,
+    pub session_binding_rx: oneshot::Receiver<Result<SessionId, String>>,
 }
 
 pub(crate) struct SpawnedRelayAgent {
@@ -972,7 +972,7 @@ impl AgentRegistry {
 
         let access_mode = request.resolved_spawn_config.access_mode;
         let status_handle = self.next_status_handle(agent_id.clone());
-        let (handle, startup_rx) = spawn_agent_actor(
+        let (handle, session_binding_rx) = spawn_agent_actor(
             agent_id.clone(),
             start.clone(),
             request,
@@ -997,7 +997,7 @@ impl AgentRegistry {
         SpawnedAgent {
             start,
             handle,
-            startup_rx,
+            session_binding_rx,
         }
     }
 

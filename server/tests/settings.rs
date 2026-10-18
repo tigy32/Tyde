@@ -2558,28 +2558,42 @@ async fn custom_acp_profile_schema_is_emitted_for_its_editor() {
         )],
     )
     .await;
-    let result = expect_settings_write_result(
+    // Settings application emits the catalog before its requester result.
+    // Waiting for the result first discarded the only catalog notification.
+    let mut applied = false;
+    let mut edited_catalog = None;
+    next_frame_matching_on(
         &mut fixture.client,
-        "w-custom-acp-model",
-        "custom ACP profile model edit",
-    )
-    .await;
-    assert!(result.applied, "{:?}", result.field_errors);
-    let catalog = wait_for_launch_profile_catalog(
-        &mut fixture,
-        "custom ACP profile edited to another model its agent offers",
-        |catalog| {
-            catalog.entries.iter().any(|entry| match entry {
-                protocol::LaunchProfileEntry::Ready { profile } => {
-                    profile.id.0 == "kiro:custom"
-                        && profile.session_settings.0.get("model")
-                            == Some(&SessionSettingValue::String("custom-b".to_owned()))
+        "custom ACP model result and live catalog",
+        |env| {
+            match env.kind {
+                FrameKind::SettingsWriteResult => {
+                    let result: SettingsWriteResultPayload = env.parse_payload().unwrap();
+                    assert_eq!(result.write_id.0, "w-custom-acp-model");
+                    assert!(result.applied, "{:?}", result.field_errors);
+                    applied = true;
                 }
-                _ => false,
-            })
+                FrameKind::LaunchProfileCatalogNotify => {
+                    let payload: protocol::LaunchProfileCatalogPayload =
+                        env.parse_payload().unwrap();
+                    if payload.catalog.entries.iter().any(|entry| match entry {
+                        protocol::LaunchProfileEntry::Ready { profile } => {
+                            profile.id.0 == "kiro:custom"
+                                && profile.session_settings.0.get("model")
+                                    == Some(&SessionSettingValue::String("custom-b".to_owned()))
+                        }
+                        _ => false,
+                    }) {
+                        edited_catalog = Some(payload.catalog);
+                    }
+                }
+                _ => {}
+            }
+            applied && edited_catalog.is_some()
         },
     )
     .await;
+    let catalog = edited_catalog.expect("edited profile catalog received with write result");
     assert_eq!(
         custom_profile_models(&catalog, "kiro:custom"),
         Some(vec!["custom-a".to_owned(), "custom-b".to_owned()]),
@@ -2789,11 +2803,31 @@ async fn running_agent_settings_carry_the_schema_the_agent_validates() {
         )],
     )
     .await;
-    let result =
-        expect_settings_write_result(&mut fixture.client, "w-enable-claude", "refresh catalog")
-            .await;
-    assert!(result.applied, "{:?}", result.field_errors);
-    wait_for_codex_catalog(&mut fixture, "gpt-new").await;
+    // The schema fanout is part of applying the write, before its result;
+    // consume both together rather than discard the schema while awaiting it.
+    let mut applied = false;
+    let mut refreshed = false;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "write result and refreshed schema",
+        |env| {
+            match env.kind {
+                FrameKind::SettingsWriteResult => {
+                    let result: SettingsWriteResultPayload = env.parse_payload().unwrap();
+                    assert_eq!(result.write_id.0, "w-enable-claude");
+                    assert!(result.applied, "{:?}", result.field_errors);
+                    applied = true;
+                }
+                FrameKind::SessionSchemas => {
+                    let payload: SessionSchemasPayload = env.parse_payload().unwrap();
+                    refreshed |= codex_schema_offers(&payload.schemas, "gpt-new");
+                }
+                _ => {}
+            }
+            applied && refreshed
+        },
+    )
+    .await;
 
     fixture
         .client

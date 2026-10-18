@@ -1740,7 +1740,10 @@ impl HostHandle {
                     "Resumed swarm member has no live agent handle",
                 )
             })?;
-            handle.wait_for_swarm_startup_ready().await;
+            handle
+                .wait_for_swarm_startup_ready()
+                .await
+                .map_err(|error| fail(SwarmErrorCode::Lifecycle, error.message()))?;
             #[cfg(feature = "test-support")]
             tracing::warn!(
                 "Swarm dispatch diagnostic: native replay ready, rechecking lifecycle before input"

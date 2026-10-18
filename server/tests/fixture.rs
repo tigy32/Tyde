@@ -767,6 +767,23 @@ impl Fixture {
         &mut self,
         configure: impl FnOnce(&mut server::HostRuntimeConfig),
     ) -> HostBootstrapPayload {
+        self.restart_host_without_client(configure).await;
+        let (client, bootstrap) = connect_client_with_bootstrap(self.host.clone()).await;
+        eprintln!(
+            "Fixture restart replacement bootstrapped; agent_count={} swarm_count={}",
+            bootstrap.agents.len(),
+            bootstrap.swarms.len()
+        );
+        self.client = client;
+        self.bootstrap = bootstrap.clone();
+        bootstrap
+    }
+
+    #[allow(dead_code)]
+    pub async fn restart_host_without_client(
+        &mut self,
+        configure: impl FnOnce(&mut server::HostRuntimeConfig),
+    ) {
         let prior_agent_count = self.host.agent_ids().await.len();
         eprintln!("Fixture restart shutdown begin; prior_agent_count={prior_agent_count}");
         self.host
@@ -786,16 +803,7 @@ impl Fixture {
         )
         .expect("initialize restarted host with existing stores");
         eprintln!("Fixture restart replacement constructed; awaiting real protocol bootstrap");
-        let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
-        eprintln!(
-            "Fixture restart replacement bootstrapped; agent_count={} swarm_count={}",
-            bootstrap.agents.len(),
-            bootstrap.swarms.len()
-        );
         self.host = host;
-        self.client = client;
-        self.bootstrap = bootstrap.clone();
-        bootstrap
     }
 
     #[allow(dead_code)]

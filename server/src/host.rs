@@ -2185,7 +2185,7 @@ impl HostHandle {
         self.restart.stopped.cancel();
         let tychat = self.state.lock().await.tychat.clone();
         tychat.bridge.shutdown().await;
-        tychat.release_process_lock();
+        tychat.release_process_lock().await;
         if let Some(registry) = &self.restart.swarm_registry {
             registry.wait_stopped().await;
         }
@@ -2526,6 +2526,13 @@ impl HostHandle {
             "recovery gates already installed"
         );
         (dispatch, withdrawing)
+    }
+
+    pub fn install_agent_resume_readiness_test_gate(
+        &self,
+        agent_name: &str,
+    ) -> crate::agent::InstalledResumeReadinessTestGate {
+        crate::agent::install_resume_readiness_test_gate(agent_name.to_owned())
     }
 
     pub fn install_agent_startup_completion_test_gate(
@@ -3291,7 +3298,7 @@ impl HostHandle {
         }
         let settings_store_for_projection = Arc::clone(&state.settings_store);
         let agent_restoration_failures = state.agent_restoration_failures.clone();
-        let tychat_snapshot = state.tychat.state.lock().await.snapshot.clone();
+        let tychat_snapshot = state.tychat.snapshot();
         let dots_snapshot = state.dots.state.borrow().clone();
         drop(state);
         tracing::info!(target: "tyde::connection_bootstrap", agent_count = agents.len(), elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap descriptors completed");
@@ -3857,7 +3864,7 @@ impl HostHandle {
                         "host restart shutdown completed; accounting committed and process scopes sealed"
                     );
                     tychat.bridge.abort().await;
-                    tychat.release_process_lock();
+                    tychat.release_process_lock().await;
                     host.config.wait_stopped().await;
                 } else {
                     tracing::error!("host restart stopped without committing required accounting");
@@ -6198,7 +6205,7 @@ impl HostHandle {
         let (
             start,
             agent_handle,
-            startup_rx,
+            session_binding_rx,
             agent_visibility,
             session_summary_count_tx,
             swarm_startup_admission,
@@ -6466,7 +6473,7 @@ impl HostHandle {
             (
                 spawned.start,
                 spawned.handle,
-                spawned.startup_rx,
+                spawned.session_binding_rx,
                 state.agent_visibility.clone(),
                 session_summary_count_tx,
                 swarm_startup_admission,
@@ -6496,7 +6503,7 @@ impl HostHandle {
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
         let session_registration_publish = self.schedule_agent_session_registration(
             agent_id.clone(),
-            startup_rx,
+            session_binding_rx,
             visibility.clone(),
             inflight_resume,
         );
@@ -6915,7 +6922,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
         };
-        let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
+        let (start, agent_handle, session_binding_rx, agent_visibility, session_summary_count_tx) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -6977,7 +6984,7 @@ impl HostHandle {
             (
                 spawned.start,
                 spawned.handle,
-                spawned.startup_rx,
+                spawned.session_binding_rx,
                 state.agent_visibility.clone(),
                 session_summary_count_tx,
             )
@@ -6988,7 +6995,7 @@ impl HostHandle {
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
         let session_registration_publish = self.schedule_agent_session_registration(
             agent_id.clone(),
-            startup_rx,
+            session_binding_rx,
             visibility.clone(),
             inflight_resume,
         );
@@ -9516,7 +9523,9 @@ impl HostHandle {
 
         // Keep each write's CAS, backend propagation, fanout, and result in
         // one order even while the general host-state lock is released for I/O.
-        let state = self.state.lock().await;
+        let custom_store = self.state.lock().await.custom_agent_store.clone();
+        let custom_agents = custom_store.lock().await.clone();
+        let mut state = self.state.lock().await;
         let settings_store = Arc::clone(&state.settings_store);
         let store = Arc::clone(&settings_store);
         let current = store
@@ -9884,7 +9893,16 @@ impl HostHandle {
             || candidate.enabled_backends != current.enabled_backends
             || candidate.launch_profiles != current.launch_profiles
         {
-            if let Err(message) = tychat::validate_tychat_settings(&state, &candidate).await {
+            drop(state);
+            let custom_agent_exists = candidate
+                .tychat
+                .custom_agent_id
+                .as_ref()
+                .is_none_or(|id| custom_agents.get(id).is_some());
+            state = self.state.lock().await;
+            if let Err(message) =
+                tychat::validate_tychat_settings(&state, &candidate, custom_agent_exists)
+            {
                 push_error(
                     &mut field_errors,
                     "/tychat",
@@ -9944,9 +9962,7 @@ impl HostHandle {
             if let Err(reason) = self.reconcile_tychat(false).await {
                 service.fail(reason).await;
             }
-            if service.state.lock().await.journal.pairing.is_some() {
-                service.notify();
-            }
+            service.settings_changed();
         }
         if current.chatgpt_dots_enabled != committed.chatgpt_dots_enabled {
             let dots = self.state.lock().await.dots.clone();
@@ -12030,7 +12046,7 @@ impl HostHandle {
             .agent_handle(agent_id)
             .is_some_and(|agent| agent.snapshot().origin == AgentOrigin::Tychat)
         {
-            state.tychat.activity(activity).await;
+            state.tychat.activity(activity);
         }
         fan_out_agent_turn_state(&mut state, agent_id, activity);
         fan_out_agent_background_work(&mut state, agent_id).await;
@@ -12060,7 +12076,7 @@ impl HostHandle {
                 .agent_handle(&agent_id)
                 .is_some_and(|agent| agent.snapshot().origin == AgentOrigin::Tychat)
             {
-                state.tychat.activity(activity).await;
+                state.tychat.activity(activity);
             }
             fan_out_agent_turn_state(&mut state, &agent_id, activity);
             fan_out_agent_background_work(&mut state, &agent_id).await;
@@ -13132,7 +13148,7 @@ impl HostHandle {
     fn schedule_agent_session_registration(
         &self,
         agent_id: AgentId,
-        startup_rx: tokio::sync::oneshot::Receiver<Result<SessionId, String>>,
+        session_binding_rx: tokio::sync::oneshot::Receiver<Result<SessionId, String>>,
         visibility: SpawnVisibility,
         inflight_resume: Option<InflightResumeClaim>,
     ) -> PendingAgentSessionPublication {
@@ -13149,9 +13165,9 @@ impl HostHandle {
             // behind the restoration marker it was closing.
             let mut inflight_resume = inflight_resume;
             let agent_id = task_agent_id;
-            let mut startup_rx = startup_rx;
+            let mut session_binding_rx = session_binding_rx;
             let startup_result = tokio::select! {
-                startup = &mut startup_rx => Some(startup),
+                startup = &mut session_binding_rx => Some(startup),
                 publication = publish_rx.recv() => match publication {
                     Some(()) => None,
                     None if host.restart.stopped.is_cancelled() => {
@@ -13170,7 +13186,7 @@ impl HostHandle {
             };
             let (startup_result, publication_authorized) = match startup_result {
                 Some(startup_result) => (startup_result, false),
-                None => (startup_rx.await, true),
+                None => (session_binding_rx.await, true),
             };
             let session_id = match startup_result {
                 Ok(Ok(session_id)) => {
@@ -16859,7 +16875,7 @@ fn spawn_host_inner(
         .tychat_api_base
         .clone()
         .unwrap_or(tychat_api_base);
-    let tychat = crate::tychat::TychatService::load(
+    let (tychat, tychat_owner) = crate::tychat::TychatService::load(
         paths.settings.with_file_name("tychat-secrets.json"),
         tychat_api_base,
     )?;
@@ -17391,7 +17407,7 @@ fn spawn_host_inner(
             ..Default::default()
         });
     }
-    spawn_open_agent_restoration_task(host.clone());
+    spawn_open_agent_restoration_task(host.clone(), tychat_owner);
 
     Ok(host)
 }
@@ -17496,8 +17512,13 @@ fn fan_out_agent_restoration_status(
     });
 }
 
-fn spawn_open_agent_restoration_task(host: HostHandle) {
+fn spawn_open_agent_restoration_task(
+    host: HostHandle,
+    tychat_owner: impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let worker = async move {
+        // Synchronous GUI setup has no entered runtime; use the restoration worker's runtime.
+        tokio::spawn(tychat_owner);
         host.start_tychat().await;
         if let Err(error) = host.restore_open_agents().await {
             tracing::error!(error = %error, "failed to restore open agents after host restart");

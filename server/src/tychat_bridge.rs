@@ -1,8 +1,14 @@
-use std::{future::Future, pin::Pin, sync::Mutex as StdMutex, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use blake2::{Blake2s256, Digest};
+use futures_util::FutureExt;
 use protocol::*;
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tychat_bot::{BotClient, BotError, BotEvent, BotState, PauseReason};
 
@@ -15,72 +21,145 @@ const RETRY: Duration = Duration::from_secs(5);
 const MAX_TEXT_UTF16: usize = 8000;
 type Work<T> = Pin<Box<dyn Future<Output = Result<T, Failure>> + Send>>;
 
+type BridgeCompletion = futures_util::future::Shared<
+    futures_util::future::BoxFuture<'static, Result<(), Arc<tokio::task::JoinError>>>,
+>;
+
+pub(crate) struct DisconnectedTransport {
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for DisconnectedTransport {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+type DisconnectRequest = oneshot::Sender<DisconnectedTransport>;
+
+async fn hold_disconnected(reply: DisconnectRequest, stop: &CancellationToken) {
+    let (release, released) = oneshot::channel();
+    tracing::info!("Tychat transport disconnected; holding through journal erasure");
+    let _ = reply.send(DisconnectedTransport {
+        release: Some(release),
+    });
+    tokio::select! {
+        _ = stop.cancelled() => {},
+        _ = released => {},
+    }
+    tracing::info!("Tychat transport disconnection hold released");
+}
+
+struct BridgeRuntime {
+    completion: BridgeCompletion,
+    abort: tokio::task::AbortHandle,
+    disconnect: mpsc::UnboundedSender<DisconnectRequest>,
+}
+
 #[derive(Default)]
 pub(crate) struct BridgeHandle {
     stopped: CancellationToken,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    disconnect: StdMutex<Option<mpsc::UnboundedSender<oneshot::Sender<()>>>>,
+    runtime: OnceLock<BridgeRuntime>,
+    started: Notify,
 }
 
 impl BridgeHandle {
     pub async fn start(&self, host: HostHandle, service: TychatService) {
-        let mut task = self.task.lock().await;
-        if task.is_some() || self.stopped.is_cancelled() {
+        if self.stopped.is_cancelled() {
             return;
         }
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.disconnect.lock().expect("Tychat bridge sender lock") = Some(tx);
-        let stop = self.stopped.clone();
-        *task = Some(tokio::spawn(async move {
-            if let Err(reason) = run(host, service.clone(), rx, stop).await {
-                tracing::error!(
-                    "Tychat bridge stopped after a host persistence or lifecycle failure"
-                );
-                service.fail(reason).await;
+        self.runtime.get_or_init(|| {
+            let (disconnect, rx) = mpsc::unbounded_channel();
+            let stop = self.stopped.clone();
+            let task = tokio::spawn(async move {
+                if let Err(reason) = run(host, service.clone(), rx, stop).await {
+                    tracing::error!(
+                        "Tychat bridge stopped after a host persistence or lifecycle failure"
+                    );
+                    service.fail(reason).await;
+                }
+            });
+            let abort = task.abort_handle();
+            let completion = async move { task.await.map_err(Arc::new) }.boxed().shared();
+            BridgeRuntime {
+                completion,
+                abort,
+                disconnect,
             }
-        }));
+        });
+        self.started.notify_waiters();
     }
 
-    pub async fn disconnect(&self) -> Result<(), String> {
-        if self
-            .task
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|task| task.is_finished())
-        {
-            return Ok(());
+    pub async fn disconnect(&self) -> Result<DisconnectedTransport, String> {
+        let runtime = loop {
+            let started = self.started.notified();
+            if let Some(runtime) = self.runtime.get() {
+                break runtime;
+            }
+            if self.stopped.is_cancelled() {
+                return Ok(DisconnectedTransport { release: None });
+            }
+            tokio::select! {
+                _ = started => {},
+                _ = self.stopped.cancelled() => {},
+            }
+        };
+        let (reply, done) = oneshot::channel();
+        if runtime.disconnect.send(reply).is_err() {
+            // A closed mailbox is a terminated transport; settle teardown on its actual task result.
+            return runtime
+                .completion
+                .clone()
+                .await
+                .map(|()| DisconnectedTransport { release: None })
+                .map_err(|_| "Tychat bridge task failed before disconnect".into());
         }
-        let tx = self
-            .disconnect
-            .lock()
-            .map_err(|_| "Tychat bridge sender lock failed")?
-            .clone();
-        if let Some(tx) = tx {
-            let (reply, done) = oneshot::channel();
-            tx.send(reply).map_err(|_| "Tychat bridge is stopped")?;
-            done.await
-                .map_err(|_| "Tychat disconnect was not acknowledged")?;
+        tokio::select! {
+            result = done => result.map_err(|_| "Tychat disconnect was not acknowledged".into()),
+            result = runtime.completion.clone() => match result {
+                Ok(()) => Ok(DisconnectedTransport { release: None }),
+                Err(_) => Err("Tychat bridge task failed during disconnect".into()),
+            }
         }
-        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn cancel_task_for_test(&self) -> Result<(), String> {
+        let runtime = loop {
+            let started = self.started.notified();
+            if let Some(runtime) = self.runtime.get() {
+                break runtime;
+            }
+            if self.stopped.is_cancelled() {
+                return Err("Bridge stopped before test cancellation".into());
+            }
+            started.await;
+        };
+        // Do not signal graceful shutdown: this setup needs an actual failed task result.
+        runtime.abort.abort();
+        match runtime.completion.clone().await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err("Unexpected bridge failure during test cancellation".into()),
+            Ok(()) => Err("Bridge completed before test cancellation".into()),
+        }
     }
 
     pub async fn shutdown(&self) {
         self.stopped.cancel();
-        let mut task = self.task.lock().await;
-        if let Some(task) = task.as_mut()
-            && task.await.is_err()
+        if let Some(runtime) = self.runtime.get()
+            && runtime.completion.clone().await.is_err()
         {
             tracing::error!("Tychat bridge task failed during shutdown");
         }
-        task.take();
     }
 
     pub async fn abort(&self) {
         self.stopped.cancel();
-        if let Some(task) = self.task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
+        if let Some(runtime) = self.runtime.get() {
+            runtime.abort.abort();
+            let _ = runtime.completion.clone().await;
         }
     }
 }
@@ -168,7 +247,7 @@ async fn persist(
 async fn run(
     host: HostHandle,
     service: TychatService,
-    mut disconnect: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    mut disconnect: mpsc::UnboundedReceiver<DisconnectRequest>,
     stop: CancellationToken,
 ) -> Result<(), String> {
     let mut changed = service.subscribe();
@@ -179,7 +258,7 @@ async fn run(
             return Ok(());
         }
         let settings = host.tychat_settings().await?;
-        let pairing = host.tychat_bot_state().await;
+        let pairing = host.tychat_bot_state().await?;
         let identity = pairing.as_ref().map(|(id, _, _)| id.clone());
         if !settings.enabled || identity.is_none() {
             held = None;
@@ -204,7 +283,7 @@ async fn run(
             let connection = tokio::select! {
                 biased;
                 _ = stop.cancelled() => return Ok(()),
-                Some(reply) = disconnect.recv() => { held = Some(generation); let _ = reply.send(()); continue; },
+                Some(reply) = disconnect.recv() => { hold_disconnected(reply, &stop).await; continue; },
                 result = BotClient::connect(&url, state) => result,
             };
             match connection {
@@ -231,8 +310,7 @@ async fn run(
                         Exit::Stopped => return Ok(()),
                         Exit::Hold => held = Some(generation),
                         Exit::Unpair(reply) => {
-                            held = Some(generation);
-                            let _ = reply.send(());
+                            hold_disconnected(reply, &stop).await;
                         }
                     }
                 }
@@ -256,7 +334,7 @@ async fn run(
         }
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
-            Some(reply) = disconnect.recv() => { held = identity; let _ = reply.send(()); },
+            Some(reply) = disconnect.recv() => { hold_disconnected(reply, &stop).await; },
             result = changed.changed() => { if result.is_err() { return Ok(()); } },
             _ = tokio::time::sleep_until(retry_at), if settings.enabled && identity.is_some() && held.as_ref() != identity.as_ref() => {}
         }
@@ -267,7 +345,7 @@ enum Exit {
     Wake,
     Stopped,
     Hold,
-    Unpair(oneshot::Sender<()>),
+    Unpair(DisconnectRequest),
 }
 
 struct SessionContext<'a> {
@@ -275,7 +353,7 @@ struct SessionContext<'a> {
     service: &'a TychatService,
     generation: &'a TychatPairingId,
     changed: &'a mut watch::Receiver<u64>,
-    disconnect: &'a mut mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    disconnect: &'a mut mpsc::UnboundedReceiver<DisconnectRequest>,
     stop: &'a CancellationToken,
     observed_cursor: u64,
 }
@@ -309,7 +387,7 @@ async fn connected(
         }
         if !host
             .tychat_bot_state()
-            .await
+            .await?
             .is_some_and(|(id, _, _)| &id == generation)
         {
             break Exit::Wake;
@@ -338,7 +416,7 @@ async fn connected(
             if inbound.is_none()
                 && state.agent_id.is_some()
                 && state.status == TychatBridgeStatus::Connected
-                && let Some(pending) = service.state.lock().await.journal.inbox.first().cloned()
+                && let Some(pending) = service.pending_owner().await?
             {
                 let host = host.clone();
                 let client = client.clone();

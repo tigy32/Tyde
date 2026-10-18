@@ -778,7 +778,9 @@ pub(crate) struct AgentHandle {
     processes: crate::backend::subprocess::ProcessOwner,
     actor_abort: tokio::task::AbortHandle,
     actor_status: registry::AgentStatusHandle,
-    startup_ready: tokio_util::sync::CancellationToken,
+    startup_completion: watch::Receiver<Option<Result<SessionId, StartupFailure>>>,
+    #[cfg(feature = "test-support")]
+    resume_readiness_test_gate: Option<ResumeReadinessTestGate>,
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
@@ -806,6 +808,47 @@ impl Drop for AgentClosePreparation {
         if let Some(closing) = &self.0 {
             closing.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StartupFailure {
+    BackendFailed,
+    SessionPersistenceFailed,
+    ReplayFailed,
+    Terminated,
+    CompletionUnavailable,
+}
+
+impl StartupFailure {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::BackendFailed => "Agent backend startup failed",
+            Self::SessionPersistenceFailed => "Agent session registration could not be persisted",
+            Self::ReplayFailed => "Agent resume replay failed before startup admission",
+            Self::Terminated => "Agent terminated during startup",
+            Self::CompletionUnavailable => "Agent startup completion channel closed",
+        }
+    }
+}
+
+struct StartupCompletion(watch::Sender<Option<Result<SessionId, StartupFailure>>>);
+
+impl StartupCompletion {
+    fn complete(&self, result: Result<SessionId, StartupFailure>) {
+        self.0.send_if_modified(|completion| {
+            if completion.is_some() {
+                return false;
+            }
+            *completion = Some(result);
+            true
+        });
+    }
+}
+
+impl Drop for StartupCompletion {
+    fn drop(&mut self) {
+        self.complete(Err(StartupFailure::Terminated));
     }
 }
 
@@ -1563,8 +1606,8 @@ impl AgentHandle {
         self.accepting_input.store(false, Ordering::SeqCst);
     }
 
-    pub(crate) async fn wait_for_swarm_startup_ready(&self) {
-        self.startup_ready.cancelled().await;
+    pub(crate) async fn wait_for_swarm_startup_ready(&self) -> Result<SessionId, StartupFailure> {
+        self.wait_for_startup_completion().await
     }
 
     pub(crate) fn enqueue_swarm_message(
@@ -1938,16 +1981,40 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
-    pub(crate) async fn wait_for_tychat_startup(&self) -> Result<SessionId, String> {
-        tokio::time::timeout(Duration::from_secs(60), self.startup_ready.cancelled())
-            .await
-            .map_err(|_| "Tychat agent startup timed out")?;
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return Err("Tychat agent did not become ready".into());
+    async fn wait_for_startup_completion(&self) -> Result<SessionId, StartupFailure> {
+        let mut completion = self.startup_completion.clone();
+        loop {
+            if let Some(result) = completion.borrow_and_update().clone() {
+                return result;
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| StartupFailure::CompletionUnavailable)?;
         }
-        self.snapshot()
-            .session_id
-            .ok_or_else(|| "Tychat session missing".into())
+    }
+
+    pub(crate) async fn wait_for_tychat_startup(&self) -> Result<SessionId, StartupFailure> {
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = &self.resume_readiness_test_gate {
+            gate.settling.cancelled().await;
+        }
+        let completion = self.wait_for_startup_completion();
+        tokio::pin!(completion);
+        let result = std::future::poll_fn(|context| {
+            let result = std::future::Future::poll(completion.as_mut(), context);
+            #[cfg(feature = "test-support")]
+            if let Some(gate) = &self.resume_readiness_test_gate
+                && !gate.observed.is_cancelled()
+            {
+                gate.observed.cancel();
+            }
+            result
+        })
+        .await;
+        tracing::info!(session_present = result.is_ok(), failure = ?result.as_ref().err(),
+            "Tychat startup completion observed");
+        result
     }
 
     pub(crate) async fn deliver_tychat(
@@ -2207,6 +2274,63 @@ impl AgentHandle {
         };
         reply_rx.await.unwrap_or(false)
     }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+struct ResumeReadinessTestGate {
+    settling: tokio_util::sync::CancellationToken,
+    observed: tokio_util::sync::CancellationToken,
+    release: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(feature = "test-support")]
+pub struct InstalledResumeReadinessTestGate(ResumeReadinessTestGate);
+
+#[cfg(feature = "test-support")]
+impl InstalledResumeReadinessTestGate {
+    pub async fn wait_until_settling(&self) {
+        self.0.settling.cancelled().await;
+    }
+
+    pub async fn wait_until_observed(&self) {
+        self.0.observed.cancelled().await;
+    }
+
+    pub fn release(&self) {
+        self.0.release.cancel();
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for InstalledResumeReadinessTestGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn resume_readiness_test_gates()
+-> &'static std::sync::Mutex<HashMap<String, ResumeReadinessTestGate>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ResumeReadinessTestGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_resume_readiness_test_gate(
+    agent_name: String,
+) -> InstalledResumeReadinessTestGate {
+    let gate = ResumeReadinessTestGate::default();
+    let replaced = resume_readiness_test_gates()
+        .lock()
+        .expect("resume readiness test gate mutex")
+        .insert(agent_name, gate.clone());
+    assert!(
+        replaced.is_none(),
+        "resume readiness test gate already installed"
+    );
+    InstalledResumeReadinessTestGate(gate)
 }
 
 #[cfg(feature = "test-support")]
@@ -3324,7 +3448,8 @@ pub(crate) fn spawn_agent_actor(
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
     let closing = Arc::new(AtomicBool::new(false));
-    let (startup_tx, startup_rx) = oneshot::channel();
+    // Session registration precedes replay; only startup_completion admits startup consumers.
+    let (session_binding_tx, session_binding_rx) = oneshot::channel();
     let (start_tx, start_rx) = watch::channel(start.clone());
     let (final_usage_tx, final_usage) = watch::channel(None);
     let actor_tx = tx.clone();
@@ -3332,9 +3457,15 @@ pub(crate) fn spawn_agent_actor(
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
-    let startup_ready = tokio_util::sync::CancellationToken::new();
-    let actor_startup_ready = startup_ready.clone();
-    let ready_completion = actor_startup_ready.clone().drop_guard();
+    let (completion_tx, startup_completion) = watch::channel(None);
+    let actor_startup_completion = StartupCompletion(completion_tx);
+    #[cfg(feature = "test-support")]
+    let resume_readiness_test_gate = resume_readiness_test_gates()
+        .lock()
+        .expect("resume readiness test gate mutex")
+        .remove(&start.name);
+    #[cfg(feature = "test-support")]
+    let actor_resume_readiness_test_gate = resume_readiness_test_gate.clone();
     let actor = async move {
         let ResolvedSpawnRequest {
             parent_session_id,
@@ -3819,7 +3950,7 @@ pub(crate) fn spawn_agent_actor(
                         continue;
                     }
                     tracing::info!("stopping backend startup for host restart");
-                    let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
+                    let _ = session_binding_tx.send(Err("host stopped during startup".to_owned()));
                     publish_final_usage(&current_start, &mut event_log);
                     return;
                 }
@@ -3859,7 +3990,8 @@ pub(crate) fn spawn_agent_actor(
                                 deferred_restart_stop = Some(reply);
                                 continue;
                             }
-                            let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
+                            let _ = session_binding_tx
+                                .send(Err("host stopped during startup".to_owned()));
                             finish_actor_close(
                                 &accepting_input_task,
                                 &status_handle,
@@ -3904,7 +4036,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             publish_final_usage(&current_start, &mut event_log);
                             let _ = reply.send(());
-                            let _ = startup_tx.send(Err("agent startup closed".to_owned()));
+                            let _ = session_binding_tx.send(Err("agent startup closed".to_owned()));
                             return;
                         }
                         AgentCommand::Attach { stream, reply } => {
@@ -4114,13 +4246,14 @@ pub(crate) fn spawn_agent_actor(
         let (backend, mut events, actor_session_id, mut initial_follow_up) = match startup_result {
             Ok(result) => result,
             Err(err) => {
-                eprintln!(
-                    "TYDE STARTUP FAILURE agent={} pending_attaches={} message={}",
-                    current_start.agent_id,
-                    pending_startup_attaches.len(),
-                    err.message
+                tracing::warn!(
+                    origin = ?current_start.origin,
+                    code = ?err.code,
+                    pending_attaches = pending_startup_attaches.len(),
+                    "agent backend startup failed"
                 );
-                let _ = startup_tx.send(Err(err.message.clone()));
+                actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
+                let _ = session_binding_tx.send(Err(err.message.clone()));
                 let payload = AgentErrorPayload {
                     agent_id: current_start.agent_id.clone(),
                     code: err.code,
@@ -4167,6 +4300,7 @@ pub(crate) fn spawn_agent_actor(
                     },
                 )
                 .await;
+                actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                 enter_terminal_failure(
                     TerminalFailureContext {
                         accepting_input: &accepting_input_task,
@@ -4348,8 +4482,8 @@ pub(crate) fn spawn_agent_actor(
                         status.activity_counter = status.activity_counter.saturating_add(1);
                     })
                     .await;
-                let _ = startup_tx.send(Err(payload.message));
-                actor_startup_ready.cancel();
+                let _ = session_binding_tx.send(Err(payload.message));
+                actor_startup_completion.complete(Err(StartupFailure::SessionPersistenceFailed));
                 pending_resume_attaches.append(&mut pending_startup_attaches);
                 upsert_activity_stats_snapshot(
                     &canonical_stream,
@@ -4422,13 +4556,13 @@ pub(crate) fn spawn_agent_actor(
         } else {
             None
         };
-        let _ = startup_tx.send(Ok(actor_session_id.clone()));
+        let _ = session_binding_tx.send(Ok(actor_session_id.clone()));
         accepting_input_task.store(
             !resume_replay_gate_pending && !status_handle.restarting(),
             Ordering::SeqCst,
         );
         if !resume_replay_gate_pending {
-            actor_startup_ready.cancel();
+            actor_startup_completion.complete(Ok(actor_session_id.clone()));
         }
         let has_acknowledged_gated_deliveries = acknowledged_gated_deliveries > 0;
         let continuation_pending = status_handle.pending_restart_continuation();
@@ -5744,6 +5878,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                         }
                         if resume_replay_gate_pending {
+                            actor_startup_completion.complete(Err(StartupFailure::ReplayFailed));
                             event_log.clear_chat_events();
                             replay_state = AgentReplayState {
                                 journal: replay_state.journal.take(),
@@ -5771,6 +5906,7 @@ pub(crate) fn spawn_agent_actor(
                                 "agent backend closed before resume replay completed",
                             )
                             .await;
+                            actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                             enter_terminal_failure(
                                 TerminalFailureContext {
                                     accepting_input: &accepting_input_task,
@@ -5867,6 +6003,7 @@ pub(crate) fn spawn_agent_actor(
                             "agent backend closed",
                         )
                         .await;
+                        actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                         enter_terminal_failure(
                             TerminalFailureContext {
                                 accepting_input: &accepting_input_task,
@@ -5948,6 +6085,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             resume_replay_boundary = None;
                             tracing::info!(
+                                origin = ?current_start.origin,
                                 succeeded = result.is_ok(),
                                 authoritative_history = resume_uses_authoritative_transcript,
                                 backend_typing,
@@ -5958,7 +6096,6 @@ pub(crate) fn spawn_agent_actor(
                                 persist_model_request_checkpoint(&session_store, &actor_session_id, usage, &current_start.agent_id, &canonical_stream, &mut event_log, &mut subscribers).await;
                             }
                             resume_replay_gate_pending = false;
-                            actor_startup_ready.cancel();
                             match result {
                                 Ok(()) => {
                                     if let Some(recovery) = resume_recovery {
@@ -6090,7 +6227,15 @@ pub(crate) fn spawn_agent_actor(
                                         },
                                     )
                                     .await;
+                                    #[cfg(feature = "test-support")]
+                                    if let Some(gate) = &actor_resume_readiness_test_gate {
+                                        gate.settling.cancel();
+                                        gate.release.cancelled().await;
+                                    }
                                     accepting_input_task.store(true, Ordering::SeqCst);
+                                    // Readiness must follow admission, including awaited replay
+                                    // reconciliation, or a host waiter can reject a valid resume.
+                                    actor_startup_completion.complete(Ok(actor_session_id.clone()));
                                     // Settling the resumed agent to Idle is only
                                     // honest when nothing is waiting to run. An
                                     // initial follow-up already suppressed it;
@@ -6178,6 +6323,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &payload.message,
                                             )
                                             .await;
+                                            actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                                             enter_terminal_failure(
                                                 TerminalFailureContext {
                                                     accepting_input: &accepting_input_task,
@@ -6302,6 +6448,7 @@ pub(crate) fn spawn_agent_actor(
                                         "resume replay failed before deferred live events could be reduced"
                                     );
                                     accepting_input_task.store(false, Ordering::SeqCst);
+                                    actor_startup_completion.complete(Err(StartupFailure::ReplayFailed));
                                     let payload = AgentErrorPayload {
                                         agent_id: current_start.agent_id.clone(),
                                         code: AgentErrorCode::BackendFailed,
@@ -6324,6 +6471,7 @@ pub(crate) fn spawn_agent_actor(
                                         &payload.message,
                                     )
                                     .await;
+                                    actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                                     enter_terminal_failure(
                                         TerminalFailureContext {
                                             accepting_input: &accepting_input_task,
@@ -7169,6 +7317,7 @@ pub(crate) fn spawn_agent_actor(
                                     &payload.message,
                                 )
                                 .await;
+                                actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                                 enter_terminal_failure(
                                     TerminalFailureContext {
                                         accepting_input: &accepting_input_task,
@@ -8118,6 +8267,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &payload.message,
                                             )
                                             .await;
+                                            actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                                             enter_terminal_failure(
                                                 TerminalFailureContext {
                                                     accepting_input: &accepting_input_task,
@@ -8659,6 +8809,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &payload.message,
                                             )
                                             .await;
+                                            actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                                             enter_terminal_failure(
                                                 TerminalFailureContext {
                                                     accepting_input: &accepting_input_task,
@@ -10289,6 +10440,7 @@ pub(crate) fn spawn_agent_actor(
                                 message: "agent backend transport closed".to_owned(),
                                 fatal: true,
                             };
+                            actor_startup_completion.complete(Err(StartupFailure::BackendFailed));
                             enter_terminal_failure(
                                 TerminalFailureContext {
                                     accepting_input: &accepting_input_task,
@@ -10532,7 +10684,6 @@ pub(crate) fn spawn_agent_actor(
     let actor = Box::pin(actor);
     let actor_task = crate::backend::subprocess::spawn(async move {
         actor_processes.scope(actor).await;
-        drop(ready_completion);
     });
 
     (
@@ -10540,7 +10691,9 @@ pub(crate) fn spawn_agent_actor(
             processes,
             actor_abort: actor_task.abort_handle(),
             actor_status,
-            startup_ready,
+            startup_completion,
+            #[cfg(feature = "test-support")]
+            resume_readiness_test_gate,
             tx,
             accepting_input,
             closing,
@@ -10549,7 +10702,7 @@ pub(crate) fn spawn_agent_actor(
             moving_project: Arc::new(AtomicBool::new(false)),
             start: start_rx,
         },
-        startup_rx,
+        session_binding_rx,
     )
 }
 
@@ -10623,8 +10776,7 @@ pub(crate) fn spawn_relay_agent_actor(
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
-    let startup_ready = tokio_util::sync::CancellationToken::new();
-    startup_ready.cancel();
+    let (_, startup_completion) = watch::channel(Some(Ok(session_id.clone())));
     let actor = async move {
         status_handle
             .bind_recovery(Arc::clone(&session_store), session_id.clone())
@@ -11387,7 +11539,9 @@ pub(crate) fn spawn_relay_agent_actor(
         processes,
         actor_abort: actor_task.abort_handle(),
         actor_status,
-        startup_ready,
+        startup_completion,
+        #[cfg(feature = "test-support")]
+        resume_readiness_test_gate: None,
         tx,
         accepting_input,
         closing,

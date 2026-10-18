@@ -30,11 +30,12 @@ struct EventSink {
 }
 
 impl EventSink {
-    fn send(&self, event: &Event) {
+    fn send(&self, event: &Event) -> bool {
         if self.pending.fetch_add(1, Ordering::Relaxed) < 128 {
             if self.tx.send(Command::Event(event.clone())).is_err() {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
             }
+            false
         } else {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             if !self.rescan.swap(true, Ordering::Relaxed) {
@@ -53,6 +54,7 @@ impl EventSink {
                     );
                 }
             }
+            true
         }
     }
 }
@@ -165,9 +167,28 @@ impl Routes {
                 }
             }
         }
+        let mut overflowed_subscribers = 0;
         for owner in recipients {
-            if let Some(sink) = self.subscribers.get(&owner) {
-                sink.send(&event);
+            if let Some(sink) = self.subscribers.get(&owner)
+                && sink.send(&event)
+            {
+                overflowed_subscribers += 1;
+            }
+        }
+        if overflowed_subscribers > 0 {
+            tracing::debug!(
+                overflowed_subscribers,
+                input_paths = event.paths.len(),
+                event_kind = ?event.kind,
+                "project filesystem event dispatch completed with overflow"
+            );
+            // Observers can release a held worker; every delivery decision must precede that release.
+            #[cfg(feature = "test-support")]
+            for path in &event.paths {
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherDropped,
+                );
             }
         }
     }

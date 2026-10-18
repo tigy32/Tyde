@@ -1969,7 +1969,7 @@ struct StoreFile {
     records: HashMap<String, CustomAgent>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CustomAgentStore {
     path: PathBuf,
 }

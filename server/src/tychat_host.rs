@@ -1,10 +1,19 @@
 use super::*;
-use crate::tychat::{Pairing, SecretBotState, Session};
+use crate::tychat::{DeliveryTarget, Lifecycle, Pairing, SecretBotState, Session, Update};
 use protocol::{TychatBridgeStatus, TychatCommandPayload, TychatSettingsApplication};
 
-pub(super) async fn validate_tychat_settings(
+#[derive(Debug)]
+enum TychatCloseReason {
+    Unpaired,
+    Disabled,
+    Reset,
+    StartupFailed,
+}
+
+pub(super) fn validate_tychat_settings(
     state: &HostState,
     settings: &settings_model::HostSettings,
+    custom_agent_exists: bool,
 ) -> Result<(), String> {
     let config = &settings.tychat;
     let Some(kind) = config.backend_kind else {
@@ -22,9 +31,7 @@ pub(super) async fn validate_tychat_settings(
     if !settings.enabled_backends.contains(&kind) {
         return Err("Tychat backend must be enabled".into());
     }
-    if let Some(id) = config.custom_agent_id.as_ref()
-        && state.custom_agent_store.lock().await.get(id).is_none()
-    {
+    if !custom_agent_exists {
         return Err("Tychat agent's custom agent no longer exists".into());
     }
     let mut values = match config.launch_profile_id.as_ref() {
@@ -56,66 +63,65 @@ pub(super) async fn validate_tychat_settings(
 impl HostHandle {
     #[cfg(feature = "test-support")]
     pub async fn install_tychat_outbound_ack_gate(&self) -> InstalledSpawnOperationTestGate {
+        self.install_tychat_test_gate(crate::tychat::TychatTestBoundary::OutboundAcknowledgement)
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn install_tychat_test_gate(
+        &self,
+        boundary: crate::tychat::TychatTestBoundary,
+    ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        *self
-            .state
+        self.state
             .lock()
             .await
             .tychat
-            .outbound_ack_gate
-            .lock()
-            .await = Some(gate.shared());
+            .install_test_gate(boundary, gate.shared());
         gate
     }
 
     #[cfg(feature = "test-support")]
     pub(crate) async fn wait_tychat_outbound_ack_for_test(&self) {
-        let gate = self
-            .state
-            .lock()
-            .await
-            .tychat
-            .outbound_ack_gate
-            .lock()
-            .await
-            .take();
-        if let Some(gate) = gate {
+        self.wait_tychat_test_boundary(crate::tychat::TychatTestBoundary::OutboundAcknowledgement)
+            .await;
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn wait_tychat_test_boundary(&self, boundary: crate::tychat::TychatTestBoundary) {
+        let service = self.state.lock().await.tychat.clone();
+        if let Some(gate) = service.take_test_gate(boundary).await {
             wait_for_spawn_operation_test_gate_inner(&gate).await;
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn cancel_tychat_bridge_task_for_test(&self) -> Result<(), String> {
+        let service = self.state.lock().await.tychat.clone();
+        service.bridge.cancel_task_for_test().await
+    }
+
     pub async fn tychat_settings(&self) -> Result<protocol::TychatSettings, String> {
-        Ok(self.state.lock().await.settings_store.get()?.tychat)
+        let store = self.state.lock().await.settings_store.clone();
+        Ok(store.get()?.tychat)
     }
 
     pub async fn tychat_state(&self) -> protocol::TychatStatePayload {
-        let service = self.state.lock().await.tychat.clone();
-        service.state.lock().await.snapshot.clone()
+        self.state.lock().await.tychat.snapshot()
     }
 
-    /// Subscribe before reading a snapshot; each change is a wake to read again.
     pub async fn subscribe_tychat(&self) -> watch::Receiver<u64> {
         self.state.lock().await.tychat.subscribe()
     }
 
     pub async fn tychat_bot_state(
         &self,
-    ) -> Option<(protocol::TychatPairingId, String, SecretBotState)> {
+    ) -> Result<Option<(protocol::TychatPairingId, String, SecretBotState)>, String> {
         let service = self.state.lock().await.tychat.clone();
-        service
-            .state
-            .lock()
-            .await
-            .journal
-            .pairing
-            .as_ref()
-            .map(|pairing| {
-                (
-                    pairing.generation.clone(),
-                    pairing.api_base_url.clone(),
-                    pairing.secret.clone(),
-                )
-            })
+        Ok(service
+            .pairing()
+            .await?
+            .map(|pairing| (pairing.generation, pairing.api_base_url, pairing.secret)))
     }
 
     /// Phase B passes only a successfully redeemed and verified BotState here.
@@ -124,31 +130,38 @@ impl HostHandle {
         secret: SecretBotState,
         fingerprints: protocol::TychatFingerprints,
     ) -> Result<protocol::TychatPairingId, String> {
+        let service = self.state.lock().await.tychat.clone();
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Install {
+                secret,
+                fingerprints,
+                reply,
+            })
+            .await?
+    }
+
+    pub(crate) async fn install_tychat_pairing_owned(
+        &self,
+        secret: SecretBotState,
+        fingerprints: protocol::TychatFingerprints,
+    ) -> Result<protocol::TychatPairingId, String> {
         if secret.0.is_empty() || fingerprints.bot.is_empty() || fingerprints.owner.is_empty() {
             return Err("Incomplete Tychat pairing".into());
         }
         let service = self.state.lock().await.tychat.clone();
-        service.acquire_process_lock()?;
+        #[cfg(feature = "test-support")]
+        self.wait_tychat_test_boundary(crate::tychat::TychatTestBoundary::PairingInstall)
+            .await;
         let generation = protocol::TychatPairingId(uuid::Uuid::new_v4().to_string());
-        {
-            let _guard = service.lifecycle.lock().await;
-            let mut state = service.state.lock().await;
-            if state.journal.pairing.is_some() {
-                return Err("Unpair before pairing another bot".into());
-            }
-            let mut journal = state.journal.clone();
-            journal.pairing = Some(Pairing {
+        service
+            .update(Update::InstallPairing(Pairing {
                 generation: generation.clone(),
                 secret,
                 api_base_url: service.api_base.to_string(),
-                fingerprints: fingerprints.clone(),
-            });
-            state.commit(journal)?;
-            state.snapshot.fingerprints = Some(fingerprints);
-            state.snapshot.status = TychatBridgeStatus::AwaitingOwnerConfirmation;
-        }
-        service.notify();
-        if let Err(reason) = self.reconcile_tychat(false).await {
+                fingerprints,
+            }))
+            .await?;
+        if let Err(reason) = self.reconcile_tychat_owned(false).await {
             service.fail(reason).await;
         }
         Ok(generation)
@@ -160,29 +173,12 @@ impl HostHandle {
         secret: SecretBotState,
     ) -> Result<(), String> {
         let service = self.state.lock().await.tychat.clone();
-        let mut state = service.state.lock().await;
-        let mut journal = state.journal.clone();
-        let pairing = journal
-            .pairing
-            .as_mut()
-            .filter(|pairing| &pairing.generation == generation)
-            .ok_or_else(|| "Stale Tychat pairing".to_owned())?;
-        let bot: tychat_bot::BotState =
-            serde_json::from_slice(&secret.0).map_err(|_| "Invalid Tychat bot state")?;
-        let fingerprints = protocol::TychatFingerprints {
-            bot: bot.bot_fingerprint().to_owned(),
-            owner: bot.owner_fingerprint(),
-        };
-        pairing.secret = secret;
-        pairing.fingerprints = fingerprints.clone();
-        state.commit(journal)?;
-        let changed = state.snapshot.fingerprints.as_ref() != Some(&fingerprints);
-        state.snapshot.fingerprints = Some(fingerprints);
-        drop(state);
-        if changed {
-            service.notify();
-        }
-        Ok(())
+        service
+            .update(Update::PersistBot {
+                generation: generation.clone(),
+                secret,
+            })
+            .await
     }
 
     pub async fn set_tychat_bridge_status(
@@ -191,25 +187,12 @@ impl HostHandle {
         status: TychatBridgeStatus,
     ) -> Result<(), String> {
         let service = self.state.lock().await.tychat.clone();
-        let mut state = service.state.lock().await;
-        if !state
-            .journal
-            .pairing
-            .as_ref()
-            .is_some_and(|pairing| &pairing.generation == generation)
-        {
-            return Err("Stale Tychat pairing".into());
-        }
-        if matches!(status, TychatBridgeStatus::Unpaired) {
-            return Err("Use Unpair to remove a Tychat pairing".into());
-        }
-        let changed = state.snapshot.status != status;
-        state.snapshot.status = status;
-        drop(state);
-        if changed {
-            service.notify();
-        }
-        Ok(())
+        service
+            .update(Update::BridgeStatus {
+                generation: generation.clone(),
+                status,
+            })
+            .await
     }
 
     pub async fn tychat_outbound(
@@ -217,19 +200,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
     ) -> Result<protocol::TychatOutboundSnapshot, String> {
         let service = self.state.lock().await.tychat.clone();
-        let state = service.state.lock().await;
-        if !state
-            .journal
-            .pairing
-            .as_ref()
-            .is_some_and(|pairing| &pairing.generation == generation)
-        {
-            return Err("Stale Tychat pairing".into());
-        }
-        Ok(protocol::TychatOutboundSnapshot {
-            typing: state.typing,
-            pending: state.journal.outbox.clone(),
-        })
+        service.outbound(generation).await
     }
 
     pub async fn acknowledge_tychat_outbound(
@@ -238,23 +209,12 @@ impl HostHandle {
         message_id: protocol::TychatOutboundId,
     ) -> Result<(), String> {
         let service = self.state.lock().await.tychat.clone();
-        let mut state = service.state.lock().await;
-        if !state
-            .journal
-            .pairing
-            .as_ref()
-            .is_some_and(|pairing| &pairing.generation == generation)
-        {
-            return Err("Stale Tychat pairing".into());
-        }
-        let mut journal = state.journal.clone();
-        journal
-            .outbox
-            .retain(|message| message.message_id != message_id);
-        state.commit(journal)?;
-        drop(state);
-        service.notify();
-        Ok(())
+        service
+            .update(Update::AcknowledgeOutbound {
+                generation: generation.clone(),
+                id: message_id,
+            })
+            .await
     }
 
     pub async fn deliver_tychat_message(
@@ -263,42 +223,34 @@ impl HostHandle {
         message: protocol::TychatOwnerMessage,
     ) -> Result<protocol::TychatDeliveryReceipt, String> {
         let service = self.state.lock().await.tychat.clone();
-        let _guard = service.lifecycle.lock().await;
-        let settings = self.state.lock().await.settings_store.get()?;
-        if !settings.tychat.enabled {
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Deliver {
+                generation: generation.clone(),
+                message,
+                reply,
+            })
+            .await?
+    }
+
+    pub(crate) async fn deliver_tychat_message_owned(
+        &self,
+        generation: &protocol::TychatPairingId,
+        message: protocol::TychatOwnerMessage,
+    ) -> Result<protocol::TychatDeliveryReceipt, String> {
+        let service = self.state.lock().await.tychat.clone();
+        if !self.tychat_settings().await?.enabled {
             return Err("Tychat is disabled".into());
         }
         if message.text.trim().is_empty() || message.message_id.0.is_empty() {
             return Err("Tychat message is empty".into());
         }
-        let agent_id = {
-            let state = service.state.lock().await;
-            if !state
-                .journal
-                .pairing
-                .as_ref()
-                .is_some_and(|pairing| &pairing.generation == generation)
-            {
-                return Err("Stale Tychat pairing".into());
-            }
-            if !matches!(state.snapshot.status, TychatBridgeStatus::Connected) {
-                return Err("Tychat bridge is not connected".into());
-            }
-            if let Some(receipt) = state.journal.deliveries.get(&message.message_id) {
-                return Ok(receipt.clone());
-            }
-            state
-                .snapshot
-                .agent_id
-                .clone()
-                .ok_or_else(|| "Tychat agent is unavailable".to_owned())?
+        let agent_id = match service.delivery_target(generation, &message).await? {
+            DeliveryTarget::Agent(id) => id,
+            DeliveryTarget::Receipt(receipt) => return Ok(receipt),
         };
         let handle = self
-            .state
-            .lock()
-            .await
-            .registry
             .agent_handle(&agent_id)
+            .await
             .ok_or("Tychat agent is unavailable")?;
         let learning_message = message.clone();
         let receipt = handle.deliver_tychat(message).await?;
@@ -313,37 +265,83 @@ impl HostHandle {
         {
             tracing::error!(reason = %reason, "Cannot persist accepted Tychat input for analysis");
         }
-        let mut state = service.state.lock().await;
-        let mut journal = state.journal.clone();
-        journal
-            .deliveries
-            .insert(receipt.message_id.clone(), receipt.clone());
-        state.commit(journal)?;
-        state.snapshot.last_delivery = Some(receipt.clone());
+        service.update(Update::Delivery(receipt.clone())).await?;
         tracing::info!(path = ?receipt.path, "Tychat owner message delivered");
-        drop(state);
-        service.notify();
         Ok(receipt)
     }
 
+    pub(crate) fn tychat_lifecycle_stop(&self) -> CancellationToken {
+        self.restart.stopped.clone()
+    }
+
     pub(super) async fn pair_tychat_now(&self, code: String) -> Result<(), String> {
-        if self.tychat_bot_state().await.is_some() {
+        let service = self.state.lock().await.tychat.clone();
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Command {
+                command: TychatCommandPayload::Pair { code },
+                disconnected: None,
+                reply,
+            })
+            .await?
+    }
+
+    pub(crate) async fn tychat_command(&self, command: TychatCommandPayload) -> Result<(), String> {
+        if let TychatCommandPayload::Pair { code } = command {
+            return self
+                .queue_settings_apply(SettingsMutation::TychatPair(code))
+                .await
+                .map_err(|error| error.message);
+        }
+        // The bridge may await this queue; hold transport outside it through erasure,
+        // including a generation installed by an earlier Pair still in the queue.
+        let service = self.state.lock().await.tychat.clone();
+        let disconnected = if matches!(command, TychatCommandPayload::Unpair) {
+            let disconnected = service.bridge.disconnect().await?;
+            #[cfg(feature = "test-support")]
+            self.wait_tychat_test_boundary(crate::tychat::TychatTestBoundary::UnpairDisconnected)
+                .await;
+            Some(disconnected)
+        } else {
+            None
+        };
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Command {
+                command,
+                disconnected,
+                reply,
+            })
+            .await?
+    }
+
+    pub(crate) async fn tychat_command_owned(
+        &self,
+        command: TychatCommandPayload,
+    ) -> Result<(), String> {
+        match command {
+            TychatCommandPayload::Pair { code } => self.pair_tychat_owned(code).await,
+            TychatCommandPayload::ResetAgent => self.reconcile_tychat_owned(true).await,
+            TychatCommandPayload::Unpair => self.forget_tychat_pairing_owned(None).await,
+        }
+    }
+
+    pub(crate) async fn pair_tychat_owned(&self, code: String) -> Result<(), String> {
+        let service = self.state.lock().await.tychat.clone();
+        if service.pairing().await?.is_some() {
             return Err("Unpair before pairing another bot".into());
         }
-        let service = self.state.lock().await.tychat.clone();
-        let base = service.api_base.clone();
-        service.acquire_process_lock()?;
-        let paired = match tychat_bot::pair(&base, code.trim()).await {
+        service.acquire_process_lock().await?;
+        let paired = match tychat_bot::pair(&service.api_base, code.trim()).await {
             Ok(paired) => paired,
             Err(error) => {
-                service.release_process_lock();
-                service.state.lock().await.snapshot.status =
-                    crate::tychat_bridge::error_status(&error);
-                service.notify();
+                service
+                    .update(Update::PairFailed(crate::tychat_bridge::error_status(
+                        &error,
+                    )))
+                    .await?;
                 return Err("Tychat pairing failed; see the bridge status".into());
             }
         };
-        self.install_tychat_pairing(
+        self.install_tychat_pairing_owned(
             crate::tychat_bridge::encode(&paired.state)?,
             protocol::TychatFingerprints {
                 bot: paired.bot_fingerprint,
@@ -354,72 +352,49 @@ impl HostHandle {
         Ok(())
     }
 
-    pub(crate) async fn tychat_command(&self, command: TychatCommandPayload) -> Result<(), String> {
-        match command {
-            TychatCommandPayload::Pair { code } => self
-                .queue_settings_apply(SettingsMutation::TychatPair(code))
-                .await
-                .map_err(|error| error.message),
-            TychatCommandPayload::ResetAgent => self.reconcile_tychat(true).await,
-            TychatCommandPayload::Unpair => {
-                let service = self.state.lock().await.tychat.clone();
-                service.bridge.disconnect().await?;
-                self.forget_tychat_pairing(None).await
-            }
-        }
-    }
-
     pub(crate) async fn forget_tychat_pairing(
         &self,
         generation: Option<&protocol::TychatPairingId>,
     ) -> Result<(), String> {
         let service = self.state.lock().await.tychat.clone();
-        let _guard = service.lifecycle.lock().await;
-        let agent_id = {
-            let state = service.state.lock().await;
-            if state.journal.pairing.is_none() {
-                return Ok(());
-            }
-            if let Some(generation) = generation
-                && !state
-                    .journal
-                    .pairing
-                    .as_ref()
-                    .is_some_and(|pairing| &pairing.generation == generation)
-            {
-                return Err("Stale Tychat pairing".into());
-            }
-            state.snapshot.agent_id.clone()
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Forget {
+                generation: generation.cloned(),
+                reply,
+            })
+            .await?
+    }
+
+    pub(crate) async fn forget_tychat_pairing_owned(
+        &self,
+        generation: Option<&protocol::TychatPairingId>,
+    ) -> Result<(), String> {
+        let service = self.state.lock().await.tychat.clone();
+        let Some(pairing) = service.pairing().await? else {
+            return Ok(());
         };
-        if let Some(id) = agent_id {
-            self.close_agent_with_host_visibility(&id, false)
-                .await
-                .map_err(|error| error.to_string())?;
+        if generation.is_some_and(|generation| generation != &pairing.generation) {
+            return Err("Stale Tychat pairing".into());
         }
-        let mut state = service.state.lock().await;
-        state.commit(crate::tychat::Journal::default())?;
-        state.snapshot = protocol::TychatStatePayload {
-            backend_capabilities: crate::tychat::steering_capabilities(),
-            ..Default::default()
-        };
-        state.typing = false;
-        drop(state);
-        service.release_process_lock();
-        service.notify();
-        Ok(())
+        if let Some(id) = service.snapshot().agent_id {
+            self.close_tychat_agent(&id, TychatCloseReason::Unpaired)
+                .await?;
+        }
+        service.update(Update::Forget).await
     }
 
     pub(super) async fn start_tychat(&self) {
         let service = self.state.lock().await.tychat.clone();
         let mut changed = service.subscribe();
         let host = self.clone();
+        let publisher = service.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = host.restart.stopped.cancelled() => break,
                     result = changed.changed() => {
                         if result.is_err() { break; }
-                        let snapshot = service.state.lock().await.snapshot.clone();
+                        let snapshot = publisher.snapshot();
                         let state = host.state.lock().await;
                         for subscriber in state.host_streams.values() {
                             if subscriber.bootstrapped {
@@ -431,11 +406,15 @@ impl HostHandle {
             }
         });
         if let Err(reason) = self.reconcile_tychat(false).await {
-            self.state.lock().await.tychat.fail(reason).await;
+            service.fail(reason).await;
         }
         #[cfg(feature = "test-support")]
-        if self.state.lock().await.tychat_bridge_disabled {
-            return;
+        {
+            let disabled = self.state.lock().await.tychat_bridge_disabled;
+            if disabled {
+                service.bridge.shutdown().await;
+                return;
+            }
         }
         let service = self.state.lock().await.tychat.clone();
         service.bridge.start(self.clone(), service.clone()).await;
@@ -443,36 +422,34 @@ impl HostHandle {
 
     pub(super) async fn reconcile_tychat(&self, reset: bool) -> Result<(), String> {
         let service = self.state.lock().await.tychat.clone();
-        let _guard = service.lifecycle.lock().await;
-        let settings = self.state.lock().await.settings_store.get()?;
-        let (paired, saved, live) = {
-            let state = service.state.lock().await;
-            (
-                state.journal.pairing.is_some(),
-                state.journal.session.clone(),
-                state.snapshot.agent_id.clone(),
-            )
-        };
+        service
+            .lifecycle(self.clone(), |reply| Lifecycle::Reconcile { reset, reply })
+            .await?
+    }
+
+    pub(crate) async fn reconcile_tychat_owned(&self, reset: bool) -> Result<(), String> {
+        let service = self.state.lock().await.tychat.clone();
+        let settings_store = self.state.lock().await.settings_store.clone();
+        let settings = settings_store.get()?;
+        let paired = service.pairing().await?.is_some();
+        let (saved, live) = service.reconcile_state().await?;
+        tracing::info!(
+            paired,
+            enabled = settings.tychat.enabled,
+            saved_session = saved.is_some(),
+            live_agent = live.is_some(),
+            reset,
+            "Tychat lifecycle reconciliation started"
+        );
         if !paired || !settings.tychat.enabled {
             if reset {
                 return Err("Enable and pair Tychat before resetting its agent".into());
             }
             if let Some(id) = live {
-                self.close_agent_with_host_visibility(&id, false)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.close_tychat_agent(&id, TychatCloseReason::Disabled)
+                    .await?;
             }
-            let mut state = service.state.lock().await;
-            let changed = state.snapshot.agent_id.is_some()
-                || state.snapshot.settings_application != TychatSettingsApplication::Inactive
-                || state.typing;
-            state.snapshot.agent_id = None;
-            state.snapshot.settings_application = TychatSettingsApplication::Inactive;
-            state.typing = false;
-            drop(state);
-            if changed {
-                service.notify();
-            }
+            service.update(Update::ClearAgent { reset: false }).await?;
             return Ok(());
         }
         if live.is_none() || reset {
@@ -493,11 +470,18 @@ impl HostHandle {
                 .map_err(|error| error.message)?;
             }
         }
+        if saved.is_none() || reset {
+            let custom_store = self.state.lock().await.custom_agent_store.clone();
+            let custom_agents = custom_store.lock().await.clone();
+            let custom_exists = match settings.tychat.custom_agent_id.as_ref() {
+                Some(id) => custom_agents.get(id).is_some(),
+                None => true,
+            };
+            let state = self.state.lock().await;
+            validate_tychat_settings(&state, &settings, custom_exists)?;
+        }
         let desired_profile = {
             let state = self.state.lock().await;
-            if saved.is_none() || reset {
-                validate_tychat_settings(&state, &settings).await?;
-            }
             settings
                 .tychat
                 .launch_profile_id
@@ -512,9 +496,8 @@ impl HostHandle {
         };
         if let Some(id) = live {
             if reset {
-                self.close_agent_with_host_visibility(&id, false)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.close_tychat_agent(&id, TychatCloseReason::Reset)
+                    .await?;
             } else {
                 let saved = saved.ok_or("Tychat live session has no durable binding")?;
                 let mut application = if saved.settings.backend_kind != settings.tychat.backend_kind
@@ -552,30 +535,31 @@ impl HostHandle {
                     values.0.extend(settings.tychat.session_settings.0.clone());
                     match handle.apply_tychat_settings(values).await {
                         Ok(true) => {
-                            let mut state = service.state.lock().await;
-                            let mut journal = state.journal.clone();
-                            if let Some(session) = journal.session.as_mut() {
-                                session.settings = settings.tychat.clone();
-                            }
-                            state.commit(journal)?;
+                            service
+                                .update(Update::Application {
+                                    settings: Some(settings.tychat.clone()),
+                                    application: TychatSettingsApplication::Live,
+                                })
+                                .await?;
                         }
                         Ok(false) => application = TychatSettingsApplication::AppliesOnReset,
                         Err(reason) => application = TychatSettingsApplication::Failed { reason },
                     }
                 }
-                service.state.lock().await.snapshot.settings_application = application;
-                service.notify();
+                service
+                    .update(Update::Application {
+                        settings: None,
+                        application,
+                    })
+                    .await?;
                 return Ok(());
             }
         }
         if reset {
-            let mut state = service.state.lock().await;
-            let mut journal = state.journal.clone();
-            journal.session = None;
-            state.commit(journal)?;
-            state.snapshot.agent_id = None;
+            service.update(Update::ClearAgent { reset: true }).await?;
         }
         let saved = if reset { None } else { saved };
+        let restoring = saved.is_some();
         let backend = settings
             .tychat
             .backend_kind
@@ -617,7 +601,10 @@ impl HostHandle {
                 AgentOrigin::Tychat,
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                tracing::warn!(code = ?error.code(), restoring, "Tychat lifecycle spawn failed");
+                error.to_string()
+            })?;
         let handle = self
             .state
             .lock()
@@ -628,27 +615,17 @@ impl HostHandle {
         let session_id = match handle.wait_for_tychat_startup().await {
             Ok(session_id) => session_id,
             Err(error) => {
-                self.close_agent_with_host_visibility(&id, false)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                return Err(error);
+                tracing::warn!(failure = ?error, restoring, "Tychat lifecycle startup failed");
+                self.close_tychat_agent(&id, TychatCloseReason::StartupFailed)
+                    .await?;
+                return Err(error.message().into());
             }
         };
-        let mut state = service.state.lock().await;
-        let mut journal = state.journal.clone();
         let (effective, launch_profile) = match saved {
             Some(session) => (session.settings, session.launch_profile),
             None => (settings.tychat.clone(), desired_profile.clone()?),
         };
-        journal.session = Some(Session {
-            agent_id: id.clone(),
-            session_id,
-            settings: effective.clone(),
-            launch_profile: launch_profile.clone(),
-        });
-        state.commit(journal)?;
-        state.snapshot.agent_id = Some(id.clone());
-        state.snapshot.settings_application = if effective == settings.tychat
+        let application = if effective == settings.tychat
             && desired_profile
                 .as_ref()
                 .is_ok_and(|profile| profile == &launch_profile)
@@ -657,24 +634,45 @@ impl HostHandle {
         } else {
             TychatSettingsApplication::AppliesOnReset
         };
-        drop(state);
-        let activity = {
-            let host = self.state.lock().await;
-            host.registry
-                .agent_status_handle(&id)
-                .ok_or("Tychat status is missing")?
-                .snapshot()
-                .await
-                .activity()
-        };
-        let projected_typing = service.state.lock().await.typing;
-        tracing::info!(
-            ?activity,
-            projected_typing,
-            "Tychat initial activity projection"
-        );
+        service
+            .update(Update::Admit {
+                session: Session {
+                    agent_id: id.clone(),
+                    session_id,
+                    settings: effective,
+                    launch_profile,
+                },
+                application,
+            })
+            .await?;
+        tracing::info!(restoring, "Tychat lifecycle session admitted");
+        let status = self
+            .state
+            .lock()
+            .await
+            .registry
+            .agent_status_handle(&id)
+            .ok_or("Tychat status is missing")?;
+        let activity = status.snapshot().await.activity();
+        tracing::info!(?activity, "Tychat initial activity projection");
         self.fan_out_agent_turn_state(&id).await;
-        service.notify();
+        Ok(())
+    }
+
+    async fn close_tychat_agent(
+        &self,
+        id: &AgentId,
+        reason: TychatCloseReason,
+    ) -> Result<(), String> {
+        tracing::info!(?reason, "Tychat lifecycle close requested");
+        let closed = self
+            .close_agent_with_host_visibility(id, false)
+            .await
+            .map_err(|error| {
+                tracing::warn!(?reason, "Tychat lifecycle close failed");
+                error.to_string()
+            })?;
+        tracing::info!(?reason, closed, "Tychat lifecycle close settled");
         Ok(())
     }
 }

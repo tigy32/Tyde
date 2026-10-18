@@ -5080,39 +5080,83 @@ async fn project_watcher_follows_worktree_git_metadata() {
     fs::write(worktree.join("source.rs"), "modified\n").unwrap();
     expect_watched_change(&mut fixture.client, "source.rs").await;
     let root = ProjectRootPath(project_root(&project, 0));
+    let git_dir =
+        std::path::PathBuf::from(git_stdout(&worktree, &["rev-parse", "--absolute-git-dir"]));
+    let index_processed = fixture.on_project_scan(
+        git_dir.join("index"),
+        server::ScanPoint::WatcherProcessed,
+        || eprintln!("WORKTREE_METADATA phase=index native_processed=true"),
+    );
+    eprintln!("WORKTREE_METADATA phase=index command=begin");
     git(&worktree, &["add", "source.rs"]);
+    eprintln!("WORKTREE_METADATA phase=index command=complete protocol_wait=begin");
     (expect_project_git_status_matching(&mut fixture.client, "worktree index update", |status| {
-        status.roots.iter().any(|entry| {
+        let staged = status.roots.iter().any(|entry| {
             entry.root == root
                 && entry
                     .files
                     .iter()
                     .any(|file| file.relative_path == "source.rs" && file.staged.is_some())
-        })
+        });
+        eprintln!(
+            "WORKTREE_METADATA phase=index protocol_staged={staged} roots={}",
+            status.roots.len()
+        );
+        staged
     }))
     .await;
+    eprintln!("WORKTREE_METADATA phase=index protocol_wait=complete");
+    drop(index_processed);
+    let head_processed = fixture.on_project_scan(
+        git_dir.join("HEAD"),
+        server::ScanPoint::WatcherProcessed,
+        || eprintln!("WORKTREE_METADATA phase=head native_processed=true"),
+    );
+    eprintln!("WORKTREE_METADATA phase=head command=begin");
     git(&worktree, &["branch", "-m", "renamed-watch-branch"]);
+    eprintln!("WORKTREE_METADATA phase=head command=complete protocol_wait=begin");
     (expect_project_git_status_matching(&mut fixture.client, "worktree HEAD update", |status| {
-        status.roots[0].branch.as_deref() == Some("renamed-watch-branch")
+        let renamed = status.roots[0].branch.as_deref() == Some("renamed-watch-branch");
+        eprintln!(
+            "WORKTREE_METADATA phase=head protocol_renamed={renamed} roots={}",
+            status.roots.len()
+        );
+        renamed
     }))
     .await;
+    eprintln!("WORKTREE_METADATA phase=head protocol_wait=complete");
+    drop(head_processed);
+    let commit_processed = fixture.on_project_scan(
+        git_dir.join("HEAD"),
+        server::ScanPoint::WatcherProcessed,
+        || eprintln!("WORKTREE_METADATA phase=commit native_processed=true"),
+    );
     let old_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    eprintln!("WORKTREE_METADATA phase=commit command=begin");
     git(
         &worktree,
         &["commit", "-m", "Advance staged source for ref watches"],
     );
+    eprintln!("WORKTREE_METADATA phase=commit command=complete protocol_wait=begin");
     let new_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
     assert_ne!(old_head, new_head, "staged source must advance HEAD");
     expect_project_git_status_matching(
         &mut fixture.client,
         "committed worktree source",
         |status| {
-            status.roots.iter().any(|entry| {
+            let advanced = status.roots.iter().any(|entry| {
                 entry.root == root && entry.head_oid.as_deref() == Some(new_head.as_str())
-            })
+            });
+            eprintln!(
+                "WORKTREE_METADATA phase=commit protocol_advanced={advanced} roots={}",
+                status.roots.len()
+            );
+            advanced
         },
     )
     .await;
+    eprintln!("WORKTREE_METADATA phase=commit protocol_wait=complete");
+    drop(commit_processed);
     git(
         &worktree,
         &["config", "branch.renamed-watch-branch.remote", "."],
@@ -5129,72 +5173,91 @@ async fn project_watcher_follows_worktree_git_metadata() {
             ("rewind", Some(old_head.as_str()), 1),
             ("delete", None, 0),
         ] {
-            // A new ref directory can contain files before its watch exists.
-            // Observe that directory's completed reconciliation on creation;
-            // all other steps observe the actual ref leaf's completed event.
+            // The failed run awaited a ref acknowledgement through overflow recovery.
+            // Hold a real queue full to prove protocol completion does not need
+            // an individual native-path acknowledgement.
             #[cfg(target_os = "linux")]
-            let (reconciliation, processed, mut reconciled_rx, processed_rx) = {
-                let path = repo
-                    .path()
-                    .join(".git")
-                    .join(if leaf != "flat" && phase == "create" {
-                        "refs/heads/nested"
-                    } else {
-                        &reference
-                    });
-                let (reconciled_tx, reconciled_rx) = tokio::sync::oneshot::channel();
-                let reconciliation = fixture.on_project_scan(
-                    path.clone(),
-                    server::ScanPoint::WatcherReconcile,
+            let overflow_case = if leaf == "flat" && phase == "create" {
+                let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocked = fixture.on_project_scan(
+                    worktree.clone(),
+                    server::ScanPoint::WatcherProcess,
                     move || {
-                        let _ = reconciled_tx.send(());
+                        let _ = blocked_tx.send(());
+                        release_rx.recv().expect("release held worktree watcher");
                     },
                 );
-                let (processed_tx, processed_rx) = tokio::sync::oneshot::channel();
-                let processed =
-                    fixture.on_project_scan(path, server::ScanPoint::WatcherProcessed, move || {
-                        let _ = processed_tx.send(());
-                    });
-                (reconciliation, processed, reconciled_rx, processed_rx)
+                fs::write(worktree.join("source.rs"), "modified\n").unwrap();
+                blocked_rx.await.expect("real worktree worker held");
+                let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+                let overflow = fixture.on_project_scan(
+                    worktree.join("burst-299.rs"),
+                    server::ScanPoint::WatcherDropped,
+                    move || {
+                        let _ = overflow_tx.send(());
+                    },
+                );
+                for index in 0..300 {
+                    fs::write(worktree.join(format!("burst-{index}.rs")), "burst\n").unwrap();
+                }
+                overflow_rx.await.expect("real worktree queue overflowed");
+                eprintln!("WORKTREE_METADATA phase=ref queue_overflow=observed");
+                let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+                let dropped = fixture.on_project_scan(
+                    repo.path().join(".git").join(&reference),
+                    server::ScanPoint::WatcherDropped,
+                    move || {
+                        let _ = dropped_tx.send(());
+                    },
+                );
+                Some((blocked, overflow, dropped, release_tx, dropped_rx))
+            } else {
+                None
             };
+            eprintln!(
+                "WORKTREE_METADATA phase=ref operation={phase} nested={} command=begin",
+                leaf != "flat"
+            );
             match target {
                 Some(target) => git(&worktree, &["update-ref", &reference, target]),
                 None => git(&worktree, &["update-ref", "-d", &reference]),
             }
+            eprintln!("WORKTREE_METADATA phase=ref operation={phase} command=complete");
             #[cfg(target_os = "linux")]
-            {
-                processed_rx.await.expect("real ref event completed");
-                let reconciled = match reconciled_rx.try_recv() {
-                    Ok(()) => true,
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        panic!("reconciliation observer closed before event completion")
-                    }
-                };
-                let directory_created = leaf != "flat" && phase == "create";
-                eprintln!(
-                    "worktree ref event: phase={phase} directory_created={directory_created} reconciled={reconciled}"
-                );
-                assert_eq!(
-                    reconciled, directory_created,
-                    "ref leaves must refresh Git without rebuilding inventory; new ref directories must reconcile"
-                );
-                drop((reconciliation, processed));
+            if let Some((blocked, overflow, dropped, release_tx, dropped_rx)) = overflow_case {
+                dropped_rx
+                    .await
+                    .expect("actual ref event dropped by the full queue");
+                eprintln!("WORKTREE_METADATA phase=ref operation={phase} native_dropped=observed");
+                for index in 0..300 {
+                    fs::remove_file(worktree.join(format!("burst-{index}.rs"))).unwrap();
+                }
+                release_tx
+                    .send(())
+                    .expect("release overflowing worktree worker");
+                drop((blocked, overflow, dropped));
             }
+            eprintln!(
+                "WORKTREE_METADATA phase=ref operation={phase} protocol_wait=begin expected_ahead={ahead}"
+            );
             let status = expect_project_git_status_matching(
                 &mut fixture.client,
                 "shared upstream ref change",
                 |status| {
-                    status.roots.iter().any(|entry| {
+                    let matched = status.roots.iter().any(|entry| {
                         entry.root == root
                             && entry.branch.as_deref() == Some("renamed-watch-branch")
                             && entry.head_oid.as_deref() == Some(new_head.as_str())
                             && entry.ahead == ahead
                             && entry.behind == 0
-                    })
+                    });
+                    eprintln!("WORKTREE_METADATA phase=ref operation={phase} protocol_matched={matched} roots={}", status.roots.len());
+                    matched
                 },
             )
             .await;
+            eprintln!("WORKTREE_METADATA phase=ref operation={phase} protocol_wait=complete");
             assert_eq!(status.roots.len(), 1, "exact linked-worktree status root");
         }
     }

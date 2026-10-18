@@ -3540,6 +3540,7 @@ pub mod scan_test_support {
         WatcherReconcile,
         WatcherProcessed,
         WatcherOverflow,
+        WatcherDropped,
         WatcherFailure,
         WatcherUnwatchFailed,
         WatcherDispatch,

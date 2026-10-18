@@ -35,6 +35,30 @@ restore-agents preference. Session ownership remains recorded after reset or
 unpair, so archived sessions cannot be adopted as another Tychat agent. Resume
 failure is visible, never an implicit fresh conversation.
 
+The agent publishes one internal typed startup outcome: success with its
+session, or failure with a category. Success follows required replay
+reconciliation and input admission. Tychat and Swarm consume that outcome;
+neither reconstructs it from a cancellation token, admission flag or snapshot.
+The earlier session-binding notification only registers the session with the
+host, before replay, and is not a second completion authority. Startup failure,
+close and cancellation settle consumers without a local deadline. This is
+construction completion, not another working/idle lifecycle.
+
+A Tychat actor owns the journal, published state, process lock and serial
+lifecycle operation queue. External host/agent work is polled alongside the
+mailbox, so persistence can complete while startup or delivery is outstanding.
+No Tychat state/lifecycle mutex or Host guard spans those awaits. Existing
+host-wide settings/catalog/registry synchronization is outside this ownership
+boundary; handles are obtained under short Host access and awaited separately.
+Unpair holds a transport-disconnection lease outside the lifecycle queue until
+erasure completes. A Pair already pending can finish installation without
+reconnecting transport between disconnection and erasure. Ownership transfers
+with the queued command, so requester cancellation cannot release it early.
+Bridge shutdown settles the hold through the stop event.
+Lifecycle diagnostics record restore
+admission, typed close/failure categories and presence/count metadata without
+session identities, settings, credentials or conversation content.
+
 Agent-control and await MCP are always injected, even when ordinary injection
 is disabled. The agent always runs unrestricted. It runs as the custom agent
 chosen in settings, by default the builtin **Tyde Operator** (id `tyde-help`,
@@ -189,7 +213,7 @@ pub async fn tychat_state(&self) -> TychatStatePayload;
 pub async fn subscribe_tychat(&self) -> watch::Receiver<u64>;
 pub async fn tychat_bot_state(
     &self,
-) -> Option<(TychatPairingId, String, SecretBotState)>;
+) -> Result<Option<(TychatPairingId, String, SecretBotState)>, String>;
 pub async fn install_tychat_pairing(
     &self,
     secret: SecretBotState,
@@ -231,6 +255,9 @@ before publishing them. Only Connected admits inbound messages.
 
 Subscribe before reading settings/state/outbound snapshots. A watch revision is
 a wake to reread current state, not a transport event or a polling interval.
+Paired settings changes also wake the owner even when its agent projection is
+unchanged, so disabling an agentless bridge still stops transport. Unpaired
+no-op reconciliation and unchanged SDK persistence do not publish revisions.
 Persist SDK StateChanged snapshots through `persist_tychat_bot_state`; pass only
 verified OwnerMessage events into `deliver_tychat_message`. Send pending outbox
 items using their existing IDs; acknowledge each only after SDK success. The
@@ -282,6 +309,17 @@ group is owned by the test and killed on success or failure.
   forced MCP, close/archive protections, live and reset-only settings, backend
   filtering, disable/re-enable, pending backend change across restart, fresh
   reset, paused delivery, secret permissions and unpair erasure.
+  Explicit actor-settling, completion-pending and release events reproduce
+  restart before eager clients reconnect. A lazy protocol observer verifies
+  that binding remains unpublished while held and persistence stays responsive.
+  After release, the real protocol must retain exactly one canonical agent. Startup failure and stream closure before replay settle
+  explicitly while preserving the saved session, without implicit recreation.
+* `private_journal_creation_replacement_and_unpair_survive_restart`: durable
+  journal replacement, explicit disconnect error after actual bridge task
+  cancellation (preserving pairing and canonical session), and successful
+  unpair after normal bridge termination on a host persistence failure.
+  Restart proves durable erasure. Invalid fixture-only SDK state prevents
+  any network access.
 * `always_steer_and_outbox_survive_restart`: idle start, held-turn steering,
   typed message origin, inbound deduplication, no queue, server typing,
   deterministic final ID/body, restart replay and durable acknowledgement.

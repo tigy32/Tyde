@@ -203,9 +203,26 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
         .expect("release actual frontend readiness");
     let result = start.as_mut().await.expect("call tyde_dev_instance_start");
     drop(start);
+    let startup_error = result
+        .content
+        .iter()
+        .filter_map(|content| match &content.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         desktop_marker.exists(),
-        "desktop did not start after frontend became ready"
+        "desktop did not start after frontend became ready: tool_error={} frontend_exit={} frontend_connection={} frontend_response={} frontend_index={} port_in_use={} desktop_spawn={} cli_missing={}",
+        result.is_error == Some(true),
+        startup_error.contains("dev frontend exited before ready"),
+        startup_error.contains("frontend connection failed"),
+        startup_error.contains("frontend readiness"),
+        startup_error.contains("frontend initial build did not serve"),
+        startup_error.contains("Address already in use"),
+        startup_error.contains("failed to spawn Tyde dev instance"),
+        startup_error.contains("cargo-tauri was not found"),
     );
     let mut byte = [0];
     assert_eq!(
