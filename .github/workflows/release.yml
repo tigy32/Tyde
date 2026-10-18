@@ -153,7 +153,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
             curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
             librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config \
-            patchelf musl-tools zip mold
+            patchelf musl-tools zip mold xvfb dbus-x11
 
       - name: Install macOS tools
         if: startsWith(matrix.platform, 'macos')
@@ -360,17 +360,29 @@ jobs:
           # MSI rejects semver prerelease labels; stable Windows builds still use all bundles.
           args: ${{ matrix.tauri-args }}${{ matrix.platform == 'windows-latest' && contains(env.RELEASE_TAG, '-') && ' --bundles nsis' || '' }}
 
-      - name: Smoke test Windows desktop startup
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: tools/smoke_windows_release.ps1 -Binary "target/${{ matrix.rust-target }}/release/tyde.exe" -ExpectedVersion "$env:RELEASE_TAG" -LogDirectory "$env:RUNNER_TEMP/windows-startup"
+      - name: Smoke test desktop startup
+        shell: bash
+        run: |
+          binary="target/${{ matrix.rust-target }}/release/tyde"
+          launcher=()
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            binary="${binary}.exe"
+          elif [[ "$RUNNER_OS" == macOS ]]; then
+            binary="target/${{ matrix.rust-target }}/release/bundle/macos/Tyde.app/Contents/MacOS/tyde"
+          elif [[ "$RUNNER_OS" == Linux ]]; then
+            launcher=(xvfb-run --auto-servernum dbus-run-session --)
+          fi
+          "${launcher[@]}" python tools/smoke_desktop_release.py \
+            --binary "$binary" \
+            --expected-version "$RELEASE_TAG" \
+            --log-directory "$RUNNER_TEMP/desktop-startup"
 
-      - name: Retain Windows startup logs
-        if: always() && matrix.platform == 'windows-latest'
+      - name: Retain desktop startup logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-startup-release
-          path: ${{ runner.temp }}/windows-startup/*.log
+          name: desktop-startup-${{ matrix.rust-target }}
+          path: ${{ runner.temp }}/desktop-startup/
           if-no-files-found: ignore
           retention-days: 7
 

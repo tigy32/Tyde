@@ -39,7 +39,9 @@ try {
     $started = $true
     $stderr = $process.StandardError.ReadToEndAsync()
     $elapsed = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
+    $frontendReady = $false
+    $hostReady = $false
+    while (-not ($frontendReady -and $hostReady)) {
         $remaining = 600000 - [int]$elapsed.ElapsedMilliseconds
         $line = $process.StandardOutput.ReadLineAsync()
         if ($remaining -le 0 -or -not $line.Wait($remaining)) {
@@ -48,10 +50,11 @@ try {
         $text = $line.GetAwaiter().GetResult()
         if ($null -eq $text) {
             $process.WaitForExit()
-            throw "Windows desktop exited before frontend readiness (exit $($process.ExitCode))"
+            throw "Windows desktop exited before frontend and local host readiness (exit $($process.ExitCode))"
         }
         $stdout.Add($text)
-        if ($text.Contains('webview.lifecycle event=frontend_ready label=main ')) { break }
+        $frontendReady = $frontendReady -or $text.Contains('webview.lifecycle event=frontend_ready label=main ')
+        $hostReady = $hostReady -or $text.Contains('proxy router received line from host')
     }
     $lock = Join-Path $storeHome '.tyde/tychat-secrets.lock'
     $acl = Get-Acl $lock
@@ -68,10 +71,10 @@ try {
     if ($process.WaitForExit(5000)) {
         throw "Windows desktop exited after frontend readiness (exit $($process.ExitCode))"
     }
-    Write-Host 'PASS Windows desktop startup, frontend readiness, and private store ACL'
+    Write-Host 'PASS Windows desktop startup, frontend and local host readiness, and private store ACL'
     $passed = $true
 } finally {
-    if ($started -and -not $process.HasExited) { $process.Kill() }
+    if ($started -and -not $process.HasExited) { $process.Kill($true) }
     if ($stderr) {
         $process.WaitForExit()
         $stdout.Add($process.StandardOutput.ReadToEnd())

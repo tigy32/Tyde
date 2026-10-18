@@ -72,7 +72,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
             curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
             librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config \
-            patchelf musl-tools zip mold
+            patchelf musl-tools zip mold xvfb dbus-x11
 
       - name: Provision native audio build tools
         shell: bash
@@ -128,7 +128,17 @@ jobs:
         working-directory: frontend/tauri-shell
         run: npx --prefix ../.. tauri build --target ${{ matrix.rust-target }} --no-bundle
 
-      - name: Smoke test Windows desktop startup
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: tools/smoke_windows_release.ps1 -Binary "target/${{ matrix.rust-target }}/release/tyde.exe" -ExpectedVersion (Get-Content package.json | ConvertFrom-Json).version -LogDirectory "$env:RUNNER_TEMP/windows-startup"
+      - name: Smoke test desktop startup
+        shell: bash
+        run: |
+          binary="target/${{ matrix.rust-target }}/release/tyde"
+          launcher=()
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            binary="${binary}.exe"
+          elif [[ "$RUNNER_OS" == Linux ]]; then
+            launcher=(xvfb-run --auto-servernum dbus-run-session --)
+          fi
+          "${launcher[@]}" python tools/smoke_desktop_release.py \
+            --binary "$binary" \
+            --expected-version "$(node -p "require('./package.json').version")" \
+            --log-directory "$RUNNER_TEMP/desktop-startup"
