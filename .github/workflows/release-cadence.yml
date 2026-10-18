@@ -114,6 +114,7 @@ jobs:
         run: |
           cargo install sccache --version 0.16.0 --locked --force
           test "$(sccache --version)" = "sccache 0.16.0"
+          echo "RUSTC_WRAPPER=$(command -v sccache)" >> "$GITHUB_ENV"
 
       - name: Rust cache
         if: needs.plan.outputs.action == 'promote'

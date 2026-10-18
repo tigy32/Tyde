@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Install in CARGO_HOME/bin so isolated dev-instance HOME values do not select
+# another cache. Cargo and dev.sh both read this one host-owned environment.
+environment="${SCCACHE_BUILD_ENV:-$(dirname "$0")/../sccache-env}"
+while IFS= read -r name; do
+    [[ "$name" == SCCACHE_* ]] && unset "$name"
+done < <(compgen -e)
+source "$environment"
+: "${SCCACHE_EXECUTABLE:?Set SCCACHE_EXECUTABLE in sccache-env}"
+: "${SCCACHE_DIR:?Set SCCACHE_DIR in sccache-env}"
+: "${SCCACHE_CACHE_SIZE:?Set SCCACHE_CACHE_SIZE in sccache-env}"
+: "${SCCACHE_SERVER_PORT:?Set SCCACHE_SERVER_PORT in sccache-env}"
+exec "$SCCACHE_EXECUTABLE" "$@"

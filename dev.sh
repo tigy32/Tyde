@@ -12,7 +12,6 @@ readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
 readonly DEV_CHECK_LOG_RETENTION=8
 readonly DEV_CHECK_CACHE_RETENTION=64
 readonly DEV_CHECK_CACHE_TEMP_MAX_AGE_MINUTES=1440
-readonly DEV_CHECK_SCCACHE_ROOT="${DEV_CHECK_SCCACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/tyde-dev-check-sccache}"
 readonly DEV_CHECK_SCCACHE_VERSION="0.16.0"
 
 DEV_CHECK_CACHE_DIR=""
@@ -85,7 +84,7 @@ finish_on_exit() {
             "$((finished_epoch - RUN_STARTED_EPOCH))" >>"$RUN_METADATA"
         record_disk_snapshot finish 2>/dev/null || true
         if [[ "$SCCACHE_CONFIGURED" == true ]]; then
-            if sccache --show-stats --stats-format=json \
+            if "$RUSTC_WRAPPER" --show-stats --stats-format=json \
                 >"$RUN_DIR/sccache-failure.json" 2>/dev/null; then
                 printf 'sccache.failure_stats=%s\n' \
                     "$PWD/$RUN_DIR/sccache-failure.json" >>"$RUN_METADATA"
@@ -443,102 +442,73 @@ prepare_rust_toolchain() {
 }
 
 set_sccache_environment() {
-    local executable repository_hash port name common_dir size_gib status namespace
+    local environment="${SCCACHE_BUILD_ENV:-${CARGO_HOME:-$HOME/.cargo}/sccache-env}"
 
-    if size_gib="$(git config --local --get tyde.sccacheSizeGiB)"; then
-        [[ "$size_gib" =~ ^[1-9][0-9]{0,3}$ ]] ||
-            die "tyde.sccacheSizeGiB must be an integer from 1 to 9999 (GiB)"
-    else
-        status=$?
-        [[ "$status" == 1 ]] || die "could not read repository sccache size"
-        size_gib=10
+    if [[ -n "${SCCACHE_BUILD_ENV:-}" || -e "$environment" ]]; then
+        [[ -f "$environment" ]] || die "sccache build environment is missing: $environment"
+        source "$environment"
     fi
-    if namespace="$(git config --local --get tyde.sccacheNamespace)"; then
-        [[ "$namespace" =~ ^[a-zA-Z0-9_-]{1,64}$ ]] ||
-            die "tyde.sccacheNamespace must contain 1 to 64 letters, digits, underscores, or hyphens"
-    else
-        status=$?
-        [[ "$status" == 1 ]] || die "could not read repository sccache namespace"
-        namespace=""
-    fi
-    readonly DEV_CHECK_SCCACHE_SIZE="${size_gib}G"
-    readonly DEV_CHECK_SCCACHE_SIZE_BYTES=$((size_gib * 1073741824))
-
-    command -v sccache >/dev/null 2>&1 ||
-        die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
-    executable="$(command -v sccache)"
-    # Key the cache by the repository rather than the worktree. sccache is
-    # content-addressed, so worktrees can reuse matching entries and share one
-    # size cap. Rust still hashes its working directory: sharing storage does
-    # not make workspace crates cache-compatible across checkout paths.
-    common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" ||
-        die "dev.sh check must run inside a Git repository"
-    common_dir="$(cd "$common_dir" && pwd)"
-    if [[ -n "$namespace" ]]; then
-        repository_hash="$(printf '%s\n%s' "$common_dir" "$namespace" | hash_text)"
-    else
-        repository_hash="$(printf '%s' "$common_dir" | hash_text)"
-    fi
-    port=$((20000 + 16#${repository_hash:0:8} % 30000))
-
-    while IFS= read -r name; do
-        [[ "$name" == SCCACHE_* ]] && unset "$name"
-    done < <(compgen -e)
-    export SCCACHE_DIR="$DEV_CHECK_SCCACHE_ROOT/$repository_hash"
-    export SCCACHE_CACHE_SIZE="$DEV_CHECK_SCCACHE_SIZE"
-    export SCCACHE_IDLE_TIMEOUT=600
-    export SCCACHE_SERVER_PORT="$port"
-    export RUSTC_WRAPPER="$executable"
+    [[ -n "${RUSTC_WRAPPER:-}" ]] ||
+        die "sccache host environment is required: $environment. Install tools/host-sccache and its environment, or explicitly set RUSTC_WRAPPER for all builds"
     export CARGO_INCREMENTAL=0
 }
 
 configure_sccache() {
-    local executable stats validation_script
+    local stats validation_script
 
-    executable="$RUSTC_WRAPPER"
-    mkdir -p "$SCCACHE_DIR"
-
-    printf 'sccache.server_port=%s\n' "$SCCACHE_SERVER_PORT" >>"$RUN_METADATA"
-    printf 'sccache.requested_max_bytes=%s\n' "$DEV_CHECK_SCCACHE_SIZE_BYTES" >>"$RUN_METADATA"
+    printf 'sccache.server_port=%s\n' "${SCCACHE_SERVER_PORT:-4226}" >>"$RUN_METADATA"
+    printf 'sccache.server_uds=%s\n' "${SCCACHE_SERVER_UDS:-}" >>"$RUN_METADATA"
     run_stage "Verify pinned sccache" 1 bash -c \
-        'actual="$(sccache --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s. Install with: cargo install sccache --version %s --locked\n" "$1" "$actual" "$1" >&2; exit 1; }' \
+        'actual="$("$RUSTC_WRAPPER" --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s. Install with: cargo install sccache --version %s --locked\n" "$1" "$actual" "$1" >&2; exit 1; }' \
         _ "$DEV_CHECK_SCCACHE_VERSION"
-    run_stage "Connect pinned local sccache" 1 \
-        sccache --show-stats --stats-format=json
+    run_stage "Connect shared sccache" 1 \
+        "$RUSTC_WRAPPER" --show-stats --stats-format=json
     SCCACHE_CONFIGURED=true
     stats="$RUN_DIR/sccache-before.json"
     validation_script="$(cat <<'SCRIPT'
 set -euo pipefail
-sccache --show-stats --stats-format=json > "$1"
-python3 - "$1" "$2" "$3" <<'PY'
+"$RUSTC_WRAPPER" --show-stats --stats-format=json > "$1"
+python3 - "$1" "$2" <<'PYTHON'
 import json
+import os
 import pathlib
+import re
 import sys
 
-stats_path, cache_dir, expected_size = sys.argv[1:]
-with open(stats_path, encoding="utf-8") as source:
+with open(sys.argv[1], encoding="utf-8") as source:
     data = json.load(source)
-expected_location = f'Local disk: "{pathlib.Path(cache_dir)}"'
-if data.get("cache_location") != expected_location:
-    raise SystemExit(
-        f"sccache is not using the check-local cache: {data.get('cache_location')!r}"
-    )
-if data.get("max_cache_size") != int(expected_size):
-    raise SystemExit(
-        f"sccache cache limit is {data.get('max_cache_size')!r}, expected {expected_size}. "
-        "Let all repository builds finish, then stop the repository's sccache "
-        "server using the SCCACHE_SERVER_PORT in this run's logs and retry."
-    )
-PY
+location = data.get("cache_location", "")
+if not location.startswith('Local disk: "') or not location.endswith('"'):
+    raise SystemExit(f"sccache must use a shared local disk cache: {location!r}")
+cache_dir = location[len('Local disk: "'):-1]
+if requested_dir := os.environ.get("SCCACHE_DIR"):
+    if pathlib.Path(cache_dir) != pathlib.Path(requested_dir):
+        raise SystemExit(f"sccache is not using the configured shared cache: {location!r}")
+size = data.get("max_cache_size")
+if not isinstance(size, int) or size <= 0:
+    raise SystemExit(f"sccache did not report a positive local cache limit: {size!r}")
+if requested_size := os.environ.get("SCCACHE_CACHE_SIZE"):
+    match = re.fullmatch(r"([0-9]+)([KMGT]?)", requested_size.upper())
+    if not match:
+        raise SystemExit(f"invalid SCCACHE_CACHE_SIZE: {requested_size!r}")
+    expected = int(match[1]) * 1024 ** (" KMGT".index(match[2]) if match[2] else 0)
+    if size != expected:
+        raise SystemExit(
+            f"sccache cache limit is {size}, expected {expected}. "
+            "Let all host builds finish before reconfiguring the shared daemon; "
+            "never stop it underneath other builds."
+        )
+with open(sys.argv[2], "a", encoding="utf-8") as metadata:
+    metadata.write(f"sccache.directory={cache_dir}\n")
+    metadata.write(f"sccache.max_bytes={size}\n")
+PYTHON
 SCRIPT
 )"
-    run_stage "Validate pinned local sccache" 1 bash -c "$validation_script" \
-        _ "$stats" "$SCCACHE_DIR" "$DEV_CHECK_SCCACHE_SIZE_BYTES"
+    run_stage "Validate shared sccache" 1 bash -c "$validation_script" \
+        _ "$stats" "$RUN_METADATA"
     SCCACHE_STATS_BEFORE="$stats"
     printf 'sccache.version=%s\n' "$DEV_CHECK_SCCACHE_VERSION" >>"$RUN_METADATA"
-    printf 'sccache.executable=%s\n' "$executable" >>"$RUN_METADATA"
-    printf 'sccache.directory=%s\n' "$SCCACHE_DIR" >>"$RUN_METADATA"
-    printf 'sccache.max_bytes=%s\n' "$DEV_CHECK_SCCACHE_SIZE_BYTES" >>"$RUN_METADATA"
+    printf 'sccache.executable=%s\n' "$RUSTC_WRAPPER" >>"$RUN_METADATA"
     printf 'cargo.incremental=%s\n' "$CARGO_INCREMENTAL" >>"$RUN_METADATA"
 }
 
@@ -657,7 +627,7 @@ record_sccache_finish() {
     local after="$RUN_DIR/sccache-after.json"
     local metrics metrics_file="$RUN_DIR/sccache-metrics.txt"
     local error_log="$RUN_DIR/sccache-metrics-error.log"
-    if ! sccache --show-stats --stats-format=json >"$after" 2>"$error_log"; then
+    if ! "$RUSTC_WRAPPER" --show-stats --stats-format=json >"$after" 2>"$error_log"; then
         printf 'FAIL  Read final sccache statistics\n' >&2
         printf 'Complete diagnostics: %s\n' "$PWD/$error_log" >&2
         cat "$error_log" >&2
@@ -768,7 +738,7 @@ run_check_stages() {
     local repetitions="$1"
     local wasm_pid tail_pid wasm_status=0 tail_status=0 status
     local n_wasm n_loader n_docs n_contract
-    local native_temp_dir="$DEV_CHECK_SCCACHE_ROOT/native-tmp/$(printf '%s' "$PWD" | hash_text | cut -c 1-12)"
+    local native_temp_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tyde-native-tmp/$(printf '%s' "$PWD" | hash_text | cut -c 1-12)"
 
     run_stage "Test tooling syntax" 1 python3 -c 'from pathlib import Path; [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in Path("tools").glob("*.py")]'
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check

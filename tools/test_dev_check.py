@@ -1470,12 +1470,7 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
                 "DEV_CHECK_TEST_LOG": str(self.log),
                 "RUSTUP_TOOLCHAIN": "nightly",
                 "TMPDIR": str(pathlib.Path(self.temp.name) / "tmp"),
-                # Fixture repositories are deleted after each test, so their
-                # sccache directories must not be created under the developer's
-                # real cache root, where nothing would ever reclaim them.
-                "DEV_CHECK_SCCACHE_ROOT": str(
-                    pathlib.Path(self.temp.name) / "sccache-root"
-                ),
+                "SCCACHE_BUILD_ENV": str(pathlib.Path(self.temp.name) / "sccache-env"),
                 "CHROME": str(self.bin / "google-chrome"),
                 "CHROMEDRIVER": str(self.bin / "chromedriver"),
                 "WASM_BINDGEN_TEST_RUNNER": str(
@@ -1491,6 +1486,12 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
             }
         )
         pathlib.Path(self.env["TMPDIR"]).mkdir()
+        pathlib.Path(self.env["SCCACHE_BUILD_ENV"]).write_text(
+            f'export RUSTC_WRAPPER={shlex.quote(str(self.bin / "sccache"))}\n'
+            f'export SCCACHE_DIR={shlex.quote(str(pathlib.Path(self.temp.name) / "cache"))}\n'
+            'export SCCACHE_CACHE_SIZE=100G\nexport SCCACHE_SERVER_PORT=32123\n',
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -2833,26 +2834,17 @@ fi
     # the git worktree fingerprint, and python3 --version is no longer probed —
     # so the failure path that test pinned no longer exists by design.
 
-    def test_sccache_root_override_keeps_cache_out_of_the_home_cache(self) -> None:
-        self._git("config", "--local", "tyde.sccacheSizeGiB", "100")
+    def test_host_cache_is_shared_across_repositories_and_workbenches(self) -> None:
         env = self.env.copy()
         env["DEV_CHECK_SCCACHE_COUNTER_FILE"] = str(
             pathlib.Path(self.temp.name) / "sccache-calls"
         )
         self._run(env=env)
-
         run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
         metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
-        directory = next(
-            line.removeprefix("sccache.directory=")
-            for line in metadata.splitlines()
-            if line.startswith("sccache.directory=")
-        )
-
-        self.assertTrue(
-            directory.startswith(self.env["DEV_CHECK_SCCACHE_ROOT"]),
-            f"a temporary fixture wrote its sccache cache to {directory}",
-        )
+        original = dict(line.split("=", 1) for line in metadata.splitlines())
+        self.assertEqual(original["sccache.directory"], str(pathlib.Path(self.temp.name) / "cache"))
+        self.assertEqual(original["sccache.server_port"], "32123")
         self.assertIn("sccache.max_bytes=107374182400\n", metadata)
         metrics = (run_dir / "sccache-metrics.txt").read_text(encoding="utf-8")
         self.assertIn("max_cache_size=107374182400\n", metrics)
@@ -2864,41 +2856,46 @@ fi
         ):
             self.assertIn(f"{metric}\n", metrics)
 
-        # Changing capacity must not change the source-based validation key.
+        # Repository settings no longer select a private compiler cache.
         key = self._explain_key()
         self._git("config", "--local", "tyde.sccacheSizeGiB", "200")
+        self._git("config", "--local", "tyde.sccacheNamespace", "obsolete")
         self.assertEqual(self._explain_key(), key)
-        wrong_daemon = self.env.copy()
-        wrong_daemon["DEV_CHECK_FAKE_CACHE_SIZE_BYTES"] = str(100 * 1024**3)
+        other = pathlib.Path(self.temp.name) / "other-repository"
+        subprocess.run(["git", "clone", "--quiet", str(self.root), str(other)], check=True)
+        result = subprocess.run([str(other / "dev.sh"), "check"], env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        other_run = max((other / "target/dev-check-logs").glob("run-*"))
+        shared = dict(line.split("=", 1) for line in
+                      (other_run / "metadata.txt").read_text().splitlines())
+        for field in ("sccache.directory", "sccache.server_port", "sccache.max_bytes"):
+            self.assertEqual(shared[field], original[field])
+
+        configuration = pathlib.Path(self.env["SCCACHE_BUILD_ENV"])
+        configuration.write_text(configuration.read_text().replace("100G", "200G"))
+        wrong_daemon = dict(self.env, DEV_CHECK_FAKE_CACHE_SIZE_BYTES=str(100 * 1024**3))
         rejected = self._run(env=wrong_daemon, check=False)
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("expected 214748364800", rejected.stderr)
-        self.assertIn("Let all repository builds finish", rejected.stderr)
+        self.assertIn("Let all host builds finish", rejected.stderr)
 
-        self._git("config", "--local", "tyde.sccacheNamespace", "large-cache")
-        self.assertEqual(self._explain_key(), key)
-        self._run()
-        migrated_run = max((self.root / "target" / "dev-check-logs").glob("run-*"))
-        migrated = dict(
-            line.split("=", 1)
-            for line in (migrated_run / "metadata.txt").read_text(encoding="utf-8").splitlines()
+        # A broken global installation must not be concealed by overriding
+        # Cargo's launcher with bare sccache and connecting to a legacy daemon.
+        cargo_home = pathlib.Path(self.temp.name) / "cargo-home"
+        (cargo_home / "bin").mkdir(parents=True)
+        launcher = cargo_home / "bin/host-sccache"
+        shutil.copy2(REPO_ROOT / "tools/host-sccache", launcher)
+        (cargo_home / "config.toml").write_text(
+            f'[build]\nrustc-wrapper={json.dumps(str(launcher))}\n', encoding="utf-8"
         )
-        original = dict(line.split("=", 1) for line in metadata.splitlines())
-        self.assertNotEqual(migrated["sccache.directory"], directory)
-        self.assertNotEqual(migrated["sccache.server_port"], original["sccache.server_port"])
-        self.assertIn("sccache.max_bytes=214748364800", (migrated_run / "metadata.txt").read_text())
-        self._git("config", "--local", "tyde.sccacheNamespace", "../invalid")
-        rejected = self._run(check=False)
+        missing = dict(self.env, CARGO_HOME=str(cargo_home))
+        missing.pop("SCCACHE_BUILD_ENV", None)
+        missing.pop("RUSTC_WRAPPER", None)
+        rejected = self._run(env=missing, check=False)
         self.assertEqual(rejected.returncode, 1)
-        self.assertIn("tyde.sccacheNamespace must contain", rejected.stderr)
-        self._git("config", "--local", "--unset", "tyde.sccacheNamespace")
-
-        for invalid in ("0", "-1", "100G", "1.5", "10000"):
-            with self.subTest(size=invalid):
-                self._git("config", "--local", "tyde.sccacheSizeGiB", invalid)
-                rejected = self._run(check=False)
-                self.assertEqual(rejected.returncode, 1)
-                self.assertIn("must be an integer from 1 to 9999", rejected.stderr)
+        self.assertIn("sccache host environment is required", rejected.stderr)
+        self.assertNotIn("START Connect shared sccache", rejected.stdout)
 
     def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
         env = self.env.copy()
@@ -2907,7 +2904,7 @@ fi
         rejected = self._run(env=env, check=False)
 
         self.assertEqual(rejected.returncode, 1)
-        self.assertIn("sccache is not using the check-local cache", rejected.stderr)
+        self.assertIn("sccache is not using the configured shared cache", rejected.stderr)
         self.assertIn("Failing repetition diagnostics:", rejected.stderr)
         run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
         metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
@@ -3938,6 +3935,22 @@ class WasmToolScriptTests(unittest.TestCase):
                 "SCCACHE_SERVER_UDS": str(directory / "sock"),
                 "SCCACHE_IDLE_TIMEOUT": "0",
             }
+            cargo_home = directory / "cargo-home"
+            (cargo_home / "bin").mkdir(parents=True)
+            wrapper = cargo_home / "bin/host-sccache"
+            shutil.copy2(REPO_ROOT / "tools/host-sccache", wrapper)
+            settings = dict(cache_environment)
+            # The installed launcher uses the canonical TCP endpoint; the real
+            # boundary fixture explicitly uses its own UDS instead.
+            settings["SCCACHE_SERVER_PORT"] = "4226"
+            settings["SCCACHE_EXECUTABLE"] = sccache
+            settings["RUSTC_WRAPPER"] = str(wrapper)
+            (cargo_home / "sccache-env").write_text("".join(
+                f"export {key}={shlex.quote(value)}\n" for key, value in settings.items()
+            ), encoding="utf-8")
+            (cargo_home / "config.toml").write_text(
+                f'[build]\nrustc-wrapper={json.dumps(str(wrapper))}\n', encoding="utf-8"
+            )
             fixtures = []
             for name in ("workbench one", "workbench two"):
                 root = directory / name
@@ -3945,9 +3958,12 @@ class WasmToolScriptTests(unittest.TestCase):
                 for variable in list(env):
                     if variable.startswith("SCCACHE_"):
                         del env[variable]
+                env.pop("RUSTC_WRAPPER", None)
                 env.update(cache_environment)
                 env.update({
-                    "RUSTC_WRAPPER": sccache,
+                    "CARGO_HOME": str(cargo_home),
+                    "HOME": str(directory / "isolated-home"),
+                    "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(pathlib.Path.home() / ".rustup")),
                     "CARGO_INCREMENTAL": "0",
                     "CARGO_TARGET_DIR": str(root / "target"),
                     "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER": "must-be-overridden",
