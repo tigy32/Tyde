@@ -32,6 +32,13 @@ fn login_shell_initialization_from_background_terminal() {
                 assert!(output.status.success());
                 use std::os::unix::ffi::OsStrExt;
                 assert_eq!(output.stdout, paths[0].as_bytes());
+                let output = tyde_process_env::command("/bin/sh")
+                    .expect("create descendant cleanup command")
+                    .args(["-c", "sleep 86400 & printf 'leader exited'"])
+                    .output_blocking()
+                    .expect("reap the leader and close descendant pipes");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"leader exited");
             });
         }
         Ok("failure") => {

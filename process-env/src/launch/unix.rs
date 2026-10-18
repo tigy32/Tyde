@@ -43,18 +43,24 @@ enum Stage {
     Session = 5,
 }
 
+#[track_caller]
 fn syscall(value: libc::c_int) -> io::Result<libc::c_int> {
     if value < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        tracing::debug!(%error, location=%std::panic::Location::caller(), "native process syscall failed");
+        Err(error)
     } else {
         Ok(value)
     }
 }
+#[track_caller]
 fn posix(value: libc::c_int) -> io::Result<()> {
     if value == 0 {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(value))
+        let error = io::Error::from_raw_os_error(value);
+        tracing::debug!(%error, location=%std::panic::Location::caller(), "native process POSIX call failed");
+        Err(error)
     }
 }
 fn cstring(value: &std::ffi::OsStr) -> io::Result<CString> {
@@ -154,6 +160,65 @@ struct Pid {
     reaped: bool,
     handed_off: bool,
 }
+
+#[cfg(target_os = "macos")]
+fn group_has_live_members(group: libc::pid_t) -> io::Result<bool> {
+    let mut capacity = 16_usize;
+    let members = loop {
+        let mut members = vec![0 as libc::pid_t; capacity];
+        let bytes = libc::c_int::try_from(std::mem::size_of_val(members.as_slice()))
+            .map_err(io::Error::other)?;
+        unsafe { *errno_location() = 0 };
+        let count = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), bytes) };
+        if count <= 0 {
+            let errno = unsafe { *errno_location() };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            return Ok(false);
+        }
+        let count = usize::try_from(count).map_err(io::Error::other)?;
+        if count < capacity {
+            members.truncate(count);
+            break members;
+        }
+        capacity = capacity.checked_mul(2).ok_or_else(|| {
+            io::Error::other("process group member list exceeds addressable memory")
+        })?;
+    };
+    for pid in members {
+        let mut info = MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+        let bytes =
+            libc::c_int::try_from(std::mem::size_of_val(&info)).map_err(io::Error::other)?;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        if read == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error);
+        }
+        if read != bytes {
+            return Err(io::Error::other(
+                "incomplete process group member information",
+            ));
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbsi_pgid == group as u32 && info.pbsi_status != libc::SZOMB {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Pid {
     fn kill_group(&self) -> io::Result<()> {
         if self.reaped || self.handed_off {
@@ -167,6 +232,16 @@ impl Pid {
         match syscall(unsafe { libc::kill(-self.pid, libc::SIGKILL) }) {
             Ok(_) => Ok(()),
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            // Darwin skips zombies during group signalling and returns EPERM
+            // when none remain alive. Keep the unreaped leader pinning its PGID.
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && !group_has_live_members(self.pid)? =>
+            {
+                tracing::debug!("owned macOS process group has no live members");
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }
@@ -377,7 +452,10 @@ impl Exchange {
                 failure[1..].try_into().map_err(io::Error::other)?,
             ));
             tracing::error!(?stage,error_kind=?error.kind(),"backend exec helper failed");
-            Err(error)
+            Err(io::Error::new(
+                error.kind(),
+                format!("process exec helper failed during {stage:?}: {error}"),
+            ))
         };
         response.await?;
         Ok(())
@@ -569,6 +647,12 @@ pub(super) fn spawn(spec: GroupCommand) -> io::Result<(Child, Exchange)> {
             &attributes.0,
             argv.as_ptr(),
             env.as_ptr(),
+        )
+    })
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to spawn the process exec helper: {error}"),
         )
     })?;
     let pid = Pid {

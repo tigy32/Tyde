@@ -54,6 +54,32 @@ questions, no-echo, stale-answer rejection and turn authority remain intact.
 
 ## One canonical runtime API
 
+### macOS exited process groups
+
+The beta.24 launcher successfully ran the startup login shell, then rejected
+its completed output while cleaning up the process group. Darwin's
+`killpg1` excludes zombies from group signalling and returns `EPERM` when the
+group still exists but has no eligible live members. Keeping the leader
+unreaped is necessary to prevent PID/PGID reuse during descendant cleanup.
+
+On macOS only, an `EPERM` group-kill result now checks the group's native
+membership and each member's short BSD process information. Only a group
+without live members is accepted as finished. Enumeration failures and denied
+signals to live members remain errors; the leader remains unreaped until the
+group check finishes. Linux and Windows launch behavior is unchanged.
+
+Native Apple Silicon and Intel CI reproduced the original error, then passed
+Bash and Zsh PATH initialization, concurrent background-terminal startup,
+missing-shell error retention, and cleanup of descendants holding output pipes.
+The native workflow retains this coverage independently of cross-compilation.
+
+References: [Darwin group signalling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c),
+[native process queries](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c),
+[failed reproduction](https://github.com/tigy32/Tyde/actions/runs/39144354093),
+[fixed native run](https://github.com/tigy32/Tyde/actions/runs/39144612130).
+
+### Runtime integration
+
 `tyde-process-env::launch` owns descriptions, native creation, cancellation,
 stdio leases, groups and reaping. Backend subprocess re-exports that API; it is
 not a second implementation. Async callers await group_spawn/output. Existing
