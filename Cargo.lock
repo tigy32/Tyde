@@ -8658,7 +8658,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-shell"
-version = "0.9.5-beta.23"
+version = "0.9.5-beta.24"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -9476,7 +9476,7 @@ dependencies = [
 
 [[package]]
 name = "tyde-server"
-version = "0.9.5-beta.23"
+version = "0.9.5-beta.24"
 dependencies = [
  "client",
  "host-config",
