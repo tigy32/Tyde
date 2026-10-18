@@ -642,12 +642,25 @@ fi
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
 export PATH="$(dirname "$runner_bin"):$PATH"
-export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$(python3 - "$repo_root/tools/run-test-hang-guard.py" "$runner_bin" <<'PY'
+wasm_runner_config="$(python3 - "$repo_root/tools/run-test-hang-guard.py" "$runner_bin" <<'PY'
+import json
 import shlex
 import sys
-print(shlex.join(["python3", sys.argv[1], "--hang-seconds", "600", "--", sys.argv[2]]))
+print("target.wasm32-unknown-unknown.runner=" + json.dumps(
+    shlex.join(["python3", sys.argv[1], "--hang-seconds", "600", "--", sys.argv[2]])
+))
 PY
 )"
+wasm_cargo_test() {
+    if [[ "${CARGO_TARGET_DIR+x}" == x ]]; then
+        set -- --target-dir "$CARGO_TARGET_DIR" "$@"
+    fi
+    # sccache hashes all CARGO_* variables, even transport-only absolute paths.
+    # CLI configuration keeps dependency keys reusable without remapping paths.
+    env -u CARGO_TARGET_DIR -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER \
+        cargo test --config "$wasm_runner_config" \
+        --target wasm32-unknown-unknown "$@"
+}
 
 # Build the wasm test modules without DWARF.
 #
@@ -679,7 +692,7 @@ export WASM_BINDGEN_TEST_TIMEOUT=18446744073709551615
 
 cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
-cargo test --target wasm32-unknown-unknown "$@"
+wasm_cargo_test "$@"
 
 fixture_ready="$(mktemp "$cache_dir/rtc-ready.XXXXXX")"
 fixture_log="$cache_dir/rtc-fixture.log"
@@ -698,14 +711,14 @@ done
 export TYDE_RTC_TEST_URL="$(cat "$fixture_ready")"
 cd "$repo_root/rtc-transport"
 log "running: cargo test --target wasm32-unknown-unknown $* (rtc-transport)"
-if ! cargo test --target wasm32-unknown-unknown "$@"; then
+if ! wasm_cargo_test "$@"; then
     cat "$fixture_log" >&2
     die "browser/native TURN tests failed"
 fi
 
 cd "$repo_root/mobile-frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (mobile-frontend)"
-cargo test --target wasm32-unknown-unknown "$@"
+wasm_cargo_test "$@"
 
 # The existing fixture harness mounts the production mobile composer in WebKit.
 cd "$repo_root"

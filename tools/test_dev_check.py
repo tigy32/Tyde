@@ -3520,7 +3520,10 @@ class WasmToolScriptTests(unittest.TestCase):
         fixture = root / "target" / "debug" / "tyde-rtc-fixture"
         fixture.parent.mkdir(parents=True)
         fixture.write_text(
-            '#!/usr/bin/env bash\nprintf "http://127.0.0.1:1" >"$1"\nexec sleep 30\n',
+            f"#!{sys.executable}\n"
+            "import pathlib, signal, sys\n"
+            "pathlib.Path(sys.argv[1]).write_text('http://127.0.0.1:1')\n"
+            "signal.pause()\n",
             encoding="utf-8",
         )
         fixture.chmod(0o755)
@@ -3543,7 +3546,8 @@ class WasmToolScriptTests(unittest.TestCase):
             '[[ "$*" == "build --features ui-fixtures" ]]\n'
             '[[ "$(basename "$PWD")" == "mobile-frontend" ]]\n'
             '[[ "${TRUNK_FAIL:-0}" != 1 ]]\n'
-            'printf "%s\\n" "$*" >"$UI_BUILD_RECORD"\n',
+            'printf "%s\\n" "$*" >"$UI_BUILD_RECORD"\n'
+            'printf "%s\\n" "${CARGO_TARGET_DIR-<unset>}" >"$UI_TARGET_RECORD"\n',
             encoding="utf-8",
         )
         npm.write_text(
@@ -3574,7 +3578,7 @@ class WasmToolScriptTests(unittest.TestCase):
             "set -eu\n"
             "{\n"
             "  printf 'cwd=%s\\n' \"$(basename \"$PWD\")\"\n"
-            "  printf 'argv=%s\\n' \"$*\"\n"
+            "  python3 -c 'import json,sys; print(\"argv=\" + json.dumps(sys.argv[1:]))' \"$@\"\n"
             "  printf 'WASM_BINDGEN_TEST_TIMEOUT=%s\\n' "
             '"${WASM_BINDGEN_TEST_TIMEOUT-<unset>}"\n'
             "  printf 'RUSTFLAGS=%s\\n' \"${RUSTFLAGS-<unset>}\"\n"
@@ -3585,6 +3589,7 @@ class WasmToolScriptTests(unittest.TestCase):
             "  printf 'CARGO_PROFILE_TEST_DEBUG=%s\\n' "
             '"${CARGO_PROFILE_TEST_DEBUG-<unset>}"\n'
             "  printf 'RUNNER=%s\\n' \"${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER-<unset>}\"\n"
+            "  printf 'TARGET_DIR=%s\\n' \"${CARGO_TARGET_DIR-<unset>}\"\n"
             "  printf '=== end ===\\n'\n"
             '} >>"$CARGO_RECORD"\n'
             'if [[ "${CARGO_FAIL_IN:-}" == "$(basename "$PWD")" ]]; then\n'
@@ -3607,6 +3612,8 @@ class WasmToolScriptTests(unittest.TestCase):
             "CARGO_PROFILE_DEV_DEBUG",
             "CARGO_PROFILE_TEST_DEBUG",
             "CARGO_FAIL_IN",
+            "CARGO_TARGET_DIR",
+            "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",
             "TRUNK_FAIL",
         ):
             env.pop(inherited, None)
@@ -3618,6 +3625,7 @@ class WasmToolScriptTests(unittest.TestCase):
                 "WASM_BINDGEN_TEST_RUNNER": str(runner),
                 "CARGO_RECORD": str(record),
                 "UI_BUILD_RECORD": str(root / "ui-build-ready.txt"),
+                "UI_TARGET_RECORD": str(root / "ui-build-target.txt"),
                 "PLAYWRIGHT_RECORD": str(root / "playwright-invocations.txt"),
             }
         )
@@ -3805,11 +3813,37 @@ class WasmToolScriptTests(unittest.TestCase):
                 self.assertEqual(invocation["CARGO_PROFILE_DEV_DEBUG"], "0")
                 self.assertEqual(invocation["CARGO_PROFILE_TEST_DEBUG"], "0")
 
-                command = shlex.split(invocation["RUNNER"])
+                self.assertEqual(invocation["RUNNER"], "<unset>")
+                self.assertEqual(invocation["TARGET_DIR"], "<unset>")
+                arguments = json.loads(invocation["argv"])
+                self.assertEqual(arguments[:2], ["test", "--config"])
+                key, value = arguments[2].split("=", 1)
+                self.assertEqual(key, "target.wasm32-unknown-unknown.runner")
+                command = shlex.split(json.loads(value))
                 self.assertEqual(command[0], "python3")
                 self.assertEqual(pathlib.Path(command[1]), root / "tools" / "run-test-hang-guard.py")
                 self.assertEqual(command[2:5], ["--hang-seconds", "600", "--"])
                 self.assertEqual(command[5], env["WASM_BINDGEN_TEST_RUNNER"])
+
+            record.unlink()
+            target = root / "target with spaces"
+            configured = subprocess.run(
+                [str(script)],
+                env=dict(env, CARGO_TARGET_DIR=str(target),
+                         CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="must-be-overridden"),
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            for invocation in self._cargo_invocations(record):
+                self.assertEqual(invocation["RUNNER"], "<unset>")
+                self.assertEqual(invocation["TARGET_DIR"], "<unset>")
+                self.assertEqual(json.loads(invocation["argv"])[3:], [
+                    "--target", "wasm32-unknown-unknown", "--target-dir", str(target),
+                ])
+            self.assertEqual(
+                pathlib.Path(env["UI_TARGET_RECORD"]).read_text(encoding="utf-8"),
+                f"{target}\n",
+            )
 
             # Cargo owns flag precedence; the wrapper must preserve both
             # spellings byte-for-byte, including deliberately empty values.
@@ -3874,6 +3908,164 @@ class WasmToolScriptTests(unittest.TestCase):
                 ["frontend"],
             )
 
+    def test_wasm_cargo_cache_reuses_dependencies_not_checkout_paths(self) -> None:
+        cargo = shutil.which("cargo")
+        sccache = shutil.which("sccache")
+        self.assertIsNotNone(cargo)
+        self.assertIsNotNone(sccache)
+        host = subprocess.run(
+            ["rustc", "-vV"], text=True, capture_output=True, check=True
+        )
+        triple = next(line.removeprefix("host: ") for line in host.stdout.splitlines()
+                      if line.startswith("host: "))
+
+        with tempfile.TemporaryDirectory(prefix="check-cache-", dir="/tmp") as temp:
+            directory = pathlib.Path(temp)
+            dependency = directory / "dependency"
+            dependency.mkdir()
+            (dependency / "Cargo.toml").write_text(
+                '[package]\nname="check-cache-dependency"\nversion="0.0.0"\nedition="2024"\n'
+                '[lib]\npath="lib.rs"\n[workspace]\n', encoding="utf-8"
+            )
+            source = dependency / "lib.rs"
+            source.write_text("pub fn version() -> u8 { 1 }\n", encoding="utf-8")
+            config = directory / "sccache.conf"
+            config.write_text("", encoding="utf-8")
+            cache_environment = {
+                "SCCACHE_CONF": str(config),
+                "SCCACHE_DIR": str(directory / "cache"),
+                "SCCACHE_CACHE_SIZE": "32M",
+                "SCCACHE_SERVER_UDS": str(directory / "sock"),
+                "SCCACHE_IDLE_TIMEOUT": "0",
+            }
+            fixtures = []
+            for name in ("workbench one", "workbench two"):
+                root = directory / name
+                script, env, record = self._write_run_fixture(root)
+                for variable in list(env):
+                    if variable.startswith("SCCACHE_"):
+                        del env[variable]
+                env.update(cache_environment)
+                env.update({
+                    "RUSTC_WRAPPER": sccache,
+                    "CARGO_INCREMENTAL": "0",
+                    "CARGO_TARGET_DIR": str(root / "target"),
+                    "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER": "must-be-overridden",
+                    "CARGO_RECORD": str(directory / "cargo-record"),
+                    "CACHE_TEST_CARGO": cargo,
+                    "CACHE_TEST_HOST": triple,
+                    "EXPECTED_CACHE_VALUE": "1",
+                })
+                (root / "Cargo.toml").write_text(
+                    '[workspace]\nresolver="2"\n'
+                    'members=["frontend", "rtc-transport", "mobile-frontend"]\n',
+                    encoding="utf-8",
+                )
+                for package in ("frontend", "rtc-transport", "mobile-frontend"):
+                    manifest = root / package
+                    (manifest / "src").mkdir()
+                    (manifest / "tests").mkdir()
+                    if package != "rtc-transport":
+                        shutil.copytree(REPO_ROOT / package / ".cargo", manifest / ".cargo")
+                    (manifest / "Cargo.toml").write_text(
+                        f'[package]\nname="{package}"\nversion="0.0.0"\nedition="2024"\n'
+                        '[lib]\ndoctest=false\n[dependencies]\n'
+                        f'check-cache-dependency={{path={json.dumps(str(dependency))}}}\n',
+                        encoding="utf-8",
+                    )
+                    (manifest / "fixture.txt").write_text(name, encoding="utf-8")
+                    (manifest / "src/lib.rs").write_text(
+                        "pub fn checkout() -> (&'static str, &'static str, u8) {\n"
+                        '    (env!("CARGO_MANIFEST_DIR"), include_str!("../fixture.txt"),\n'
+                        '     check_cache_dependency::version())\n}\n', encoding="utf-8"
+                    )
+                    (manifest / "tests/checkout.rs").write_text(
+                        '#[test]\nfn current_checkout_reads_its_own_fixture() {\n'
+                        f'    let (compiled_root, embedded, version) = {package.replace("-", "_")}::checkout();\n'
+                        '    let current = std::env::var("CARGO_MANIFEST_DIR").unwrap();\n'
+                        '    assert_eq!(compiled_root, current);\n'
+                        '    let fixture = std::path::Path::new(&current).join("fixture.txt");\n'
+                        '    assert_eq!(embedded, std::fs::read_to_string(fixture).unwrap());\n'
+                        '    assert_eq!(version, std::env::var("EXPECTED_CACHE_VALUE").unwrap().parse::<u8>().unwrap());\n'
+                        '}\n', encoding="utf-8"
+                    )
+                # Compile and execute tiny native fixtures through real Cargo
+                # and sccache; browser setup is unrelated to the cache boundary.
+                (root / "bin/cargo").write_text(
+                    f"#!{sys.executable}\n"
+                    "import os, pathlib, shlex, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "assert args[0] == 'test'\n"
+                    "args[args.index('--target') + 1] = os.environ['CACHE_TEST_HOST']\n"
+                    "if 'CACHE_TEST_LEGACY_TARGET_DIR' in os.environ:\n"
+                    "    os.environ['CARGO_TARGET_DIR'] = os.environ['CACHE_TEST_LEGACY_TARGET_DIR']\n"
+                    "    os.environ['CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER'] = shlex.join([\n"
+                    "        'python3', str(pathlib.Path.cwd().parent / 'tools/run-test-hang-guard.py'),\n"
+                    "        '--hang-seconds', '600', '--', os.environ['WASM_BINDGEN_TEST_RUNNER']])\n"
+                    "cargo = os.environ['CACHE_TEST_CARGO']\n"
+                    "os.execv(cargo, [cargo, *args, '--offline'])\n", encoding="utf-8"
+                )
+                fixtures.append((root, script, env))
+
+            def run_checkout(fixture, expected, legacy=False):
+                root, script, env = fixture
+                (root / "Cargo.lock").write_text(
+                    'version = 4\n[[package]]\nname = "wasm-bindgen"\n'
+                    'version = "0.2.118"\n', encoding="utf-8"
+                )
+                environment = dict(env, EXPECTED_CACHE_VALUE=str(expected))
+                if legacy:
+                    environment["CARGO_TARGET_DIR"] = str(root / "legacy-target")
+                    environment["CACHE_TEST_LEGACY_TARGET_DIR"] = environment["CARGO_TARGET_DIR"]
+                run = subprocess.run(
+                    [str(script)], cwd=root, env=environment,
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                stats = subprocess.run(
+                    [sccache, "--show-stats", "--stats-format=json"], env=env,
+                    text=True, capture_output=True, check=True,
+                )
+                data = json.loads(stats.stdout)
+                self.assertEqual(data["cache_location"], f'Local disk: "{directory / "cache"}"')
+                return data["stats"]
+
+            private_env = fixtures[0][2]
+            subprocess.run([sccache, "--start-server"], env=private_env,
+                           text=True, capture_output=True, check=True)
+            try:
+                legacy_first = run_checkout(fixtures[0], 1, legacy=True)
+                legacy_second = run_checkout(fixtures[1], 1, legacy=True)
+                legacy_hits = (legacy_second["cache_hits"]["counts"].get("Rust", 0)
+                               - legacy_first["cache_hits"]["counts"].get("Rust", 0))
+                legacy_misses = (legacy_second["cache_misses"]["counts"]["Rust"]
+                                 - legacy_first["cache_misses"]["counts"]["Rust"])
+                self.assertEqual((legacy_hits, legacy_misses), (0, 4))
+                first = run_checkout(fixtures[0], 1)
+                second = run_checkout(fixtures[1], 1)
+                hits = (second["cache_hits"]["counts"].get("Rust", 0)
+                        - first["cache_hits"]["counts"].get("Rust", 0))
+                misses = (second["cache_misses"]["counts"]["Rust"]
+                          - first["cache_misses"]["counts"]["Rust"])
+                self.assertEqual((hits, misses), (1, 3))
+                targets = [root / "target" for root, _, _ in fixtures]
+                self.assertNotEqual(targets[0].resolve(), targets[1].resolve())
+                for target in targets:
+                    self.assertFalse(target.is_symlink())
+                    self.assertTrue(list(target.glob(f"{triple}/debug/deps/libcheck_cache_dependency-*.rlib")))
+
+                source.write_text("pub fn version() -> u8 { 2 }\n", encoding="utf-8")
+                changed = run_checkout(fixtures[1], 2)
+                self.assertEqual(
+                    changed["cache_misses"]["counts"]["Rust"]
+                    - second["cache_misses"]["counts"]["Rust"], 4,
+                )
+                print(f"WASM_CARGO_CACHE second-checkout legacy hits={legacy_hits} misses={legacy_misses}; "
+                      f"CLI hits={hits} misses={misses}; source-change misses=4", flush=True)
+            finally:
+                subprocess.run([sccache, "--stop-server"], env=private_env,
+                               text=True, capture_output=True, check=True)
+
     def test_canonical_run_adds_no_filter_skip_or_shard_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = pathlib.Path(temp_name) / "repo"
@@ -3891,7 +4083,8 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertEqual(len(invocations), 3)
             for invocation in invocations:
                 self.assertEqual(
-                    invocation["argv"], "test --target wasm32-unknown-unknown"
+                    json.loads(invocation["argv"])[3:],
+                    ["--target", "wasm32-unknown-unknown"],
                 )
 
             # Explicit developer filters still pass through unchanged.
@@ -3906,8 +4099,8 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertEqual(filtered.returncode, 0, filtered.stderr)
             for invocation in self._cargo_invocations(record):
                 self.assertEqual(
-                    invocation["argv"],
-                    "test --target wasm32-unknown-unknown components::chat_view",
+                    json.loads(invocation["argv"])[3:],
+                    ["--target", "wasm32-unknown-unknown", "components::chat_view"],
                 )
     def test_mobile_ui_setup_waits_for_its_server_and_reports_process_death(self) -> None:
         setup = REPO_ROOT / "tools" / "mobile-ui-server.mjs"
