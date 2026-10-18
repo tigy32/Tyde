@@ -359,6 +359,8 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
     );
     owner.delete_bot(&replacement.bot.bot_id).await.unwrap();
     eprintln!("PASS re-pair, explicit Settings unpair and erased state across restart");
-    host.shutdown_for_restart().await;
+    host.shutdown_for_restart()
+        .await
+        .expect("restart must preserve required accounting");
     local.child.kill().await.unwrap();
 }

@@ -1957,3 +1957,125 @@ async fn builtin_compaction_remains_available_without_native_support() {
             .assert_stream_end_contains("continue after built-in compact");
     }
 }
+
+#[tokio::test]
+async fn replacement_compaction_reports_required_close_failure() {
+    let mut fixture = Fixture::new().await;
+    let success = fixture
+        .spawn_scripted(
+            "replacement success ordering",
+            MockScript::new()
+                .with_unbounded_echo()
+                .with_compaction_coordinator(
+                    server::backend::compaction::BackendCompactionCoordinator::LegacyReplacement,
+                ),
+        )
+        .await;
+    fixture.finish_turn(&success).await;
+    fixture
+        .client
+        .compact_agent(&success.stream, protocol::AgentCompactPayload::default())
+        .await
+        .expect("request successful replacement");
+    let mut advertised_replacement = false;
+    fixture.next_frame_matching("successful replacement completion before close", |event| {
+        if event.kind == FrameKind::NewAgent {
+            advertised_replacement |= event.parse_payload::<NewAgentPayload>().is_ok_and(|new| new.agent_id != success.new_agent.agent_id);
+        }
+        if event.kind == FrameKind::AgentClosed && event.parse_payload::<AgentClosedPayload>().is_ok_and(|closed| closed.agent_id == success.new_agent.agent_id) {
+            panic!("required accounting must commit before Completed, but Completed must precede AgentClosed");
+        }
+        let completed = event.kind == FrameKind::AgentCompactNotify && event.parse_payload::<protocol::AgentCompactNotifyPayload>().is_ok_and(|notice| notice.old_agent_id == success.new_agent.agent_id && notice.status == protocol::AgentCompactStatus::Completed);
+        if completed { assert!(advertised_replacement, "replacement must be advertised before completion"); }
+        completed
+    }).await;
+    fixture
+        .next_frame_matching("successful replacement closes after completion", |event| {
+            event.kind == FrameKind::AgentClosed
+                && event
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == success.new_agent.agent_id)
+        })
+        .await;
+    let agent = fixture
+        .spawn_scripted(
+            "replacement close failure",
+            MockScript::new()
+                .with_unbounded_echo()
+                .with_compaction_coordinator(
+                    server::backend::compaction::BackendCompactionCoordinator::LegacyReplacement,
+                ),
+        )
+        .await;
+    fixture.finish_turn(&agent).await;
+    let close_gate = fixture
+        .host_for_test()
+        .install_restore_marker_withdraw_test_gate()
+        .await;
+    fixture
+        .client
+        .compact_agent(&agent.stream, protocol::AgentCompactPayload::default())
+        .await
+        .expect("request replacement compaction");
+    close_gate.wait_until_entered().await;
+    let failure = fixture.fail_next_session_commit();
+    close_gate.release_one();
+    let terminal = fixture
+        .next_frame_matching("replacement compaction terminal", |env| {
+            env.kind == FrameKind::AgentCompactNotify
+                && env
+                    .parse_payload::<protocol::AgentCompactNotifyPayload>()
+                    .is_ok_and(|notice| {
+                        notice.old_agent_id == agent.new_agent.agent_id
+                            && matches!(
+                                notice.status,
+                                protocol::AgentCompactStatus::Completed
+                                    | protocol::AgentCompactStatus::Failed
+                            )
+                    })
+        })
+        .await
+        .parse_payload::<protocol::AgentCompactNotifyPayload>()
+        .expect("replacement terminal");
+    assert_eq!(
+        terminal.status,
+        protocol::AgentCompactStatus::Failed,
+        "a replacement is not complete until its required old-agent close commits"
+    );
+    assert!(
+        terminal
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("could not close"))
+    );
+    drop(failure);
+    drop(close_gate);
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .any(|entry| entry.agent_id == agent.new_agent.agent_id),
+        "failed close retains original card for an explicit retry"
+    );
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .any(|entry| Some(&entry.agent_id) == terminal.new_agent_id.as_ref()),
+        "the successfully started replacement remains available"
+    );
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("retry required close");
+    fixture
+        .next_frame_matching("original closes on retry", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == agent.new_agent.agent_id)
+        })
+        .await;
+}

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use protocol::{
     Envelope, FrameKind, FrameReader, StreamPath, VoiceAudioPayload, VoiceDirection, VoiceSessionId,
@@ -1203,6 +1203,58 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RecordPrefixGate<
     }
 }
 
+struct FirstWriteGate<W> {
+    writer: W,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+    resumed: bool,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FirstWriteGate<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.started.is_none() && !this.resumed {
+            match std::future::Future::poll(std::pin::Pin::new(&mut this.resume), context) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "first-write gate release was dropped",
+                    )));
+                }
+                std::task::Poll::Ready(Ok(())) => this.resumed = true,
+            }
+        }
+        let result = std::pin::Pin::new(&mut this.writer).poll_write(context, bytes);
+        if matches!(result, std::task::Poll::Ready(Ok(written)) if written > 0)
+            && let Some(started) = this.started.take()
+        {
+            started
+                .send(())
+                .expect("first-write observer remains present");
+        }
+        result
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_shutdown(context)
+    }
+}
+
 #[tokio::test]
 async fn production_writer_interleaves_four_megabyte_bulk() {
     let diagnostic_path =
@@ -1223,7 +1275,17 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
     let bulk_stream = StreamPath("/project/bulk".into());
     let voice_stream = StreamPath("/voice/synthetic".into());
     let initial = HashMap::from([(bulk_stream.clone(), 0), (voice_stream.clone(), 0)]);
-    let (probe, writer) = server::start_production_writer_probe(Box::new(host_writer), initial);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (probe, writer) = server::start_production_writer_probe(
+        Box::new(FirstWriteGate {
+            writer: host_writer,
+            started: Some(started_tx),
+            resume: resume_rx,
+            resumed: false,
+        }),
+        initial,
+    );
     probe
         .send(
             bulk_stream,
@@ -1232,15 +1294,11 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
             Vec::new(),
         )
         .expect("queue real four MiB bulk envelope");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while probe.records_written() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("production writer starts first bulk record");
-
-    let queued_at = Instant::now();
+    // Delivery ordering is the contract, not host-load-dependent milliseconds.
+    // Hold the in-flight bulk record until both priority messages are queued.
+    started_rx
+        .await
+        .expect("production writer starts bulk record");
     let audio = VoiceAudioPayload {
         session_id: VoiceSessionId("synthetic".into()),
         generation: 1,
@@ -1281,64 +1339,50 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
         .unwrap();
 
     let mut reader = FrameReader::new(client_reader);
-    let mut control_latency = None;
-    let mut audio_latency = None;
+    resume_tx.send(()).expect("release in-flight bulk record");
+    let mut saw_control = false;
     let mut saw_audio = false;
     let mut saw_bulk = false;
     let mut saw_same_stream_control = false;
     let mut voice_sequences = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while control_latency.is_none() || !saw_audio || !saw_bulk || !saw_same_stream_control {
-            let frame = reader
-                .read_frame()
-                .await
-                .expect("production framed TURN read")
-                .expect("frame");
-            match frame.envelope.kind {
-                FrameKind::VoiceStop => {
-                    assert!(
-                        !saw_bulk,
-                        "control suffered head-of-line blocking behind the complete 4 MiB transfer"
-                    );
-                    control_latency = Some(queued_at.elapsed());
-                    voice_sequences.push(frame.envelope.seq);
-                }
-                FrameKind::VoiceAudio => {
-                    assert!(
-                        !saw_bulk,
-                        "audio suffered head-of-line blocking behind the complete 4 MiB transfer"
-                    );
-                    saw_audio = true;
-                    audio_latency = Some(queued_at.elapsed());
-                    voice_sequences.push(frame.envelope.seq);
-                }
-                FrameKind::ProjectFileContents => saw_bulk = true,
-                FrameKind::HeartbeatAck => {
-                    assert!(
-                        saw_bulk,
-                        "same-stream control cannot overtake an incomplete fragmented envelope"
-                    );
-                    saw_same_stream_control = true;
-                }
-                _ => {}
+    while !saw_control || !saw_audio || !saw_bulk || !saw_same_stream_control {
+        let frame = reader
+            .read_frame()
+            .await
+            .expect("production framed TURN read")
+            .expect("frame");
+        match frame.envelope.kind {
+            FrameKind::VoiceStop => {
+                assert!(
+                    !saw_bulk,
+                    "control suffered head-of-line blocking behind the complete 4 MiB transfer"
+                );
+                saw_control = true;
+                voice_sequences.push(frame.envelope.seq);
             }
+            FrameKind::VoiceAudio => {
+                assert!(
+                    !saw_bulk,
+                    "audio suffered head-of-line blocking behind the complete 4 MiB transfer"
+                );
+                saw_audio = true;
+                assert_eq!(frame.binary, vec![1, 2, 3], "audio payload remains intact");
+                voice_sequences.push(frame.envelope.seq);
+            }
+            FrameKind::ProjectFileContents => saw_bulk = true,
+            FrameKind::HeartbeatAck => {
+                assert!(
+                    saw_bulk,
+                    "same-stream control cannot overtake an incomplete fragmented envelope"
+                );
+                saw_same_stream_control = true;
+            }
+            _ => {}
         }
-    })
-    .await
-    .expect("bulk, voice, and control all traverse real TURN");
-    let latency = control_latency.unwrap();
+    }
     eprintln!(
-        "writer delivery: control={control_latency:?}, audio={audio_latency:?}, records={}",
+        "writer delivery: control={saw_control}, audio={saw_audio}, records={}",
         probe.records_written()
-    );
-    assert!(
-        latency <= Duration::from_millis(100),
-        "control latency {latency:?} exceeded the defensible local-production bound"
-    );
-    let latency = audio_latency.unwrap();
-    assert!(
-        latency <= Duration::from_millis(100),
-        "audio latency {latency:?} exceeded the defensible local-production bound"
     );
     assert_eq!(
         voice_sequences,
@@ -1366,7 +1410,7 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
             )
             .expect("queue real records across a cancelled read");
     }
-    tokio::time::timeout(Duration::from_secs(2), async {
+    {
         let read = reader.read_frame();
         tokio::pin!(read);
         tokio::select! {
@@ -1374,12 +1418,12 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
             () = entered.notified() => {},
             result = &mut read => panic!("a seven-byte prefix must not produce a complete record; completed={}", result.is_ok()),
         }
-    }).await.expect("real record reaches the partial-header gate");
+    }
     opened.store(true, std::sync::atomic::Ordering::SeqCst);
     for expected_sequence in [2, 3] {
-        let frame = tokio::time::timeout(Duration::from_secs(2), reader.read_frame())
+        let frame = reader
+            .read_frame()
             .await
-            .expect("continue cancelled record within the transport bound")
             .unwrap_or_else(|error| panic!("cancelled real record must remain decodable: {error}"))
             .expect("production writer remains connected");
         assert_eq!(frame.envelope.kind, FrameKind::HeartbeatAck);

@@ -39,6 +39,7 @@ pub mod swarm_dialogs;
 pub mod swarm_view;
 pub mod swarms_panel;
 pub mod task_list;
+mod task_usage;
 pub mod teams_panel;
 pub mod terminal_view;
 pub mod tool_card;

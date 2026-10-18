@@ -36,6 +36,17 @@ pub fn resume_session(
     session_id: SessionId,
     project_id: Option<ProjectId>,
 ) {
+    resume_session_with_parent(state, host_id, backend_kind, session_id, project_id, None);
+}
+
+pub fn resume_session_with_parent(
+    state: &AppState,
+    host_id: String,
+    backend_kind: BackendKind,
+    session_id: SessionId,
+    project_id: Option<ProjectId>,
+    parent_agent_id: Option<protocol::AgentId>,
+) {
     if open_existing_session_agent(
         state,
         &host_id,
@@ -73,7 +84,7 @@ pub fn resume_session(
             launch_context: protocol::AgentLaunchContext::Standard,
             name: None,
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id,
             project_id: None,
             params: SpawnAgentParams::Resume {
                 session_id,

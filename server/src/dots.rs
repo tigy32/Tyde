@@ -124,7 +124,7 @@ pub(crate) fn start(
     state: watch::Sender<DotsStatePayload>,
     config: ConnectionConfig,
     stopped: CancellationToken,
-    mut complete: watch::Receiver<bool>,
+    mut complete: watch::Receiver<Option<Result<(), String>>>,
 ) -> Result<(), String> {
     let ConnectionConfig {
         path,
@@ -220,7 +220,7 @@ pub(crate) fn start(
                     runtime.block_on(async move {
                         worker.await;
                         // Agents launched here must remain alive through the host's graceful shutdown.
-                        while !*complete.borrow_and_update() {
+                        while !matches!(*complete.borrow_and_update(), Some(Ok(()))) {
                             if complete.changed().await.is_err() {
                                 break;
                             }

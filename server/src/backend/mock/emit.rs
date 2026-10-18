@@ -629,6 +629,9 @@ pub(super) async fn spawn_native_child(
         },
     }));
 
+    if let Some(gate) = &child.registration_gate {
+        gate.wait().await;
+    }
     let handle = match emitter
         .on_subagent_spawned(
             tool_use_id.clone(),
@@ -652,11 +655,42 @@ pub(super) async fn spawn_native_child(
 
     match child.lifecycle {
         MockChildLifecycle::LiveUntilInterrupt => {
+            if child.emit_timing_tool {
+                emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+                let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: "native-running-timing".to_owned(),
+                    tool_name: "run_command".to_owned(),
+                    tool_type: ToolRequestType::RunCommand {
+                        command: "printf native-running-observation".to_owned(),
+                        working_directory: "/tmp/test".to_owned(),
+                    },
+                }));
+            }
             emit_live_native_child_stream(&handle);
             active_subagents.push(handle);
         }
         MockChildLifecycle::CompleteAndRetain => {
             emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+            if child.emit_timing_tool {
+                let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: "native-timing-fixture".to_owned(),
+                    tool_name: "run_command".to_owned(),
+                    tool_type: ToolRequestType::RunCommand {
+                        command: "printf native-observation".to_owned(),
+                        working_directory: "/tmp/test".to_owned(),
+                    },
+                }));
+                let _ = handle.event_tx.send(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: "native-timing-fixture".to_owned(),
+                        outcome: ToolExecutionOutcome::Succeeded {
+                            result: ToolExecutionResult::Other {
+                                result: json!({"fixture":true}),
+                            },
+                        },
+                    },
+                ));
+            }
             if let Some(grandchild) = &child.grandchild {
                 let grandchild_tool_id = format!("mock-grandchild-tool-use-{}", Uuid::new_v4());
                 let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {

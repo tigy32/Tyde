@@ -142,8 +142,24 @@ impl TurnRecovery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TaskAccountingSource {
+    CanonicalMessages,
+    NativeAbsolute,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub(crate) task_accounting_source: Option<TaskAccountingSource>,
+    #[serde(default)]
+    pub task_timing: protocol::AgentTimingTrace,
+    #[serde(default)]
+    pub accounting_history_incomplete: bool,
+    #[serde(default)]
+    pub accounting_session_shared: bool,
+    #[serde(default)]
+    pub model_request_usage: Option<protocol::ModelRequestTokenUsage>,
     #[serde(default)]
     pub tyde_permissions: protocol::AgentTydePermissions,
     #[serde(default)]
@@ -276,7 +292,8 @@ impl SessionStore {
         }
         transaction
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS startup_reservations (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);",
+                "CREATE TABLE IF NOT EXISTS startup_reservations (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS task_usage_archive (agent_id TEXT PRIMARY KEY NOT NULL, session_id TEXT UNIQUE, record TEXT NOT NULL);",
             )
             .map_err(sql_error)?;
         let purged = {
@@ -318,10 +335,12 @@ impl SessionStore {
         Ok(out)
     }
 
+    pub(crate) fn get_result(&self, id: &SessionId) -> Result<Option<SessionRecord>, String> {
+        Ok(read_records(&self.reader()?, &[id])?.remove(&id.0))
+    }
+
     pub fn get(&self, id: &SessionId) -> Option<SessionRecord> {
-        read_records(&self.reader().ok()?, &[id])
-            .ok()?
-            .remove(&id.0)
+        self.get_result(id).ok().flatten()
     }
 
     pub fn get_task_list(&self, id: &SessionId) -> Option<TaskList> {
@@ -376,6 +395,11 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    task_accounting_source: None,
+                    task_timing: Default::default(),
+                    accounting_history_incomplete: false,
+                    accounting_session_shared: false,
+                    model_request_usage: None,
                     tyde_permissions: Default::default(),
                     origin: None,
                     swarm_membership: swarm_membership.clone(),
@@ -637,6 +661,87 @@ impl SessionStore {
             }
             deleted.sort_by(|left, right| left.0.cmp(&right.0));
             Ok((deleted, true))
+        })
+    }
+
+    pub(crate) fn task_usage_snapshots(
+        &self,
+    ) -> Result<Vec<protocol::TaskAgentUsageSnapshot>, String> {
+        let connection = self.reader()?;
+        let mut query = connection.prepare("SELECT a.record, s.record FROM task_usage_archive a LEFT JOIN sessions s ON a.session_id=s.id").map_err(sql_error)?;
+        query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(sql_error)?
+            .map(|row| {
+                let (json, context) = row.map_err(sql_error)?;
+                let shared = context
+                    .as_ref()
+                    .map(|record| {
+                        serde_json::from_str::<SessionRecord>(record)
+                            .map(|record| record.accounting_session_shared)
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        format!("Cannot decode session accounting ownership: {error}")
+                    })?
+                    .unwrap_or(false);
+                let mut snapshot: protocol::TaskAgentUsageSnapshot = serde_json::from_str(&json)
+                    .map_err(|error| format!("Cannot decode task accounting archive: {error}"))?;
+                if snapshot.observation == protocol::TaskUsageObservation::Live {
+                    snapshot.observation = protocol::TaskUsageObservation::Interrupted;
+                    snapshot.usage = snapshot.usage.with_incomplete_reason(
+                        protocol::TaskTokenUsageUnavailableReason::ObservationInterrupted,
+                    );
+                    for span in &mut snapshot.timing.spans {
+                        if span.state == protocol::TaskTimingState::Open {
+                            span.state = protocol::TaskTimingState::Interrupted;
+                        }
+                    }
+                }
+                if shared {
+                    snapshot.usage = protocol::TaskTokenUsageScope::Unavailable {
+                        reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting,
+                    };
+                    snapshot.timing = Default::default();
+                }
+                if context.is_none() {
+                    snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
+                }
+                Ok(snapshot)
+            })
+            .collect()
+    }
+
+    pub(crate) fn save_task_usage_snapshot(
+        &self,
+        mut snapshot: protocol::TaskAgentUsageSnapshot,
+    ) -> Result<(), String> {
+        self.reservation_transaction(move |transaction| {
+            if let Some(session) = snapshot.start.session_id.as_ref() {
+                let original = read_raw_records(transaction, &[session])?;
+                let mut records = decode_records(&original)?;
+                if let Some(record) = records.get_mut(&session.0) {
+                    record.accounting_session_shared |= matches!(snapshot.usage, protocol::TaskTokenUsageScope::Unavailable { reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting });
+                    if record.accounting_session_shared {
+                        snapshot.usage = protocol::TaskTokenUsageScope::Unavailable { reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting };
+                        snapshot.timing = Default::default();
+                    }
+                    record.task_timing = snapshot.timing.clone();
+                    if let Some(usage) = snapshot.native_usage.as_ref() { record.model_request_usage = Some(usage.clone()); }
+                    record.accounting_history_incomplete |= match &snapshot.usage {
+                        protocol::TaskTokenUsageScope::Partial { reasons, .. } => reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete),
+                        protocol::TaskTokenUsageScope::Unavailable { reason } => *reason == protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete,
+                        protocol::TaskTokenUsageScope::Known { .. } => false,
+                    };
+                }
+                write_records(transaction, &original, records)?;
+                transaction.execute("DELETE FROM task_usage_archive WHERE session_id=?1", [&session.0]).map_err(sql_error)?;
+            }
+            let json = serde_json::to_string(&snapshot).map_err(|error| format!("Cannot encode task accounting archive: {error}"))?;
+            transaction.execute("INSERT INTO task_usage_archive(agent_id, session_id, record) VALUES (?1, ?2, ?3) ON CONFLICT(agent_id) DO UPDATE SET session_id=excluded.session_id, record=excluded.record", params![snapshot.start.agent_id.0, snapshot.start.session_id.map(|id| id.0), json]).map_err(sql_error)?;
+            Ok(((), true))
         })
     }
 
@@ -1434,6 +1539,14 @@ impl SessionStoreHandle {
     ) -> Result<Vec<SessionId>, String> {
         let project_id = project_id.clone();
         self.call(move |store| store.delete_for_project(&project_id))
+            .await
+    }
+
+    pub(crate) async fn save_task_usage_snapshot(
+        &self,
+        snapshot: protocol::TaskAgentUsageSnapshot,
+    ) -> Result<(), String> {
+        self.call(move |store| store.save_task_usage_snapshot(snapshot))
             .await
     }
 

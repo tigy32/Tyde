@@ -1089,4 +1089,28 @@ async fn dying_launch_prompt_is_absent_from_resumed_history() {
         "a launch-time death must not record its prompt into replayable history: {:?}",
         end.message.content
     );
+    // A visible failed card is a settled checkpoint, not another execution owner.
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close settled failed card");
+    fixture
+        .next_frame_matching("failed card closes independently", |event| {
+            event.kind == FrameKind::AgentClosed
+                && event
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == agent.new_agent.agent_id)
+        })
+        .await;
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    let usage = snapshot
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == resumed.new_agent.agent_id)
+        .expect("resumed accounting after failed card closes");
+    assert!(
+        matches!(usage.total.status, protocol::TaskTokenUsageStatus::Known),
+        "a parked failed card cannot permanently invalidate the successful resume's accounting"
+    );
 }

@@ -455,8 +455,9 @@ offer a dead button on a host where that CLI is absent.
   vendor bucket carrying its label, the vendor's bucket type, its measure with
   per-value provenance, its scope, its window, its reset, and its vendor status
   — each of which may honestly be "not reported".
-- `CapacityCompactRow` sits inside the task token-usage popup, in its own
-  labelled region under a "Subscription · reported by <vendor>" heading.
+- `TaskCapacityLimits` sits beside each backend's task rollup in the compact
+  popup and expanded Overview. Account limits and task tokens have separate
+  labelled regions; no quota value is derived from task tokens.
 
 **Mobile** — `mobile-frontend/src/components/backend_capacity.rs`: the same
 states, the same coverage caveat, the same absolute timestamps, the same error
@@ -478,16 +479,12 @@ mobile-only freshness maths.
   labels are distinct today; the type is the durable identity, and it is what
   keeps a Codex `primary` from reading as a Claude `five_hour`. The frontend
   hardcodes no label of its own.
-- **In the compact row, exactly one bucket owns the bar** — the most constrained
-  window. If a short window is fine but a weekly one is nearly exhausted, the
-  weekly one is what will actually stop your work. Where the vendor names its own
-  binding limit (Claude), that is the only bucket and this picks it by
-  construction. Ties resolve to the later bucket in the vendor's ordering, which
-  for Codex is the longer `secondary` window — two windows at equal utilization
-  are not equally constraining, and the longer one takes longer to recover. The
-  rest collapse to a `+N more` pointer at Settings. A report with **no**
-  percentage bucket at all (Claude acknowledging a limit without a utilization,
-  or a credits-only Codex report) renders as text with no bar.
+- **Task views show every reported non-balance bucket inline.** Each plain
+  scope/window label is outside a short matte rounded track, its percentage is
+  inside, and its reset is outside. Derived percentages remain labelled text,
+  not authoritative bars. Model-family windows stay together; neither windows
+  nor providers are combined. Freshness and representative-only coverage remain
+  visible. Credit balances stay on the existing Settings surface.
 - **Absolute time is authoritative**; relative durations ("resets in 2d 4h") are
   presentation only, derived from the server's absolute value, and always
   accompanied by the absolute time in the accessible text. A reset already in
@@ -620,3 +617,119 @@ quota-rejected compaction never entered deferred recovery. The previous test
 expecting a raised pause threshold to release 95% usage was updated for the
 explicit below-50% recovery contract; it now verifies that raising the threshold
 keeps work held and a 49% reading releases it exactly once.
+
+## Task usage scope and timing
+
+The task scope is the current root agent and its descendants, including closed
+children. It is not a feature identity, work item, or a manager's lifetime
+allocated to a feature. Each agent contributes its own usage once; inclusive
+provider child totals and inherited fork context are not additional own usage.
+The latest observed model is labelled as such, not used to invent historical
+per-model allocations. Reported zero and missing usage remain different states.
+Cached tokens are an input subset; reasoning tokens are an output subset.
+
+The status-bar summary retains input/cache, output/reasoning, agent count and
+partial coverage. Its popup is one dense flat backend list with account limits
+inline beside each backend's task tokens. Limits retain their family, window,
+reset, freshness, provenance and bucket coverage. Only authoritative reported
+utilization receives a percent track; derived and unreported readings remain
+plain labelled values. Credit balances and sign-in links do not belong here.
+
+Expand opens Overview, Time breakdown and Agents. Overview uses the same server
+backend rollups and capacity primitives; Agents supports search, backend filters,
+tree/flat views and own-usage drilldown. Navigation is bound to the source host
+and exact agent/session, not a name match. Closed context can be resumed only
+when its saved context and owning parent are available. Removing saved chat
+context disables navigation without erasing already observed task accounting.
+The expanded view supports tab keys, heading focus, Escape and back/close without
+trapping focus or stealing focus on outside dismissal.
+
+### Observed timing, not inferred performance
+
+The server observes typed live tool requests, completions and cancellations with
+monotonic elapsed time. The retained span range includes possible unobserved
+gaps. Summed parallel classified tool round-trips are not wall-clock duration,
+model compute or actual process lifetime. Typed child waits carry causal target
+IDs and are excluded from the tool sum; child work is not added to parent wait
+time. Commands are runs, not agents. An exact `./dev.sh check` request receives a
+check-run label. Opaque calls, including unclassified command-wait interactions,
+are shown separately and do not create additional command executions.
+
+Process lifetime, provider-request round-trip, model compute and CPU have typed
+unsupported states: existing source events do not attest those boundaries.
+Background tool return is not process exit. Review state has round identities
+but no typed terminal timestamp for a truthful review duration. That hook is
+reserved for the separate review lifecycle item; no review core is changed.
+
+Each agent retains 64 spans and each task payload at most 256, with explicit
+dropped/omitted counts and bounded identifiers, command labels and causal links.
+Aggregates cover retained observations, not lifetime coverage. Existing host
+subscriptions carry changes; no transcript is re-read per timing update. Replay
+is not new execution. Restored open spans become interrupted at the last durable
+endpoint, never invented active downtime.
+
+### Durable accounting and lifecycle
+
+Canonical message accounting ownership is stored independently of chat-authority
+markers. Resume hydrates own-session accounting before backend startup, then
+projects canonical chat after AgentStart; provider history cannot duplicate it
+or replace the required accounting source. Imported/unowned history remains
+display-only. Storage migrates legacy own/inherited ownership once; the actor
+never interprets historical event identities. Native request counters use typed
+absolute checkpoints, including reported zero, not guessed message allocations.
+
+Missing, damaged or unwritable journals durably mark accounting incomplete. New
+turns and structurally intact replacement journals cannot certify lost history
+complete. Coverage refreshes on accounting mutations independently of display
+stats. Failure to save required coverage or native checkpoints stops the source
+explicitly rather than certifying an older checkpoint complete.
+
+SQLite task descriptors persist independently of resumable chat. Native relays
+archive live own usage, lineage and bounded spans, including while their source
+stream stays open. A hard restart marks those observations interrupted/partial.
+Descriptors replace prior descriptors for the same session across close/resume
+cycles. Close and graceful restart consume the actor's settled final checkpoint;
+a missing checkpoint or failed required commit is an explicit failure, not an
+empty replacement or a successful restart acknowledgement. Storage recovery
+allows an explicit retry.
+
+Close preparation reserves subtree admission before storage and stays reversible
+until settled-marker cleanup succeeds. Resume, marker withdrawal and deletion
+use host-owned completion reservations, not session mutexes held across awaits.
+Actual live/in-flight ownership prevents deletion; retained restoration intent
+alone does not. Native relay activation follows its required session-row commit.
+
+### Validation boundaries
+
+The protocol sim flow exercises live rollups, missing/zero counts, closed and
+native descendants, close/resume deduplication, faulted accounting writes,
+restart/replay, timing overlap, cancellation and retention. Injected clock ticks
+control timing assertions; completion events and explicit gates synchronize work.
+The real-DOM flow covers 87 agents across eight backends, limits/grouping, live
+updates, navigation, tab/focus behavior and viewport/tree geometry. The new
+backend-grouping assertion failed against the former agent-row popup; disabling
+live timing observation failed the overlap flow with zero rather than two spans.
+
+Collateral gate fixes retain launcher isolation assertions without the obsolete
+106-second cutoff sleep, and allocate mobile browser tests a per-run loopback
+port rather than sharing port 4173 with other workbenches. These do not change
+process-launcher primitives or the mobile settings product UI.
+
+### Associated analyzer accounting
+
+Task totals retain the server's explicitly associated self-improvement analyzer
+batches. Backend rows include each attached batch once under its reported
+backend, including backends with no task agent. Analyzer batches are labelled
+separately, never counted as agents or assigned historical model allocations.
+A batch shared by multiple source roots is not apportioned between tasks. Agent
+rows remain own usage only; analyzer timing remains explicitly unobserved.
+If analyzer accounting cannot be read, the task total remains explicitly partial
+without guessing which backend supplied the missing usage.
+
+Simultaneously open cards of one saved session cannot independently attribute
+shared history or concurrent requests. Those cards remain usable, but task
+accounting reports `SharedSessionAccounting` as unavailable, never as zero or
+as two copies of the same tokens. The session's ownership conflict is durable:
+closing a card or restarting cannot restore certainty about that history.
+Its shared timing history is likewise unobserved. A new session has an
+independent accounting source; no historical allocation is guessed.

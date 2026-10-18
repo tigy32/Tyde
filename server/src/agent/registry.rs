@@ -864,6 +864,7 @@ impl AgentStartupFailure {
 }
 
 pub(crate) struct RelaySpawnRequest {
+    pub created_at_ms: u64,
     pub name: String,
     pub input_origin: protocol::MessageOrigin,
     pub origin: AgentOrigin,
@@ -1023,7 +1024,7 @@ impl AgentRegistry {
             project_id: request.project_id.clone(),
             parent_agent_id: Some(request.parent_agent_id.clone()),
             session_id: Some(request.session_id.clone()),
-            created_at_ms: now_ms(),
+            created_at_ms: request.created_at_ms,
         };
 
         let status_handle = self.next_status_handle(agent_id.clone());

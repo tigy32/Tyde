@@ -215,6 +215,9 @@ impl MockBackend {
         let now = now_ms();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
         let mut compaction_capability = native_mock_compaction_capability();
+        if let Some(coordinator) = launch_script.compaction_coordinator {
+            compaction_capability.coordinator = coordinator;
+        }
         if let Some(availability) = launch_script.compaction_availability.clone() {
             compaction_capability.availability = availability;
         }

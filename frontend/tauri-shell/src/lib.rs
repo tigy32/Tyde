@@ -443,9 +443,16 @@ fn with_recovery_policies<T>(
     f(&mut policies)
 }
 
-fn shutdown_managed_host(app: &AppHandle) {
+fn shutdown_managed_host(app: &AppHandle) -> bool {
     let host = app.state::<ShellState>().host.clone();
-    tauri::async_runtime::block_on(host.shutdown_for_restart());
+    match tauri::async_runtime::block_on(host.shutdown_for_restart()) {
+        Ok(()) => true,
+        Err(error) => {
+            app.dialog().message(format!("Tyde could not save task accounting and has not restarted. Resolve the storage error and retry.\n\n{error}"))
+                .kind(MessageDialogKind::Error).show(|_| {});
+            false
+        }
+    }
 }
 
 #[derive(Default)]
@@ -605,7 +612,10 @@ fn show_web_content_recovery_notice(
         match recovery_dialog_action(failure, result) {
             RecoveryDialogAction::Restart => {
                 tauri::async_runtime::spawn(async move {
-                    app.state::<ShellState>().host.shutdown_for_restart().await;
+                    if let Err(error) = app.state::<ShellState>().host.shutdown_for_restart().await {
+                        app.dialog().message(error).kind(MessageDialogKind::Error).show(|_|{});
+                        return;
+                    }
                     #[cfg(desktop)]
                     let result=updates::restart_current_application(&app).await;
                     #[cfg(not(desktop))]
@@ -1656,7 +1666,9 @@ pub fn run() {
             if code == Some(tauri::RESTART_EXIT_CODE)
                 || quit_confirmation_for_run.consume_confirmed_exit()
             {
-                shutdown_managed_host(app);
+                if !shutdown_managed_host(app) {
+                    api.prevent_exit();
+                }
                 return;
             }
 

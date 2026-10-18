@@ -39,6 +39,7 @@ pub enum AbandonedResponse {
 pub struct MockScript {
     #[cfg(all(feature = "test-support", target_os = "linux"))]
     pub(super) native_process: Option<Box<crate::backend::subprocess::test_support::Fixture>>,
+    pub(super) compaction_coordinator: Option<crate::backend::BackendCompactionCoordinator>,
     pub(super) compaction_availability: Option<crate::backend::BackendCompactionAvailability>,
     pub(super) compaction_failure: Option<MockCompactionFailure>,
     pub(super) turns: Vec<MockTurn>,
@@ -79,6 +80,14 @@ impl MockScript {
 
     pub fn then(mut self, turn: MockTurn) -> Self {
         self.turns.push(turn);
+        self
+    }
+
+    pub fn with_compaction_coordinator(
+        mut self,
+        coordinator: crate::backend::BackendCompactionCoordinator,
+    ) -> Self {
+        self.compaction_coordinator = Some(coordinator);
         self
     }
 
@@ -383,6 +392,13 @@ impl MockTurn {
         Self::done(steps)
     }
 
+    pub fn text_completion_after_gate(text: impl Into<String>, gate: &MockGateHandle) -> Self {
+        let mut steps = text_steps(text.into(), TextShape::default());
+        let position = steps.iter().position(|step| matches!(step, MockStep::Emit(event) if matches!(&**event, BackendEvent::Chat(protocol::ChatEvent::StreamEnd(_))))).expect("text completion boundary");
+        steps.insert(position, MockStep::Gate(gate.gate()));
+        Self::done(steps)
+    }
+
     pub fn gated_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         Self::done(text_steps(
             text.into(),
@@ -410,6 +426,8 @@ impl MockTurn {
             text.into(),
             TextShape {
                 busy_native_child: Some(MockNativeChild {
+                    registration_gate: None,
+                    emit_timing_tool: false,
                     name: child_name.into(),
                     prompt: child_prompt.into(),
                     grandchild: None,
@@ -578,6 +596,8 @@ impl MockTurn {
     ) -> Self {
         let mut steps = held_steps(text.into());
         steps.push(MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
             grandchild: None,
@@ -705,6 +725,135 @@ impl MockTurn {
                 gate_after_completion: Some(gate_after.gate()),
             },
         )
+    }
+
+    /// Protocol-server fixture: overlapping command and dependency wait,
+    /// followed by background completion, without a second execution.
+    pub fn timing_flow(
+        child: AgentId,
+        foreground: &MockGateHandle,
+        background: &MockGateHandle,
+    ) -> Self {
+        let request = |id: &str, name: &str, tool_type| {
+            MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: id.to_owned(),
+                tool_name: name.to_owned(),
+                tool_type,
+            }))
+        };
+        let mut steps = vec![
+            MockStep::emit(emit::typing(true)),
+            request(
+                "timing-check",
+                "run_command",
+                protocol::ToolRequestType::RunCommand {
+                    command: "./dev.sh check".to_owned(),
+                    working_directory: "/tmp/test".to_owned(),
+                },
+            ),
+            request(
+                "timing-await",
+                "tyde_await_agents",
+                protocol::ToolRequestType::TydeAwaitAgents {
+                    agent_ids: vec![child],
+                },
+            ),
+            MockStep::Gate(foreground.gate()),
+            MockStep::emit(emit::tool_completed(protocol::ToolExecutionCompletedData {
+                tool_call_id: "timing-await".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::TydeAwaitAgents {
+                        ready: Vec::new(),
+                        still_thinking: Vec::new(),
+                    },
+                },
+            })),
+            MockStep::emit(emit::tool_progress(protocol::ToolProgressData {
+                tool_call_id: "timing-check".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({"status":"running"}),
+                },
+            })),
+            MockStep::emit(emit::typing(false)),
+            MockStep::Gate(background.gate()),
+        ];
+        steps.extend(
+            emit::background_task_finished_frames("timing-check")
+                .into_iter()
+                .map(MockStep::emit),
+        );
+        Self::done(steps)
+    }
+
+    pub fn text_with_late_zero_native_usage(
+        text: impl Into<String>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        Self::text_with_late_native_usage(text, gate, 0)
+    }
+
+    pub fn text_with_late_native_usage(
+        text: impl Into<String>,
+        gate: &MockGateHandle,
+        tokens: u64,
+    ) -> Self {
+        let mut steps = text_steps(
+            text.into(),
+            TextShape {
+                usage: TextUsage::Omitted,
+                ..TextShape::default()
+            },
+        );
+        steps.push(MockStep::Gate(gate.gate()));
+        steps.push(MockStep::emit(BackendEvent::ModelRequestTokenUsage(
+            protocol::ModelRequestTokenUsage {
+                request_id: protocol::ModelRequestId {
+                    turn_id: protocol::ModelTurnId(format!("observed-native-{tokens}")),
+                    sequence: 1,
+                },
+                request: protocol::TokenUsage {
+                    output_tokens: tokens,
+                    total_tokens: tokens,
+                    ..Default::default()
+                },
+                turn: protocol::TokenUsage {
+                    output_tokens: tokens,
+                    total_tokens: tokens,
+                    ..Default::default()
+                },
+                cumulative: protocol::TokenUsage {
+                    output_tokens: tokens,
+                    total_tokens: tokens,
+                    ..Default::default()
+                },
+                model_context_window: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
+            },
+        )));
+        Self::done(steps)
+    }
+
+    pub fn text_with_cache_counter(
+        text: impl Into<String>,
+        cached_prompt_tokens: Option<u64>,
+    ) -> Self {
+        let mut steps = text_steps(text.into(), TextShape::default());
+        for step in &mut steps {
+            if let MockStep::Emit(event) = step
+                && let BackendEvent::Chat(protocol::ChatEvent::StreamEnd(end)) = &mut **event
+            {
+                let mut usage = emit::mock_turn_token_usage();
+                usage.cached_prompt_tokens = cached_prompt_tokens;
+                end.message.token_usage = Some(MessageTokenUsage::request_and_turn_known(
+                    usage.clone(),
+                    usage,
+                ));
+            }
+        }
+        Self::done(steps)
     }
 
     pub fn agent_control_await(agent_ids: impl IntoIterator<Item = AgentId>) -> Self {
@@ -862,12 +1011,45 @@ impl MockTurn {
         ])
     }
 
+    pub fn with_gated_native_child_and_timing_tool(
+        self,
+        child_name: impl Into<String>,
+        child_prompt: impl Into<String>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: Some(gate.gate()),
+            emit_timing_tool: true,
+            name: child_name.into(),
+            prompt: child_prompt.into(),
+            grandchild: None,
+            lifecycle: MockChildLifecycle::CompleteAndRetain,
+        })])
+    }
+
+    pub fn with_running_native_child_and_timing(
+        self,
+        child_name: impl Into<String>,
+        child_prompt: impl Into<String>,
+    ) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            emit_timing_tool: true,
+            name: child_name.into(),
+            prompt: child_prompt.into(),
+            grandchild: None,
+            lifecycle: MockChildLifecycle::LiveUntilInterrupt,
+        })])
+    }
+
     pub fn with_native_child(
         self,
         child_name: impl Into<String>,
         child_prompt: impl Into<String>,
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
             grandchild: None,
@@ -883,6 +1065,8 @@ impl MockTurn {
         grandchild_prompt: impl Into<String>,
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
             lifecycle: MockChildLifecycle::CompleteAndRetain,
@@ -899,6 +1083,8 @@ impl MockTurn {
         child_prompt: impl Into<String>,
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
             grandchild: None,
@@ -962,6 +1148,32 @@ impl MockTurn {
     /// out, and no completion follows. This is the state a provider leaves
     /// behind when it loses track of a command it started — the card stays
     /// open and its in-flight tray row has nothing left that could close it.
+    pub fn with_tool_round_trips(self, count: usize) -> Self {
+        let mut steps = Vec::new();
+        for index in 0..count {
+            let id = format!("retention-tool-{index}");
+            steps.push(MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: id.clone(),
+                tool_name: "run_command".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: "printf bounded-trace".to_owned(),
+                    working_directory: "/tmp/test".to_owned(),
+                },
+            })));
+            steps.push(MockStep::emit(emit::tool_completed(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: id,
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::Other {
+                            result: serde_json::json!({"fixture": true}),
+                        },
+                    },
+                },
+            )));
+        }
+        self.with_appended_steps(steps)
+    }
+
     pub fn with_open_background_task(self, tool_call_id: impl Into<String>) -> Self {
         let steps = emit::background_task_started_frames(&tool_call_id.into(), true)
             .into_iter()
@@ -1210,6 +1422,8 @@ pub(super) struct MockPendingTool {
 
 #[derive(Debug, Clone)]
 pub(super) struct MockNativeChild {
+    pub(super) registration_gate: Option<MockGate>,
+    pub(super) emit_timing_tool: bool,
     pub(super) name: String,
     pub(super) prompt: String,
     pub(super) lifecycle: MockChildLifecycle,

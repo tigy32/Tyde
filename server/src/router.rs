@@ -863,7 +863,7 @@ pub(crate) async fn route_client_envelope(
                         "Use Reset Tychat agent instead of closing the host-owned agent",
                     ));
                 }
-                host.close_agent(&agent_id).await;
+                host.close_agent(&agent_id).await?;
             }
             FrameKind::SetSessionSettings => {
                 let stream_path = envelope.stream.clone();

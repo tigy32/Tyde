@@ -744,13 +744,29 @@ fn stored_access_mode(fixture: &Fixture, session_id: &SessionId) -> BackendAcces
 #[tokio::test]
 async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     let mut fixture = Fixture::new().await;
+    let parent = fixture
+        .spawn_scripted(
+            "shared accounting parent",
+            MockScript::new().with_unbounded_echo(),
+        )
+        .await;
+    fixture.finish_turn(&parent).await;
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let parent_usage = before
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
+        .expect("parent usage")
+        .total
+        .usage
+        .total_tokens;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("shared session".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: Some(parent.new_agent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/shared-session".to_owned()],
@@ -806,6 +822,39 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         "resuming an open session must produce a distinct card"
     );
 
+    let (_, shared) = fixture.connect_with_bootstrap().await;
+    let usage = shared
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
+        .expect("shared-session task accounting");
+    assert_eq!(usage.descendant_count, 2, "both cards remain visible");
+    assert_eq!(
+        usage.total.usage.total_tokens, parent_usage,
+        "ambiguous shared history must not be summed twice or guessed"
+    );
+    assert!(
+        usage
+            .breakdown
+            .iter()
+            .skip(1)
+            .all(|entry| entry.usage.reported_usage().is_none()),
+        "simultaneous cards have no independently attributable own-session totals"
+    );
+
+    assert!(
+        matches!(&usage.total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting))
+    );
+    assert!(usage.breakdown.iter().skip(1).all(|entry| matches!(
+        entry.usage,
+        protocol::TaskTokenUsageScope::Unavailable {
+            reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting
+        }
+    )));
+    assert!(
+        usage.timing.spans.is_empty(),
+        "shared historical spans cannot be certified as independent runs"
+    );
     fixture
         .client
         .close_agent(&second.instance_stream)
@@ -819,11 +868,49 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     })
     .await;
 
+    let (_, remaining) = fixture.connect_with_bootstrap().await;
+    let usage = remaining
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
+        .expect("remaining shared accounting");
+    assert_eq!(
+        usage.total.usage.total_tokens, parent_usage,
+        "closing one card cannot certify shared historical attribution"
+    );
+    let parent_session = before
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
+        .and_then(|usage| usage.root_session_id.clone())
+        .expect("parent session");
     let bootstrap = fixture.restart_host().await;
-    let (restored_by_session, _) =
-        collect_restart_replay(&mut fixture, &bootstrap, std::slice::from_ref(&session)).await;
+    let (restored_by_session, _) = collect_restart_replay(
+        &mut fixture,
+        &bootstrap,
+        &[session.clone(), parent_session.clone()],
+    )
+    .await;
     restored_by_session.get(&session).expect(
         "the card still open must be restored; closing its sibling must not withdraw the session",
+    );
+    let (_, after_restart) = fixture.connect_with_bootstrap().await;
+    let restored_parent = &restored_by_session[&parent_session];
+    let usage = after_restart
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored_parent.agent_id)
+        .expect("restored shared accounting");
+    assert_eq!(
+        usage.total.usage.total_tokens, parent_usage,
+        "restart cannot re-certify ambiguous session history"
+    );
+    assert!(
+        usage
+            .breakdown
+            .iter()
+            .skip(1)
+            .all(|entry| entry.usage.reported_usage().is_none())
     );
 }
 
@@ -3693,7 +3780,7 @@ async fn delete_session_removes_it_from_list() {
         .expect("spawn agent failed");
 
     let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    let _: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     expect_turn(&mut fixture.client, "mock backend response to: hello").await;
 
@@ -3707,6 +3794,39 @@ async fn delete_session_removes_it_from_list() {
     assert_eq!(list.sessions.len(), 1, "expected one session before delete");
     let session_id = list.sessions[0].id.clone();
 
+    // An open card still owns durable task accounting; deleting that row used
+    // to strand its later close. Deletion remains available after close.
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("request deletion of open session");
+    let error: protocol::CommandErrorPayload = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "open session deletion rejected",
+        |env| env.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("delete conflict");
+    assert_eq!(error.code, protocol::CommandErrorCode::Conflict);
+    assert!(error.message.contains("Close the agent"));
+    fixture
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close before deleting session");
+    let closed: protocol::AgentClosedPayload = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "agent closes after rejected delete",
+        |env| env.kind == FrameKind::AgentClosed,
+    )
+    .await
+    .parse_payload()
+    .expect("closed agent");
+    assert_eq!(closed.agent_id, agent.agent_id);
     // Delete the session — server will fan-out an updated SessionList automatically.
     fixture
         .client
@@ -3716,21 +3836,13 @@ async fn delete_session_removes_it_from_list() {
         .await
         .expect("delete_session failed");
 
-    for attempt in 0..3 {
-        let list = wait_for_session_list(&mut fixture.client, "SessionList after delete").await;
-        if list.sessions.is_empty() {
-            return;
-        }
-        if attempt == 2 {
-            panic!(
-                "session list must be empty after delete, got {:?}",
-                list.sessions
-                    .iter()
-                    .map(|s| s.id.0.as_str())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
+    fixture::next_frame_matching_on(&mut fixture.client, "deleted session is absent", |env| {
+        env.kind == FrameKind::SessionList
+            && env
+                .parse_payload::<SessionListPayload>()
+                .is_ok_and(|list| list.sessions.is_empty())
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -4286,6 +4398,22 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
     );
 }
 
+async fn close_accounting_card(fixture: &mut Fixture, agent: &NewAgentPayload) {
+    fixture
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close single-owner recovery source");
+    fixture
+        .next_frame_matching("single-owner recovery source closed", |event| {
+            event.kind == FrameKind::AgentClosed
+                && event
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == agent.agent_id)
+        })
+        .await;
+}
+
 /// A transcript that stops being written says so.
 ///
 /// The agent keeps running and the stream keeps updating when journaling
@@ -4330,18 +4458,9 @@ async fn a_transcript_that_cannot_be_written_reports_a_non_fatal_error() {
     // A directory where the journal belongs fails every read and every write of
     // it, for any user, which is the durable stand-in for a disk that has
     // stopped accepting appends.
-    // The actor may still be flushing the turn it just finished, so claim the
-    // path until it stays claimed rather than racing it exactly once.
-    let mut blocked = false;
-    for _ in 0..100 {
-        let _ = std::fs::remove_file(&journal);
-        if std::fs::create_dir(&journal).is_ok() {
-            blocked = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(blocked, "could not block {}", journal.display());
+    fixture.mock_by_id(&agent.agent_id).await;
+    std::fs::remove_file(&journal).expect("remove settled journal to inject failure");
+    std::fs::create_dir(&journal).expect("block canonical journal writes");
 
     fixture
         .client
@@ -4391,6 +4510,104 @@ async fn a_transcript_that_cannot_be_written_reports_a_non_fatal_error() {
         extra, 0,
         "a continuing outage must not re-report itself every turn"
     );
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "last outage turn is idle",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    fixture.mock_by_id(&agent.agent_id).await;
+    std::fs::remove_dir(&journal).expect("recover canonical journal storage");
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "storage recovered".to_owned())
+        .await
+        .expect("run after journal recovery");
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: storage recovered",
+    )
+    .await;
+    // This checks lost journaling, not concurrent cards sharing one history.
+    close_accounting_card(&mut fixture, &agent).await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("recovered-partial-accounting".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("after persistence loss".to_owned()),
+            },
+        })
+        .await
+        .expect("resume after recovered append failure");
+    let reopened: NewAgentPayload = fixture
+        .next_frame_matching("recovered source descriptor", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("recovered source descriptor");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &reopened.instance_stream,
+        "recovered source ready",
+    )
+    .await;
+    // Resume visibly replays the one recovered turn before its new own turn.
+    // The strict live-only helper rejected that valid canonical history.
+    let mut replayed_recovered_turns = 0;
+    loop {
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &reopened.instance_stream,
+            "recovered history then new own completion",
+        )
+        .await;
+        if let ChatEvent::StreamEnd(end) = event {
+            if end
+                .message
+                .content
+                .contains("mock backend response to: after persistence loss")
+            {
+                break;
+            }
+            assert!(
+                end.message
+                    .content
+                    .contains("mock backend response to: storage recovered"),
+                "only the recovered canonical turn may precede the new own turn"
+            );
+            replayed_recovered_turns += 1;
+        }
+    }
+    assert_eq!(
+        replayed_recovered_turns, 1,
+        "recovered canonical history must replay exactly once"
+    );
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &reopened.instance_stream,
+        "new own turn settled after recovered history",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == reopened.agent_id)
+        .expect("append-loss accounting after resume");
+    assert!(
+        matches!(&usage.total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "an intact recovered journal cannot certify the lost turns complete"
+    );
+    assert_eq!(usage.total.usage.total_tokens, 3180);
 }
 
 /// A record this build cannot read is not a record it may delete.
@@ -4426,12 +4643,18 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         .await
         .expect("spawn agent failed");
 
-    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let original: NewAgentPayload = expect_next_event(&mut fixture.client, "NewAgent")
+        .await
+        .parse_payload()
+        .expect("original descriptor");
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     expect_turn(&mut fixture.client, "mock backend response to: hello").await;
 
     let session_id = wait_for_session_id(&mut fixture, "SessionList").await;
     let journal = transcript_journal_path(&fixture, &session_id);
+    // Close before corruption: the assertions below isolate unreadable history,
+    // while the shared-card flow separately covers concurrent attribution.
+    close_accounting_card(&mut fixture, &original).await;
     let intact_lines = journal_lines(&journal);
 
     // Well-formed JSON, properly terminated, carrying an event this build has
@@ -4478,6 +4701,7 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse resumed AgentBootstrap");
 
+    assert!(payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentError(error) if !error.fatal && error.message.contains("accounting is incomplete"))), "damaged accounting must include an actionable nonfatal restore error");
     // The prefix is still served: an unreadable record costs what follows it,
     // not what precedes it.
     assert_bootstrap_tail_messages(&payload, &["hello"]);
@@ -4488,6 +4712,16 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
     )
     .await;
 
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let usage = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == resumed.agent_id)
+        .expect("damaged accounting rollup");
+    assert!(
+        matches!(&usage.total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "new turns must not conceal missing historical accounting"
+    );
     let contents = std::fs::read_to_string(&journal).expect("read journal after resume");
     assert!(
         contents.contains("from-a-newer-build"),
@@ -4502,6 +4736,198 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         journal_lines(&journal)[..intact_lines.len()],
         intact_lines[..],
         "records written before the unreadable one must be untouched"
+    );
+    close_accounting_card(&mut fixture, &resumed).await;
+    std::fs::remove_file(&journal).expect("remove required journal for resume failure case");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("missing-journal-resume".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("after missing journal".to_owned()),
+            },
+        })
+        .await
+        .expect("resume with missing journal");
+    let missing: NewAgentPayload =
+        expect_next_event(&mut fixture.client, "missing-journal descriptor")
+            .await
+            .parse_payload()
+            .expect("missing-journal descriptor");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &missing.instance_stream,
+        FrameKind::AgentBootstrap,
+        "missing-journal bootstrap",
+    )
+    .await;
+    let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("missing-journal bootstrap");
+    assert!(bootstrap.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentError(error) if !error.fatal && error.message.contains("accounting is incomplete"))));
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: after missing journal",
+    )
+    .await;
+    let (_, after_missing) = fixture.connect_with_bootstrap().await;
+    assert!(
+        matches!(&after_missing.task_token_usages.iter().find(|usage| usage.root_agent_id == missing.agent_id).expect("missing-journal usage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "a new journal cannot certify lost history complete"
+    );
+    let bootstrap = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&bootstrap, std::slice::from_ref(&session_id))
+        .await;
+    let (_, restarted) = fixture.connect_with_bootstrap().await;
+    assert!(
+        matches!(&restarted.task_token_usages.iter().find(|usage| usage.root_agent_id == restored[&session_id].agent_id).expect("persistent missing-history coverage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "recreating a journal must not clear historical incompleteness after restart"
+    );
+    // A complete, independent session must not select provider accounting merely
+    // because its canonical authority marker was lost.
+    let mut fixture = Fixture::new().await;
+    let replay = server::backend::mock::MockResumeReplay::default();
+    let complete = fixture
+        .spawn_scripted(
+            "lost-authority",
+            MockScript::one(MockTurn::text("replayed history"))
+                .with_controlled_resume_replay(&replay),
+        )
+        .await;
+    fixture.finish_turn(&complete).await;
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let usage = before
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == complete.new_agent.agent_id)
+        .expect("complete usage before marker loss");
+    assert!(matches!(
+        usage.total.status,
+        protocol::TaskTokenUsageStatus::Known
+    ));
+    let session = usage.root_session_id.clone().expect("complete session");
+    close_accounting_card(&mut fixture, &complete.new_agent).await;
+    std::fs::remove_file(
+        transcript_journal_path(&fixture, &session).with_extension("authoritative"),
+    )
+    .expect("remove canonical authority marker");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("lost-authority-resumed".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session,
+                prompt: Some("new own turn".to_owned()),
+            },
+        })
+        .await
+        .expect("resume after marker loss");
+    let resumed: NewAgentPayload = fixture
+        .next_frame_matching("marker-loss descriptor", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("marker-loss descriptor");
+    replay.wait_until_started().await;
+    replay.history_batch(1);
+    replay.complete();
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "marker-loss bootstrap",
+    )
+    .await;
+    let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("marker-loss bootstrap");
+    assert_eq!(bootstrap.events.iter().filter(|event| matches!(event, AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) if message.content == "replayed history") || matches!(event, AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) if end.message.content == "replayed history")).count(), 1, "missing chat authority marker must not duplicate canonical history with provider replay");
+    assert!(!bootstrap.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentError(error) if error.message.contains("accounting is incomplete"))), "the durable accounting source does not depend on the chat authority marker");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        "mock backend response to: new own turn",
+    )
+    .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == resumed.agent_id)
+        .expect("marker-loss accounting");
+    assert!(matches!(
+        usage.total.status,
+        protocol::TaskTokenUsageStatus::Known
+    ));
+    assert_eq!(
+        usage.total.usage.total_tokens, 3180,
+        "marker loss cannot select provider replay instead of the canonical journal"
+    );
+    let session = usage.root_session_id.clone().expect("marker-loss session");
+    close_accounting_card(&mut fixture, &resumed).await;
+    std::fs::remove_dir_all(
+        transcript_journal_path(&fixture, &session)
+            .parent()
+            .expect("journal directory"),
+    )
+    .expect("remove required canonical directory");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("missing-canonical-directory".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session,
+                prompt: Some("after directory loss".to_owned()),
+            },
+        })
+        .await
+        .expect("resume after canonical directory loss");
+    let missing: NewAgentPayload = fixture
+        .next_frame_matching("missing-directory descriptor", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("missing-directory descriptor");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &missing.instance_stream,
+        FrameKind::AgentBootstrap,
+        "missing-directory bootstrap",
+    )
+    .await;
+    let bootstrap: AgentBootstrapPayload =
+        env.parse_payload().expect("missing-directory bootstrap");
+    assert!(bootstrap.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentError(error) if error.message.contains("accounting is incomplete"))));
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &missing.instance_stream,
+        "mock backend response to: after directory loss",
+    )
+    .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == missing.agent_id)
+        .expect("missing-directory accounting");
+    assert!(
+        matches!(&usage.total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete))
+    );
+    assert_eq!(
+        usage.total.usage.total_tokens, 1590,
+        "provider history cannot substitute for a missing canonical journal"
     );
 }
 
@@ -4518,7 +4944,7 @@ async fn restart_does_not_resurrect_backend_native_children() {
             "parent-with-native-child",
             MockScript::one(
                 MockTurn::text("mock backend response to: parent prompt")
-                    .with_native_child("mock-native-child", "parent prompt"),
+                    .with_running_native_child_and_timing("mock-native-child", "parent prompt"),
             ),
         )
         .await;
@@ -4591,7 +5017,69 @@ async fn restart_does_not_resurrect_backend_native_children() {
     .expect("parse native child SessionSettings");
     assert!(child_settings.schema.is_none());
 
-    let bootstrap = fixture.restart_host().await;
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "running native tool observation", |env| env.stream == child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "native-running-timing"))).await;
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let own_before = before
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent.agent_id)
+        .expect("running native task usage")
+        .total
+        .usage
+        .total_tokens;
+    let archive_gate = fixture
+        .host_for_test()
+        .install_restart_archive_test_gate(child.agent_id.clone())
+        .await;
+    let stopping = fixture.host_for_test();
+    let attempt = tokio::spawn(async move { stopping.shutdown_for_restart().await });
+    archive_gate.wait_until_entered().await;
+    let failed_archive = fixture.fail_next_session_commit();
+    archive_gate.release_one();
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "required native archive failure",
+        |env| {
+            env.kind == FrameKind::AgentError
+                && env.parse_payload::<AgentErrorPayload>().is_ok_and(|error| {
+                    error.agent_id == child.agent_id
+                        && error.fatal
+                        && error.message.contains("restart cancelled")
+                })
+        },
+    )
+    .await;
+    attempt
+        .await
+        .expect("restart coordinator finishes with an explicit result")
+        .expect_err("required archive failure must not acknowledge successful restart");
+    drop(failed_archive);
+    drop(archive_gate);
+    let (_, still_owned) = fixture.connect_with_bootstrap().await;
+    assert!(
+        still_owned
+            .agents
+            .iter()
+            .any(|agent| agent.agent_id == child.agent_id),
+        "a failed restart cannot replace the instance before accounting commits"
+    );
+    assert_eq!(
+        still_owned
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == parent.agent_id)
+            .expect("failed-restart source accounting")
+            .total
+            .usage
+            .total_tokens,
+        own_before
+    );
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config.restoration_complete_test_gate = Some(restoration_finished.shared())
+        })
+        .await;
     let (mut restored, _) = collect_restart_replay(
         &mut fixture,
         &bootstrap,
@@ -4604,23 +5092,41 @@ async fn restart_does_not_resurrect_backend_native_children() {
         "restart must restore the parent under its persisted agent id"
     );
 
-    // Restoration is one sequential pass, so the child would be reconstructed
-    // moments after the parent. Give the pass room to do it and require that
-    // the agent count never grows past the parent.
-    let resurrected = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if fixture.agent_ids().await.len() > 1 {
-                return fixture.agent_session_ids().await;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        resurrected.is_err(),
-        "backend-native child must not be reconstructed after restart, live sessions: {:?}",
-        resurrected.unwrap_or_default()
+    restoration_finished.wait_until_entered().await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored_parent.agent_id)
+        .expect("running native accounting retained after restart");
+    assert_eq!(usage.total.usage.total_tokens, own_before);
+    let saved_child = usage
+        .breakdown
+        .iter()
+        .find(|entry| entry.origin == protocol::AgentOrigin::BackendNative)
+        .expect("running native own descriptor retained");
+    assert_eq!(
+        saved_child
+            .usage
+            .known_usage()
+            .expect("native observed own usage")
+            .total_tokens,
+        330
     );
+    assert_eq!(
+        saved_child.navigation,
+        protocol::TaskUsageNavigation::Unavailable
+    );
+    assert!(
+        usage
+            .timing
+            .spans
+            .iter()
+            .any(|entry| entry.agent_id == saved_child.agent_id
+                && entry.span.tool_call_id == "native-running-timing"
+                && entry.span.state == protocol::TaskTimingState::Interrupted)
+    );
+    restoration_finished.release_one();
     let live_sessions = fixture.agent_session_ids().await;
     assert_eq!(
         live_sessions,
@@ -6088,7 +6594,11 @@ async fn restart_during_turn_admission_continues_the_admitted_turn() {
 
     let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
     let host = fixture.host_for_test();
-    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    let shutdown = tokio::spawn(async move {
+        host.shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting")
+    });
     stop_gate.wait_until_entered().await;
     assert_eq!(
         stored_turn_recovery(&fixture, &session),
@@ -6097,10 +6607,7 @@ async fn restart_during_turn_admission_continues_the_admitted_turn() {
     );
     send_gate.release_one();
     stop_gate.release_one();
-    tokio::time::timeout(Duration::from_secs(27), shutdown)
-        .await
-        .expect("restart stop is bounded")
-        .expect("restart stop");
+    shutdown.await.expect("restart stop");
 
     let bootstrap = fixture.restart_host().await;
     let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
@@ -7112,6 +7619,46 @@ async fn failed_restored_parent_keeps_its_subtree_for_a_stable_retry() {
         "a successful retry reports no restoration failure: {:?}",
         after_retry.agent_restoration_failures
     );
+    let finished = server::new_spawn_operation_test_gate();
+    fixture
+        .restart_host_with_runtime_config(|config| {
+            config
+                .rejected_restoration_sessions
+                .insert(parent_session.clone());
+            config.restoration_complete_test_gate = Some(finished.shared());
+        })
+        .await;
+    finished.wait_until_entered().await;
+    for session in [&parent_session, &child_session] {
+        fixture
+            .client
+            .delete_session(protocol::DeleteSessionPayload {
+                session_id: session.clone(),
+            })
+            .await
+            .expect("delete unowned failed-restoration context");
+    }
+    let list = fixture
+        .next_frame_matching("failed-restoration contexts deleted", |env| {
+            env.kind == FrameKind::SessionList
+                && env
+                    .parse_payload::<protocol::SessionListPayload>()
+                    .is_ok_and(|list| {
+                        list.sessions.iter().all(|session| {
+                            session.id != parent_session && session.id != child_session
+                        })
+                    })
+        })
+        .await
+        .parse_payload::<protocol::SessionListPayload>()
+        .expect("deleted intent session list");
+    assert!(
+        list.sessions
+            .iter()
+            .any(|session| session.id == free_root_session),
+        "deleting unowned restoration intent must preserve independent sessions"
+    );
+    finished.release_one();
 }
 
 /// Closing an agent in the middle of a turn withdraws it from recovery: a
@@ -7287,7 +7834,10 @@ async fn closing_mid_turn_spends_the_recovery_marker() {
     let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
     let stopping_host = fixture.host_for_test();
     let stop = tokio::spawn(async move {
-        stopping_host.shutdown_for_restart().await;
+        stopping_host
+            .shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
     });
     stop_gate.wait_until_entered().await;
     assert_eq!(
@@ -7775,14 +8325,15 @@ async fn restart_during_initial_prompt_startup_continues_the_spawned_turn() {
 
     let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
     let host = fixture.host_for_test();
-    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    let shutdown = tokio::spawn(async move {
+        host.shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting")
+    });
     stop_gate.wait_until_entered().await;
     stop_gate.release_one();
     ready_gate.release_one();
-    tokio::time::timeout(Duration::from_secs(27), shutdown)
-        .await
-        .expect("restart stop is bounded")
-        .expect("restart stop");
+    shutdown.await.expect("restart stop");
     let session = interrupted_session_under(&fixture, workspace_root)
         .expect("the first turn the provider started is recorded as interrupted by the restart");
 
@@ -7985,7 +8536,11 @@ async fn quota_queued_message_on_idle_agent_is_not_continued_after_restart() {
     fixture.expect_queued_messages(&agent, 1).await;
     fixture.mock_by_id(&agent_id).await;
 
-    fixture.host_for_test().shutdown_for_restart().await;
+    fixture
+        .host_for_test()
+        .shutdown_for_restart()
+        .await
+        .expect("restart must preserve required accounting");
     assert_eq!(
         stored_turn_recovery(&fixture, &session),
         serde_json::Value::Null,
@@ -8080,7 +8635,11 @@ async fn busy_provider_retains_the_restart_continuation() {
         let final_agent = if restart_before_resend {
             let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
             let host = fixture.host_for_test();
-            let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+            let shutdown = tokio::spawn(async move {
+                host.shutdown_for_restart()
+                    .await
+                    .expect("restart must preserve required accounting")
+            });
             stop_gate.wait_until_entered().await;
             assert_eq!(
                 stored_turn_recovery(&fixture, &session),
@@ -8089,10 +8648,7 @@ async fn busy_provider_retains_the_restart_continuation() {
             );
             resend_gate.release_one();
             stop_gate.release_one();
-            tokio::time::timeout(Duration::from_secs(27), shutdown)
-                .await
-                .expect("restart stop is bounded")
-                .expect("restart stop");
+            shutdown.await.expect("restart stop");
             let bootstrap = fixture.restart_host().await;
             restored_descriptor(&mut fixture, &bootstrap, &session).await
         } else {
@@ -8742,7 +9298,11 @@ async fn close_during_startup_with_deferred_restart_is_not_restored() {
     .await;
     let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
     let host = fixture.host_for_test();
-    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    let shutdown = tokio::spawn(async move {
+        host.shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting")
+    });
     stop_gate.wait_until_entered().await;
     fixture
         .client
@@ -8758,10 +9318,7 @@ async fn close_during_startup_with_deferred_restart_is_not_restored() {
         })
         .await;
     stop_gate.release_one();
-    tokio::time::timeout(Duration::from_secs(27), shutdown)
-        .await
-        .expect("restart stop is bounded")
-        .expect("restart stop");
+    shutdown.await.expect("restart stop");
 
     let restoration_finished = server::new_spawn_operation_test_gate();
     let bootstrap = fixture

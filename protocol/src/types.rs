@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 84;
+pub const PROTOCOL_VERSION: u32 = 85;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -4727,6 +4727,145 @@ pub struct TaskTokenUsagePayload {
     pub descendant_usage: TaskTokenUsageAggregate,
     pub descendant_count: u32,
     pub breakdown: Vec<TaskTokenUsageEntry>,
+    pub backends: Vec<TaskBackendUsage>,
+    pub timing: TaskTimingSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskUsageNavigation {
+    LiveAgent,
+    SavedSession { session_id: SessionId },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskUsageObservation {
+    #[default]
+    Unobserved,
+    Live,
+    Closed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAgentUsageSnapshot {
+    #[serde(default)]
+    pub observation: TaskUsageObservation,
+    #[serde(default)]
+    pub native_usage: Option<ModelRequestTokenUsage>,
+    pub navigation: TaskUsageNavigation,
+    pub start: AgentStartPayload,
+    pub usage: TaskTokenUsageScope,
+    pub model: Option<String>,
+    pub parent_session_id: Option<SessionId>,
+    pub timing: AgentTimingTrace,
+}
+
+/// Rollups are backend-scoped, never allocations to the latest selected model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBackendUsage {
+    pub backend_kind: BackendKind,
+    pub analyzer_batch_count: u32,
+    pub agent_count: u32,
+    pub reporting_agent_count: u32,
+    pub incomplete_agent_count: u32,
+    pub total: TaskTokenUsageAggregate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingAvailability {
+    #[default]
+    Unsupported,
+    Unobserved,
+    Observed,
+    PersistenceFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskTimingCategory {
+    Command {
+        command: String,
+        check: bool,
+    },
+    DependencyWait {
+        agent_ids: Vec<AgentId>,
+        omitted_link_count: Option<u32>,
+        targets_observed: bool,
+    },
+    Tool {
+        name: String,
+        classified: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTimingState {
+    Open,
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+/// Server receipt-to-receipt timing, not process lifetime or model compute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimingSpan {
+    pub tool_call_id: String,
+    pub category: TaskTimingCategory,
+    pub started_at_ms: u64,
+    pub observed_through_ms: u64,
+    pub observed_duration_ms: u64,
+    pub state: TaskTimingState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTimingTrace {
+    pub availability: TimingAvailability,
+    pub dropped_span_count: u64,
+    pub spans: Vec<TaskTimingSpan>,
+}
+
+impl Default for AgentTimingTrace {
+    fn default() -> Self {
+        Self {
+            availability: TimingAvailability::Unobserved,
+            dropped_span_count: 0,
+            spans: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimingEntry {
+    pub agent_id: AgentId,
+    pub span: TaskTimingSpan,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimingSummary {
+    pub covered_agent_count: u32,
+    pub unobserved_agent_count: u32,
+    pub persistence_failed_agent_count: u32,
+    pub dropped_span_count: u64,
+    pub omitted_span_count: u32,
+    pub observed_start_ms: Option<u64>,
+    pub observed_end_ms: Option<u64>,
+    pub summed_tool_ms: u64,
+    pub classified_tool_count: u32,
+    pub summed_unclassified_ms: u64,
+    pub unclassified_tool_count: u32,
+    pub summed_dependency_wait_ms: u64,
+    pub command_count: u32,
+    pub process_lifetime: TimingAvailability,
+    pub provider_request_round_trip: TimingAvailability,
+    pub model_compute: TimingAvailability,
+    pub cpu: TimingAvailability,
+    pub spans: Vec<TaskTimingEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4737,6 +4876,9 @@ pub struct TaskTokenUsageAggregate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTokenUsageEntry {
+    pub navigation: TaskUsageNavigation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     pub agent_id: AgentId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
@@ -4756,6 +4898,8 @@ pub struct TaskTokenUsageEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTokenUsageAmount {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
     pub total_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
@@ -4772,6 +4916,7 @@ pub struct TaskTokenUsageAmount {
 impl TaskTokenUsageAmount {
     pub fn zero() -> Self {
         Self {
+            prompt_tokens: Some(0),
             total_tokens: 0,
             input_tokens: Some(0),
             output_tokens: Some(0),
@@ -4783,6 +4928,7 @@ impl TaskTokenUsageAmount {
 
     pub fn from_token_usage(usage: &TokenUsage) -> Self {
         Self {
+            prompt_tokens: Some(usage.prompt_tokens()),
             total_tokens: usage.total_tokens,
             input_tokens: Some(usage.input_tokens),
             output_tokens: Some(usage.output_tokens),
@@ -4794,6 +4940,7 @@ impl TaskTokenUsageAmount {
 
     pub fn total_only(total_tokens: u64) -> Self {
         Self {
+            prompt_tokens: None,
             total_tokens,
             input_tokens: None,
             output_tokens: None,
@@ -4804,6 +4951,7 @@ impl TaskTokenUsageAmount {
     }
 
     pub fn saturating_add(&mut self, other: &Self) {
+        add_optional_usage_amount(&mut self.prompt_tokens, other.prompt_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         add_optional_usage_amount(&mut self.input_tokens, other.input_tokens);
         add_optional_usage_amount(&mut self.output_tokens, other.output_tokens);
@@ -4846,6 +4994,32 @@ pub enum TaskTokenUsageScope {
 }
 
 impl TaskTokenUsageScope {
+    pub fn with_incomplete_reason(self, reason: TaskTokenUsageUnavailableReason) -> Self {
+        match self {
+            Self::Known { usage } => Self::Partial {
+                usage,
+                unavailable_count: 1,
+                reasons: vec![reason],
+            },
+            Self::Partial {
+                usage,
+                unavailable_count,
+                mut reasons,
+            } => {
+                let missing = !reasons.contains(&reason);
+                if missing {
+                    reasons.push(reason);
+                }
+                Self::Partial {
+                    usage,
+                    unavailable_count: unavailable_count.saturating_add(u32::from(missing)),
+                    reasons,
+                }
+            }
+            Self::Unavailable { .. } => Self::Unavailable { reason },
+        }
+    }
+
     pub fn known_usage(&self) -> Option<&TaskTokenUsageAmount> {
         match self {
             Self::Known { usage } => Some(usage),
@@ -4883,6 +5057,9 @@ pub enum TaskTokenUsageUnavailableReason {
     BackendDidNotReport,
     ProviderScopeAmbiguous,
     AgentUnavailable,
+    AccountingHistoryIncomplete,
+    SharedSessionAccounting,
+    ObservationInterrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

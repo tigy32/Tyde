@@ -693,6 +693,73 @@ impl Fixture {
         self.restart_host_with_runtime_config(|_| {}).await
     }
 
+    // Shared fixture is compiled separately for every integration binary.
+    #[allow(dead_code)]
+    pub async fn restored_agents(
+        &mut self,
+        bootstrap: &HostBootstrapPayload,
+        sessions: &[protocol::SessionId],
+    ) -> std::collections::HashMap<protocol::SessionId, NewAgentPayload> {
+        let mut agents = bootstrap
+            .agents
+            .iter()
+            .filter_map(|agent| {
+                agent
+                    .session_id
+                    .as_ref()
+                    .filter(|session| sessions.contains(session))
+                    .map(|session| (session.clone(), agent.clone()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut bootstraps = std::collections::HashSet::new();
+        while agents.len() != sessions.len()
+            || !agents
+                .values()
+                .all(|agent| bootstraps.contains(&agent.instance_stream))
+        {
+            let env = next_frame_matching_on(&mut self.client, "restored agent bootstrap", |env| {
+                matches!(
+                    env.kind,
+                    FrameKind::NewAgent | FrameKind::AgentBootstrap | FrameKind::AgentError
+                )
+            })
+            .await;
+            match env.kind {
+                FrameKind::NewAgent => {
+                    let agent: NewAgentPayload = env.parse_payload().expect("restored descriptor");
+                    if let Some(session) = agent.session_id.as_ref()
+                        && sessions.contains(session)
+                    {
+                        agents.insert(session.clone(), agent);
+                    }
+                }
+                FrameKind::AgentBootstrap => {
+                    let payload: protocol::AgentBootstrapPayload =
+                        env.parse_payload().expect("restored bootstrap");
+                    assert!(
+                        payload.events.iter().any(|event| matches!(
+                            event,
+                            protocol::AgentBootstrapEvent::AgentStart(_)
+                        )),
+                        "restored bootstrap must include its initialized agent"
+                    );
+                    bootstraps.insert(env.stream);
+                }
+                FrameKind::AgentError => {
+                    let error: protocol::AgentErrorPayload =
+                        env.parse_payload().expect("restoration error");
+                    assert!(
+                        !error.fatal,
+                        "restoration failed with code {:?}",
+                        error.code
+                    );
+                }
+                _ => unreachable!("filtered restoration event"),
+            }
+        }
+        agents
+    }
+
     /// Restarts like [`Fixture::restart_host`], adjusting the replacement
     /// host's runtime configuration first.
     #[allow(dead_code)]
@@ -702,7 +769,10 @@ impl Fixture {
     ) -> HostBootstrapPayload {
         let prior_agent_count = self.host.agent_ids().await.len();
         eprintln!("Fixture restart shutdown begin; prior_agent_count={prior_agent_count}");
-        self.host.shutdown_for_restart().await;
+        self.host
+            .shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
         eprintln!(
             "Fixture restart retired old-host agents before replacement; prior_agent_count={prior_agent_count}"
         );

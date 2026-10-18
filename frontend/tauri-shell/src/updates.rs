@@ -186,13 +186,11 @@ async fn check(app: &AppHandle, manual: bool) -> Result<AppUpdateStatus, String>
         else {
             return Ok(None);
         };
-        let shutdown_app = app.clone();
         let updater = app
             .updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|error| error.to_string())?
             .timeout(Duration::from_secs(30))
-            .on_before_exit(move || crate::shutdown_managed_host(&shutdown_app))
             .build()
             .map_err(|error| error.to_string())?;
         let mut update = updater.check().await.map_err(|error| error.to_string())?;
@@ -376,11 +374,11 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
             inner.status.downloaded = bytes.len() as u64;
             inner.status.phase = UpdatePhase::Installing;
         });
-        updates.host_stopped.store(true, Ordering::Release);
         app.state::<crate::ShellState>()
             .host
             .shutdown_for_restart()
-            .await;
+            .await?;
+        updates.host_stopped.store(true, Ordering::Release);
         #[cfg(target_os = "macos")]
         {
             let environment = app.env();

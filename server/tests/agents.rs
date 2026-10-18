@@ -921,6 +921,15 @@ async fn spawn_token_usage_agent(
     name: &str,
     prompt: &str,
 ) -> NewAgentPayload {
+    spawn_token_usage_agent_with_backend(client, name, prompt, BackendKind::Claude).await
+}
+
+async fn spawn_token_usage_agent_with_backend(
+    client: &mut client::Connection,
+    name: &str,
+    prompt: &str,
+    backend_kind: BackendKind,
+) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
@@ -932,7 +941,7 @@ async fn spawn_token_usage_agent(
                 workspace_roots: vec![format!("/tmp/{name}")],
                 prompt: prompt.to_owned(),
                 images: None,
-                backend_kind: BackendKind::Claude,
+                backend_kind,
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
@@ -1791,6 +1800,14 @@ async fn expect_agent_start_on_stream(
             return env.parse_payload().expect("parse AgentStart");
         }
         let env = expect_next_event(client, context).await;
+        if env.stream == *stream && env.kind == FrameKind::AgentError {
+            let error: AgentErrorPayload = env.parse_payload().expect("agent startup error");
+            assert!(
+                !error.fatal,
+                "agent startup failed with code {:?}",
+                error.code
+            );
+        }
         if env.kind != FrameKind::AgentStart || env.stream != *stream {
             push_pending_agent_event(client, env);
             continue;
@@ -1806,6 +1823,25 @@ async fn spawn_user_child(
     prompt: &str,
     workspace_root: &str,
 ) -> NewAgentPayload {
+    spawn_child_with_backend(
+        client,
+        parent_agent_id,
+        name,
+        prompt,
+        workspace_root,
+        BackendKind::Claude,
+    )
+    .await
+}
+
+async fn spawn_child_with_backend(
+    client: &mut client::Connection,
+    parent_agent_id: &protocol::AgentId,
+    name: &str,
+    prompt: &str,
+    workspace_root: &str,
+    backend_kind: BackendKind,
+) -> NewAgentPayload {
     client
         .spawn_agent(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
@@ -1817,7 +1853,7 @@ async fn spawn_user_child(
                 workspace_roots: vec![workspace_root.to_owned()],
                 prompt: prompt.to_owned(),
                 images: None,
-                backend_kind: BackendKind::Claude,
+                backend_kind,
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
@@ -2082,12 +2118,17 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
 #[tokio::test]
 async fn subagent_turn_token_usage_is_strictly_self() {
     let mut fixture = Fixture::new().await;
+    let registration = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "strict-self-parent",
             MockScript::one(
                 MockTurn::text("mock backend response to: parent prompt")
-                    .with_native_child("mock-native-child", "parent prompt"),
+                    .with_gated_native_child_and_timing_tool(
+                        "mock-native-child",
+                        "parent prompt",
+                        &registration,
+                    ),
             ),
         )
         .await;
@@ -2135,6 +2176,24 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         MOCK_TURN_TOKEN_TOTAL,
     );
 
+    registration.wait_until_entered().await;
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "native spawn request is durably observed", |env| env.stream == parent_new.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })))).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let commit = fixture.on_next_session_commit(move || {
+        entered_tx.send(()).expect("native commit entered");
+        release_rx.recv().expect("native commit release");
+    });
+    registration.release_one();
+    entered_rx.await.expect("native session commit pending");
+    let (_, preparing) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        preparing.agents.len(),
+        1,
+        "a native relay must not activate before its session commit"
+    );
+    release_tx.send(()).expect("release native session commit");
+    drop(commit);
     let child_new =
         expect_new_agent(&mut fixture.client, "strict-self native child NewAgent").await;
     expect_agent_start_on_stream(
@@ -2161,6 +2220,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
     );
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "native timing tool completion", |env| env.stream == child_new.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "native-timing-fixture"))).await;
     let task_usage = expect_task_token_usage_matching(
         &mut fixture.client,
         &parent_new.agent_id,
@@ -2177,6 +2237,129 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     )
     .await;
     assert_known_task_status(&task_usage.total.status);
+    let (_, settled) = fixture.connect_with_bootstrap().await;
+    let timing = &settled
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == parent_new.agent_id)
+        .expect("native timing rollup")
+        .timing;
+    assert_eq!(timing.persistence_failed_agent_count, 0);
+    assert!(
+        timing
+            .spans
+            .iter()
+            .any(|entry| entry.agent_id == child_new.agent_id
+                && entry.span.tool_call_id == "native-timing-fixture"
+                && entry.span.state == protocol::TaskTimingState::Completed)
+    );
+    let parent_session = task_usage
+        .root_session_id
+        .clone()
+        .expect("native parent session");
+    let before_total = task_usage.total.usage.total_tokens;
+    let restart = fixture.relaunch_host_after_kill().await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&parent_session))
+        .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&parent_session].agent_id)
+        .expect("native child accounting after restart");
+    assert_eq!(usage.total.usage.total_tokens, before_total);
+    assert_eq!(usage.breakdown.len(), 2);
+    let child = usage
+        .breakdown
+        .iter()
+        .find(|entry| entry.origin == protocol::AgentOrigin::BackendNative)
+        .expect("archived native descriptor");
+    assert!(
+        matches!(&child.usage, TaskTokenUsageScope::Partial { usage, reasons, .. } if usage.total_tokens == MOCK_NATIVE_CHILD_TOKEN_TOTAL && reasons.contains(&TaskTokenUsageUnavailableReason::ObservationInterrupted))
+    );
+    assert_eq!(child.navigation, protocol::TaskUsageNavigation::Unavailable);
+    assert!(
+        usage
+            .timing
+            .spans
+            .iter()
+            .any(|entry| entry.agent_id == child.agent_id
+                && entry.span.tool_call_id == "native-timing-fixture"
+                && entry.span.state == protocol::TaskTimingState::Completed)
+    );
+    let restored_parent = &restored[&parent_session];
+    fixture
+        .mock_by_id(&restored_parent.agent_id)
+        .await
+        .enqueue(
+            MockTurn::text("parent opens another native child")
+                .with_running_native_child_and_timing(
+                    "native-open-before-kill",
+                    "open native work",
+                ),
+        )
+        .await;
+    fixture
+        .client
+        .send_message(
+            &restored_parent.instance_stream,
+            "observe another native child".to_owned(),
+        )
+        .await
+        .expect("start native hard-restart flow");
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &restored_parent.instance_stream,
+        "parent opens another native child",
+    )
+    .await;
+    let running_child = expect_new_agent(
+        &mut fixture.client,
+        "running native child before hard restart",
+    )
+    .await;
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "native open span durable before hard restart", |env| env.stream == running_child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "native-running-timing"))).await;
+    let (_, before_kill) = fixture.connect_with_bootstrap().await;
+    let before = before_kill
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored_parent.agent_id)
+        .expect("before native hard restart")
+        .total
+        .usage
+        .total_tokens;
+    let restart = fixture.relaunch_host_after_kill().await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&parent_session))
+        .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&parent_session].agent_id)
+        .expect("native hard restart observations");
+    assert_eq!(usage.total.usage.total_tokens, before);
+    assert_eq!(usage.breakdown.len(), 3);
+    assert!(
+        usage
+            .timing
+            .spans
+            .iter()
+            .any(|entry| entry.agent_id == running_child.agent_id
+                && entry.span.tool_call_id == "native-running-timing"
+                && entry.span.state == protocol::TaskTimingState::Interrupted)
+    );
+    let (_, reconnect) = fixture.connect_with_bootstrap().await;
+    let repeated = reconnect
+        .task_token_usages
+        .iter()
+        .find(|item| item.root_agent_id == usage.root_agent_id)
+        .expect("native reconnect observations");
+    assert_eq!(
+        repeated.timing, usage.timing,
+        "a lost native source cannot invent active downtime on reconnect"
+    );
 }
 
 /// The first turn's backend reports no usage: the turn surfaces as
@@ -2261,11 +2444,104 @@ async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_par
     assert_eq!(payload.descendant_count, 0);
     assert_eq!(payload.breakdown.len(), 1);
     assert_partial_task_scope(&payload.breakdown[0].usage, MOCK_TURN_TOKEN_TOTAL, 1);
+    fixture
+        .mock(&agent)
+        .await
+        .enqueue(MockTurn::text_without_usage("final unreported turn"))
+        .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "last unreported".to_owned())
+        .await
+        .expect("send final missing-usage turn");
+    expect_strict_mock_turn(&mut fixture.client, &agent.stream, "final unreported turn").await;
+    let (_, final_live) = fixture.connect_with_bootstrap().await;
+    let live = final_live
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
+        .expect("final live partial own usage");
+    assert!(matches!(
+        live.total.status,
+        TaskTokenUsageStatus::Partial {
+            unavailable_count: 2,
+            ..
+        }
+    ));
+    let session = live.root_session_id.clone().expect("partial own session");
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close with final missing usage");
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "partial own actor closed",
+    )
+    .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("partial-own-reopened".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume final missing usage");
+    let reopened = expect_new_agent(&mut fixture.client, "partial own resumed").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &reopened.instance_stream,
+        "partial own ready",
+    )
+    .await;
+    let restart = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&session))
+        .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&session].agent_id)
+        .expect("retained final missing usage");
+    assert_eq!(usage.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    assert!(
+        matches!(
+            usage.total.status,
+            TaskTokenUsageStatus::Partial {
+                unavailable_count: 2,
+                ..
+            }
+        ),
+        "close/restart must not conceal the last unreported turn"
+    );
 }
 
 #[tokio::test]
 async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new_with_mock_backend_for_enabled_backends(vec![
+        BackendKind::Claude,
+        BackendKind::Grok,
+    ])
+    .await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "usage-root",
+            MockScript::one(MockTurn::text_with_cache_counter(
+                "mock backend response to: root usage",
+                Some(1),
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
     let root = spawn_token_usage_agent(&mut fixture.client, "usage-root", "root usage").await;
     let _ = expect_completed_turn_on_stream(
         &mut fixture.client,
@@ -2273,6 +2549,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "mock backend response to: root usage",
     )
     .await;
+    drop(reservation);
     let (mut usage_client, _) = fixture.connect_with_bootstrap().await;
     let child = spawn_user_child(
         &mut fixture.client,
@@ -2282,15 +2559,31 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "/tmp/usage-child",
     )
     .await;
-    let grandchild = spawn_user_child(
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Grok)
+        .await;
+    let grandchild_script = fixture
+        .reserve_next_mock_launch(
+            "usage-grandchild",
+            MockScript::one(MockTurn::text_with_cache_counter(
+                "mock backend response to: grandchild usage",
+                None,
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
+    let grandchild = spawn_child_with_backend(
         &mut fixture.client,
         &child.agent_id,
         "usage-grandchild",
         "grandchild usage",
         "/tmp/usage-grandchild",
+        BackendKind::Grok,
     )
     .await;
 
+    drop(grandchild_script);
     let payload = expect_task_token_usage_matching(
         &mut usage_client,
         &root.agent_id,
@@ -2307,6 +2600,34 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     );
     assert_eq!(payload.descendant_count, 2);
     assert_eq!(payload.breakdown.len(), 3);
+    assert_eq!(payload.backends.len(), 2);
+    assert_eq!(payload.backends[0].backend_kind, BackendKind::Claude);
+    assert_eq!(payload.backends[0].agent_count, 2);
+    assert_eq!(payload.backends[0].reporting_agent_count, 2);
+    assert_eq!(payload.backends[0].incomplete_agent_count, 0);
+    assert_eq!(
+        payload.backends[0].total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
+    assert_eq!(payload.backends[1].backend_kind, BackendKind::Grok);
+    assert_eq!(payload.backends[1].agent_count, 1);
+    assert_eq!(
+        payload.backends[1].total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    assert_eq!(
+        payload.total.usage.cached_prompt_tokens, None,
+        "missing cache splits remain missing"
+    );
+    assert_eq!(
+        payload.total.usage.prompt_tokens,
+        payload
+            .total
+            .usage
+            .input_tokens
+            .map(|uncached| uncached + 951),
+        "unknown cache breakdowns must not erase known prompt input from another agent"
+    );
     assert_eq!(&payload.breakdown[0].agent_id, &root.agent_id);
     assert_eq!(payload.breakdown[0].depth, 0);
     assert_eq!(payload.breakdown[0].tree_index, 0);
@@ -2374,11 +2695,148 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         .expect("updated child breakdown entry");
     assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL * 2);
 
+    let completion_gate = MockGateHandle::new();
+    fixture
+        .mock_by_id(&grandchild.agent_id)
+        .await
+        .enqueue(MockTurn::text_completion_after_gate(
+            "completion during close preparation",
+            &completion_gate,
+        ))
+        .await;
+    fixture
+        .client
+        .send_message(
+            &grandchild.instance_stream,
+            "finish while close prepares".to_owned(),
+        )
+        .await
+        .expect("start overlapping completion");
+    completion_gate.wait_until_entered().await;
+    fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "source running before close preparation",
+        |env| {
+            env.stream == grandchild.instance_stream
+                && env.kind == FrameKind::ChatEvent
+                && env
+                    .parse_payload::<ChatEvent>()
+                    .is_ok_and(|event| matches!(event, ChatEvent::StreamDelta(_)))
+        },
+    )
+    .await;
+    let failed_commit = fixture.fail_next_session_commit();
+    fixture
+        .client
+        .close_agent(&grandchild.instance_stream)
+        .await
+        .expect("request close with failed accounting save");
+    let failure = expect_command_error(
+        &mut fixture.client,
+        "failed accounting save must be visible",
+    )
+    .await;
+    assert_eq!(failure.code, CommandErrorCode::Internal);
+    assert!(
+        failure
+            .message
+            .contains("Cannot clear closed task restoration markers")
+    );
+    drop(failed_commit);
+    let (mut contender, _) = fixture.connect_with_bootstrap().await;
+    let close_preparation = fixture
+        .host_for_test()
+        .install_restore_marker_withdraw_test_gate()
+        .await;
     fixture
         .client
         .close_agent(&grandchild.instance_stream)
         .await
         .expect("close grandchild");
+    close_preparation.wait_until_entered().await;
+    contender
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("must-not-escape-close".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(grandchild.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/closing-child".to_owned()],
+                prompt: "must not run".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Grok,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("concurrent child admission request");
+    let blocked =
+        expect_command_error(&mut contender, "close preparation blocks child admission").await;
+    assert_eq!(blocked.code, CommandErrorCode::Conflict);
+    assert!(blocked.message.contains("closing"));
+    completion_gate.release_one();
+    fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "completed own accounting while close preparation is held",
+        |env| {
+            env.stream == grandchild.instance_stream
+                && env.kind == FrameKind::AgentActivityStats
+                && env
+                    .parse_payload::<protocol::AgentActivityStatsPayload>()
+                    .is_ok_and(|stats| {
+                        stats.stats.token_usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2
+                    })
+        },
+    )
+    .await;
+    close_preparation.release_one();
+    close_preparation.wait_until_entered().await;
+    // Inject the stale marker a finishing startup can write after the bulk clear.
+    let session = payload
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == grandchild.agent_id)
+        .and_then(|entry| entry.session_id.clone())
+        .expect("grandchild session for settled marker race");
+    let marker_writer = rusqlite::Connection::open(
+        server::store::session::SessionStore::database_path(&fixture.session_store_path()),
+    )
+    .expect("open marker fault writer");
+    marker_writer
+        .execute(
+            "UPDATE sessions SET record=json_set(record, '$.restore_state', json(?1)) WHERE id=?2",
+            rusqlite::params![
+                serde_json::json!({
+                    "agent_id": grandchild.agent_id,
+                    "origin": protocol::AgentOrigin::User,
+                    "workflow": null,
+                })
+                .to_string(),
+                session.0
+            ],
+        )
+        .expect("inject late ownership marker");
+    drop(marker_writer);
+    let failed_settled_marker = fixture.fail_next_session_commit();
+    close_preparation.release_one();
+    let failed = expect_command_error(
+        &mut fixture.client,
+        "settled marker persistence must fail explicitly",
+    )
+    .await;
+    assert!(failed.message.contains("settled close"));
+    assert_eq!(failed.code, CommandErrorCode::Internal);
+    drop(failed_settled_marker);
+    drop(close_preparation);
+    fixture
+        .client
+        .close_agent(&grandchild.instance_stream)
+        .await
+        .expect("retry settled close after storage recovery");
     let closed = expect_kind(
         &mut fixture.client,
         FrameKind::AgentClosed,
@@ -2392,16 +2850,738 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         &mut usage_client,
         &root.agent_id,
         "aggregate after grandchild close",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 4,
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 5,
     )
     .await;
     assert_eq!(after_close.descendant_count, 2);
+    assert_eq!(
+        after_close.backends[1].agent_count, 1,
+        "closed descendants remain in backend rollups"
+    );
+    assert_eq!(
+        after_close.backends[1].total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
     let grandchild_entry = after_close
         .breakdown
         .iter()
         .find(|entry| entry.agent_id.eq(&grandchild.agent_id))
         .expect("closed grandchild breakdown entry");
-    assert_known_task_scope(&grandchild_entry.usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_known_task_scope(&grandchild_entry.usage, MOCK_TURN_TOKEN_TOTAL * 2);
+    let grandchild_session = grandchild_entry
+        .session_id
+        .clone()
+        .expect("saved grandchild session");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("usage-grandchild-resumed".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(child.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: grandchild_session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume saved child");
+    let reopened = expect_new_agent(&mut fixture.client, "reopened grandchild").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &reopened.instance_stream,
+        "reopened child ready",
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&reopened.instance_stream)
+        .await
+        .expect("close reopened child");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "reopened child closed",
+    )
+    .await;
+    assert_eq!(
+        env.parse_payload::<AgentClosedPayload>()
+            .expect("closed child event")
+            .agent_id,
+        reopened.agent_id
+    );
+    let (_, reclosed) = fixture.connect_with_bootstrap().await;
+    let reclosed = reclosed
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == root.agent_id)
+        .expect("reclosed child rollup");
+    assert_eq!(
+        reclosed.total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 5,
+        "closing a resumed session must replace its saved descriptor"
+    );
+    assert_eq!(reclosed.breakdown.len(), 3);
+    assert_eq!(
+        reclosed
+            .breakdown
+            .iter()
+            .filter(|entry| entry.session_id.as_ref() == Some(&grandchild_session))
+            .count(),
+        1
+    );
+
+    fixture
+        .client
+        .delete_session(protocol::DeleteSessionPayload {
+            session_id: grandchild_session.clone(),
+        })
+        .await
+        .expect("delete closed chat context");
+    let (mut deletion_observer, deleted_bootstrap) = fixture.connect_with_bootstrap().await;
+    let retained = if let Some(usage) = deleted_bootstrap.task_token_usages.iter().find(|usage| {
+        usage.root_agent_id == root.agent_id
+            && usage.breakdown.iter().any(|entry| {
+                entry.session_id.as_ref() == Some(&grandchild_session)
+                    && matches!(entry.navigation, protocol::TaskUsageNavigation::Unavailable)
+            })
+    }) {
+        usage.clone()
+    } else {
+        expect_task_token_usage_matching(
+            &mut deletion_observer,
+            &root.agent_id,
+            "deleted context retains task accounting",
+            |usage| {
+                usage.breakdown.iter().any(|entry| {
+                    entry.session_id.as_ref() == Some(&grandchild_session)
+                        && matches!(entry.navigation, protocol::TaskUsageNavigation::Unavailable)
+                })
+            },
+        )
+        .await
+    };
+    assert_eq!(
+        retained.total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 5,
+        "deleting chat context must not delete a task's observed accounting"
+    );
+    let root_session = after_close
+        .root_session_id
+        .clone()
+        .expect("root session present");
+    let child_session = after_close
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == child.agent_id)
+        .and_then(|entry| entry.session_id.clone())
+        .expect("child session present");
+    let fork_reservation = fixture
+        .reserve_next_mock_launch(
+            "usage-fork",
+            MockScript::one(MockTurn::text("fork own usage completed")),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("usage-fork".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: child_session.clone(),
+                prompt: "fork own turn".to_owned(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await
+        .expect("fork usage source");
+    let fork = expect_new_agent(&mut fixture.client, "usage fork").await;
+    expect_agent_start_on_stream(&mut fixture.client, &fork.instance_stream, "fork start").await;
+    // Fork bootstrap includes inherited responses before its new own response.
+    let mut inherited_responses = 0;
+    loop {
+        let env = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &fork.instance_stream,
+            "fork own response after inherited context",
+        )
+        .await;
+        if let ChatEvent::StreamEnd(end) = env.parse_payload::<ChatEvent>().expect("fork response")
+        {
+            if end.message.content == "fork own usage completed" {
+                break;
+            }
+            inherited_responses += 1;
+        }
+    }
+    assert!(
+        inherited_responses > 0,
+        "fork must still display inherited context"
+    );
+    drop(fork_reservation);
+    let (_, fork_ready) = fixture.connect_with_bootstrap().await;
+    let fork_usage = fork_ready
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == fork.agent_id)
+        .expect("fork usage");
+    assert_eq!(
+        fork_usage.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL,
+        "inherited context is not own usage"
+    );
+    let fork_session = fork_usage.root_session_id.clone().expect("fork session");
+    let bootstrap = fixture.restart_host().await;
+    let restored_agents = fixture
+        .restored_agents(
+            &bootstrap,
+            &[
+                root_session.clone(),
+                child_session.clone(),
+                fork_session.clone(),
+            ],
+        )
+        .await;
+    let restored_agent = &restored_agents[&root_session];
+    let (_, ready) = fixture.connect_with_bootstrap().await;
+    let restored = ready
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+        .expect("restored task usage");
+    eprintln!(
+        "Restored usage scope: agents={} descendants={} incomplete={:?}",
+        restored.breakdown.len(),
+        restored.descendant_count,
+        restored.total.status
+    );
+    assert_eq!(restored.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL * 5);
+    let restored_fork = ready
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == restored_agents[&fork_session].agent_id)
+        .expect("restored fork own usage");
+    assert_eq!(
+        restored_fork.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL,
+        "restart must not allocate inherited fork history to the fork"
+    );
+    let restored_child = &restored_agents[&child_session];
+    fixture
+        .client
+        .send_message(
+            &restored_child.instance_stream,
+            "after accounting restore".to_owned(),
+        )
+        .await
+        .expect("follow-up after restore");
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &restored_child.instance_stream,
+        "mock backend response to: after accounting restore",
+    )
+    .await;
+    let (_, updated) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        updated
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+            .expect("updated restored task")
+            .total
+            .usage
+            .total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 6,
+        "new observations add once after canonical hydration"
+    );
+
+    assert_eq!(
+        restored.breakdown.len(),
+        3,
+        "restart must retain closed descendants without duplicating live sessions"
+    );
+    assert_eq!(
+        restored
+            .backends
+            .iter()
+            .find(|group| group.backend_kind == BackendKind::Grok)
+            .expect("closed provider group")
+            .agent_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
+    use server::backend::Backend;
+    let discovery =
+        server::backend::mock::MockDiscovery::new(vec![Ok(server::backend::BackendDiscovery {
+            schema: server::backend::codex::CodexBackend::session_settings_schema(),
+            launch_profiles: Vec::new(),
+        })]);
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        mock_backend_discovery: [(BackendKind::Codex, discovery.clone())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    })
+    .await;
+    let write = fixture
+        .client
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude, BackendKind::Codex],
+            Vec::<BackendKind>::new(),
+        )
+        .await
+        .expect("enable native counter source");
+    expect_settings_write_applied(&mut fixture.client, &write, "enable native counter source")
+        .await;
+    let gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "native-usage",
+            MockScript::one(MockTurn::text_with_late_zero_native_usage(
+                "native counter pending",
+                &gate,
+            )),
+        )
+        .await;
+    let agent = spawn_token_usage_agent_with_backend(
+        &mut fixture.client,
+        "native-usage",
+        "native source",
+        BackendKind::Codex,
+    )
+    .await;
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "native counter pending",
+    )
+    .await;
+    gate.wait_until_entered().await;
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    let pending = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == agent.agent_id)
+        .expect("native pending rollup");
+    assert!(matches!(
+        pending.total.status,
+        TaskTokenUsageStatus::Unavailable { .. }
+    ));
+    gate.release_one();
+    let reported = expect_task_token_usage_matching(
+        &mut observer,
+        &agent.agent_id,
+        "late native zero",
+        |payload| matches!(payload.total.status, TaskTokenUsageStatus::Known),
+    )
+    .await;
+    assert_known_task_scope(&reported.self_usage, 0);
+    let session = reported.root_session_id.expect("native session");
+    drop(reservation);
+    let first_restart_discovery = discovery.clone();
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(move |config| {
+            config
+                .mock_backend_discovery
+                .insert(BackendKind::Codex, first_restart_discovery);
+        })
+        .await;
+    let agents = fixture
+        .restored_agents(&bootstrap, std::slice::from_ref(&session))
+        .await;
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let restored = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == agents[&session].agent_id)
+        .expect("restored native rollup");
+    assert_known_task_scope(&restored.self_usage, 0);
+    assert_eq!(
+        restored.backends[0].reporting_agent_count, 1,
+        "reported zero is not missing after restart"
+    );
+    let gate = MockGateHandle::new();
+    let restored_agent = &agents[&session];
+    fixture
+        .mock_by_id(&restored_agent.agent_id)
+        .await
+        .enqueue(MockTurn::text_with_late_native_usage(
+            "native counter save pending",
+            &gate,
+            49,
+        ))
+        .await;
+    fixture
+        .client
+        .send_message(
+            &restored_agent.instance_stream,
+            "counter save failure".to_owned(),
+        )
+        .await
+        .expect("start native checkpoint failure flow");
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &restored_agent.instance_stream,
+        "native counter save pending",
+    )
+    .await;
+    gate.wait_until_entered().await;
+    let failed = fixture.fail_next_session_commit();
+    gate.release_one();
+    fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "native checkpoint failure is fatal and explicit",
+        |env| {
+            env.stream == restored_agent.instance_stream
+                && env.kind == FrameKind::AgentError
+                && env.parse_payload::<AgentErrorPayload>().is_ok_and(|error| {
+                    error.fatal && error.message.contains("Task accounting could not be saved")
+                })
+        },
+    )
+    .await;
+    drop(failed);
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(move |config| {
+            config
+                .mock_backend_discovery
+                .insert(BackendKind::Codex, discovery);
+        })
+        .await;
+    let agents = fixture
+        .restored_agents(&bootstrap, std::slice::from_ref(&session))
+        .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let usage = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == agents[&session].agent_id)
+        .expect("native failed-checkpoint coverage");
+    assert!(
+        matches!(&usage.total.status, TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "an older native checkpoint must not become complete after a failed save"
+    );
+    assert_eq!(
+        usage.total.usage.total_tokens, 49,
+        "the required final archive commit must preserve the exact latest native checkpoint"
+    );
+}
+
+/// These are receipt-boundary measurements on the real server/protocol,
+/// deliberately not provider or process-lifetime measurements.
+#[tokio::test(start_paused = true)]
+async fn task_timing_observes_overlap_background_completion_and_restart_without_replay() {
+    let scenario = async {
+        let mut fixture = Fixture::new().await;
+        let root = fixture
+            .spawn_scripted(
+                "timing-root",
+                MockScript::one(MockTurn::text("timing ready")),
+            )
+            .await;
+        fixture.finish_turn(&root).await;
+        let child = spawn_user_child(
+            &mut fixture.client,
+            &root.new_agent.agent_id,
+            "timing-child",
+            "child usage",
+            "/tmp/timing-child",
+        )
+        .await;
+        let foreground = MockGateHandle::new();
+        let background = MockGateHandle::new();
+        fixture
+            .mock(&root)
+            .await
+            .enqueue(MockTurn::timing_flow(
+                child.agent_id.clone(),
+                &foreground,
+                &background,
+            ))
+            .await;
+        fixture
+            .client
+            .send_message(&root.stream, "observe tools".to_owned())
+            .await
+            .expect("send timing turn");
+        foreground.wait_until_entered().await;
+        fixture.next_chat_event_matching(&root, "wait request observed", |event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "timing-await")).await;
+        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        let initial = bootstrap
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
+            .expect("task bootstrap");
+        assert_eq!(
+            initial.timing.spans.len(),
+            2,
+            "both live tool boundaries must be retained"
+        );
+        assert_eq!(
+            initial.timing.command_count, 1,
+            "waits are not command runs"
+        );
+        assert_eq!(initial.timing.summed_tool_ms, 0);
+        assert_eq!(initial.timing.summed_dependency_wait_ms, 0);
+        assert_eq!(
+            initial.timing.process_lifetime,
+            protocol::TimingAvailability::Unsupported
+        );
+        assert_eq!(
+            initial.timing.provider_request_round_trip,
+            protocol::TimingAvailability::Unsupported
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        foreground.release_one();
+        background.wait_until_entered().await;
+        fixture
+            .next_chat_event_matching(&root, "background foreground-idle boundary", |event| {
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        let running = bootstrap
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
+            .expect("running task bootstrap");
+        assert_eq!(running.timing.summed_tool_ms, 2_000);
+        assert_eq!(
+            running.timing.summed_dependency_wait_ms, 2_000,
+            "parallel waits must stay separate from child/tool time"
+        );
+        assert!(running.timing.spans.iter().any(|entry| matches!(
+            entry.span.category,
+            protocol::TaskTimingCategory::Command { check: true, .. }
+        ) && entry.span.state
+            == protocol::TaskTimingState::Open));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        background.release_one();
+        fixture.next_chat_event_matching(&root, "background completion", |event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "timing-check")).await;
+        let (_, completed_bootstrap) = fixture.connect_with_bootstrap().await;
+        let completed = completed_bootstrap
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
+            .expect("completed task bootstrap");
+        assert_eq!(completed.timing.command_count, 1);
+        assert_eq!(completed.timing.summed_tool_ms, 5_000);
+        assert_eq!(completed.timing.summed_dependency_wait_ms, 2_000);
+        assert!(
+            completed
+                .timing
+                .spans
+                .iter()
+                .all(|entry| entry.span.state == protocol::TaskTimingState::Completed)
+        );
+        let session = completed.root_session_id.clone().expect("root session");
+        // Begin another open span, then restart. Historical tool replay must
+        // neither add executions nor extend an open span across downtime.
+        fixture
+            .mock(&root)
+            .await
+            .enqueue(MockTurn::held_running_command(
+                "interrupted-timing",
+                server::backend::mock::RunningCommandShape::RequestAfterResponse,
+            ))
+            .await;
+        fixture
+            .client
+            .send_message(&root.stream, "interrupt timing".to_owned())
+            .await
+            .expect("send interrupted timing turn");
+        fixture.next_chat_event_matching(&root, "open span before restart", |event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "interrupted-timing")).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        fixture
+            .client
+            .close_agent(&root.stream)
+            .await
+            .expect("close open timing span");
+        loop {
+            let env = expect_kind(
+                &mut fixture.client,
+                FrameKind::AgentClosed,
+                "timing root closed",
+            )
+            .await;
+            if env
+                .parse_payload::<AgentClosedPayload>()
+                .expect("timing close event")
+                .agent_id
+                == root.new_agent.agent_id
+            {
+                break;
+            }
+        }
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("timing-root-resumed".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .expect("resume interrupted timing");
+        let reopened = expect_new_agent(&mut fixture.client, "timing reopened").await;
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &reopened.instance_stream,
+            "timing reopened ready",
+        )
+        .await;
+        let (_, reopened_bootstrap) = fixture.connect_with_bootstrap().await;
+        let reopened_usage = reopened_bootstrap
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == reopened.agent_id)
+            .expect("reopened timing usage");
+        assert_eq!(
+            reopened_usage.timing.summed_tool_ms, 6_000,
+            "close/resume must keep the last observed endpoint"
+        );
+        assert_eq!(reopened_usage.timing.spans.len(), 3);
+        fixture
+            .mock_by_id(&reopened.agent_id)
+            .await
+            .enqueue(MockTurn::held_running_command(
+                "restart-open-timing",
+                server::backend::mock::RunningCommandShape::RequestAfterResponse,
+            ))
+            .await;
+        fixture
+            .client
+            .send_message(
+                &reopened.instance_stream,
+                "restart observed work".to_owned(),
+            )
+            .await
+            .expect("start direct restart tool");
+        fixture::next_logical_frame_matching_on(&mut fixture.client, "direct restart open observation", |env| env.stream == reopened.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "restart-open-timing"))).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let bootstrap = fixture.restart_host().await;
+        let restored_agents = fixture
+            .restored_agents(&bootstrap, std::slice::from_ref(&session))
+            .await;
+        let restored_agent = &restored_agents[&session];
+        let (_, replay) = fixture.connect_with_bootstrap().await;
+        let restored = replay
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+            .expect("restored task timing");
+        eprintln!(
+            "Restored timing trace: spans={} covered={} persistence_failures={}",
+            restored.timing.spans.len(),
+            restored.timing.covered_agent_count,
+            restored.timing.persistence_failed_agent_count
+        );
+        assert_eq!(
+            restored.timing.spans.len(),
+            4,
+            "resume replay cannot duplicate tool spans"
+        );
+        assert_eq!(restored.timing.command_count, 3);
+        assert_eq!(
+            restored.timing.summed_tool_ms, 8_000,
+            "restart cannot invent observed active downtime"
+        );
+        assert!(
+            restored
+                .timing
+                .spans
+                .iter()
+                .any(|entry| entry.span.tool_call_id == "interrupted-timing"
+                    && entry.span.state == protocol::TaskTimingState::Interrupted)
+        );
+        assert!(
+            restored
+                .timing
+                .spans
+                .iter()
+                .any(|entry| entry.span.tool_call_id == "restart-open-timing"
+                    && entry.span.state == protocol::TaskTimingState::Interrupted
+                    && entry.span.observed_duration_ms == 2_000)
+        );
+        tokio::time::resume();
+        fixture
+            .mock_by_id(&restored_agent.agent_id)
+            .await
+            .enqueue(MockTurn::text("retention source ready").with_tool_round_trips(65))
+            .await;
+        fixture
+            .client
+            .send_message(
+                &restored_agent.instance_stream,
+                "retain bounded observations".to_owned(),
+            )
+            .await
+            .expect("run retention source");
+        fixture::next_logical_frame_matching_on(&mut fixture.client, "root bounded trace complete", |env| env.stream == restored_agent.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "retention-tool-64"))).await;
+        for index in 0..4 {
+            let name = format!("retention-child-{index}");
+            let prompt = format!("retention-{index}");
+            let reservation = fixture
+                .reserve_next_mock_launch(
+                    &name,
+                    MockScript::one(
+                        MockTurn::text(format!("mock backend response to: {prompt}"))
+                            .with_tool_round_trips(65),
+                    ),
+                )
+                .await;
+            let child = spawn_user_child(
+                &mut fixture.client,
+                &restored_agent.agent_id,
+                &name,
+                &prompt,
+                "/tmp/retention-child",
+            )
+            .await;
+            drop(reservation);
+            fixture::next_logical_frame_matching_on(&mut fixture.client, "child bounded trace complete", |env| env.stream == child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "retention-tool-64"))).await;
+            let (_, own) = fixture.connect_with_bootstrap().await;
+            assert_eq!(
+                own.task_token_usages
+                    .iter()
+                    .find(|usage| usage.root_agent_id == restored_agent.agent_id)
+                    .expect("bounded descendant traces")
+                    .timing
+                    .classified_tool_count,
+                64 * (index + 2)
+            );
+        }
+        let (_, bounded) = fixture.connect_with_bootstrap().await;
+        let timing = &bounded
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == restored_agent.agent_id)
+            .expect("bounded task trace")
+            .timing;
+        assert_eq!(timing.spans.len(), 256);
+        assert_eq!(timing.omitted_span_count, 64);
+        assert_eq!(timing.dropped_span_count, 9);
+    };
+    tokio::pin!(scenario);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut scenario => break,
+            () = tokio::task::yield_now() => {},
+        }
+    }
 }
 
 /// A descendant whose first turn reports no usage first marks the whole
@@ -6174,7 +7354,9 @@ async fn agent_control_await_cut_short_by_host_restart_reports_typed_host_stoppi
     let stop_gate = fixture.install_restart_stop_test_gate();
     let host = fixture.host_for_test();
     let shutdown = tokio::spawn(async move {
-        host.shutdown_for_restart().await;
+        host.shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
     });
     stop_gate.wait_until_entered().await;
     let response = (&mut pending).await;
@@ -6198,10 +7380,7 @@ async fn agent_control_await_cut_short_by_host_restart_reports_typed_host_stoppi
     );
 
     stop_gate.release_one();
-    tokio::time::timeout(Duration::from_secs(27), shutdown)
-        .await
-        .expect("restart shutdown must finish within its bounded budget")
-        .expect("restart shutdown task");
+    shutdown.await.expect("restart shutdown task");
 }
 
 #[tokio::test]
@@ -11635,97 +12814,138 @@ async fn per_character_streaming_reaches_the_client_coalesced() {
 ///
 /// The mock backend tracks no background commands at all, which is exactly the
 /// state under test: a card is open and the backend can say nothing about it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stopping_an_untracked_background_command_closes_its_card() {
-    const CARD: &str = "mock-orphaned-background-command";
+    let scenario = async {
+        const CARD: &str = "mock-orphaned-background-command";
 
-    let mut fixture = Fixture::new().await;
-    let agent = fixture
-        .spawn_scripted(
-            "orphaned-background-agent",
-            MockScript::one(
-                MockTurn::text("mock backend response to: scripted launch")
-                    .with_open_background_task(CARD),
+        let mut fixture = Fixture::new().await;
+        let agent = fixture
+            .spawn_scripted(
+                "orphaned-background-agent",
+                MockScript::one(
+                    MockTurn::text("mock backend response to: scripted launch")
+                        .with_open_background_task(CARD),
+                )
+                .with_unbounded_echo(),
             )
-            .with_unbounded_echo(),
-        )
-        .await;
+            .await;
 
-    // The card the tray offers a stop button on is the one whose progress says
-    // it is cancellable and still running. Reaching for it any other way would
-    // test something the button never does.
-    let progress = fixture
-        .next_chat_event_matching(&agent, "background command progress", |event| {
-            matches!(
-                event,
-                ChatEvent::ToolProgress(progress)
-                    if progress.tool_call_id == CARD
-                        && progress.execution_mode == protocol::ToolExecutionMode::Background
-                        && progress.cancellable
+        // The card the tray offers a stop button on is the one whose progress says
+        // it is cancellable and still running. Reaching for it any other way would
+        // test something the button never does.
+        let progress = fixture
+            .next_chat_event_matching(&agent, "background command progress", |event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolProgress(progress)
+                        if progress.tool_call_id == CARD
+                            && progress.execution_mode == protocol::ToolExecutionMode::Background
+                            && progress.cancellable
+                )
+            })
+            .await;
+        assert!(matches!(progress, ChatEvent::ToolProgress(_)));
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        fixture
+            .client
+            .cancel_background_task(
+                &agent.stream,
+                protocol::CancelBackgroundTaskPayload {
+                    tool_call_id: CARD.to_owned(),
+                },
             )
-        })
-        .await;
-    assert!(matches!(progress, ChatEvent::ToolProgress(_)));
+            .await
+            .expect("cancel_background_task frame");
 
-    fixture
-        .client
-        .cancel_background_task(
-            &agent.stream,
-            protocol::CancelBackgroundTaskPayload {
-                tool_call_id: CARD.to_owned(),
-            },
-        )
-        .await
-        .expect("cancel_background_task frame");
-
-    let completion = fixture
-        .next_chat_event_matching(&agent, "background card closed after stop", |event| {
-            matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(completion)
-                    if completion.tool_call_id == CARD
-            )
-        })
-        .await;
-    let ChatEvent::ToolExecutionCompleted(completion) = completion else {
-        unreachable!("matched a ToolExecutionCompleted");
-    };
-    assert!(
-        matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
-        "a command that was already gone must close as cancelled, not as a result nobody \
+        let completion = fixture
+            .next_chat_event_matching(&agent, "background card closed after stop", |event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == CARD
+                )
+            })
+            .await;
+        let ChatEvent::ToolExecutionCompleted(completion) = completion else {
+            unreachable!("matched a ToolExecutionCompleted");
+        };
+        assert!(
+            matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
+            "a command that was already gone must close as cancelled, not as a result nobody \
          observed: {:?}",
-        completion.outcome
-    );
+            completion.outcome
+        );
 
-    // Stopping the same card again must not manufacture a second outcome: the
-    // card is closed, so there is nothing left to close.
-    fixture
-        .client
-        .cancel_background_task(
-            &agent.stream,
-            protocol::CancelBackgroundTaskPayload {
-                tool_call_id: CARD.to_owned(),
-            },
-        )
-        .await
-        .expect("second cancel_background_task frame");
-    fixture
-        .client
-        .send_message(&agent.stream, "after the stop".to_owned())
-        .await
-        .expect("send follow-up after stopping the background card");
-    let next = fixture
-        .next_chat_event_matching(&agent, "next event after a repeated stop", |event| {
-            matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == CARD
-            ) || matches!(event, ChatEvent::StreamEnd(_))
-        })
-        .await;
-    assert!(
-        matches!(next, ChatEvent::StreamEnd(_)),
-        "a repeated stop closed the card twice: {next:?}"
-    );
+        let (_, cancelled) = fixture.connect_with_bootstrap().await;
+        let timing = &cancelled
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
+            .expect("cancelled tool timing")
+            .timing;
+        let span = timing
+            .spans
+            .iter()
+            .find(|entry| entry.span.tool_call_id == CARD)
+            .expect("cancelled command span");
+        assert_eq!(span.span.state, protocol::TaskTimingState::Cancelled);
+        assert_eq!(span.span.observed_duration_ms, 2_000);
+        tokio::time::advance(Duration::from_secs(7)).await;
+        // Stopping the same card again must not manufacture a second outcome: the
+        // card is closed, so there is nothing left to close.
+        fixture
+            .client
+            .cancel_background_task(
+                &agent.stream,
+                protocol::CancelBackgroundTaskPayload {
+                    tool_call_id: CARD.to_owned(),
+                },
+            )
+            .await
+            .expect("second cancel_background_task frame");
+        fixture
+            .client
+            .send_message(&agent.stream, "after the stop".to_owned())
+            .await
+            .expect("send follow-up after stopping the background card");
+        let next = fixture
+            .next_chat_event_matching(&agent, "next event after a repeated stop", |event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == CARD
+                ) || matches!(event, ChatEvent::StreamEnd(_))
+            })
+            .await;
+        assert!(
+            matches!(next, ChatEvent::StreamEnd(_)),
+            "a repeated stop closed the card twice: {next:?}"
+        );
+        let (_, settled) = fixture.connect_with_bootstrap().await;
+        let timing = &settled
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
+            .expect("settled cancellation timing")
+            .timing;
+        assert_eq!(
+            timing
+                .spans
+                .iter()
+                .find(|entry| entry.span.tool_call_id == CARD)
+                .expect("retained cancelled span")
+                .span
+                .observed_duration_ms,
+            2_000,
+            "server cancellation must stop accumulating idle time"
+        );
+        tokio::time::resume();
+    };
+    tokio::pin!(scenario);
+    loop {
+        tokio::select! { biased; () = &mut scenario => break, () = tokio::task::yield_now() => {} }
+    }
 }
 
 #[tokio::test]
@@ -12756,7 +13976,9 @@ async fn human_home_help_hands_off_to_independent_project_owner() {
         if env.stream != resumed.instance_stream { return false; }
         if env.kind == FrameKind::AgentError {
             let error: AgentErrorPayload = env.parse_payload().unwrap();
-            let history_warning = error.message.contains("saved history");
+            // This injected journal loss now also emits the required typed-accounting
+            // coverage warning; rejecting that warning would hide genuine incompleteness.
+            let history_warning = error.message.contains("saved history") || error.message == "Saved task accounting is incomplete or unreadable; historical coverage cannot be certified complete.";
             eprintln!("HELP HANDOFF: resume error fatal={} code={:?} history_warning={history_warning}", error.fatal, error.code);
             assert!(!error.fatal && history_warning, "Only the deliberately unreadable history warning is expected");
         }
@@ -12766,6 +13988,10 @@ async fn human_home_help_hands_off_to_independent_project_owner() {
     let resumed_start: AgentStartPayload = env.parse_payload().unwrap();
     assert_eq!(resumed_start.tyde_permissions, AgentTydePermissions::Root);
     let (mut reader, snapshot) = fixture.connect_with_bootstrap().await;
+    assert!(
+        matches!(&snapshot.task_token_usages.iter().find(|usage| usage.root_agent_id == resumed.agent_id).expect("unreadable Help accounting").total.status, TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        "a usable resumed Help chat must not certify its unreadable accounting complete"
+    );
     let replay_stream = bootstrapped_agent(&snapshot, &resumed.agent_id).instance_stream;
     loop {
         let env = reader.next_event().await.unwrap().unwrap();

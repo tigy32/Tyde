@@ -224,7 +224,7 @@ fn run_host_stdio() -> Result<(), String> {
             _ = shutdown.cancelled() => Ok(()),
             result = connection => result,
         };
-        host.shutdown_for_restart().await;
+        host.shutdown_for_restart().await?;
         tracing::info!("stdio host graceful shutdown completed; leaving runtime");
         result
     })

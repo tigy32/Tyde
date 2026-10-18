@@ -214,6 +214,56 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         "Each accepted identity is analyzed once"
     );
     let reconnect = fixture.connect_with_bootstrap().await;
+    let task = reconnect
+        .1
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
+        .expect("author task rollup");
+    assert_eq!(
+        task.breakdown.len(),
+        1,
+        "Analyzer batches must not become descendant agents"
+    );
+    assert_eq!(
+        task.helper_usage.len(),
+        2,
+        "Each observed analyzer source is attached once"
+    );
+    let analyzer = task
+        .backends
+        .iter()
+        .find(|group| group.backend_kind == BackendKind::Codex)
+        .expect("analyzer-only backend retained in task overview");
+    assert_eq!(analyzer.agent_count, 0);
+    assert_eq!(analyzer.analyzer_batch_count, 2);
+    let source_tokens: u64 = task
+        .helper_usage
+        .iter()
+        .map(|source| {
+            source
+                .usage
+                .reported_usage()
+                .expect("reported analyzer usage")
+                .total_tokens
+        })
+        .sum();
+    assert!(
+        source_tokens > 0,
+        "The boundary must exercise real nonzero mock accounting"
+    );
+    assert_eq!(
+        analyzer.total.usage.total_tokens, source_tokens,
+        "Backend rollups include analyzer sources, not an allocation to the author backend"
+    );
+    assert_eq!(
+        task.total.usage.total_tokens,
+        task.backends
+            .iter()
+            .map(|group| group.total.usage.total_tokens)
+            .sum::<u64>(),
+        "Task and backend rollups must represent identical source scopes"
+    );
     assert!(
         reconnect.1.steering.is_empty(),
         "Suggest cannot alter canonical steering"

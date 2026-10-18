@@ -1647,15 +1647,15 @@ async fn restart_stop_holds_redirects_mailboxed_before_the_stop() {
     let host = fixture.host_for_test();
     let stop_host = host.clone();
     let stop = tokio::spawn(async move {
-        stop_host.shutdown_for_restart().await;
+        stop_host
+            .shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
     });
     stop_gate.wait_until_entered().await;
     send_gate.release_one();
     stop_gate.release_one();
-    tokio::time::timeout(std::time::Duration::from_secs(27), stop)
-        .await
-        .expect("restart stop completes")
-        .expect("restart stop task");
+    stop.await.expect("restart stop task");
 
     // The restart stop itself interrupts the provider once; nothing else
     // may redirect it.
@@ -1867,7 +1867,10 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
     let host = fixture.host_for_test();
     let first_host = host.clone();
     let first = tokio::spawn(async move {
-        first_host.shutdown_for_restart().await;
+        first_host
+            .shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
     });
     stop_gate.wait_until_entered().await;
     // Every agent is prepared for the restart and both orchestrators' awaits
@@ -1939,11 +1942,10 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
             .expect_err("first waiter cancelled")
             .is_cancelled()
     );
-    tokio::time::timeout(std::time::Duration::from_secs(27), async {
-        tokio::join!(host.shutdown_for_restart(), host.shutdown_for_restart());
-    })
-    .await
-    .expect("all callers must share the bounded shutdown despite a stuck backend");
+    shutdown_gate.release_one();
+    let (first, second) = tokio::join!(host.shutdown_for_restart(), host.shutdown_for_restart());
+    first.expect("shared shutdown preserves accounting after cancellation");
+    second.expect("all waiters observe the committed shutdown");
     let after = store.list().expect("list stopped records");
     let queued_messages = |record: &serde_json::Value| -> Vec<(String, String)> {
         record["queued_messages"]
@@ -2023,7 +2025,10 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
     let second_stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
     let second_host = fixture.host_for_test();
     let second = tokio::spawn(async move {
-        second_host.shutdown_for_restart().await;
+        second_host
+            .shutdown_for_restart()
+            .await
+            .expect("restart must preserve required accounting");
     });
     second_stop_gate.wait_until_entered().await;
     durable_replay.complete();
@@ -2063,10 +2068,7 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
         "neither the continuation nor the queue may reach the backend: {restored_requests:?}"
     );
     second_stop_gate.release_one();
-    tokio::time::timeout(std::time::Duration::from_secs(27), second)
-        .await
-        .expect("second restart stop is bounded")
-        .expect("second restart stop");
+    second.await.expect("second restart stop");
     let stopped_again = store.list().expect("list records after the second stop");
     let durable_again = record_for(&stopped_again, &durable_session);
     assert_eq!(

@@ -171,7 +171,9 @@ pub async fn listen_uds(
         let listener = match bind_uds(path).await {
             Ok(listener) => listener,
             Err(err) => {
-                host.shutdown_for_restart().await;
+                host.shutdown_for_restart()
+                    .await
+                    .map_err(io::Error::other)?;
                 return Err(err);
             }
         };
@@ -188,7 +190,9 @@ pub async fn listen_uds(
     {
         let _ = path;
         let _ = config;
-        host.shutdown_for_restart().await;
+        host.shutdown_for_restart()
+            .await
+            .map_err(io::Error::other)?;
         Err(io::Error::new(
             ErrorKind::Unsupported,
             "Unix domain sockets are not supported on this platform",
@@ -268,7 +272,9 @@ pub async fn serve_uds(
         }
     }
     .await;
-    host.shutdown_for_restart().await;
+    host.shutdown_for_restart()
+        .await
+        .map_err(io::Error::other)?;
     result
 }
 

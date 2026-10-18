@@ -41,7 +41,7 @@ pub fn run() -> Result<(), String> {
             _ = shutdown.cancelled() => Ok(()),
             result = connection => result,
         };
-        host.shutdown_for_restart().await;
+        host.shutdown_for_restart().await?;
         result
     })
 }

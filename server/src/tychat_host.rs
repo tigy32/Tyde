@@ -392,7 +392,9 @@ impl HostHandle {
             state.snapshot.agent_id.clone()
         };
         if let Some(id) = agent_id {
-            self.close_agent_with_host_visibility(&id, false).await;
+            self.close_agent_with_host_visibility(&id, false)
+                .await
+                .map_err(|error| error.to_string())?;
         }
         let mut state = service.state.lock().await;
         state.commit(crate::tychat::Journal::default())?;
@@ -456,7 +458,9 @@ impl HostHandle {
                 return Err("Enable and pair Tychat before resetting its agent".into());
             }
             if let Some(id) = live {
-                self.close_agent_with_host_visibility(&id, false).await;
+                self.close_agent_with_host_visibility(&id, false)
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
             let mut state = service.state.lock().await;
             let changed = state.snapshot.agent_id.is_some()
@@ -508,7 +512,9 @@ impl HostHandle {
         };
         if let Some(id) = live {
             if reset {
-                self.close_agent_with_host_visibility(&id, false).await;
+                self.close_agent_with_host_visibility(&id, false)
+                    .await
+                    .map_err(|error| error.to_string())?;
             } else {
                 let saved = saved.ok_or("Tychat live session has no durable binding")?;
                 let mut application = if saved.settings.backend_kind != settings.tychat.backend_kind
@@ -622,7 +628,9 @@ impl HostHandle {
         let session_id = match handle.wait_for_tychat_startup().await {
             Ok(session_id) => session_id,
             Err(error) => {
-                self.close_agent_with_host_visibility(&id, false).await;
+                self.close_agent_with_host_visibility(&id, false)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 return Err(error);
             }
         };

@@ -859,10 +859,10 @@ impl TydeConfigMcpServer {
             Ok(id) => id,
             Err(error) => return Ok(err_text(error)),
         };
-        if self.host.close_agent(&agent_id).await {
-            ok_json(json!({"agent_id": agent_id, "closed": true}))
-        } else {
-            Ok(err_text("agent is not open or is already closing"))
+        match self.host.close_agent(&agent_id).await {
+            Err(error) => Ok(err_text(error.to_string())),
+            Ok(true) => ok_json(json!({"agent_id": agent_id, "closed": true})),
+            Ok(false) => Ok(err_text("agent is not open or is already closing")),
         }
     }
 

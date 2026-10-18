@@ -1614,6 +1614,10 @@ impl Connection {
                     let _: LaunchProfileCatalogPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::AgentError => {
+                    let _: AgentErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::CommandError => {
                     let _: CommandErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1748,6 +1752,14 @@ impl Connection {
                         self.outgoing_seq.contains_key(&envelope.stream),
                         "AgentActivityChanged on stream {} before NewAgent",
                         envelope.stream
+                    );
+                }
+                FrameKind::AgentCompactNotify => {
+                    let payload: protocol::AgentCompactNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    assert!(
+                        payload.old_agent_id == parse_agent_stream(&envelope.stream).agent_id,
+                        "replacement compaction notification must name the issuing agent"
                     );
                 }
                 FrameKind::ContextCompactionNotify => {

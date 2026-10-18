@@ -15,6 +15,7 @@ export default async function startMobileUiServer(config) {
   const child = spawn("npm", ["run", "mobile:ui:serve"], {
     cwd: process.cwd(),
     stdio: "inherit",
+    env: { ...process.env, TYDE_MOBILE_UI_TEST_PORT: url.port },
     detached: process.platform !== "win32",
   });
   let stopping = false;

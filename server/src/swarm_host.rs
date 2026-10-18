@@ -240,9 +240,10 @@ async fn validate_migration_locked(
         .filter(|member| member.team_id == *team_id)
         .collect::<Vec<_>>();
     if draft.retained_sessions.values().any(|session| {
-        lock_resuming_sessions(&state.resuming_sessions)
+        state
+            .resuming_sessions
             .get(session)
-            .is_some_and(|count| *count > 0)
+            .is_some_and(|claims| claims.iter().any(|claim| !claim.is_cancelled()))
             || state
                 .agent_sessions
                 .values()
@@ -1396,7 +1397,11 @@ impl HostHandle {
                 )
             }) {
                 if let Some(agent) = &member.agent_id {
-                    if !self.close_agent(agent).await {
+                    if !self
+                        .close_agent(agent)
+                        .await
+                        .map_err(|error| fail(SwarmErrorCode::Lifecycle, error.to_string()))?
+                    {
                         return Err(fail(
                             SwarmErrorCode::Lifecycle,
                             "Member close was not confirmed; retiring member still occupies capacity",
@@ -1561,7 +1566,12 @@ impl HostHandle {
             _ => None,
         };
         for agent in member.agent_id.iter().chain(terminated.iter()) {
-            if self.agent_handle(agent).await.is_some() && !self.close_agent(agent).await {
+            if self.agent_handle(agent).await.is_some()
+                && !self
+                    .close_agent(agent)
+                    .await
+                    .map_err(|error| fail(SwarmErrorCode::Lifecycle, error.to_string()))?
+            {
                 return Err(fail(
                     SwarmErrorCode::Lifecycle,
                     format!(
@@ -2006,7 +2016,14 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
                         {
                             continue;
                         }
-                        if !host.close_agent(agent).await {
+                        let closed = match host.close_agent(agent).await {
+                            Ok(closed) => closed,
+                            Err(error) => {
+                                tracing::error!(%error, "Swarm member close failed");
+                                continue;
+                            }
+                        };
+                        if !closed {
                             tracing::error!("Swarm retiring member close was not confirmed");
                         } else if let Err(error) = host
                             .record_swarm_status(

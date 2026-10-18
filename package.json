@@ -4,7 +4,7 @@
   "version": "0.9.6-beta.1",
   "scripts": {
     "tauri": "cargo tauri",
-    "mobile:ui:serve": "cd mobile-frontend && NO_COLOR=true trunk serve --features ui-fixtures --address 127.0.0.1 --port 4173",
+    "mobile:ui:serve": "cd mobile-frontend && NO_COLOR=true trunk serve --features ui-fixtures --address 127.0.0.1 --port ${TYDE_MOBILE_UI_TEST_PORT:-4173}",
     "mobile:ui:test": "playwright test --config playwright.mobile.config.mjs",
     "mobile:ui:screenshots": "playwright test --config playwright.mobile.config.mjs --grep @visual",
     "mobile:ui:report": "playwright show-report test-results/mobile-playwright-report",

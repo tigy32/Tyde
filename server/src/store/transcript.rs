@@ -28,12 +28,21 @@ pub(crate) struct ProviderEventIdentity {
     pub event_id: String,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TranscriptAccountingScope {
+    #[default]
+    SessionOwn,
+    InheritedContext,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TranscriptRecord {
     pub logical_session_id: SessionId,
     pub sequence: u64,
     pub event_id: String,
     pub visibility: TranscriptVisibility,
+    pub accounting_scope: TranscriptAccountingScope,
     #[serde(default)]
     pub provider_identity: Option<ProviderEventIdentity>,
     pub event: ChatEvent,
@@ -115,7 +124,7 @@ impl JournalStamp {
 
 /// Why a journal read stopped before the end of the file.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum JournalDamage {
+pub(crate) enum JournalDamage {
     #[default]
     None,
     /// Bytes that are not a finished record. No writer ever committed them, so
@@ -134,6 +143,7 @@ struct LoadedJournal {
     intact_len: u64,
     file_len: u64,
     damage: JournalDamage,
+    ownership_migrated: bool,
 }
 
 /// What one append batch did, beyond the records it wrote.
@@ -244,9 +254,37 @@ impl TranscriptStore {
     }
 
     pub(crate) fn load(&self, session_id: &SessionId) -> Result<Vec<TranscriptRecord>, String> {
-        let mut journal = self.read_journal(session_id)?;
+        let mut journal = self.read_journal(session_id, false)?;
         journal.records.sort_by_key(|record| record.sequence);
         Ok(journal.records)
+    }
+
+    pub(crate) fn load_accounting(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(Vec<TranscriptRecord>, JournalDamage), String> {
+        let journal_owner = self.open_session(session_id);
+        let mut index = journal_owner
+            .index
+            .lock()
+            .map_err(|_| "transcript index is poisoned".to_owned())?;
+        let mut journal = self.read_journal(session_id, true)?;
+        if journal.ownership_migrated && journal.damage == JournalDamage::None {
+            let mut bytes = Vec::new();
+            for record in &journal.records {
+                serde_json::to_writer(&mut bytes, record).map_err(|error| {
+                    format!("Cannot migrate transcript accounting ownership: {error}")
+                })?;
+                bytes.push(b'\n');
+            }
+            crate::store::permissions::atomic_write_owner_only(
+                &self.journal_path(session_id),
+                &bytes,
+            )?;
+            *index = None;
+        }
+        journal.records.sort_by_key(|record| record.sequence);
+        Ok((journal.records, journal.damage))
     }
 
     /// Read the journal for a writer, dropping a torn record from the file.
@@ -259,7 +297,7 @@ impl TranscriptStore {
         &self,
         session_id: &SessionId,
     ) -> Result<(Vec<TranscriptRecord>, TranscriptAppend), String> {
-        let journal = self.read_journal(session_id)?;
+        let journal = self.read_journal(session_id, false)?;
         let mut outcome = TranscriptAppend {
             unreadable_record: journal.damage == JournalDamage::Unreadable,
             ..TranscriptAppend::default()
@@ -303,11 +341,15 @@ impl TranscriptStore {
     /// A record that parses but disagrees with the file it sits in is a
     /// different animal: that is a logic bug, not a torn write, and it still
     /// fails the read.
-    fn read_journal(&self, session_id: &SessionId) -> Result<LoadedJournal, String> {
+    fn read_journal(
+        &self,
+        session_id: &SessionId,
+        required: bool,
+    ) -> Result<LoadedJournal, String> {
         let path = self.journal_path(session_id);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
                 return Ok(LoadedJournal::default());
             }
             Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
@@ -318,6 +360,7 @@ impl TranscriptStore {
         let mut intact_len = 0;
         let mut line_number = 0;
         let mut damage = JournalDamage::None;
+        let mut ownership_migrated = false;
         while offset < bytes.len() {
             line_number += 1;
             let Some(newline) = bytes[offset..].iter().position(|byte| *byte == b'\n') else {
@@ -338,7 +381,28 @@ impl TranscriptStore {
                 intact_len = next;
                 continue;
             }
-            let record: TranscriptRecord = match serde_json::from_slice(line) {
+            let record: TranscriptRecord = match serde_json::from_slice::<serde_json::Value>(line)
+                .and_then(|mut value| {
+                    // Schema v1 encoded inherited ownership in Tyde's reserved fork identity.
+                    if let Some(record) = value.as_object_mut()
+                        && !record.contains_key("accounting_scope")
+                    {
+                        let inherited = record
+                            .get("event_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|id| id.starts_with("fork:"));
+                        record.insert(
+                            "accounting_scope".to_owned(),
+                            serde_json::to_value(if inherited {
+                                TranscriptAccountingScope::InheritedContext
+                            } else {
+                                TranscriptAccountingScope::SessionOwn
+                            })?,
+                        );
+                        ownership_migrated = true;
+                    }
+                    serde_json::from_value(value)
+                }) {
                 Ok(record) => record,
                 Err(error) => {
                     // A record that is valid JSON but the wrong shape was
@@ -386,6 +450,7 @@ impl TranscriptStore {
             intact_len: intact_len as u64,
             file_len: bytes.len() as u64,
             damage,
+            ownership_migrated,
         })
     }
 

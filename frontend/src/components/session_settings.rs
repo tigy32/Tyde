@@ -8,9 +8,8 @@ use protocol::{
     UNAVAILABLE_OPTION_SUFFIX, clear_invalid_dependent_select_values, options_including_current,
 };
 
-use crate::components::agents_panel::backend_label;
-use crate::components::backend_capacity::CapacityCompactRow;
-use crate::components::chat_message::{format_compact, token_badge_data};
+use crate::components::chat_message::format_compact;
+use crate::components::task_usage::TaskUsagePopup;
 use crate::state::{ActiveAgentRef, AppState, ComposerHandle};
 
 #[component]
@@ -738,7 +737,7 @@ pub fn SessionSettingsBar(
     }
 }
 
-fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'static str {
+pub(super) fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'static str {
     match reason {
         TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted => "no completed turns",
         TaskTokenUsageUnavailableReason::BackendDidNotReport => "backend did not report",
@@ -747,44 +746,67 @@ fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'sta
         TaskTokenUsageUnavailableReason::HelperAccountingUnavailable => {
             "analyzer accounting unavailable"
         }
-    }
-}
-
-/// `(input_text, output_text)` for a rollup amount, formatted by the same
-/// `token_badge_data` the per-agent badges use. When the server only knows the
-/// combined figure (per-scope splits summed away by an unavailable entry) the
-/// pair collapses to a single `Σtotal` text with no output slot.
-fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
-    match (amount.input_tokens, amount.output_tokens) {
-        (Some(input_tokens), Some(output_tokens)) => {
-            let usage = protocol::TokenUsage {
-                input_tokens,
-                output_tokens,
-                total_tokens: amount.total_tokens,
-                cached_prompt_tokens: amount.cached_prompt_tokens,
-                cache_creation_input_tokens: amount.cache_creation_input_tokens,
-                reasoning_tokens: amount.reasoning_tokens,
-            };
-            let (input_text, output_text, _) = token_badge_data(&usage);
-            (input_text, Some(output_text))
+        TaskTokenUsageUnavailableReason::SharedSessionAccounting => {
+            "shared session accounting cannot be attributed"
         }
-        _ => (
-            format!("\u{03a3}{}", format_compact(amount.total_tokens)),
-            None,
-        ),
+        TaskTokenUsageUnavailableReason::ObservationInterrupted => "agent observations interrupted",
+        TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete => {
+            "saved accounting incomplete"
+        }
     }
 }
 
-fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
+// Keep the footer's established arrow/subset presentation. Prompt totals
+// arrive already aggregated: missing cache breakdowns must not erase input
+// contributed by other backends or turn an unknown subset into zero.
+fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
+    let number = |value: Option<u64>| value.map(format_compact).unwrap_or_else(|| "—".to_owned());
+    let input = match amount.cached_prompt_tokens {
+        Some(cached) if cached > 0 => format!(
+            "↑{} (cached {})",
+            number(amount.prompt_tokens),
+            format_compact(cached)
+        ),
+        _ => format!("↑{}", number(amount.prompt_tokens)),
+    };
+    let output = match amount.reasoning_tokens {
+        Some(reasoning) if reasoning > 0 => format!(
+            "↓{} (reasoning {})",
+            number(amount.output_tokens),
+            format_compact(reasoning)
+        ),
+        _ => format!("↓{}", number(amount.output_tokens)),
+    };
+    (input, Some(output))
+}
+
+fn task_detail_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
+    let number = |value: Option<u64>| value.map(format_compact).unwrap_or_else(|| "—".to_owned());
+    (
+        format!(
+            "↑{} (cached {})",
+            number(amount.prompt_tokens),
+            number(amount.cached_prompt_tokens)
+        ),
+        Some(format!(
+            "↓{} (reasoning {})",
+            number(amount.output_tokens),
+            number(amount.reasoning_tokens)
+        )),
+    )
+}
+
+pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
     match scope {
         TaskTokenUsageScope::Known { usage } => {
-            let (input_text, output_text) = task_amount_texts(usage);
+            let (input_text, output_text) = task_detail_texts(usage);
             view! {
                 <span class="session-task-row-usage">
                     <span class="token-stat token-stat-input">{input_text}</span>
                     {output_text.map(|text| view! {
                         <span class="token-stat token-stat-output">{text}</span>
                     })}
+                    {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
                 </span>
             }
             .into_any()
@@ -794,7 +816,7 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
             unavailable_count,
             ..
         } => {
-            let (input_text, output_text) = task_amount_texts(usage);
+            let (input_text, output_text) = task_detail_texts(usage);
             let marker = format!("partial \u{b7} {unavailable_count} unreported");
             view! {
                 <span class="session-task-row-usage">
@@ -802,6 +824,7 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
                     {output_text.map(|text| view! {
                         <span class="token-stat token-stat-output">{text}</span>
                     })}
+                    {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
                     <span class="session-task-status session-task-status-partial">
                         {marker}
                     </span>
@@ -818,21 +841,7 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
     }
 }
 
-/// The single task-wide token usage display for the active agent's whole task
-/// (root + sub-agents), rendered once at the right edge of the session-settings
-/// footer. It shows a left-style `↑input ↓output` string sourced from the
-/// server's authoritative `TaskTokenUsagePayload.total` — never summed from
-/// chat rows — and appends `including N agents` for multi-agent tasks (N is the
-/// breakdown length). Partial totals carry a subtle `partial` marker; an
-/// all-unavailable total shows a muted marker rather than a fabricated zero.
-/// Click/Enter toggles the per-agent breakdown popover. Escape and pointer-down
-/// outside dismiss it; hovering alone never opens it.
-///
-/// The popover also carries the compact subscription-capacity row for the
-/// current agent's backend, in a *separate* labelled region below the task
-/// breakdown. Task tokens are this task; subscription capacity is the account's
-/// quota. They are not summable, so nothing in the layout or the accessible
-/// text combines them, and capacity is never derived from these token figures.
+/// The footer remains the authoritative task total; detail views never replace it.
 #[component]
 fn TaskUsageBadge(
     rollup: Memo<Option<TaskTokenUsagePayload>>,
@@ -840,13 +849,14 @@ fn TaskUsageBadge(
 ) -> impl IntoView {
     let open = RwSignal::new(false);
     let wrapper_ref: NodeRef<leptos::html::Span> = NodeRef::new();
-
-    // Dismissal listeners live on the window: a pointer-down anywhere outside
-    // the badge/popover region closes it, as does Escape regardless of focus.
-    // They use try_* accessors because window callbacks can race owner
-    // disposal, and are explicitly removed on cleanup (window listeners are
-    // not tied to the ownership tree).
-    let outside_pointer = window_event_listener(leptos::ev::pointerdown, move |ev| {
+    let toggle_ref: NodeRef<leptos::html::Button> = NodeRef::new();
+    let close = Callback::new(move |_| {
+        open.set(false);
+        if let Some(toggle) = toggle_ref.get_untracked() {
+            let _ = toggle.focus();
+        }
+    });
+    let outside_pointer = window_event_listener(leptos::ev::pointerdown, move |event| {
         if !open.try_get_untracked().unwrap_or(false) {
             return;
         }
@@ -854,7 +864,8 @@ fn TaskUsageBadge(
             .try_get_untracked()
             .flatten()
             .is_some_and(|wrapper| {
-                ev.target()
+                event
+                    .target()
                     .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
                     .is_some_and(|node| wrapper.contains(Some(&node)))
             });
@@ -862,136 +873,41 @@ fn TaskUsageBadge(
             open.try_set(false);
         }
     });
-    let escape_key = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && open.try_get_untracked().unwrap_or(false) {
-            open.try_set(false);
+    let escape_key = window_event_listener(leptos::ev::keydown, move |event| {
+        if event.key() == "Escape" && open.try_get_untracked().unwrap_or(false) {
+            close.run(());
         }
     });
     on_cleanup(move || {
         outside_pointer.remove();
         escape_key.remove();
     });
-
+    let popover_id = Memo::new(move |_| {
+        rollup
+            .get()
+            .map(|payload| format!("session-task-popover-{}", payload.root_agent_id))
+    });
     view! {
-        {move || {
-            let payload = rollup.get()?;
-            let agent_total = payload.breakdown.len();
-            let multi_agent = agent_total > 1;
-            // The figure is the server's authoritative combined task total,
-            // formatted in the same left-style `↑input ↓output` string the
-            // per-message badges use. An all-unavailable aggregate carries no
-            // real figure — show a muted marker, never a fabricated zero.
-            let usage_texts = match &payload.total.status {
-                TaskTokenUsageStatus::Unavailable { .. } => None,
-                TaskTokenUsageStatus::Known | TaskTokenUsageStatus::Partial { .. } => {
-                    Some(task_amount_texts(&payload.total.usage))
-                }
-            };
-            let partial = matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. });
-            let including_text = multi_agent.then(|| format!("including {agent_total} agents"));
-            let status_note = match &payload.total.status {
-                TaskTokenUsageStatus::Known => None,
-                TaskTokenUsageStatus::Partial {
-                    unavailable_count, ..
-                } => Some(format!("partial \u{b7} {unavailable_count} unreported")),
-                TaskTokenUsageStatus::Unavailable { .. } => Some("unavailable".to_owned()),
-            };
-            let popover_id = format!("session-task-popover-{}", payload.root_agent_id);
-            let popover_id_attr = popover_id.clone();
-            let breakdown = payload.breakdown.clone();
-            Some(view! {
-                <span
-                    class="session-task-usage"
-                    node_ref=wrapper_ref
-                >
-                    <button
-                        class="session-task-toggle"
-                        aria-haspopup="dialog"
-                        aria-expanded=move || open.get().to_string()
-                        aria-controls=popover_id_attr
-                        title="Cumulative tokens across this task's requests and \
-                               agents. The context panel shows the latest \
-                               request's occupancy instead."
-                        on:click=move |_| open.update(|o| *o = !*o)
-                    >
-                        // Scope marker. This figure is task-wide and
-                        // cumulative; the context bar is single-request
-                        // occupancy. Unlabelled, the pair reads as bad
-                        // arithmetic rather than two different measurements.
-                        <span class="session-task-scope">"Task"</span>
-                        {match usage_texts {
-                            Some((input_text, output_text)) => view! {
-                                <>
-                                    <span class="token-stat token-stat-input">{input_text}</span>
-                                    {output_text.map(|text| view! {
-                                        <span class="token-stat token-stat-output">{text}</span>
-                                    })}
-                                </>
-                            }.into_any(),
-                            None => view! {
-                                <span class="session-task-usage-unavailable">
-                                    "usage unavailable"
-                                </span>
-                            }.into_any(),
-                        }}
-                        {including_text.map(|text| view! {
-                            <span class="session-task-including">{text}</span>
-                        })}
-                        {partial.then(|| view! {
-                            <span class="session-task-status session-task-status-partial">
-                                "partial"
-                            </span>
-                        })}
-                    </button>
-                    <Show when=move || open.get()>
-                        <div
-                            class="session-task-popover"
-                            id=popover_id.clone()
-                            role="dialog"
-                            aria-label="Task token usage breakdown"
-                        >
-                            <div class="session-task-popover-title">
-                                <span>{format!(
-                                    "Task usage \u{b7} {agent_total} agent{}",
-                                    if agent_total == 1 { "" } else { "s" },
-                                )}</span>
-                                {status_note.clone().map(|note| view! {
-                                    <span class="session-task-popover-status">{note}</span>
-                                })}
-                            </div>
-                            <div
-                                class="session-task-popover-rows"
-                                role="group"
-                                aria-label="Task token usage by agent"
-                            >
-                                {breakdown.iter().map(|entry| {
-                                    let indent = 6 + entry.depth.min(12) * 14;
-                                    let meta = match &entry.model {
-                                        Some(model) => {
-                                            format!("{} \u{b7} {model}", backend_label(entry.backend_kind))
-                                        }
-                                        None => backend_label(entry.backend_kind).to_owned(),
-                                    };
-                                    view! {
-                                        <div
-                                            class="session-task-row"
-                                            style=format!("padding-left: {indent}px")
-                                        >
-                                            <span class="session-task-row-name">
-                                                {entry.name.clone()}
-                                            </span>
-                                            <span class="session-task-row-meta">{meta}</span>
-                                            {task_scope_view(&entry.usage)}
-                                        </div>
-                                    }
-                                }).collect_view()}
-                            </div>
-                            <CapacityCompactRow binding=binding />
-                        </div>
-                    </Show>
-                </span>
-            })
-        }}
+        <span class="session-task-usage" node_ref=wrapper_ref>
+            <button class="session-task-toggle" node_ref=toggle_ref aria-haspopup="dialog"
+                aria-expanded=move || open.get().to_string() aria-controls=move || popover_id.get()
+                title="Cumulative tokens across this task's requests and agents. The context panel shows the latest request's occupancy instead."
+                on:click=move |_| open.update(|open| *open = !*open)>
+                <span class="session-task-scope">"Task"</span>
+                {move || rollup.get().map(|payload| match payload.total.status {
+                    TaskTokenUsageStatus::Unavailable { .. } => view! { <span class="session-task-usage-unavailable">"usage unavailable"</span> }.into_any(),
+                    _ => {
+                        let (input_text, output_text) = task_amount_texts(&payload.total.usage);
+                        view! { <span class="token-stat token-stat-input">{input_text}</span>{output_text.map(|text| view! { <span class="token-stat token-stat-output">{text}</span> })} }.into_any()
+                    }
+                })}
+                {move || rollup.get().and_then(|payload| (payload.breakdown.len() > 1).then(|| view! { <span class="session-task-including">{format!("including {} agents", payload.breakdown.len())}</span> }))}
+                {move || rollup.get().and_then(|payload| matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. }).then(|| view! { <span class="session-task-status session-task-status-partial">"partial"</span> }))}
+            </button>
+            <Show when=move || open.get()>
+                <div id=move || popover_id.get()><TaskUsagePopup rollup=rollup binding=binding on_close=close /></div>
+            </Show>
+        </span>
     }
 }
 
@@ -1670,6 +1586,10 @@ mod wasm_tests {
                 "position: absolute; top: 0; left: 0; width: 600px; height: 400px;",
             )
             .unwrap();
+        // Geometry must use production CSS, not styles leaked by another test.
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        container.append_child(&style).unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
     }
@@ -2157,6 +2077,7 @@ mod wasm_tests {
 
     fn known_amount(input: u64, output: u64) -> TaskTokenUsageAmount {
         TaskTokenUsageAmount {
+            prompt_tokens: Some(input),
             total_tokens: input + output,
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -2189,6 +2110,8 @@ mod wasm_tests {
         usage: TaskTokenUsageScope,
     ) -> TaskTokenUsageEntry {
         TaskTokenUsageEntry {
+            navigation: protocol::TaskUsageNavigation::LiveAgent,
+            project_id: None,
             agent_id: AgentId(agent_id.to_owned()),
             session_id: None,
             parent_agent_id: parent_agent_id.map(|id| AgentId(id.to_owned())),
@@ -2208,6 +2131,21 @@ mod wasm_tests {
     fn partial_rollup(root: &str, root_in: u64, root_out: u64) -> TaskTokenUsagePayload {
         TaskTokenUsagePayload {
             helper_usage: Vec::new(),
+            timing: Default::default(),
+            backends: vec![protocol::TaskBackendUsage {
+                analyzer_batch_count: 0,
+                backend_kind: BackendKind::Claude,
+                agent_count: 3,
+                reporting_agent_count: 2,
+                incomplete_agent_count: 1,
+                total: TaskTokenUsageAggregate {
+                    usage: known_amount(root_in + 1_000, root_out + 200),
+                    status: TaskTokenUsageStatus::Partial {
+                        unavailable_count: 1,
+                        reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+                    },
+                },
+            }],
             root_agent_id: AgentId(root.to_owned()),
             root_session_id: None,
             total: TaskTokenUsageAggregate {
@@ -2335,6 +2273,22 @@ mod wasm_tests {
         );
     }
 
+    async fn expand_usage(container: &HtmlElement, label: &str) {
+        query(container, ".task-usage-expand")
+            .expect("expand task usage")
+            .click();
+        next_tick().await;
+        let tabs = container.query_selector_all("[role=tab]").unwrap();
+        let tab = (0..tabs.length())
+            .filter_map(|index| tabs.item(index))
+            .find(|tab| tab.text_content().as_deref() == Some(label))
+            .expect("expanded tab");
+        let tab = tab.dyn_into::<HtmlElement>().unwrap();
+        tab.focus().unwrap();
+        tab.click();
+        next_tick().await;
+    }
+
     /// A multi-agent task renders the combined left-style total sourced from
     /// the server rollup (not summed chat rows), with an `including N agents`
     /// suffix (N = breakdown length) and a `partial` marker. Clicking opens the
@@ -2395,10 +2349,15 @@ mod wasm_tests {
         );
         let popover_text = popover.text_content().unwrap_or_default();
         assert!(
+            popover_text.contains("By backend"),
+            "the compact task popup must aggregate by backend"
+        );
+        assert!(
             popover_text.contains("3 agents"),
             "popover title should count all breakdown rows, got: {popover_text}"
         );
 
+        expand_usage(&container, "Agents").await;
         let rows = container
             .query_selector_all(".session-task-row")
             .expect("rows query");
@@ -2446,9 +2405,17 @@ mod wasm_tests {
                 .get_bounding_client_rect()
                 .x()
         };
+        let row_display = web_sys::window()
+            .unwrap()
+            .get_computed_style(&query(&container, ".session-task-row").unwrap())
+            .unwrap()
+            .unwrap()
+            .get_property_value("display")
+            .unwrap();
         assert!(
             name_x(1) > name_x(0) && name_x(2) > name_x(0),
-            "depth-1 rows must be indented past the root row"
+            "depth-1 rows must be indented past the root row; x={:?}, row display={row_display}",
+            [name_x(0), name_x(1), name_x(2)]
         );
 
         // A live rollup update must re-render the open popover — no stale
@@ -2477,6 +2444,66 @@ mod wasm_tests {
             "badge must show the updated server total as ↑input ↓output, got: {updated_badge_text}"
         );
 
+        let mut with_analyzer = partial_rollup("root", 700_000, 100);
+        with_analyzer.total.usage = known_amount(701_400, 350);
+        with_analyzer.helper_usage.push(protocol::LearningUsage {
+            scope: protocol::SteeringScope::Host,
+            batch_id: protocol::LearningChangeId("usage-analyzer-batch".to_owned()),
+            origin_agent_ids: vec![AgentId("root".to_owned())],
+            origin_session_ids: Vec::new(),
+            input_ids: vec![protocol::HumanInputId("usage-human-input".to_owned())],
+            analyzer: protocol::LearningAnalyzer {
+                backend_kind: BackendKind::Codex,
+                model: "source-model".to_owned(),
+            },
+            usage: known_scope(400, 50),
+        });
+        with_analyzer.backends.push(protocol::TaskBackendUsage {
+            backend_kind: BackendKind::Codex,
+            analyzer_batch_count: 1,
+            agent_count: 0,
+            reporting_agent_count: 0,
+            incomplete_agent_count: 0,
+            total: TaskTokenUsageAggregate {
+                usage: known_amount(400, 50),
+                status: TaskTokenUsageStatus::Known,
+            },
+        });
+        dispatch_task_usage(&state, "h-task-tree", 2, &with_analyzer);
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            3,
+            "Analyzer sources cannot fabricate additional agent rows"
+        );
+        let badge = query(&container, ".session-task-toggle").unwrap();
+        assert!(
+            badge.text_content().unwrap().contains("↑701.4K")
+                && badge.text_content().unwrap().contains("↓350"),
+            "The unchanged arrow footer projects the server total including its explicit analyzer sources"
+        );
+        query(&container, ".task-usage-back").unwrap().click();
+        next_tick().await;
+        let codex =
+            query(&container, "article[aria-label=Codex]").expect("analyzer-only backend row");
+        let text = codex.text_content().unwrap();
+        assert!(
+            text.contains("0 agents")
+                && text.contains("1 analyzer batch")
+                && text.contains("↑400")
+                && text.contains("↓50"),
+            "An analyzer-only backend keeps its usage without becoming an agent"
+        );
+        assert!(
+            query(&container, ".session-task-popover")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("not per-task allocations")
+        );
         let badge = query(&container, ".session-task-toggle").expect("badge still rendered");
         badge.click();
         for _ in 0..4 {
@@ -2486,6 +2513,514 @@ mod wasm_tests {
             query(&container, ".session-task-popover").is_none(),
             "clicking the badge again must close the breakdown"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn task_usage_eight_backends_tabs_filters_limits_and_host_bound_navigation() {
+        install_send_stub();
+        let container = make_container();
+        let state = make_state_with_active_agent("h-task-expanded", "root");
+        let kinds = [
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Grok,
+            BackendKind::Hermes,
+            BackendKind::Kiro,
+            BackendKind::Muse,
+            BackendKind::Opencode,
+        ];
+        let mut rollup = partial_rollup("root", 1_000, 100);
+        let mut amount = known_amount(1_000, 100);
+        amount.cached_prompt_tokens = Some(0);
+        rollup.breakdown = (0..87)
+            .map(|index| {
+                let mut row = entry(
+                    if index == 0 { "root" } else { "unused" },
+                    (index != 0).then_some("root"),
+                    &format!("Worker {index}"),
+                    u32::from(index != 0),
+                    index,
+                    TaskTokenUsageScope::Known {
+                        usage: Box::new(amount.clone()),
+                    },
+                );
+                if index != 0 {
+                    row.agent_id = AgentId(format!("worker-{index}"));
+                }
+                row.backend_kind = kinds[index as usize % kinds.len()];
+                row
+            })
+            .collect();
+        rollup.breakdown[85].usage = TaskTokenUsageScope::Known {
+            usage: Box::new(TaskTokenUsageAmount::total_only(42)),
+        };
+        rollup.breakdown[86].usage = TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
+        };
+        rollup.total.usage = TaskTokenUsageAmount {
+            prompt_tokens: Some(86_000),
+            total_tokens: 94_600,
+            input_tokens: Some(86_000),
+            output_tokens: Some(8_600),
+            cached_prompt_tokens: Some(0),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        };
+        rollup.breakdown[86].navigation = protocol::TaskUsageNavigation::SavedSession {
+            session_id: protocol::SessionId("saved-usage-session".to_owned()),
+        };
+        rollup.descendant_count = 86;
+        rollup.backends = kinds
+            .iter()
+            .map(|kind| {
+                let count = rollup
+                    .breakdown
+                    .iter()
+                    .filter(|entry| entry.backend_kind == *kind)
+                    .count() as u32;
+                let missing = u32::from(*kind == kinds[86 % kinds.len()]);
+                let mut usage = known_amount(
+                    u64::from(count - missing) * 1_000,
+                    u64::from(count - missing) * 100,
+                );
+                usage.cached_prompt_tokens = Some(0);
+                protocol::TaskBackendUsage {
+                    analyzer_batch_count: 0,
+                    backend_kind: *kind,
+                    agent_count: count,
+                    reporting_agent_count: count - missing,
+                    incomplete_agent_count: missing,
+                    total: TaskTokenUsageAggregate {
+                        usage,
+                        status: if missing == 0 {
+                            TaskTokenUsageStatus::Known
+                        } else {
+                            rollup.total.status.clone()
+                        },
+                    },
+                }
+            })
+            .collect();
+        rollup.timing = protocol::TaskTimingSummary {
+            covered_agent_count: 1,
+            unobserved_agent_count: 86,
+            observed_start_ms: Some(1_000),
+            observed_end_ms: Some(6_000),
+            summed_tool_ms: 5_000,
+            summed_dependency_wait_ms: 2_000,
+            command_count: 1,
+            classified_tool_count: 1,
+            spans: vec![protocol::TaskTimingEntry {
+                agent_id: AgentId("root".to_owned()),
+                span: protocol::TaskTimingSpan {
+                    tool_call_id: "check-observed".to_owned(),
+                    category: protocol::TaskTimingCategory::Command {
+                        command: "./dev.sh check".to_owned(),
+                        check: true,
+                    },
+                    started_at_ms: 1_000,
+                    observed_through_ms: 6_000,
+                    observed_duration_ms: 5_000,
+                    state: protocol::TaskTimingState::Completed,
+                },
+            }],
+            ..Default::default()
+        };
+        dispatch_task_usage(&state, "h-task-expanded", 0, &rollup);
+        dispatch_capacity(&state, "h-task-expanded", 1, 0);
+        let mut claude =
+            state.backend_capacity.get_untracked()["h-task-expanded"][&BackendKind::Claude].clone();
+        let protocol::BackendCapacityState::Known { report } = &mut claude.state else {
+            unreachable!()
+        };
+        report.coverage = protocol::CapacityCoverage::AllVendorBuckets;
+        report.buckets[0].id = protocol::CapacityBucketId::Claude {
+            limit: protocol::ClaudeLimitType::FiveHour,
+        };
+        report.buckets[0].scope = protocol::CapacityScope::Account;
+        report.buckets[0].window = protocol::CapacityWindow::Rolling {
+            duration_minutes: 300,
+        };
+        let mut week = report.buckets[0].clone();
+        week.id = protocol::CapacityBucketId::Claude {
+            limit: protocol::ClaudeLimitType::SevenDay,
+        };
+        week.label = "weekly".to_owned();
+        week.window = protocol::CapacityWindow::Rolling {
+            duration_minutes: 10_080,
+        };
+        report.buckets.push(week);
+        let mut gemini = claude.clone();
+        gemini.backend_kind = BackendKind::Antigravity;
+        let protocol::BackendCapacityState::Known { report } = &mut gemini.state else {
+            unreachable!()
+        };
+        report.source = protocol::CapacitySource::AntigravityUsageCommand;
+        for (index, bucket) in report.buckets.iter_mut().enumerate() {
+            bucket.id = protocol::CapacityBucketId::Antigravity {
+                bucket: format!("gemini-{index}"),
+            };
+            bucket.scope = protocol::CapacityScope::ModelFamily {
+                name: "Gemini".to_owned(),
+            };
+            bucket.measure = protocol::CapacityMeasure::UsedPercent {
+                used_percent: 2,
+                remaining_percent: 98,
+                provenance: protocol::ValueProvenance {
+                    vendor_reported: false,
+                },
+            };
+        }
+        let protocol::BackendCapacityState::Known { report } = &mut claude.state else {
+            unreachable!()
+        };
+        let mut family = report.buckets[1].clone();
+        family.id = protocol::CapacityBucketId::ClaudeModel {
+            name: "Fable".to_owned(),
+        };
+        family.label = "Fable limit".to_owned();
+        report.buckets.push(family);
+        let capacity = Envelope::from_payload(
+            StreamPath("/host/h-task-expanded".to_owned()),
+            FrameKind::BackendCapacity,
+            2,
+            &protocol::BackendCapacityPayload {
+                snapshots: vec![claude, gemini],
+            },
+        )
+        .unwrap();
+        crate::dispatch::dispatch_envelope(&state, "h-task-expanded", capacity);
+        let fixed_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let composer = fixed_state.composer_untracked();
+            provide_context(fixed_state.clone());
+            let agent_ref = Signal::derive(|| {
+                Some(ActiveAgentRef {
+                    host_id: "h-task-expanded".to_owned(),
+                    agent_id: AgentId("root".to_owned()),
+                })
+            });
+            view! { <SessionSettingsBar agent_ref=agent_ref composer=composer /> }
+        });
+        next_tick().await;
+        let badge = query(&container, ".session-task-toggle").unwrap();
+        let original = badge.text_content().unwrap();
+        assert!(
+            original.contains("↑86.0K")
+                && original.contains("including 87 agents")
+                && original.contains("partial")
+        );
+        badge.click();
+        next_tick().await;
+        let popup_rect = query(&container, ".session-task-popover")
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            popup_rect.left() >= 0.0
+                && popup_rect.right()
+                    <= web_sys::window()
+                        .unwrap()
+                        .inner_width()
+                        .unwrap()
+                        .as_f64()
+                        .unwrap(),
+            "the compact popup must fit the viewport even when its badge is in a narrow pane"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".task-backend-row")
+                .unwrap()
+                .length(),
+            8,
+            "one flat row per backend, never 87 agent cards"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".task-limit-track")
+                .unwrap()
+                .length(),
+            3,
+            "authoritative Claude windows and named family get tracks; estimates do not"
+        );
+        let claude = query(&container, "article[aria-label=Claude]").unwrap();
+        let gemini = query(&container, "article[aria-label=Antigravity]").unwrap();
+        assert!(
+            claude.text_content().unwrap().contains("5h")
+                && claude.text_content().unwrap().contains("7d")
+                && claude.text_content().unwrap().contains("Fable 7d")
+        );
+        assert!(
+            gemini.text_content().unwrap().contains("Gemini 5h")
+                && gemini.text_content().unwrap().contains("Gemini 7d")
+                && gemini.text_content().unwrap().contains("~2% derived")
+        );
+        let label = query(&claude, ".task-limit-label")
+            .unwrap()
+            .get_bounding_client_rect();
+        let track = query(&claude, ".task-limit-track")
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            label.right() <= track.left(),
+            "limit label remains outside the matte track"
+        );
+        let summary_node = query(&container, ".task-backend-drilldown").unwrap();
+        let mut update = rollup.clone();
+        update.backends[0].total.usage.input_tokens = Some(999_000);
+        update.backends[0].total.usage.prompt_tokens = Some(999_000);
+        dispatch_task_usage(&state, "h-task-expanded", 3, &update);
+        next_tick().await;
+        assert!(
+            query(&container, "article[aria-label=Claude]")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("↑999.0K")
+        );
+        assert!(
+            summary_node.is_connected(),
+            "same-key rows stay mounted on live updates"
+        );
+        expand_usage(&container, "Overview").await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        assert_eq!(
+            document.active_element().unwrap().tag_name(),
+            "BUTTON",
+            "selecting a tab preserves keyboard focus"
+        );
+        let tabs = container.query_selector_all("[role=tab]").unwrap();
+        tabs.item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let text = query(&container, ".task-time-view")
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            text.contains("5.0s")
+                && text.contains("1/87 agents")
+                && text.contains("Process lifetime: unsupported")
+        );
+        query(&container, ".task-timing-row").unwrap().click();
+        next_tick().await;
+        assert!(
+            query(&container, ".task-timing-detail")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("not evidence of background process exit")
+        );
+        tabs.item(2)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            87
+        );
+        let input = query(&container, "input[aria-label='Filter agents']")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value("Worker 85");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            query(&container, ".session-task-row")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Reported combined: 42 · input/output unreported"),
+            "details preserve a reported total without inventing input/output splits or replacing the footer"
+        );
+        input.set_value("Worker 86");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert!(
+            query(&container, ".session-task-row")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("backend did not report")
+        );
+        input.set_value("");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        query(&container, ".task-tree-toggle").unwrap().click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            1,
+            "collapse hides descendants without changing scope totals"
+        );
+        let buttons = container
+            .query_selector_all(".task-agent-controls button")
+            .unwrap();
+        buttons
+            .item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            87,
+            "flat view ignores tree collapse"
+        );
+        buttons
+            .item(0)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            1
+        );
+        query(&container, ".task-usage-close").unwrap().click();
+        next_tick().await;
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&badge))
+        );
+        assert_eq!(
+            badge.text_content().unwrap(),
+            original,
+            "expanded views leave the footer untouched"
+        );
+        badge.click();
+        next_tick().await;
+        query(&container, ".task-backend-drilldown")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            query(&container, "[role=tab][aria-selected=true]")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Agents")
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            11,
+            "backend drilldown filters own-usage rows"
+        );
+        state.agents.update(|agents| {
+            let mut target = agents[0].clone();
+            target.agent_id = AgentId("worker-8".to_owned());
+            target.name = "Worker 8".to_owned();
+            target.parent_agent_id = Some(AgentId("root".to_owned()));
+            let mut other = target.clone();
+            other.host_id = "different-host".to_owned();
+            other.name = "Wrong host target".to_owned();
+            agents.insert(0, other);
+            agents.push(target);
+        });
+        let destination = make_container();
+        let destination_state = state.clone();
+        let _destination_handle = mount_to(destination.clone(), move || {
+            provide_context(destination_state.clone());
+            view! { <crate::components::center_zone::CenterZone /> }
+        });
+        next_tick().await;
+        assert!(!destination.text_content().unwrap().contains("Worker 8"));
+        container
+            .query_selector_all(".task-agent-open")
+            .unwrap()
+            .item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            query(&destination, "[role=tab][aria-selected=true] .tab-label")
+                .expect("selected destination tab")
+                .text_content()
+                .as_deref(),
+            Some("Worker 8")
+        );
+        assert_eq!(
+            query(
+                &destination,
+                "[role=tabpanel]:not([style*='display: none']) .chat-agent-name"
+            )
+            .expect("visible destination chat header")
+            .text_content()
+            .as_deref(),
+            Some("Worker 8"),
+            "navigation must select the exact agent on the source host, not an ID match on another host"
+        );
+        query(&container, ".session-task-toggle").unwrap().click();
+        next_tick().await;
+        expand_usage(&container, "Agents").await;
+        let filter = query(&container, "input[aria-label='Filter agents']")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        filter.set_value("Worker 86");
+        filter
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        query(&container, ".task-agent-open").unwrap().click();
+        next_tick().await;
+        let sent = captured_frames("spawn_agent");
+        assert_eq!(
+            sent.len(),
+            1,
+            "opening a closed row sends one explicit resume"
+        );
+        let resume: protocol::SpawnAgentPayload = serde_json::from_str(&sent[0]).unwrap();
+        assert!(
+            matches!(resume.params, protocol::SpawnAgentParams::Resume { session_id, .. } if session_id.0 == "saved-usage-session")
+        );
+        assert_eq!(
+            resume.parent_agent_id,
+            Some(AgentId("root".to_owned())),
+            "saved-child resume must retain its server-emitted parent"
+        );
+        let host = js_sys::eval("JSON.parse(window.__test_send_calls.filter(([cmd]) => cmd === 'send_host_line').at(-1)[1]).hostId").unwrap();
+        assert_eq!(host.as_string().as_deref(), Some("h-task-expanded"));
     }
 
     /// A row-level Partial scope is not an all-unavailable row: it carries the
@@ -2515,6 +3050,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
+        expand_usage(&container, "Agents").await;
         let rows = container
             .query_selector_all(".session-task-row")
             .expect("rows query");
@@ -2556,13 +3092,14 @@ mod wasm_tests {
                 reasons: vec![TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted],
             },
         };
+        rollup.backends[0].total = rollup.total.clone();
         for entry in &mut rollup.breakdown {
             entry.usage = TaskTokenUsageScope::Unavailable {
                 reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
             };
         }
         dispatch_task_usage(&state, "h-task-unavail", 0, &rollup);
-        let _handle = mount_bar(&container, state);
+        let _handle = mount_bar(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
@@ -2586,6 +3123,27 @@ mod wasm_tests {
         assert!(
             popover_text.contains("no completed turns"),
             "rows must spell out the unavailable reason, got: {popover_text}"
+        );
+        rollup.total.status = TaskTokenUsageStatus::Unavailable {
+            unavailable_count: 3,
+            reasons: vec![TaskTokenUsageUnavailableReason::SharedSessionAccounting],
+        };
+        rollup.backends[0].total = rollup.total.clone();
+        for entry in &mut rollup.breakdown {
+            entry.usage = TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting,
+            };
+        }
+        dispatch_task_usage(&state, "h-task-unavail", 1, &rollup);
+        next_tick().await;
+        let text = popover.text_content().unwrap_or_default();
+        assert!(
+            text.contains("shared session accounting cannot be attributed"),
+            "the live backend row must name shared-source ambiguity, not display a copied or zero token total"
+        );
+        assert!(
+            !text.contains("no completed turns"),
+            "same-key rows must replace stale coverage reasons"
         );
     }
 
@@ -2671,6 +3229,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
+        expand_usage(&container, "Agents").await;
         let popover = query(&container, ".session-task-popover")
             .expect("breakdown opens from a sub-agent tab too");
         let popover_text = popover.text_content().unwrap_or_default();
@@ -2848,9 +3407,9 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let capacity = query(&container, ".capacity-compact")
+        let capacity = query(&container, ".task-capacity-limits")
             .expect("the popup carries the compact capacity row");
-        let task_rows = query(&container, ".session-task-popover-rows")
+        let task_rows = query(&container, "[aria-label=\"Claude task token usage\"]")
             .expect("the popup carries the task breakdown");
 
         // Two distinct labelled regions, neither nested in the other.
@@ -2859,11 +3418,11 @@ mod wasm_tests {
         let capacity_label = capacity.get_attribute("aria-label").unwrap_or_default();
         let task_label = task_rows.get_attribute("aria-label").unwrap_or_default();
         assert!(
-            capacity_label.contains("Subscription capacity"),
+            capacity_label.contains("account limits"),
             "capacity region must name itself, got: {capacity_label}"
         );
         assert!(
-            task_label.contains("Task token usage"),
+            task_label.contains("task token usage"),
             "task region must name itself, got: {task_label}"
         );
         assert!(
@@ -2875,11 +3434,11 @@ mod wasm_tests {
         let capacity_text = capacity.text_content().unwrap_or_default();
         let task_text = task_rows.text_content().unwrap_or_default();
         assert!(
-            capacity_text.contains("82% used") && capacity_text.contains("weekly limit"),
+            capacity_text.contains("82%") && capacity_text.contains("weekly limit"),
             "capacity region shows the quota figure, got: {capacity_text}"
         );
         assert!(
-            capacity_text.contains("Subscription") && capacity_text.contains("Claude"),
+            capacity_label.contains("Claude") && capacity_label.contains("account limits"),
             "capacity region names the reporting vendor, got: {capacity_text}"
         );
         assert!(
@@ -2894,13 +3453,13 @@ mod wasm_tests {
         // The coverage caveat is text in the popup, not a hover-only tooltip:
         // Claude reports only the binding limit, and the user must be told.
         assert!(
-            capacity_text.contains("only the binding limit is reported"),
+            capacity_text.contains("Only the binding limit reported"),
             "RepresentativeBucketOnly coverage must be stated in the popup, got: {capacity_text}"
         );
 
         // Passive sources: nothing to refresh, so no refresh control.
         assert!(
-            query(&container, ".capacity-compact button").is_none(),
+            query(&container, ".task-capacity-limits button").is_none(),
             "phase 1 capacity must not offer a refresh button"
         );
     }

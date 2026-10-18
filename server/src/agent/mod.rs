@@ -17,11 +17,10 @@ use protocol::{
     MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
     QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SUPERVISOR_MESSAGE_PREFIX,
     SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues,
-    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
-    ToolRequestType,
+    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamStartData, StreamTextDeltaData,
+    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -49,6 +48,7 @@ use crate::sub_agent::HostSubAgentSpawnTx;
 pub(crate) mod customization;
 pub(crate) mod registry;
 pub(crate) mod supervisor;
+mod timing;
 
 use self::registry::{
     AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest,
@@ -95,6 +95,16 @@ const INITIAL_HISTORY_TAIL_LIMIT: usize = 15;
 // chat must not deserialize old message bodies just to discard them.
 #[derive(Default)]
 struct AgentEventLog {
+    final_usage_tx: Option<watch::Sender<Option<AgentUsageSnapshot>>>,
+    timing_context: Option<(Arc<SessionStoreHandle>, SessionId)>,
+    live_archive_start: Option<watch::Receiver<AgentStartPayload>>,
+    message_accounting: bool,
+    accounting_history_incomplete: bool,
+    accounting_storage_failed: bool,
+    timing: timing::TimingTracker,
+    own_usage: Option<(TaskTokenUsageScope, Option<String>)>,
+    native_usage: Option<ModelRequestTokenUsage>,
+    parent_session_id: Option<SessionId>,
     entries: Vec<Envelope>,
     message_starts: Vec<usize>,
     message_terminals: Vec<usize>,
@@ -378,6 +388,9 @@ enum RunningTurnRedirect {
 }
 
 enum AgentCommand {
+    MarkAccountingSessionShared {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     RecordHandoff {
         handoff: protocol::AgentHandoff,
         reply: oneshot::Sender<Result<(), String>>,
@@ -543,12 +556,7 @@ pub(crate) struct AgentActivityHistorySnapshot {
     pub active_stream_included: bool,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct AgentUsageSnapshot {
-    pub start: AgentStartPayload,
-    pub usage: TaskTokenUsageScope,
-    pub model: Option<String>,
-}
+pub(crate) use protocol::TaskAgentUsageSnapshot as AgentUsageSnapshot;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionHistoryWindow {
@@ -774,6 +782,8 @@ pub(crate) struct AgentHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
+    final_usage: watch::Receiver<Option<AgentUsageSnapshot>>,
+    close_preparing: Arc<AtomicBool>,
     moving_project: Arc<AtomicBool>,
     /// Live view of the actor's `AgentStartPayload`. Populated synchronously at
     /// handle construction and updated by the actor on name changes. Owning a
@@ -781,6 +791,22 @@ pub(crate) struct AgentHandle {
     /// without a message round-trip — which makes it structurally impossible
     /// for a stopped actor to cause the old "agent disappeared" panic.
     start: watch::Receiver<AgentStartPayload>,
+}
+
+pub(crate) struct AgentClosePreparation(Option<Arc<AtomicBool>>);
+
+impl AgentClosePreparation {
+    pub(crate) fn commit(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AgentClosePreparation {
+    fn drop(&mut self) {
+        if let Some(closing) = &self.0 {
+            closing.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 pub(crate) struct AgentProjectMoveGuard(Arc<AtomicBool>);
@@ -894,6 +920,8 @@ fn context_estimate_matches(
 
 #[derive(Debug, Default)]
 struct AgentActivityStatsTracker {
+    accounting_restore_incomplete: bool,
+    accounting_session_shared: bool,
     stats: AgentActivityStats,
     seen_tool_calls: HashSet<String>,
     token_usage_by_source: HashMap<TokenUsageSource, TaskTokenUsageScope>,
@@ -923,7 +951,25 @@ impl AgentActivityStatsTracker {
     }
 
     fn usage_snapshot(&self) -> (TaskTokenUsageScope, Option<String>) {
-        self.usage_snapshot_with_reported_usage_floor(None)
+        if self.accounting_session_shared {
+            return (
+                TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting,
+                },
+                self.latest_model.clone(),
+            );
+        }
+        let (usage, model) = self.usage_snapshot_with_reported_usage_floor(None);
+        (
+            if self.accounting_restore_incomplete {
+                usage.with_incomplete_reason(
+                    TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete,
+                )
+            } else {
+                usage
+            },
+            model,
+        )
     }
 
     fn usage_snapshot_with_reported_usage_floor(
@@ -1422,7 +1468,10 @@ fn token_usage_reason_from_task_reason(
         TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
         | TaskTokenUsageUnavailableReason::BackendDidNotReport
         | TaskTokenUsageUnavailableReason::AgentUnavailable
-        | TaskTokenUsageUnavailableReason::HelperAccountingUnavailable => {
+        | TaskTokenUsageUnavailableReason::HelperAccountingUnavailable
+        | TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete
+        | TaskTokenUsageUnavailableReason::SharedSessionAccounting
+        | TaskTokenUsageUnavailableReason::ObservationInterrupted => {
             TokenUsageUnavailableReason::BackendDidNotReport
         }
     }
@@ -1476,7 +1525,7 @@ impl AgentHandle {
     }
 
     pub async fn send_input(&self, input: AgentInput) -> bool {
-        if self.closing.load(Ordering::SeqCst) {
+        if self.is_closing() {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
@@ -1493,18 +1542,20 @@ impl AgentHandle {
         Ok(AgentProjectMoveGuard(self.moving_project.clone()))
     }
 
-    /// Whether this handle has been closed.
-    ///
-    /// Exists so a caller that just saw [`AgentHandle::send_input`] fail can
-    /// tell the user *why* rather than defaulting to "agent not running" — a
-    /// closing agent is still running, and saying otherwise sends people
-    /// looking for a crash that never happened.
-    ///
-    /// The flag is monotonic: close admission sets it before teardown and
-    /// never clears it. Reading it after a failed send is therefore not a race
-    /// — if it reads true now it was already true when the send was refused.
     pub(crate) fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+        self.closing.load(Ordering::SeqCst) || self.is_close_preparing()
+    }
+
+    pub(crate) fn is_close_preparing(&self) -> bool {
+        self.close_preparing.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn prepare_close(&self) -> Option<AgentClosePreparation> {
+        // Restart admission also sets closing; an explicit close must still win.
+        self.close_preparing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| AgentClosePreparation(Some(Arc::clone(&self.close_preparing))))
     }
 
     pub(crate) fn begin_closing(&self) {
@@ -1645,7 +1696,7 @@ impl AgentHandle {
         input: AgentInput,
         redirect: RunningTurnRedirect,
     ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
-        if self.closing.load(Ordering::SeqCst) {
+        if self.is_closing() {
             return Err(AgentDeliveryFailure::Rejected(
                 DELIVERY_REJECTED_CLOSING.to_owned(),
             ));
@@ -2013,7 +2064,24 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
+    pub(crate) fn accounting_is_settled(&self) -> bool {
+        self.actor_finished() || self.final_usage.borrow().is_some()
+    }
+
+    pub(crate) async fn mark_accounting_session_shared(&self) -> Result<(), String> {
+        let (reply, receiver) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::MarkAccountingSessionShared { reply })
+            .map_err(|_| "Accounting owner is no longer running".to_owned())?;
+        receiver
+            .await
+            .map_err(|_| "Accounting ownership acknowledgement was lost".to_owned())?
+    }
+
     pub async fn read_usage_snapshot(&self) -> Option<AgentUsageSnapshot> {
+        if self.actor_finished() {
+            return self.final_usage.borrow().clone();
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -2063,12 +2131,13 @@ impl AgentHandle {
         self.actor_status.prepare_restart().await;
     }
 
-    pub async fn stop_for_restart(&self) {
+    pub async fn stop_for_restart(&self) -> Result<AgentUsageSnapshot, String> {
         self.prepare_restart().await;
         let (reply, done) = oneshot::channel();
         if self.tx.send(AgentCommand::StopForRestart { reply }).is_ok() {
             let _ = done.await;
         }
+        self.final_usage_snapshot()
     }
 
     pub fn actor_finished(&self) -> bool {
@@ -2078,6 +2147,10 @@ impl AgentHandle {
     pub fn kill_for_restart(&self) {
         self.processes.kill_all();
         self.actor_abort.abort();
+    }
+
+    pub(crate) fn final_usage_snapshot(&self) -> Result<AgentUsageSnapshot, String> {
+        self.final_usage.borrow().clone().ok_or_else(|| "The actor ended without a final task accounting checkpoint; durable observations were not replaced".to_owned())
     }
 
     pub async fn close(&self) -> bool {
@@ -3253,6 +3326,7 @@ pub(crate) fn spawn_agent_actor(
     let closing = Arc::new(AtomicBool::new(false));
     let (startup_tx, startup_rx) = oneshot::channel();
     let (start_tx, start_rx) = watch::channel(start.clone());
+    let (final_usage_tx, final_usage) = watch::channel(None);
     let actor_tx = tx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
@@ -3261,15 +3335,7 @@ pub(crate) fn spawn_agent_actor(
     let startup_ready = tokio_util::sync::CancellationToken::new();
     let actor_startup_ready = startup_ready.clone();
     let ready_completion = actor_startup_ready.clone().drop_guard();
-    let actor_task = crate::backend::subprocess::spawn(async move {
-        let ready_completion = ready_completion;
-        actor_processes.scope(async move {
-        if let Some(admission) = startup_admission
-            && admission.await.is_err()
-        {
-            let _ = startup_tx.send(Err("Swarm startup admission was withdrawn".into()));
-            return;
-        }
+    let actor = async move {
         let ResolvedSpawnRequest {
             parent_session_id,
             restoration,
@@ -3294,9 +3360,13 @@ pub(crate) fn spawn_agent_actor(
         if (start.parent_agent_id.is_some() || parent_session_id.is_some())
             && crate::backend::capabilities_for_backend_kind(backend_kind)
                 .contains(tyde_agent_adapter::BackendCapability::UserQuestionRequests)
-            && !resolved_spawn_config.excluded_tool_categories.contains(&protocol::ToolCategory::AskUser)
+            && !resolved_spawn_config
+                .excluded_tool_categories
+                .contains(&protocol::ToolCategory::AskUser)
         {
-            resolved_spawn_config.excluded_tool_categories.push(protocol::ToolCategory::AskUser);
+            resolved_spawn_config
+                .excluded_tool_categories
+                .push(protocol::ToolCategory::AskUser);
         }
         resolved_spawn_config.assert_session_policy(startup_failure.is_some());
         let startup_mcp_servers =
@@ -3326,9 +3396,16 @@ pub(crate) fn spawn_agent_actor(
         let initial_session_settings = spawn_config.session_settings.clone();
         let compaction_spawn_config = spawn_config.clone();
         let canonical_stream = format!("/agent/{}", agent_id);
-        let mut event_log = AgentEventLog::default();
+        let mut event_log = AgentEventLog {
+            message_accounting: crate::backend::token_usage_tracking_mode(backend_kind)
+                == TokenUsageTrackingMode::Messages,
+            final_usage_tx: Some(final_usage_tx),
+            parent_session_id: parent_session_id.clone(),
+            ..Default::default()
+        };
         let mut latest_output = AgentControlLatestOutput::default();
-        let mut accepted_human_inputs = HashMap::<protocol::HumanInputId, protocol::AcceptedHumanInput>::new();
+        let mut accepted_human_inputs =
+            HashMap::<protocol::HumanInputId, protocol::AcceptedHumanInput>::new();
         let mut replay_state = AgentReplayState::default();
         let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
         let mut last_backend_event_at: Option<Instant> = None;
@@ -3336,6 +3413,7 @@ pub(crate) fn spawn_agent_actor(
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(backend_kind);
+        event_log.own_usage = Some(activity_stats.usage_snapshot());
         let mut activity_event_seq = 0_u64;
         let mut current_session_id = resume_session_id.clone();
         let mut pending_alias = initial_alias;
@@ -3358,7 +3436,10 @@ pub(crate) fn spawn_agent_actor(
             },
         );
         let resume_recovery = match resume_session_id.as_ref() {
-            Some(session_id) => session_store.get(session_id).await.and_then(|record| record.turn_recovery),
+            Some(session_id) => session_store
+                .get(session_id)
+                .await
+                .and_then(|record| record.turn_recovery),
             None => None,
         };
         let mut startup_failure = startup_failure;
@@ -3368,7 +3449,8 @@ pub(crate) fn spawn_agent_actor(
                 .await
                 .map(|record| record.queued_messages)
                 .unwrap_or_default()
-        } else if let (None, Some(first_input)) = (startup_failure.as_ref(), initial_input.as_ref()) {
+        } else if let (None, Some(first_input)) = (startup_failure.as_ref(), initial_input.as_ref())
+        {
             let reservation = startup_reservation(
                 &current_start,
                 first_input,
@@ -3393,10 +3475,14 @@ pub(crate) fn spawn_agent_actor(
             Vec::new()
         };
         #[cfg(feature = "test-support")]
-        if current_start.swarm_membership.is_some() && resume_session_id.is_none() && startup_failure.is_none()
+        if current_start.swarm_membership.is_some()
+            && resume_session_id.is_none()
+            && startup_failure.is_none()
             && let Some(gate) = &swarm_startup_test_gates.reservation
         {
-            tracing::warn!("Swarm startup boundary diagnostic: durable reservation before provider startup");
+            tracing::warn!(
+                "Swarm startup boundary diagnostic: durable reservation before provider startup"
+            );
             tokio::select! {
                 biased;
                 () = swarm_startup_test_gates.stopped.cancelled() => return,
@@ -3441,12 +3527,129 @@ pub(crate) fn spawn_agent_actor(
         );
         let starts_with_initial_turn = resume_session_id.is_none();
         let is_resume = resume_session_id.is_some();
+        if is_resume {
+            current_start.session_id = resume_session_id.clone();
+            let _ = start_tx.send(current_start.clone());
+        }
         let fork_source_session_id = fork_from_session_id.clone();
-        let resume_uses_authoritative_transcript = match resume_session_id.as_ref() {
+        let mut resume_uses_authoritative_transcript = match resume_session_id.as_ref() {
             Some(session_id) => transcript_is_authoritative(&transcript_store, session_id).await,
             None => false,
         };
 
+        let mut startup_input_rejections: Vec<AgentErrorPayload> = Vec::new();
+        let mut early_accounting_error = None;
+        let resume_message_accounting_seeded = is_resume
+            && activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::Messages;
+        if let Some(session) = resume_session_id
+            .as_ref()
+            .filter(|_| resume_message_accounting_seeded)
+        {
+            let id = session.clone();
+            match session_store
+                .read(move |store| {
+                    store
+                        .get_result(&id)?
+                        .map(|record| {
+                            (
+                                record.accounting_history_incomplete,
+                                record.task_accounting_source,
+                                record.accounting_session_shared,
+                            )
+                        })
+                        .ok_or_else(|| "Task accounting session is missing".to_owned())
+                })
+                .await
+            {
+                Ok((incomplete, source, shared)) => {
+                    activity_stats.accounting_session_shared |= shared;
+                    activity_stats.accounting_restore_incomplete |= incomplete;
+                    resume_uses_authoritative_transcript |= source
+                        == Some(crate::store::session::TaskAccountingSource::CanonicalMessages);
+                }
+                Err(error) => {
+                    activity_stats.accounting_restore_incomplete = true;
+                    early_accounting_error = Some(error);
+                }
+            }
+            if let Err(error) = seed_existing_transcript_history(
+                &transcript_store,
+                session,
+                &canonical_stream,
+                &mut event_log,
+                Some((&mut activity_stats, &mut activity_event_seq)),
+                false,
+            )
+            .await
+            {
+                tracing::error!(
+                    error_bytes = error.len(),
+                    "canonical task accounting was unavailable before backend startup"
+                );
+                activity_stats.accounting_restore_incomplete = true;
+                if let Err(error) = session_store
+                    .update(session, |record| {
+                        record.accounting_history_incomplete = true
+                    })
+                    .await
+                {
+                    early_accounting_error = Some(error);
+                }
+                startup_input_rejections.push(AgentErrorPayload { agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal, fatal: false, message: "Saved task accounting is incomplete or unreadable; historical coverage cannot be certified complete.".to_owned() });
+            }
+            event_log.own_usage = Some(activity_stats.usage_snapshot());
+        }
+        if is_resume
+            && activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests
+        {
+            let session = resume_session_id
+                .clone()
+                .expect("resume accounting session");
+            match session_store
+                .read(move |store| {
+                    store
+                        .get_result(&session)?
+                        .map(|record| {
+                            (
+                                record.model_request_usage,
+                                record.accounting_history_incomplete,
+                                record.accounting_session_shared,
+                            )
+                        })
+                        .ok_or_else(|| "Native task accounting session is missing".to_owned())
+                })
+                .await
+            {
+                Ok((Some(mut usage), incomplete, shared)) => {
+                    activity_stats.accounting_session_shared |= shared;
+                    activity_stats.accounting_restore_incomplete |= incomplete;
+                    usage.current_context_usage = None;
+                    usage.estimated_context_breakdown = None;
+                    event_log.native_usage = Some(usage.clone());
+                    activity_stats.observe_model_request_token_usage(usage, activity_event_seq);
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                }
+                Ok((None, incomplete, shared)) => {
+                    activity_stats.accounting_session_shared |= shared;
+                    activity_stats.accounting_restore_incomplete |= incomplete;
+                }
+                Err(error) => {
+                    early_accounting_error = Some(error.clone());
+                    tracing::error!(
+                        error_bytes = error.len(),
+                        "model-request accounting restore failed"
+                    );
+                    startup_input_rejections.push(AgentErrorPayload {
+                        agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal, fatal: false,
+                        message: "Stored task accounting could not be loaded; usage coverage is unavailable.".to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(session) = resume_session_id.as_ref() {
+            event_log.timing.restore(&session_store, session).await;
+            event_log.own_usage = Some(activity_stats.usage_snapshot());
+        }
         #[cfg(feature = "test-support")]
         let startup_gate_name = current_start.name.clone();
         let _restoration_guard = restoration.as_ref().map(|admission| {
@@ -3461,7 +3664,16 @@ pub(crate) fn spawn_agent_actor(
         #[cfg(feature = "test-support")]
         let startup_cancellation_supported = startup_cancellation_supported
             && !startup_is_non_cancellable_for_test(&startup_gate_name);
+        let mut startup_admission_waiting = startup_admission.is_some();
+        let startup_admission_changed = tokio_util::sync::CancellationToken::new();
         let mut startup_future = Box::pin(async {
+            if let Some(admission) = startup_admission {
+                let admitted = admission.await;
+                startup_admission_changed.cancel();
+                admitted.map_err(|_| {
+                    AgentStartupFailure::internal("Swarm startup admission was withdrawn")
+                })?;
+            }
             // A restored parent must not resume until its restored children
             // have settled, so their continuations reach the provider first.
             let restored_startup_timeout = match restoration.as_ref() {
@@ -3477,98 +3689,104 @@ pub(crate) fn spawn_agent_actor(
             let restored_startup_timeout =
                 restored_startup_timeout.filter(|_| startup_cancellation_supported);
             let startup = async {
-            #[cfg(feature = "test-support")]
-            wait_for_startup_completion_test_gate(&startup_gate_name).await;
-            if let Some(admission) = review_startup_admission && admission.await.is_err() {
-                return Err(AgentStartupFailure::internal("Review startup admission was withdrawn".to_owned()));
-            }
-            let mcp_config_validation = if use_mock_backend {
-                Ok(())
-            } else {
-                validate_startup_mcp_configuration(&spawn_config.startup_mcp_servers).await
-            };
-            eprintln!(
-                "TYDE MCP CONFIG VALIDATION agent={} result={:?}",
-                agent_id, mcp_config_validation
-            );
-            let startup_result: Result<
-                (
-                    BackendHandle,
-                    EventStream,
-                    SessionId,
-                    Option<SendMessagePayload>,
-                ),
-                AgentStartupFailure,
-            > = if let Err(error) = mcp_config_validation {
-                Err(AgentStartupFailure::backend_failed(error))
-            } else if let Some(err) = startup_failure {
-                Err(err)
-            } else {
-                let launch_config = BackendSpawnConfig {
-                    mock_launch,
-                    ..spawn_config
+                #[cfg(feature = "test-support")]
+                wait_for_startup_completion_test_gate(&startup_gate_name).await;
+                if let Some(admission) = review_startup_admission
+                    && admission.await.is_err()
+                {
+                    return Err(AgentStartupFailure::internal(
+                        "Review startup admission was withdrawn".to_owned(),
+                    ));
+                }
+                let mcp_config_validation = if use_mock_backend {
+                    Ok(())
+                } else {
+                    validate_startup_mcp_configuration(&spawn_config.startup_mcp_servers).await
                 };
-                match resume_session_id {
-                    Some(session_id) => {
-                        let resumed = resume_backend(
-                            use_mock_backend,
-                            backend_kind,
-                            workspace_roots.clone(),
-                            launch_config,
-                            session_id.clone(),
-                        )
-                        .await;
-                        resumed
-                            .map(|(backend, events)| (backend, events, session_id, initial_input))
-                            .map_err(AgentStartupFailure::backend_failed)
-                    }
-                    None => {
-                        if let Err(failure) =
-                            admit_initial_turn(&status_handle, &initial_turn_admitted).await
-                        {
-                            Err(failure)
-                        } else if let Some(from_session_id) = fork_from_session_id {
-                            let first_input =
-                                initial_input.expect("fork spawn requires initial_input");
-                            let forked = fork_backend(
+                eprintln!(
+                    "TYDE MCP CONFIG VALIDATION agent={} result={:?}",
+                    agent_id, mcp_config_validation
+                );
+                let startup_result: Result<
+                    (
+                        BackendHandle,
+                        EventStream,
+                        SessionId,
+                        Option<SendMessagePayload>,
+                    ),
+                    AgentStartupFailure,
+                > = if let Err(error) = mcp_config_validation {
+                    Err(AgentStartupFailure::backend_failed(error))
+                } else if let Some(err) = startup_failure {
+                    Err(err)
+                } else {
+                    let launch_config = BackendSpawnConfig {
+                        mock_launch,
+                        ..spawn_config
+                    };
+                    match resume_session_id {
+                        Some(session_id) => {
+                            let resumed = resume_backend(
                                 use_mock_backend,
                                 backend_kind,
                                 workspace_roots.clone(),
                                 launch_config,
-                                from_session_id,
-                                first_input,
+                                session_id.clone(),
                             )
                             .await;
-                            forked
-                                .map(|(backend, events, session_id)| {
-                                    (backend, events, session_id, None)
-                                })
-                                .map_err(AgentStartupFailure::from)
-                        } else {
-                            let first_input =
-                                initial_input.expect("new spawn requires initial_input");
-                            let spawned = spawn_backend(
-                                use_mock_backend,
-                                backend_kind,
-                                workspace_roots.clone(),
-                                launch_config,
-                                first_input,
-                            )
-                            .await;
-                            spawned
-                                .map(|(backend, events, session_id)| {
-                                    (backend, events, session_id, None)
+                            resumed
+                                .map(|(backend, events)| {
+                                    (backend, events, session_id, initial_input)
                                 })
                                 .map_err(AgentStartupFailure::backend_failed)
                         }
+                        None => {
+                            if let Err(failure) =
+                                admit_initial_turn(&status_handle, &initial_turn_admitted).await
+                            {
+                                Err(failure)
+                            } else if let Some(from_session_id) = fork_from_session_id {
+                                let first_input =
+                                    initial_input.expect("fork spawn requires initial_input");
+                                let forked = fork_backend(
+                                    use_mock_backend,
+                                    backend_kind,
+                                    workspace_roots.clone(),
+                                    launch_config,
+                                    from_session_id,
+                                    first_input,
+                                )
+                                .await;
+                                forked
+                                    .map(|(backend, events, session_id)| {
+                                        (backend, events, session_id, None)
+                                    })
+                                    .map_err(AgentStartupFailure::from)
+                            } else {
+                                let first_input =
+                                    initial_input.expect("new spawn requires initial_input");
+                                let spawned = spawn_backend(
+                                    use_mock_backend,
+                                    backend_kind,
+                                    workspace_roots.clone(),
+                                    launch_config,
+                                    first_input,
+                                )
+                                .await;
+                                spawned
+                                    .map(|(backend, events, session_id)| {
+                                        (backend, events, session_id, None)
+                                    })
+                                    .map_err(AgentStartupFailure::backend_failed)
+                            }
+                        }
                     }
+                };
+                #[cfg(feature = "test-support")]
+                if startup_result.is_ok() {
+                    wait_for_startup_backend_ready_test_gate(&startup_gate_name).await;
                 }
-            };
-            #[cfg(feature = "test-support")]
-            if startup_result.is_ok() {
-                wait_for_startup_backend_ready_test_gate(&startup_gate_name).await;
-            }
-            startup_result
+                startup_result
             };
             // A restored agent's parent waits for it to settle, so its startup
             // must end within the bound instead of holding the parent forever.
@@ -3591,7 +3809,7 @@ pub(crate) fn spawn_agent_actor(
         let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
         let mut restart_deferred = false;
         let mut deferred_restart_stop: Option<oneshot::Sender<()>> = None;
-        let mut startup_input_rejections: Vec<AgentErrorPayload> = Vec::new();
+
         let startup_result = loop {
             let startup_event = tokio::select! {
                 biased;
@@ -3602,14 +3820,18 @@ pub(crate) fn spawn_agent_actor(
                     }
                     tracing::info!("stopping backend startup for host restart");
                     let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
+                    publish_final_usage(&current_start, &mut event_log);
                     return;
                 }
+                () = startup_admission_changed.cancelled(), if startup_admission_waiting => {
+                    startup_admission_waiting = false;
+                    continue;
+                }
                 event = next_agent_startup_event(
-                    startup_future.as_mut(), &mut rx, startup_cancellation_supported,
+                    startup_future.as_mut(), &mut rx, startup_cancellation_supported || startup_admission_waiting,
                 ) => event,
             };
-            match startup_event
-            {
+            match startup_event {
                 AgentStartupEvent::Completed(result) => break result,
                 AgentStartupEvent::Command(command) => {
                     let Some(command) = *command else {
@@ -3621,7 +3843,6 @@ pub(crate) fn spawn_agent_actor(
                                 reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
                         }
                         AgentCommand::Interrupt { reply } => {
-
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
                                 ?backend_kind,
@@ -3639,7 +3860,17 @@ pub(crate) fn spawn_agent_actor(
                                 continue;
                             }
                             let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
-                            let _ = reply.send(());
+                            finish_actor_close(
+                                &accepting_input_task,
+                                &status_handle,
+                                Some(reply),
+                                ActorFinish::StopForRestart,
+                                ActorUsageFinalization {
+                                    start: &current_start,
+                                    event_log: &mut event_log,
+                                },
+                            )
+                            .await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -3662,10 +3893,16 @@ pub(crate) fn spawn_agent_actor(
                                 })
                                 .await;
                             flush_pending_agent_attaches(
-                                &event_log, Some(&replay_state), &mut latest_output,
-                                latest_slash_commands.as_ref(), &mut subscribers,
-                                &mut pending_startup_attaches, &status_handle,
-                            ).await;
+                                &event_log,
+                                Some(&replay_state),
+                                &mut latest_output,
+                                latest_slash_commands.as_ref(),
+                                &mut subscribers,
+                                &mut pending_startup_attaches,
+                                &status_handle,
+                            )
+                            .await;
+                            publish_final_usage(&current_start, &mut event_log);
                             let _ = reply.send(());
                             let _ = startup_tx.send(Err("agent startup closed".to_owned()));
                             return;
@@ -3701,21 +3938,30 @@ pub(crate) fn spawn_agent_actor(
                                 active_stream_included: false,
                             });
                         }
+                        AgentCommand::MarkAccountingSessionShared { reply } => {
+                            activity_stats.accounting_session_shared = true;
+                            event_log.own_usage = Some(activity_stats.usage_snapshot());
+                            let _ = reply.send(Ok(()));
+                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
+                                &event_log,
                             ));
                         }
                         AgentCommand::ScheduleProjectMove { reply, .. } => {
-                            let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned()));
+                            let _ = reply.send(Err(
+                                "This agent cannot enter another project in its current state"
+                                    .to_owned(),
+                            ));
                         }
                         AgentCommand::MoveToProject { reply, .. } => {
                             let _ = reply.send(Err(
                                 "Wait until the agent is ready before moving it".to_owned(),
                             ));
                         }
-            AgentCommand::SetTydePermissions { reply, .. } => {
+                        AgentCommand::SetTydePermissions { reply, .. } => {
                             let _ = reply.send(Err("Wait until the agent has started before changing its Tyde permissions".to_owned()));
                         }
                         AgentCommand::RecordHandoff { reply, .. } => {
@@ -3778,11 +4024,21 @@ pub(crate) fn spawn_agent_actor(
                                 ),
                             }
                         }
-                        AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
-                        AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
-                        AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
-                        AgentCommand::DeliverMessage { input, redirect, human, reply } => {
-
+                        AgentCommand::TychatDeliver { reply, .. } => {
+                            let _ = reply.send(Err("Tychat agent is starting".into()));
+                        }
+                        AgentCommand::TychatSettings { reply, .. } => {
+                            let _ = reply.send(Err("Tychat agent is starting".into()));
+                        }
+                        AgentCommand::TychatSend { reply, .. } => {
+                            let _ = reply.send(Err("Tychat agent is starting".into()));
+                        }
+                        AgentCommand::DeliverMessage {
+                            input,
+                            redirect,
+                            human,
+                            reply,
+                        } => {
                             if matches!(
                                 redirect,
                                 RunningTurnRedirect::IdleOnly | RunningTurnRedirect::SwarmWake
@@ -3790,7 +4046,16 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
-                            let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
+                            let Some(reply) = prepare_delivery_ack(
+                                reply,
+                                human,
+                                &input,
+                                &current_start,
+                                latest_output.output(),
+                                &mut accepted_human_inputs,
+                            ) else {
+                                continue;
+                            };
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
@@ -3814,7 +4079,9 @@ pub(crate) fn spawn_agent_actor(
                                     let _ = reply.send(Ok(()));
                                 }
                                 Err(_) => {
-                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_UNRECORDED.to_owned())));
+                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                                        DELIVERY_REJECTED_UNRECORDED.to_owned(),
+                                    )));
                                 }
                             }
                         }
@@ -3868,22 +4135,22 @@ pub(crate) fn spawn_agent_actor(
                     &current_start,
                 )
                 .await;
-            for rejection in startup_input_rejections.drain(..) {
-                append_event(
-                    &canonical_stream,
-                    &mut event_log,
-                    &mut subscribers,
-                    FrameKind::AgentError,
-                    &rejection,
-                )
-                .await;
-            }
+                for rejection in startup_input_rejections.drain(..) {
+                    append_event(
+                        &canonical_stream,
+                        &mut event_log,
+                        &mut subscribers,
+                        FrameKind::AgentError,
+                        &rejection,
+                    )
+                    .await;
+                }
                 upsert_activity_stats_snapshot(
                     &canonical_stream,
                     &mut event_log,
                     &mut subscribers,
                     &current_start.agent_id,
-                    activity_stats.snapshot(),
+                    &activity_stats,
                 )
                 .await;
                 // A failed agent accepts no settings edits, so it has no
@@ -3959,7 +4226,10 @@ pub(crate) fn spawn_agent_actor(
         // True while tychat_send_message is the agent's latest tool call this
         // turn; only then does it replace the automatic final reply.
         let mut tychat_final_covered = false;
-        let mut tychat_handoff: Option<(protocol::TychatOwnerMessage, oneshot::Sender<Result<protocol::TychatDeliveryReceipt, String>>)> = None;
+        let mut tychat_handoff: Option<(
+            protocol::TychatOwnerMessage,
+            oneshot::Sender<Result<protocol::TychatDeliveryReceipt, String>>,
+        )> = None;
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
@@ -4016,6 +4286,7 @@ pub(crate) fn spawn_agent_actor(
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = is_resume;
+        let mut replay_model_request_checkpoint = None;
         let mut deferred_resume_events = VecDeque::new();
         let mut resume_replay_boundary: Option<Result<(), String>> = None;
         let mut resume_live_turn_seen = false;
@@ -4036,43 +4307,93 @@ pub(crate) fn spawn_agent_actor(
         {
             Ok(restore_state) => restore_state,
             Err(err) => {
-                if current_start.swarm_membership.is_some() {
-                    tracing::error!("Failed to persist owned swarm session startup state; activation stopped");
-                    if let Some(backend) = backend.take() {
-                        backend.shutdown().await;
-                    }
-                    let payload = AgentErrorPayload {
-                        agent_id: current_start.agent_id.clone(),
-                        code: AgentErrorCode::Internal,
-                        message: format!("Cannot persist swarm session ownership: {err}"),
-                        fatal: true,
-                    };
-                    append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentStart, &current_start).await;
-                    append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &payload).await;
-                    status_handle.update(|status| {
+                if let Some(backend) = backend.take() {
+                    backend.shutdown().await;
+                }
+                current_start.session_id = None;
+                let _ = start_tx.send(current_start.clone());
+                let message = if current_start.swarm_membership.is_some() {
+                    format!("Cannot persist swarm session ownership: {err}")
+                } else {
+                    format!("Cannot persist agent session ownership: {err}")
+                };
+                let payload = AgentErrorPayload {
+                    agent_id: current_start.agent_id.clone(),
+                    code: AgentErrorCode::Internal,
+                    message,
+                    fatal: true,
+                };
+                append_event(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    FrameKind::AgentStart,
+                    &current_start,
+                )
+                .await;
+                append_event(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    FrameKind::AgentError,
+                    &payload,
+                )
+                .await;
+                status_handle
+                    .update(|status| {
                         status.terminated = true;
                         status.is_thinking = false;
                         status.turn_completed = true;
                         status.last_error = Some(payload.message.clone());
                         status.activity_counter = status.activity_counter.saturating_add(1);
-                    }).await;
-                    let _ = startup_tx.send(Err(payload.message));
-                    return;
-                }
-                tracing::error!(
-                    agent_id = %current_start.agent_id,
-                    session_id = %actor_session_id,
-                    error = %err,
-                    "failed to persist agent session startup state"
-                );
-                None
+                    })
+                    .await;
+                let _ = startup_tx.send(Err(payload.message));
+                actor_startup_ready.cancel();
+                pending_resume_attaches.append(&mut pending_startup_attaches);
+                upsert_activity_stats_snapshot(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    &current_start.agent_id,
+                    &activity_stats,
+                )
+                .await;
+                flush_pending_agent_attaches(
+                    &event_log,
+                    Some(&replay_state),
+                    &mut latest_output,
+                    latest_slash_commands.as_ref(),
+                    &mut subscribers,
+                    &mut pending_resume_attaches,
+                    &status_handle,
+                )
+                .await;
+                park_terminal_agent(
+                    &session_store,
+                    &transcript_store,
+                    None,
+                    &mut pending_alias,
+                    &mut current_start,
+                    &start_tx,
+                    &mut event_log,
+                    &mut latest_output,
+                    &mut subscribers,
+                    &mut pending_inputs,
+                    &mut rx,
+                    &status_handle,
+                )
+                .await;
+                return;
             }
         };
         #[cfg(feature = "test-support")]
         if current_start.swarm_membership.is_some()
             && let Some(gate) = &swarm_startup_test_gates.session
         {
-            tracing::warn!("Swarm startup boundary diagnostic: owned session persisted before swarm completion");
+            tracing::warn!(
+                "Swarm startup boundary diagnostic: owned session persisted before swarm completion"
+            );
             tokio::select! {
                 biased;
                 () = swarm_startup_test_gates.stopped.cancelled() => return,
@@ -4089,6 +4410,13 @@ pub(crate) fn spawn_agent_actor(
                 restore_state,
             )
             .await;
+        if !is_resume {
+            event_log
+                .timing
+                .restore(&session_store, &actor_session_id)
+                .await;
+        }
+        event_log.timing_context = Some((Arc::clone(&session_store), actor_session_id.clone()));
         let mut persisted_resume_task_list = if is_resume {
             session_store.get_task_list(&actor_session_id).await
         } else {
@@ -4140,20 +4468,58 @@ pub(crate) fn spawn_agent_actor(
             )
             .await;
         }
+        let mut accounting_coverage_error = early_accounting_error;
+        if is_resume && activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::Messages
+        {
+            let session = actor_session_id.clone();
+            match session_store
+                .read(move |store| {
+                    store
+                        .get_result(&session)?
+                        .map(|record| record.accounting_history_incomplete)
+                        .ok_or_else(|| "Task accounting session is missing".to_owned())
+                })
+                .await
+            {
+                Ok(incomplete) => activity_stats.accounting_restore_incomplete |= incomplete,
+                Err(error) => {
+                    activity_stats.accounting_restore_incomplete = true;
+                    accounting_coverage_error = Some(error);
+                }
+            }
+        }
         if resume_uses_authoritative_transcript
             && let Err(error) = seed_existing_transcript_history(
                 &transcript_store,
                 &actor_session_id,
                 &canonical_stream,
                 &mut event_log,
+                None,
+                true,
             )
             .await
         {
             tracing::error!(
-                session_id = %actor_session_id,
-                %error,
+                error_bytes = error.len(),
                 "failed to seed authoritative resume transcript"
             );
+            if activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::Messages {
+                activity_stats.accounting_restore_incomplete = true;
+                if let Err(error) = session_store
+                    .update(&actor_session_id, |record| {
+                        record.accounting_history_incomplete = true
+                    })
+                    .await
+                {
+                    accounting_coverage_error = Some(error);
+                }
+            }
+            append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &AgentErrorPayload {
+                agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal, fatal: false,
+                message: if activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::Messages {
+                    "Saved task accounting is incomplete or unreadable; historical coverage cannot be certified complete.".to_owned()
+                } else { "Saved chat history is incomplete or unreadable. Native task counters are reported separately.".to_owned() },
+            }).await;
         }
         if let Some(source_session_id) = fork_source_session_id.as_ref()
             && let Err(error) = seed_fork_transcript_history(
@@ -4172,12 +4538,74 @@ pub(crate) fn spawn_agent_actor(
                 "failed to seed fork transcript history"
             );
         }
+        if let Some(error) = accounting_coverage_error {
+            tracing::error!(
+                error_bytes = error.len(),
+                "Task accounting coverage storage failed; stopping resume"
+            );
+            if let Some(backend) = backend.take() {
+                backend.shutdown().await;
+            }
+            let payload = AgentErrorPayload { agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal, fatal: true,
+                message: "Cannot load or save task accounting coverage. Resolve the session storage error before resuming work.".to_owned() };
+            append_event(
+                &canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                FrameKind::AgentError,
+                &payload,
+            )
+            .await;
+            status_handle
+                .update(|status| {
+                    status.terminated = true;
+                    status.is_thinking = false;
+                    status.turn_completed = true;
+                    status.last_error = Some(payload.message.clone());
+                    status.activity_counter = status.activity_counter.saturating_add(1);
+                })
+                .await;
+            upsert_activity_stats_snapshot(
+                &canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &current_start.agent_id,
+                &activity_stats,
+            )
+            .await;
+            flush_pending_agent_attaches(
+                &event_log,
+                Some(&replay_state),
+                &mut latest_output,
+                latest_slash_commands.as_ref(),
+                &mut subscribers,
+                &mut pending_resume_attaches,
+                &status_handle,
+            )
+            .await;
+            park_terminal_agent(
+                &session_store,
+                &transcript_store,
+                current_session_id.as_ref(),
+                &mut pending_alias,
+                &mut current_start,
+                &start_tx,
+                &mut event_log,
+                &mut latest_output,
+                &mut subscribers,
+                &mut pending_inputs,
+                &mut rx,
+                &status_handle,
+            )
+            .await;
+            return;
+        }
         upsert_activity_stats_snapshot(
             &canonical_stream,
             &mut event_log,
             &mut subscribers,
             &current_start.agent_id,
-            activity_stats.snapshot(),
+            &activity_stats,
         )
         .await;
         let backend_capability = backend
@@ -4275,9 +4703,7 @@ pub(crate) fn spawn_agent_actor(
         {
             pending_inputs.push_back(AgentInput::SendMessage(input));
         }
-        if !resume_replay_gate_pending
-            && let Some(input) = initial_follow_up.take()
-        {
+        if !resume_replay_gate_pending && let Some(input) = initial_follow_up.take() {
             match send_initial_follow_up_or_park(
                 input,
                 InitialFollowUpContext {
@@ -4327,12 +4753,48 @@ pub(crate) fn spawn_agent_actor(
         )>();
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
-            if scheduled_project_move.is_some() && !project_move_waiting_for_backend
+            if event_log.accounting_storage_failed {
+                if let Some(backend) = backend.take() {
+                    backend.shutdown().await;
+                }
+                status_handle
+                    .update(|status| {
+                        status.terminated = true;
+                        status.is_thinking = false;
+                        status.turn_completed = true;
+                        status.activity_counter = status.activity_counter.saturating_add(1);
+                    })
+                    .await;
+                park_terminal_agent(
+                    &session_store,
+                    &transcript_store,
+                    current_session_id.as_ref(),
+                    &mut pending_alias,
+                    &mut current_start,
+                    &start_tx,
+                    &mut event_log,
+                    &mut latest_output,
+                    &mut subscribers,
+                    &mut pending_inputs,
+                    &mut rx,
+                    &status_handle,
+                )
+                .await;
+                return;
+            }
+            if scheduled_project_move.is_some()
+                && !project_move_waiting_for_backend
                 && matches!(lifecycle, ActorLifecycle::Running)
-                && !in_turn && !backend_typing && !compaction_blocked && active_compaction.is_none()
-                && context_compaction.is_none() && !resume_replay_gate_pending
-                && pending_tool_response_ids.is_empty() && open_tool_call_ids.is_empty()
-                && !status_handle.snapshot().await.has_background_work {
+                && !in_turn
+                && !backend_typing
+                && !compaction_blocked
+                && active_compaction.is_none()
+                && context_compaction.is_none()
+                && !resume_replay_gate_pending
+                && pending_tool_response_ids.is_empty()
+                && open_tool_call_ids.is_empty()
+                && !status_handle.snapshot().await.has_background_work
+            {
                 let movement = match scheduled_project_move.take() {
                     Some(movement) => movement,
                     None => continue,
@@ -4344,51 +4806,88 @@ pub(crate) fn spawn_agent_actor(
                 let roots = match movement.project_id.as_ref() {
                     Some(id) => {
                         let store = movement.project_store.lock().await;
-                        store.get(id)
-                            .ok_or_else(|| ProjectMoveFailure::Rejected("Destination project was removed before entry".to_owned()))
-                            .and_then(|project| crate::backend::validate_local_workspace_roots(
-                                project.root_paths().into_iter().map(|root| root.0).collect())
-                                .map_err(ProjectMoveFailure::Rejected))
+                        store
+                            .get(id)
+                            .ok_or_else(|| {
+                                ProjectMoveFailure::Rejected(
+                                    "Destination project was removed before entry".to_owned(),
+                                )
+                            })
+                            .and_then(|project| {
+                                crate::backend::validate_local_workspace_roots(
+                                    project
+                                        .root_paths()
+                                        .into_iter()
+                                        .map(|root| root.0)
+                                        .collect(),
+                                )
+                                .map_err(ProjectMoveFailure::Rejected)
+                            })
                     }
                     None => Ok(current_start.workspace_roots.clone()),
                 };
                 let result = match roots {
-                    Ok(roots) => apply_agent_project_move(AgentProjectMoveContext {
-                        backend: backend.as_mut().expect("running actor has backend"),
-                        session_store: &session_store,
-                        session_id: current_session_id.as_ref(),
-                        current_start: &mut current_start,
-                        start_tx: &start_tx,
-                        event_log: &mut event_log,
-                        workspace_emitter: &workspace_emitter,
-                    }, movement.project_id.clone(), roots).await,
+                    Ok(roots) => {
+                        apply_agent_project_move(
+                            AgentProjectMoveContext {
+                                backend: backend.as_mut().expect("running actor has backend"),
+                                session_store: &session_store,
+                                session_id: current_session_id.as_ref(),
+                                current_start: &mut current_start,
+                                start_tx: &start_tx,
+                                event_log: &mut event_log,
+                                workspace_emitter: &workspace_emitter,
+                            },
+                            movement.project_id.clone(),
+                            roots,
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 };
                 drop(parent_guard);
                 let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
                 match result {
                     Err(ProjectMoveFailure::Busy) => {
-                        tracing::info!("Keeping scheduled project entry pending until backend work settles");
+                        tracing::info!(
+                            "Keeping scheduled project entry pending until backend work settles"
+                        );
                         scheduled_project_move = Some(movement);
                         project_move_waiting_for_backend = true;
                     }
                     Ok(start) => {
                         drop(movement.guard);
-                        broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
+                        broadcast_live_event(
+                            &mut subscribers,
+                            FrameKind::AgentProjectChanged,
+                            &start,
+                        )
+                        .await;
                         pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                             message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
                                 movement.project_id.as_ref().map_or_else(|| "Home (no project)".to_owned(), ToString::to_string), current_start.workspace_roots.join(", ")),
                             images: None, origin: Some(MessageOrigin::System), tool_response: None,
                         }));
                     }
-                    Err(ProjectMoveFailure::Rejected(message) | ProjectMoveFailure::Unreconciled(message)) => {
+                    Err(
+                        ProjectMoveFailure::Rejected(message)
+                        | ProjectMoveFailure::Unreconciled(message),
+                    ) => {
                         drop(movement.guard);
                         tracing::error!(fatal, "Scheduled project entry failed");
-                        append_event(&canonical_stream, &mut event_log, &mut subscribers,
-                            FrameKind::AgentError, &AgentErrorPayload {
-                                agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal,
-                                message, fatal,
-                            }).await;
+                        append_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            FrameKind::AgentError,
+                            &AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(),
+                                code: AgentErrorCode::Internal,
+                                message,
+                                fatal,
+                            },
+                        )
+                        .await;
                         if fatal {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             lifecycle = ActorLifecycle::Closing;
@@ -4800,7 +5299,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut event_log,
                     &mut subscribers,
                     &current_start.agent_id,
-                    activity_stats.snapshot(),
+                    &activity_stats,
                 )
                 .await;
             }
@@ -5198,6 +5697,7 @@ pub(crate) fn spawn_agent_actor(
                 } => {
                     project_move_waiting_for_backend = false;
                     let Some(event) = maybe_event else {
+                        event_log.timing.interrupt();
                         if let Some(compaction) = active_compaction.take() {
                             let _ = compaction
                                 .reply
@@ -5344,7 +5844,7 @@ pub(crate) fn spawn_agent_actor(
                                 "agent closed",
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                             return;
                         }
                         let payload = AgentErrorPayload {
@@ -5429,15 +5929,10 @@ pub(crate) fn spawn_agent_actor(
                                 ingest_gated_replay_event(
                                     &mut event,
                                     &canonical_stream,
-                                    &current_start.agent_id,
                                     &mut event_log,
-                                    &mut subscribers,
                                     &mut replay_state,
-                                    &mut activity_stats,
                                     &mut active_stream_text,
-                                    &mut activity_event_seq,
-                                )
-                                .await;
+                                );
                             }
                             if resume_replay_boundary.is_none()
                                 && result.is_ok()
@@ -5459,6 +5954,9 @@ pub(crate) fn spawn_agent_actor(
                                 in_turn,
                                 "resume replay boundary reached in backend stream order"
                             );
+                            if result.is_ok() && let Some(usage) = replay_model_request_checkpoint.take() {
+                                persist_model_request_checkpoint(&session_store, &actor_session_id, usage, &current_start.agent_id, &canonical_stream, &mut event_log, &mut subscribers).await;
+                            }
                             resume_replay_gate_pending = false;
                             actor_startup_ready.cancel();
                             match result {
@@ -5922,13 +6420,21 @@ pub(crate) fn spawn_agent_actor(
                         BackendEvent::ModelRequestTokenUsage(usage) => {
                             let source_seq = activity_event_seq;
                             activity_event_seq = activity_event_seq.saturating_add(1);
-                            if activity_stats.observe_model_request_token_usage(usage, source_seq) {
+                            if observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| stats.observe_model_request_token_usage(usage.clone(), source_seq)) {
+                                if activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+                                    if resume_replay_gate_pending {
+                                        replay_model_request_checkpoint = Some(usage);
+                                    } else {
+                                        persist_model_request_checkpoint(&session_store, &actor_session_id, usage, &current_start.agent_id, &canonical_stream, &mut event_log, &mut subscribers).await;
+                                    }
+                                }
+                                status_handle.update(|status| status.activity_counter = status.activity_counter.saturating_add(1)).await;
                                 upsert_activity_stats_snapshot(
                                     &canonical_stream,
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
-                                    activity_stats.snapshot(),
+                                    &activity_stats,
                                 )
                                 .await;
                             }
@@ -6028,7 +6534,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
-                                    activity_stats.snapshot(),
+                                    &activity_stats,
                                 )
                                 .await;
                             }
@@ -6085,17 +6591,12 @@ pub(crate) fn spawn_agent_actor(
                     if resume_replay_gate_pending && resume_replay_boundary.is_none() {
                         if !resume_uses_authoritative_transcript {
                             ingest_gated_replay_event(
-                                &mut event,
-                                &canonical_stream,
-                                &current_start.agent_id,
-                                &mut event_log,
-                                &mut subscribers,
-                                &mut replay_state,
-                                &mut activity_stats,
-                                &mut active_stream_text,
-                                &mut activity_event_seq,
-                            )
-                            .await;
+                                    &mut event,
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut replay_state,
+                                    &mut active_stream_text,
+                                );
                         }
                         continue;
                     }
@@ -6406,17 +6907,13 @@ pub(crate) fn spawn_agent_actor(
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_chat_event(
-                        &mut event,
-                        source_seq,
-                        &active_stream_text,
-                    ) {
+                    if observe_actor_chat(&mut activity_stats, &mut event_log, &mut event, source_seq, &active_stream_text) {
                         upsert_activity_stats_snapshot(
                             &canonical_stream,
                             &mut event_log,
                             &mut subscribers,
                             &current_start.agent_id,
-                            activity_stats.snapshot(),
+                            &activity_stats,
                         )
                         .await;
                     }
@@ -6516,7 +7013,7 @@ pub(crate) fn spawn_agent_actor(
                             "agent closed",
                         )
                         .await;
-                        finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                        finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                         return;
                     }
 
@@ -9577,10 +10074,16 @@ pub(crate) fn spawn_agent_actor(
                                 max_bytes,
                             ));
                         }
+                        AgentCommand::MarkAccountingSessionShared { reply } => {
+                            activity_stats.accounting_session_shared = true;
+                            event_log.own_usage = Some(activity_stats.usage_snapshot());
+                            let _ = reply.send(Ok(()));
+                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
+                                &event_log,
                             ));
                         }
                         AgentCommand::CancelBackgroundTask {
@@ -9849,7 +10352,7 @@ pub(crate) fn spawn_agent_actor(
                                 UNKNOWN_TOOL_OUTCOME_MESSAGE,
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -9937,7 +10440,7 @@ pub(crate) fn spawn_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
-                                finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                                finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                                 return;
                             }
                             // Closing a busy agent has to end its turn, not
@@ -10016,12 +10519,19 @@ pub(crate) fn spawn_agent_actor(
                         "agent closed",
                     )
                     .await;
-                    finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
+                    finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                     return;
                 }
             }
         }
-    }).await;
+    };
+    tracing::debug!(
+        actor_future_bytes = std::mem::size_of_val(&actor),
+        "heap-owning agent state before process scope and runtime submission"
+    );
+    let actor = Box::pin(actor);
+    let actor_task = crate::backend::subprocess::spawn(async move {
+        actor_processes.scope(actor).await;
         drop(ready_completion);
     });
 
@@ -10034,6 +10544,8 @@ pub(crate) fn spawn_agent_actor(
             tx,
             accepting_input,
             closing,
+            final_usage,
+            close_preparing: Arc::new(AtomicBool::new(false)),
             moving_project: Arc::new(AtomicBool::new(false)),
             start: start_rx,
         },
@@ -10074,6 +10586,7 @@ pub(crate) struct RelayEventReceivers {
 }
 
 pub(crate) struct RelayAgentRuntimeResources {
+    pub parent_session_id: SessionId,
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
@@ -10094,6 +10607,7 @@ pub(crate) fn spawn_relay_agent_actor(
         mut total_usage,
     } = receivers;
     let RelayAgentRuntimeResources {
+        parent_session_id,
         session_store,
         transcript_store,
         session_summary_count_tx,
@@ -10103,17 +10617,28 @@ pub(crate) fn spawn_relay_agent_actor(
     let accepting_input_task = Arc::clone(&accepting_input);
     let closing = Arc::new(AtomicBool::new(false));
     let (start_tx, start_rx) = watch::channel(start.clone());
+    let (final_usage_tx, final_usage) = watch::channel(None);
+    let live_archive_start = start_rx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
     let startup_ready = tokio_util::sync::CancellationToken::new();
     startup_ready.cancel();
-    let actor_task = crate::backend::subprocess::spawn(async move {
-        actor_processes.scope(async move {
-        status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
+    let actor = async move {
+        status_handle
+            .bind_recovery(Arc::clone(&session_store), session_id.clone())
+            .await;
         let canonical_stream = format!("/agent/{}", agent_id);
-        let mut event_log = AgentEventLog::default();
+        let mut event_log = AgentEventLog {
+            live_archive_start: Some(live_archive_start),
+            message_accounting: crate::backend::token_usage_tracking_mode(start.backend_kind)
+                == TokenUsageTrackingMode::Messages,
+            final_usage_tx: Some(final_usage_tx),
+            timing_context: Some((Arc::clone(&session_store), session_id.clone())),
+            parent_session_id: Some(parent_session_id),
+            ..Default::default()
+        };
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState {
             journal: Some(transcript_store.open_session(&session_id)),
@@ -10124,6 +10649,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
+        event_log.own_usage = Some(activity_stats.usage_snapshot());
         let mut activity_event_seq = 0_u64;
         let mut current_start = start;
         let mut pending_alias = None;
@@ -10135,6 +10661,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut close_deadline: Option<tokio::time::Instant> = None;
+        event_log.timing.restore(&session_store, &session_id).await;
         let mut model_usage_open = true;
         let mut total_usage_open = true;
 
@@ -10158,7 +10685,7 @@ pub(crate) fn spawn_relay_agent_actor(
             &mut event_log,
             &mut subscribers,
             &current_start.agent_id,
-            activity_stats.snapshot(),
+            &activity_stats,
         )
         .await;
         // A relay accepts no input, so it has no settings schema to edit.
@@ -10174,8 +10701,36 @@ pub(crate) fn spawn_relay_agent_actor(
         )
         .await;
 
+        archive_live_usage(&canonical_stream, &mut event_log, &mut subscribers).await;
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
+            if event_log.accounting_storage_failed {
+                status_handle
+                    .update(|status| {
+                        status.terminated = true;
+                        status.is_thinking = false;
+                        status.turn_completed = true;
+                        status.activity_counter = status.activity_counter.saturating_add(1);
+                    })
+                    .await;
+                park_relay_terminal_agent(
+                    &session_store,
+                    &transcript_store,
+                    &session_id,
+                    &mut pending_alias,
+                    &mut current_start,
+                    &start_tx,
+                    &mut event_log,
+                    &mut latest_output,
+                    &mut subscribers,
+                    &mut rx,
+                    &accepting_input_task,
+                    &status_handle,
+                    &canonical_stream,
+                )
+                .await;
+                return;
+            }
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed relay replay log must project latest output");
@@ -10189,13 +10744,17 @@ pub(crate) fn spawn_relay_agent_actor(
                     };
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_model_request_token_usage(usage, source_seq) {
-                        upsert_activity_stats_snapshot(
+                    if observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| stats.observe_model_request_token_usage(usage.clone(), source_seq)) {
+                        if activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+                            persist_model_request_checkpoint(&session_store, &session_id, usage, &current_start.agent_id, &canonical_stream, &mut event_log, &mut subscribers).await;
+                        }
+                        status_handle.update(|status| status.activity_counter = status.activity_counter.saturating_add(1)).await;
+                        publish_native_accounting(
                             &canonical_stream,
                             &mut event_log,
                             &mut subscribers,
                             &current_start.agent_id,
-                            activity_stats.snapshot(),
+                            &activity_stats,
                         )
                         .await;
                     }
@@ -10207,29 +10766,34 @@ pub(crate) fn spawn_relay_agent_actor(
                     };
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_total_only_token_usage(total_tokens, source_seq) {
-                        upsert_activity_stats_snapshot(
+                    if observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| stats.observe_total_only_token_usage(total_tokens, source_seq)) {
+                        publish_native_accounting(
                             &canonical_stream,
                             &mut event_log,
                             &mut subscribers,
                             &current_start.agent_id,
-                            activity_stats.snapshot(),
+                            &activity_stats,
                         )
                         .await;
                     }
                 }
                 maybe_event = events.recv() => {
                     let Some(mut event) = maybe_event else {
+                        event_log.timing.interrupt();
                         while let Ok(usage) = model_usage.try_recv() {
                             let source_seq = activity_event_seq;
                             activity_event_seq = activity_event_seq.saturating_add(1);
-                            if activity_stats.observe_model_request_token_usage(usage, source_seq) {
-                                upsert_activity_stats_snapshot(
+                            if observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| stats.observe_model_request_token_usage(usage.clone(), source_seq)) {
+                        if activity_stats.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+                            persist_model_request_checkpoint(&session_store, &session_id, usage, &current_start.agent_id, &canonical_stream, &mut event_log, &mut subscribers).await;
+                        }
+                        status_handle.update(|status| status.activity_counter = status.activity_counter.saturating_add(1)).await;
+                                publish_native_accounting(
                                     &canonical_stream,
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
-                                    activity_stats.snapshot(),
+                                    &activity_stats,
                                 )
                                 .await;
                             }
@@ -10237,15 +10801,14 @@ pub(crate) fn spawn_relay_agent_actor(
                         while let Ok(total_tokens) = total_usage.try_recv() {
                             let source_seq = activity_event_seq;
                             activity_event_seq = activity_event_seq.saturating_add(1);
-                            if activity_stats
-                                .observe_total_only_token_usage(total_tokens, source_seq)
+                            if observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| stats.observe_total_only_token_usage(total_tokens, source_seq))
                             {
-                                upsert_activity_stats_snapshot(
+                                publish_native_accounting(
                                     &canonical_stream,
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
-                                    activity_stats.snapshot(),
+                                    &activity_stats,
                                 )
                                 .await;
                             }
@@ -10268,7 +10831,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 "agent closed",
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                             return;
                         }
                         if status_handle.snapshot().await.is_active() {
@@ -10441,17 +11004,13 @@ pub(crate) fn spawn_relay_agent_actor(
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_chat_event(
-                        &mut event,
-                        source_seq,
-                        &active_stream_text,
-                    ) {
+                    if observe_actor_chat(&mut activity_stats, &mut event_log, &mut event, source_seq, &active_stream_text) {
                         upsert_activity_stats_snapshot(
                             &canonical_stream,
                             &mut event_log,
                             &mut subscribers,
                             &current_start.agent_id,
-                            activity_stats.snapshot(),
+                            &activity_stats,
                         )
                         .await;
                     }
@@ -10485,7 +11044,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             "agent closed",
                         )
                         .await;
-                        finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
+                        finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                         return;
                     }
                 }
@@ -10672,15 +11231,21 @@ pub(crate) fn spawn_relay_agent_actor(
                                 max_bytes,
                             ));
                         }
+                        AgentCommand::MarkAccountingSessionShared { reply } => {
+                            activity_stats.accounting_session_shared = true;
+                            event_log.own_usage = Some(activity_stats.usage_snapshot());
+                            let _ = reply.send(Ok(()));
+                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
+                                &event_log,
                             ));
                         }
                         AgentCommand::StopForRestart { reply } => {
                             status_handle.prepare_restart().await;
-                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -10713,7 +11278,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
-                                finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
+                                finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                                 return;
                             }
                             // A relay mirrors a backend-native child and owns no
@@ -10803,12 +11368,19 @@ pub(crate) fn spawn_relay_agent_actor(
                         "agent closed",
                     )
                     .await;
-                    finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close).await;
+                    finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                     return;
                 }
             }
         }
-    }).await;
+    };
+    tracing::debug!(
+        actor_future_bytes = std::mem::size_of_val(&actor),
+        "heap-owning native relay state before process scope and runtime submission"
+    );
+    let actor = Box::pin(actor);
+    let actor_task = crate::backend::subprocess::spawn(async move {
+        actor_processes.scope(actor).await;
     });
 
     AgentHandle {
@@ -10819,6 +11391,8 @@ pub(crate) fn spawn_relay_agent_actor(
         tx,
         accepting_input,
         closing,
+        final_usage,
+        close_preparing: Arc::new(AtomicBool::new(false)),
         moving_project: Arc::new(AtomicBool::new(false)),
         start: start_rx,
     }
@@ -11033,12 +11607,32 @@ enum ActorFinish {
     StopForRestart,
 }
 
+struct ActorUsageFinalization<'a> {
+    start: &'a AgentStartPayload,
+    event_log: &'a mut AgentEventLog,
+}
+
+fn publish_final_usage(
+    start: &AgentStartPayload,
+    event_log: &mut AgentEventLog,
+) -> AgentUsageSnapshot {
+    event_log.timing.interrupt();
+    let mut snapshot = agent_usage_snapshot_from_log(start, event_log);
+    snapshot.observation = protocol::TaskUsageObservation::Closed;
+    if let Some(publisher) = &event_log.final_usage_tx {
+        publisher.send_replace(Some(snapshot.clone()));
+    }
+    snapshot
+}
+
 async fn finish_actor_close(
     accepting_input: &Arc<AtomicBool>,
     status_handle: &registry::AgentStatusHandle,
     reply: Option<oneshot::Sender<()>>,
     finish: ActorFinish,
+    usage: ActorUsageFinalization<'_>,
 ) {
+    publish_final_usage(usage.start, usage.event_log);
     accepting_input.store(false, Ordering::SeqCst);
     match finish {
         // A closed agent is never continued, whatever turn it was in.
@@ -11738,6 +12332,7 @@ async fn terminalize_live_activity(
     message: &str,
 ) {
     let canonical_stream = context.canonical_stream;
+    context.event_log.timing.interrupt();
     let event_log = &mut context.event_log;
     let replay_state = &mut context.replay_state;
     let subscribers = &mut context.subscribers;
@@ -11812,6 +12407,11 @@ async fn park_terminal_agent(
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
     status_handle: &registry::AgentStatusHandle,
 ) {
+    event_log.timing.interrupt();
+    if let Some(session_id) = session_id {
+        event_log.timing.persist(session_store, session_id).await;
+    }
+    let mut usage = publish_final_usage(current_start, event_log);
     loop {
         latest_output
             .observe_event_log(event_log)
@@ -11923,8 +12523,29 @@ async fn park_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
+            AgentCommand::MarkAccountingSessionShared { reply } => {
+                usage.usage = TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting,
+                };
+                usage.timing = Default::default();
+                event_log.own_usage = Some((usage.usage.clone(), usage.model.clone()));
+                if let Some(publisher) = &event_log.final_usage_tx {
+                    publisher.send_replace(Some(usage.clone()));
+                }
+                let _ = reply.send(Ok(()));
+            }
             AgentCommand::ReadUsageSnapshot { reply } => {
-                let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
+                let mut snapshot = usage.clone();
+                snapshot.start = current_start.clone();
+                if !matches!(
+                    snapshot.usage,
+                    TaskTokenUsageScope::Unavailable {
+                        reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting
+                    }
+                ) {
+                    snapshot.timing = event_log.timing.snapshot();
+                }
+                let _ = reply.send(snapshot);
             }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber_with_latest_output(
@@ -12053,6 +12674,26 @@ async fn park_relay_terminal_agent(
     status_handle: &registry::AgentStatusHandle,
     canonical_stream: &str,
 ) {
+    event_log.timing.interrupt();
+    event_log.timing.persist(session_store, session_id).await;
+    let usage = publish_final_usage(current_start, event_log);
+    let mut archived = usage.clone();
+    archived.navigation = protocol::TaskUsageNavigation::Unavailable;
+    if let Err(error) = session_store.save_task_usage_snapshot(archived).await {
+        append_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            FrameKind::AgentError,
+            &AgentErrorPayload {
+                agent_id: current_start.agent_id.clone(),
+                code: AgentErrorCode::Internal,
+                fatal: false,
+                message: format!("Cannot retain terminal native task accounting: {error}"),
+            },
+        )
+        .await;
+    }
     loop {
         latest_output
             .observe_event_log(event_log)
@@ -12157,8 +12798,14 @@ async fn park_relay_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
+            AgentCommand::MarkAccountingSessionShared { reply } => {
+                let _ = reply.send(Err("Accounting owner is no longer running".to_owned()));
+            }
             AgentCommand::ReadUsageSnapshot { reply } => {
-                let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
+                let mut snapshot = usage.clone();
+                snapshot.start = current_start.clone();
+                snapshot.timing = event_log.timing.snapshot();
+                let _ = reply.send(snapshot);
             }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber_with_latest_output(
@@ -12178,6 +12825,10 @@ async fn park_relay_terminal_agent(
                     status_handle,
                     Some(reply),
                     ActorFinish::Close,
+                    ActorUsageFinalization {
+                        start: current_start,
+                        event_log,
+                    },
                 )
                 .await;
                 break;
@@ -12188,6 +12839,10 @@ async fn park_relay_terminal_agent(
                     status_handle,
                     Some(reply),
                     ActorFinish::StopForRestart,
+                    ActorUsageFinalization {
+                        start: current_start,
+                        event_log,
+                    },
                 )
                 .await;
                 break;
@@ -12770,9 +13425,27 @@ async fn persist_agent_session(
             .await?;
         let saved_session = session_id.clone();
         let permissions = current_start.tyde_permissions;
+        let source = match crate::backend::token_usage_tracking_mode(current_start.backend_kind) {
+            TokenUsageTrackingMode::Messages => {
+                crate::store::session::TaskAccountingSource::CanonicalMessages
+            }
+            TokenUsageTrackingMode::ModelRequests => {
+                crate::store::session::TaskAccountingSource::NativeAbsolute
+            }
+        };
         run_session_store_io(session_store, move |store| {
+            let record = store
+                .get_result(&saved_session)?
+                .ok_or_else(|| "Task accounting session is missing".to_owned())?;
+            if record
+                .task_accounting_source
+                .is_some_and(|saved| saved != source)
+            {
+                return Err("Stored task accounting source does not match this session".to_owned());
+            }
             store.update(&saved_session, |record| {
-                record.tyde_permissions = permissions
+                record.tyde_permissions = permissions;
+                record.task_accounting_source = Some(source);
             })
         })
         .await?;
@@ -13021,6 +13694,20 @@ async fn append_chat_event_with_transcript_metadata(
     transcript_metadata: Option<(BackendKind, &EventStream)>,
     event: &ChatEvent,
 ) -> Result<(), String> {
+    let timing_changed = if let Some((store, session)) = event_log.timing_context.clone() {
+        event_log.timing.observe(event, &store, &session).await
+    } else {
+        false
+    };
+    if timing_changed
+        || matches!(
+            event,
+            ChatEvent::StreamEnd(_) | ChatEvent::MessageMetadataUpdated(_)
+        )
+        || matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Assistant { .. }))
+    {
+        archive_live_usage(canonical_stream, event_log, subscribers).await;
+    }
     let projected = match event {
         ChatEvent::MessageAdded(message)
             if matches!(message.sender, MessageSender::User)
@@ -13159,6 +13846,7 @@ async fn seed_fork_transcript_history(
             sequence,
             event_id: format!("fork:{}:{}", source_session_id.0, source.event_id),
             visibility: source.visibility,
+            accounting_scope: crate::store::transcript::TranscriptAccountingScope::InheritedContext,
             provider_identity: source.provider_identity,
             event: source.event,
             timestamp_ms: source.timestamp_ms,
@@ -13182,18 +13870,44 @@ async fn seed_existing_transcript_history(
     session_id: &SessionId,
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
+    mut accounting: Option<(&mut AgentActivityStatsTracker, &mut u64)>,
+    project_history: bool,
 ) -> Result<(), String> {
     if !store.actor_io_enabled() {
         return Ok(());
     }
     let store_for_load = store.clone();
     let session_for_load = session_id.clone();
-    let records = tokio::task::spawn_blocking(move || store_for_load.load(&session_for_load))
-        .await
-        .map_err(|error| format!("resume transcript load task failed: {error}"))??;
+    let (records, damage) =
+        tokio::task::spawn_blocking(move || store_for_load.load_accounting(&session_for_load))
+            .await
+            .map_err(|error| format!("resume transcript load task failed: {error}"))??;
     let mut visible_tool_calls = HashSet::new();
     let mut open_stream_events = Vec::new();
+    let mut active_text = String::new();
     for record in records {
+        let inherited = record.accounting_scope
+            == crate::store::transcript::TranscriptAccountingScope::InheritedContext;
+        if let Some((tracker, source_seq)) = accounting.as_mut()
+            && !inherited
+            && matches!(
+                record.visibility,
+                crate::store::transcript::TranscriptVisibility::Visible
+            )
+        {
+            let mut event = record.event.clone();
+            strip_replayed_cumulative_token_usage(&mut event);
+            match &event {
+                ChatEvent::StreamStart(_) => active_text.clear(),
+                ChatEvent::StreamDelta(delta) => active_text.push_str(&delta.text),
+                _ => {}
+            }
+            tracker.observe_chat_event(&mut event, **source_seq, &active_text);
+            **source_seq = source_seq.saturating_add(1);
+        }
+        if !project_history {
+            continue;
+        }
         match record.visibility {
             crate::store::transcript::TranscriptVisibility::Visible
             | crate::store::transcript::TranscriptVisibility::TimelineMarker => {
@@ -13219,6 +13933,14 @@ async fn seed_existing_transcript_history(
             crate::store::transcript::TranscriptVisibility::InternalCompactionSeed
             | crate::store::transcript::TranscriptVisibility::ProviderMetadata => {}
         }
+    }
+    if let Some((tracker, _)) = accounting.as_mut() {
+        tracker.commit_provisional_request_usage();
+    }
+    if accounting.is_some() && damage != crate::store::transcript::JournalDamage::None {
+        return Err(
+            "Saved accounting journal is incomplete or contains an unreadable record".to_owned(),
+        );
     }
     // The host stopped inside a response that never ended, so replay never
     // materialized the tool calls it had already issued. Publish them now, in
@@ -13311,6 +14033,7 @@ async fn journal_open_stream_tool_event(
         sequence: 0,
         event_id: uuid::Uuid::new_v4().to_string(),
         visibility: crate::store::transcript::TranscriptVisibility::OpenStreamToolEvent,
+        accounting_scope: crate::store::transcript::TranscriptAccountingScope::SessionOwn,
         provider_identity: None,
         event: event.clone(),
         timestamp_ms: now_ms(),
@@ -13366,6 +14089,7 @@ async fn journal_new_replay_records(
                 sequence: envelope.seq,
                 event_id,
                 visibility,
+                accounting_scope: crate::store::transcript::TranscriptAccountingScope::SessionOwn,
                 provider_identity: provider_identities.get(&envelope.seq).cloned(),
                 event,
                 timestamp_ms: now_ms(),
@@ -13416,6 +14140,28 @@ async fn report_transcript_persistence(
     let Some(agent_id) = replay_state.journal_agent_id.clone() else {
         return;
     };
+    let accounting_loss = match &persistence {
+        Err(_) => true,
+        Ok(outcome) => outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.unreadable_record || outcome.discarded_bytes > 0),
+    };
+    if accounting_loss && event_log.message_accounting && !event_log.accounting_history_incomplete {
+        event_log.accounting_history_incomplete = true;
+        if let Some((store, session)) = event_log.timing_context.clone()
+            && let Err(error) = store
+                .update(&session, |record| {
+                    record.accounting_history_incomplete = true
+                })
+                .await
+        {
+            event_log.accounting_storage_failed = true;
+            append_event(canonical_stream, event_log, subscribers, FrameKind::AgentError, &AgentErrorPayload {
+                agent_id: agent_id.clone(), code: AgentErrorCode::Internal, fatal: true,
+                message: format!("Cannot preserve incomplete task-accounting coverage; agent stopped: {error}"),
+            }).await;
+        }
+    }
     let outcome = match persistence {
         Err(error) => {
             if replay_state.journal_failed {
@@ -13534,16 +14280,150 @@ async fn mark_transcript_authoritative(store: &TranscriptStore, session_id: &Ses
     }
 }
 
+async fn persist_model_request_checkpoint(
+    store: &SessionStoreHandle,
+    session: &SessionId,
+    usage: ModelRequestTokenUsage,
+    agent_id: &AgentId,
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+) {
+    event_log.native_usage = Some(usage.clone());
+    if let Err(error) = store
+        .update(session, move |record| {
+            record.model_request_usage = Some(usage)
+        })
+        .await
+    {
+        event_log.accounting_history_incomplete = true;
+        event_log.accounting_storage_failed = true;
+        if let Err(coverage_error) = store
+            .update(session, |record| {
+                record.accounting_history_incomplete = true
+            })
+            .await
+        {
+            tracing::error!(
+                error_bytes = coverage_error.len(),
+                "native accounting coverage could not be saved"
+            );
+        }
+        tracing::error!(
+            error_bytes = error.len(),
+            "model-request accounting persistence failed"
+        );
+        append_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            FrameKind::AgentError,
+            &AgentErrorPayload {
+                agent_id: agent_id.clone(),
+                code: AgentErrorCode::Internal,
+                fatal: true,
+                message: "Task accounting could not be saved; agent stopped and restart coverage is incomplete."
+                    .to_owned(),
+            },
+        )
+        .await;
+    }
+}
+
+async fn archive_live_usage(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+) {
+    let Some(start) = event_log
+        .live_archive_start
+        .as_ref()
+        .map(|start| start.borrow().clone())
+    else {
+        return;
+    };
+    let (store, _) = event_log
+        .timing_context
+        .clone()
+        .expect("native timing context exists before activation");
+    let mut snapshot = agent_usage_snapshot_from_log(&start, event_log);
+    snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
+    if let Err(error) = store.save_task_usage_snapshot(snapshot).await {
+        event_log.accounting_history_incomplete = true;
+        event_log.accounting_storage_failed = true;
+        append_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            FrameKind::AgentError,
+            &AgentErrorPayload {
+                agent_id: start.agent_id,
+                code: AgentErrorCode::Internal,
+                fatal: true,
+                message: format!(
+                    "Cannot preserve native task observations; agent stopped: {error}"
+                ),
+            },
+        )
+        .await;
+    }
+}
+
+async fn publish_native_accounting(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    agent_id: &AgentId,
+    tracker: &AgentActivityStatsTracker,
+) {
+    upsert_activity_stats_snapshot(canonical_stream, event_log, subscribers, agent_id, tracker)
+        .await;
+    archive_live_usage(canonical_stream, event_log, subscribers).await;
+}
+
+fn observe_actor_chat(
+    tracker: &mut AgentActivityStatsTracker,
+    event_log: &mut AgentEventLog,
+    event: &mut ChatEvent,
+    source_seq: u64,
+    text: &str,
+) -> bool {
+    let accounting = matches!(
+        event,
+        ChatEvent::MessageAdded(_)
+            | ChatEvent::MessageMetadataUpdated(_)
+            | ChatEvent::StreamEnd(_)
+            | ChatEvent::StreamStart(_)
+            | ChatEvent::TypingStatusChanged(_)
+    );
+    let changed = tracker.observe_chat_event(event, source_seq, text);
+    if accounting {
+        event_log.own_usage = Some(tracker.usage_snapshot());
+    }
+    changed
+}
+
+fn observe_actor_accounting(
+    tracker: &mut AgentActivityStatsTracker,
+    event_log: &mut AgentEventLog,
+    observe: impl FnOnce(&mut AgentActivityStatsTracker) -> bool,
+) -> bool {
+    let changed = observe(tracker);
+    event_log.own_usage = Some(tracker.usage_snapshot());
+    changed
+}
+
 async fn upsert_activity_stats_snapshot(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
-    stats: AgentActivityStats,
+    tracker: &AgentActivityStatsTracker,
 ) {
+    event_log.accounting_history_incomplete |= tracker.accounting_restore_incomplete;
     let payload = AgentActivityStatsPayload {
         agent_id: agent_id.clone(),
-        stats,
+        stats: tracker.snapshot(),
     };
     let value =
         serde_json::to_value(&payload).expect("failed to serialize AgentActivityStats payload");
@@ -14037,37 +14917,18 @@ async fn publish_resumed_agent_idle(
 /// replay state, but never broadcast it to subscribers as a live event.
 ///
 #[allow(clippy::too_many_arguments)]
-async fn ingest_gated_replay_event(
+fn ingest_gated_replay_event(
     event: &mut ChatEvent,
     canonical_stream: &str,
-    agent_id: &AgentId,
     event_log: &mut AgentEventLog,
-    subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
-    activity_stats: &mut AgentActivityStatsTracker,
     active_stream_text: &mut String,
-    activity_event_seq: &mut u64,
 ) {
     project_legacy_native_collaboration_event(event);
     match &*event {
-        ChatEvent::StreamStart(_) => active_stream_text.clear(),
+        ChatEvent::StreamStart(_) | ChatEvent::StreamEnd(_) => active_stream_text.clear(),
         ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
         _ => {}
-    }
-    let source_seq = *activity_event_seq;
-    *activity_event_seq = activity_event_seq.saturating_add(1);
-    if activity_stats.observe_chat_event(event, source_seq, active_stream_text) {
-        upsert_activity_stats_snapshot(
-            canonical_stream,
-            event_log,
-            subscribers,
-            agent_id,
-            activity_stats.snapshot(),
-        )
-        .await;
-    }
-    if matches!(&*event, ChatEvent::StreamEnd(_)) {
-        active_stream_text.clear();
     }
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event);
 }
@@ -14476,116 +15337,72 @@ fn activity_history_snapshot(
 fn agent_usage_snapshot_from_tracker(
     start: &AgentStartPayload,
     tracker: &AgentActivityStatsTracker,
+    event_log: &AgentEventLog,
 ) -> AgentUsageSnapshot {
     let (usage, model) = tracker.usage_snapshot();
+    let shared = matches!(
+        &usage,
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting
+        }
+    );
     AgentUsageSnapshot {
+        observation: protocol::TaskUsageObservation::Live,
+        native_usage: event_log.native_usage.clone(),
+        timing: if shared {
+            Default::default()
+        } else {
+            event_log.timing.snapshot()
+        },
+        navigation: protocol::TaskUsageNavigation::LiveAgent,
+        parent_session_id: event_log.parent_session_id.clone(),
         start: start.clone(),
-        usage,
+        usage: if event_log.accounting_history_incomplete && !shared {
+            usage.with_incomplete_reason(
+                TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete,
+            )
+        } else {
+            usage
+        },
         model,
     }
 }
 
 fn agent_usage_snapshot_from_log(
     start: &AgentStartPayload,
-    event_log: &[Envelope],
+    event_log: &AgentEventLog,
 ) -> AgentUsageSnapshot {
-    let mut tracker = AgentActivityStatsTracker::for_backend(start.backend_kind);
-    let mut active_stream_text = String::new();
-    let mut saw_replayable_usage_event = false;
-    let mut latest_stats = None;
-    for envelope in event_log {
-        match envelope.kind {
-            FrameKind::ChatEvent => {
-                let Ok(mut event) = serde_json::from_value::<ChatEvent>(envelope.payload.clone())
-                else {
-                    continue;
-                };
-                if chat_event_can_reconstruct_usage(&event) {
-                    saw_replayable_usage_event = true;
-                }
-                strip_replayed_cumulative_token_usage(&mut event);
-                match &event {
-                    ChatEvent::StreamStart(_) => active_stream_text.clear(),
-                    ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
-                    _ => {}
-                }
-                tracker.observe_chat_event(&mut event, envelope.seq, &active_stream_text);
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    active_stream_text.clear();
-                }
-            }
-            FrameKind::AgentActivityStats => {
-                if let Ok(payload) =
-                    serde_json::from_value::<AgentActivityStatsPayload>(envelope.payload.clone())
-                {
-                    latest_stats = Some(payload.stats);
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(total_tokens) = latest_stats.as_ref().and_then(|stats| {
-        stats
-            .token_usage_total_only
-            .filter(|total| *total >= stats.token_usage.total_tokens)
-    }) {
-        return AgentUsageSnapshot {
-            start: start.clone(),
-            usage: TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::total_only(total_tokens)),
-            },
-            model: tracker.latest_model,
-        };
-    }
-    if tracker.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests
-        && let Some(stats) = latest_stats.as_ref()
-        && stats.token_usage.total_tokens > 0
-    {
-        return AgentUsageSnapshot {
-            start: start.clone(),
-            usage: TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&stats.token_usage)),
-            },
-            model: tracker.latest_model,
-        };
-    }
-    if saw_replayable_usage_event {
-        let reported_usage_floor = latest_stats.as_ref().map(|stats| &stats.token_usage);
-        let (usage, model) = tracker.usage_snapshot_with_reported_usage_floor(reported_usage_floor);
-        return AgentUsageSnapshot {
-            start: start.clone(),
-            usage,
-            model,
-        };
-    }
-
-    // Legacy logs can contain only the coalesced activity snapshot. In that
-    // case there is no replayable source-level usage state, so keep the old
-    // stats-only reconstruction path explicit.
-    let stats = latest_stats.unwrap_or_default();
-    let usage = if stats.token_usage.total_tokens > 0 {
-        TaskTokenUsageScope::Known {
-            usage: Box::new(TaskTokenUsageAmount::from_token_usage(&stats.token_usage)),
-        }
-    } else {
+    let (usage, model) = event_log.own_usage.clone().unwrap_or((
         TaskTokenUsageScope::Unavailable {
             reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+        },
+        None,
+    ));
+    let shared = matches!(
+        &usage,
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::SharedSessionAccounting
         }
-    };
+    );
     AgentUsageSnapshot {
+        observation: protocol::TaskUsageObservation::Live,
+        native_usage: event_log.native_usage.clone(),
+        timing: if shared {
+            Default::default()
+        } else {
+            event_log.timing.snapshot()
+        },
+        navigation: protocol::TaskUsageNavigation::LiveAgent,
+        parent_session_id: event_log.parent_session_id.clone(),
         start: start.clone(),
-        usage,
-        model: None,
-    }
-}
-
-fn chat_event_can_reconstruct_usage(event: &ChatEvent) -> bool {
-    match event {
-        ChatEvent::MessageAdded(message) | ChatEvent::StreamEnd(StreamEndData { message }) => {
-            matches!(message.sender, MessageSender::Assistant { .. })
-        }
-        ChatEvent::MessageMetadataUpdated(update) => update.token_usage.is_some(),
-        _ => false,
+        usage: if event_log.accounting_history_incomplete && !shared {
+            usage.with_incomplete_reason(
+                TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete,
+            )
+        } else {
+            usage
+        },
+        model,
     }
 }
 
@@ -14931,7 +15748,7 @@ async fn record_context_compaction_terminal(
             event_log,
             subscribers,
             &start.agent_id,
-            activity_stats.snapshot(),
+            activity_stats,
         )
         .await;
     }
@@ -15564,6 +16381,7 @@ async fn persist_compaction_marker(
         sequence,
         event_id: marker.marker_id.0.clone(),
         visibility: crate::store::transcript::TranscriptVisibility::TimelineMarker,
+        accounting_scope: crate::store::transcript::TranscriptAccountingScope::SessionOwn,
         provider_identity: marker
             .provider_session_id
             .as_ref()

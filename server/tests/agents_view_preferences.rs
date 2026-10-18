@@ -1455,6 +1455,14 @@ async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
         }]
     );
 
+    close_agent(&mut fixture.client, &agent.instance_stream).await;
+    let closed =
+        expect_preferences_notify(&mut fixture.client, "closed session group retained").await;
+    assert_eq!(
+        closed.snapshot.groups.assignments,
+        promoted_notify.snapshot.groups.assignments
+    );
+
     fixture
         .client
         .delete_session(DeleteSessionPayload {
@@ -1587,6 +1595,15 @@ async fn agents_view_preferences_agent_annotations_promote_drop_and_session_dele
     )
     .await;
     expect_preferences_notify(&mut fixture.client, "pin before delete").await;
+
+    close_agent(&mut fixture.client, &agent.instance_stream).await;
+    let closed =
+        expect_preferences_notify(&mut fixture.client, "closed session annotations retained").await;
+    assert_eq!(
+        closed.snapshot.tags.manual_assignments,
+        promoted_notify.snapshot.tags.manual_assignments
+    );
+    assert_eq!(closed.snapshot.pins.pinned, vec![session_target]);
 
     fixture
         .client
