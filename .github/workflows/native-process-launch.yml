@@ -1,0 +1,34 @@
+name: Native process launch
+
+on:
+  push:
+    branches: [fix-macos-startup]
+  pull_request:
+    paths:
+      - 'process-env/**'
+      - '.github/workflows/native-process-launch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the production exec-helper entrypoint
+        run: cargo build --locked -p tyde-process-env --example launch_probe --features test-support
+      - name: Initialize the login-shell PATH
+        run: target/debug/examples/launch_probe
+      - name: Exercise startup from a background terminal
+        shell: bash
+        run: |
+          export TYDE_TEST_PROCESS_EXECUTABLE="$PWD/target/debug/examples/launch_probe"
+          cargo test --locked -p tyde-process-env --features test-support --test login_shell -- --nocapture

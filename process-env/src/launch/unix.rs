@@ -377,7 +377,10 @@ impl Exchange {
                 failure[1..].try_into().map_err(io::Error::other)?,
             ));
             tracing::error!(?stage,error_kind=?error.kind(),"backend exec helper failed");
-            Err(error)
+            Err(io::Error::new(
+                error.kind(),
+                format!("process exec helper failed during {stage:?}: {error}"),
+            ))
         };
         response.await?;
         Ok(())
@@ -569,6 +572,12 @@ pub(super) fn spawn(spec: GroupCommand) -> io::Result<(Child, Exchange)> {
             &attributes.0,
             argv.as_ptr(),
             env.as_ptr(),
+        )
+    })
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to spawn the process exec helper: {error}"),
         )
     })?;
     let pid = Pid {
