@@ -390,6 +390,14 @@ impl MockTurn {
     /// busy: the shape for busy-parent child-completion tests.
     /// ([`MockTurn::with_native_child`] runs the child after the parent
     /// idles, matching the legacy sentinel placement.)
+    pub fn gated_held_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
+        let mut turn = Self::gated_text(text, gate);
+        turn.finish = MockTurnFinish::Held {
+            interruptible: true,
+        };
+        turn
+    }
+
     pub fn gated_text_with_busy_native_child(
         text: impl Into<String>,
         child_name: impl Into<String>,

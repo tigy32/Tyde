@@ -269,6 +269,8 @@ pub fn prime_agent_stream_for_tests(
             events: vec![BootstrapEvent::AgentStart(agent_payload.clone())],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -4115,6 +4117,7 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 .review_action_target_pending
                 .with_untracked(|set| set.iter().filter(|(rid, _)| rid == review_id).count());
             let context_label = match &error.context {
+                ReviewErrorContext::Transport => "transport",
                 ReviewErrorContext::AddComment => "add_comment",
                 ReviewErrorContext::UpdateComment { .. } => "update_comment",
                 ReviewErrorContext::DeleteComment { .. } => "delete_comment",
@@ -4131,6 +4134,7 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
             );
             // Clear only the gate matching the error context.
             match error.context {
+                ReviewErrorContext::Transport => {}
                 ReviewErrorContext::AddComment => {
                     state.review_action_target_pending.update(|set| {
                         set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));

@@ -295,6 +295,7 @@ pub(crate) struct AgentActorRuntimeContext {
     #[cfg(feature = "test-support")]
     pub swarm_startup_test_gates: SwarmStartupTestGates,
     pub(crate) startup_admission: Option<oneshot::Receiver<()>>,
+    pub(crate) review_startup_admission: Option<oneshot::Receiver<()>>,
     pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
@@ -315,6 +316,7 @@ pub(crate) struct AgentActorRuntimeResources {
     #[cfg(feature = "test-support")]
     pub swarm_startup_test_gates: SwarmStartupTestGates,
     pub(crate) startup_admission: Option<oneshot::Receiver<()>>,
+    pub(crate) review_startup_admission: Option<oneshot::Receiver<()>>,
     pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
@@ -341,6 +343,7 @@ impl AgentActorRuntimeResources {
             #[cfg(feature = "test-support")]
             swarm_startup_test_gates: self.swarm_startup_test_gates,
             startup_admission: self.startup_admission,
+            review_startup_admission: self.review_startup_admission,
             session_store: self.session_store,
             transcript_store: self.transcript_store,
             host_sub_agent_spawn_tx: self.host_sub_agent_spawn_tx,
@@ -3196,6 +3199,7 @@ pub(crate) fn spawn_agent_actor(
         #[cfg(feature = "test-support")]
         swarm_startup_test_gates,
         startup_admission,
+        review_startup_admission,
         session_store,
         transcript_store,
         host_sub_agent_spawn_tx,
@@ -3451,6 +3455,9 @@ pub(crate) fn spawn_agent_actor(
             let startup = async {
             #[cfg(feature = "test-support")]
             wait_for_startup_completion_test_gate(&startup_gate_name).await;
+            if let Some(admission) = review_startup_admission && admission.await.is_err() {
+                return Err(AgentStartupFailure::internal("Review startup admission was withdrawn".to_owned()));
+            }
             let mcp_config_validation = if use_mock_backend {
                 Ok(())
             } else {
@@ -3630,9 +3637,11 @@ pub(crate) fn spawn_agent_actor(
                                         status.activity_counter.saturating_add(1);
                                 })
                                 .await;
-                            for (_, attach_reply) in std::mem::take(&mut pending_startup_attaches) {
-                                let _ = attach_reply.send(true);
-                            }
+                            flush_pending_agent_attaches(
+                                &event_log, Some(&replay_state), &mut latest_output,
+                                latest_slash_commands.as_ref(), &mut subscribers,
+                                &mut pending_startup_attaches, &status_handle,
+                            ).await;
                             let _ = reply.send(());
                             let _ = startup_tx.send(Err("agent startup closed".to_owned()));
                             return;
@@ -9934,7 +9943,7 @@ pub(crate) fn spawn_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.activity(),
+                                &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -10718,7 +10727,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.activity(),
+                                &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -11766,7 +11775,7 @@ async fn park_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
-                    AgentActivity::Idle,
+                    &status_handle.snapshot().await,
                     None,
                     subscribers,
                     stream,
@@ -11985,7 +11994,7 @@ async fn park_relay_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
-                    status_handle.snapshot().await.activity(),
+                    &status_handle.snapshot().await,
                     None,
                     subscribers,
                     stream,
@@ -13382,13 +13391,13 @@ async fn flush_pending_agent_attaches(
 ) {
     let output = current_latest_output(latest_output, event_log)
         .expect("typed agent replay log must project latest output");
-    let activity = status_handle.snapshot().await.activity();
+    let status = status_handle.snapshot().await;
     for (stream, reply) in std::mem::take(pending_attaches) {
         let attached = attach_subscriber_with_latest_output(
             event_log,
             replay_state,
             &output,
-            activity,
+            &status,
             slash_commands,
             subscribers,
             stream,
@@ -15464,7 +15473,7 @@ fn attach_subscriber_with_latest_output(
     event_log: &AgentEventLog,
     replay_state: Option<&AgentReplayState>,
     latest_output: &AgentControlOutput,
-    activity: AgentActivity,
+    status: &registry::AgentStatus,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
@@ -15532,7 +15541,9 @@ fn attach_subscriber_with_latest_output(
     let payload = serde_json::to_value(AgentBootstrapPayload {
         events,
         latest_output: latest_output.clone(),
-        activity,
+        activity: status.activity(),
+        status: status.status(),
+        error: status.last_error.clone(),
     })
     .expect("failed to serialize AgentBootstrap payload");
     if stream

@@ -3774,6 +3774,8 @@ mod wasm_tests {
     /// envelope on that stream can use seq 0.
     fn prime_agent_stream(state: &AppState, host: &LocalHostId, stream: &StreamPath) {
         let bootstrap = protocol::AgentBootstrapPayload {
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
             events: Vec::new(),
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
@@ -4733,6 +4735,8 @@ mod wasm_tests {
             images: None,
         });
         let bootstrap = protocol::AgentBootstrapPayload {
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
             events: vec![
                 protocol::AgentBootstrapEvent::AgentStart(agent_start),
                 protocol::AgentBootstrapEvent::ChatEvent(chat_event),
@@ -5566,6 +5570,8 @@ mod wasm_tests {
         };
 
         let bootstrap = protocol::AgentBootstrapPayload {
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
             events: vec![protocol::AgentBootstrapEvent::AgentActivityStats(
                 protocol::AgentActivityStatsPayload {
                     agent_id: AgentId("a-1".to_owned()),

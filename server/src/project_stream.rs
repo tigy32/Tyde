@@ -3090,6 +3090,17 @@ pub(crate) fn read_diff(
     project: &Project,
     payload: ProjectReadDiffPayload,
 ) -> Result<ProjectGitDiffPayload, String> {
+    let diff = build_diff(project, payload)?;
+    ensure_json_payload_is_transportable(&diff, "diff")?;
+    Ok(diff)
+}
+
+// Internal review state is not a wire response. Keep the same Git/parser path,
+// but enforce transport bounds only when sending a genuine client payload.
+pub(crate) fn build_diff(
+    project: &Project,
+    payload: ProjectReadDiffPayload,
+) -> Result<ProjectGitDiffPayload, String> {
     read_diff_with_runner(project, payload, run_git_mode)
 }
 
@@ -3162,7 +3173,6 @@ where
         context_mode: payload.context_mode,
         files,
     };
-    ensure_diff_is_transportable(&diff)?;
     Ok(diff)
 }
 
@@ -3182,13 +3192,16 @@ impl std::io::Write for SerializedLen {
     }
 }
 
-fn ensure_diff_is_transportable(diff: &ProjectGitDiffPayload) -> Result<(), String> {
+pub(crate) fn ensure_json_payload_is_transportable(
+    payload: &impl serde::Serialize,
+    description: &str,
+) -> Result<(), String> {
     let mut length = SerializedLen(0);
-    serde_json::to_writer(&mut length, diff)
-        .map_err(|error| format!("failed to measure diff response: {error}"))?;
+    serde_json::to_writer(&mut length, payload)
+        .map_err(|error| format!("failed to measure {description} response: {error}"))?;
     if length.0 > DIFF_PAYLOAD_LIMIT_BYTES {
         return Err(format!(
-            "diff is too large to send: {} bytes exceeds the {DIFF_PAYLOAD_LIMIT_BYTES} byte \
+            "{description} is too large to send: {} bytes exceeds the {DIFF_PAYLOAD_LIMIT_BYTES} byte \
              limit for one response",
             length.0
         ));

@@ -1793,7 +1793,21 @@ fn claude_init_frame_skills(value: &Value) -> Option<Result<Option<Vec<String>>,
     Some(Ok(Some(names)))
 }
 
+const REVIEW_FEEDBACK_TOOLS: [&str; 4] = [
+    "mcp__tyde-review-feedback__propose_review_comment",
+    "mcp__tyde-review-feedback__read_review_finding",
+    "mcp__tyde-review-feedback__read_review_history",
+    "mcp__tyde-review-feedback__read_review_git",
+];
+
 fn claude_native_tool_kind(name: &str) -> NativeToolKind {
+    if REVIEW_FEEDBACK_TOOLS.contains(&name) {
+        return if name == REVIEW_FEEDBACK_TOOLS[0] {
+            NativeToolKind::SessionControl
+        } else {
+            NativeToolKind::ReadOnly
+        };
+    }
     if claude_is_modify_tool_name(name) {
         return NativeToolKind::FileMutation;
     }
@@ -4798,6 +4812,7 @@ impl ClaudeInner {
                         return Err("Claude advertised an excluded native tool category".to_owned());
                     }
                     if state.access_mode == BackendAccessMode::EnforcedReadOnly
+                        && !REVIEW_FEEDBACK_TOOLS.contains(&tool.name.as_str())
                         && !matches!(
                             tool.name.as_str(),
                             "Read"
@@ -6870,7 +6885,10 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
             String::new(),
             "--strict-mcp-config".to_owned(),
             "--allowedTools".to_owned(),
-            "Read,Glob,Grep,mcp__tyde-agent-control__*".to_owned(),
+            format!(
+                "Read,Glob,Grep,mcp__tyde-agent-control__*,{}",
+                REVIEW_FEEDBACK_TOOLS.join(",")
+            ),
         ]);
         cli_settings.insert("disableAllHooks".to_owned(), json!(true));
     }
@@ -8525,6 +8543,7 @@ fn control_response_payload_for_request(
     let response = if is_tool_permission_subtype(subtype) {
         let tool_name = control_request_tool_name(value, request).unwrap_or_default();
         if access_mode == BackendAccessMode::EnforcedReadOnly
+            && !REVIEW_FEEDBACK_TOOLS.contains(&tool_name)
             && !matches!(
                 tool_name,
                 "Read" | "Glob" | "Grep" | "AskUserQuestion" | "ExitPlanMode"

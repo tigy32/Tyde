@@ -425,53 +425,54 @@ files, Git status, diffs, review comments, or review navigation.
 
 ### AI review
 
-`StartAiReview` and `tyde_request_review` accept optional `mode: light | deep`.
-The stable wire values display as **Lite** and **Heavy**, including history.
-Omitting mode uses `/review/default_mode` (initially Lite). Shared
-`/review/aspects` contains names, descriptions, instructions and enabled flags.
-Independent `/review/lite` and `/review/heavy` lists each initially contain one
-reviewer inheriting the host default backend and its current settings at launch.
-Each entry has a stable `id`, a `name`, and a typed `target`: `kind: default`,
-or `kind: explicit` with `backend_kind` and `session_settings`. Lists must be
-nonempty and IDs unique within each mode. Multiple entries can use the same
-backend with different models/settings. The Tyde Operator uses `review_reviewers` with
-`mode` and `reviewers` to replace a list.
+`StartAiReview` and the canonical `tyde_review` tool accept optional
+`mode: light | deep` (displayed Lite / Heavy). Omitting mode uses the configured
+default. Lite preserves one independent reviewer per configured entry, with all
+enabled aspects. Heavy preserves one independent reviewer per entry/aspect.
+Configured models and settings remain independent, including same-backend
+reviewers. Per-run backend overrides are rejected.
 
-Lite launches one agent per reviewer, each receiving all enabled aspects.
-Heavy launches one agent per reviewer per enabled aspect: three aspects and
-two reviewers launch six agents. The server alone computes assignments; the
-UI does not predict counts or provider readiness. Heavy and agent-requested
-reviews require enabled aspects. Unconfigured manual Lite reviews still work.
-Per-run backend overrides are rejected visibly; edit the mode's reviewers
-instead. Additional instructions and cost hints remain available.
+`tyde_review` lives only on the long-running agent-await MCP surface. Supply a
+caller-chosen `request_id` (1–128 bytes): a new ID requests work; repeating an ID
+reattaches to the same persisted execution even if its response was interrupted.
+The call launches configured reviewers, event-waits without a local work timer,
+and returns only review ID, honest completed/incomplete/failed state, new finding
+count, outstanding count across all prior findings, and failure count. Completion
+means the reviewers finished, not approval or proof that all code was inspected.
+Cancellation of the wait does not cancel review work. Host restart expires waits
+explicitly; running persisted executions become failed. Results are not injected
+into the requester's conversation.
 
-All members receive the same frozen diff snapshot. Each round records its mode;
-each member records its reviewer ID, selected target, resolved backend, session
-setting overrides and exact aspect definitions. Omitted settings continue to use
-backend defaults through the normal spawn path. Missing explicit backends fail
-visibly, never silently change provider or reduce required coverage. Historical
-records missing the new fields remain readable. Agent-requested members remain
-children of the requester. Await waits for the whole round, and findings are
-read through tools, never injected into conversations. Any authenticated agent
-in the review's project can close a finding or update its recorded reason with
-`tyde_review_disposition`, including findings requested by another agent or from
-a manual review, even when the requester or reviewer is no longer available.
-Project membership is checked at the host boundary; requester ownership remains
-required only for awaiting a round. The reason is recorded in the
-round's `dispositions`, and a `Pending` suggestion becomes
-`ReviewSuggestionState::Resolved` (protocol version 80), broadcast as a
-`SuggestionUpsert` and dropped from pending counts. Resolved findings leave
-the inline and comments surfaces; the review rounds history keeps them with
-the agent's response. Accepted or rejected findings keep the user's state. Manual reviews retain
-the accept-and-submit flow and independent finding attribution.
+Ordinary control tools are small and project-authorized:
 
-`tyde_edit_review_comment` lets any authenticated agent in the same project edit
-an AI finding's text in a draft review without accepting, closing, or reopening
-it. Attribution, anchor, severity, and dispositions remain unchanged. Accepted
-findings and their backing comments are updated together through the review
-actor and broadcast as `SuggestionUpsert` and `CommentUpsert`; edits never create
-parallel comment state. Empty text, unknown findings, non-draft reviews, missing
-credentials, and cross-project edits are refused.
+- `tyde_list_reviews`: outstanding/active/failed review IDs, status and counts.
+- `tyde_list_review_findings`: pending finding IDs, location, severity and marked
+  short summaries across every execution, not just newly reported findings.
+- `tyde_read_review_finding`: exact finding metadata and character-paginated body
+  and rationale by ID.
+- `tyde_edit_review_comment`: edit text only; preserve resolution, attribution,
+  location and disposition. Accepted comments update their backing inline comment.
+- `tyde_resolve_review_findings`: atomically validate 1–100 ID/reason updates, then
+  resolve pending findings and append audit entries. Accepted/rejected human
+  decisions are preserved. Responses acknowledge counts, not repeated reasons.
+- `tyde_review_history`: explicit bounded pagination over persisted executions,
+  findings and all text-edit/disposition audit entries. No common operation
+  automatically replays history. JSON is never silently truncated.
+
+All list/history calls require an explicit limit and disclose total/next_offset.
+History also requires text_limit (1–8192 characters); large text values expose
+text/total_characters/next_offset and can be read completely with text_offset.
+Empty reasons, duplicate/unknown IDs, missing credentials and cross-project
+access fail explicitly. The old request/await/get/disposition entry points are
+removed, not hidden aliases. External user-authored agent instructions or MCP
+allowlists naming them need a human-owned migration to these canonical tools;
+Tyde upgrades only exact unedited built-in instructions, never custom steering.
+
+Internal execution IDs remain solely for output routing and finding attribution.
+A finding records its originating execution; dispositions never select the first
+execution merely because a reviewer agent ID matches. Old persisted findings
+are assigned an execution only where historical attribution is unambiguous.
+The UI retains its inline accept/reject/navigation and reviewer history.
 
 Before any typed settings read, startup migrates `review.agents` into aspects,
 then migrates legacy execution settings. Untouched Light (Codex, empty settings)
@@ -484,35 +485,55 @@ flags and the selected default mode are retained. Migration is idempotent;
 obsolete setting writes fail rather than silently disappearing. Mixed legacy
 and new execution keys are rejected as ambiguous.
 
-Each spawn request uses:
+Reviewers use the workbench's exact project roots and enforced read-only access,
+with ordinary native read tools, read-only Git operations and review-feedback
+MCP tools. Backends unable to enforce these permissions fail explicitly.
+A stable system instruction describes the advisory role; the concise turn
+assignment provides current review/execution IDs, scope, focus and pending count.
+Reviewers decide what to inspect through normal workspace/file/Git tools. Startup
+reads scope metadata only: no full-file diff serialization, temporary artifacts,
+mandatory reading sequence, whole-patch sweep, incremental-diff tracking or
+approval certificate. No prior feedback history is replayed in the prompt. Human
+review diffs and file snapshots remain intact. Genuine client diff/review
+payloads retain explicit transport bounds; an oversized full review bootstrap
+reports an error and can be requested as metadata with individual project diffs.
 
-- `project_id = Some(review.project_id)`
-- `workspace_roots = project.roots`
-- read-only access mode
-- a compact reviewer prompt addressing a host-local `review.md` manifest;
-  no diff, file list, reviewer focus, or prior feedback is embedded in CLI arguments
-- per-file frozen diff artifacts with exact hunk-local changed-line coordinates;
-  the manifest records their root, staged/unstaged scope, and committed range
-- a separate `feedback.json` artifact for prior rounds and dispositions
-- the review-feedback MCP server so the reviewer can call
-  `propose_review_comment`
+Follow-ups reuse the same live reviewer/context when assignment, model, project
+roots, effective tools/permissions and steering remain unchanged. Each independent
+configured assignment retains its own context. Changed configuration, explicit
+closure or host restart invalidates context explicitly; provider failures do not
+silently switch or replace it. Failed live reviewers must be closed or their
+configuration explicitly changed before replacement. Parent closure closes its
+reviewer children. Manual reviewers remain independent.
 
-The reviewer proposes typed `ReviewLocation` values. The `root` in each
-location must be one of the project root paths present in the review diff.
-Review artifacts live in a private temporary directory on the host running the
-reviewer, outside the project. They belong to the live reviewer agent, not its
-first turn: completion, cancellation, and errors retain the snapshot so
-follow-up questions can reread it. Closing the agent removes the artifacts
-before its close notification; pre-spawn failures remove partial artifacts.
-The host runtime's `review_context_parent` defaults to the OS temporary
-directory. A path that cannot be encoded as UTF-8 fails that review cleanly
-without stopping the review worker. The manifest tells reviewers to read
-large artifacts in chunks and treats diff/feedback contents as untrusted data.
-Working-tree and index edits after launch do not change these artifacts; a
-committed review retains its exact base/tip OIDs and excludes working changes.
-There is no CLI-driven 512 KiB review limit. A failure to materialize the context
-still prevents launch and surfaces an error; context is never truncated to fit
-process arguments.
+A per-execution follow-up bridge attaches before the next input and ignores
+earlier-turn bootstrap history. Initial actors retain the Backend initial-prompt
+contract and use a typed startup-admission channel: review registration happens
+before the first provider turn. Initial attachment reads canonical bootstrap
+status/error (protocol 83), not transcript history. Fresh typing activity
+completes successive executions;
+errors, cancellation and closure remain failures. Finding proposals carry the
+execution ID, so delayed output from an older execution is rejected. Inputs wait
+on review-actor registration before reaching a reviewer; no lock or timer is used
+for that synchronization. No temporary reviewer artifacts are created.
+
+### Validating a review-tool upgrade before installation
+
+`./dev.sh check` builds both `tyde-server` and `tyde-dev-driver`. A validated
+candidate can run an isolated host with its own socket and every mutable store
+redirected to a temporary directory. Copy the user's review configuration and
+backend defaults unchanged; point its project at the complete workbench. Use the
+matching-version Tyde MCP bridge to spawn a requester, then invoke `tyde_review`
+with the configured default mode. This is the same canonical review operation,
+not a narrowed review or a separate reviewer implementation. Preserve its audit
+store through finding dispositions, and shut down the candidate after use.
+
+The running host's tools do not change when source files change. In particular,
+an older debug launcher's readiness client cannot handshake with a candidate
+whose protocol version changed. Use the checked matching-version bridge, not a
+weakened handshake, global host restart, transport-cap increase or truncated diff.
+Backend correctness remains covered directly through `Backend` conformance;
+scoped real-provider workbench exercises are integration QA, not conformance.
 
 ### Submit
 

@@ -38,6 +38,7 @@ impl ReviewHandle {
     pub(crate) async fn request_review(
         &self,
         caller: AgentId,
+        request_id: String,
         scope: protocol::ReviewAiScope,
         mode: Option<protocol::ReviewMode>,
     ) -> Result<Review, String> {
@@ -45,6 +46,7 @@ impl ReviewHandle {
         self.send(ReviewCommand::AgentRequest {
             mode,
             caller,
+            request_id,
             scope,
             reply,
         })
@@ -56,11 +58,13 @@ impl ReviewHandle {
 
     pub(crate) async fn edit_finding(
         &self,
+        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         body: String,
     ) -> Result<Review, String> {
         let (reply, response) = oneshot::channel();
         self.send(ReviewCommand::EditFinding {
+            caller,
             suggestion_id,
             body,
             reply,
@@ -71,18 +75,17 @@ impl ReviewHandle {
             .map_err(|_| "review comment edit dropped".to_owned())?
     }
 
-    pub(crate) async fn disposition(
+    pub(crate) async fn dispositions(
         &self,
-        suggestion_id: ReviewSuggestionId,
-        reason: String,
+        caller: AgentId,
+        updates: Vec<protocol::ReviewFindingDisposition>,
     ) -> Result<Review, String> {
         let (reply, response) = oneshot::channel();
-        self.send(ReviewCommand::Disposition {
-            suggestion_id,
-            reason,
+        self.send(ReviewCommand::Dispositions {
+            caller,
+            updates,
             reply,
-        })
-        .map_err(|_| "review stopped".to_owned())?;
+        })?;
         response
             .await
             .map_err(|_| "review disposition dropped".to_owned())?
@@ -91,10 +94,23 @@ impl ReviewHandle {
     pub(crate) async fn ai_reviewer_exited(
         &self,
         agent_id: AgentId,
+        execution_id: String,
         result: Result<(), String>,
     ) -> Result<(), String> {
-        self.send(ReviewCommand::AiReviewerExited { agent_id, result })
-            .map_err(|_| "project review owner stopped".to_owned())
+        self.send(ReviewCommand::AiReviewerExited {
+            agent_id,
+            execution_id,
+            result,
+        })
+        .map_err(|_| "project review owner stopped".to_owned())
+    }
+
+    pub(crate) async fn project_roots(&self) -> Result<Vec<protocol::ProjectRootPath>, String> {
+        let (reply, response) = oneshot::channel();
+        self.send(ReviewCommand::ProjectRoots { reply })?;
+        response
+            .await
+            .map_err(|_| "project review owner dropped roots response".to_owned())
     }
 
     pub(crate) async fn snapshot(&self) -> Result<Review, String> {
@@ -128,6 +144,9 @@ pub(crate) struct ReviewCreateRequest {
 }
 
 pub(crate) enum RegistryCommand {
+    ReviewerClosed {
+        agent_id: AgentId,
+    },
     RegisterProject {
         project_id: ProjectId,
         handle: ProjectStreamHandle,
@@ -162,7 +181,7 @@ pub(crate) enum RegistryCommand {
     },
     AiSuggestion {
         review_id: ReviewId,
-        suggestion: protocol::ReviewSuggestedComment,
+        suggestion: Box<protocol::ReviewSuggestedComment>,
         reply: oneshot::Sender<Result<Result<ReviewSuggestionId, ReviewErrorPayload>, String>>,
     },
     BundleConsumed {
@@ -215,6 +234,17 @@ impl ReviewRegistry {
                     } => {
                         owners.insert(review_id, project_id);
                     }
+                    RegistryCommand::ReviewerClosed { agent_id } => {
+                        for project in projects.values() {
+                            if let Err(error) =
+                                project.route_review_registry(RegistryCommand::ReviewerClosed {
+                                    agent_id: agent_id.clone(),
+                                })
+                            {
+                                tracing::warn!(%error, "failed to route reviewer closure");
+                            }
+                        }
+                    }
                     RegistryCommand::UnsubscribeAll { conn } => {
                         for project in projects.values() {
                             if let Err(error) =
@@ -246,7 +276,8 @@ impl ReviewRegistry {
                             | RegistryCommand::InternalError { review_id, .. } => {
                                 owners.get(review_id)
                             }
-                            RegistryCommand::RegisterProject { .. }
+                            RegistryCommand::ReviewerClosed { .. }
+                            | RegistryCommand::RegisterProject { .. }
                             | RegistryCommand::RegisterReview { .. }
                             | RegistryCommand::UnsubscribeAll { .. }
                             | RegistryCommand::DeleteForProject { .. } => None,
@@ -313,7 +344,8 @@ fn reject_registry_command(command: RegistryCommand, error: String) {
         RegistryCommand::DeleteForProject { reply, .. } => {
             let _ = reply.send(Err(error));
         }
-        RegistryCommand::RegisterProject { .. }
+        RegistryCommand::ReviewerClosed { .. }
+        | RegistryCommand::RegisterProject { .. }
         | RegistryCommand::RegisterReview { .. }
         | RegistryCommand::UnsubscribeAll { .. } => {
             tracing::warn!(%error, "invalid project review directory operation");
@@ -322,6 +354,24 @@ fn reject_registry_command(command: RegistryCommand, error: String) {
 }
 
 impl ReviewRegistryHandle {
+    pub(crate) fn reviewer_closed(&self, agent_id: AgentId) -> Result<(), String> {
+        self.tx
+            .send(RegistryCommand::ReviewerClosed { agent_id })
+            .map_err(|_| "Review directory stopped before reviewer closure".to_owned())
+    }
+
+    pub(crate) async fn project_reviews(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<Review>, String> {
+        let mut reviews = Vec::new();
+        for stored in self.runtime.store.list_for_project(&project_id).await? {
+            reviews.push(self.handle(stored.id).await?.snapshot().await?);
+        }
+        reviews.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        Ok(reviews)
+    }
+
     pub(crate) fn register_project(
         &self,
         project_id: ProjectId,
@@ -436,7 +486,7 @@ impl ReviewRegistryHandle {
         self.tx
             .send(RegistryCommand::AiSuggestion {
                 review_id,
-                suggestion,
+                suggestion: Box::new(suggestion),
                 reply,
             })
             .map_err(|_| "review registry stopped".to_owned())?;
@@ -521,6 +571,24 @@ impl ProjectReviews {
         {
             let mut changed = reset_running_ai_reviewer(&mut review);
             changed |= normalize_rehydrated_workspace_review(&mut review);
+            for finding in &mut review.suggestions {
+                if finding.execution_id.is_none() {
+                    let executions = review
+                        .ai_reviewer
+                        .rounds
+                        .iter()
+                        .filter(|r| {
+                            r.reviewers.iter().any(|member| {
+                                member.agent_id.as_ref() == Some(&finding.reviewer_agent_id)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if let [execution] = executions.as_slice() {
+                        finding.execution_id = Some(execution.id.clone());
+                        changed = true;
+                    }
+                }
+            }
             if changed {
                 owner.registry.runtime.store.upsert(review.clone()).await?;
             }
@@ -620,6 +688,11 @@ impl ProjectReviews {
 
     pub(crate) async fn handle_registry(&mut self, project: &Project, command: RegistryCommand) {
         match command {
+            RegistryCommand::ReviewerClosed { agent_id } => {
+                for state in self.reviews.values_mut() {
+                    state.reviewer_closed(agent_id.clone()).await;
+                }
+            }
             RegistryCommand::Create { request, reply } => {
                 let _ = reply.send(self.create(request).await);
             }
@@ -690,7 +763,7 @@ impl ProjectReviews {
                             }));
                         });
                         ReviewCommand::AiSuggestion {
-                            suggestion,
+                            suggestion: *suggestion,
                             reply: inner,
                         }
                     }

@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::now_ms;
-use crate::project_stream::{committed_range_commit_count, read_diff, root_is_git_repository};
+use crate::project_stream::{
+    GitAccessMode, build_diff, build_git_status, committed_range_commit_count,
+    ensure_json_payload_is_transportable, root_is_git_repository, run_git_mode,
+};
 use crate::review::bundle::ReviewFeedbackBundle;
 use crate::store::review::ReviewStore;
 use crate::stream::Stream;
@@ -62,9 +65,9 @@ pub(crate) struct ReviewLaunchOptions {
 pub(crate) struct ReviewAiSpawnRequest {
     pub mode: Option<protocol::ReviewMode>,
     pub review_id: ReviewId,
-    /// Only the selected scope is materialized for the reviewer to read.
     pub review: Review,
-    pub snapshot_id: String,
+    pub roots: Vec<ProjectRootPath>,
+    pub execution_id: String,
     pub scope: protocol::ReviewAiScope,
     pub backend_kind: Option<protocol::BackendKind>,
     pub cost_hint: Option<protocol::SpawnCostHint>,
@@ -83,17 +86,19 @@ pub(crate) enum ReviewCommand {
     AgentRequest {
         mode: Option<protocol::ReviewMode>,
         caller: AgentId,
+        request_id: String,
         scope: protocol::ReviewAiScope,
         reply: oneshot::Sender<Result<Review, String>>,
     },
     EditFinding {
+        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         body: String,
         reply: oneshot::Sender<Result<Review, String>>,
     },
-    Disposition {
-        suggestion_id: ReviewSuggestionId,
-        reason: String,
+    Dispositions {
+        caller: AgentId,
+        updates: Vec<protocol::ReviewFindingDisposition>,
         reply: oneshot::Sender<Result<Review, String>>,
     },
     Subscribe {
@@ -112,6 +117,7 @@ pub(crate) enum ReviewCommand {
     },
     AiReviewerExited {
         agent_id: AgentId,
+        execution_id: String,
         result: Result<(), String>,
     },
     BundleConsumed {
@@ -122,6 +128,9 @@ pub(crate) enum ReviewCommand {
     InternalError {
         message: String,
         context: ReviewErrorContext,
+    },
+    ProjectRoots {
+        reply: oneshot::Sender<Vec<ProjectRootPath>>,
     },
     Snapshot {
         reply: oneshot::Sender<Review>,
@@ -146,9 +155,10 @@ pub(crate) struct ReviewState {
     changes: watch::Sender<()>,
     changed: bool,
     pending_ai: Option<PendingAiStartup>,
+    active_ai_cancellation: Option<CancellationToken>,
     pending_delivery: Option<(Uuid, ConnectionId)>,
     deferred: VecDeque<ReviewCommand>,
-    early_exits: Vec<(AgentId, Result<(), String>)>,
+    early_exits: Vec<(AgentId, String, Result<(), String>)>,
 }
 
 #[derive(Clone)]
@@ -159,11 +169,12 @@ struct ReviewSubscriber {
 
 struct PendingAiStartup {
     operation: Uuid,
+    mode: Option<protocol::ReviewMode>,
     conn: ConnectionId,
-    snapshot_id: String,
     scope: protocol::ReviewAiScope,
     requested_by: Option<AgentId>,
-    reply: Option<oneshot::Sender<Result<Review, String>>>,
+    request_id: Option<String>,
+    replies: Vec<oneshot::Sender<Result<Review, String>>>,
     accepted: Option<oneshot::Sender<bool>>,
     cancellation: CancellationToken,
 }
@@ -173,7 +184,7 @@ impl Drop for PendingAiStartup {
         if self.accepted.is_some() {
             self.cancellation.cancel();
         }
-        if let Some(reply) = self.reply.take() {
+        for reply in self.replies.drain(..) {
             let _ = reply.send(Err("Review startup was cancelled".to_owned()));
         }
     }
@@ -203,6 +214,7 @@ impl ReviewState {
             changes,
             changed: false,
             pending_ai: None,
+            active_ai_cancellation: None,
             pending_delivery: None,
             deferred: VecDeque::new(),
             early_exits: Vec::new(),
@@ -222,6 +234,7 @@ impl ReviewState {
             && !matches!(
                 command,
                 ReviewCommand::Snapshot { .. }
+                    | ReviewCommand::ProjectRoots { .. }
                     | ReviewCommand::Subscribe { .. }
                     | ReviewCommand::Delivered { .. }
                     | ReviewCommand::InternalError { .. }
@@ -234,43 +247,82 @@ impl ReviewState {
             ReviewCommand::AgentRequest {
                 mode,
                 caller,
+                request_id,
                 scope,
                 reply,
             } => {
-                let already_pending = self.pending_ai.is_some();
-                self.start_ai_review(
-                    project,
-                    ReviewLaunchOptions {
-                        mode,
-                        backend_kind: None,
-                        cost_hint: None,
-                        instructions: None,
-                    },
-                    scope,
-                    StreamPath(format!("/review-request/{}", caller.0)),
-                    Some(caller),
-                )
-                .await;
-                if !already_pending && let Some(pending) = self.pending_ai.as_mut() {
-                    pending.reply = Some(reply);
+                if request_id.trim().is_empty() || request_id.len() > 128 {
+                    let _ = reply.send(Err("request_id must contain 1–128 bytes".to_owned()));
+                    return;
+                }
+                if let Some(execution) = self.review.ai_reviewer.rounds.iter().find(|r| {
+                    r.requested_by.as_ref() == Some(&caller)
+                        && r.request_id.as_ref() == Some(&request_id)
+                }) {
+                    let result = if execution.scope == scope
+                        && mode.is_none_or(|m| execution.mode == Some(m))
+                    {
+                        Ok(self.review.clone())
+                    } else {
+                        Err("request_id was already used with different review options".to_owned())
+                    };
+                    let _ = reply.send(result);
+                    return;
+                }
+                if let Some(pending) = self.pending_ai.as_mut() {
+                    if pending.requested_by.as_ref() == Some(&caller)
+                        && pending.request_id.as_ref() == Some(&request_id)
+                        && pending.scope == scope
+                        && (mode.is_none() || pending.mode == mode)
+                    {
+                        pending.replies.push(reply);
+                    } else {
+                        let _ = reply.send(Err("Another review is starting".to_owned()));
+                    }
+                    return;
+                }
+                if let Err(message) = self
+                    .start_ai_review(
+                        project,
+                        ReviewLaunchOptions {
+                            mode,
+                            backend_kind: None,
+                            cost_hint: None,
+                            instructions: None,
+                        },
+                        scope,
+                        StreamPath(format!("/review-request/{}", caller.0)),
+                        Some(caller),
+                    )
+                    .await
+                {
+                    let _ = reply.send(Err(message));
+                    return;
+                }
+                if let Some(pending) = self.pending_ai.as_mut() {
+                    pending.request_id = Some(request_id);
+                    pending.replies.push(reply);
                 } else {
-                    let _ = reply.send(Err("Review did not start: check for an active review or an empty/invalid diff scope".to_owned()));
+                    let _ = reply.send(Err(
+                        "Review startup returned without a pending execution".to_owned()
+                    ));
                 }
             }
             ReviewCommand::EditFinding {
+                caller,
                 suggestion_id,
                 body,
                 reply,
             } => {
-                let result = self.edit_finding(suggestion_id, body).await;
+                let result = self.edit_finding(caller, suggestion_id, body).await;
                 let _ = reply.send(result);
             }
-            ReviewCommand::Disposition {
-                suggestion_id,
-                reason,
+            ReviewCommand::Dispositions {
+                caller,
+                updates,
                 reply,
             } => {
-                let result = self.record_disposition(suggestion_id, reason).await;
+                let result = self.record_dispositions(caller, updates).await;
                 let _ = reply.send(result);
             }
 
@@ -290,11 +342,16 @@ impl ReviewState {
                 let result = self.handle_ai_suggestion(project, suggestion).await;
                 let _ = reply.send(result);
             }
-            ReviewCommand::AiReviewerExited { agent_id, result } => {
+            ReviewCommand::AiReviewerExited {
+                agent_id,
+                execution_id,
+                result,
+            } => {
                 if self.pending_ai.is_some() {
-                    self.early_exits.push((agent_id, result));
+                    self.early_exits.push((agent_id, execution_id, result));
                 } else {
-                    self.handle_ai_reviewer_exited(agent_id, result).await;
+                    self.handle_ai_reviewer_exited(agent_id, execution_id, result)
+                        .await;
                 }
             }
             ReviewCommand::BundleConsumed {
@@ -309,6 +366,9 @@ impl ReviewState {
             ReviewCommand::InternalError { message, context } => {
                 self.send_error(None, ReviewErrorCode::Internal, message, false, context)
                     .await;
+            }
+            ReviewCommand::ProjectRoots { reply } => {
+                let _ = reply.send(project.root_paths());
             }
             ReviewCommand::Snapshot { reply } => {
                 let _ = reply.send(self.review.clone());
@@ -355,10 +415,16 @@ impl ReviewState {
             self.refresh_diffs_inner(project, self.pending_delivery.is_some())
                 .await?;
         }
-        let payload = serde_json::to_value(ReviewBootstrapPayload {
+        let payload = ReviewBootstrapPayload {
             review: review_for_subscriber(&self.review, effective_include_diffs),
-        })
-        .map_err(|error| format!("failed to serialize ReviewBootstrap payload: {error}"))?;
+        };
+        ensure_json_payload_is_transportable(&payload, "review bootstrap").map_err(|message| {
+            format!(
+                "{message}; subscribe with include_diffs=false and read individual project diffs"
+            )
+        })?;
+        let payload = serde_json::to_value(payload)
+            .map_err(|error| format!("failed to serialize ReviewBootstrap payload: {error}"))?;
         stream
             .send_value(FrameKind::ReviewBootstrap, payload)
             .map_err(|_| "review stream closed".to_owned())?;
@@ -397,9 +463,12 @@ impl ReviewState {
         }
         match action {
             ReviewActionPayload::StopAiReview => {
+                if let Some(cancellation) = self.active_ai_cancellation.take() {
+                    cancellation.cancel();
+                }
                 if let Some(mut pending) = self.pending_ai.take() {
                     pending.cancellation.cancel();
-                    if let Some(reply) = pending.reply.take() {
+                    for reply in pending.replies.drain(..) {
                         let _ = reply.send(Err("Review cancelled by user".to_owned()));
                     }
                     self.early_exits.clear();
@@ -453,19 +522,20 @@ impl ReviewState {
                 instructions,
                 scope,
             } => {
-                self.start_ai_review(
-                    project,
-                    ReviewLaunchOptions {
-                        mode,
-                        backend_kind,
-                        cost_hint,
-                        instructions,
-                    },
-                    scope,
-                    conn,
-                    None,
-                )
-                .await;
+                let _ = self
+                    .start_ai_review(
+                        project,
+                        ReviewLaunchOptions {
+                            mode,
+                            backend_kind,
+                            cost_hint,
+                            instructions,
+                        },
+                        scope,
+                        conn,
+                        None,
+                    )
+                    .await;
             }
             ReviewActionPayload::Submit { target } => {
                 self.submit(project, target, conn).await;
@@ -875,7 +945,7 @@ impl ReviewState {
         scope: protocol::ReviewAiScope,
         conn: ConnectionId,
         requested_by: Option<AgentId>,
-    ) {
+    ) -> Result<(), String> {
         let ReviewLaunchOptions {
             mode,
             backend_kind,
@@ -911,7 +981,7 @@ impl ReviewState {
             "starting AI review"
         );
         if !self.ensure_draft(&conn, context.clone()).await {
-            return;
+            return Err("review is not in draft status".to_owned());
         }
         if self.pending_ai.is_some()
             || matches!(
@@ -927,50 +997,49 @@ impl ReviewState {
                 context,
             )
             .await;
-            return;
+            return Err("AI reviewer is already running".to_owned());
         }
-        if !self
-            .refresh_diffs_or_error(project, Some(&conn), context.clone())
-            .await
-        {
-            return;
-        }
-        let prompt_diffs = match &scope {
-            protocol::ReviewAiScope::WorkingTree => self
-                .review
-                .diffs
-                .iter()
-                .filter(|diff| matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree))
-                .cloned()
-                .collect::<Vec<_>>(),
+        let reviewable = match &scope {
+            protocol::ReviewAiScope::WorkingTree => {
+                build_git_status(project).map(|status| status.roots.iter().any(|root| !root.clean))
+            }
             protocol::ReviewAiScope::CommittedRange {
                 root,
                 base_oid,
                 tip_oid,
-            } => {
-                if let Err(message) = self
-                    .ensure_committed_diff(project, root, base_oid, tip_oid)
-                    .await
-                {
-                    self.send_error(
-                        Some(&conn),
-                        ReviewErrorCode::InvalidLocation,
-                        message,
-                        false,
-                        context,
+            } => committed_range_commit_count(project, root, base_oid, tip_oid)
+                .and_then(|_| {
+                    run_git_mode(
+                        &root.0,
+                        &[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--name-only",
+                            base_oid,
+                            tip_oid,
+                            "--",
+                        ],
+                        GitAccessMode::ReadOnly,
                     )
-                    .await;
-                    return;
-                }
-                self.review
-                    .diffs
-                    .iter()
-                    .filter(|diff| committed_payload_matches(diff, root, base_oid, tip_oid))
-                    .cloned()
-                    .collect::<Vec<_>>()
+                })
+                .map(|paths| !paths.is_empty()),
+        };
+        let reviewable = match reviewable {
+            Ok(reviewable) => reviewable,
+            Err(message) => {
+                self.send_error(
+                    Some(&conn),
+                    ReviewErrorCode::GitFailed,
+                    message.clone(),
+                    false,
+                    context,
+                )
+                .await;
+                return Err(message);
             }
         };
-        if diff_is_clean(&prompt_diffs) {
+        if !reviewable {
             let message = match &scope {
                 protocol::ReviewAiScope::WorkingTree => {
                     "nothing to review: workspace has no uncommitted changes"
@@ -978,37 +1047,28 @@ impl ReviewState {
                 protocol::ReviewAiScope::CommittedRange { .. } => {
                     "nothing to review: the committed range has no file changes"
                 }
-            };
-            tracing::info!(
-                review_id = %self.review.id,
-                conn = %conn,
-                scope = ?scope,
-                "AI review skipped because the scope has no changed files"
-            );
+            }
+            .to_owned();
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::InvalidStatus,
-                message.to_owned(),
+                message.clone(),
                 false,
                 context,
             )
             .await;
-            return;
+            return Err(message);
         }
-        let mut review_for_prompt = self.review.clone();
-        review_for_prompt.diffs = prompt_diffs;
+        let review_for_prompt = review_for_subscriber(&self.review, false);
 
         let (reply, response) = oneshot::channel();
         let (accepted, acceptance) = oneshot::channel();
         let operation = Uuid::new_v4();
         let cancellation = CancellationToken::new();
-        let snapshot_id = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&review_for_prompt.diffs).expect("diffs serialize"))
-        );
         let request = ReviewAiSpawnRequest {
             mode,
-            snapshot_id: snapshot_id.clone(),
+            roots: project.root_paths(),
+            execution_id: operation.to_string(),
             review_id: self.review.id.clone(),
             review: review_for_prompt,
             scope: scope.clone(),
@@ -1023,11 +1083,12 @@ impl ReviewState {
         };
         self.pending_ai = Some(PendingAiStartup {
             operation,
+            mode,
             conn,
-            snapshot_id,
             scope,
             requested_by,
-            reply: None,
+            request_id: None,
+            replies: Vec::new(),
             accepted: Some(accepted),
             cancellation,
         });
@@ -1043,6 +1104,7 @@ impl ReviewState {
             };
             let _ = handle.send(ReviewCommand::AiStarted { operation, result });
         });
+        Ok(())
     }
 
     async fn complete_ai_startup(
@@ -1076,8 +1138,9 @@ impl ReviewState {
                 let mut rounds = self.review.ai_reviewer.rounds.clone();
                 rounds.push(protocol::ReviewRound {
                     mode: Some(mode),
-                    snapshot_id: pending.snapshot_id.clone(),
-                    id: Uuid::new_v4().to_string(),
+                    snapshot_id: None,
+                    id: operation.to_string(),
+                    request_id: pending.request_id.clone(),
                     scope: pending.scope.clone(),
                     started_at_ms: now_ms(),
                     requested_by: pending.requested_by.clone(),
@@ -1096,6 +1159,7 @@ impl ReviewState {
                 if !self.persist_or_revert(previous, Some(&conn), context).await {
                     return;
                 }
+                self.active_ai_cancellation = Some(pending.cancellation.clone());
                 if let Some(accepted) = pending.accepted.take() {
                     let _ = accepted.send(true);
                 }
@@ -1140,10 +1204,11 @@ impl ReviewState {
             }
         }
         let early_exits = std::mem::take(&mut self.early_exits);
-        for (agent_id, result) in early_exits {
-            self.handle_ai_reviewer_exited(agent_id, result).await;
+        for (agent_id, execution_id, result) in early_exits {
+            self.handle_ai_reviewer_exited(agent_id, execution_id, result)
+                .await;
         }
-        if let Some(reply) = pending.reply.take() {
+        for reply in pending.replies.drain(..) {
             let result = if succeeded {
                 Ok(self.review.clone())
             } else {
@@ -1426,10 +1491,11 @@ impl ReviewState {
             self.review.ai_reviewer.status,
             ReviewAiReviewerStatus::Running
         ) || !self.review.ai_reviewer.rounds.last().is_some_and(|round| {
-            round.reviewers.iter().any(|r| {
-                r.agent_id.as_ref() == Some(&suggestion.reviewer_agent_id)
-                    && r.status == ReviewAiReviewerStatus::Running
-            })
+            suggestion.execution_id.as_ref() == Some(&round.id)
+                && round.reviewers.iter().any(|r| {
+                    r.agent_id.as_ref() == Some(&suggestion.reviewer_agent_id)
+                        && r.status == ReviewAiReviewerStatus::Running
+                })
         }) {
             let error = review_error(
                 ReviewErrorCode::InvalidStatus,
@@ -1554,6 +1620,7 @@ impl ReviewState {
 
     async fn edit_finding(
         &mut self,
+        caller: AgentId,
         suggestion_id: ReviewSuggestionId,
         body: String,
     ) -> Result<Review, String> {
@@ -1586,7 +1653,16 @@ impl ReviewState {
         };
         let previous = self.review.clone();
         let now = now_ms();
-        self.review.suggestions[index].body = body.clone();
+        let finding = &mut self.review.suggestions[index];
+        finding.audit.push(protocol::ReviewFindingAuditEntry {
+            at_ms: now,
+            actor_agent_id: caller,
+            change: protocol::ReviewFindingChange::TextEdited {
+                previous_body: finding.body.clone(),
+                body: body.clone(),
+            },
+        });
+        finding.body = body.clone();
         let suggestion = self.review.suggestions[index].clone();
         let comment = comment_index.map(|index| {
             let comment = &mut self.review.comments[index];
@@ -1620,78 +1696,134 @@ impl ReviewState {
         Ok(self.review.clone())
     }
 
-    async fn record_disposition(
+    async fn record_dispositions(
         &mut self,
-        suggestion_id: ReviewSuggestionId,
-        reason: String,
+        caller: AgentId,
+        updates: Vec<protocol::ReviewFindingDisposition>,
     ) -> Result<Review, String> {
-        if reason.trim().is_empty() {
-            return Err("A concrete reason is required".to_owned());
+        if updates.is_empty() || updates.len() > 100 {
+            return Err("Supply 1–100 dispositions".to_owned());
         }
-        let suggestion = self
-            .review
-            .suggestions
-            .iter()
-            .find(|s| s.id == suggestion_id)
-            .ok_or_else(|| "Unknown finding".to_owned())?;
+        let mut selected = Vec::new();
+        for update in &updates {
+            if update.reason.trim().is_empty() {
+                return Err("A concrete reason is required".to_owned());
+            }
+            let index = self
+                .review
+                .suggestions
+                .iter()
+                .position(|s| s.id == update.finding_id)
+                .ok_or_else(|| "Unknown finding".to_owned())?;
+            if selected.iter().any(|(i, _)| *i == index) {
+                return Err("Duplicate finding ID".to_owned());
+            }
+            let finding = &self.review.suggestions[index];
+            let execution = match &finding.execution_id {
+                Some(id) => self
+                    .review
+                    .ai_reviewer
+                    .rounds
+                    .iter()
+                    .position(|r| &r.id == id),
+                None => {
+                    let matches = self
+                        .review
+                        .ai_reviewer
+                        .rounds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| {
+                            r.reviewers.iter().any(|reviewer| {
+                                reviewer.agent_id.as_ref() == Some(&finding.reviewer_agent_id)
+                            })
+                        })
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        matches.first().copied()
+                    } else {
+                        None
+                    }
+                }
+            }
+            .ok_or_else(|| "Finding has no unambiguous execution attribution".to_owned())?;
+            selected.push((index, execution));
+        }
         let previous = self.review.clone();
-        let round = self
-            .review
-            .ai_reviewer
-            .rounds
-            .iter_mut()
-            .find(|r| {
-                r.reviewers.iter().any(|reviewer| {
-                    reviewer.agent_id.as_ref() == Some(&suggestion.reviewer_agent_id)
-                })
-            })
-            .ok_or_else(|| "Finding has no review round".to_owned())?;
-        round
-            .dispositions
-            .insert(suggestion_id.0.clone(), reason.trim().to_owned());
-        let resolved = self
-            .review
-            .suggestions
-            .iter_mut()
-            .find(|s| s.id == suggestion_id && matches!(s.state, ReviewSuggestionState::Pending))
-            .map(|suggestion| {
-                suggestion.state = ReviewSuggestionState::Resolved;
-                suggestion.clone()
+        let now = now_ms();
+        for (update, (index, execution)) in updates.into_iter().zip(selected) {
+            let finding = &mut self.review.suggestions[index];
+            let reason = update.reason.trim().to_owned();
+            self.review.ai_reviewer.rounds[execution]
+                .dispositions
+                .insert(finding.id.0.clone(), reason.clone());
+            finding.audit.push(protocol::ReviewFindingAuditEntry {
+                at_ms: now,
+                actor_agent_id: caller.clone(),
+                change: protocol::ReviewFindingChange::Resolved { reason },
             });
-        self.review.updated_at_ms = now_ms();
+            if finding.state == ReviewSuggestionState::Pending {
+                finding.state = ReviewSuggestionState::Resolved;
+            }
+        }
+        self.review.updated_at_ms = now;
         if !self
-            .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
+            .persist_or_revert(previous.clone(), None, ReviewErrorContext::StartAiReview)
             .await
         {
-            return Err("Failed to save disposition".to_owned());
+            return Err("Failed to save dispositions".to_owned());
         }
         self.broadcast(ReviewEventPayload::AiReviewerChanged {
             state: self.review.ai_reviewer.clone(),
         })
         .await;
-        if let Some(suggestion) = resolved {
-            self.broadcast(ReviewEventPayload::SuggestionUpsert { suggestion })
+        for finding in self.review.suggestions.clone() {
+            if previous.suggestions.iter().find(|s| s.id == finding.id) != Some(&finding) {
+                self.broadcast(ReviewEventPayload::SuggestionUpsert {
+                    suggestion: finding,
+                })
                 .await;
-            self.notify_project_changed();
+            }
         }
-        tracing::debug!(
-            review_id = %self.review.id,
-            "recorded project review disposition"
-        );
+        self.notify_project_changed();
         Ok(self.review.clone())
     }
 
-    async fn handle_ai_reviewer_exited(&mut self, agent_id: AgentId, result: Result<(), String>) {
+    pub(crate) async fn reviewer_closed(&mut self, agent_id: AgentId) {
+        let result = Err("Reviewer closed before completion".to_owned());
+        if let Some(pending) = &self.pending_ai {
+            self.early_exits
+                .push((agent_id, pending.operation.to_string(), result));
+        } else if let Some(execution) = self.review.ai_reviewer.rounds.last() {
+            self.handle_ai_reviewer_exited(agent_id, execution.id.clone(), result)
+                .await;
+        }
+    }
+
+    async fn handle_ai_reviewer_exited(
+        &mut self,
+        agent_id: AgentId,
+        execution_id: String,
+        result: Result<(), String>,
+    ) {
         if self.review.ai_reviewer.status != ReviewAiReviewerStatus::Running {
             return;
         }
         let previous = self.review.clone();
-        let Some(reviewer) = self.review.ai_reviewer.rounds.last_mut().and_then(|round| {
-            round
-                .reviewers
-                .iter_mut()
-                .find(|r| r.agent_id.as_ref() == Some(&agent_id))
-        }) else {
+        let Some(reviewer) = self
+            .review
+            .ai_reviewer
+            .rounds
+            .last_mut()
+            .filter(|round| round.id == execution_id)
+            .and_then(|round| {
+                round
+                    .reviewers
+                    .iter_mut()
+                    .find(|r| r.agent_id.as_ref() == Some(&agent_id))
+            })
+        else {
             return;
         };
         if reviewer.status != ReviewAiReviewerStatus::Running {
@@ -1743,7 +1875,12 @@ impl ReviewState {
             .iter()
             .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {}", r.name, e)))
             .collect::<Vec<_>>();
-        self.review.ai_reviewer.status = if errors.is_empty() {
+        self.review.ai_reviewer.status = if !round.reviewers.is_empty()
+            && round
+                .reviewers
+                .iter()
+                .all(|r| r.status == ReviewAiReviewerStatus::Completed)
+        {
             ReviewAiReviewerStatus::Completed
         } else {
             ReviewAiReviewerStatus::Failed
@@ -1849,6 +1986,9 @@ impl ReviewState {
         context: ReviewErrorContext,
     ) -> bool {
         self.pending_ai.take();
+        if let Some(cancellation) = self.active_ai_cancellation.take() {
+            cancellation.cancel();
+        }
         self.early_exits.clear();
         let previous = self.review.clone();
         self.review.status = ReviewStatus::Draft;
@@ -2069,7 +2209,7 @@ impl ReviewState {
             return Ok(());
         }
         committed_range_commit_count(project, root, base_oid, tip_oid)?;
-        let diff = read_diff(
+        let diff = build_diff(
             project,
             ProjectReadDiffPayload {
                 request_id: None,
@@ -2230,6 +2370,19 @@ impl ReviewState {
         stream: &Stream,
         payload: ReviewEventPayload,
     ) -> Result<(), String> {
+        let payload = match ensure_json_payload_is_transportable(&payload, "review event") {
+            Ok(()) => payload,
+            Err(message) => ReviewEventPayload::Error {
+                error: review_error(
+                    ReviewErrorCode::Internal,
+                    format!(
+                        "{message}; use a metadata review subscription and individual project diffs"
+                    ),
+                    false,
+                    ReviewErrorContext::Transport,
+                ),
+            },
+        };
         let event_kind = payload.kind_name();
         let payload = serde_json::to_value(&payload).map_err(|err| {
             tracing::warn!(
@@ -2573,7 +2726,7 @@ fn read_review_diffs(
                     context_mode: DiffContextMode::FullFile,
                     out_of_band: false,
                 };
-                diffs.push(read_diff(project, unstaged)?);
+                diffs.push(build_diff(project, unstaged)?);
                 let staged = ProjectReadDiffPayload {
                     request_id: None,
                     root,
@@ -2583,7 +2736,7 @@ fn read_review_diffs(
                     context_mode: DiffContextMode::FullFile,
                     out_of_band: false,
                 };
-                let staged = read_diff(project, staged)?;
+                let staged = build_diff(project, staged)?;
                 if !staged.files.is_empty() {
                     diffs.push(staged);
                 }
@@ -2603,7 +2756,7 @@ fn read_review_diffs(
                 context_mode: DiffContextMode::FullFile,
                 out_of_band: false,
             };
-            let mut diffs = vec![read_diff(project, unstaged)?];
+            let mut diffs = vec![build_diff(project, unstaged)?];
             let staged = ProjectReadDiffPayload {
                 request_id: None,
                 root: root.clone(),
@@ -2613,7 +2766,7 @@ fn read_review_diffs(
                 context_mode: DiffContextMode::FullFile,
                 out_of_band: false,
             };
-            let staged = read_diff(project, staged)?;
+            let staged = build_diff(project, staged)?;
             if !staged.files.is_empty() {
                 diffs.push(staged);
             }
@@ -2624,7 +2777,7 @@ fn read_review_diffs(
             base_oid,
             tip_oid,
             ..
-        } => read_diff(
+        } => build_diff(
             project,
             ProjectReadDiffPayload {
                 request_id: None,
@@ -2791,10 +2944,6 @@ fn referenced_committed_diffs(review: &Review) -> Vec<ProjectGitDiffPayload> {
         })
         .cloned()
         .collect()
-}
-
-fn diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
-    diffs.iter().all(|diff| diff.files.is_empty())
 }
 
 fn unstaged_diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {

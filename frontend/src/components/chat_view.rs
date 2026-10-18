@@ -4064,6 +4064,8 @@ mod wasm_tests {
 
     fn tycode_constructor_only_bootstrap() -> AgentBootstrapPayload {
         AgentBootstrapPayload {
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
             events: vec![
                 AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(tycode_terminal_message())),
                 AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
@@ -4086,6 +4088,8 @@ mod wasm_tests {
             ChatEvent::TypingStatusChanged(false),
         ));
         AgentBootstrapPayload {
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
             events,
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,

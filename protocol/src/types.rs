@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 82;
+pub const PROTOCOL_VERSION: u32 = 83;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -373,7 +373,7 @@ impl fmt::Display for ReviewCommentId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ReviewSuggestionId(pub String);
 
@@ -2292,6 +2292,8 @@ pub struct AgentsViewPreferencesNotifyPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentBootstrapPayload {
+    pub status: AgentControlStatus,
+    pub error: Option<String>,
     pub events: Vec<AgentBootstrapEvent>,
     pub latest_output: AgentControlOutput,
     /// Authoritative activity after replaying `events`.
@@ -6823,7 +6825,49 @@ pub struct ReviewSuggestedComment {
     pub severity: ReviewSeverity,
     pub state: ReviewSuggestionState,
     pub reviewer_agent_id: AgentId,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub audit: Vec<ReviewFindingAuditEntry>,
     pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCompletionStatus {
+    Completed,
+    Incomplete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewToolSummary {
+    pub review_id: ReviewId,
+    pub status: ReviewCompletionStatus,
+    pub new_finding_count: usize,
+    pub outstanding_count: usize,
+    pub failed_reviewer_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFindingAuditEntry {
+    pub at_ms: u64,
+    pub actor_agent_id: AgentId,
+    pub change: ReviewFindingChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewFindingChange {
+    TextEdited { previous_body: String, body: String },
+    Resolved { reason: String },
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingDisposition {
+    pub finding_id: ReviewSuggestionId,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -6941,6 +6985,10 @@ pub enum ReviewReviewerTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewReviewerRun {
     #[serde(default)]
+    pub context_key: Option<String>,
+    #[serde(default)]
+    pub reused_context: bool,
+    #[serde(default)]
     pub reviewer_id: Option<ReviewReviewerId>,
     #[serde(default)]
     pub target: Option<ReviewReviewerTarget>,
@@ -6958,9 +7006,12 @@ pub struct ReviewReviewerRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRound {
     #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
     pub mode: Option<ReviewMode>,
     pub id: String,
-    pub snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
     pub scope: ReviewAiScope,
     pub started_at_ms: u64,
     pub requested_by: Option<AgentId>,
@@ -7199,6 +7250,7 @@ impl ReviewErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewErrorContext {
+    Transport,
     AddComment,
     UpdateComment { comment_id: ReviewCommentId },
     DeleteComment { comment_id: ReviewCommentId },
@@ -7213,6 +7265,7 @@ pub enum ReviewErrorContext {
 impl ReviewErrorContext {
     pub const fn kind_name(&self) -> &'static str {
         match self {
+            Self::Transport => "transport",
             Self::AddComment => "add_comment",
             Self::UpdateComment { .. } => "update_comment",
             Self::DeleteComment { .. } => "delete_comment",

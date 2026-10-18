@@ -157,7 +157,8 @@ pub(crate) fn resolve_spawn_config(
         SpawnCustomization::Reviewer { instructions } => {
             resolved.instructions = Some(instructions.clone());
             resolved.tool_policy = crate::review::reviewer::reviewer_tool_policy();
-            resolved.access_mode = BackendAccessMode::ReadOnly;
+            resolved.access_mode = BackendAccessMode::EnforcedReadOnly;
+            resolved.excluded_tool_categories = vec![protocol::ToolCategory::AgentDelegation];
         }
     }
     resolved.builtin_steering = crate::backend::builtin_steering_for_tools(

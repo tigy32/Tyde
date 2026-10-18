@@ -230,7 +230,7 @@ fn assert_project_manager_and_lander(builtins: &HashMap<CustomAgentId, CustomAge
         "Project Manager must delegate, cap concurrency, and serialize landing"
     );
     assert!(
-        implementer_text.contains("`tyde_request_review` in its default mode")
+        implementer_text.contains("`tyde_review` in its default mode")
             && implementer_text.contains("You do not land it on `main`; the Lander does")
             && implementer_text.contains("Stay available"),
         "the Implementer agent type must carry the review-then-ready workflow"

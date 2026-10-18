@@ -751,8 +751,6 @@ struct AgentEntry {
     status_handle: AgentStatusHandle,
     access_mode: BackendAccessMode,
     parent_agent_id: Option<AgentId>,
-    // A completed review still has a live chat that can reread its snapshot.
-    review_context: Option<tempfile::TempDir>,
 }
 
 impl AgentRegistry {
@@ -846,7 +844,6 @@ impl AgentRegistry {
                 status_handle,
                 access_mode,
                 parent_agent_id: start.parent_agent_id.clone(),
-                review_context: None,
             },
         );
         assert!(
@@ -906,7 +903,6 @@ impl AgentRegistry {
                 status_handle,
                 access_mode: BackendAccessMode::Unrestricted,
                 parent_agent_id: start.parent_agent_id.clone(),
-                review_context: None,
             },
         );
         assert!(
@@ -916,27 +912,6 @@ impl AgentRegistry {
         );
 
         SpawnedRelayAgent { start, handle }
-    }
-
-    pub fn retain_review_context(
-        &mut self,
-        agent_id: &AgentId,
-        context: tempfile::TempDir,
-    ) -> Option<AgentHandle> {
-        let entry = self.agents.get_mut(agent_id)?;
-        if entry.handle.is_closing() {
-            return None;
-        }
-        assert!(
-            entry.review_context.is_none(),
-            "review context already registered"
-        );
-        entry.review_context = Some(context);
-        Some(entry.handle.clone())
-    }
-
-    pub fn take_review_context(&mut self, agent_id: &AgentId) -> Option<tempfile::TempDir> {
-        self.agents.get_mut(agent_id)?.review_context.take()
     }
 
     pub fn remove_agent(&mut self, agent_id: &AgentId) -> Option<AgentHandle> {

@@ -1629,6 +1629,8 @@ mod wasm_tests {
                 let mut target_location = location();
                 target_location.target = target;
                 review.suggestions.push(ReviewSuggestedComment {
+                    execution_id: None,
+                    audit: Vec::new(),
                     id: ReviewSuggestionId(id.to_owned()),
                     location: target_location,
                     anchor_status: ReviewAnchorStatus::Current,

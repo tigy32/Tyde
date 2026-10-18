@@ -1997,6 +1997,137 @@ async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AgentDelegation];
+    let directory = tempfile::tempdir().expect("review metadata outside the read-only workspace");
+    let script = directory.path().join("probe.py");
+    let journal = directory.path().join("calls.jsonl");
+    let mut source = mcp_probe_script().replace(MCP_TOOL_NAME, "propose_review_comment");
+    let boundary = "    elif method == \"tools/call\":";
+    source = source.replace(boundary, &format!("        result[\"tools\"].append(dict(result[\"tools\"][0], name=\"read_review_git\"))\n{boundary}"));
+    source = source.replace("    method = request.get(\"method\")", "    method = request.get(\"method\")\n    with open(journal + \".methods\", \"a\") as handle: handle.write(method + \"\\n\")");
+    source = source.replace("        value = str(arguments.get(\"value\", \"\"))", "        value = str(arguments.get(\"value\", \"\"))\n        if value == \"CLOSE_REVIEW_TRANSPORT\": sys.exit(0)");
+    std::fs::write(&script, source).expect("write review MCP probe");
+    install_mcp_server(
+        host,
+        "tyde-review-feedback",
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let values = [unique_payload(), unique_payload()];
+    let prompt = |value: &str| {
+        format!(
+            "Call read_review_git and then propose_review_comment on the configured tyde-review-feedback MCP server, each exactly once with value {}. These test tools only read/record review metadata, never edit workspace files. Do not use shell, delegation or other tools. Briefly acknowledge the returned text.",
+            serde_json::to_string(value).expect("encode probe value")
+        )
+    };
+    let first_prompt = prompt(&values[0]);
+    let agent = spawn_agent(host, &first_prompt).await;
+    let first = collect_turn(host, &agent, &first_prompt).await;
+    let second = ask(host, &agent, prompt(&values[1])).await;
+    eprintln!(
+        "REVIEW_TOOL_CONFORMANCE first_requests={:?} second_requests={:?} journal_calls={} methods={}",
+        first
+            .tool_declarations()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        second
+            .tool_declarations()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        mcp_journal(&journal).len(),
+        std::fs::read_to_string(journal.with_extension("jsonl.methods"))
+            .expect("MCP method journal")
+    );
+    assert_eq!(
+        mcp_journal(&journal).len(),
+        4,
+        "Both turns must execute both review tools without retries or hidden calls"
+    );
+    for (index, turn) in [&first, &second].into_iter().enumerate() {
+        let calls = mcp_journal(&journal);
+        let actual = &calls[index * 2..(index + 1) * 2];
+        assert!(
+            actual
+                .iter()
+                .all(|call| call.get("value").and_then(Value::as_str)
+                    == Some(values[index].as_str())),
+            "Review feedback calls must reach the real MCP server in both turns"
+        );
+        for name in ["read_review_git", "propose_review_comment"] {
+            let requests = turn
+                .tool_requests()
+                .filter(|r| {
+                    turn.declared_name(&r.tool_call_id)
+                        .is_some_and(|declared| declared.ends_with(name))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                requests.len(),
+                1,
+                "Every review tool call must have exactly one visible request"
+            );
+            let completion = turn
+                .tool_completions()
+                .find(|c| c.tool_call_id == requests[0].tool_call_id)
+                .expect("review tool completion");
+            assert!(
+                matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
+                "Read-only review metadata tools must not be denied"
+            );
+        }
+        assert_no_error_message(&turn.label(), turn.events());
+    }
+    let disconnected = ask(host, &agent, "Call read_review_git exactly once with value CLOSE_REVIEW_TRANSPORT. The fixture intentionally closes its MCP connection during this call. Report the failure; do not retry or call any other tool.").await;
+    assert_eq!(
+        mcp_journal(&journal).len(),
+        5,
+        "The transport failure must execute once, without hidden retries"
+    );
+    let failures = disconnected
+        .tool_completions()
+        .filter(|completion| {
+            disconnected
+                .declared_name(&completion.tool_call_id)
+                .is_some_and(|name| name.ends_with("read_review_git"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failures.len(),
+        1,
+        "The failed MCP call needs one terminal outcome"
+    );
+    match &failures[0].outcome {
+        ToolExecutionOutcome::Failed {
+            message, details, ..
+        } => {
+            assert!(
+                message.to_ascii_lowercase().contains("closed")
+                    || details
+                        .as_ref()
+                        .is_some_and(|detail| detail.to_ascii_lowercase().contains("closed")),
+                "Native MCP transport errors must preserve the closed-connection cause, not an empty successful result"
+            );
+        }
+        _ => panic!("A closed MCP transport must be an explicit failed tool execution"),
+    }
+    assert_universal_contract(&[first, second, disconnected]);
+    assert_clean_close(host, &agent).await;
+}
+conformance2_scenario!(
+    real_enforced_review_feedback,
+    [
+        BackendCapability::EnforcedReadOnly,
+        BackendCapability::StartupMcpServers
+    ]
+);
+
 async fn real_mcp_error_result<B: Backend>(host: &mut Harness<B>) {
     let probe_dir = host.workspace().join(MCP_PROBE_DIR);
     std::fs::create_dir_all(&probe_dir).expect("create MCP probe directory");

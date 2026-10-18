@@ -3626,6 +3626,8 @@ mod wasm_tests {
             let review = reviews.get_mut(&ReviewId("rev-1".to_owned())).unwrap();
             review.suggestions = (0..12)
                 .map(|index| protocol::ReviewSuggestedComment {
+                    execution_id: None,
+                    audit: Vec::new(),
                     id: protocol::ReviewSuggestionId(format!("finding-{index}")),
                     location: review.comments[0].location.clone(),
                     anchor_status: protocol::ReviewAnchorStatus::Current,
@@ -3639,13 +3641,16 @@ mod wasm_tests {
                 .collect();
             review.ai_reviewer.status = protocol::ReviewAiReviewerStatus::Completed;
             review.ai_reviewer.rounds.push(protocol::ReviewRound {
+                request_id: None,
                 mode: Some(protocol::ReviewMode::Deep),
                 id: "round-1".to_owned(),
-                snapshot_id: "snapshot-1".to_owned(),
+                snapshot_id: Some("snapshot-1".to_owned()),
                 scope: Default::default(),
                 started_at_ms: 1,
                 requested_by: Some(AgentId("requester".to_owned())),
                 reviewers: vec![protocol::ReviewReviewerRun {
+                    context_key: None,
+                    reused_context: false,
                     reviewer_id: None,
                     target: None,
                     session_settings: Default::default(),

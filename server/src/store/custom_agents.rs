@@ -673,10 +673,17 @@ pub fn superseded_implementer_v1_instructions() -> String {
     )
 }
 
-fn implementer_instructions() -> String {
+pub fn superseded_implementer_v2_instructions() -> String {
     superseded_implementer_v1_instructions().replace(
         "only Tyde agent-control tools to spawn helpers.",
         "only Tyde agent-control tools to spawn helpers. Work in your assigned project:\nif you need to create your own workbench, use `tyde_create_workbench` with\n`action: \"enter\"`, then finish that turn immediately. Tyde moves the same\nconversation and continues automatically there. Reviews target that project;\nnever substitute changing shell directories for entering the workbench.",
+    )
+}
+
+fn implementer_instructions() -> String {
+    superseded_implementer_v2_instructions().replace(
+        "4. Review once with `tyde_request_review` in its default mode on your complete\n   change: the working tree before you commit, or a committed range from your\n   base on `main` to your tip. Wait with `tyde_await_review` and read findings\n   with `tyde_get_review`. Fix findings supported by evidence, record every\n   disposition with `tyde_review_disposition`, and revalidate. Request another\n   round only if a fix was substantial.",
+        "4. Review once with `tyde_review` in its default mode on your complete\n   change. It event-waits and returns completion and finding counts. Use a\n   stable request_id to reattach an interrupted wait without duplicate work.\n   List outstanding findings with `tyde_list_review_findings`, read details\n   with `tyde_read_review_finding`, and fix findings supported by evidence.\n   Batch-resolve with concrete reasons using `tyde_resolve_review_findings`;\n   `tyde_edit_review_comment` edits text without resolution. Full audit history\n   is available on demand through bounded `tyde_review_history` pages. A\n   finished reviewer is not approval or proof of coverage. Revalidate fixes;\n   request follow-up review only when useful. The Lander adds no review.",
     )
 }
 
@@ -1352,6 +1359,13 @@ You can inspect and change Tyde itself (settings, custom agents, skills, MCP
 servers) and see, create, steer, and close every agent on the host with your
 `tyde-config` tools. You also answer questions about how to use Tyde.";
 
+fn operator_instructions() -> String {
+    superseded_operator_v4_instructions().replace(
+        "Coding agents call `tyde_request_review`; the selected mode\n  launches reviewers as its sub-agents. Await the returned review_id and round_id\n  with `tyde_await_review`, then read findings with `tyde_get_review`. Review\n  completion never injects conversation messages.\n  Agents can record dispositions and request another round after fixes.",
+        "Coding agents call `tyde_review` with a stable request_id; it runs configured\n  advisory reviewers and event-waits for compact completion/finding counts.\n  Repeat request_id to reattach; use a new ID for a follow-up. List/read\n  outstanding findings by ID, edit text with `tyde_edit_review_comment`, or\n  batch-resolve with reasons using `tyde_resolve_review_findings`. Bounded\n  `tyde_review_history` pages expose the full audit only on demand. Completion\n  is not approval or coverage proof and never injects chat messages.",
+    )
+}
+
 const OPERATOR_COORDINATION: &str = "## Coordinating work
 
 You coordinate; other agents do the work. For code changes, investigations,
@@ -1361,7 +1375,7 @@ one), steer them with `tyde_config_send_agent_message`, follow their status
 with `tyde_config_list_agents`, and report what they did. Do the work yourself
 only when the user explicitly asks you to.";
 
-fn operator_instructions() -> String {
+pub fn superseded_operator_v4_instructions() -> String {
     superseded_operator_v3_instructions()
         .replace(OPERATOR_INTRO, "You are Tyde Help, the hands-on guide and top-level coordinator for this Tyde host.
 
@@ -2178,6 +2192,14 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
 /// builtin records from user-edited ones.
 fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     let mut published = legacy_builtin_team_custom_agents();
+    for mut agent in builtin_custom_agents() {
+        agent.instructions = match agent.id.0.as_str() {
+            IMPLEMENTER_CUSTOM_AGENT_ID => Some(superseded_implementer_v2_instructions()),
+            OPERATOR_CUSTOM_AGENT_ID => Some(superseded_operator_v4_instructions()),
+            _ => continue,
+        };
+        published.push(agent);
+    }
     for mut agent in builtin_custom_agents() {
         agent.instructions = match agent.id.0.as_str() {
             PROJECT_MANAGER_CUSTOM_AGENT_ID => Some(superseded_project_manager_v3_instructions()),

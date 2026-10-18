@@ -1008,7 +1008,10 @@ async fn authorize_observed_agents(
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RequestReviewToolInput {
+struct ReviewToolInput {
+    /// Stable caller-chosen ID for this invocation. Repeat it to reattach after
+    /// interruption, including when launch completed before the response arrived.
+    request_id: String,
     #[serde(default)]
     mode: Option<protocol::ReviewMode>,
     #[serde(default)]
@@ -1017,115 +1020,200 @@ struct RequestReviewToolInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GetReviewToolInput {
-    review_id: String,
+struct ReviewPageInput {
+    #[serde(default)]
+    offset: usize,
+    /// Required explicit bound, between 1 and 50 records.
+    limit: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AwaitReviewToolInput {
-    review_id: String,
-    /// The round id returned by tyde_request_review, not the snapshot id.
-    round_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AwaitReviewResult {
+struct ReviewFindingPageInput {
     review_id: protocol::ReviewId,
-    round_id: String,
-    status: protocol::ReviewAiReviewerStatus,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ReviewDispositionToolInput {
-    review_id: String,
-    suggestion_id: String,
-    /// Explain what was fixed, or why this finding is not actionable.
-    reason: String,
+struct ReviewHistoryInput {
+    review_id: protocol::ReviewId,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
+    #[serde(default)]
+    text_offset: usize,
+    /// Bound for each large text value, in characters (1–8192). Large values
+    /// become {text,total_characters,next_offset}; repeat with text_offset.
+    text_limit: usize,
+}
+
+pub(crate) fn review_history_items(
+    review: &protocol::Review,
+    text_offset: usize,
+    text_limit: usize,
+) -> Result<Vec<serde_json::Value>, McpError> {
+    let mut items = Vec::new();
+    for execution in &review.ai_reviewer.rounds {
+        let mut detail = serde_json::to_value(execution)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let object = detail
+            .as_object_mut()
+            .ok_or_else(|| McpError::internal_error("Execution must be an object", None))?;
+        object.remove("reviewers");
+        object.remove("dispositions");
+        items.push(json!({"kind": "execution", "execution": detail}));
+        for reviewer in &execution.reviewers {
+            let mut detail = serde_json::to_value(reviewer)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            detail
+                .as_object_mut()
+                .ok_or_else(|| McpError::internal_error("Reviewer must be an object", None))?
+                .remove("aspects");
+            items.push(
+                json!({"kind": "reviewer", "execution_id": execution.id, "reviewer": detail}),
+            );
+            for aspect in &reviewer.aspects {
+                items.push(json!({"kind": "aspect", "execution_id": execution.id, "reviewer_id": reviewer.reviewer_id, "aspect": aspect}));
+            }
+        }
+        for (finding_id, reason) in &execution.dispositions {
+            items.push(json!({"kind": "disposition", "execution_id": execution.id, "finding_id": finding_id, "reason": reason}));
+        }
+    }
+    for finding in &review.suggestions {
+        let mut detail = serde_json::to_value(finding)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        detail
+            .as_object_mut()
+            .ok_or_else(|| McpError::internal_error("Finding must be an object", None))?
+            .remove("audit");
+        items.push(json!({"kind": "finding", "finding": detail}));
+        for entry in &finding.audit {
+            items.push(json!({"kind": "audit", "finding_id": finding.id, "entry": entry}));
+        }
+    }
+    for item in &mut items {
+        paginate_history_text(item, text_offset, text_limit);
+    }
+    Ok(items)
+}
+
+fn paginate_history_text(value: &mut serde_json::Value, offset: usize, limit: usize) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                paginate_history_text(value, offset, limit);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(
+                    key.as_str(),
+                    "body"
+                        | "previous_body"
+                        | "reason"
+                        | "instructions"
+                        | "description"
+                        | "name"
+                        | "error"
+                        | "rationale"
+                        | "string"
+                ) && let serde_json::Value::String(text) = value
+                    && text.chars().count() > limit
+                {
+                    *value = text_page(text, offset, limit);
+                } else {
+                    paginate_history_text(value, offset, limit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadReviewFindingInput {
+    review_id: protocol::ReviewId,
+    finding_id: protocol::ReviewSuggestionId,
+    /// Character offset in body and rationale. Each is paginated independently.
+    #[serde(default)]
+    offset: usize,
+    /// Maximum characters per text field, between 1 and 8192.
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolveReviewFindingsInput {
+    review_id: protocol::ReviewId,
+    dispositions: Vec<protocol::ReviewFindingDisposition>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EditReviewCommentToolInput {
-    review_id: String,
-    suggestion_id: String,
+    review_id: protocol::ReviewId,
+    finding_id: protocol::ReviewSuggestionId,
     body: String,
 }
 
-fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpError> {
-    let round_id = review
-        .ai_reviewer
-        .rounds
-        .last()
-        .map(|round| round.id.clone());
-    ok_json(
-        json!({ "review_id": review.id, "round_id": round_id, "status": review.ai_reviewer.status, "error": review.ai_reviewer.error,
-        "rounds": review.ai_reviewer.rounds, "findings": review.suggestions }),
-    )
+fn outstanding_count(review: &protocol::Review) -> usize {
+    review
+        .suggestions
+        .iter()
+        .filter(|s| s.state == protocol::ReviewSuggestionState::Pending)
+        .count()
+}
+
+pub(crate) fn review_page(
+    items: Vec<serde_json::Value>,
+    offset: usize,
+    limit: usize,
+) -> Result<CallToolResult, McpError> {
+    if !(1..=50).contains(&limit) || offset > items.len() {
+        return Ok(err_text("Use limit 1–50 and offset within total"));
+    }
+    let total = items.len();
+    let end = offset.saturating_add(limit).min(total);
+    let page = &items[offset..end];
+    // Never truncate serialized JSON. A pathological individual record requires
+    // the text-paginated finding reader rather than an unbounded history replay.
+    if serde_json::to_vec(page)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        .len()
+        > 1024 * 1024
+    {
+        return Ok(err_text(
+            "Page exceeds 1 MiB; reduce limit or read finding text with tyde_read_review_finding",
+        ));
+    }
+    ok_json(json!({ "items": page, "total": total, "next_offset": (end < total).then_some(end) }))
+}
+
+pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> serde_json::Value {
+    let total = text.chars().count();
+    let end = offset.saturating_add(limit).min(total);
+    json!({ "text": text.chars().skip(offset).take(limit).collect::<String>(), "total_characters": total,
+        "next_offset": (end < total).then_some(end) })
 }
 
 #[tool_router]
 impl TydeAgentControlMcpServer {
     #[tool(
-        description = "Review all enabled aspects from Settings → Review. Lite (light) runs each configured reviewer on all enabled aspects; Heavy (deep) runs each configured reviewer separately per enabled aspect. Omit mode to use the user-configured default. Request a review against a frozen snapshot of your project's changes. Returns review_id and round_id after launch. Call tyde_await_review on the await server for that round, then tyde_get_review for findings. No feedback is injected into your conversation. Fix actionable findings. If you request a review, you must close every AI-generated finding with tyde_review_disposition after addressing or dismissing it, recording what was fixed or why it was dismissed. A conversational reply alone does not close a finding. Before reporting completion, call tyde_get_review and verify that no AI-generated findings remain pending in any round you requested. Request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's aspects or model settings."
+        description = "Run the configured advisory reviewers and event-wait for completion, without a local work timer. Lite uses each reviewer for all aspects; Heavy preserves each reviewer/aspect assignment. Returns only review_id, completed/incomplete/failed status, new_finding_count and outstanding_count. Completed means reviewers finished, not approval or coverage. Use a new request_id for a follow-up; repeat the same request_id to reattach after cancellation without starting duplicate work. Findings are never injected into chat. List outstanding findings, read details by ID, edit text without resolving, or batch-resolve with concrete reasons. Failures are never clean reviews. Working tree is default; committed_range requires exact root/base_oid/tip_oid. No commits or stashes are created."
     )]
-    async fn tyde_request_review(
+    async fn tyde_review(
         &self,
-        Parameters(input): Parameters<RequestReviewToolInput>,
-        Extension(parts): Extension<axum::http::request::Parts>,
-    ) -> Result<CallToolResult, McpError> {
-        let caller = match require_authenticated_caller(self, &parts, "tyde_request_review").await {
-            Ok(caller) => caller,
-            Err(error) => return Ok(err_text(error)),
-        };
-        match self
-            .host
-            .request_agent_review(caller, input.scope, input.mode)
-            .await
-        {
-            Ok(review) => review_tool_result(review),
-            Err(error) => Ok(err_text(error)),
-        }
-    }
-
-    #[tool(
-        description = "Read review progress, reviewer failures, findings, prior rounds, and recorded dispositions for a review in your project. Use tyde_await_review to wait for your requested round without polling. This tool reads findings; it does not send a message or accept suggestions."
-    )]
-    async fn tyde_get_review(
-        &self,
-        Parameters(input): Parameters<GetReviewToolInput>,
-        Extension(parts): Extension<axum::http::request::Parts>,
-    ) -> Result<CallToolResult, McpError> {
-        let caller = match require_authenticated_caller(self, &parts, "tyde_get_review").await {
-            Ok(caller) => caller,
-            Err(error) => return Ok(err_text(error)),
-        };
-        let result = async {
-            self.host
-                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
-                .await?
-                .snapshot()
-                .await
-        }
-        .await;
-        match result {
-            Ok(review) => review_tool_result(review),
-            Err(error) => Ok(err_text(error)),
-        }
-    }
-
-    #[tool(
-        description = "Wait without a Tyde tool timer until every reviewer in your requested round has completed or failed. Supply review_id and round_id from tyde_request_review. Only the requesting agent may await the round. Returns status, not findings; call tyde_get_review afterwards. A failed or cancelled reviewer means incomplete review, never success. No messages are injected into your conversation."
-    )]
-    async fn tyde_await_review(
-        &self,
-        Parameters(input): Parameters<AwaitReviewToolInput>,
+        Parameters(input): Parameters<ReviewToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let _active_request = ActiveAwaitRequestGuard::new(Arc::clone(&self.active_await_requests));
-        let caller = match require_authenticated_caller(self, &parts, "tyde_await_review").await {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_review").await {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
@@ -1134,63 +1222,144 @@ impl TydeAgentControlMcpServer {
             caller.clone(),
         );
         let wait = async {
+            let review = self
+                .host
+                .request_agent_review(
+                    caller.clone(),
+                    input.request_id.clone(),
+                    input.scope,
+                    input.mode,
+                )
+                .await?;
+            let execution_id = review
+                .ai_reviewer
+                .rounds
+                .iter()
+                .find(|r| {
+                    r.requested_by.as_ref() == Some(&caller)
+                        && r.request_id.as_ref() == Some(&input.request_id)
+                })
+                .map(|r| r.id.clone())
+                .ok_or_else(|| "Requested review execution is missing".to_owned())?;
             let handle = self
                 .host
-                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .agent_review_handle(&caller, Some(review.id))
                 .await?;
-            await_review_round(
+            let mut result = await_review_execution(
                 handle,
-                caller,
-                input.round_id,
+                caller.clone(),
+                execution_id,
                 AwaitProgressReporter::from_context(&context),
             )
-            .await
+            .await?;
+            result.outstanding_count = self
+                .host
+                .project_reviews(review.project_id)
+                .await?
+                .iter()
+                .map(outstanding_count)
+                .sum();
+            Ok::<_, String>(result)
         };
         let result = tokio::select! {
             biased;
             _ = self.await_expiration.cancelled() => Err(AwaitToolFailure::HostStopping),
-            _ = host_cancellation.cancelled() => Err(AwaitToolFailure::Message("review await request cancelled".to_owned())),
-            _ = context.ct.cancelled() => Err(AwaitToolFailure::Message("review await request cancelled".to_owned())),
+            _ = host_cancellation.cancelled() => Err(AwaitToolFailure::Message("Review wait cancelled; repeat the same request_id to reattach".to_owned())),
+            _ = context.ct.cancelled() => Err(AwaitToolFailure::Message("Review wait cancelled; repeat the same request_id to reattach".to_owned())),
             result = wait => result.map_err(AwaitToolFailure::from),
         };
         match result {
             Ok(result) => ok_json(result),
-            Err(failure) => failure.into_tool_result("tyde_await_review"),
+            Err(failure) => failure.into_tool_result("tyde_review"),
         }
     }
 
     #[tool(
-        description = "Record a visible reason for addressing or dismissing a review finding and close it. A pending finding becomes resolved and leaves the user's open review comments; the reason stays visible in the review round. Any authenticated agent in the review's project may close a finding or update its recorded reason, even if the requester is no longer available; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
+        description = "List outstanding reviews in your project, with review IDs, honest execution status and counts across all prior findings. Explicit bounded pagination: limit 1–50; next_offset discloses remaining records. No history replay."
     )]
-    async fn tyde_review_disposition(
+    async fn tyde_list_reviews(
         &self,
-        Parameters(input): Parameters<ReviewDispositionToolInput>,
+        Parameters(input): Parameters<ReviewPageInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_list_reviews").await {
+            Ok(c) => c,
+            Err(e) => return Ok(err_text(e)),
+        };
+        match self.host.agent_project_reviews(&caller).await {
+            Ok(reviews) => review_page(reviews.iter().filter(|r| outstanding_count(r) > 0 || r.ai_reviewer.status == protocol::ReviewAiReviewerStatus::Running || r.ai_reviewer.status == protocol::ReviewAiReviewerStatus::Failed)
+                .map(|r| json!({ "review_id": r.id, "status": r.ai_reviewer.status, "outstanding_count": outstanding_count(r), "error": r.ai_reviewer.error.as_ref().map(|e| e.chars().take(180).collect::<String>()), "error_is_excerpt": r.ai_reviewer.error.as_ref().is_some_and(|e| e.chars().count() > 180) })).collect(), input.offset, input.limit),
+            Err(e) => Ok(err_text(e)),
+        }
+    }
+
+    #[tool(
+        description = "List every currently outstanding finding in a project review, including earlier executions. Returns IDs, location, severity and short text summaries, with total and next_offset. limit 1–50; use tyde_read_review_finding for full text."
+    )]
+    async fn tyde_list_review_findings(
+        &self,
+        Parameters(input): Parameters<ReviewFindingPageInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller =
-            match require_authenticated_caller(self, &parts, "tyde_review_disposition").await {
-                Ok(caller) => caller,
-                Err(error) => return Ok(err_text(error)),
+            match require_authenticated_caller(self, &parts, "tyde_list_review_findings").await {
+                Ok(c) => c,
+                Err(e) => return Ok(err_text(e)),
             };
         let result = async {
             self.host
-                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .agent_review_handle(&caller, Some(input.review_id))
                 .await?
-                .disposition(
-                    protocol::ReviewSuggestionId(input.suggestion_id),
-                    input.reason,
-                )
+                .snapshot()
                 .await
         }
         .await;
         match result {
-            Ok(review) => review_tool_result(review),
-            Err(error) => Ok(err_text(error)),
+            Ok(review) => review_page(review.suggestions.iter().filter(|s| s.state == protocol::ReviewSuggestionState::Pending)
+                .map(|s| json!({ "finding_id": s.id, "severity": s.severity, "location": s.location, "summary": s.body.chars().take(180).collect::<String>(), "summary_is_excerpt": s.body.chars().count() > 180 })).collect(), input.offset, input.limit),
+            Err(e) => Ok(err_text(e)),
         }
     }
 
     #[tool(
-        description = "Edit the text of an AI review comment in a draft review. Any authenticated agent in the review's project may edit it, even if the requester or reviewer is no longer available. Use suggestion_id from tyde_get_review. Preserves the finding's state, attribution, location, and any recorded disposition; an accepted comment is updated with its backing suggestion. Does not accept or close the finding."
+        description = "Read a finding by ID in your project, including state, attribution and exact location. Body and rationale are explicitly character-paginated (limit 1–8192) with separate totals/next_offset, never truncated JSON. Audit history is available on demand through tyde_review_history."
+    )]
+    async fn tyde_read_review_finding(
+        &self,
+        Parameters(input): Parameters<ReadReviewFindingInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_read_review_finding").await {
+                Ok(c) => c,
+                Err(e) => return Ok(err_text(e)),
+            };
+        if !(1..=8192).contains(&input.limit) {
+            return Ok(err_text("Use limit 1–8192 characters"));
+        }
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(input.review_id))
+                .await?
+                .snapshot()
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => match review.suggestions.iter().find(|s| s.id == input.finding_id) {
+                Some(s) => ok_json(
+                    json!({ "finding_id": s.id, "state": s.state, "location": s.location, "severity": s.severity,
+                    "reviewer_agent_id": s.reviewer_agent_id, "execution_id": s.execution_id, "anchor_status": s.anchor_status,
+                    "body": text_page(&s.body, input.offset, input.limit), "rationale": s.rationale.as_ref().map(|r| text_page(r, input.offset, input.limit)), "audit_count": s.audit.len() }),
+                ),
+                None => Ok(err_text("Unknown finding")),
+            },
+            Err(e) => Ok(err_text(e)),
+        }
+    }
+
+    #[tool(
+        description = "Edit a finding's text by ID without accepting, resolving, reopening or changing its attribution/location. Accepted findings update their backing inline comment too. Returns a compact acknowledgement; previous and new text remain in audit history."
     )]
     async fn tyde_edit_review_comment(
         &self,
@@ -1199,23 +1368,89 @@ impl TydeAgentControlMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let caller =
             match require_authenticated_caller(self, &parts, "tyde_edit_review_comment").await {
-                Ok(caller) => caller,
-                Err(error) => return Ok(err_text(error)),
+                Ok(c) => c,
+                Err(e) => return Ok(err_text(e)),
             };
         let result = async {
             self.host
-                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .agent_review_handle(&caller, Some(input.review_id))
                 .await?
-                .edit_finding(
-                    protocol::ReviewSuggestionId(input.suggestion_id),
-                    input.body,
-                )
+                .edit_finding(caller, input.finding_id.clone(), input.body)
                 .await
         }
         .await;
         match result {
-            Ok(review) => review_tool_result(review),
-            Err(error) => Ok(err_text(error)),
+            Ok(review) => ok_json(
+                json!({ "review_id": review.id, "finding_id": input.finding_id, "edited": true, "outstanding_count": outstanding_count(&review) }),
+            ),
+            Err(e) => Ok(err_text(e)),
+        }
+    }
+
+    #[tool(
+        description = "Resolve 1–100 findings by ID with concrete reasons, atomically validating the whole batch before mutation. Duplicate/unknown IDs or empty reasons reject the entire batch. Preserves accepted/rejected human decisions. Updating a reason appends audit history. Returns counts only, not repeated reasons or history."
+    )]
+    async fn tyde_resolve_review_findings(
+        &self,
+        Parameters(input): Parameters<ResolveReviewFindingsInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(
+            self,
+            &parts,
+            "tyde_resolve_review_findings",
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(err_text(e)),
+        };
+        let count = input.dispositions.len();
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(input.review_id))
+                .await?
+                .dispositions(caller, input.dispositions)
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => ok_json(
+                json!({ "review_id": review.id, "updated_count": count, "outstanding_count": outstanding_count(&review) }),
+            ),
+            Err(e) => Ok(err_text(e)),
+        }
+    }
+
+    #[tool(
+        description = "Read complete persisted review history on demand, explicitly paginated with limit 1–50 and next_offset. Includes internal execution attribution, findings, and every text edit/resolution reason, not approval certificates. Supply text_limit 1–8192; large strings become explicit text pages with totals/next_offset. Repeat the record page with text_offset to read the remainder. Large finding text is also available through the character-paginated reader. Common review/edit/resolve operations never replay history."
+    )]
+    async fn tyde_review_history(
+        &self,
+        Parameters(input): Parameters<ReviewHistoryInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_review_history").await {
+            Ok(c) => c,
+            Err(e) => return Ok(err_text(e)),
+        };
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(input.review_id))
+                .await?
+                .snapshot()
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => {
+                if !(1..=8192).contains(&input.text_limit) {
+                    return Ok(err_text("Use text_limit 1–8192 characters"));
+                }
+                let items = review_history_items(&review, input.text_offset, input.text_limit)?;
+                review_page(items, input.offset, input.limit)
+            }
+            Err(e) => Ok(err_text(e)),
         }
     }
 
@@ -2007,10 +2242,10 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition, which closes them in the user's review, and request another round after fixes. Read your current Tyde permissions with tyde_config_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_review on the await server to run configured advisory reviewers and return completion/counts in one call. Use ID-scoped list/read/edit/resolve tools on this server; full audit history is bounded and on demand. Completion is not approval. Review results never arrive as injected messages. Read your current Tyde permissions with tyde_config_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
             }
             AgentControlMcpSurface::Await => {
-                "Long-running tools for awaiting direct child agents and requested review rounds. tyde_await_review waits for all reviewers in the specified round; use tyde_get_review on the control server to read findings."
+                "Long-running tools without local work timers: tyde_await_agents waits for direct children; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."
             }
         };
         ServerInfo {
@@ -2049,14 +2284,12 @@ impl ServerHandler for TydeAgentControlMcpServer {
             };
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| match self.surface {
-            AgentControlMcpSurface::Control => !matches!(
-                tool.name.as_ref(),
-                "tyde_await_agents" | "tyde_await_review"
-            ),
-            AgentControlMcpSurface::Await => matches!(
-                tool.name.as_ref(),
-                "tyde_await_agents" | "tyde_await_review"
-            ),
+            AgentControlMcpSurface::Control => {
+                !matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
+            }
+            AgentControlMcpSurface::Await => {
+                matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
+            }
         });
         if swarm_caller {
             let parts = context
@@ -2202,11 +2435,11 @@ impl ServerHandler for TydeAgentControlMcpServer {
             let allowed = match self.surface {
                 AgentControlMcpSurface::Control => !matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_await_review"
+                    "tyde_await_agents" | "tyde_review"
                 ),
                 AgentControlMcpSurface::Await => matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_await_review"
+                    "tyde_await_agents" | "tyde_review"
                 ),
             };
             if !allowed {
@@ -3030,12 +3263,12 @@ pub(crate) async fn do_list_agents(
     Ok(overviews)
 }
 
-async fn await_review_round(
+async fn await_review_execution(
     handle: crate::review::ReviewHandle,
     caller: AgentId,
-    round_id: String,
+    execution_id: String,
     progress_reporter: Option<AwaitProgressReporter>,
-) -> Result<AwaitReviewResult, String> {
+) -> Result<protocol::ReviewToolSummary, String> {
     let mut changes = handle.changes.clone();
     let interval = progress_reporter
         .as_ref()
@@ -3050,10 +3283,10 @@ async fn await_review_round(
             .ai_reviewer
             .rounds
             .iter()
-            .find(|round| round.id == round_id)
-            .ok_or_else(|| "Unknown review round".to_owned())?;
+            .find(|round| round.id == execution_id)
+            .ok_or_else(|| "Unknown review execution".to_owned())?;
         if round.requested_by.as_ref() != Some(&caller) {
-            return Err("Only the requesting agent may await a review round".to_owned());
+            return Err("Only the requesting agent may reattach a review".to_owned());
         }
         let running = round
             .reviewers
@@ -3066,14 +3299,27 @@ async fn await_review_round(
                     .reviewers
                     .iter()
                     .all(|reviewer| reviewer.status == protocol::ReviewAiReviewerStatus::Completed);
-            return Ok(AwaitReviewResult {
-                review_id: review.id,
-                round_id,
+            let succeeded = round
+                .reviewers
+                .iter()
+                .filter(|r| r.status == protocol::ReviewAiReviewerStatus::Completed)
+                .count();
+            return Ok(protocol::ReviewToolSummary {
+                review_id: review.id.clone(),
                 status: if completed {
-                    protocol::ReviewAiReviewerStatus::Completed
+                    protocol::ReviewCompletionStatus::Completed
+                } else if succeeded > 0 {
+                    protocol::ReviewCompletionStatus::Incomplete
                 } else {
-                    protocol::ReviewAiReviewerStatus::Failed
+                    protocol::ReviewCompletionStatus::Failed
                 },
+                new_finding_count: review
+                    .suggestions
+                    .iter()
+                    .filter(|s| s.execution_id.as_ref() == Some(&execution_id))
+                    .count(),
+                outstanding_count: outstanding_count(&review),
+                failed_reviewer_count: round.reviewers.len() - succeeded,
             });
         }
         if let Some(reporter) = &progress_reporter {

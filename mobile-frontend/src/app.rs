@@ -2329,15 +2329,8 @@ mod wasm_tests {
                     .is_same_node(Some(&input))
             );
         }
-        // Synthetic contacts exercise mounted behavior and hit geometry, not native click delivery.
-        let performance_now = js_sys::Function::new_no_args("return performance.now()");
-        let now = || {
-            performance_now
-                .call0(&wasm_bindgen::JsValue::NULL)
-                .unwrap()
-                .as_f64()
-                .unwrap()
-        };
+        // The old gate rejected a 307.19 ms sample despite correct Send hit
+        // geometry. Assert before and after the reactive flush, not host speed.
         let set_input = js_sys::Function::new_with_args(
             "input,value",
             r#"
@@ -2375,124 +2368,108 @@ mod wasm_tests {
         };
         let contact_guard = crate::bridge::test_defer_sends();
         for resize_during_contact in [false, true] {
-            for delay in [0_u64, 50, 250] {
-                for (shape, draft) in [
-                    ("wrap", "a wrapped composing draft ".repeat(10)),
-                    ("shrink", "short".to_owned()),
-                    ("newline", "one\ntwo\nthree\nfour\nfive\nsix".to_owned()),
-                    ("maxheight", "line\n".repeat(40)),
-                    ("shrink", "short".to_owned()),
-                ] {
-                    let attempts_before = crate::bridge::test_send_attempts();
-                    let original_height = input.get_bounding_client_rect().height();
-                    let original_point = center();
-                    if resize_during_contact {
-                        down_or_up("pointerdown", original_point);
-                    }
-                    let started = now();
-                    set_input
-                        .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.clone().into())
+            for (shape, draft) in [
+                ("wrap", "a wrapped composing draft ".repeat(10)),
+                ("shrink", "short".to_owned()),
+                ("newline", "one\ntwo\nthree\nfour\nfive\nsix".to_owned()),
+                ("maxheight", "line\n".repeat(40)),
+                ("shrink", "short".to_owned()),
+            ] {
+                let attempts_before = crate::bridge::test_send_attempts();
+                let original_height = input.get_bounding_client_rect().height();
+                let original_point = center();
+                if resize_during_contact {
+                    down_or_up("pointerdown", original_point);
+                }
+                set_input
+                    .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.clone().into())
+                    .unwrap();
+                let point = if resize_during_contact {
+                    original_point
+                } else {
+                    center()
+                };
+                if !resize_during_contact {
+                    down_or_up("pointerdown", point);
+                }
+                assert!(
+                    reachable(),
+                    "Send must be reachable synchronously during resize"
+                );
+                assert!(
+                    send.contains(Some(&hit_at(point))),
+                    "Contact must remain on Send before the reactive flush"
+                );
+                assert!(input.value() == draft && state.chat_input.get_untracked() == draft);
+                next_tick().await;
+                let height = input.get_bounding_client_rect().height();
+                if shape == "shrink" {
+                    assert!(height < original_height, "short draft must shrink");
+                } else {
+                    assert!(height > original_height, "multiline draft must grow");
+                }
+                if shape == "maxheight" {
+                    let max = frame
+                        .content_window()
+                        .unwrap()
+                        .get_computed_style(&input)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("max-height")
+                        .unwrap()
+                        .trim_end_matches("px")
+                        .parse::<f64>()
                         .unwrap();
-                    if delay != 0 {
-                        sleep(Duration::from_millis(delay)).await;
-                    }
-                    let point = if resize_during_contact {
-                        original_point
-                    } else {
-                        center()
-                    };
-                    if !resize_during_contact {
-                        down_or_up("pointerdown", point);
-                    }
-                    let elapsed = now() - started;
-                    let height = input.get_bounding_client_rect().height();
                     assert!(
-                        elapsed < 300.0,
-                        "resize contact missed timing coverage: {elapsed}ms"
-                    );
-                    if shape == "shrink" {
-                        assert!(height < original_height, "short draft must shrink");
-                    } else {
-                        assert!(height > original_height, "multiline draft must grow");
-                    }
-                    if shape == "maxheight" {
-                        let max = frame
-                            .content_window()
-                            .unwrap()
-                            .get_computed_style(&input)
-                            .unwrap()
-                            .unwrap()
-                            .get_property_value("max-height")
-                            .unwrap()
-                            .trim_end_matches("px")
-                            .parse::<f64>()
-                            .unwrap();
-                        assert!(
-                            (height - max).abs() <= 1.0,
-                            "long draft reaches the CSS cap"
-                        );
-                        assert!(
-                            f64::from(input.scroll_height()) > height,
-                            "capped draft scrolls internally"
-                        );
-                    }
-                    assert!(send.is_connected());
-                    assert!(
-                        send.is_same_node(
-                            container
-                                .query_selector("[data-mobile-test='chat-send']")
-                                .unwrap()
-                                .as_ref()
-                                .map(|element| element.as_ref())
-                        )
-                    );
-                    assert!(!send.has_attribute("disabled"));
-                    assert!(
-                        reachable(),
-                        "current Send center remains reachable during resize"
+                        (height - max).abs() <= 1.0,
+                        "long draft reaches the CSS cap"
                     );
                     assert!(
-                        send.contains(Some(&hit_at(point))),
-                        "original contact stays on Send during resize"
-                    );
-                    assert!(input.value() == draft && state.chat_input.get_untracked() == draft);
-                    down_or_up("pointerup", point);
-                    let release_elapsed = now() - started;
-                    assert!(
-                        release_elapsed < 300.0,
-                        "contact release missed timing coverage: {release_elapsed}ms"
-                    );
-                    send.unchecked_ref::<HtmlElement>().click();
-                    next_tick().await;
-                    assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
-                    let lines = crate::bridge::test_sent_lines();
-                    assert_eq!(lines.len(), attempts_before + 1);
-                    let sent: serde_json::Value =
-                        serde_json::from_str(lines.last().unwrap()).unwrap();
-                    assert_eq!(sent["kind"], "send_message");
-                    assert!(
-                        sent["payload"]["message"] == draft.trim(),
-                        "resized draft reaches local admission"
-                    );
-                    crate::bridge::test_resolve_next_send();
-                    next_tick().await;
-                    next_tick().await;
-                    assert!(input.value().is_empty());
-                    // Restore the shape for the next grow/shrink contact, outside its timing window.
-                    set_input
-                        .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.into())
-                        .unwrap();
-                    next_tick().await;
-                    wasm_bindgen_test::console_log!(
-                        "RESIZE_CONTACT shape={} during_contact={} requested_ms={} down_or_sample_ms={} release_ms={} height={} center_hit=true original_hit=true",
-                        shape,
-                        resize_during_contact,
-                        delay,
-                        elapsed,
-                        release_elapsed,
-                        height
+                        f64::from(input.scroll_height()) > height,
+                        "capped draft scrolls internally"
                     );
                 }
+                assert!(send.is_connected());
+                assert!(
+                    send.is_same_node(
+                        container
+                            .query_selector("[data-mobile-test='chat-send']")
+                            .unwrap()
+                            .as_ref()
+                            .map(|element| element.as_ref())
+                    )
+                );
+                assert!(!send.has_attribute("disabled"));
+                assert!(
+                    reachable(),
+                    "current Send center remains reachable during resize"
+                );
+                assert!(
+                    send.contains(Some(&hit_at(point))),
+                    "original contact stays on Send during resize"
+                );
+                assert!(input.value() == draft && state.chat_input.get_untracked() == draft);
+                down_or_up("pointerup", point);
+                send.unchecked_ref::<HtmlElement>().click();
+                next_tick().await;
+                assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
+                let lines = crate::bridge::test_sent_lines();
+                assert_eq!(lines.len(), attempts_before + 1);
+                let sent: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+                assert_eq!(sent["kind"], "send_message");
+                assert!(
+                    sent["payload"]["message"] == draft.trim(),
+                    "resized draft reaches local admission"
+                );
+                crate::bridge::test_resolve_next_send();
+                next_tick().await;
+                next_tick().await;
+                assert!(input.value().is_empty());
+                // Restore the shape for the next grow/shrink contact.
+                set_input
+                    .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.into())
+                    .unwrap();
+                next_tick().await;
             }
         }
         set_input

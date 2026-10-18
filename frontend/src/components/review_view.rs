@@ -2426,7 +2426,7 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                 view! {
                     <details open=index + 1 == total>
                         <summary>{format!("Round {} · {} · {} of {} reviewers completed", index + 1, round.mode.map_or("Legacy", protocol::ReviewMode::label), completed, count)}</summary>
-                        <p class="review-round-note">{if round.requested_by.is_some() { "The requesting agent awaits this round and reads findings through tools." } else { "Manual review · select suggestions to submit." }}</p>
+                        <p class="review-round-note">{if round.requested_by.is_some() { "Advisory review requested by an agent; completion is not approval." } else { "Manual review · select suggestions to submit." }}</p>
                         {round.delivery_error.map(|error| view! { <p role="alert">{error}</p> })}
                         {groups.into_iter().map(|(aspects, members)| {
                             let findings = findings.clone();
@@ -2434,7 +2434,7 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                             view! { <section aria-label="Review aspect results">
                                 {aspects.into_iter().map(|aspect| view! { <details><summary>{aspect.name}</summary><p>{aspect.description}</p><pre>{aspect.instructions}</pre></details> }).collect_view()}
                                 {members.into_iter().map(|reviewer| {
-                            let reviewer_findings = findings.iter().filter(|s| reviewer.agent_id.as_ref() == Some(&s.reviewer_agent_id)).cloned().collect::<Vec<_>>();
+                            let reviewer_findings = findings.iter().filter(|s| s.execution_id.as_ref() == Some(&round.id) && reviewer.agent_id.as_ref() == Some(&s.reviewer_agent_id)).cloned().collect::<Vec<_>>();
                             let dispositions = dispositions.clone();
                             view! {
                                 <section class="review-round-member">
@@ -2686,6 +2686,8 @@ mod wasm_tests {
 
     fn pending_suggestion_at_line(line: u32, body: &str) -> ReviewSuggestedComment {
         ReviewSuggestedComment {
+            execution_id: None,
+            audit: Vec::new(),
             id: ReviewSuggestionId(format!("s-{line}")),
             location: ReviewLocation {
                 root: root_path(),
@@ -2705,6 +2707,65 @@ mod wasm_tests {
             reviewer_agent_id: AgentId("ai-1".to_owned()),
             created_at_ms: 1,
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn reused_reviewer_history_keeps_findings_in_their_execution() {
+        let container = make_container();
+        let mut review = make_review();
+        let mut finding = pending_suggestion_at_line(10, "First execution evidence");
+        finding.execution_id = Some("first".to_owned());
+        review.suggestions.push(finding.clone());
+        finding.id = ReviewSuggestionId("later".to_owned());
+        finding.body = "Later execution evidence".to_owned();
+        finding.execution_id = Some("later".to_owned());
+        review.suggestions.push(finding);
+        for id in ["first", "later"] {
+            review.ai_reviewer.rounds.push(protocol::ReviewRound {
+                request_id: None,
+                id: id.to_owned(),
+                mode: Some(protocol::ReviewMode::Light),
+                snapshot_id: None,
+                scope: protocol::ReviewAiScope::WorkingTree,
+                started_at_ms: 1,
+                requested_by: None,
+                dispositions: Default::default(),
+                delivery_error: None,
+                reviewers: vec![protocol::ReviewReviewerRun {
+                    context_key: None,
+                    reused_context: id == "later",
+                    reviewer_id: None,
+                    target: None,
+                    session_settings: Default::default(),
+                    aspects: Vec::new(),
+                    name: "Same reviewer".to_owned(),
+                    backend_kind: protocol::BackendKind::Codex,
+                    agent_id: Some(AgentId("ai-1".to_owned())),
+                    status: ReviewAiReviewerStatus::Completed,
+                    error: None,
+                }],
+            });
+        }
+        let mounted = Mounted::new(
+            mount_to(
+                container.clone(),
+                move || view! { <ReviewRounds review=review.clone() /> },
+            ),
+            (),
+        );
+        let executions = container.query_selector_all("details").unwrap();
+        assert_eq!(executions.length(), 2);
+        let later = executions.item(0).unwrap().text_content().unwrap();
+        let first = executions.item(1).unwrap().text_content().unwrap();
+        assert!(
+            later.contains("Later execution evidence")
+                && !later.contains("First execution evidence")
+        );
+        assert!(
+            first.contains("First execution evidence")
+                && !first.contains("Later execution evidence")
+        );
+        drop(mounted);
     }
 
     /// Mounts the shared `ReviewSidebar` (the surviving review-controls
@@ -3431,6 +3492,8 @@ mod wasm_tests {
 
     fn rejected_suggestion_at_line(line: u32, body: &str) -> ReviewSuggestedComment {
         ReviewSuggestedComment {
+            execution_id: None,
+            audit: Vec::new(),
             state: ReviewSuggestionState::Rejected,
             ..pending_suggestion_at_line(line, body)
         }

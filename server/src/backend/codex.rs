@@ -69,7 +69,8 @@ const CODEX_AGENT_DELEGATION_EXCLUSION_KEYS: [&str; 3] = [
     "agents.enabled",
 ];
 const CODEX_READ_ONLY_MCP_OMITTED_SURFACES: [&str; 2] = ["code_mode", "deferred"];
-const CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES: [&str; 2] = ["functions", "web"];
+const CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES: [&str; 3] =
+    ["functions", "web", "mcp__tyde_review_feedback"];
 const CODEX_READ_ONLY_TOOL_METADATA_CONFIG_KEY: &str =
     "features.tool_registry.turn_metadata_includes_tool_info";
 const CODEX_MODEL_TOOL_DIAGNOSTIC_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -1997,7 +1998,15 @@ impl CodexSession {
             }
         }
         if access_mode == BackendAccessMode::EnforcedReadOnly {
-            match codex_restricted_thread_config(&rpc, &cwd, &[AGENT_CONTROL_MCP_SERVER_NAME]).await
+            match codex_restricted_thread_config(
+                &rpc,
+                &cwd,
+                &[
+                    AGENT_CONTROL_MCP_SERVER_NAME,
+                    REVIEW_FEEDBACK_MCP_SERVER_NAME,
+                ],
+            )
+            .await
             {
                 Ok(config) => thread_start_params["config"] = config,
                 Err(error) => {
@@ -2212,7 +2221,15 @@ impl CodexSession {
             json!(codex_runtime_workspace_roots(workspace_roots, &cwd));
 
         if access_mode == BackendAccessMode::EnforcedReadOnly {
-            match codex_restricted_thread_config(&rpc, &cwd, &[AGENT_CONTROL_MCP_SERVER_NAME]).await
+            match codex_restricted_thread_config(
+                &rpc,
+                &cwd,
+                &[
+                    AGENT_CONTROL_MCP_SERVER_NAME,
+                    REVIEW_FEEDBACK_MCP_SERVER_NAME,
+                ],
+            )
+            .await
             {
                 Ok(config) => fork_params["config"] = config,
                 Err(error) => {
@@ -9358,7 +9375,10 @@ impl CodexInner {
                 let config = codex_restricted_thread_config(
                     &self.rpc,
                     &self.launch_cwd,
-                    &[AGENT_CONTROL_MCP_SERVER_NAME],
+                    &[
+                        AGENT_CONTROL_MCP_SERVER_NAME,
+                        REVIEW_FEEDBACK_MCP_SERVER_NAME,
+                    ],
                 )
                 .await?;
                 let map = params
@@ -15891,6 +15911,10 @@ let stream_key = stream_key.as_str();
     }
 
     async fn handle_server_request(self: &Arc<Self>, id: Value, method: &str, params: &Value) {
+        tracing::info!(
+            native_method = method,
+            "Handling Codex native server request"
+        );
         let inference_only = self.state.with(move |state| state.execution_mode).await
             == BackendExecutionMode::InferenceOnly;
         if inference_only && is_codex_tool_server_request(method) {
@@ -20740,6 +20764,7 @@ fn codex_mcp_elicitation_result(params: &Value) -> Value {
         .get("_meta")
         .and_then(|meta| meta.get("codex_approval_kind"))
         .and_then(Value::as_str);
+    tracing::info!(server_name, approval_kind, "Resolving Codex MCP approval");
     if approval_kind == Some("mcp_tool_call")
         && matches!(
             server_name,
@@ -20946,8 +20971,11 @@ async fn codex_restricted_thread_config(
         } else {
             json!({ "enabled": false })
         };
-        if rpc.read_only_agentcontrol_direct_tools
-            && name == AGENT_CONTROL_MCP_SERVER_NAME
+        if rpc.read_only_builtins_direct_tools
+            && matches!(
+                name.as_str(),
+                AGENT_CONTROL_MCP_SERVER_NAME | REVIEW_FEEDBACK_MCP_SERVER_NAME
+            )
             && allowed_servers.contains(&name.as_str())
         {
             server
@@ -20959,7 +20987,8 @@ async fn codex_restricted_thread_config(
                 );
             tracing::info!(
                 omitted_surface_count = CODEX_READ_ONLY_MCP_OMITTED_SURFACES.len(),
-                "Retaining authenticated Codex control MCP tools as direct-only tools"
+                server_name = name.as_str(),
+                "Retaining authenticated Codex read-only MCP tools as direct-only tools"
             );
         }
         restricted_mcp_servers.insert(name.clone(), server);
@@ -22987,6 +23016,16 @@ fn codex_mcp_config_overrides(
             continue;
         }
         let base = format!("mcp_servers.{name}");
+        if name == REVIEW_FEEDBACK_MCP_SERVER_NAME {
+            for tool in [
+                "propose_review_comment",
+                "read_review_finding",
+                "read_review_history",
+                "read_review_git",
+            ] {
+                overrides.push(format!("{base}.tools.{tool}.approval_mode=\"approve\""));
+            }
+        }
         if tyde_loopback_reachable
             && matches!(
                 name,
@@ -24835,6 +24874,12 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
     } else {
         tool_name
     };
+    tracing::info!(
+        native_type = item_type,
+        native_tool = tool_name.as_str(),
+        native_namespace = item.get("namespace").and_then(|value| value.as_str()),
+        "Observed Codex raw tool routing"
+    );
     let arguments = item
         .get("arguments")
         .or_else(|| item.get("input"))
@@ -25065,6 +25110,19 @@ fn codex_mcp_call_tool_result(
 ) -> super::NormalizedMcpToolResult {
     if provider_success {
         return normalize_mcp_call_tool_result(item);
+    }
+    if item.get("result").is_none_or(Value::is_null)
+        && let Some(error) = item.get("error").filter(|value| !value.is_null())
+    {
+        let message = match error.get("message").and_then(Value::as_str) {
+            Some(message) => message.to_owned(),
+            None => "Codex failed MCP item has an invalid native error payload".to_owned(),
+        };
+        return super::NormalizedMcpToolResult {
+            tool_result: json!({"kind": "Error", "short_message": message, "detailed_message": message}),
+            success: false,
+            error: Some(message),
+        };
     }
     let mut item = item.clone();
     if let Some(result) = item.get_mut("result").and_then(Value::as_object_mut) {

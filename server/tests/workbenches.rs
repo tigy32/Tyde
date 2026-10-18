@@ -182,7 +182,14 @@ async fn call_agent_control_optional(
     name: &str,
     arguments: Value,
 ) -> (bool, String) {
-    let url = fixture.agent_control_http_url().await;
+    let url = if name == "tyde_review" {
+        fixture
+            .agent_control_caller(caller.expect("review caller"))
+            .await
+            .await_url
+    } else {
+        fixture.agent_control_http_url().await
+    };
     let bearer = match caller {
         Some(caller) => {
             let caller_auth = fixture.agent_control_caller(caller).await;
@@ -2027,8 +2034,13 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         "pending entry must not relabel a running turn"
     );
     assert_eq!(before.workspace_roots, project_roots(&parent));
-    let (failed, _) =
-        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_review",
+        json!({"request_id": "workbench-review"}),
+    )
+    .await;
     assert!(failed, "pending entry must not review the old project");
     initial.release_one();
     let changed = expect_kind(
@@ -2135,14 +2147,22 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             )),
         )
         .await;
-    let (failed, body) =
-        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
-    assert!(!failed, "review after entry failed");
-    let review: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        review["status"], "running",
-        "configured reviewer must actually launch"
-    );
+    let review_caller = fixture.agent_control_caller(&start.agent_id).await;
+    let call = tokio::spawn(async move {
+        call_agent_control_request(
+            review_caller.await_url,
+            Some(
+                review_caller
+                    .authorization
+                    .strip_prefix("Bearer ")
+                    .unwrap()
+                    .to_owned(),
+            ),
+            "tyde_review".to_owned(),
+            json!({"request_id": "entered-review"}),
+        )
+        .await
+    });
     let reviewer = next_frame_matching_on(&mut fixture.client, "workbench reviewer", |env| {
         env.kind == FrameKind::NewAgent
             && env.parse_payload::<NewAgentPayload>().unwrap().name == "Review: Entry"
@@ -2157,7 +2177,21 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(true)),
     )
     .await;
-    let review_id = protocol::ReviewId(review["review_id"].as_str().unwrap().to_owned());
+    let (failed, summaries) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_list_reviews",
+        json!({"limit": 1}),
+    )
+    .await;
+    assert!(!failed);
+    let summaries: Value = serde_json::from_str(&summaries).unwrap();
+    let review_id = protocol::ReviewId(
+        summaries["items"][0]["review_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
     fixture
         .client
         .review_subscribe(&review_id, protocol::ReviewSubscribePayload::default())
@@ -2198,7 +2232,10 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     })
     .await;
     drop(reviewer_reservation);
-    assert!(review["review_id"].is_string());
+    let (failed, body) = call.await.unwrap();
+    assert!(!failed);
+    let review: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(review["status"], "completed");
 
     let returned = MockGateHandle::new();
     fixture
@@ -2485,8 +2522,13 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         "busy move cannot relabel the conversation"
     );
     assert_eq!(live.workspace_roots, project_roots(&parent));
-    let (failed, _) =
-        call_agent_control(&fixture, &start.agent_id, "tyde_request_review", json!({})).await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_review",
+        json!({"request_id": "workbench-review"}),
+    )
+    .await;
     assert!(
         failed,
         "busy relocation must retain its movement reservation"

@@ -2398,6 +2398,8 @@ mod wasm_tests {
         crate::dispatch::dispatch_envelope(&state, &owner.local_host_id, protocol::Envelope::from_payload(
             StreamPath("stream/1".to_owned()), protocol::FrameKind::AgentBootstrap, 0,
             &protocol::AgentBootstrapPayload {
+                status: protocol::AgentControlStatus::Idle,
+                error: None,
                 events: vec![protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
                     tool_call_id: "background-check".to_owned(), execution_mode: protocol::ToolExecutionMode::Background, cancellable: false,
                     update: protocol::ToolProgressUpdate::Other { payload: serde_json::json!({"description": "Restored running command"}) },
@@ -4136,6 +4138,8 @@ mod wasm_tests {
                 protocol::FrameKind::AgentBootstrap,
                 0,
                 &protocol::AgentBootstrapPayload {
+                    status: protocol::AgentControlStatus::Idle,
+                    error: None,
                     events: vec![protocol::AgentBootstrapEvent::ChatEvent(
                         protocol::ChatEvent::AgentHandoff(handoff),
                     )],

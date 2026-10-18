@@ -37,15 +37,8 @@ printf 'plan\n' > "$config/plans/dev-instance-plan.md" || exit 91
 printf 'CLAUDE_PLAN_FILE=%s\n' "$config/plans/dev-instance-plan.md"
 [ "$(cat "$credentials/.credentials.json" 2>/dev/null)" = "$TYDE_TEST_CLAUDE_CREDENTIAL" ] || exit 92
 printf 'CLAUDE_CREDENTIAL_MATCH=1\n'
-# Cross the old 105-second startup cutoff while the real launcher remains alive.
-sleep 106
 exit 3
 "#;
-
-fn free_loopback_addr() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve debug MCP port");
-    listener.local_addr().expect("debug MCP addr")
-}
 
 // Nextest isolates each test in its own process, so the process environment
 // below belongs to this test alone. It is set before any runtime starts.
@@ -91,7 +84,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
 
     assert!(
         error.contains("exited before ready"),
-        "a live cold build must not be stopped by a startup deadline"
+        "failed startup must report child exit and captured output"
     );
     let plan_file = error
         .lines()
@@ -123,9 +116,10 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
 }
 
 async fn start_dev_instance_expecting_exit() -> String {
-    let debug_mcp_addr = free_loopback_addr();
-    let _fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
-        debug_mcp_bind_addr: Some(debug_mcp_addr),
+    // Let the server retain its ephemeral listener: reserving then releasing a
+    // port raced other tests and failed with AddressAlreadyInUse.
+    let fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        debug_mcp_bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         ..Default::default()
     })
     .await;
@@ -139,7 +133,9 @@ async fn start_dev_instance_expecting_exit() -> String {
         "DEV INSTANCE test paths: runtime_root_exists={}",
         repo_root.is_dir()
     );
-    let transport = StreamableHttpClientTransport::from_uri(format!("http://{debug_mcp_addr}/mcp"));
+    let transport = StreamableHttpClientTransport::from_uri(
+        fixture.host_for_test().debug_mcp_url_for_test().await,
+    );
     let service = ().serve(transport).await.expect("connect to debug MCP");
     let result = service
         .call_tool(CallToolRequestParams {

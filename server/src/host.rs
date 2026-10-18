@@ -141,7 +141,6 @@ use crate::project_stream::{
 };
 use crate::review::reviewer::{
     ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
-    prepare_reviewer_context,
 };
 use crate::review::state::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::{
@@ -384,7 +383,6 @@ pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
-    pub review_context_parent: PathBuf,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub backend_storage_roots: HashMap<BackendKind, PathBuf>,
     pub backend_probe_programs: HashMap<BackendKind, String>,
@@ -444,7 +442,6 @@ impl Default for HostRuntimeConfig {
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
-            review_context_parent: std::env::temp_dir(),
             workflow_mcp_bind_addr: None,
             backend_storage_roots: HashMap::new(),
             backend_probe_programs: HashMap::new(),
@@ -825,7 +822,6 @@ pub(crate) struct HostState {
     pub agent_control_mcp: AgentControlMcpHandle,
     pub config_mcp: ConfigMcpHandle,
     pub review_mcp: ReviewMcpHandle,
-    review_context_parent: PathBuf,
     pub workflow_mcp: WorkflowMcpHandle,
     pub workflow_watcher: WorkflowWatcherHandle,
     pub workflow_catalog: WorkflowCatalog,
@@ -4750,7 +4746,9 @@ impl HostHandle {
             operation_terminal_claim,
             admitted_session,
             restoration,
+            mut review_startup_admission,
         } = context;
+        let review_startup_deferred = review_startup_admission.is_some();
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
             project_id = ?payload.project_id,
@@ -6129,6 +6127,7 @@ impl HostHandle {
                     #[cfg(feature = "test-support")]
                     swarm_startup_test_gates,
                     startup_admission: swarm_startup_rx.take(),
+                    review_startup_admission: review_startup_admission.take(),
                     usage_limits_rx,
                     session_store: Arc::clone(&session_store),
                     supervisor_settings_rx,
@@ -6365,7 +6364,7 @@ impl HostHandle {
             self.schedule_generated_agent_name(agent_handle.clone(), request);
         }
         for attachment in deferred_attachments {
-            if restoration.is_some() {
+            if restoration.is_some() || review_startup_deferred {
                 let host = self.clone();
                 tokio::spawn(async move {
                     host.attach_deferred_agent_stream(attachment).await;
@@ -6689,6 +6688,7 @@ impl HostHandle {
                     #[cfg(feature = "test-support")]
                     swarm_startup_test_gates: Default::default(),
                     startup_admission: None,
+                    review_startup_admission: None,
                     usage_limits_rx,
                     session_store,
                     supervisor_settings_rx,
@@ -10810,6 +10810,12 @@ impl HostHandle {
                 closing_sessions_by_agent,
             )
         };
+        let reviews = self.state.lock().await.review_registry.clone();
+        for (id, _) in &close_targets {
+            if let Err(error) = reviews.reviewer_closed(id.clone()) {
+                tracing::warn!(%error, "failed to record reviewer closure");
+            }
+        }
         let closing_session_ids = closing_sessions_by_agent
             .values()
             .cloned()
@@ -10894,19 +10900,6 @@ impl HostHandle {
             )
             .await;
 
-            let review_context = self
-                .state
-                .lock()
-                .await
-                .registry
-                .take_review_context(&target_agent_id);
-            if let Some(context) = review_context {
-                if let Err(error) = context.close() {
-                    tracing::warn!(%error, "failed to remove closed reviewer context");
-                } else {
-                    tracing::debug!("removed closed reviewer context");
-                }
-            }
             let payload = AgentClosedPayload {
                 agent_id: target_agent_id,
             };
@@ -11680,6 +11673,11 @@ impl HostHandle {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn config_mcp_url_for_test(&self) -> String {
         self.state.lock().await.config_mcp.url.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn debug_mcp_url_for_test(&self) -> String {
+        self.state.lock().await.debug_mcp.url.clone()
     }
 
     pub async fn review_mcp_url(&self) -> String {
@@ -14278,29 +14276,45 @@ impl HostHandle {
             let state = self.state.lock().await;
             state.review_registry.clone()
         };
-        if matches!(
+        let interrupted_reviewers = if matches!(
             payload,
             ReviewActionPayload::StopAiReview
                 | ReviewActionPayload::ClearComments
                 | ReviewActionPayload::Cancel
-        ) && let Ok(handle) = review_registry.handle(review_id.clone()).await
-            && let Ok(review) = handle.snapshot().await
-            && let Some(round) = review.ai_reviewer.rounds.last()
-        {
-            for reviewer in &round.reviewers {
-                if reviewer.status == protocol::ReviewAiReviewerStatus::Running
-                    && let Some(agent_id) = &reviewer.agent_id
-                {
-                    self.interrupt_agent(agent_id).await;
-                }
-            }
-        }
+        ) {
+            let review = review_registry
+                .handle(review_id.clone())
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?
+                .snapshot()
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+            review
+                .ai_reviewer
+                .rounds
+                .last()
+                .into_iter()
+                .flat_map(|execution| &execution.reviewers)
+                .filter(|reviewer| reviewer.status == protocol::ReviewAiReviewerStatus::Running)
+                .filter_map(|reviewer| reviewer.agent_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        // Commit explicit user intent before interrupt-generated idle events can finish the execution.
         review_registry
             .action(review_id, payload, connection_host_stream.clone())
             .await
             .map_err(|error| {
                 AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
             })?;
+        for agent_id in interrupted_reviewers {
+            self.interrupt_agent(&agent_id).await;
+        }
         Ok(())
     }
 
@@ -14669,9 +14683,29 @@ impl HostHandle {
         Ok(handle)
     }
 
+    pub(crate) async fn agent_project_reviews(
+        &self,
+        caller: &AgentId,
+    ) -> Result<Vec<protocol::Review>, String> {
+        let project_id = self
+            .project_id_for_agent(caller)
+            .await
+            .ok_or_else(|| "Caller has no project".to_owned())?;
+        self.project_reviews(project_id).await
+    }
+
+    pub(crate) async fn project_reviews(
+        &self,
+        project_id: protocol::ProjectId,
+    ) -> Result<Vec<protocol::Review>, String> {
+        let registry = self.state.lock().await.review_registry.clone();
+        registry.project_reviews(project_id).await
+    }
+
     pub(crate) async fn request_agent_review(
         &self,
         caller: AgentId,
+        request_id: String,
         scope: protocol::ReviewAiScope,
         mode: Option<protocol::ReviewMode>,
     ) -> Result<protocol::Review, String> {
@@ -14685,7 +14719,7 @@ impl HostHandle {
         self.validate_sub_agent_depth(&caller).await?;
         self.agent_review_handle(&caller, None)
             .await?
-            .request_review(caller, scope, mode)
+            .request_review(caller, request_id, scope, mode)
             .await
     }
 
@@ -14702,6 +14736,7 @@ impl HostHandle {
         let aspects = settings
             .review
             .aspects
+            .clone()
             .into_iter()
             .filter(|(_, a)| a.enabled)
             .map(|(id, a)| protocol::ReviewAspectSnapshot {
@@ -14720,8 +14755,8 @@ impl HostHandle {
             return Err("Per-run review backend overrides are no longer supported; configure reviewers in Settings → Review".to_owned());
         }
         let reviewers = match mode {
-            protocol::ReviewMode::Light => settings.review.lite,
-            protocol::ReviewMode::Deep => settings.review.heavy,
+            protocol::ReviewMode::Light => settings.review.lite.clone(),
+            protocol::ReviewMode::Deep => settings.review.heavy.clone(),
         };
         let mut assignments = Vec::new();
         for reviewer in reviewers {
@@ -14759,7 +14794,35 @@ impl HostHandle {
                 }
             }
         }
-        tracing::info!(review_id = %request.review_id, snapshot_id = %request.snapshot_id, ?mode, assignment_count = assignments.len(), "launching aspect review snapshot");
+        let mut retired = std::collections::HashSet::new();
+        for execution in request
+            .review
+            .ai_reviewer
+            .rounds
+            .iter()
+            .filter(|r| r.requested_by == request.requested_by)
+        {
+            for member in &execution.reviewers {
+                let retained = execution.mode == Some(mode)
+                    && assignments.iter().any(|(_, aspects, reviewer, _)| {
+                        member.reviewer_id.as_ref() == Some(&reviewer.id)
+                            && member
+                                .aspects
+                                .iter()
+                                .map(|a| &a.id)
+                                .eq(aspects.iter().map(|a| &a.id))
+                    });
+                if !retained && let Some(id) = &member.agent_id {
+                    retired.insert(id.clone());
+                }
+            }
+        }
+        for id in retired {
+            tracing::info!(review_id = %request.review_id, reviewer_agent_id = %id, "reviewer context invalidated: assignment removed or review mode changed");
+            self.close_agent(&id).await;
+        }
+        tracing::info!(review_id = %request.review_id, ?mode, assignment_count = assignments.len(), "launching configured advisory reviewers");
+        let host_settings = &settings;
         let enabled_backends = &settings.enabled_backends;
         let results = futures_util::future::join_all(assignments.into_iter().map(
             |(name, aspects, reviewer, config)| async move {
@@ -14773,8 +14836,15 @@ impl HostHandle {
                     instructions.push_str(extra);
                 }
                 let result = if enabled_backends.contains(&config.backend_kind) {
-                    self.spawn_ai_reviewer_member(request, &name, &instructions, &config)
-                        .await
+                    self.spawn_ai_reviewer_member(
+                        request,
+                        (&reviewer.id, &aspects, mode),
+                        &name,
+                        &instructions,
+                        &config,
+                        host_settings,
+                    )
+                    .await
                 } else {
                     Err(format!(
                         "Review backend {:?} is not enabled",
@@ -14782,6 +14852,8 @@ impl HostHandle {
                     ))
                 };
                 protocol::ReviewReviewerRun {
+                    context_key: result.as_ref().ok().map(|(_, key, _)| key.clone()),
+                    reused_context: result.as_ref().is_ok_and(|(_, _, reused)| *reused),
                     reviewer_id: Some(reviewer.id),
                     target: Some(reviewer.target),
                     session_settings: config.session_settings,
@@ -14793,7 +14865,7 @@ impl HostHandle {
                     } else {
                         protocol::ReviewAiReviewerStatus::Failed
                     },
-                    agent_id: result.as_ref().ok().cloned(),
+                    agent_id: result.as_ref().ok().map(|(id, _, _)| id.clone()),
                     error: result.err(),
                 }
             },
@@ -14812,71 +14884,28 @@ impl HostHandle {
     async fn spawn_ai_reviewer_member(
         &self,
         request: &ReviewAiSpawnRequest,
+        assignment: (
+            &protocol::ReviewReviewerId,
+            &[protocol::ReviewAspectSnapshot],
+            protocol::ReviewMode,
+        ),
         name: &str,
         instructions: &str,
         config: &settings_model::ReviewExecutionConfig,
-    ) -> Result<AgentId, String> {
-        let requested_backend_kind = Some(config.backend_kind);
-        let backend_kind = match self
-            .resolve_ai_reviewer_backend_kind(requested_backend_kind)
-            .await
-        {
-            Ok(backend_kind) => backend_kind,
-            Err(message) => return Err(message),
-        };
+        host_settings: &settings_model::HostSettings,
+    ) -> Result<(AgentId, String, bool), String> {
+        let (reviewer_id, aspects, mode) = assignment;
+        let backend_kind = config.backend_kind;
         let instructions_len = request.instructions.as_ref().map_or(0, String::len);
-        let roots = {
-            let state = self.state.lock().await;
-            let project = match state
-                .project_store
-                .lock()
-                .await
-                .get(&request.review.project_id)
-            {
-                Some(project) => project,
-                None => {
-                    return Err(format!(
-                        "cannot spawn AI reviewer for missing project {}",
-                        request.review.project_id
-                    ));
-                }
-            };
-            project
-                .root_paths()
-                .into_iter()
-                .map(|root| root.0)
-                .collect::<Vec<_>>()
-        };
+        let roots = request
+            .roots
+            .iter()
+            .map(|root| root.0.clone())
+            .collect::<Vec<_>>();
         let roots_count = roots.len();
-        let stats = host_diff_stats(&request.review.diffs);
-        tracing::info!(
-            review_id = %request.review_id,
-            backend_kind = ?backend_kind,
-            requested_backend_kind = ?requested_backend_kind,
-            roots_count,
-            diff_count = stats.diff_count,
-            file_count = stats.file_count,
-            hunk_count = stats.hunk_count,
-            line_count = stats.line_count,
-            instructions_len,
-            "spawning AI reviewer"
-        );
-        if roots_count == 0 {
-            tracing::warn!(
-                review_id = %request.review_id,
-                backend_kind = ?backend_kind,
-                "AI reviewer spawn rejected without diff roots"
-            );
-            return Err("review has no frozen diff roots".to_owned());
-        }
-        if stats.file_count == 0 {
-            tracing::warn!(
-                review_id = %request.review_id,
-                backend_kind = ?backend_kind,
-                roots_count,
-                "AI reviewer spawn rejected without changed files"
-            );
-            return Err("review has no changed files to review".to_owned());
+        tracing::info!(review_id = %request.review_id, backend_kind = ?backend_kind, roots_count, instructions_len, "spawning advisory reviewer without diff materialization");
+        if roots.is_empty() {
+            return Err("review project has no workspace roots".to_owned());
         }
         let review_mcp_url = {
             let state = self.state.lock().await;
@@ -14890,16 +14919,7 @@ impl HostHandle {
             );
             return Err("review feedback MCP server is unavailable for AI review".to_owned());
         }
-        let context_parent = self.state.lock().await.review_context_parent.clone();
-        let context_directory = prepare_reviewer_context(
-            &request.review,
-            &request.scope,
-            instructions,
-            &context_parent,
-        )
-        .await?;
-        let reviewer_system_prompt =
-            build_reviewer_system_prompt(&context_directory.path().join("review.md"))?;
+        let reviewer_system_prompt = build_reviewer_system_prompt();
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_mcp_servers = vec![StartupMcpServer {
             name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
@@ -14930,7 +14950,97 @@ impl HostHandle {
                 skill_store: &skills,
             })?
         };
-        let prompt = build_reviewer_user_prompt();
+        use sha2::Digest;
+        let mut configuration = serde_json::json!({
+            "reviewer": config,
+            "cost_hint": request.cost_hint,
+            "complexity_tiers_enabled": host_settings.complexity_tiers_enabled,
+            "tier_config": host_settings.backend_tier_configs.get(&backend_kind),
+            "backend_config": resolve_backend_config_for_spawn(host_settings, backend_kind),
+            "roots": roots,
+            "instructions": instructions,
+            "aspects": aspects,
+            "system_prompt": reviewer_spawn_config.instructions,
+            "steering": reviewer_spawn_config.steering_body,
+            "builtin_steering": reviewer_spawn_config.builtin_steering,
+            "mcp_servers": reviewer_spawn_config.mcp_servers,
+            "tool_policy": reviewer_spawn_config.tool_policy,
+            "access_mode": reviewer_spawn_config.access_mode,
+            "excluded_tool_categories": reviewer_spawn_config.excluded_tool_categories,
+        });
+        // Settings and MCP headers use HashMaps; iteration order is not configuration.
+        configuration.sort_all_objects();
+        let context_key = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&configuration)
+                    .map_err(|error| format!("Cannot encode reviewer configuration: {error}"))?
+            )
+        );
+        let previous = request
+            .review
+            .ai_reviewer
+            .rounds
+            .iter()
+            .rev()
+            .filter(|r| r.mode == Some(mode) && r.requested_by == request.requested_by)
+            .flat_map(|r| &r.reviewers)
+            .find(|r| {
+                r.agent_id.is_some()
+                    && r.reviewer_id.as_ref() == Some(reviewer_id)
+                    && r.aspects
+                        .iter()
+                        .map(|a| &a.id)
+                        .eq(aspects.iter().map(|a| &a.id))
+            });
+        if let Some(previous) = previous {
+            if previous.context_key.as_ref() == Some(&context_key) {
+                if let Some(agent_id) = &previous.agent_id {
+                    if let Some(handle) = self.agent_handle(agent_id).await {
+                        if previous.status != protocol::ReviewAiReviewerStatus::Completed {
+                            return Err("Previous reviewer did not complete; close it or explicitly change its configuration before replacement".to_owned());
+                        }
+                        let prompt = build_reviewer_user_prompt(
+                            &request.review,
+                            &request.execution_id,
+                            &request.scope,
+                            instructions,
+                            &request.roots,
+                        )?;
+                        ReviewerToolBridge::attach(
+                            agent_id.clone(),
+                            request.execution_id.clone(),
+                            handle.clone(),
+                            request.review_handle.clone(),
+                        )
+                        .await?;
+                        ReviewerToolBridge::send_when_registered(
+                            agent_id.clone(),
+                            request.execution_id.clone(),
+                            handle,
+                            request.review_handle.clone(),
+                            prompt,
+                            request.cancellation.clone(),
+                        );
+                        tracing::info!(review_id = %request.review_id, reviewer_agent_id = %agent_id, execution_id = %request.execution_id, reused_context = true, "continuing configured reviewer");
+                        return Ok((agent_id.clone(), context_key, true));
+                    }
+                    tracing::info!(review_id = %request.review_id, "reviewer context invalidated: closed or host restarted");
+                }
+            } else {
+                tracing::info!(review_id = %request.review_id, "reviewer context invalidated: configuration changed");
+                if let Some(agent_id) = &previous.agent_id {
+                    self.close_agent(agent_id).await;
+                }
+            }
+        }
+        let prompt = build_reviewer_user_prompt(
+            &request.review,
+            &request.execution_id,
+            &request.scope,
+            instructions,
+            &request.roots,
+        )?;
         let prompt_len = prompt.len();
         let payload = SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
@@ -14949,7 +15059,7 @@ impl HostHandle {
                 backend_kind,
                 launch_profile_id: None,
                 cost_hint: request.cost_hint,
-                access_mode: protocol::BackendAccessMode::ReadOnly,
+                access_mode: protocol::BackendAccessMode::EnforcedReadOnly,
                 session_settings: Some(config.session_settings.clone()),
             },
         };
@@ -14961,12 +15071,16 @@ impl HostHandle {
             prompt_len,
             "dispatching AI reviewer spawn"
         );
+        let (review_startup, review_startup_admission) = oneshot::channel();
         let agent_id = self
-            .spawn_agent_with_origin_and_config(
+            .spawn_agent_with_origin_config_and_team(
                 payload,
-                protocol::AgentOrigin::AgentControl,
-                Some(reviewer_spawn_config),
-                None,
+                SpawnAgentContext {
+                    origin: protocol::AgentOrigin::AgentControl,
+                    resolved_spawn_config_override: Some(reviewer_spawn_config),
+                    review_startup_admission: Some(review_startup_admission),
+                    ..Default::default()
+                },
             )
             .await
             .map_err(|error| error.to_string());
@@ -14975,23 +15089,29 @@ impl HostHandle {
             Err(error) => return Err(error),
         };
         let agent_handle = self
-            .state
-            .lock()
+            .agent_handle(&agent_id)
             .await
-            .registry
-            .retain_review_context(&agent_id, context_directory);
+            .filter(|handle| !handle.is_closing());
         if let Some(agent_handle) = agent_handle {
             tracing::info!(
                 review_id = %request.review_id,
                 reviewer_agent_id = %agent_id,
                 "AI reviewer spawned; attaching tool bridge"
             );
-            ReviewerToolBridge::spawn(
+            ReviewerToolBridge::spawn_initial(
                 agent_id.clone(),
+                request.execution_id.clone(),
                 agent_handle,
                 request.review_handle.clone(),
             );
-            Ok(agent_id)
+            ReviewerToolBridge::admit_when_registered(
+                agent_id.clone(),
+                request.execution_id.clone(),
+                request.review_handle.clone(),
+                review_startup,
+                request.cancellation.clone(),
+            );
+            Ok((agent_id, context_key, false))
         } else {
             tracing::warn!(
                 review_id = %request.review_id,
@@ -15003,31 +15123,6 @@ impl HostHandle {
                 agent_id
             ))
         }
-    }
-
-    async fn resolve_ai_reviewer_backend_kind(
-        &self,
-        requested: Option<protocol::BackendKind>,
-    ) -> Result<protocol::BackendKind, String> {
-        if let Some(backend_kind) = requested {
-            return Ok(backend_kind);
-        }
-        let settings_store = {
-            let state = self.state.lock().await;
-            Arc::clone(&state.settings_store)
-        };
-        let settings = settings_store
-            .lock()
-            .await
-            .get()
-            .map_err(|error| format!("failed to load host settings for AI review: {error}"))?;
-        settings
-            .default_backend
-            .or_else(|| settings.enabled_backends.first().copied())
-            .ok_or_else(|| {
-                "backend_kind is required because the host has no default_backend or enabled backends"
-                    .to_owned()
-            })
     }
 }
 
@@ -15067,7 +15162,7 @@ fn read_review_diffs(
                     context_mode: protocol::DiffContextMode::FullFile,
                     out_of_band: false,
                 };
-                diffs.push(read_diff(project, payload)?);
+                diffs.push(crate::project_stream::build_diff(project, payload)?);
             }
             Ok(diffs)
         }
@@ -15084,7 +15179,7 @@ fn read_review_diffs(
                 context_mode: protocol::DiffContextMode::FullFile,
                 out_of_band: false,
             };
-            Ok(vec![read_diff(project, payload)?])
+            Ok(vec![crate::project_stream::build_diff(project, payload)?])
         }
         ReviewDiffSelection::CommittedRange {
             root,
@@ -15104,7 +15199,7 @@ fn read_review_diffs(
                 context_mode: protocol::DiffContextMode::FullFile,
                 out_of_band: false,
             };
-            read_diff(project, payload).map(|diff| vec![diff])
+            crate::project_stream::build_diff(project, payload).map(|diff| vec![diff])
         }
     }
 }
@@ -16187,7 +16282,6 @@ fn spawn_host_inner(
             agent_control_mcp: agent_control_mcp_placeholder,
             config_mcp: config_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
-            review_context_parent: runtime_config.review_context_parent.clone(),
             workflow_mcp: workflow_mcp_placeholder,
             workflow_watcher,
             workflow_catalog,
@@ -16475,6 +16569,7 @@ struct SpawnAgentContext {
     /// deadlock trying to take it a second time.
     admitted_session: Option<tokio::sync::OwnedMutexGuard<()>>,
     restoration: Option<Arc<crate::agent::registry::RestorationAdmission>>,
+    review_startup_admission: Option<oneshot::Receiver<()>>,
 }
 
 impl Default for SpawnAgentContext {
@@ -16489,6 +16584,7 @@ impl Default for SpawnAgentContext {
             operation_terminal_claim: None,
             admitted_session: None,
             restoration: None,
+            review_startup_admission: None,
         }
     }
 }

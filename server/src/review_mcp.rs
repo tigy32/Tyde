@@ -47,14 +47,88 @@ impl TydeReviewMcpServer {
     }
 }
 
+impl TydeReviewMcpServer {
+    async fn authorized_review(
+        &self,
+        parts: &axum::http::request::Parts,
+        review_id: ReviewId,
+        execution_id: &str,
+    ) -> Result<(protocol::Review, crate::review::ReviewHandle), String> {
+        let caller = request_agent_id_from_parts(parts)?
+            .ok_or_else(|| "Reviewer agent ID is required".to_owned())?;
+        let handle = self
+            .host
+            .agent_review_handle(&caller, Some(review_id))
+            .await?;
+        let review = handle.snapshot().await?;
+        if !review.ai_reviewer.rounds.last().is_some_and(|r| {
+            r.id == execution_id
+                && r.reviewers.iter().any(|member| {
+                    member.agent_id.as_ref() == Some(&caller)
+                        && member.status == protocol::ReviewAiReviewerStatus::Running
+                })
+        }) {
+            return Err("Caller is not assigned to this running review execution".to_owned());
+        }
+        Ok((review, handle))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ProposeReviewCommentToolInput {
     review_id: ReviewId,
+    execution_id: String,
     location: ReviewLocation,
     body: String,
     severity: ReviewSeverity,
     rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewerReadInput {
+    review_id: ReviewId,
+    execution_id: String,
+    finding_id: Option<ReviewSuggestionId>,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewerHistoryInput {
+    review_id: ReviewId,
+    execution_id: String,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
+    #[serde(default)]
+    text_offset: usize,
+    text_limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewerGitInput {
+    review_id: ReviewId,
+    execution_id: String,
+    root: String,
+    operation: ReviewGitOperation,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ReviewGitOperation {
+    Status,
+    Diff { staged: bool },
+    CommittedDiff { base_oid: String, tip_oid: String },
+    Show { oid: String },
+    Log { count: u8 },
 }
 
 #[derive(Debug, Serialize)]
@@ -85,7 +159,159 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
 #[tool_router]
 impl TydeReviewMcpServer {
     #[tool(
-        description = "Propose a pending inline review comment for the supplied frozen review_id and typed diff location."
+        description = "Read current pending findings, or full details for finding_id, in your assigned review. Explicit pagination: limit 1–50 records when listing; 1–8192 characters when reading text. Prior history is not replayed automatically."
+    )]
+    async fn read_review_finding(
+        &self,
+        Parameters(input): Parameters<ReviewerReadInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .authorized_review(&parts, input.review_id, &input.execution_id)
+            .await;
+        let review = match result {
+            Ok((review, _)) => review,
+            Err(e) => return Ok(err_text(e)),
+        };
+        if let Some(id) = input.finding_id {
+            if !(1..=8192).contains(&input.limit) {
+                return Ok(err_text("Use limit 1–8192"));
+            }
+            return match review.suggestions.iter().find(|s| s.id == id) {
+                Some(finding) => ok_json(
+                    serde_json::json!({ "finding_id": finding.id, "state": finding.state, "location": finding.location,
+                    "body": crate::agent_control_mcp::text_page(&finding.body, input.offset, input.limit),
+                    "rationale": finding.rationale.as_ref().map(|r| crate::agent_control_mcp::text_page(r, input.offset, input.limit)) }),
+                ),
+                None => Ok(err_text("Unknown finding")),
+            };
+        }
+        crate::agent_control_mcp::review_page(review.suggestions.iter().filter(|s| s.state == protocol::ReviewSuggestionState::Pending)
+            .map(|s| serde_json::json!({ "finding_id": s.id, "location": s.location, "summary": s.body.chars().take(180).collect::<String>(), "summary_is_excerpt": s.body.chars().count() > 180 })).collect(), input.offset, input.limit)
+    }
+
+    #[tool(
+        description = "Read historical findings and disposition evidence only when useful, in your assigned project review. Explicit bounded pagination: limit 1–50 records, text_limit 1–8192 characters. Large strings disclose text-page totals/next_offset; repeat with text_offset for remaining text."
+    )]
+    async fn read_review_history(
+        &self,
+        Parameters(input): Parameters<ReviewerHistoryInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        if !(1..=8192).contains(&input.text_limit) {
+            return Ok(err_text("Use text_limit 1–8192"));
+        }
+        let review = match self
+            .authorized_review(&parts, input.review_id, &input.execution_id)
+            .await
+        {
+            Ok((review, _)) => review,
+            Err(e) => return Ok(err_text(e)),
+        };
+        let items = crate::agent_control_mcp::review_history_items(
+            &review,
+            input.text_offset,
+            input.text_limit,
+        )?;
+        crate::agent_control_mcp::review_page(items, input.offset, input.limit)
+    }
+
+    #[tool(
+        description = "Read normal Git status, diffs, commit contents or history in a review root. This read-only Git tool disables external diff/textconv/fsmonitor commands. No mandatory inspection sequence. Output uses explicit character pagination (limit 1–8192)."
+    )]
+    async fn read_review_git(
+        &self,
+        Parameters(input): Parameters<ReviewerGitInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (_, handle) = match self
+            .authorized_review(&parts, input.review_id, &input.execution_id)
+            .await
+        {
+            Ok(review) => review,
+            Err(e) => return Ok(err_text(e)),
+        };
+        if !(1..=8192).contains(&input.limit) {
+            return Ok(err_text("Use limit 1–8192"));
+        }
+        let roots = match handle.project_roots().await {
+            Ok(roots) => roots,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if !roots.iter().any(|root| root.0 == input.root) {
+            return Ok(err_text("Root is outside this review project"));
+        }
+        let valid_oid =
+            |oid: &str| (4..=64).contains(&oid.len()) && oid.bytes().all(|c| c.is_ascii_hexdigit());
+        let mut command = tokio::process::Command::new("git");
+        command.args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            &input.root,
+        ]);
+        match input.operation {
+            ReviewGitOperation::Status => {
+                command.args(["status", "--short"]);
+            }
+            ReviewGitOperation::Diff { staged } => {
+                command.args(["diff", "--no-ext-diff", "--no-textconv"]);
+                if staged {
+                    command.arg("--cached");
+                }
+                command.arg("--");
+            }
+            ReviewGitOperation::CommittedDiff { base_oid, tip_oid } => {
+                if !valid_oid(&base_oid) || !valid_oid(&tip_oid) {
+                    return Ok(err_text("Supply exact hexadecimal commit OIDs"));
+                }
+                command.args([
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    &base_oid,
+                    &tip_oid,
+                    "--",
+                ]);
+            }
+            ReviewGitOperation::Show { oid } => {
+                if !valid_oid(&oid) {
+                    return Ok(err_text("Supply an exact hexadecimal commit OID"));
+                }
+                command.args(["show", "--no-ext-diff", "--no-textconv", &oid, "--"]);
+            }
+            ReviewGitOperation::Log { count } => {
+                if count == 0 || count > 50 {
+                    return Ok(err_text("Use count 1–50"));
+                }
+                command.args(["log", "--format=%H %s", &format!("-{count}"), "--"]);
+            }
+        }
+        command.kill_on_drop(true);
+        let output = match command.output().await {
+            Ok(output) => output,
+            Err(e) => return Ok(err_text(format!("Git failed: {e}"))),
+        };
+        if !output.status.success() {
+            return Ok(err_text(format!(
+                "Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let output = match String::from_utf8(output.stdout) {
+            Ok(output) => output,
+            Err(e) => return Ok(err_text(format!("Git output is not UTF-8: {e}"))),
+        };
+        ok_json(crate::agent_control_mcp::text_page(
+            &output,
+            input.offset,
+            input.limit,
+        ))
+    }
+
+    #[tool(
+        description = "Propose a pending inline review comment for the supplied review_id/execution_id and typed location."
     )]
     async fn propose_review_comment(
         &self,
@@ -139,9 +365,11 @@ impl TydeReviewMcpServer {
             severity: input.severity,
             rationale: input.rationale,
         };
-        let Some(suggestion) =
-            ReviewerToolBridge::suggestion_from_tool_args(&reviewer_agent_id, args)
-        else {
+        let Some(suggestion) = ReviewerToolBridge::suggestion_from_tool_args(
+            &reviewer_agent_id,
+            input.execution_id,
+            args,
+        ) else {
             tracing::warn!(
                 review_id = %review_id_for_log,
                 reviewer_agent_id = %reviewer_agent_id,
