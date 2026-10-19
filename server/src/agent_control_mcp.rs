@@ -533,7 +533,10 @@ struct CreateWorkbenchToolInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MoveProjectToolInput {
-    project_id: String,
+    /// Existing host project ID; null or omitted moves to Home without changing roots.
+    project_id: Option<String>,
+    /// Omit to move yourself at the end of this turn; controlled agents must be idle.
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1556,7 +1559,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Move yourself into your canonical project or one of its workbenches, preserving the conversation. Requires an explicit project_id from tyde_list_workbenches. Moving is scheduled at the end of your current turn: finish immediately without editing or requesting review; Tyde updates your backend workspace, UI project, and review target together, then automatically continues your task. Use this to enter an existing workbench or return to the parent before landing and removing it. Close your children and background work first. Team, workflow, and swarm members cannot move independently."
+        description = "Move yourself or an authorized agent into any existing project or workbench on this host, preserving the conversation. Use project_id from tyde_config_list_projects; null or omitted means Home and retains workspace roots. Omit agent_id for yourself: entry is scheduled at the end of your turn, so finish immediately without editing or requesting review; Tyde updates backend workspace, UI project, and review target together, then continues automatically. An ordinary Agent may move only itself or direct children; Orchestrator and Root retain host-wide agent control. Other agents move immediately and must be idle. Close the moving agent’s children and background work first. Team, workflow, swarm, and Tychat agents cannot move independently."
     )]
     async fn tyde_move_to_project(
         &self,
@@ -1569,10 +1572,24 @@ impl TydeAgentControlMcpServer {
             Err(error) => return Ok(err_text(error)),
         };
         let result = async {
-            let project_id = parse_project_id(&input.project_id)?;
-            self.host.schedule_agent_project_move(&caller, &project_id).await?;
-            Ok::<_, String>(json!({"project_id": project_id, "entry_scheduled": true,
-                "instruction": "Finish this turn now. Tyde will move your conversation and continue automatically in the destination project. Do not edit or request review before that continuation."}))
+            let project_id = input.project_id.as_deref().map(parse_project_id).transpose()?;
+            let agent_id = input.agent_id.as_deref().map(parse_agent_id).transpose()?
+                .unwrap_or_else(|| caller.clone());
+            if agent_id == caller {
+                self.host.schedule_agent_project_move(&caller, project_id.as_ref()).await?;
+                Ok::<_, String>(json!({"agent_id": agent_id, "project_id": project_id, "entry_scheduled": true,
+                    "instruction": "Finish this turn now. Tyde will move your conversation and continue automatically in the destination project or Home. Do not edit or request review before that continuation."}))
+            } else {
+                let handle = self.host.agent_handle(&caller).await
+                    .ok_or_else(|| "Caller is no longer running".to_owned())?;
+                let targets = std::slice::from_ref(&agent_id);
+                match handle.snapshot().tyde_permissions {
+                    protocol::AgentTydePermissions::Agent => authorize_direct_children(&self.host, &caller, targets).await?,
+                    protocol::AgentTydePermissions::Orchestrator | protocol::AgentTydePermissions::Root => authorize_global_targets(&self.host, &caller, targets).await?,
+                }
+                let moved = self.host.move_agent_to_project(&agent_id, project_id.as_ref()).await?;
+                Ok(json!({"agent_id": moved.agent_id, "project_id": moved.project_id, "entry_scheduled": false}))
+            }
         }.await;
         match result {
             Ok(result) => ok_json(result),
@@ -2890,7 +2907,7 @@ async fn do_create_workbench(
         .map_err(|error| error.to_string())?;
     let mut result = create_workbench_result(created)?;
     if input.action == protocol::WorkbenchCreateAction::Enter {
-        host.schedule_agent_project_move(caller, &ProjectId(result.project_id.clone())).await
+        host.schedule_agent_project_move(caller, Some(&ProjectId(result.project_id.clone()))).await
             .map_err(|error| format!("Workbench {} was created, but entry failed: {error}. Your project is unchanged; use tyde_move_to_project to enter it explicitly.", result.project_id))?;
         result.entry_scheduled = true;
     }

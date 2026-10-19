@@ -791,9 +791,9 @@ impl Drop for AgentProjectMoveGuard {
 }
 
 pub(crate) struct ScheduledProjectMove {
-    pub project_id: protocol::ProjectId,
+    pub project_id: Option<protocol::ProjectId>,
     pub project_store: Arc<tokio::sync::Mutex<crate::store::project::ProjectStore>>,
-    pub parent_lock: Arc<tokio::sync::Mutex<()>>,
+    pub parent_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     pub guard: AgentProjectMoveGuard,
 }
 
@@ -4337,14 +4337,20 @@ pub(crate) fn spawn_agent_actor(
                     Some(movement) => movement,
                     None => continue,
                 };
-                let parent_guard = movement.parent_lock.lock().await;
-                let roots = {
-                    let store = movement.project_store.lock().await;
-                    store.get(&movement.project_id)
-                        .ok_or_else(|| ProjectMoveFailure::Rejected("Destination project was removed before entry".to_owned()))
-                        .and_then(|project| crate::backend::validate_local_workspace_roots(
-                            project.root_paths().into_iter().map(|root| root.0).collect())
-                            .map_err(ProjectMoveFailure::Rejected))
+                let parent_guard = match movement.parent_lock.as_ref() {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                let roots = match movement.project_id.as_ref() {
+                    Some(id) => {
+                        let store = movement.project_store.lock().await;
+                        store.get(id)
+                            .ok_or_else(|| ProjectMoveFailure::Rejected("Destination project was removed before entry".to_owned()))
+                            .and_then(|project| crate::backend::validate_local_workspace_roots(
+                                project.root_paths().into_iter().map(|root| root.0).collect())
+                                .map_err(ProjectMoveFailure::Rejected))
+                    }
+                    None => Ok(current_start.workspace_roots.clone()),
                 };
                 let result = match roots {
                     Ok(roots) => apply_agent_project_move(AgentProjectMoveContext {
@@ -4355,7 +4361,7 @@ pub(crate) fn spawn_agent_actor(
                         start_tx: &start_tx,
                         event_log: &mut event_log,
                         workspace_emitter: &workspace_emitter,
-                    }, Some(movement.project_id.clone()), roots).await,
+                    }, movement.project_id.clone(), roots).await,
                     Err(error) => Err(error),
                 };
                 drop(parent_guard);
@@ -4371,7 +4377,7 @@ pub(crate) fn spawn_agent_actor(
                         broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
                         pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                             message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
-                                movement.project_id, current_start.workspace_roots.join(", ")),
+                                movement.project_id.as_ref().map_or_else(|| "Home (no project)".to_owned(), ToString::to_string), current_start.workspace_roots.join(", ")),
                             images: None, origin: Some(MessageOrigin::System), tool_response: None,
                         }));
                     }
@@ -9433,7 +9439,10 @@ pub(crate) fn spawn_agent_actor(
                                     event_log: &mut event_log,
                                     workspace_emitter: &workspace_emitter,
                                 }, project_id, roots).await {
-                                    Ok(start) => Ok(start),
+                                    Ok(start) => {
+                                        broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
+                                        Ok(start)
+                                    }
                                     Err(ProjectMoveFailure::Busy) => Err(crate::backend::WorkspaceRelocationError::Busy.to_string()),
                                     Err(ProjectMoveFailure::Rejected(message)) => Err(message),
                                     Err(ProjectMoveFailure::Unreconciled(message)) => {

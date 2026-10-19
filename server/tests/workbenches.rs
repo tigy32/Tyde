@@ -1619,7 +1619,12 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
 async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     let repo = init_git_repo("scope-parent");
     let other_repo = init_git_repo("scope-other");
-    let mut fixture = Fixture::new().await;
+    let mut fixture =
+        Fixture::new_with_mock_backend_for_enabled_backends(vec![BackendKind::Codex]).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     let other = create_project(&mut fixture.client, vec![other_repo.path()]).await;
     let removable = create_workbench(&mut fixture.client, &parent, "feature/mcp-remove").await;
@@ -1633,6 +1638,7 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         .expect("write dirty MCP workbench file");
 
     for (tool, arguments) in [
+        ("tyde_move_to_project", json!({"project_id": other.id.0})),
         ("tyde_list_workbenches", json!({})),
         (
             "tyde_create_workbench",
@@ -1655,6 +1661,13 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         &parent,
         "read-only-workbench-caller",
         BackendAccessMode::ReadOnly,
+    )
+    .await;
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &read_only.instance_stream,
+        "read-only caller idle",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
     )
     .await;
     let (is_error, body) = call_agent_control(
@@ -1763,6 +1776,326 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     .expect("parse MCP workbench delete");
     assert!(
         matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == removable.id)
+    );
+
+    let busy = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Moving child",
+            MockScript::one(MockTurn::gated_text("Child working before move", &busy)),
+        )
+        .await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "name": "Moving child", "prompt": "Work for the parent", "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(!failed, "spawn controlled child");
+    let child = expect_kind(&mut fixture.client, FrameKind::NewAgent, "moving child")
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .unwrap();
+    let child_start = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "moving child registered session",
+        |env| {
+            env.stream == child.instance_stream
+                && env.kind == FrameKind::AgentStart
+                && env
+                    .parse_payload::<AgentStartPayload>()
+                    .unwrap()
+                    .session_id
+                    .is_some()
+        },
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(child_start.agent_id, child.agent_id);
+    drop(reservation);
+    busy.wait_until_entered().await;
+    let (failed, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_move_to_project",
+        json!({
+            "agent_id": child.agent_id.0, "project_id": other_workbench.id.0
+        }),
+    )
+    .await;
+    assert!(
+        failed && body.contains("finished"),
+        "controlled move must preserve the idle boundary"
+    );
+    busy.release_one();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &child.instance_stream,
+        "child idle",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    for (moving_caller, target) in [
+        (None, &child.agent_id),
+        (Some(&read_only.agent_id), &child.agent_id),
+        (Some(&child.agent_id), &caller.agent_id),
+        (Some(&caller.agent_id), &read_only.agent_id),
+    ] {
+        let (failed, _) = call_agent_control_optional(
+            &fixture,
+            moving_caller,
+            "tyde_move_to_project",
+            json!({
+                "agent_id": target.0, "project_id": other_workbench.id.0
+            }),
+        )
+        .await;
+        assert!(
+            failed,
+            "move must authenticate and retain control ownership, even for top-level ordinary Agents"
+        );
+    }
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_move_to_project",
+        json!({
+            "agent_id": child.agent_id.0, "project_id": "missing-project"
+        }),
+    )
+    .await;
+    assert!(
+        failed,
+        "authorized control cannot create a missing destination"
+    );
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let before = before
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == child.agent_id)
+        .unwrap();
+    assert_eq!(
+        before.project_id,
+        Some(parent.id.clone()),
+        "denied moves must not mutate assignment"
+    );
+    assert_eq!(
+        before.tyde_permissions,
+        protocol::AgentTydePermissions::Agent
+    );
+    let mut observer = fixture.connect().await;
+    for destination in [Some(&other), Some(&other_workbench), None] {
+        let project_id = destination.map(|project| project.id.clone());
+        let roots = destination.map_or_else(|| project_roots(&other_workbench), project_roots);
+        let (failed, body) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_move_to_project",
+            json!({
+                "agent_id": child.agent_id.0, "project_id": project_id
+            }),
+        )
+        .await;
+        eprintln!(
+            "CROSS-PROJECT CHILD MOVE: destination_assigned={} succeeded={}",
+            project_id.is_some(),
+            !failed
+        );
+        assert!(
+            !failed,
+            "an owned child must be movable across project boundaries"
+        );
+        let result: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result["entry_scheduled"], false,
+            "controlled idle moves must not create an automatic turn"
+        );
+        let moved = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentProjectChanged,
+            "controlled child move",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(moved.agent_id, child.agent_id);
+        assert_eq!(moved.project_id, project_id);
+        assert_eq!(moved.workspace_roots, roots);
+        assert!(
+            moved.session_id == child_start.session_id,
+            "child conversation is preserved"
+        );
+        assert_eq!(moved.parent_agent_id, Some(caller.agent_id.clone()));
+        assert_eq!(
+            moved.tyde_permissions,
+            protocol::AgentTydePermissions::Agent
+        );
+        let broadcast = expect_kind(
+            &mut observer,
+            FrameKind::AgentProjectChanged,
+            "controlled child move observer",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(broadcast.project_id, project_id);
+        assert_eq!(broadcast.workspace_roots, roots);
+        fixture
+            .mock_by_id(&child.agent_id)
+            .await
+            .enqueue(MockTurn::workspace_roots())
+            .await;
+        let (failed, _) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_send_agent_message",
+            json!({
+                "agent_id": child.agent_id.0, "message": "Report the effective workspace"
+            }),
+        )
+        .await;
+        assert!(
+            !failed,
+            "cross-project child remains controllable by its parent"
+        );
+        let turn = fixture::finish_turn_on(&mut fixture.client, &child.instance_stream).await;
+        let reported = turn
+            .chat_events()
+            .into_iter()
+            .find_map(|event| match event {
+                protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                _ => None,
+            })
+            .expect("child workspace report");
+        let reported: Vec<String> = serde_json::from_str(&reported).unwrap();
+        assert_eq!(
+            reported, roots,
+            "controlled child execution must use destination roots"
+        );
+        let (_, state) = fixture.connect_with_bootstrap().await;
+        let saved = state
+            .sessions
+            .iter()
+            .find(|saved| Some(&saved.id) == child_start.session_id.as_ref())
+            .unwrap();
+        assert_eq!(saved.project_id, project_id);
+        assert_eq!(saved.workspace_roots, roots);
+        let parent_state = state
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == caller.agent_id)
+            .unwrap();
+        assert_eq!(parent_state.project_id, Some(parent.id.clone()));
+        assert_eq!(
+            parent_state.tyde_permissions,
+            protocol::AgentTydePermissions::Agent
+        );
+    }
+    let caller_stream = caller.instance_stream.clone();
+    for (role, destination) in [
+        (protocol::AgentTydePermissions::Orchestrator, &other),
+        (protocol::AgentTydePermissions::Root, &parent),
+    ] {
+        fixture
+            .client
+            .set_agent_tyde_permissions(&caller_stream, role)
+            .await
+            .unwrap();
+        expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentTydePermissionsChanged,
+            "human-assigned move authority",
+        )
+        .await;
+        let (failed, _) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_move_to_project",
+            json!({
+                "agent_id": read_only.agent_id.0, "project_id": destination.id.0
+            }),
+        )
+        .await;
+        assert!(
+            !failed,
+            "explicit higher role must retain existing host-wide agent scope"
+        );
+        let moved = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentProjectChanged,
+            "higher role move",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(moved.project_id, Some(destination.id.clone()));
+        assert_eq!(
+            moved.tyde_permissions,
+            protocol::AgentTydePermissions::Agent
+        );
+    }
+    fixture
+        .client
+        .set_agent_tyde_permissions(&caller_stream, protocol::AgentTydePermissions::Agent)
+        .await
+        .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentTydePermissionsChanged,
+        "restored ordinary role",
+    )
+    .await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_move_to_project",
+        json!({
+            "agent_id": read_only.agent_id.0, "project_id": other.id.0
+        }),
+    )
+    .await;
+    assert!(
+        failed,
+        "a move must not retain authority after human role revocation"
+    );
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: other_workbench.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(
+        &mut fixture.client,
+        "Home agent stops before workspace removal",
+        |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .unwrap()
+                    .agent_id
+                    == child.agent_id
+        },
+    )
+    .await;
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert!(
+        !state
+            .agents
+            .iter()
+            .any(|entry| entry.agent_id == child.agent_id)
+    );
+    assert!(
+        state
+            .agents
+            .iter()
+            .any(|entry| entry.agent_id == caller.agent_id),
+        "removing the child's workspace must not close its parent in another project"
     );
 }
 
@@ -2108,21 +2441,131 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         "the client must receive the automatic continuation's assistant output"
     );
 
-    let (failed, _) = call_agent_control(
-        &fixture,
-        &start.agent_id,
-        "tyde_move_to_project",
-        json!({"project_id": unrelated.id.0}),
-    )
-    .await;
-    assert!(failed, "entry must not widen caller project scope");
+    let unrelated_workbench =
+        create_workbench(&mut fixture.client, &unrelated, "feature/cross-project").await;
+    let mut previous_project = Some(workbench_id.clone());
+    let mut previous_roots = roots.clone();
+    for destination in [Some(&unrelated), None, Some(&unrelated_workbench)] {
+        let finishing = MockGateHandle::new();
+        fixture
+            .mock(&agent)
+            .await
+            .enqueue_all([
+                MockTurn::gated_text("Finishing before cross-project entry", &finishing),
+                MockTurn::workspace_roots(),
+            ])
+            .await;
+        fixture
+            .client
+            .send_message(
+                &agent.stream,
+                "Continue in the selected destination".to_owned(),
+            )
+            .await
+            .unwrap();
+        finishing.wait_until_entered().await;
+        let project_id = destination.map(|project| project.id.clone());
+        let expected_roots = destination.map_or_else(|| previous_roots.clone(), project_roots);
+        let (failed, body) = call_agent_control(
+            &fixture,
+            &start.agent_id,
+            "tyde_move_to_project",
+            json!({"project_id": project_id}),
+        )
+        .await;
+        eprintln!(
+            "CROSS-PROJECT SELF MOVE: destination_assigned={} scheduled={} ancestry_rejection={}",
+            project_id.is_some(),
+            !failed,
+            body.contains("Destination is outside caller project scope")
+        );
+        assert!(
+            !failed,
+            "an existing unrelated project/workbench or Home must be enterable"
+        );
+        let (_, pending) = fixture.connect_with_bootstrap().await;
+        let pending = pending
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap();
+        assert_eq!(
+            pending.project_id, previous_project,
+            "self move must wait for turn completion"
+        );
+        assert_eq!(pending.workspace_roots, previous_roots);
+        let (failed, _) = call_agent_control(
+            &fixture,
+            &start.agent_id,
+            "tyde_review",
+            json!({"request_id": "pending-cross-project"}),
+        )
+        .await;
+        assert!(
+            failed,
+            "pending cross-project entry cannot review the source"
+        );
+        finishing.release_one();
+        let moved = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentProjectChanged,
+            "cross-project self entry",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(moved.project_id, project_id);
+        assert_eq!(moved.workspace_roots, expected_roots);
+        assert!(
+            moved.session_id == start.session_id,
+            "cross-project entry preserves conversation identity"
+        );
+        assert_eq!(moved.parent_agent_id, start.parent_agent_id);
+        assert_eq!(moved.tyde_permissions, start.tyde_permissions);
+        let broadcast = expect_kind(
+            &mut observer,
+            FrameKind::AgentProjectChanged,
+            "cross-project observer",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(broadcast.project_id, project_id);
+        assert_eq!(broadcast.workspace_roots, expected_roots);
+        let turn = fixture.finish_turn(&agent).await;
+        let reported = turn
+            .chat_events()
+            .into_iter()
+            .find_map(|event| match event {
+                protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                _ => None,
+            })
+            .expect("continuation workspace report");
+        let reported: Vec<String> = serde_json::from_str(&reported).expect("workspace roots JSON");
+        assert_eq!(
+            reported, expected_roots,
+            "resumed execution must use the actual destination roots"
+        );
+        let (_, persisted) = fixture.connect_with_bootstrap().await;
+        let saved = persisted
+            .sessions
+            .iter()
+            .find(|saved| Some(&saved.id) == start.session_id.as_ref())
+            .unwrap();
+        assert_eq!(saved.project_id, project_id);
+        assert_eq!(saved.workspace_roots, expected_roots);
+        previous_project = project_id;
+        previous_roots = expected_roots;
+    }
+    let review_project_id = unrelated_workbench.id.clone();
+    let review_roots = project_roots(&unrelated_workbench);
     fs::write(
-        Path::new(&roots[0]).join("README.md"),
-        "# Workbench changes\n",
+        Path::new(&review_roots[0]).join("README.md"),
+        "# Cross-project workbench changes\n",
     )
     .unwrap();
     next_frame_matching_on(&mut fixture.client, "workbench reviewable changes", |env| {
-        env.stream.0 == format!("/project/{}", workbench_id.0)
+        env.stream.0 == format!("/project/{}", review_project_id.0)
             && env.kind == FrameKind::ProjectGitStatus
             && env
                 .parse_payload::<protocol::ProjectGitStatusPayload>()
@@ -2130,7 +2573,7 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
                 .roots
                 .iter()
                 .any(|root| {
-                    root.root.0 == roots[0]
+                    root.root.0 == review_roots[0]
                         && root.files.iter().any(|file| {
                             file.relative_path == "README.md" && file.unstaged.is_some()
                         })
@@ -2206,12 +2649,15 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     .parse_payload::<protocol::ReviewBootstrapPayload>()
     .unwrap()
     .review;
-    assert_eq!(snapshot.project_id, workbench_id);
+    assert_eq!(snapshot.project_id, review_project_id);
     assert!(
-        snapshot.diffs.iter().any(|diff| diff.root.0 == roots[0]),
+        snapshot
+            .diffs
+            .iter()
+            .any(|diff| diff.root.0 == review_roots[0]),
         "review must freeze the workbench's actual changes"
     );
-    assert_eq!(reviewer.project_id, Some(workbench_id.clone()));
+    assert_eq!(reviewer.project_id, Some(review_project_id.clone()));
     assert_eq!(reviewer.parent_agent_id, Some(start.agent_id.clone()));
     reviewer_gate.wait_until_entered().await;
     reviewer_gate.release_one();

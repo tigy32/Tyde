@@ -7113,7 +7113,7 @@ impl HostHandle {
         Ok(())
     }
 
-    async fn move_agent_to_project(
+    pub(crate) async fn move_agent_to_project(
         &self,
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
@@ -7169,8 +7169,8 @@ impl HostHandle {
         {
             return Err("This backend cannot move a running conversation".to_owned());
         }
-        if start.team_id.is_some() || start.workflow.is_some() || start.parent_agent_id.is_some() {
-            return Err("Move a standalone agent; team, workflow, and child agents belong to their existing project".to_owned());
+        if start.team_id.is_some() || start.workflow.is_some() {
+            return Err("Team and workflow agents cannot move independently".to_owned());
         }
         let _move_guard = {
             let state = self.state.lock().await;
@@ -7227,36 +7227,34 @@ impl HostHandle {
     pub(crate) async fn schedule_agent_project_move(
         &self,
         agent_id: &AgentId,
-        project_id: &ProjectId,
+        project_id: Option<&ProjectId>,
     ) -> Result<(), String> {
         let handle = self.validate_agent_project_entry(agent_id).await?;
         let project_store = self.state.lock().await.project_store.clone();
-        let current_id = handle
-            .snapshot()
-            .project_id
-            .ok_or_else(|| "Caller has no project".to_owned())?;
-        let canonical_id = {
-            let store = project_store.lock().await;
-            let current = store
-                .get(&current_id)
-                .ok_or_else(|| "Caller project no longer exists".to_owned())?;
-            current
-                .parent_project_id()
-                .cloned()
-                .unwrap_or(current_id.clone())
+        let current_id = handle.snapshot().project_id;
+        let parent_lock = match project_id {
+            Some(id) => {
+                let project = project_store
+                    .lock()
+                    .await
+                    .get(id)
+                    .ok_or_else(|| "Destination project no longer exists".to_owned())?;
+                Some(
+                    self.workbench_parent_lock(project.parent_project_id().unwrap_or(&project.id))
+                        .await,
+                )
+            }
+            None => None,
         };
-        let parent_lock = self.workbench_parent_lock(&canonical_id).await;
-        let parent_guard = parent_lock.lock().await;
-        {
+        let parent_guard = match parent_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if let Some(id) = project_id {
             let store = project_store.lock().await;
             let destination = store
-                .get(project_id)
+                .get(id)
                 .ok_or_else(|| "Destination project no longer exists".to_owned())?;
-            if destination.id != canonical_id
-                && destination.parent_project_id() != Some(&canonical_id)
-            {
-                return Err("Destination is outside caller project scope".to_owned());
-            }
             crate::backend::validate_local_workspace_roots(
                 destination
                     .root_paths()
@@ -7265,20 +7263,26 @@ impl HostHandle {
                     .collect(),
             )?;
         }
+        tracing::info!(
+            caller_has_project = current_id.is_some(),
+            destination_has_project = project_id.is_some(),
+            same_project = current_id.as_ref() == project_id,
+            "Validated scheduled agent project destination"
+        );
         let move_guard = {
             let state = self.state.lock().await;
             let guard = handle.reserve_project_move()?;
             if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
                 return Err("Close this agent's child agents before moving it".to_owned());
             }
-            if handle.snapshot().project_id != Some(current_id) {
+            if handle.snapshot().project_id != current_id {
                 return Err("Caller project changed before entry was scheduled".to_owned());
             }
             guard
         };
         let result = handle
             .schedule_project_move(crate::agent::ScheduledProjectMove {
-                project_id: project_id.clone(),
+                project_id: project_id.cloned(),
                 project_store,
                 parent_lock: parent_lock.clone(),
                 guard: move_guard,
@@ -7722,7 +7726,14 @@ impl HostHandle {
                 .into_iter()
                 .filter(|agent_id| {
                     state.registry.agent_handle(agent_id).is_some_and(|agent| {
-                        agent.snapshot().project_id.as_ref() == Some(&project.id)
+                        let start = agent.snapshot();
+                        start.project_id.as_ref() == Some(&project.id)
+                            || (start.project_id.is_none()
+                                && start.workspace_roots.iter().any(|workspace| {
+                                    roots.iter().any(|root| {
+                                        Path::new(workspace).starts_with(&root.worktree_root.0)
+                                    })
+                                }))
                     })
                 })
                 .collect::<Vec<_>>();
