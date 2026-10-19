@@ -631,6 +631,24 @@ fn ProjectRow(
         move || abbreviate(&project_name())
     };
     let title_attr = project_name.clone();
+    let engine_title = move || {
+        project_signal().and_then(|project| match project.source {
+            ProjectSource::Standalone { .. } => None,
+            ProjectSource::GitWorkbench { environment, .. } => Some(match environment {
+                protocol::WorkbenchEnvironment::Native => "Native workbench",
+                protocol::WorkbenchEnvironment::Bubblewrap { initialization, .. } => {
+                    match initialization {
+                        protocol::WorkbenchInitialization::Cold => {
+                            "Bubblewrap · Cold initialization"
+                        }
+                        protocol::WorkbenchInitialization::Snapshot { .. } => {
+                            "Bubblewrap · Snapshot seeded"
+                        }
+                    }
+                }
+            }),
+        })
+    };
 
     view! {
         <div
@@ -648,7 +666,7 @@ fn ProjectRow(
                 on:dblclick=on_dblclick
                 on:contextmenu=on_contextmenu
             >
-                <span class="rail-tag">{move || abbrev()}</span>
+                <span class="rail-tag" title=engine_title>{move || abbrev()}</span>
                 {label_view}
             </button>
         </div>
@@ -1489,6 +1507,7 @@ mod wasm_tests {
             name: name.to_owned(),
             sort_order,
             source: ProjectSource::GitWorkbench {
+                environment: Default::default(),
                 parent_project_id: ProjectId(parent_id.to_owned()),
                 branch: GitBranchName(branch.to_owned()),
                 roots: vec![WorkbenchRoot {
@@ -1597,9 +1616,10 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn renders_two_top_level_with_nested_workbenches() {
         let container = make_container();
+        let state = make_state_with_fixture();
+        let mount_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = make_state_with_fixture();
-            provide_context(state);
+            provide_context(mount_state.clone());
             view! { <ProjectRail /> }
         });
 
@@ -1650,6 +1670,73 @@ mod wasm_tests {
         assert!(
             workbenches.contains(&"bugfix-x".to_owned()),
             "expected 'bugfix-x' workbench label rendered, got: {workbenches:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[title='Native workbench']")
+                .unwrap()
+                .length(),
+            2,
+        );
+        state.projects.update(|projects| {
+            let project = projects
+                .iter_mut()
+                .find(|info| info.project.id.0 == "wb-feat")
+                .unwrap();
+            let ProjectSource::GitWorkbench { environment, .. } = &mut project.project.source
+            else {
+                panic!("fixture must be a workbench");
+            };
+            *environment = protocol::WorkbenchEnvironment::Bubblewrap {
+                manifest_path: protocol::HostAbsPath("/tmp/workbench/manifest.json".to_owned()),
+                logical_root: ProjectRootPath("/workspace".to_owned()),
+                support: Default::default(),
+                lifecycle: Default::default(),
+                initialization: protocol::WorkbenchInitialization::Cold,
+            };
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[title='Bubblewrap · Cold initialization']")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[title='Native workbench']")
+                .unwrap()
+                .length(),
+            1
+        );
+        state.projects.update(|projects| {
+            let project = projects
+                .iter_mut()
+                .find(|info| info.project.id.0 == "wb-feat")
+                .unwrap();
+            let ProjectSource::GitWorkbench {
+                environment: protocol::WorkbenchEnvironment::Bubblewrap { initialization, .. },
+                ..
+            } = &mut project.project.source
+            else {
+                panic!("fixture must be a Bubblewrap workbench");
+            };
+            *initialization = protocol::WorkbenchInitialization::Snapshot {
+                cohort: "fixture".to_owned(),
+            };
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[title='Bubblewrap · Snapshot seeded']")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            container
+                .query_selector("[title='Bubblewrap · Cold initialization']")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1801,6 +1888,7 @@ mod wasm_tests {
                     protocol::FrameKind::CommandError,
                     0,
                     &protocol::CommandErrorPayload {
+                        workbench_reason: None,
                         context: Some(protocol::CommandErrorContext::WorkbenchRemove {
                             project_id: ProjectId("wb-feat".to_owned()),
                         }),

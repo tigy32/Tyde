@@ -179,8 +179,10 @@ pub use types::{
     TydeAgentWaitStatus, UNAVAILABLE_OPTION_SUFFIX, UsageLimitPausePhase, UsageLimitPauseState,
     UserQuestionAnswer, UserQuestionAnswerSchema, UserQuestionAnswerValue, UserQuestionId,
     UserQuestionMode, UserSmartViewId, ValueProvenance, VapidPrivateKey, VapidPublicKey, Version,
-    WelcomePayload, WorkbenchCreateAction, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkbenchRoot, WorkflowAgentState, WorkflowAgentStatus, WorkflowCatalogLocation,
+    WelcomePayload, WorkbenchAvailability, WorkbenchCreateAction, WorkbenchCreatePayload,
+    WorkbenchEngine, WorkbenchEnvironment, WorkbenchEnvironmentLifecycle, WorkbenchInitialization,
+    WorkbenchRemovalPhase, WorkbenchRemovePayload, WorkbenchRoot, WorkbenchSupport,
+    WorkbenchUnsupportedReason, WorkflowAgentState, WorkflowAgentStatus, WorkflowCatalogLocation,
     WorkflowCoordinatorSpec, WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowId,
     WorkflowInputControl, WorkflowInputOption, WorkflowInputSpec, WorkflowNotifyPayload,
     WorkflowRefreshPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
@@ -199,6 +201,10 @@ pub use types::{
     VoiceRequest, VoiceSessionId, VoiceSessionPayload, VoiceSessionState, VoiceStartPayload,
     VoiceStatePayload, VoiceStopPayload, VoiceStopReason, VoiceTarget, VoiceTranscriptPayload,
     VoiceTranscriptSpeaker, VoiceUnavailableReason,
+};
+pub use types::{
+    WorkbenchConfiguration, WorkbenchRuntimeFileBinding, WorkbenchServiceConfiguration,
+    WorkbenchSnapshotConfiguration,
 };
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).

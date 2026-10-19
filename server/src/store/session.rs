@@ -1204,7 +1204,7 @@ impl SessionStore {
         let (result, wrote) = body(&transaction)?;
         #[cfg(feature = "test-support")]
         if wrote {
-            commit_hooks::run(&self.path)?;
+            commit_hooks::run(&self.path, &[])?;
         }
         transaction.commit().map_err(sql_error)?;
         tracing::debug!(wrote, "committed startup reservation transaction");
@@ -1242,6 +1242,18 @@ impl SessionStore {
         let original = read_raw_records(&transaction, ids)?;
         let mut records = decode_records(&original)?;
         let (result, changed) = body(&mut records)?;
+        #[cfg(feature = "test-support")]
+        let withdrawn = records
+            .values()
+            .filter(|record| {
+                record.restore_state.is_none()
+                    && original
+                        .get(&record.id.0)
+                        .and_then(|value| value.get("restore_state"))
+                        .is_some_and(|value| !value.is_null())
+            })
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
         let writes = if changed {
             write_records(&transaction, &original, records)?
         } else {
@@ -1249,7 +1261,7 @@ impl SessionStore {
         };
         #[cfg(feature = "test-support")]
         if writes > 0 {
-            commit_hooks::run(&self.path)?;
+            commit_hooks::run(&self.path, &withdrawn)?;
         }
         transaction.commit().map_err(sql_error)?;
         tracing::debug!(
@@ -1912,18 +1924,42 @@ pub mod commit_hooks {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
+    use protocol::SessionId;
+
     type Hook = Box<dyn FnOnce() -> Result<(), String> + Send>;
-    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+    enum Target {
+        AnyCommit,
+        RestorationWithdrawal(SessionId),
+    }
+    struct PendingHook {
+        target: Target,
+        callback: Hook,
+    }
+    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, PendingHook>>> = OnceLock::new();
 
     pub struct InstalledHook(PathBuf);
 
     impl InstalledHook {
         pub fn install(path: PathBuf, hook: Hook) -> Self {
-            let previous = HOOKS
-                .get_or_init(Mutex::default)
-                .lock()
-                .unwrap()
-                .insert(path.clone(), hook);
+            Self::install_target(path, Target::AnyCommit, hook)
+        }
+
+        pub fn install_restoration_withdrawal(
+            path: PathBuf,
+            session: SessionId,
+            hook: Hook,
+        ) -> Self {
+            Self::install_target(path, Target::RestorationWithdrawal(session), hook)
+        }
+
+        fn install_target(path: PathBuf, target: Target, hook: Hook) -> Self {
+            let previous = HOOKS.get_or_init(Mutex::default).lock().unwrap().insert(
+                path.clone(),
+                PendingHook {
+                    target,
+                    callback: hook,
+                },
+            );
             assert!(previous.is_none(), "session commit hook already installed");
             Self(path)
         }
@@ -1939,12 +1975,22 @@ pub mod commit_hooks {
         }
     }
 
-    pub(super) fn run(path: &Path) -> Result<(), String> {
-        let hook = HOOKS
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap()
-            .remove(path);
-        hook.map_or(Ok(()), |hook| hook())
+    pub(super) fn run(path: &Path, withdrawn: &[SessionId]) -> Result<(), String> {
+        let hook = {
+            let mut hooks = HOOKS.get_or_init(Mutex::default).lock().unwrap();
+            let matches = hooks.get(path).is_some_and(|hook| match &hook.target {
+                Target::AnyCommit => true,
+                Target::RestorationWithdrawal(session) => withdrawn.contains(session),
+            });
+            if matches { hooks.remove(path) } else { None }
+        };
+        hook.map_or(Ok(()), |hook| {
+            let boundary = match hook.target {
+                Target::AnyCommit => "any-commit",
+                Target::RestorationWithdrawal(_) => "restoration-withdrawal",
+            };
+            eprintln!("Session commit injection diagnostic: boundary={boundary}");
+            (hook.callback)()
+        })
     }
 }

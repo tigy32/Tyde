@@ -1,3 +1,5 @@
+#[path = "project_lifecycle.rs"]
+pub(crate) mod lifecycle;
 #[path = "tychat_host.rs"]
 mod tychat;
 use crate::swarm_registry::SwarmRegistryHandle;
@@ -744,6 +746,7 @@ enum SessionSchemaResolution {
 type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
+    workbench_support: protocol::WorkbenchSupport,
     tychat: crate::tychat::TychatService,
     dots: crate::dots::DotsHandle,
     #[cfg(feature = "test-support")]
@@ -866,7 +869,7 @@ pub(crate) struct HostState {
     project_watcher: crate::project_watch::SharedProjectWatcher,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
-    workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
+    project_lifecycles: HashMap<Option<ProjectId>, Weak<lifecycle::LifecycleHandle>>,
     /// Per-project "active search id". Each project-wide search stores its
     /// `search_id` here before spawning its walk; the walk polls this atomic
     /// and aborts as soon as the value no longer matches (a superseding search
@@ -2902,6 +2905,13 @@ impl SubAgentEmitter for HostSubAgentEmitter {
     }
 }
 
+#[cfg(feature = "test-support")]
+fn bootstrap_diagnostic(phase: &str) {
+    if std::env::var_os("TYDE_DIAGNOSE_PROCESS_PHASES").is_some() {
+        eprintln!("Host bootstrap diagnostic: phase={phase}");
+    }
+}
+
 impl HostHandle {
     pub(crate) async fn register_connection_host_stream(
         &self,
@@ -2923,6 +2933,7 @@ impl HostHandle {
     ) -> Vec<DeferredAgentAttachment> {
         let bootstrap_started = Instant::now();
         let mut state = self.state.lock().await;
+        let workbench_support = state.workbench_support.clone();
         let backend_setup =
             if agent_replay == AgentReplayMode::Lazy && state.capacity_polling_started {
                 state.backend_setup.clone()
@@ -2934,6 +2945,8 @@ impl HostHandle {
                 setup
             };
         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap discovery completed");
+        #[cfg(feature = "test-support")]
+        bootstrap_diagnostic("discovery");
         // Backend discovery has now run at least once, which is the earliest
         // point the poller can tell an installed backend from a missing one.
         if !std::mem::replace(&mut state.capacity_polling_started, true) {
@@ -3054,6 +3067,13 @@ impl HostHandle {
             .settings_store
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for registration: {err}"));
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TYDE_DIAGNOSE_PROCESS_PHASES").is_some() {
+            eprintln!(
+                "Host bootstrap diagnostic: phase=settings engine={:?}",
+                settings.workbenches.engine
+            );
+        }
         let refresh_dynamic_session_schemas = settings
             .enabled_backends
             .iter()
@@ -3212,6 +3232,8 @@ impl HostHandle {
         };
 
         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap catalogs completed");
+        #[cfg(feature = "test-support")]
+        bootstrap_diagnostic("catalogs");
         let agent_ids = state.registry.agent_ids();
         let agent_visibility = state.agent_visibility.clone();
         let mut agents = Vec::new();
@@ -3302,6 +3324,8 @@ impl HostHandle {
         let dots_snapshot = state.dots.state.borrow().clone();
         drop(state);
         tracing::info!(target: "tyde::connection_bootstrap", agent_count = agents.len(), elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap descriptors completed");
+        #[cfg(feature = "test-support")]
+        bootstrap_diagnostic("descriptors");
         let mut task_token_usages = match usage_sources {
             Some((handles, closed_snapshots, live_agent_ids, agent_sessions)) => {
                 task_token_usage_rollups_from_handles(
@@ -3317,11 +3341,14 @@ impl HostHandle {
 
         attach_learning_accounting(&mut task_token_usages, self.config.usage().await);
         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap usage completed");
+        #[cfg(feature = "test-support")]
+        bootstrap_diagnostic("usage");
         let (settings_doc, configured_secrets, settings_etag) = {
             let store = Arc::clone(&settings_store_for_projection);
             settings_wire_projection(&store, &settings)
         };
         let bootstrap = HostBootstrapPayload {
+            workbench_support,
             self_improvement: self.config.projection(),
             tychat: tychat_snapshot,
             dots: dots_snapshot,
@@ -3502,6 +3529,8 @@ impl HostHandle {
             self.schedule_backend_config_snapshot_refresh();
         }
         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap queued");
+        #[cfg(feature = "test-support")]
+        bootstrap_diagnostic("queued");
         deferred_attachments
     }
 
@@ -3626,24 +3655,41 @@ impl HostHandle {
         }
     }
 
-    async fn workbench_parent_lock(&self, parent_project_id: &ProjectId) -> Arc<Mutex<()>> {
+    async fn project_lifecycle(
+        &self,
+        parent_project_id: Option<&ProjectId>,
+    ) -> Arc<lifecycle::LifecycleHandle> {
         let mut state = self.state.lock().await;
         state
-            .workbench_parent_locks
-            .retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = state
-            .workbench_parent_locks
-            .get(parent_project_id)
+            .project_lifecycles
+            .retain(|_, actor| actor.strong_count() > 0);
+        if let Some(actor) = state
+            .project_lifecycles
+            .get(&parent_project_id.cloned())
             .and_then(Weak::upgrade)
         {
-            return lock;
+            return actor;
         }
-
-        let lock = Arc::new(Mutex::new(()));
+        let actor = lifecycle::LifecycleHandle::spawn(self.clone());
         state
-            .workbench_parent_locks
-            .insert(parent_project_id.clone(), Arc::downgrade(&lock));
-        lock
+            .project_lifecycles
+            .insert(parent_project_id.cloned(), Arc::downgrade(&actor));
+        actor
+    }
+
+    async fn project_lifecycle_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Arc<lifecycle::LifecycleHandle>, String> {
+        let store = self.state.lock().await.project_store.clone();
+        let parent_id = {
+            let store = store.lock().await;
+            let project = store
+                .get(project_id)
+                .ok_or_else(|| format!("missing project {project_id}"))?;
+            project.parent_project_id().cloned().unwrap_or(project.id)
+        };
+        Ok(self.project_lifecycle(Some(&parent_id)).await)
     }
 
     fn schedule_generated_agent_name(
@@ -6377,29 +6423,39 @@ impl HostHandle {
                         .map(|input| input.message.clone())
                 })
                 .flatten();
-            let spawned = state.registry.spawn(
-                request,
-                &agent_control_mcp,
-                crate::agent::AgentActorRuntimeResources {
-                    tychat,
-                    #[cfg(feature = "test-support")]
-                    swarm_startup_test_gates,
-                    startup_admission: swarm_startup_rx.take(),
-                    review_startup_admission: review_startup_admission.take(),
-                    usage_limits_rx,
-                    session_store: Arc::clone(&session_store),
-                    supervisor_settings_rx,
-                    use_mock_backend: supervisor_use_mock_backend,
-                    supervisor_compaction_tx,
-                    transcript_store,
-                    host_sub_agent_spawn_tx: sub_agent_spawn_tx,
-                    capacity_tx,
-                    session_summary_count_tx: session_summary_count_tx.clone(),
-                    review_registry,
-                    provider_version,
-                    backend_storage,
-                },
-            );
+            let execution_project = match request.project_id.as_ref() {
+                Some(id) => state.project_store.lock().await.get(id),
+                None => None,
+            };
+            if let Some(project) = &execution_project {
+                crate::workbench::validate_backend(project, request.backend_kind)?;
+            }
+            let spawned = tyde_process_env::launch::project_scope(execution_project, async {
+                state.registry.spawn(
+                    request,
+                    &agent_control_mcp,
+                    crate::agent::AgentActorRuntimeResources {
+                        tychat,
+                        #[cfg(feature = "test-support")]
+                        swarm_startup_test_gates,
+                        startup_admission: swarm_startup_rx.take(),
+                        review_startup_admission: review_startup_admission.take(),
+                        usage_limits_rx,
+                        session_store: Arc::clone(&session_store),
+                        supervisor_settings_rx,
+                        use_mock_backend: supervisor_use_mock_backend,
+                        supervisor_compaction_tx,
+                        transcript_store,
+                        host_sub_agent_spawn_tx: sub_agent_spawn_tx,
+                        capacity_tx,
+                        session_summary_count_tx: session_summary_count_tx.clone(),
+                        review_registry,
+                        provider_version,
+                        backend_storage,
+                    },
+                )
+            })
+            .await;
             if let Some(message) = human_prompt {
                 let input = protocol::AcceptedHumanInput {
                     id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
@@ -6957,29 +7013,39 @@ impl HostHandle {
                 ));
             }
             let tychat = state.tychat.clone();
-            let spawned = state.registry.spawn(
-                request,
-                &agent_control_mcp,
-                crate::agent::AgentActorRuntimeResources {
-                    tychat,
-                    #[cfg(feature = "test-support")]
-                    swarm_startup_test_gates: Default::default(),
-                    startup_admission: None,
-                    review_startup_admission: None,
-                    usage_limits_rx,
-                    session_store,
-                    supervisor_settings_rx,
-                    use_mock_backend: supervisor_use_mock_backend,
-                    supervisor_compaction_tx,
-                    transcript_store,
-                    host_sub_agent_spawn_tx: sub_agent_spawn_tx,
-                    capacity_tx,
-                    session_summary_count_tx: session_summary_count_tx.clone(),
-                    review_registry,
-                    provider_version,
-                    backend_storage,
-                },
-            );
+            let execution_project = match request.project_id.as_ref() {
+                Some(id) => state.project_store.lock().await.get(id),
+                None => None,
+            };
+            if let Some(project) = &execution_project {
+                crate::workbench::validate_backend(project, request.backend_kind)?;
+            }
+            let spawned = tyde_process_env::launch::project_scope(execution_project, async {
+                state.registry.spawn(
+                    request,
+                    &agent_control_mcp,
+                    crate::agent::AgentActorRuntimeResources {
+                        tychat,
+                        #[cfg(feature = "test-support")]
+                        swarm_startup_test_gates: Default::default(),
+                        startup_admission: None,
+                        review_startup_admission: None,
+                        usage_limits_rx,
+                        session_store,
+                        supervisor_settings_rx,
+                        use_mock_backend: supervisor_use_mock_backend,
+                        supervisor_compaction_tx,
+                        transcript_store,
+                        host_sub_agent_spawn_tx: sub_agent_spawn_tx,
+                        capacity_tx,
+                        session_summary_count_tx: session_summary_count_tx.clone(),
+                        review_registry,
+                        provider_version,
+                        backend_storage,
+                    },
+                )
+            })
+            .await;
             self.register_restart_handle(&spawned.handle);
             (
                 spawned.start,
@@ -7220,6 +7286,30 @@ impl HostHandle {
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
     ) -> Result<AgentStartPayload, String> {
+        let scope_id = match project_id {
+            Some(id) => Some(id.clone()),
+            None => self.agent_project_id(agent_id).await,
+        };
+        if let Some(scope_id) = scope_id {
+            let actor = self.project_lifecycle_for_project(&scope_id).await?;
+            actor
+                .request(|reply| lifecycle::Command::Move {
+                    agent_id: agent_id.clone(),
+                    project_id: project_id.cloned(),
+                    reply,
+                })
+                .await?
+        } else {
+            self.move_agent_to_project_serialized(agent_id, project_id)
+                .await
+        }
+    }
+
+    async fn move_agent_to_project_serialized(
+        &self,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+    ) -> Result<AgentStartPayload, String> {
         if self
             .is_swarm_agent(agent_id)
             .await
@@ -7246,23 +7336,9 @@ impl HostHandle {
             };
             (handle, project)
         };
-        let lock = match project.as_ref() {
-            Some(project) => {
-                let lock_id = match &project.source {
-                    ProjectSource::GitWorkbench {
-                        parent_project_id, ..
-                    } => parent_project_id,
-                    _ => &project.id,
-                };
-                Some(self.workbench_parent_lock(lock_id).await)
-            }
-            None => None,
-        };
-        let _guard = match lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
         let start = handle.snapshot();
+        self.validate_native_project_move(start.project_id.as_ref(), project.as_ref())
+            .await?;
         if start.origin == AgentOrigin::Tychat {
             return Err("The Tychat agent belongs to the host, not a project".into());
         }
@@ -7323,7 +7399,36 @@ impl HostHandle {
         if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
             return Err("Close this agent's child agents before moving it".to_owned());
         }
+        drop(state);
+        self.validate_native_project_move(start.project_id.as_ref(), None)
+            .await?;
         Ok(handle)
+    }
+
+    async fn validate_native_project_move(
+        &self,
+        source_id: Option<&ProjectId>,
+        destination: Option<&Project>,
+    ) -> Result<(), String> {
+        let store = self.state.lock().await.project_store.clone();
+        let store = store.lock().await;
+        let source = match source_id {
+            Some(id) => Some(
+                store
+                    .get(id)
+                    .ok_or_else(|| "Source project no longer exists".to_owned())?,
+            ),
+            None => None,
+        };
+        if source
+            .as_ref()
+            .is_some_and(|project| crate::workbench::bubblewrap_environment(project).is_some())
+            || destination
+                .is_some_and(|project| crate::workbench::bubblewrap_environment(project).is_some())
+        {
+            return Err("Moving live conversations into or out of Bubblewrap workbenches is unsupported; create a new session in the destination project".to_owned());
+        }
+        Ok(())
     }
 
     pub(crate) async fn schedule_agent_project_move(
@@ -7331,40 +7436,53 @@ impl HostHandle {
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
     ) -> Result<(), String> {
+        let source_id = self.agent_project_id(agent_id).await;
+        let actor = match project_id.or(source_id.as_ref()) {
+            Some(id) => self.project_lifecycle_for_project(id).await?,
+            None => self.project_lifecycle(None).await,
+        };
+        actor
+            .request(|reply| lifecycle::Command::ScheduleMove {
+                agent_id: agent_id.clone(),
+                project_id: project_id.cloned(),
+                lifecycle: actor.clone(),
+                reply,
+            })
+            .await?
+    }
+
+    async fn schedule_agent_project_move_serialized(
+        &self,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        lifecycle: Arc<lifecycle::LifecycleHandle>,
+    ) -> Result<(), String> {
         let handle = self.validate_agent_project_entry(agent_id).await?;
-        let project_store = self.state.lock().await.project_store.clone();
         let current_id = handle.snapshot().project_id;
-        let parent_lock = match project_id {
+        let project_store = self.state.lock().await.project_store.clone();
+        let destination = match project_id {
             Some(id) => {
                 let project = project_store
                     .lock()
                     .await
                     .get(id)
                     .ok_or_else(|| "Destination project no longer exists".to_owned())?;
-                Some(
-                    self.workbench_parent_lock(project.parent_project_id().unwrap_or(&project.id))
-                        .await,
-                )
+                if project.is_removing_workbench() {
+                    return Err("Destination workbench is being removed".to_owned());
+                }
+                crate::backend::validate_local_workspace_roots(
+                    project
+                        .root_paths()
+                        .into_iter()
+                        .map(|root| root.0)
+                        .collect(),
+                )?;
+                Some(project)
             }
             None => None,
         };
-        let parent_guard = match parent_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        if let Some(id) = project_id {
-            let store = project_store.lock().await;
-            let destination = store
-                .get(id)
-                .ok_or_else(|| "Destination project no longer exists".to_owned())?;
-            crate::backend::validate_local_workspace_roots(
-                destination
-                    .root_paths()
-                    .into_iter()
-                    .map(|root| root.0)
-                    .collect(),
-            )?;
-        }
+        self.validate_native_project_move(current_id.as_ref(), destination.as_ref())
+            .await?;
         tracing::info!(
             caller_has_project = current_id.is_some(),
             destination_has_project = project_id.is_some(),
@@ -7382,16 +7500,13 @@ impl HostHandle {
             }
             guard
         };
-        let result = handle
+        handle
             .schedule_project_move(crate::agent::ScheduledProjectMove {
                 project_id: project_id.cloned(),
-                project_store,
-                parent_lock: parent_lock.clone(),
+                lifecycle,
                 guard: move_guard,
             })
-            .await;
-        drop(parent_guard);
-        result
+            .await
     }
 
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
@@ -7424,9 +7539,18 @@ impl HostHandle {
     }
 
     pub(crate) async fn add_project_root(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
+        let actor = self
+            .project_lifecycle_for_project(&payload.id)
+            .await
+            .map_err(|error| AppError::not_found("project_add_root", error))?;
+        actor
+            .request(|reply| lifecycle::Command::AddRoot { payload, reply })
+            .await
+            .map_err(|error| AppError::internal("project_add_root", anyhow!(error)))?
+    }
+
+    async fn add_project_root_serialized(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
         const OPERATION: &str = "project_add_root";
-        let parent_lock = self.workbench_parent_lock(&payload.id).await;
-        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
         let project = {
             let mut project_store = state.project_store.lock().await;
@@ -7470,9 +7594,21 @@ impl HostHandle {
         &self,
         payload: ProjectDeleteRootPayload,
     ) -> AppResult<()> {
+        let actor = self
+            .project_lifecycle_for_project(&payload.id)
+            .await
+            .map_err(|error| AppError::not_found("project_delete_root", error))?;
+        actor
+            .request(|reply| lifecycle::Command::DeleteRoot { payload, reply })
+            .await
+            .map_err(|error| AppError::internal("project_delete_root", anyhow!(error)))?
+    }
+
+    async fn delete_project_root_serialized(
+        &self,
+        payload: ProjectDeleteRootPayload,
+    ) -> AppResult<()> {
         const OPERATION: &str = "project_delete_root";
-        let parent_lock = self.workbench_parent_lock(&payload.id).await;
-        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
         let project = {
             let mut project_store = state.project_store.lock().await;
@@ -7513,9 +7649,15 @@ impl HostHandle {
     }
 
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
+        let actor = self.project_lifecycle(Some(&payload.id)).await;
+        actor
+            .request(|reply| lifecycle::Command::DeleteProject { payload, reply })
+            .await
+            .map_err(|error| AppError::internal("project_delete", anyhow!(error)))?
+    }
+
+    async fn delete_project_serialized(&self, payload: ProjectDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "project_delete";
-        let parent_lock = self.workbench_parent_lock(&payload.id).await;
-        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
         {
             let project_store = state.project_store.lock().await;
@@ -7599,9 +7741,25 @@ impl HostHandle {
         payload: WorkbenchCreatePayload,
         base: Option<BaseRevision>,
     ) -> AppResult<CreatedWorkbench> {
+        let actor = self
+            .project_lifecycle(Some(&payload.parent_project_id))
+            .await;
+        actor
+            .request(|reply| lifecycle::Command::Create {
+                payload,
+                base,
+                reply,
+            })
+            .await
+            .map_err(|error| AppError::internal("workbench_create", anyhow!(error)))?
+    }
+
+    async fn create_workbench_serialized(
+        &self,
+        payload: WorkbenchCreatePayload,
+        base: Option<BaseRevision>,
+    ) -> AppResult<CreatedWorkbench> {
         const OPERATION: &str = "workbench_create";
-        let parent_lock = self.workbench_parent_lock(&payload.parent_project_id).await;
-        let _parent_guard = parent_lock.lock().await;
 
         let project_store = {
             let state = self.state.lock().await;
@@ -7640,6 +7798,26 @@ impl HostHandle {
                 anyhow!("standalone parent project has no roots"),
             ));
         }
+
+        let settings_store = self.state.lock().await.settings_store.clone();
+        let engine = settings_store
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .workbenches
+            .engine;
+        if engine == protocol::WorkbenchEngine::Bubblewrap && parent_roots.len() != 1 {
+            return Err(AppError::invalid(
+                OPERATION,
+                "Bubblewrap workbenches require exactly one project root",
+            )
+            .with_workbench_reason(protocol::WorkbenchUnsupportedReason::UnsupportedRoots));
+        }
+        let environment_directory = match engine {
+            protocol::WorkbenchEngine::Native => None,
+            protocol::WorkbenchEngine::Bubblewrap => {
+                Some(project_store.lock().await.environment_directory()?)
+            }
+        };
 
         let branch = payload.branch.clone();
         let roots = compute_workbench_roots(parent_roots, &branch)?;
@@ -7681,20 +7859,45 @@ impl HostHandle {
             created.push(root.clone());
         }
 
-        let project = {
-            let mut project_store = project_store.lock().await;
-            match project_store.create_workbench(
-                payload.parent_project_id.clone(),
-                payload.name,
-                payload.branch,
-                roots,
-            ) {
-                Ok(project) => project,
-                Err(error) => {
-                    let rollback_message = rollback_created_worktrees(&created, &branch).await;
-                    let message = append_rollback_message(error.to_string(), rollback_message);
-                    return Err(project_store_error(OPERATION, error.with_message(message)));
+        let environment = match environment_directory.as_ref() {
+            None => protocol::WorkbenchEnvironment::Native,
+            Some(directory) => {
+                match crate::workbench::prepare(Path::new(&roots[0].worktree_root.0), directory)
+                    .await
+                {
+                    Ok(environment) => environment,
+                    Err(mut error) => {
+                        let environment_cleanup = rollback_workbench_environment(directory).await;
+                        let git_cleanup = rollback_created_worktrees(&created, &branch).await;
+                        error.message = append_rollback_message(
+                            append_rollback_message(error.message, environment_cleanup),
+                            git_cleanup,
+                        );
+                        return Err(error);
+                    }
                 }
+            }
+        };
+        let registered = project_store.lock().await.create_workbench(
+            payload.parent_project_id.clone(),
+            payload.name,
+            payload.branch,
+            roots,
+            environment.clone(),
+        );
+        let project = match registered {
+            Ok(project) => project,
+            Err(error) => {
+                let environment_cleanup = crate::workbench::finish(&environment)
+                    .await
+                    .err()
+                    .map(|error| format!("Environment rollback failed: {error}"));
+                let git_cleanup = rollback_created_worktrees(&created, &branch).await;
+                let message = append_rollback_message(
+                    append_rollback_message(error.to_string(), environment_cleanup),
+                    git_cleanup,
+                );
+                return Err(project_store_error(OPERATION, error.with_message(message)));
             }
         };
 
@@ -7749,6 +7952,13 @@ impl HostHandle {
         })
     }
 
+    pub(crate) async fn selected_workbench_engine(
+        &self,
+    ) -> Result<protocol::WorkbenchEngine, String> {
+        let store = self.state.lock().await.settings_store.clone();
+        Ok(store.get()?.workbenches.engine)
+    }
+
     pub(crate) async fn list_projects(&self) -> Result<Vec<Project>, String> {
         let state = self.state.lock().await;
         state.project_store.lock().await.list().map_err(Into::into)
@@ -7759,6 +7969,17 @@ impl HostHandle {
     }
 
     pub(crate) async fn remove_workbench(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
+        let actor = self
+            .project_lifecycle_for_project(&payload.id)
+            .await
+            .map_err(|error| AppError::not_found("workbench_remove", error))?;
+        actor
+            .request(|reply| lifecycle::Command::Remove { payload, reply })
+            .await
+            .map_err(|error| AppError::internal("workbench_remove", anyhow!(error)))?
+    }
+
+    async fn remove_workbench_serialized(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
         let project_store = {
             let state = self.state.lock().await;
@@ -7766,12 +7987,7 @@ impl HostHandle {
         };
 
         let project = load_project(&project_store, &payload.id, OPERATION).await?;
-        let ProjectSource::GitWorkbench {
-            parent_project_id,
-            roots,
-            ..
-        } = &project.source
-        else {
+        let ProjectSource::GitWorkbench { roots, .. } = &project.source else {
             return Err(AppError::invalid(
                 OPERATION,
                 format!(
@@ -7780,17 +7996,17 @@ impl HostHandle {
                 ),
             ));
         };
-        let parent_lock = self.workbench_parent_lock(parent_project_id).await;
-        let _parent_guard = parent_lock.lock().await;
 
         // Mark the workbench as being removed before validating blockers
         // so agent spawns and terminal creation reject it while the slow
         // git subprocesses below run outside the host state lock. The
-        // marker is cleared on every exit path (success or failure) by
-        // the wrapper below.
+        // marker survives failed Bubblewrap teardown once Removing is persisted;
+        // restarting the host must not reopen a partially removed environment.
         {
             let mut state = self.state.lock().await;
-            if !state.removing_projects.insert(payload.id.clone()) {
+            if !state.removing_projects.insert(payload.id.clone())
+                && !project.is_removing_workbench()
+            {
                 return Err(AppError::conflict(
                     OPERATION,
                     format!("workbench {} is already being removed", payload.id),
@@ -7801,12 +8017,38 @@ impl HostHandle {
         let result = self
             .remove_workbench_marked(&payload, &project, roots, &project_store)
             .await;
-        self.state
+        let still_removing = project_store
             .lock()
             .await
-            .removing_projects
-            .remove(&payload.id);
+            .get(&payload.id)
+            .is_some_and(|project| project.is_removing_workbench());
+        if !still_removing {
+            self.state
+                .lock()
+                .await
+                .removing_projects
+                .remove(&payload.id);
+        }
         result
+    }
+
+    async fn persist_workbench_removal_phase(
+        &self,
+        project_store: &Arc<Mutex<ProjectStore>>,
+        id: &ProjectId,
+        phase: protocol::WorkbenchRemovalPhase,
+    ) -> AppResult<()> {
+        let project = project_store
+            .lock()
+            .await
+            .set_workbench_lifecycle(
+                id,
+                protocol::WorkbenchEnvironmentLifecycle::Removing { phase },
+            )
+            .map_err(|error| project_store_error("workbench_remove", error))?;
+        let mut state = self.state.lock().await;
+        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        Ok(())
     }
 
     async fn remove_workbench_marked(
@@ -7819,6 +8061,31 @@ impl HostHandle {
         const OPERATION: &str = "workbench_remove";
         self.validate_workbench_remove_roots(project, payload.force)
             .await?;
+
+        let ProjectSource::GitWorkbench { environment, .. } = &project.source else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "Expected a workbench environment",
+            ));
+        };
+        let removal_phase = match environment {
+            protocol::WorkbenchEnvironment::Native => None,
+            protocol::WorkbenchEnvironment::Bubblewrap { lifecycle, .. } => {
+                let phase = match lifecycle {
+                    protocol::WorkbenchEnvironmentLifecycle::Active => {
+                        self.persist_workbench_removal_phase(
+                            project_store,
+                            &project.id,
+                            protocol::WorkbenchRemovalPhase::SealArtifacts,
+                        )
+                        .await?;
+                        protocol::WorkbenchRemovalPhase::SealArtifacts
+                    }
+                    protocol::WorkbenchEnvironmentLifecycle::Removing { phase } => *phase,
+                };
+                Some(phase)
+            }
+        };
 
         let (agent_ids, terminals) = {
             let state = self.state.lock().await;
@@ -7852,15 +8119,44 @@ impl HostHandle {
         }
         for terminal in terminals {
             terminal.close().await;
+            terminal.wait_for_exit().await;
         }
 
-        {
+        if matches!(
+            environment,
+            protocol::WorkbenchEnvironment::Bubblewrap { .. }
+        ) {
+            let debug_mcp = self.state.lock().await.debug_mcp.clone();
+            debug_mcp
+                .stop_workbench(&payload.id)
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+
+        let subscription = {
             let mut state = self.state.lock().await;
             if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
                 router.shutdown_all();
             }
-            if let Some(subscription) = state.project_streams.remove(&payload.id) {
-                subscription.task.abort();
+            state.project_streams.remove(&payload.id)
+        };
+        if let Some(mut subscription) = subscription {
+            subscription.task.abort();
+            if let Err(error) = (&mut subscription.task).await
+                && !error.is_cancelled()
+            {
+                return Err(AppError::internal(OPERATION, anyhow!(error)));
+            }
+        }
+        if removal_phase != Some(protocol::WorkbenchRemovalPhase::RemoveResources) {
+            crate::workbench::seal(project, payload.force).await?;
+            if removal_phase.is_some() {
+                self.persist_workbench_removal_phase(
+                    project_store,
+                    &project.id,
+                    protocol::WorkbenchRemovalPhase::RemoveResources,
+                )
+                .await?;
             }
         }
 
@@ -7893,6 +8189,8 @@ impl HostHandle {
                 }
             }
         }
+
+        crate::workbench::finish(environment).await?;
 
         let (deleted_session_ids, annotations_store) = {
             let state = self.state.lock().await;
@@ -10630,6 +10928,7 @@ impl HostHandle {
             .display()
             .to_string();
         let launch = TerminalLaunchInfo {
+            execution_project: None,
             project_id: None,
             root: None,
             cwd,
@@ -11722,7 +12021,12 @@ impl HostHandle {
                 .restore_marker_withdraw_test_gate
                 .clone();
             if let Some(gate) = gate {
+                eprintln!(
+                    "Close withdrawal diagnostic: phase=gate-entered context={context} orphaned_count={}",
+                    orphaned.len()
+                );
                 wait_for_spawn_operation_test_gate_inner(&gate).await;
+                eprintln!("Close withdrawal diagnostic: phase=gate-released context={context}");
             }
         }
         if !orphaned.is_empty() {
@@ -11739,6 +12043,33 @@ impl HostHandle {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn withdraw_failed_project_entry_restoration(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), String> {
+        let (handle, store) = {
+            let state = self.state.lock().await;
+            let handle = state.registry.agent_handle(agent_id).ok_or_else(|| {
+                "Conversation disappeared before project entry retirement".to_owned()
+            })?;
+            (handle, state.session_store.clone())
+        };
+        // The entry actor is waiting for this durable phase: close admission
+        // must not request work from that same agent.
+        handle.begin_closing();
+        let session = handle
+            .snapshot()
+            .session_id
+            .ok_or_else(|| "Failed project entry has no canonical session".to_owned())?;
+        self.withdraw_unowned_restoration_markers(
+            &HashSet::from([session]),
+            &store,
+            "failed project entry",
+        )
+        .await
+        .map_err(|error| error.message)
     }
 
     async fn session_resume_admission(
@@ -12241,29 +12572,35 @@ impl HostHandle {
         {
             payload.project_id = Some(project_id);
         }
-        let project_parent_lock = if let Some(project_id) = payload.project_id.as_ref() {
-            let project = self
-                .list_projects()
-                .await?
-                .into_iter()
-                .find(|project| &project.id == project_id)
-                .ok_or_else(|| format!("cannot spawn agent in missing project {project_id}"))?;
-            match project.source {
-                ProjectSource::GitWorkbench {
-                    parent_project_id, ..
-                } => Some(self.workbench_parent_lock(&parent_project_id).await),
-                ProjectSource::Standalone { .. } => None,
-            }
-        } else {
-            None
-        };
-        let _project_parent_guard = match project_parent_lock.as_ref() {
-            Some(lock) => {
-                notify_workbench_spawn_waiting_test_hook(self);
-                Some(lock.lock().await)
-            }
-            None => None,
-        };
+        if let Some(project_id) = payload.project_id.as_ref() {
+            let actor = self.project_lifecycle_for_project(project_id).await?;
+            notify_workbench_spawn_waiting_test_hook(self);
+            return actor
+                .request(|reply| lifecycle::Command::Spawn {
+                    payload: Box::new(payload),
+                    caller_agent_id: caller_agent_id.cloned(),
+                    input_origin,
+                    workflow,
+                    reply,
+                })
+                .await?;
+        }
+        self.spawn_agent_from_agent_control_serialized(
+            payload,
+            caller_agent_id,
+            input_origin,
+            workflow,
+        )
+        .await
+    }
+
+    async fn spawn_agent_from_agent_control_serialized(
+        &self,
+        mut payload: SpawnAgentPayload,
+        caller_agent_id: Option<&AgentId>,
+        input_origin: protocol::MessageOrigin,
+        workflow: Option<AgentWorkflowMetadata>,
+    ) -> Result<AgentId, String> {
         let requested_roots = match &payload.params {
             SpawnAgentParams::New {
                 workspace_roots, ..
@@ -12354,6 +12691,11 @@ impl HostHandle {
             .into_iter()
             .find(|project| &project.id == project_id)
             .ok_or_else(|| format!("cannot spawn agent in missing project {project_id}"))?;
+        if project.is_removing_workbench() {
+            return Err(format!(
+                "cannot spawn agent in workbench {project_id} because it is being removed"
+            ));
+        }
         let authoritative = project
             .root_paths()
             .into_iter()
@@ -16381,6 +16723,17 @@ async fn git_status_porcelain(worktree_root: &ProjectRootPath) -> Result<String,
         .map_err(|error| format!("git status output was not valid UTF-8: {error}"))
 }
 
+async fn rollback_workbench_environment(directory: &Path) -> Option<String> {
+    match tokio::fs::try_exists(directory).await {
+        Ok(false) => None,
+        Ok(true) => tokio::fs::remove_dir_all(directory)
+            .await
+            .err()
+            .map(|error| format!("Environment rollback failed: {error}")),
+        Err(error) => Some(format!("Environment rollback inspection failed: {error}")),
+    }
+}
+
 async fn rollback_created_worktrees(
     created: &[WorkbenchRoot],
     branch: &GitBranchName,
@@ -16855,6 +17208,9 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     crate::process_env::initialize_process_env()?;
+    // Capability discovery is host initialization, not a subprocess barrier on
+    // every live bootstrap. Creation still validates the actual environment.
+    let workbench_support = crate::workbench::support();
     let (dots, dots_commands, dots_state) = crate::dots::DotsHandle::new();
     let dots_path = paths.settings.with_file_name("dots-host-secrets.json");
     #[cfg(feature = "test-support")]
@@ -16895,6 +17251,11 @@ fn spawn_host_inner(
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
     let initial_projects = project_store.list()?;
+    let removing_projects = initial_projects
+        .iter()
+        .filter(|project| project.is_removing_workbench())
+        .map(|project| project.id.clone())
+        .collect();
     let workflow_catalog = WorkflowCatalog::discover(&initial_projects);
     let workflow_locations = workflow_catalog_locations(&initial_projects);
     let workflow_watch_targets = workflow_watch_dirs(&initial_projects);
@@ -17009,10 +17370,12 @@ fn spawn_host_inner(
                 "debug MCP server unavailable; continuing without it: {}",
                 err
             );
-            crate::debug_mcp::DebugMcpHandle { url: String::new() }
+            crate::debug_mcp::DebugMcpHandle::unavailable()
         }
         Err(err) => return Err(err),
     };
+
+    let debug_host_binding = debug_mcp.clone();
 
     // Create the host handle first so we can pass it to the agent-control MCP
     // server. The MCP server runs on its own thread and accesses the host
@@ -17071,6 +17434,7 @@ fn spawn_host_inner(
             ..Default::default()
         }),
         state: Arc::new(Mutex::new(HostState {
+            workbench_support,
             dots,
             #[cfg(feature = "test-support")]
             tychat_bridge_disabled: runtime_config.tychat_bridge_disabled,
@@ -17197,10 +17561,10 @@ fn spawn_host_inner(
             project_watcher,
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
-            workbench_parent_locks: HashMap::new(),
+            project_lifecycles: HashMap::new(),
             project_search_ids: HashMap::new(),
             code_intel_routers: HashMap::new(),
-            removing_projects: HashSet::new(),
+            removing_projects,
             #[cfg(feature = "test-support")]
             agent_name_test_gate: None,
             #[cfg(feature = "test-support")]
@@ -17215,6 +17579,8 @@ fn spawn_host_inner(
         spawn_operations: spawn_operation_handle.clone(),
         spawn_operation_owner: Some(Arc::clone(&spawn_operations)),
     };
+
+    debug_host_binding.bind_host(&host)?;
 
     spawn_settings_apply_actor(WeakHostHandle::downgrade(&host), settings_apply_rx);
     let spawn_operation_worker = spawn_host_spawn_operation_task(
@@ -23625,6 +23991,7 @@ async fn resolve_terminal_launch(
                 .display()
                 .to_string();
             Ok(TerminalLaunchInfo {
+                execution_project: None,
                 project_id: None,
                 root: None,
                 cwd,
@@ -23653,6 +24020,7 @@ async fn resolve_terminal_launch(
             let cwd = resolve_project_terminal_cwd(&root, relative_cwd.as_deref())
                 .map_err(|error| AppError::invalid(OPERATION, error))?;
             Ok(TerminalLaunchInfo {
+                execution_project: Some(project),
                 project_id: Some(project_id),
                 root: Some(root),
                 cwd,
@@ -23676,6 +24044,7 @@ async fn resolve_terminal_launch(
                 ));
             }
             Ok(TerminalLaunchInfo {
+                execution_project: None,
                 project_id: None,
                 root: None,
                 cwd: trimmed.to_owned(),

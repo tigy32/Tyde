@@ -2742,6 +2742,7 @@ mod wasm_tests {
             m.insert(
                 host_id.to_owned(),
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),

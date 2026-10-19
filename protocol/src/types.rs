@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 85;
+pub const PROTOCOL_VERSION: u32 = 86;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1775,6 +1775,8 @@ pub struct WorkflowRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBootstrapPayload<S = Value> {
+    #[serde(default)]
+    pub workbench_support: WorkbenchSupport,
     #[serde(default)]
     pub self_improvement: crate::SelfImprovementState,
     #[serde(default)]
@@ -5052,6 +5054,7 @@ pub enum TaskTokenUsageStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskTokenUsageUnavailableReason {
+    AgentStarting,
     HelperAccountingUnavailable,
     NoAssistantTurnCompleted,
     BackendDidNotReport,
@@ -5825,6 +5828,40 @@ impl Project {
         }
     }
 
+    pub fn host_path_for_runtime(&self, path: &str) -> Option<String> {
+        let ProjectSource::GitWorkbench {
+            roots,
+            environment: WorkbenchEnvironment::Bubblewrap { logical_root, .. },
+            ..
+        } = &self.source
+        else {
+            return Some(path.to_owned());
+        };
+        let [root] = roots.as_slice() else {
+            return None;
+        };
+        match path.strip_prefix(&logical_root.0) {
+            Some("") => Some(root.worktree_root.0.clone()),
+            Some(suffix) if suffix.starts_with('/') => {
+                Some(format!("{}{}", root.worktree_root.0, suffix))
+            }
+            Some(_) | None => Some(path.to_owned()),
+        }
+    }
+
+    pub fn is_removing_workbench(&self) -> bool {
+        matches!(
+            &self.source,
+            ProjectSource::GitWorkbench {
+                environment: WorkbenchEnvironment::Bubblewrap {
+                    lifecycle: WorkbenchEnvironmentLifecycle::Removing { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    }
+
     pub fn is_workbench(&self) -> bool {
         matches!(self.source, ProjectSource::GitWorkbench { .. })
     }
@@ -5840,6 +5877,136 @@ pub enum ProjectSource {
         parent_project_id: ProjectId,
         branch: GitBranchName,
         roots: Vec<WorkbenchRoot>,
+        #[serde(default)]
+        environment: WorkbenchEnvironment,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchEngine {
+    #[default]
+    Native,
+    Bubblewrap,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkbenchConfiguration {
+    pub snapshot: Option<WorkbenchSnapshotConfiguration>,
+    pub environment: BTreeMap<String, String>,
+    pub remove_environment: Vec<String>,
+    pub writable_paths: Vec<String>,
+    pub runtime_directories: Vec<String>,
+    pub runtime_files: BTreeMap<String, String>,
+    pub runtime_file_bindings: Vec<WorkbenchRuntimeFileBinding>,
+    pub services: Vec<WorkbenchServiceConfiguration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchSnapshotConfiguration {
+    pub producer: Vec<String>,
+    pub include: Vec<String>,
+    pub provenance_paths: Vec<String>,
+    pub provenance_environment: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchRuntimeFileBinding {
+    pub runtime_file: String,
+    pub host_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchServiceConfiguration {
+    pub name: String,
+    pub command: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub ready_notification: String,
+    pub stop_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchUnsupportedReason {
+    NotProbed,
+    NotLinux,
+    BubblewrapMissing,
+    NamespaceDenied,
+    ReflinkUnsupported,
+    RuntimeToolMissing,
+    RuntimeConfigurationInvalid,
+    RuntimeServiceFailed,
+    NestedNamespacesDenied,
+    UnsupportedBackend,
+    UnsupportedRoots,
+    IncompatibleEnvironment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkbenchAvailability {
+    Available,
+    Unsupported {
+        reason: WorkbenchUnsupportedReason,
+        message: String,
+    },
+}
+
+impl Default for WorkbenchAvailability {
+    fn default() -> Self {
+        Self::Unsupported {
+            reason: WorkbenchUnsupportedReason::NotProbed,
+            message: "This host has not reported workbench prerequisites".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkbenchSupport {
+    pub bubblewrap: WorkbenchAvailability,
+    pub nested_namespaces: WorkbenchAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkbenchInitialization {
+    Cold,
+    Snapshot { cohort: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchRemovalPhase {
+    SealArtifacts,
+    RemoveResources,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkbenchEnvironmentLifecycle {
+    #[default]
+    Active,
+    Removing {
+        phase: WorkbenchRemovalPhase,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkbenchEnvironment {
+    #[default]
+    Native,
+    Bubblewrap {
+        manifest_path: HostAbsPath,
+        logical_root: ProjectRootPath,
+        support: WorkbenchSupport,
+        #[serde(default)]
+        lifecycle: WorkbenchEnvironmentLifecycle,
+        initialization: WorkbenchInitialization,
     },
 }
 
@@ -8293,6 +8460,8 @@ pub enum CommandErrorContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandErrorPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workbench_reason: Option<WorkbenchUnsupportedReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<CommandErrorContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

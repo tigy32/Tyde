@@ -6,6 +6,7 @@ edition.workspace = true
 test-support = []
 
 [dependencies]
+protocol = { path = "../protocol", default-features = false }
 anyhow = "1"
 portable-pty = "0.8"
 command-group = { version = "5", features = ["with-tokio"] }

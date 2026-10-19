@@ -389,6 +389,20 @@ impl Fixture {
         )
     }
 
+    // Shared fixture is compiled per integration binary. Replacement recovery
+    // can commit independently while the old close is held.
+    #[allow(dead_code)]
+    pub fn fail_restoration_withdrawal(
+        &self,
+        session: &protocol::SessionId,
+    ) -> server::store::session::commit_hooks::InstalledHook {
+        server::store::session::commit_hooks::InstalledHook::install_restoration_withdrawal(
+            server::store::session::SessionStore::database_path(&self.session_store_path()),
+            session.clone(),
+            Box::new(|| Err("injected session commit failure".to_owned())),
+        )
+    }
+
     /// Fails the next session-store commit that writes a record, as a full
     /// disk or I/O error would.
     // Shared fixture is compiled separately for each integration test binary.
@@ -673,12 +687,23 @@ impl Fixture {
     /// agents are never closed, so nothing they left open is terminalized.
     #[allow(dead_code)]
     pub async fn relaunch_host_after_kill(&mut self) -> HostBootstrapPayload {
+        self.relaunch_host_after_kill_with_runtime_config(|_| {})
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn relaunch_host_after_kill_with_runtime_config(
+        &mut self,
+        configure: impl FnOnce(&mut server::HostRuntimeConfig),
+    ) -> HostBootstrapPayload {
         self.host.hard_stop_for_conformance().await;
+        let mut runtime_config = self.fresh_host_runtime_config();
+        configure(&mut runtime_config);
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
             self.settings_store_path(),
-            self.fresh_host_runtime_config(),
+            runtime_config,
         )
         .expect("initialize relaunched host with existing stores");
         let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
@@ -767,7 +792,19 @@ impl Fixture {
         &mut self,
         configure: impl FnOnce(&mut server::HostRuntimeConfig),
     ) -> HostBootstrapPayload {
+        self.restart_host_with_runtime_config_before_connect(configure, async {})
+            .await
+    }
+
+    // Shared fixture is compiled by binaries that do not hold restoration.
+    #[allow(dead_code)]
+    pub async fn restart_host_with_runtime_config_before_connect(
+        &mut self,
+        configure: impl FnOnce(&mut server::HostRuntimeConfig),
+        before_connect: impl std::future::Future<Output = ()>,
+    ) -> HostBootstrapPayload {
         self.restart_host_without_client(configure).await;
+        before_connect.await;
         let (client, bootstrap) = connect_client_with_bootstrap(self.host.clone()).await;
         eprintln!(
             "Fixture restart replacement bootstrapped; agent_count={} swarm_count={}",

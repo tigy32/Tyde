@@ -3902,6 +3902,7 @@ pub struct AppState {
     pub dots_by_host: RwSignal<HashMap<String, protocol::DotsStatePayload>>,
     pub tychat_by_host: RwSignal<HashMap<String, protocol::TychatStatePayload>>,
     pub self_improvement_by_host: RwSignal<HashMap<String, protocol::SelfImprovementState>>,
+    pub workbench_support_by_host: RwSignal<HashMap<String, protocol::WorkbenchSupport>>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub host_settings_schema_by_host: RwSignal<HashMap<String, serde_json::Value>>,
     pub configured_secrets_by_host: RwSignal<HashMap<String, Vec<protocol::ConfiguredSecret>>>,
@@ -4391,6 +4392,7 @@ impl AppState {
             dots_by_host: RwSignal::new(HashMap::new()),
             tychat_by_host: RwSignal::new(HashMap::new()),
             self_improvement_by_host: RwSignal::new(HashMap::new()),
+            workbench_support_by_host: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             host_settings_schema_by_host: RwSignal::new(HashMap::new()),
             configured_secrets_by_host: RwSignal::new(HashMap::new()),
@@ -7085,6 +7087,9 @@ impl AppState {
         });
         self.host_settings_by_host.update(|settings| {
             settings.remove(host_id);
+        });
+        self.workbench_support_by_host.update(|support| {
+            support.remove(host_id);
         });
         self.host_settings_schema_by_host.update(|schemas| {
             schemas.remove(host_id);

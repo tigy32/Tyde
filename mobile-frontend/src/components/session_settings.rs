@@ -1331,6 +1331,7 @@ mod wasm_tests {
             map.insert(
                 host_id(),
                 HostSettings {
+                    workbenches: Default::default(),
                     review: Default::default(),
                     self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],

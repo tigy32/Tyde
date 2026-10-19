@@ -3511,7 +3511,7 @@ class WasmToolScriptTests(unittest.TestCase):
         (root / "frontend").mkdir()
         (root / "mobile-frontend").mkdir()
         (root / "rtc-transport").mkdir()
-        fixture = root / "target" / "debug" / "tyde-rtc-fixture"
+        fixture = root / "native-artifacts" / "debug" / "tyde-rtc-fixture"
         fixture.parent.mkdir(parents=True)
         fixture.write_text(
             f"#!{sys.executable}\n"
@@ -3618,6 +3618,7 @@ class WasmToolScriptTests(unittest.TestCase):
                 "CHROMEDRIVER": str(driver),
                 "WASM_BINDGEN_TEST_RUNNER": str(runner),
                 "CARGO_RECORD": str(record),
+                "TYDE_RTC_FIXTURE_EXECUTABLE": str(fixture),
                 "UI_BUILD_RECORD": str(root / "ui-build-ready.txt"),
                 "UI_TARGET_RECORD": str(root / "ui-build-target.txt"),
                 "PLAYWRIGHT_RECORD": str(root / "playwright-invocations.txt"),

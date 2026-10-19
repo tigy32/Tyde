@@ -42,8 +42,16 @@ pub use protocol::{
     ReviewTeamConfig, default_reviewers,
 };
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkbenchSettings {
+    #[serde(default)]
+    pub engine: protocol::WorkbenchEngine,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostSettings {
+    #[serde(default)]
+    pub workbenches: WorkbenchSettings,
     #[serde(default)]
     pub tychat: protocol::TychatSettings,
     #[serde(default)]
@@ -145,6 +153,7 @@ pub struct HostSettings {
 impl Default for HostSettings {
     fn default() -> Self {
         Self {
+            workbenches: WorkbenchSettings::default(),
             tychat: protocol::TychatSettings::default(),
             chatgpt_dots_enabled: false,
             resume_previous_agents: default_resume_previous_agents(),

@@ -117,6 +117,7 @@ async fn real_tychat_pair_steer_chunk_restart_and_revoke() {
     let owner = OwnerKit::create(&local.base, "tyde-bridge").await.unwrap();
     let created = owner.create_bot("Tyde integration").await.unwrap();
     let settings = settings_model::HostSettings {
+        workbenches: Default::default(),
         enabled_backends: vec![BackendKind::Claude],
         resume_previous_agents: false,
         tyde_agent_control_mcp_enabled: false,

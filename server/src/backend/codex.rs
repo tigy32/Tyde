@@ -1950,6 +1950,9 @@ impl CodexSession {
         let mut skill_setup = skill_setup;
         skill_setup.diagnostics.splice(0..0, skill_notices);
 
+        let cwd = process_env::launch::runtime_path(Path::new(&cwd))
+            .to_string_lossy()
+            .into_owned();
         let runtime_roots = codex_runtime_workspace_roots(workspace_roots, &cwd);
         tracing::info!(
             ?runtime_roots,
@@ -21087,7 +21090,11 @@ fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<S
         .iter()
         .filter_map(|root| {
             let trimmed = root.trim();
-            (!trimmed.is_empty() && !trimmed.starts_with("ssh://")).then(|| root.clone())
+            (!trimmed.is_empty() && !trimmed.starts_with("ssh://")).then(|| {
+                process_env::launch::runtime_path(Path::new(trimmed))
+                    .to_string_lossy()
+                    .into_owned()
+            })
         })
         .collect::<Vec<_>>();
 
@@ -23577,6 +23584,11 @@ impl CodexRpc {
         local_program: Option<&str>,
         excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
+        if access_mode == BackendAccessMode::EnforcedReadOnly
+            || execution_mode == BackendExecutionMode::InferenceOnly
+        {
+            process_env::launch::require_nested_namespaces()?;
+        }
         if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
             return Err("Codex transient inference requires a local Codex process".to_owned());
         }
@@ -25693,6 +25705,7 @@ impl Backend for CodexBackend {
 
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
+            tyde_agent_adapter::BackendCapability::BubblewrapWorkbench,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,

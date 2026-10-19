@@ -2212,6 +2212,7 @@ mod wasm_tests {
 
     fn host_settings(default: Option<BackendKind>, enabled: Vec<BackendKind>) -> HostSettings {
         HostSettings {
+            workbenches: Default::default(),
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),

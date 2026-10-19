@@ -4533,6 +4533,7 @@ mod wasm_tests {
             for id in ["alpha-workbench", "alpha-workbench-two"] {
                 let mut workbench = project_info("local", id, id, 2);
                 workbench.project.source = ProjectSource::GitWorkbench {
+                    environment: Default::default(),
                     parent_project_id: ProjectId("alpha".to_owned()),
                     branch: protocol::GitBranchName(id.to_owned()),
                     roots: vec![protocol::WorkbenchRoot {
@@ -6236,6 +6237,7 @@ mod wasm_tests {
             for id in ["bamboo-bench", "bamboo-sibling"] {
                 let mut workbench = project_info("local", id, id, 2);
                 workbench.project.source = ProjectSource::GitWorkbench {
+                    environment: Default::default(),
                     parent_project_id: ProjectId("bamboo".to_owned()),
                     branch: protocol::GitBranchName(id.to_owned()),
                     roots: vec![],
@@ -9083,6 +9085,7 @@ mod wasm_tests {
             .set(vec![configured_host("local", "Local Host")]);
         let mut workbench = project_info("local", "workbench", "Task workbench", 1);
         workbench.project.source = ProjectSource::GitWorkbench {
+            environment: Default::default(),
             parent_project_id: ProjectId("source".to_owned()),
             branch: protocol::GitBranchName("task".to_owned()),
             roots: vec![protocol::WorkbenchRoot {

@@ -3538,7 +3538,15 @@ async fn review_keeps_comments_when_git_cannot_read_the_repository() {
             assert!(error.message.contains("automatic recovery"));
             assert_eq!(error.request_kind, FrameKind::ProjectFileList);
             assert_eq!(error.code, protocol::CommandErrorCode::Internal);
-            assert!(error.message.contains("not a git repository"));
+            // Retained real Git output also discovers the repo, then reports
+            // unreadable objects/info/alternates and "fatal: bad object HEAD".
+            assert!(
+                error.message.contains("not a git repository")
+                    || (error.operation == "project_git_status"
+                        && error.message.contains("Permission denied")
+                        && error.message.contains("fatal: bad object HEAD")),
+                "unreadable Git objects must surface the actual repository-read failure"
+            );
         }
         env.kind == FrameKind::ReviewBootstrap
     })

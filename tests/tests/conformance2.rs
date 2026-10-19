@@ -14638,3 +14638,112 @@ async fn collect_owned_background_turn<B: Backend>(host: &mut Harness<B>, prompt
         }
     }
 }
+
+conformance2_scenario!(
+    real_bubblewrap_workbench,
+    [BackendCapability::BubblewrapWorkbench]
+);
+
+async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
+    let project = host.prepare_bubblewrap().await;
+    let protocol::ProjectSource::GitWorkbench { environment, .. } = &project.source else {
+        panic!("engine fixture must be a workbench");
+    };
+    assert!(
+        matches!(
+            environment,
+            protocol::WorkbenchEnvironment::Bubblewrap {
+                initialization: protocol::WorkbenchInitialization::Cold,
+                ..
+            }
+        ),
+        "an unbuilt fixture must not claim a snapshot"
+    );
+    let host_namespace = std::fs::read_link("/proc/self/ns/mnt")
+        .expect("host mount namespace")
+        .to_string_lossy()
+        .into_owned();
+    let script = format!(
+        r#"import json, os, pathlib, subprocess
+root = pathlib.Path('/mnt/tyde-workspace')
+source = root / 'README.txt'
+output = root / 'build-output'
+output.mkdir()
+clone = output / 'private-copy.txt'
+before = source.read_text()
+subprocess.run(['cp', '--reflink=always', str(source), str(clone)], check=True)
+private_inode = source.stat().st_ino != clone.stat().st_ino
+clone.write_text('private build artifact\n')
+(root / 'boundary.txt').write_text('created\n')
+print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private_inode and source.read_text() == before, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+"#
+    );
+    let prompt = format!(
+        "Use a real shell tool in /mnt/tyde-workspace to execute this exact Python 3 script. \
+         Do not substitute an explanation or change the checks. Then briefly confirm completion.\n\
+         python3 - <<'TYDE_BOUNDARY_PY'\n{script}TYDE_BOUNDARY_PY"
+    );
+    tyde_process_env::launch::project_scope(Some(project), async {
+        let agent = spawn_agent(host, &prompt).await;
+        let first = collect_turn(host, &agent, &prompt).await;
+        report_bubblewrap_usage("created", &first);
+        assert_bubblewrap_process_output(&first, "created", &["cwd", "namespace", "cow", "generic"]);
+        assert!(std::fs::read_to_string(host.workspace().join("boundary.txt"))
+            .expect("provider-created host file") == "created\n", "provider must write the real host workbench");
+        assert!(std::fs::read_to_string(host.workspace().join("README.txt"))
+            .expect("unchanged source") == "tyde conformance workspace", "private CoW edit must preserve source");
+        let followup = "Use a real shell tool to run exactly:\npython3 - <<'TYDE_BOUNDARY_PY'\nimport json, pathlib\np = pathlib.Path('/mnt/tyde-workspace/boundary.txt')\nassert p.read_text() == 'created\\n'\np.write_text('edited\\n')\nprint(json.dumps({'boundary': 'edited', 'readback': p.read_text() == 'edited\\n'}))\nTYDE_BOUNDARY_PY\nThen briefly confirm completion.";
+        let second = ask(host, &agent, followup).await;
+        report_bubblewrap_usage("edited", &second);
+        assert_bubblewrap_process_output(&second, "edited", &["readback"]);
+        assert!(std::fs::read_to_string(host.workspace().join("boundary.txt"))
+            .expect("provider-edited host file") == "edited\n", "next turn must edit the same host file");
+        assert_universal_contract(&[first, second]);
+        let shutdown = close_agent(host, &agent).await;
+        assert_no_error_message("Bubblewrap shutdown", &shutdown);
+    }).await;
+}
+
+fn assert_bubblewrap_process_output(turn: &Turn, phase: &str, checks: &[&str]) {
+    let observed = turn.tool_completions().any(|completion| {
+        let ToolExecutionOutcome::Succeeded {
+            result:
+                ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout,
+                    ..
+                },
+        } = &completion.outcome
+        else {
+            return false;
+        };
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|output| {
+                output["boundary"].as_str() == Some(phase)
+                    && checks
+                        .iter()
+                        .all(|key| output[*key].as_bool() == Some(true))
+            })
+    });
+    assert!(
+        observed,
+        "real successful command output must establish every boundary check"
+    );
+}
+
+fn report_bubblewrap_usage(phase: &str, turn: &Turn) {
+    for (index, observation) in turn.model_requests().iter().enumerate() {
+        eprintln!(
+            "BUBBLEWRAP_USAGE {}",
+            serde_json::json!({
+                "phase": phase,
+                "request_index": index,
+                "request": observation.request,
+                "turn": observation.turn,
+                "cumulative": observation.cumulative,
+            })
+        );
+    }
+}

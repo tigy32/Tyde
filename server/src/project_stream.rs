@@ -1985,6 +1985,7 @@ async fn emit_project_command_error(
     fatal: bool,
 ) {
     let payload = CommandErrorPayload {
+        workbench_reason: None,
         context: None,
         request_id: None,
         stream: stream.path().clone(),
@@ -3747,7 +3748,8 @@ fn strip_trailing_line_suffix(path: &str) -> &str {
 }
 
 fn project_path_from_absolute(project: &Project, absolute_path: &str) -> Option<ProjectPath> {
-    let absolute = Path::new(absolute_path);
+    let host_path = project.host_path_for_runtime(absolute_path)?;
+    let absolute = Path::new(&host_path);
     if !absolute.is_absolute() {
         return None;
     }

@@ -3143,6 +3143,7 @@ mod wasm_tests {
                 source: match parent {
                     None => ProjectSource::Standalone { roots: vec![] },
                     Some(parent) => ProjectSource::GitWorkbench {
+                        environment: Default::default(),
                         parent_project_id: ProjectId(parent.to_owned()),
                         branch: GitBranchName(id.to_owned()),
                         roots: vec![WorkbenchRoot {

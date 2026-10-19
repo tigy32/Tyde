@@ -951,6 +951,27 @@ impl DevInstanceStartupCleanup {
     pub fn disarm(&mut self) {
         self.armed = false;
     }
+
+    pub fn cleanup(&mut self) -> Result<(), String> {
+        self.armed = false;
+        let mut errors = Vec::new();
+        if let Some(config_path) = &self.config_path
+            && let Err(error) = fs::remove_file(config_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!("DEV config cleanup failed: {error}"));
+        }
+        if let Err(error) = fs::remove_dir_all(&self.store_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!("DEV store cleanup failed: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
 }
 
 #[cfg(feature = "launcher")]

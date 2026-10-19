@@ -468,6 +468,7 @@ mod wasm_tests {
             view! { <Header /> <crate::components::file_explorer::FileExplorer /> }
         });
         let error = protocol::CommandErrorPayload {
+            workbench_reason: None,
             context: None,
             request_id: None,
             stream: protocol::StreamPath("/project/notice-project".to_owned()),

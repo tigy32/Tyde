@@ -1151,6 +1151,7 @@ mod wasm_tests {
             m.insert(
                 host.clone(),
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     review: Default::default(),
                     self_improvement: Default::default(),
                     enabled_backends: vec![

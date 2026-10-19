@@ -8821,6 +8821,7 @@ dependencies = [
  "turn",
  "tyde-agent-adapter",
  "tyde-dev-driver",
+ "tyde-process-env",
  "uuid",
  "webrtc-util",
 ]
@@ -9468,6 +9469,7 @@ dependencies = [
  "libc",
  "nix 0.25.1",
  "portable-pty",
+ "protocol",
  "tokio",
  "tokio-util",
  "tracing",

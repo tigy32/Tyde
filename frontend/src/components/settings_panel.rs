@@ -416,6 +416,7 @@ enum SettingsTab {
     SelfImprovement,
     Skills,
     CodeIntelligence,
+    Workbenches,
     Voice,
     Tychat,
     ChatgptDots,
@@ -451,6 +452,7 @@ impl SettingsTab {
             Self::SelfImprovement => "Self-improvement",
             Self::Skills => "Skills",
             Self::CodeIntelligence => "Code Intelligence",
+            Self::Workbenches => "Workbenches",
             Self::Voice => "Voice",
             Self::ChatgptDots => "Remote MCP",
             Self::Tychat => "Tychat",
@@ -476,6 +478,7 @@ impl SettingsTab {
             | Self::SelfImprovement
             | Self::Skills
             | Self::CodeIntelligence
+            | Self::Workbenches
             | Self::Voice
             | Self::ChatgptDots
             | Self::Tychat
@@ -573,6 +576,13 @@ impl SettingsTab {
                 "High tier",
                 "Cheaper faster setup",
                 "Most capable setup",
+            ],
+            Self::Workbenches => &[
+                "Workbenches",
+                "Native",
+                "Bubblewrap",
+                "Linux",
+                "Nested namespaces",
             ],
             Self::CodeIntelligence => &[
                 "Code Intelligence",
@@ -753,7 +763,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 21] = [
+const ALL_TABS: [SettingsTab; 22] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
@@ -770,6 +780,7 @@ const ALL_TABS: [SettingsTab; 21] = [
     SettingsTab::SelfImprovement,
     SettingsTab::Skills,
     SettingsTab::CodeIntelligence,
+    SettingsTab::Workbenches,
     SettingsTab::Voice,
     SettingsTab::Tychat,
     SettingsTab::ChatgptDots,
@@ -793,7 +804,7 @@ const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 14] = [
+const HOST_GROUP_TABS: [SettingsTab; 15] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
@@ -805,6 +816,7 @@ const HOST_GROUP_TABS: [SettingsTab; 14] = [
     SettingsTab::Skills,
     SettingsTab::McpServers,
     SettingsTab::CodeIntelligence,
+    SettingsTab::Workbenches,
     SettingsTab::Voice,
     SettingsTab::Mobile,
     SettingsTab::Debug,
@@ -1017,6 +1029,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::SelfImprovement => view! { <SelfImprovementTab /> }.into_any(),
                                     SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
                                     SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
+                                    SettingsTab::Workbenches => view! { <WorkbenchesTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
                                     SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
                                     SettingsTab::ChatgptDots => view! { <super::dots_settings::DotsTab /> }.into_any(),
@@ -1129,6 +1142,72 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
     }
     };
     view! { <div class="settings-scope-bar">{body}</div> }
+}
+
+#[component]
+fn WorkbenchesTab() -> impl IntoView {
+    let display_state = expect_context::<AppState>();
+    view! {
+        <div>
+            <h2 class="settings-panel-title">"Workbenches"</h2>
+            <p class="settings-description">"Choose the engine for new workbenches on this host. Existing workbenches are unaffected."</p>
+            <p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p>
+            <p class="settings-description">"Bubblewrap currently supports new normal Codex sessions only. Other providers, modes, and live conversation transfers across engines are explicitly unsupported."</p>
+            <p class="settings-description">"No build runs automatically. Optional .tyde/workbench.json configuration selects opaque snapshot paths and namespace-local services. External host services are not automatically namespace-compatible. Setup or launch errors are reported; Tyde never falls back to Native."</p>
+            {move || {
+                let Some(host_id) = display_state.selected_host_id.get() else {
+                    return view! { <p class="settings-description">"Select a host to configure workbenches."</p> }.into_any();
+                };
+                let Some(settings) = display_state.host_settings(&host_id) else {
+                    return view! { <p class="settings-description">"Workbenches settings are unavailable from this host."</p> }.into_any();
+                };
+                let support = display_state.workbench_support_by_host.get().get(&host_id).cloned();
+                let Some(support) = support else {
+                    return view! { <p class="settings-description">"Workbenches support has not been reported by this host."</p> }.into_any();
+                };
+                let bubblewrap_available = matches!(support.bubblewrap, protocol::WorkbenchAvailability::Available);
+                let bubblewrap_status = match support.bubblewrap {
+                    protocol::WorkbenchAvailability::Available => "Bubblewrap is available on this host.".to_owned(),
+                    protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Bubblewrap unavailable: {message}"),
+                };
+                let nested_status = match support.nested_namespaces {
+                    protocol::WorkbenchAvailability::Available => "Nested namespaces are available.".to_owned(),
+                    protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Nested namespace limit: {message}"),
+                };
+                let disconnected = display_state.selected_host_connection_status() != ConnectionStatus::Connected;
+                let native_state = display_state.clone();
+                let bubblewrap_state = display_state.clone();
+                view! {
+                    <fieldset disabled=disconnected>
+                        <legend>"Engine for new workbenches"</legend>
+                        <label class="settings-toggle-row" style="gap:0.5rem;">
+                            <input type="radio" name="workbench-engine" value="native"
+                                prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Native
+                                on:click=move |event| {
+                                    event.prevent_default();
+                                    send_host_replace(&native_state, "/workbenches/engine", protocol::WorkbenchEngine::Native);
+                                }
+                            />
+                            "Native (default)"
+                        </label>
+                        <label class="settings-toggle-row" style="gap:0.5rem;">
+                            <input type="radio" name="workbench-engine" value="bubblewrap"
+                                disabled=!bubblewrap_available
+                                prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Bubblewrap
+                                on:click=move |event| {
+                                    event.prevent_default();
+                                    send_host_replace(&bubblewrap_state, "/workbenches/engine", protocol::WorkbenchEngine::Bubblewrap);
+                                }
+                            />
+                            "Bubblewrap (Linux opt-in)"
+                        </label>
+                    </fieldset>
+                    <p class="settings-description" role="status">{bubblewrap_status}</p>
+                    <p class="settings-description">{nested_status}</p>
+                }.into_any()
+            }}
+        </div>
+    }
 }
 
 #[component]
@@ -9590,6 +9669,237 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    #[wasm_bindgen_test]
+    async fn workbenches_engine_waits_for_server_state_and_tracks_host_support() {
+        let calls = install_settings_send_stub();
+        let state = AppState::new();
+        install_scope_bar_hosts(&state, ConnectionStatus::Connected);
+        for host in ["host-a", "host-b"] {
+            state.host_streams.update(|streams| {
+                streams.insert(
+                    host.to_owned(),
+                    protocol::StreamPath(format!("/host/{host}")),
+                );
+            });
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(host.to_owned(), ConnectionStatus::Connected);
+            });
+            crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |bootstrap| {
+                bootstrap.workbench_support = if host == "host-a" {
+                    protocol::WorkbenchSupport {
+                        bubblewrap: protocol::WorkbenchAvailability::Available,
+                        nested_namespaces: protocol::WorkbenchAvailability::Unsupported {
+                            reason: protocol::WorkbenchUnsupportedReason::NestedNamespacesDenied,
+                            message: "This host denies nested user namespaces".to_owned(),
+                        },
+                    }
+                } else {
+                    protocol::WorkbenchSupport {
+                        bubblewrap: protocol::WorkbenchAvailability::Unsupported {
+                            reason: protocol::WorkbenchUnsupportedReason::NotLinux,
+                            message: "Bubblewrap requires Linux on this host".to_owned(),
+                        },
+                        nested_namespaces: protocol::WorkbenchAvailability::Unsupported {
+                            reason: protocol::WorkbenchUnsupportedReason::NotLinux,
+                            message: "Nested namespaces require Linux".to_owned(),
+                        },
+                    }
+                };
+            });
+        }
+        let host_store = serde_json::json!({
+            "hosts": state.configured_hosts.get_untracked(),
+            "selected_host_id": "host-a",
+        });
+        js_sys::Reflect::set(
+            &web_sys::window().unwrap(),
+            &JsValue::from_str("__workbench_host_store"),
+            &js_sys::JSON::parse(&host_store.to_string()).unwrap(),
+        )
+        .unwrap();
+        js_sys::eval(
+            r#"
+            const workbenchInvoke = window.__TAURI__.core.invoke;
+            window.__TAURI__.core.invoke = (cmd, args) => {
+                if (cmd === 'set_selected_host') {
+                    window.__workbench_host_store.selected_host_id = args.hostId;
+                    return Promise.resolve(window.__workbench_host_store);
+                }
+                if (cmd === 'list_configured_hosts') {
+                    return Promise.resolve(window.__workbench_host_store);
+                }
+                return workbenchInvoke(cmd, args);
+            };
+        "#,
+        )
+        .unwrap();
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Workbenches");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Workbenches");
+        let native: HtmlInputElement = container
+            .query_selector("input[value=native]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let bubblewrap: HtmlInputElement = container
+            .query_selector("input[value=bubblewrap]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(native.checked());
+        assert!(!bubblewrap.disabled());
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("This host denies nested user namespaces")
+        );
+        bubblewrap.click();
+        next_tick().await;
+        assert!(
+            native.checked(),
+            "intent must not replace authoritative server state"
+        );
+        assert!(!bubblewrap.checked());
+        let writes = calls
+            .iter()
+            .filter_map(|entry| {
+                let entry = entry.dyn_into::<js_sys::Array>().unwrap();
+                if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                    return None;
+                }
+                let args: Value = serde_json::from_str(&entry.get(1).as_string().unwrap()).unwrap();
+                let envelope: protocol::Envelope =
+                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                (envelope.kind == FrameKind::SettingsWrite).then_some(envelope)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].stream,
+            protocol::StreamPath("/host/host-a".to_owned())
+        );
+        let write: SettingsWritePayload = writes[0].parse_payload().unwrap();
+        assert_eq!(write.ops.len(), 1);
+        let SettingOp::Replace {
+            path,
+            expected,
+            value,
+        } = &write.ops[0]
+        else {
+            panic!("engine intent must replace the setting");
+        };
+        assert_eq!(path, "/workbenches/engine");
+        assert_eq!(
+            expected,
+            &SettingExpectation::Value {
+                value: serde_json::json!("native")
+            }
+        );
+        assert_eq!(value, &serde_json::json!("bubblewrap"));
+        dispatch_settings_result(&state, "host-a", 0, &write.write_id.0, true, "");
+        next_tick().await;
+        assert!(
+            native.checked(),
+            "acknowledgement alone must not invent settings state"
+        );
+        let mut settings = state.host_settings_untracked("host-a").unwrap();
+        settings.workbenches.engine = protocol::WorkbenchEngine::Bubblewrap;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-a",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-a".to_owned()),
+                FrameKind::HostSettings,
+                1,
+                &settings_model::HostSettingsPayload {
+                    settings,
+                    etag: "engine-saved".to_owned(),
+                    configured_secrets: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let bubblewrap: HtmlInputElement = container
+            .query_selector("input[value=bubblewrap]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(bubblewrap.checked());
+        let picker: HtmlSelectElement = container
+            .query_selector("select[aria-label='Host these settings apply to']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        picker.set_value("host-b");
+        dispatch_event_from_js(&picker.unchecked_into(), "change", None);
+        next_tick().await;
+        assert_eq!(
+            state.selected_host_id.get_untracked().as_deref(),
+            Some("host-b")
+        );
+        let native: HtmlInputElement = container
+            .query_selector("input[value=native]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let bubblewrap: HtmlInputElement = container
+            .query_selector("input[value=bubblewrap]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(native.checked());
+        assert!(!bubblewrap.checked());
+        assert!(bubblewrap.disabled());
+        let text = container.text_content().unwrap();
+        assert!(text.contains("Bubblewrap requires Linux on this host"));
+        assert!(text.contains("Nested namespaces require Linux"));
+        assert!(!text.contains("This host denies nested user namespaces"));
+        bubblewrap.click();
+        next_tick().await;
+        assert_eq!(
+            recorded_settings_write_ops(&calls).len(),
+            1,
+            "unsupported engine must not emit a write"
+        );
+        let picker: HtmlSelectElement = container
+            .query_selector("select[aria-label='Host these settings apply to']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        picker.set_value("host-a");
+        dispatch_event_from_js(&picker.unchecked_into(), "change", None);
+        next_tick().await;
+        let bubblewrap: HtmlInputElement = container
+            .query_selector("input[value=bubblewrap]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            bubblewrap.checked(),
+            "host switch must retain the acknowledged engine"
+        );
+        assert!(!bubblewrap.disabled());
+        drop(handle);
+        container.remove();
+    }
+
     // Signal-only: builds the form directly rather than mounting the settings
     // page, because the settings panel is close to the wasm test instance's
     // memory ceiling and a full mount here has OOM'd before.
@@ -9958,6 +10268,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
@@ -12504,6 +12815,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
@@ -13397,6 +13709,7 @@ mod wasm_tests {
         enabled_backends: Vec<BackendKind>,
     ) -> settings_model::HostSettings {
         settings_model::HostSettings {
+            workbenches: Default::default(),
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
@@ -14792,6 +15105,7 @@ mod wasm_tests {
                     FrameKind::CommandError,
                     seq,
                     &protocol::CommandErrorPayload {
+                        workbench_reason: None,
                         context: None,
                         request_id: None,
                         stream,
@@ -16238,6 +16552,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),

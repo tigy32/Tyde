@@ -1282,9 +1282,59 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         matches!(event, protocol::ChatEvent::StreamDelta(delta) if delta.text.contains("waiting for interrupt"))
     }).await;
 
-    for repository in [&repo, &peer_repo] {
+    let monitor_directory = tempfile::Builder::new()
+        .prefix("tyde-git-monitor-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut monitors = tokio::task::JoinSet::new();
+    let mut entries = Vec::new();
+    for (index, repository) in [&repo, &peer_repo].into_iter().enumerate() {
+        let address = monitor_directory.path().join(index.to_string());
+        let listener = tokio::net::UnixListener::bind(&address).unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        entries.push(entry);
+        let mut entered = Some(entered);
+        let released = released.clone();
+        let stopped = stop.clone();
+        monitors.spawn(async move {
+            let mut calls = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        if let Some(entered) = entered.take() {
+                            let _ = entered.send(());
+                        }
+                        let mut released = released.clone();
+                        calls.spawn(async move {
+                            use tokio::io::AsyncWriteExt;
+                            while !*released.borrow_and_update() {
+                                released.changed().await.unwrap();
+                            }
+                            socket.write_all(b"R").await.unwrap();
+                        });
+                    }
+                    completed = calls.join_next(), if !calls.is_empty() => {
+                        completed.unwrap().unwrap();
+                    }
+                    _ = stopped.cancelled() => break,
+                }
+            }
+            while let Some(completed) = calls.join_next().await {
+                completed.unwrap();
+            }
+        });
         let hook = repository.path().join(".git/slow-fsmonitor");
-        fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ -d .git ] && [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
+        fs::write(
+            &hook,
+            format!(
+                "#!/usr/bin/env python3\nimport pathlib, socket, sys\nif not pathlib.Path('.git/monitor-release').exists():\n with socket.socket(socket.AF_UNIX) as connection:\n  connection.connect({:?})\n  assert connection.recv(1) == b'R'\nsys.stdout.buffer.write(b'token\\0/\\0')\n",
+                address.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         git(
             repository.path(),
@@ -1292,36 +1342,11 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         );
     }
     write_file(&repo.path().join("src/lib.rs"), "pub fn changed() {}\n");
-
-    let roots = [repo.path().to_path_buf(), peer_repo.path().to_path_buf()];
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    // The independent watchdog releases real Git even if it blocks the sole
-    // async worker, so the regression fails instead of hanging the suite.
-    let watchdog = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while roots
-            .iter()
-            .any(|root| !root.join(".git/monitor-started").exists())
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Git never entered fsmonitor"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let _ = entered_tx.send(());
-        std::thread::sleep(Duration::from_secs(2));
-        for root in roots {
-            if let Err(error) = fs::write(root.join(".git/monitor-release"), "") {
-                assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound,
-                    "release Git watchdog: {error}"
-                );
-            }
-        }
-    });
-    entered_rx.await.expect("fsmonitor started");
+    // Real fsmonitor calls remain blocked until the protocol assertions finish;
+    // the old two-second watchdog released healthy Git under host load.
+    for entry in entries {
+        entry.await.expect("real Git entered fsmonitor");
+    }
     let (mut connection, bootstrap) = fixture.connect_with_bootstrap().await;
     let late_agent_stream = bootstrap
         .agents
@@ -1447,6 +1472,7 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
     );
     fs::write(repo.path().join(".git/monitor-release"), "").unwrap();
     fs::write(peer_repo.path().join(".git/monitor-release"), "").unwrap();
+    release.send_replace(true);
     next_frame_matching_on(
         &mut connection,
         "review response after bootstrap",
@@ -1470,7 +1496,10 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
     let status: ProjectGitStatusPayload = status.parse_payload().unwrap();
     assert_eq!(status.roots[0].files[0].relative_path, "src/lib.rs");
     drop(connection);
-    watchdog.join().unwrap();
+    stop.cancel();
+    while let Some(completed) = monitors.join_next().await {
+        completed.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -742,6 +742,7 @@ pub(super) fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReaso
         TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted => "no completed turns",
         TaskTokenUsageUnavailableReason::BackendDidNotReport => "backend did not report",
         TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous => "provider scope ambiguous",
+        TaskTokenUsageUnavailableReason::AgentStarting => "agent starting",
         TaskTokenUsageUnavailableReason::AgentUnavailable => "agent unavailable",
         TaskTokenUsageUnavailableReason::HelperAccountingUnavailable => {
             "analyzer accounting unavailable"
@@ -3144,6 +3145,34 @@ mod wasm_tests {
         assert!(
             !text.contains("no completed turns"),
             "same-key rows must replace stale coverage reasons"
+        );
+        rollup.total.status = TaskTokenUsageStatus::Unavailable {
+            unavailable_count: 3,
+            reasons: vec![TaskTokenUsageUnavailableReason::AgentStarting],
+        };
+        rollup.backends[0].total = rollup.total.clone();
+        for entry in &mut rollup.breakdown {
+            entry.usage = TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::AgentStarting,
+            };
+        }
+        dispatch_task_usage(&state, "h-task-unavail", 2, &rollup);
+        next_tick().await;
+        let popover = query(&container, ".session-task-popover").expect("popover stays open");
+        assert!(
+            popover
+                .text_content()
+                .unwrap_or_default()
+                .contains("agent starting"),
+            "pending native startup must show its server-owned unavailable reason"
+        );
+        let badge = query(&container, ".session-task-toggle").expect("unavailable badge stays");
+        let badge_text = badge.text_content().unwrap_or_default();
+        assert!(
+            badge_text.contains("unavailable")
+                && !badge_text.contains('Σ')
+                && !badge_text.contains('0'),
+            "pending startup must not fabricate a real zero"
         );
     }
 

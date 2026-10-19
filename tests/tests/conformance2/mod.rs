@@ -520,6 +520,11 @@ pub struct Harness<B: Backend> {
     events: Option<EventStream>,
     workspace: tempfile::TempDir,
     profile: Profile,
+    workbench: Option<(
+        tempfile::TempDir,
+        protocol::WorkbenchEnvironment,
+        std::path::PathBuf,
+    )>,
     pub config: BackendSpawnConfig,
     pub test_name: String,
     pub observer: std::sync::Arc<Observer>,
@@ -575,6 +580,7 @@ impl<B: Backend> Harness<B> {
             events: None,
             workspace,
             profile,
+            workbench: None,
             config,
             test_name: test_name.to_owned(),
             observer,
@@ -620,8 +626,66 @@ impl<B: Backend> Harness<B> {
         PROTOCOL_VIOLATIONS.with(|violations| violations.borrow().clone())
     }
 
+    pub async fn prepare_bubblewrap(&mut self) -> protocol::Project {
+        assert!(self.backend.is_none(), "prepare before provider launch");
+        std::fs::write(self.workspace().join(".gitignore"), "/build-output/\n")
+            .expect("ignore private build output");
+        init_workspace_repo(self.workspace());
+        let directory = tempfile::tempdir().expect("environment parent");
+        let worktree = directory.path().join("worktree");
+        let status = std::process::Command::new("git")
+            .current_dir(self.workspace())
+            .args(["worktree", "add", "-q", "-b", "feature/bubblewrap"])
+            .arg(&worktree)
+            .status()
+            .expect("create conformance Git workbench");
+        assert!(
+            status.success(),
+            "create real Git workbench before engine preparation"
+        );
+        let environment =
+            server::prepare_workbench_environment(&worktree, &directory.path().join("environment"))
+                .await
+                .expect("real Bubblewrap engine must support the paid scenario");
+        let parent_root =
+            protocol::ProjectRootPath(self.workspace().to_string_lossy().into_owned());
+        let root = protocol::ProjectRootPath(worktree.to_string_lossy().into_owned());
+        let project = protocol::Project {
+            id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
+            name: "Bubblewrap conformance".to_owned(),
+            sort_order: 0,
+            source: protocol::ProjectSource::GitWorkbench {
+                parent_project_id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
+                branch: protocol::GitBranchName("feature/bubblewrap".to_owned()),
+                roots: vec![protocol::WorkbenchRoot {
+                    parent_root,
+                    worktree_root: root,
+                }],
+                environment: environment.clone(),
+            },
+        };
+        self.workbench = Some((directory, environment, worktree));
+        project
+    }
+
     pub async fn finish(&mut self) {
         self.shutdown().await;
+        if let Some((directory, environment, worktree)) = self.workbench.take() {
+            server::finish_workbench_environment(&environment, true)
+                .await
+                .expect("remove real Bubblewrap environment after provider shutdown");
+            let status = std::process::Command::new("git")
+                .current_dir(self.workspace())
+                .args(["worktree", "remove", "--force"])
+                .arg(worktree)
+                .status()
+                .expect("remove conformance Git workbench");
+            assert!(
+                status.success(),
+                "remove real Git workbench after engine teardown"
+            );
+            drop(directory);
+        }
         if let Some((service, task)) = self.control.take() {
             service.shutdown().await;
             for child in service.children.lock().expect("children").iter() {
@@ -649,7 +713,10 @@ impl<B: Backend> Harness<B> {
     }
 
     pub fn workspace(&self) -> &Path {
-        self.workspace.path()
+        match &self.workbench {
+            Some((_, _, root)) => root,
+            None => self.workspace.path(),
+        }
     }
 
     pub fn declares(&self, capability: BackendCapability) -> bool {
@@ -657,7 +724,7 @@ impl<B: Backend> Harness<B> {
     }
 
     pub fn workspace_roots(&self) -> Vec<String> {
-        vec![self.workspace.path().to_string_lossy().into_owned()]
+        vec![self.workspace().to_string_lossy().into_owned()]
     }
 
     pub async fn shutdown(&mut self) -> Vec<ChatEvent> {

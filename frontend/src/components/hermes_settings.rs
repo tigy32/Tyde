@@ -3283,6 +3283,7 @@ mod wasm_tests {
             install_doc(&state, doc.clone());
             if !disabled.is_empty() {
                 let settings = settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),

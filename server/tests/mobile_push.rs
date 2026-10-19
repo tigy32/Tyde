@@ -252,7 +252,9 @@ fn seed_paired_device() -> tempfile::TempDir {
 
 /// Connects as the paired mobile device over the real mobile connection path.
 async fn connect_mobile(host: server::HostHandle) -> client::Connection {
-    fixture::connect_raw_mobile_client(host, DEVICE_ID).await
+    fixture::connect_mobile_client_with_bootstrap(host, DEVICE_ID)
+        .await
+        .0
 }
 
 async fn register_subscription(
@@ -263,6 +265,22 @@ async fn register_subscription(
         .mobile_push_subscribe(MobilePushSubscribePayload { subscription })
         .await
         .expect("send MobilePushSubscribe");
+    // Gate2 missed the live background-work edge after a raw Welcome. A
+    // transport write is not subscription admission: wait for server-settled
+    // state before producing events from the separate desktop connection.
+    fixture::next_frame_matching_on(mobile, "push subscription enabled", |env| {
+        env.kind == FrameKind::MobileAccessState
+            && env
+                .parse_payload::<protocol::MobileAccessStatePayload>()
+                .expect("parse push subscription state")
+                .paired_devices
+                .iter()
+                .any(|device| {
+                    device.device_id.0 == DEVICE_ID
+                        && device.push == protocol::MobilePushState::Enabled
+                })
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -347,8 +365,7 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
     );
     assert!(
         captured.authorization.starts_with("vapid t="),
-        "push must carry VAPID authorization, got {:?}",
-        captured.authorization
+        "push must carry VAPID authorization"
     );
     assert!(
         captured

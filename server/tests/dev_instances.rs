@@ -3,7 +3,7 @@ mod fixture;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use fixture::Fixture;
+use fixture::{Fixture, next_frame_matching_on};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -29,10 +29,17 @@ fn shell_quote(path: &Path) -> String {
 const FAKE_CARGO_TAURI: &str = r#"#!/bin/sh
 # Starting this CLI must follow frontend readiness, not initiate it.
 /usr/bin/python3 - "$@" <<'PYCONFIG' || exit 89
-import json,pathlib,sys,os
+import json,pathlib,sys,os,socket
 path=sys.argv[sys.argv.index('--config')+1]
 assert json.load(open(path))['build']['beforeDevCommand'] is None
-pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).touch()
+marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
+marker.touch()
+marker.with_suffix('.namespace').write_text(json.dumps({'logical_cwd':os.getcwd()=='/mnt/tyde-workspace','private_namespace':os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'] if pathlib.Path('/proc/self/ns/mnt').exists() else False}))
+if marker.with_suffix('.hold').exists():
+ control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+ control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL']);control.sendall(b'D')
+ assert control.recv(1)==b'R'
+
 PYCONFIG
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 if [ "${CLAUDE_SECURESTORAGE_CONFIG_DIR+set}" = set ]; then
@@ -52,6 +59,9 @@ const FAKE_NODE: &str = r#"#!/usr/bin/python3
 import http.server,os,socket,sys
 assert sys.argv[1].endswith('/tools/trunk-command.mjs')
 assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv
+if sys.argv[1].startswith('/mnt/tyde-workspace/'):
+ assert os.getcwd()=='/mnt/tyde-workspace'
+ assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE']
 port=int(sys.argv[sys.argv.index('--port')+1])
 control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
@@ -101,6 +111,11 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     .expect("parent Claude credentials");
     unsafe {
         std::env::set_var("TYDE_TEST_FRONTEND_CONTROL", &control_path);
+        #[cfg(target_os = "linux")]
+        std::env::set_var(
+            "TYDE_TEST_HOST_NAMESPACE",
+            std::fs::read_link("/proc/self/ns/mnt").expect("host mount namespace"),
+        );
         std::env::set_var("TYDE_TEST_DESKTOP_MARKER", &desktop_marker);
         std::env::set_var("SHELL", &shell);
         std::env::set_var("CLAUDE_CONFIG_DIR", &parent_claude_home);
@@ -116,6 +131,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         .block_on(start_dev_instance_expecting_exit(
             &control_path,
             &desktop_marker,
+            DevScenario::NativeExit,
         ));
 
     assert!(
@@ -149,28 +165,256 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
             .any(|line| line == "CLAUDE_CREDENTIAL_MATCH=1"),
         "dev instance Claude must still read the parent's credentials"
     );
+    #[cfg(target_os = "linux")]
+    for scenario in [
+        DevScenario::BubblewrapExit,
+        DevScenario::RemoveDuringFrontend,
+        DevScenario::RemoveDuringDesktop,
+    ] {
+        if desktop_marker.exists() {
+            std::fs::remove_file(&desktop_marker).expect("reset completed desktop marker");
+        }
+        std::fs::remove_file(&control_path).expect("remove completed readiness socket");
+        if matches!(scenario, DevScenario::RemoveDuringDesktop) {
+            std::fs::write(desktop_marker.with_extension("hold"), "held")
+                .expect("hold desktop readiness at real process boundary");
+        }
+        let error = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Bubblewrap test runtime")
+            .block_on(start_dev_instance_expecting_exit(
+                &control_path,
+                &desktop_marker,
+                scenario,
+            ));
+        if matches!(scenario, DevScenario::BubblewrapExit) {
+            assert!(
+                error.contains("exited before ready"),
+                "DEV must reach the real child exit, not fail host chdir"
+            );
+        } else {
+            assert!(
+                error.contains("DEV startup cancelled"),
+                "pending startup must observe explicit cancellation"
+            );
+        }
+        if !matches!(scenario, DevScenario::RemoveDuringFrontend) {
+            let proof: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(desktop_marker.with_extension("namespace"))
+                    .expect("actual desktop process proof"),
+            )
+            .expect("desktop namespace proof");
+            assert_eq!(
+                proof,
+                json!({"logical_cwd": true, "private_namespace": true})
+            );
+        }
+    }
 }
 
-async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: &Path) -> String {
-    let control =
+#[derive(Clone, Copy)]
+enum DevScenario {
+    NativeExit,
+    #[cfg(target_os = "linux")]
+    BubblewrapExit,
+    #[cfg(target_os = "linux")]
+    RemoveDuringFrontend,
+    #[cfg(target_os = "linux")]
+    RemoveDuringDesktop,
+}
+
+impl DevScenario {
+    fn removes_pending(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self, Self::RemoveDuringFrontend | Self::RemoveDuringDesktop)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn holds_frontend(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self, Self::RemoveDuringFrontend)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+}
+
+async fn start_dev_instance_expecting_exit(
+    control_path: &Path,
+    desktop_marker: &Path,
+    scenario: DevScenario,
+) -> String {
+    let control_listener =
         tokio::net::UnixListener::bind(control_path).expect("bind frontend readiness gate");
     // Let the server retain its ephemeral listener: reserving then releasing a
     // port raced other tests and failed with AddressAlreadyInUse.
-    let fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
         debug_mcp_bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         ..Default::default()
     })
     .await;
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
-        .expect("nextest must provide the current package directory");
-    let repo_root = Path::new(&manifest_dir)
-        .parent()
-        .expect("server crate has a repo root")
-        .to_path_buf();
-    eprintln!(
-        "DEV INSTANCE test paths: runtime_root_exists={}",
-        repo_root.is_dir()
-    );
+    let fixture_root = tempfile::tempdir().expect("disposable project container");
+    let workbench = if !matches!(scenario, DevScenario::NativeExit) {
+        assert!(
+            matches!(
+                fixture.bootstrap.workbench_support.bubblewrap,
+                protocol::WorkbenchAvailability::Available
+            ),
+            "DEV isolation regression requires Linux Bubblewrap with unprivileged user/mount namespaces; capability={:?}",
+            fixture.bootstrap.workbench_support.bubblewrap
+        );
+        let unavailable = fixture_root.path().join("unavailable");
+        std::fs::create_dir(&unavailable).expect("unrelated DEV project root");
+        fixture
+            .client
+            .project_create(protocol::ProjectCreatePayload {
+                name: "Unavailable unrelated project".into(),
+                roots: vec![protocol::ProjectRootPath(
+                    unavailable.to_string_lossy().into_owned(),
+                )],
+            })
+            .await
+            .expect("register unrelated project");
+        next_frame_matching_on(&mut fixture.client, "unrelated project registered", |env| {
+            env.kind == protocol::FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<protocol::ProjectNotifyPayload>().unwrap(),
+                    protocol::ProjectNotifyPayload::Upsert { project } if project.name == "Unavailable unrelated project")
+        }).await;
+        std::fs::remove_dir(&unavailable).expect("make unrelated registered root unavailable");
+        let physical = fixture_root.path().join("physical");
+        std::fs::create_dir(&physical).expect("physical DEV source parent");
+        let alias = fixture_root.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).expect("symlinked DEV source parent");
+        let source = alias.join("source");
+        std::fs::create_dir_all(source.join("frontend/tauri-shell"))
+            .expect("DEV fixture config directory");
+        std::fs::create_dir(source.join("tools")).expect("DEV fixture tools directory");
+        std::fs::write(
+            source.join("tools/trunk-command.mjs"),
+            "// explicit DEV workload fixture\n",
+        )
+        .expect("frontend workload source");
+        std::fs::write(
+            source.join("frontend/tauri-shell/tauri.conf.json"),
+            "{\"build\":{}}",
+        )
+        .expect("DEV fixture config");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@localhost",
+                "commit",
+                "-qm",
+                "DEV workload fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&source)
+                    .args(args)
+                    .status()
+                    .expect("fixture Git command")
+                    .success()
+            );
+        }
+        fixture
+            .client
+            .project_create(protocol::ProjectCreatePayload {
+                name: "DEV workload".into(),
+                roots: vec![protocol::ProjectRootPath(
+                    source.to_string_lossy().into_owned(),
+                )],
+            })
+            .await
+            .expect("create parent through protocol");
+        let created = next_frame_matching_on(&mut fixture.client, "DEV parent project", |e| {
+            e.kind == protocol::FrameKind::ProjectNotify
+        })
+        .await;
+        let protocol::ProjectNotifyPayload::Upsert { project: parent } =
+            created.parse_payload().expect("parent project payload")
+        else {
+            panic!("parent upsert required")
+        };
+        let write = fixture
+            .client
+            .replace_setting(
+                "/workbenches/engine",
+                protocol::WorkbenchEngine::Bubblewrap,
+                protocol::WorkbenchEngine::Native,
+            )
+            .await
+            .expect("select Bubblewrap engine");
+        let result = next_frame_matching_on(&mut fixture.client, "DEV engine setting", |e| {
+            e.kind == protocol::FrameKind::SettingsWriteResult
+                && e.parse_payload::<protocol::SettingsWriteResultPayload>()
+                    .unwrap()
+                    .write_id
+                    == write
+        })
+        .await;
+        assert!(
+            result
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .unwrap()
+                .applied
+        );
+        fixture
+            .client
+            .workbench_create(protocol::WorkbenchCreatePayload {
+                parent_project_id: parent.id,
+                branch: protocol::GitBranchName("qa-dev-runtime".into()),
+                name: "DEV runtime".into(),
+            })
+            .await
+            .expect("create real engine workbench");
+        let created = next_frame_matching_on(&mut fixture.client, "DEV workbench", |e| {
+            matches!(
+                e.kind,
+                protocol::FrameKind::ProjectNotify | protocol::FrameKind::CommandError
+            )
+        })
+        .await;
+        assert_eq!(
+            created.kind,
+            protocol::FrameKind::ProjectNotify,
+            "DEV isolation regression requires a strict-CoW filesystem; creation must succeed, reason={:?}",
+            (created.kind == protocol::FrameKind::CommandError).then(|| created
+                .parse_payload::<protocol::CommandErrorPayload>()
+                .unwrap()
+                .workbench_reason)
+        );
+        let protocol::ProjectNotifyPayload::Upsert { project } =
+            created.parse_payload().expect("workbench payload")
+        else {
+            panic!("workbench upsert required")
+        };
+        Some(project)
+    } else {
+        None
+    };
+    let repo_root = match &workbench {
+        Some(project) => PathBuf::from(&project.root_paths()[0].0),
+        None => {
+            Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("current package directory"))
+                .parent()
+                .expect("repository root")
+                .to_path_buf()
+        }
+    };
     let transport = StreamableHttpClientTransport::from_uri(
         fixture.host_for_test().debug_mcp_url_for_test().await,
     );
@@ -187,7 +431,7 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
     );
     let (mut control, _) = tokio::select! {
         result = &mut start => panic!("dev start settled before frontend readiness gate: tool_completed={}", result.is_ok()),
-        connected = control.accept() => connected.expect("frontend entered actual readiness gate"),
+        connected = control_listener.accept() => connected.expect("frontend entered actual readiness gate"),
     };
     assert_eq!(
         control.read_u8().await.expect("frontend control gate"),
@@ -197,11 +441,52 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
         !desktop_marker.exists(),
         "desktop started before frontend was ready"
     );
-    control
-        .write_all(b"R")
-        .await
-        .expect("release actual frontend readiness");
-    let result = start.as_mut().await.expect("call tyde_dev_instance_start");
+    let mut desktop_control = None;
+    if !scenario.holds_frontend() {
+        control
+            .write_all(b"R")
+            .await
+            .expect("release actual frontend readiness");
+        if scenario.removes_pending() {
+            let (mut connected, _) = tokio::select! {
+                result = &mut start => panic!("dev start settled before desktop readiness gate: tool_completed={}", result.is_ok()),
+                connected = control_listener.accept() => connected.expect("desktop entered actual readiness gate"),
+            };
+            assert_eq!(connected.read_u8().await.expect("desktop held event"), b'D');
+            desktop_control = Some(connected);
+        }
+    }
+    let result = if scenario.removes_pending() {
+        let project = workbench.as_ref().expect("owned Bubblewrap workbench");
+        fixture
+            .client
+            .workbench_remove(protocol::WorkbenchRemovePayload {
+                id: project.id.clone(),
+                force: true,
+            })
+            .await
+            .expect("remove workbench while actual startup readiness is held");
+        let (start_result, removed) = tokio::join!(
+            start.as_mut(),
+            next_frame_matching_on(&mut fixture.client, "pending DEV workbench removed", |e| {
+                e.kind == protocol::FrameKind::CommandError
+                    || (e.kind == protocol::FrameKind::ProjectNotify
+                        && matches!(e.parse_payload::<protocol::ProjectNotifyPayload>().unwrap(), protocol::ProjectNotifyPayload::Delete { project: p } if p.id == project.id))
+            })
+        );
+        assert_eq!(
+            removed.kind,
+            protocol::FrameKind::ProjectNotify,
+            "removal must join pending DEV processes without releasing readiness"
+        );
+        assert!(
+            !repo_root.exists(),
+            "joined workbench removal must remove the host root"
+        );
+        start_result.expect("cancelled DEV tool completes")
+    } else {
+        start.as_mut().await.expect("call tyde_dev_instance_start")
+    };
     drop(start);
     let startup_error = result
         .content
@@ -212,9 +497,10 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
+    assert_eq!(
         desktop_marker.exists(),
-        "desktop did not start after frontend became ready: tool_error={} frontend_exit={} frontend_connection={} frontend_response={} frontend_index={} port_in_use={} desktop_spawn={} cli_missing={}",
+        !scenario.holds_frontend(),
+        "desktop launch must follow actual frontend readiness: tool_error={} frontend_exit={} frontend_connection={} frontend_response={} frontend_index={} port_in_use={} desktop_spawn={} cli_missing={}",
         result.is_error == Some(true),
         startup_error.contains("dev frontend exited before ready"),
         startup_error.contains("frontend connection failed"),
@@ -224,6 +510,16 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
         startup_error.contains("failed to spawn Tyde dev instance"),
         startup_error.contains("cargo-tauri was not found"),
     );
+    if let Some(mut desktop) = desktop_control {
+        assert_eq!(
+            desktop
+                .read_u8()
+                .await
+                .expect_err("held desktop must close")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
     let mut byte = [0];
     assert_eq!(
         control
@@ -237,11 +533,26 @@ async fn start_dev_instance_expecting_exit(control_path: &Path, desktop_marker: 
     assert_eq!(
         result.is_error,
         Some(true),
-        "fake Tauri CLI exits, so the start must fail: {result:?}"
+        "failed or cancelled actual DEV process must report a tool error"
     );
     let content = result.content.first().expect("start error content");
     let RawContent::Text(text) = &content.raw else {
         panic!("expected text start error, got {:?}", content.raw);
     };
-    text.text.clone()
+    let error = text.text.clone();
+    if let Some(project) = workbench
+        && !scenario.removes_pending()
+    {
+        fixture
+            .client
+            .workbench_remove(protocol::WorkbenchRemovePayload {
+                id: project.id.clone(),
+                force: true,
+            })
+            .await
+            .expect("remove DEV workbench after joined startup failure");
+        next_frame_matching_on(&mut fixture.client, "DEV workbench removed", |e| e.kind==protocol::FrameKind::ProjectNotify && matches!(e.parse_payload::<protocol::ProjectNotifyPayload>().unwrap(),protocol::ProjectNotifyPayload::Delete { project: p } if p.id==project.id)).await;
+        assert!(!repo_root.exists());
+    }
+    error
 }

@@ -861,8 +861,7 @@ impl Drop for AgentProjectMoveGuard {
 
 pub(crate) struct ScheduledProjectMove {
     pub project_id: Option<protocol::ProjectId>,
-    pub project_store: Arc<tokio::sync::Mutex<crate::store::project::ProjectStore>>,
-    pub parent_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    pub lifecycle: Arc<crate::host::lifecycle::LifecycleHandle>,
     pub guard: AgentProjectMoveGuard,
 }
 
@@ -1508,7 +1507,8 @@ fn token_usage_reason_from_task_reason(
         TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous => {
             TokenUsageUnavailableReason::ProviderScopeAmbiguous
         }
-        TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
+        TaskTokenUsageUnavailableReason::AgentStarting
+        | TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
         | TaskTokenUsageUnavailableReason::BackendDidNotReport
         | TaskTokenUsageUnavailableReason::AgentUnavailable
         | TaskTokenUsageUnavailableReason::HelperAccountingUnavailable
@@ -2148,6 +2148,25 @@ impl AgentHandle {
     pub async fn read_usage_snapshot(&self) -> Option<AgentUsageSnapshot> {
         if self.actor_finished() {
             return self.final_usage.borrow().clone();
+        }
+        // Pending native startup cannot serve the usage mailbox yet. It has
+        // not published accounting/timing observations, not a measured zero.
+        let unavailable = match self.startup_completion.borrow().as_ref() {
+            None => Some(TaskTokenUsageUnavailableReason::AgentStarting),
+            Some(Err(_)) => Some(TaskTokenUsageUnavailableReason::AgentUnavailable),
+            Some(Ok(_)) => None,
+        };
+        if let Some(reason) = unavailable {
+            return Some(AgentUsageSnapshot {
+                observation: protocol::TaskUsageObservation::Unobserved,
+                native_usage: None,
+                navigation: protocol::TaskUsageNavigation::LiveAgent,
+                parent_session_id: None,
+                timing: Default::default(),
+                start: self.snapshot(),
+                usage: TaskTokenUsageScope::Unavailable { reason },
+                model: None,
+            });
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -4380,6 +4399,12 @@ pub(crate) fn spawn_agent_actor(
         let mut backend_typing = false;
         let mut scheduled_project_move: Option<ScheduledProjectMove> = None;
         let mut project_move_waiting_for_backend = false;
+        let mut project_entry_pending: Option<
+            oneshot::Receiver<Result<crate::host::lifecycle::ProjectEntryExecution, String>>,
+        > = None;
+        let mut project_entry_execution: Option<
+            Result<crate::host::lifecycle::ProjectEntryExecution, String>,
+        > = None;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
         let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
@@ -4916,7 +4941,7 @@ pub(crate) fn spawn_agent_actor(
                 .await;
                 return;
             }
-            if scheduled_project_move.is_some()
+            let project_entry_ready = scheduled_project_move.is_some()
                 && !project_move_waiting_for_backend
                 && matches!(lifecycle, ActorLifecycle::Running)
                 && !in_turn
@@ -4927,40 +4952,42 @@ pub(crate) fn spawn_agent_actor(
                 && !resume_replay_gate_pending
                 && pending_tool_response_ids.is_empty()
                 && open_tool_call_ids.is_empty()
-                && !status_handle.snapshot().await.has_background_work
+                && !status_handle.snapshot().await.has_background_work;
+            if scheduled_project_move.is_none() {
+                project_entry_pending = None;
+                project_entry_execution = None;
+            }
+            if project_entry_ready
+                && project_entry_pending.is_none()
+                && project_entry_execution.is_none()
+                && let Some(movement) = scheduled_project_move.as_ref()
             {
+                match movement.lifecycle.enter_scheduled_project(
+                    current_start.agent_id.clone(),
+                    movement.project_id.clone(),
+                    current_start.workspace_roots.clone(),
+                ) {
+                    Ok(pending) => project_entry_pending = Some(pending),
+                    Err(error) => project_entry_execution = Some(Err(error)),
+                }
+            }
+            if !project_entry_ready {
+                project_entry_execution = None;
+            }
+            if project_entry_ready && project_entry_execution.is_some() {
                 let movement = match scheduled_project_move.take() {
                     Some(movement) => movement,
                     None => continue,
                 };
-                let parent_guard = match movement.parent_lock.as_ref() {
-                    Some(lock) => Some(lock.lock().await),
-                    None => None,
+                let mut execution = match project_entry_execution.take() {
+                    Some(execution) => execution,
+                    None => continue,
                 };
-                let roots = match movement.project_id.as_ref() {
-                    Some(id) => {
-                        let store = movement.project_store.lock().await;
-                        store
-                            .get(id)
-                            .ok_or_else(|| {
-                                ProjectMoveFailure::Rejected(
-                                    "Destination project was removed before entry".to_owned(),
-                                )
-                            })
-                            .and_then(|project| {
-                                crate::backend::validate_local_workspace_roots(
-                                    project
-                                        .root_paths()
-                                        .into_iter()
-                                        .map(|root| root.0)
-                                        .collect(),
-                                )
-                                .map_err(ProjectMoveFailure::Rejected)
-                            })
-                    }
-                    None => Ok(current_start.workspace_roots.clone()),
+                let roots = match &mut execution {
+                    Err(error) => Err(ProjectMoveFailure::Rejected(error.clone())),
+                    Ok(execution) => Ok(std::mem::take(&mut execution.roots)),
                 };
-                let result = match roots {
+                let mut result = match roots {
                     Ok(roots) => {
                         apply_agent_project_move(
                             AgentProjectMoveContext {
@@ -4979,7 +5006,25 @@ pub(crate) fn spawn_agent_actor(
                     }
                     Err(error) => Err(error),
                 };
-                drop(parent_guard);
+                if let Ok(execution) = execution {
+                    use crate::host::lifecycle::ProjectEntryOutcome;
+                    match &mut result {
+                        Ok(_) => execution.complete(ProjectEntryOutcome::Committed),
+                        Err(ProjectMoveFailure::Busy) => {
+                            execution.complete(ProjectEntryOutcome::BackendBusy)
+                        }
+                        Err(ProjectMoveFailure::Rejected(_)) => {
+                            execution.complete(ProjectEntryOutcome::Rejected)
+                        }
+                        Err(ProjectMoveFailure::Unreconciled(message)) => {
+                            if let Err(error) = execution.retire().await {
+                                tracing::error!("Cannot withdraw failed project entry restoration");
+                                *message =
+                                    format!("{message}; conversation retirement failed: {error}");
+                            }
+                        }
+                    }
+                }
                 let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
                 match result {
                     Err(ProjectMoveFailure::Busy) => {
@@ -5009,6 +5054,11 @@ pub(crate) fn spawn_agent_actor(
                     ) => {
                         drop(movement.guard);
                         tracing::error!(fatal, "Scheduled project entry failed");
+                        if fatal {
+                            // Restart may begin as soon as the fatal error is
+                            // visible, before native shutdown has settled.
+                            status_handle.withdraw_recovery().await;
+                        }
                         append_event(
                             &canonical_stream,
                             &mut event_log,
@@ -5506,6 +5556,18 @@ pub(crate) fn spawn_agent_actor(
             tokio::pin!(supervisor_sleep);
             tokio::pin!(stall_sleep);
             tokio::select! {
+                result = async {
+                    match project_entry_pending.as_mut() {
+                        Some(pending) => match pending.await {
+                            Ok(result) => result,
+                            Err(_) => Err("Project lifecycle stopped before entry".to_owned()),
+                        },
+                        None => std::future::pending().await,
+                    }
+                }, if project_entry_pending.is_some() => {
+                    project_entry_pending = None;
+                    project_entry_execution = Some(result);
+                }
                 _ = &mut supervisor_sleep, if supervisor_deadline.is_some() => {
                     let now = Instant::now();
                     let action = supervisor_state.due_action(

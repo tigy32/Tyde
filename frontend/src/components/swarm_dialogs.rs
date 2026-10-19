@@ -1979,6 +1979,7 @@ mod wasm_tests {
                         name: "Scope workbench".to_owned(),
                         sort_order: 1,
                         source: ProjectSource::GitWorkbench {
+                            environment: Default::default(),
                             parent_project_id: ProjectId(PROJECT.to_owned()),
                             branch: protocol::GitBranchName("scope-workbench".to_owned()),
                             roots: Vec::new(),

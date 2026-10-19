@@ -554,6 +554,7 @@ struct CreateWorkbenchResult {
     branch: String,
     parent_project_id: String,
     roots: Vec<CreatedWorkbenchRootResult>,
+    environment: protocol::WorkbenchEnvironment,
     entry_scheduled: bool,
 }
 
@@ -579,6 +580,7 @@ struct ProjectOverview {
     parent_project_id: Option<String>,
     branch: Option<String>,
     workspace_roots: Vec<String>,
+    environment: protocol::WorkbenchEnvironment,
 }
 
 #[derive(Debug, Serialize)]
@@ -2881,6 +2883,9 @@ async fn do_create_workbench(
     }
     if input.action == protocol::WorkbenchCreateAction::Enter {
         host.validate_agent_project_entry(caller).await?;
+        if host.selected_workbench_engine().await? == protocol::WorkbenchEngine::Bubblewrap {
+            return Err("Bubblewrap workbenches require a new agent process. Use create_only and spawn a new agent in the returned project; live namespace transfer is unsupported".to_owned());
+        }
     }
     let branch = input.branch.trim();
     if branch.is_empty() {
@@ -2920,6 +2925,7 @@ fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchR
     let ProjectSource::GitWorkbench {
         parent_project_id,
         branch,
+        environment,
         ..
     } = created.project.source
     else {
@@ -2928,6 +2934,7 @@ fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchR
         ));
     };
     Ok(CreateWorkbenchResult {
+        environment,
         entry_scheduled: false,
         project_id,
         name,
@@ -2988,7 +2995,12 @@ async fn do_list_workbenches(
                     Some(branch.0.clone()),
                 ),
             };
+            let environment = match &project.source {
+                ProjectSource::GitWorkbench { environment, .. } => environment.clone(),
+                ProjectSource::Standalone { .. } => protocol::WorkbenchEnvironment::Native,
+            };
             ProjectOverview {
+                environment,
                 project_id: project.id.0,
                 name: project.name,
                 kind,

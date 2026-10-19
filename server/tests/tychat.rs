@@ -9,6 +9,7 @@ async fn configured() -> Fixture {
 
 async fn configured_with_bridge_disabled(bridge_disabled: bool) -> Fixture {
     let settings = settings_model::HostSettings {
+        workbenches: Default::default(),
         enabled_backends: vec![
             BackendKind::Claude,
             BackendKind::Codex,
@@ -116,12 +117,22 @@ async fn outbox(
 
 async fn ready(host: &server::HostHandle) {
     let mut changed = host.subscribe_tychat().await;
-    (async {
-        while host.tychat_state().await.agent_id.is_none() {
-            changed.changed().await.unwrap();
+    loop {
+        let state = host.tychat_state().await;
+        if state.agent_id.is_some() {
+            return;
         }
-    })
-    .await;
+        // Bridge failure is not agent lifecycle authority. Retain only its
+        // typed presence while waiting for the actual agent publication.
+        eprintln!(
+            "Tychat readiness diagnostic: agent_present=false bridge_failed={}",
+            matches!(state.status, TychatBridgeStatus::Failed { .. })
+        );
+        changed
+            .changed()
+            .await
+            .expect("Tychat state stream remains open until readiness or failure");
+    }
 }
 
 async fn typing(host: &server::HostHandle, generation: &TychatPairingId, expected: bool) {

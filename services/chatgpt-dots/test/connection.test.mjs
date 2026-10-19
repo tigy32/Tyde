@@ -10,7 +10,8 @@ const random = () => randomBytes(32).toString("hex");
 const hash = code => createHash("sha256").update(code).digest("hex");
 
 test("Real worker isolates paired hosts and enforces OAuth lifetime and revocation", async () => {
-  const binary = fileURLToPath(new URL(`../../../target/debug/tyde-server${process.platform === "win32" ? ".exe" : ""}`, import.meta.url));
+  const binary = process.env.TYDE_TEST_PROCESS_EXECUTABLE;
+  assert.ok(binary, "canonical check must provide the native server executable");
   const schema = execFileSync(binary, ["dots-schema"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   execFileSync("python3", [fileURLToPath(new URL("../../../tools/generate-dots-codec.py", import.meta.url)), "--check"], { input: schema, stdio: ["pipe", "pipe", "pipe"] });
   const options = { modules: true, modulesRoot: fileURLToPath(new URL("../", import.meta.url)), scriptPath: fileURLToPath(new URL("../worker.mjs", import.meta.url)),

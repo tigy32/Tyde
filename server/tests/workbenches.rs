@@ -395,6 +395,7 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
             parent_project_id,
             branch,
             roots,
+            ..
         } => {
             assert_eq!(parent_project_id, &parent.id);
             assert_eq!(branch.0, "feature/login");
@@ -1298,6 +1299,7 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
         parent_project_id,
         branch,
         roots,
+        ..
     } = &workbench.source
     else {
         panic!("expected GitWorkbench source")
@@ -3088,7 +3090,16 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             eprintln!("WORKSPACE MOVE PHASE: await mock cleanliness after release");
             mock.assert_clean().await;
             eprintln!("WORKSPACE MOVE PHASE: restart after internal shutdown");
-            let restarted = fixture.restart_host().await;
+            let restored = server::new_spawn_operation_test_gate();
+            let restarted = fixture
+                .restart_host_with_runtime_config_before_connect(
+                    |config| config.restoration_complete_test_gate = Some(restored.shared()),
+                    async {
+                        restored.wait_until_entered().await;
+                        restored.release_one();
+                    },
+                )
+                .await;
             assert!(
                 !restarted
                     .agents
@@ -3115,6 +3126,717 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             .unwrap();
         assert_eq!(saved.project_id, Some(destination.id.clone()));
         assert_eq!(saved.workspace_roots, project_roots(&destination));
+        assert!(
+            saved.resumable,
+            "failed relocation must preserve accessible saved history"
+        );
     }
     mock.assert_clean().await;
+}
+
+#[tokio::test]
+async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
+    use protocol::{WorkbenchAvailability, WorkbenchEngine, WorkbenchEnvironment};
+
+    let mut fixture = Fixture::new().await;
+    assert_eq!(
+        fixture.bootstrap.settings.workbenches.engine,
+        WorkbenchEngine::Native
+    );
+    let repo = init_git_repo("bubblewrap-boundary");
+    fs::write(repo.path().join(".gitignore"), "/build-output/\n").expect("ignore build output");
+    git(repo.path(), &["add", ".gitignore"]);
+    git(
+        repo.path(),
+        &["commit", "-m", "Ignore private build output"],
+    );
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let write_id = fixture
+        .client
+        .replace_setting(
+            "/workbenches/engine",
+            WorkbenchEngine::Bubblewrap,
+            WorkbenchEngine::Native,
+        )
+        .await
+        .expect("write engine setting with CAS");
+    let result = next_frame_matching_on(&mut fixture.client, "engine setting result", |env| {
+        env.kind == FrameKind::SettingsWriteResult
+            && env
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .unwrap()
+                .write_id
+                == write_id
+    })
+    .await
+    .parse_payload::<protocol::SettingsWriteResultPayload>()
+    .unwrap();
+    assert!(
+        result.applied && result.field_errors.is_empty(),
+        "engine setting must apply cleanly"
+    );
+    let (_, configured) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        configured.settings.workbenches.engine,
+        WorkbenchEngine::Bubblewrap
+    );
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("feature/bubblewrap-boundary".to_owned()),
+            name: "Bubblewrap boundary".to_owned(),
+        })
+        .await
+        .expect("request real engine workbench");
+    let created = next_frame_matching_on(&mut fixture.client, "engine create outcome", |env| {
+        matches!(env.kind, FrameKind::ProjectNotify | FrameKind::CommandError)
+    })
+    .await;
+    if created.kind == FrameKind::CommandError {
+        let error = created.parse_payload::<CommandErrorPayload>().unwrap();
+        assert_eq!(error.request_kind, FrameKind::WorkbenchCreate);
+        assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        assert!(!error.fatal);
+        match &configured.workbench_support.bubblewrap {
+            WorkbenchAvailability::Unsupported { reason, message } => {
+                assert_ne!(*reason, protocol::WorkbenchUnsupportedReason::NotProbed);
+                assert_eq!(error.workbench_reason, Some(*reason));
+                assert!(
+                    !message.is_empty() && error.message.contains(message),
+                    "unsupported engine must report its probed prerequisite failure"
+                );
+                eprintln!("Bubblewrap boundary explicitly unsupported: {reason:?}");
+            }
+            WorkbenchAvailability::Available => {
+                assert_eq!(
+                    error.workbench_reason,
+                    Some(protocol::WorkbenchUnsupportedReason::ReflinkUnsupported)
+                );
+                assert!(
+                    error.message.contains("Strict CoW cloning failed")
+                        || error.message.contains("CoW probe"),
+                    "available namespace may reject storage only with an explicit CoW failure"
+                );
+                eprintln!("Bubblewrap boundary explicitly unsupported: ReflinkUnsupported");
+            }
+        }
+        let (_, replay) = fixture.connect_with_bootstrap().await;
+        assert!(
+            !replay
+                .projects
+                .iter()
+                .any(|project| project.parent_project_id() == Some(&parent.id)),
+            "failed setup must not register a Native substitute"
+        );
+        assert!(
+            !expected_worktree_path(repo.path(), "feature-bubblewrap-boundary").exists(),
+            "unsupported setup must roll back its real worktree"
+        );
+        assert_eq!(
+            replay.settings.workbenches.engine,
+            WorkbenchEngine::Bubblewrap
+        );
+        return;
+    }
+    let ProjectNotifyPayload::Upsert { project } = created.parse_payload().unwrap() else {
+        panic!("engine create must upsert its authoritative project");
+    };
+    let ProjectSource::GitWorkbench { environment, .. } = &project.source else {
+        panic!("engine create must produce a Git workbench");
+    };
+    let WorkbenchEnvironment::Bubblewrap {
+        manifest_path,
+        logical_root,
+        initialization,
+        ..
+    } = environment
+    else {
+        panic!("Bubblewrap selection cannot route through Native");
+    };
+    assert_eq!(logical_root.0, "/mnt/tyde-workspace");
+    assert_eq!(*initialization, protocol::WorkbenchInitialization::Cold);
+    let manifest_path = PathBuf::from(&manifest_path.0);
+    let root = project.root_paths()[0].clone();
+    let (_, replay) = fixture.connect_with_bootstrap().await;
+    assert!(
+        replay.projects.iter().any(|entry| entry == &project),
+        "replay must carry the same typed environment and host root"
+    );
+    fixture
+        .client
+        .terminal_create(TerminalCreatePayload {
+            target: TerminalLaunchTarget::Project {
+                project_id: project.id.clone(),
+                root: root.clone(),
+                relative_cwd: None,
+            },
+            cols: 120,
+            rows: 30,
+        })
+        .await
+        .expect("create real engine terminal");
+    let terminal = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewTerminal,
+        "engine terminal",
+    )
+    .await
+    .parse_payload::<NewTerminalPayload>()
+    .unwrap();
+    let bootstrap = expect_kind(
+        &mut fixture.client,
+        FrameKind::TerminalBootstrap,
+        "engine terminal bootstrap",
+    )
+    .await
+    .parse_payload::<protocol::TerminalBootstrapPayload>()
+    .unwrap();
+    assert_eq!(bootstrap.start.project_id, Some(project.id.clone()));
+    assert_eq!(bootstrap.start.root, Some(root.clone()));
+    let host_namespace = fs::read_link("/proc/self/ns/mnt")
+        .expect("host namespace")
+        .to_string_lossy()
+        .into_owned();
+    let script = format!(
+        r#"import json, os, pathlib, subprocess
+root = pathlib.Path('/mnt/tyde-workspace')
+source = root / 'README.md'
+output = root / 'build-output'
+output.mkdir()
+clone = output / 'private-copy.txt'
+before = source.read_text()
+subprocess.run(['cp', '--reflink=always', str(source), str(clone)], check=True)
+independent = clone.stat().st_ino != source.stat().st_ino
+clone.write_text('private artifact\n')
+private = independent and source.read_text() == before
+source.write_text('edited in engine terminal\n')
+# Frame machine-readable output after Bash's bracketed-paste CSI plus bare CR.
+print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+"#
+    );
+    fixture
+        .client
+        .terminal_send(
+            &terminal.terminal_id,
+            protocol::TerminalSendPayload {
+                data: format!("python3 - <<'TYDE_BOUNDARY_PY'\n{script}TYDE_BOUNDARY_PY\n"),
+            },
+        )
+        .await
+        .expect("run namespace boundary command");
+    let mut output = String::new();
+    loop {
+        let event = next_frame_matching_on(&mut fixture.client, "engine command output", |env| {
+            env.stream == terminal.stream
+                && matches!(
+                    env.kind,
+                    FrameKind::TerminalOutput | FrameKind::TerminalError | FrameKind::TerminalExit
+                )
+        })
+        .await;
+        assert_eq!(
+            event.kind,
+            FrameKind::TerminalOutput,
+            "terminal must remain running through command completion"
+        );
+        output.push_str(
+            &event
+                .parse_payload::<protocol::TerminalOutputPayload>()
+                .unwrap()
+                .data,
+        );
+        if let Some(evidence) = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["boundary"] == "complete")
+        {
+            assert!(
+                ["cwd", "namespace", "cow", "generic"]
+                    .iter()
+                    .all(|key| evidence[*key].as_bool() == Some(true)),
+                "actual terminal output must establish every isolation boundary"
+            );
+            break;
+        }
+    }
+    assert!(
+        fs::read_to_string(Path::new(&root.0).join("README.md"))
+            .expect("terminal-edited host worktree")
+            == "edited in engine terminal\n"
+    );
+    assert!(
+        fs::read_to_string(repo.path().join("README.md")).expect("parent source")
+            == "# bubblewrap-boundary\n",
+        "workbench writes must not alter the parent checkout"
+    );
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: project.id.clone(),
+            force: true,
+        })
+        .await
+        .expect("remove engine workbench and terminal");
+    next_frame_matching_on(&mut fixture.client, "engine removed", |env| {
+        env.kind == FrameKind::ProjectNotify
+            && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+            ProjectNotifyPayload::Delete { project: deleted } if deleted.id == project.id)
+    })
+    .await;
+    assert!(
+        !Path::new(&root.0).exists(),
+        "remove must finish host worktree cleanup"
+    );
+    assert!(!manifest_path.exists(), "remove must finish engine cleanup");
+    let (_, replay) = fixture.connect_with_bootstrap().await;
+    assert!(!replay.projects.iter().any(|entry| entry.id == project.id));
+    assert!(replay.projects.iter().any(|entry| entry.id == parent.id));
+    assert_eq!(
+        replay.settings.workbenches.engine,
+        WorkbenchEngine::Bubblewrap
+    );
+    eprintln!("BUBBLEWRAP FLOW initial-terminal-and-removal verified");
+    let snapshots = repo.path().join(".git/tyde-workbench-snapshots-v2");
+    assert!(
+        fs::read_dir(&snapshots)
+            .expect("snapshot directory")
+            .next()
+            .is_none(),
+        "an unconfigured directory without an explicit producer cannot publish a snapshot"
+    );
+
+    fs::create_dir(repo.path().join(".tyde")).expect("project configuration directory");
+    fs::write(
+        repo.path().join("requirements.lock"),
+        "opaque-project-input-v1\n",
+    )
+    .expect("tracked project-relative provenance input");
+    fs::write(repo.path().join("assemble.py"),
+        "from pathlib import Path\np = Path('build-output'); p.mkdir()\n(p / 'result.data').write_bytes(Path('README.md').read_bytes())\n").expect("non-Rust producer source");
+    let python = tyde_process_env::find_executable_in_path("python3")
+        .expect("the successful engine terminal established host Python availability");
+    fs::write(
+        repo.path().join(".tyde/workbench.json"),
+        serde_json::to_vec(&json!({
+            "environment": {
+                "PATH": "${PATH}:/tyde-qa-provenance",
+                "QA_PRODUCER_PATH": "/mnt/tyde-runtime/bin:${PATH}:/tyde-qa-provenance"
+            },
+            "snapshot": {
+                "producer": ["python3", "assemble.py"],
+                "include": ["build-output"],
+                "provenance_paths": [python, "requirements.lock"],
+                "provenance_environment": ["PATH"]
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("explicit generic project configuration");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &["commit", "-m", "Configure opaque project artifacts"],
+    );
+    let caller = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "snapshot caller",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    let (failed, response) = call_agent_control(&fixture, &caller.agent_id, "tyde_create_workbench", json!({
+        "parent_project_id": parent.id.0, "branch": "feature/generic-producer", "action": "create_only"
+    })).await;
+    assert!(!failed, "MCP must use the selected server-owned engine");
+    let response: Value = serde_json::from_str(&response).expect("MCP creation result");
+    assert_eq!(response["environment"]["kind"], "bubblewrap");
+    assert_eq!(response["environment"]["initialization"]["kind"], "cold");
+    let producer_id = ProjectId(response["project_id"].as_str().unwrap().to_owned());
+    let producer = fixture
+        .connect_with_bootstrap()
+        .await
+        .1
+        .projects
+        .into_iter()
+        .find(|project| project.id == producer_id)
+        .expect("canonical MCP-created project");
+    let producer_root = producer.root_paths()[0].clone();
+    fs::File::open(Path::new(&producer_root.0).join("requirements.lock"))
+        .expect("tracked producer input")
+        .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .expect("fixed provenance-input timestamp distinct from a fresh checkout");
+    assert!(
+        !Path::new(&producer_root.0).join("build-output").exists(),
+        "creation must not run a build"
+    );
+    fixture
+        .client
+        .terminal_create(TerminalCreatePayload {
+            target: TerminalLaunchTarget::Project {
+                project_id: producer_id.clone(),
+                root: producer_root.clone(),
+                relative_cwd: None,
+            },
+            cols: 120,
+            rows: 30,
+        })
+        .await
+        .expect("generic producer terminal");
+    let producer_terminal = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewTerminal,
+        "producer terminal",
+    )
+    .await
+    .parse_payload::<NewTerminalPayload>()
+    .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::TerminalBootstrap,
+        "producer terminal bootstrap",
+    )
+    .await;
+    fixture.client.terminal_send(&producer_terminal.terminal_id, protocol::TerminalSendPayload {
+        data: "PATH=\"$QA_PRODUCER_PATH\" /mnt/tyde-runtime/bin/tyde-workbench-produce && printf '\\n{\"producer_completed\":true}\\n'\n".to_owned(),
+    }).await.expect("explicit generic producer request");
+    eprintln!("BUBBLEWRAP FLOW explicit-producer requested");
+    let mut produced = String::new();
+    loop {
+        let event =
+            next_frame_matching_on(&mut fixture.client, "producer command completion", |env| {
+                env.stream == producer_terminal.stream
+                    && matches!(
+                        env.kind,
+                        FrameKind::TerminalOutput
+                            | FrameKind::TerminalError
+                            | FrameKind::TerminalExit
+                    )
+            })
+            .await;
+        assert_eq!(
+            event.kind,
+            FrameKind::TerminalOutput,
+            "producer command must complete successfully"
+        );
+        produced.push_str(
+            &event
+                .parse_payload::<protocol::TerminalOutputPayload>()
+                .unwrap()
+                .data,
+        );
+        if produced
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|value| value["producer_completed"] == true)
+        {
+            break;
+        }
+    }
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: producer_id.clone(),
+            force: false,
+        })
+        .await
+        .expect("seal completed producer and remove resources");
+    let removed = next_frame_matching_on(&mut fixture.client, "producer removed", |env| {
+        env.kind == FrameKind::CommandError
+            || (env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+            ProjectNotifyPayload::Delete { project } if project.id == producer_id))
+    })
+    .await;
+    assert_eq!(
+        removed.kind,
+        FrameKind::ProjectNotify,
+        "quiescent completed producer must seal successfully, not emit CommandError"
+    );
+    eprintln!("BUBBLEWRAP FLOW quiescent-producer removed");
+    let cohorts: Vec<_> = fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        cohorts.len(),
+        1,
+        "one completed quiescent producer must publish one actual cohort"
+    );
+    let (failed, response) = call_agent_control(&fixture, &caller.agent_id, "tyde_create_workbench", json!({
+        "parent_project_id": parent.id.0, "branch": "feature/generic-consumer", "action": "create_only"
+    })).await;
+    assert!(
+        !failed,
+        "compatible MCP creation must clone opaque artifacts"
+    );
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["environment"]["initialization"]["kind"],
+        "snapshot"
+    );
+    let consumer_id = ProjectId(response["project_id"].as_str().unwrap().to_owned());
+    let consumer_root = PathBuf::from(response["roots"][0]["worktree_root"].as_str().unwrap());
+    let result = consumer_root.join("build-output/result.data");
+    let donor = cohorts[0].join("files/build-output/result.data");
+    assert_eq!(
+        fs::read(&result).unwrap(),
+        fs::read(repo.path().join("README.md")).unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            fs::metadata(&result).unwrap().ino(),
+            fs::metadata(&donor).unwrap().ino()
+        );
+    }
+    fs::write(&result, "private consumer edit").unwrap();
+    assert_eq!(
+        fs::read(&donor).unwrap(),
+        fs::read(repo.path().join("README.md")).unwrap()
+    );
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: consumer_id.clone(),
+            force: true,
+        })
+        .await
+        .expect("remove private consumer");
+    next_frame_matching_on(&mut fixture.client, "consumer removed", |env| {
+        env.kind == FrameKind::ProjectNotify
+            && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+            ProjectNotifyPayload::Delete { project } if project.id == consumer_id)
+    })
+    .await;
+    assert!(!consumer_root.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bubblewrap_service_failure_after_foreground_exit_is_not_success() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut fixture = Fixture::new().await;
+    assert!(
+        matches!(
+            fixture.bootstrap.workbench_support.bubblewrap,
+            protocol::WorkbenchAvailability::Available
+        ),
+        "service lifecycle regression requires Linux Bubblewrap with unprivileged user/mount namespaces; capability={:?}",
+        fixture.bootstrap.workbench_support.bubblewrap
+    );
+    let control = tempfile::Builder::new()
+        .prefix("tyde-service-")
+        .tempdir_in("/tmp")
+        .expect("owned control directory");
+    let service_listener = tokio::net::UnixListener::bind(control.path().join("service"))
+        .expect("service exit control");
+    let descendant_listener = tokio::net::UnixListener::bind(control.path().join("descendant"))
+        .expect("descendant event control");
+    let repo = init_git_repo("service-failure");
+    fs::create_dir(repo.path().join(".tyde")).expect("project configuration directory");
+    fs::write(repo.path().join(".tyde/workbench.json"), serde_json::to_vec(&json!({"environment":{"CONTROL_DIR":control.path()},"services":[{"name":"required","command":["python3","service.py"],"environment":{},"ready_notification":"ready.sock","stop_command":[]}]})).unwrap()).expect("generic service configuration");
+    fs::write(
+        repo.path().join("service.py"),
+        r#"import os,pathlib,socket
+runtime=pathlib.Path(os.environ['TYDE_WORKBENCH_RUNTIME'])
+(runtime/'service.pid').write_text(str(os.getpid()))
+with socket.socket(socket.AF_UNIX) as control:
+ control.connect(os.environ['CONTROL_DIR']+'/service')
+ with socket.socket(socket.AF_UNIX) as ready:
+  ready.connect(str(runtime/'ready.sock'));ready.sendall(b'actual-ready')
+ assert control.recv(1)==b'X'
+"#,
+    )
+    .expect("real foreground service");
+    fs::write(repo.path().join("command.py"), r#"import os,pathlib,select,socket
+read,write=os.pipe()
+if os.fork():
+ os.close(write);assert os.read(read,1)==b'R';os._exit(0)
+os.close(read)
+parent=os.pidfd_open(os.getppid())
+service=os.pidfd_open(int(pathlib.Path(os.environ['TYDE_WORKBENCH_RUNTIME']+'/service.pid').read_text()))
+os.write(write,b'R');os.close(write)
+select.select([parent],[],[])
+with socket.socket(socket.AF_UNIX) as control:
+ control.connect(os.environ['CONTROL_DIR']+'/descendant');control.sendall(b'P')
+ select.select([service],[],[])
+os._exit(0)
+"#).expect("command with real owned descendant");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &["commit", "-m", "Explicit service failure workload"],
+    );
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let write = fixture
+        .client
+        .replace_setting(
+            "/workbenches/engine",
+            protocol::WorkbenchEngine::Bubblewrap,
+            protocol::WorkbenchEngine::Native,
+        )
+        .await
+        .expect("select engine");
+    let result = next_frame_matching_on(&mut fixture.client, "service engine setting", |e| {
+        e.kind == FrameKind::SettingsWriteResult
+            && e.parse_payload::<protocol::SettingsWriteResultPayload>()
+                .unwrap()
+                .write_id
+                == write
+    })
+    .await;
+    assert!(
+        result
+            .parse_payload::<protocol::SettingsWriteResultPayload>()
+            .unwrap()
+            .applied
+    );
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id,
+            branch: GitBranchName("qa-service-failure".into()),
+            name: "Service failure".into(),
+        })
+        .await
+        .expect("create service workbench");
+    let result = next_frame_matching_on(&mut fixture.client, "service workbench", |e| {
+        matches!(e.kind, FrameKind::ProjectNotify | FrameKind::CommandError)
+    })
+    .await;
+    assert_eq!(
+        result.kind,
+        FrameKind::ProjectNotify,
+        "service lifecycle regression requires a strict-CoW filesystem; creation must succeed, reason={:?}",
+        (result.kind == FrameKind::CommandError).then(|| result
+            .parse_payload::<CommandErrorPayload>()
+            .unwrap()
+            .workbench_reason)
+    );
+    let ProjectNotifyPayload::Upsert { project } = result.parse_payload().unwrap() else {
+        panic!("workbench upsert required")
+    };
+    let root = project.root_paths()[0].clone();
+    fixture
+        .client
+        .terminal_create(TerminalCreatePayload {
+            target: TerminalLaunchTarget::Project {
+                project_id: project.id.clone(),
+                root: root.clone(),
+                relative_cwd: None,
+            },
+            cols: 100,
+            rows: 25,
+        })
+        .await
+        .expect("real engine terminal");
+    let terminal = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewTerminal,
+        "service terminal",
+    )
+    .await
+    .parse_payload::<NewTerminalPayload>()
+    .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::TerminalBootstrap,
+        "service terminal bootstrap",
+    )
+    .await;
+    fixture
+        .client
+        .terminal_send(
+            &terminal.terminal_id,
+            protocol::TerminalSendPayload {
+                data: "exec python3 command.py\n".into(),
+            },
+        )
+        .await
+        .expect("execute real command");
+    let (mut service, _) = service_listener
+        .accept()
+        .await
+        .expect("owned service control connection");
+    let (mut descendant, _) = descendant_listener
+        .accept()
+        .await
+        .expect("owned descendant control connection");
+    assert_eq!(
+        descendant
+            .read_u8()
+            .await
+            .expect("foreground completed event"),
+        b'P'
+    );
+    service
+        .write_all(b"X")
+        .await
+        .expect("request actual required-service exit after foreground settled");
+    let mut output = String::new();
+    let exit = loop {
+        let event = next_frame_matching_on(
+            &mut fixture.client,
+            "service failure terminal outcome",
+            |e| {
+                e.stream == terminal.stream
+                    && matches!(
+                        e.kind,
+                        FrameKind::TerminalOutput
+                            | FrameKind::TerminalExit
+                            | FrameKind::TerminalError
+                    )
+            },
+        )
+        .await;
+        match event.kind {
+            FrameKind::TerminalOutput => output.push_str(
+                &event
+                    .parse_payload::<protocol::TerminalOutputPayload>()
+                    .unwrap()
+                    .data,
+            ),
+            FrameKind::TerminalExit => {
+                break event
+                    .parse_payload::<protocol::TerminalExitPayload>()
+                    .unwrap();
+            }
+            _ => panic!("terminal transport failed instead of completing the runtime"),
+        }
+    };
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: project.id.clone(),
+            force: true,
+        })
+        .await
+        .expect("cleanup failed-runtime workbench");
+    next_frame_matching_on(&mut fixture.client,"service workbench removed",|e|e.kind==FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>().unwrap(),ProjectNotifyPayload::Delete {project:p} if p.id==project.id)).await;
+    assert!(!Path::new(&root.0).exists());
+    assert_eq!(
+        descendant
+            .read_u8()
+            .await
+            .expect_err("owned descendant must close")
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    eprintln!(
+        "SERVICE FAILURE boundary: exit_code={:?} typed_failure={} output_bytes={}",
+        exit.exit_code,
+        output.contains("\"reason\": \"runtime_service_failed\""),
+        output.len()
+    );
+    assert_ne!(
+        exit.exit_code,
+        Some(0),
+        "required service exit after foreground completion must fail the environment"
+    );
+    assert!(
+        output.contains("\"reason\": \"runtime_service_failed\""),
+        "actual terminal output must surface the typed runtime service failure"
+    );
 }

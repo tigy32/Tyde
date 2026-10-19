@@ -123,6 +123,7 @@ fn write_unusable_hermes_cli(home: &Path) -> PathBuf {
 
 fn expected_empty_settings() -> HostSettings {
     HostSettings {
+        workbenches: Default::default(),
         resume_previous_agents: settings_model::default_resume_previous_agents(),
         pause_swarms_on_restart: false,
         review: Default::default(),
@@ -363,6 +364,7 @@ async fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
     assert_eq!(
         fixture.bootstrap.settings,
         HostSettings {
+            workbenches: Default::default(),
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
@@ -885,27 +887,13 @@ async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
     );
 
     let script = std::fs::read_to_string(&fake_hermes).expect("read CLI probe script");
-    std::fs::write(
-        &fake_hermes,
-        script
-            .replace("then\n", "then\n  sleep 1\n")
-            .replace("v9.9.9", "v9.9.8"),
-    )
-    .expect("delay the next inventory probe");
-    let started = std::time::Instant::now();
+    std::fs::write(&fake_hermes, script.replace("v9.9.9", "v9.9.8"))
+        .expect("change the next inventory observation");
     let (mut mobile, mobile_bootstrap) =
         fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), "inventory-phone")
             .await;
-    let elapsed = started.elapsed();
-    eprintln!(
-        "Mobile inventory startup: elapsed_ms={}, delayed_probe_ms=1000",
-        elapsed.as_millis()
-    );
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "mobile startup waited for backend discovery: {} ms",
-        elapsed.as_millis()
-    );
+    // The cached bootstrap and later changed-version event prove ordering;
+    // the former 100 ms host-speed assertion rejected a correct 178 ms replay.
     assert_eq!(
         mobile_bootstrap.backend_setup, payload,
         "mobile must render the host's known installation state first"

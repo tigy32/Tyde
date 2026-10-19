@@ -151,11 +151,13 @@ pub fn prime_host_with_bootstrap_for_tests(
         release_version: None,
     };
     let mut bootstrap = BootstrapHostPayload {
+        workbench_support: Default::default(),
         self_improvement: Default::default(),
         tychat: protocol::TychatStatePayload::default(),
         dots: Default::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
+            workbenches: Default::default(),
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
@@ -6835,6 +6837,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.tychat_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.tychat);
     });
+    state.workbench_support_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.workbench_support);
+    });
     state.host_settings_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.settings);
     });
@@ -7686,11 +7691,13 @@ pub(crate) mod restore_fixtures {
             FrameKind::HostBootstrap,
             seq,
             &HostBootstrapPayload {
+                workbench_support: Default::default(),
                 self_improvement: Default::default(),
                 tychat: protocol::TychatStatePayload::default(),
                 dots: Default::default(),
                 agents_with_background_work: Vec::new(),
                 settings: settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
@@ -9304,6 +9311,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                workbench_reason: None,
                 context: Some(protocol::CommandErrorContext::WorkbenchRemove {
                     project_id: ProjectId("workbench-a".to_owned()),
                 }),
@@ -9351,6 +9359,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                workbench_reason: None,
                 context: None,
                 request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
@@ -9462,6 +9471,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                workbench_reason: None,
                 context: None,
                 request_id: None,
                 stream: StreamPath("/host/local".to_owned()),

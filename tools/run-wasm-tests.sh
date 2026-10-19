@@ -696,7 +696,7 @@ wasm_cargo_test "$@"
 
 fixture_ready="$(mktemp "$cache_dir/rtc-ready.XXXXXX")"
 fixture_log="$cache_dir/rtc-fixture.log"
-"$repo_root/target/debug/tyde-rtc-fixture" "$fixture_ready" >"$fixture_log" 2>&1 &
+"${TYDE_RTC_FIXTURE_EXECUTABLE:?canonical check must provide the native RTC fixture executable}" "$fixture_ready" >"$fixture_log" 2>&1 &
 fixture_pid=$!
 cleanup_rtc_fixture() {
     if kill -0 "$fixture_pid" 2>/dev/null; then kill "$fixture_pid"; fi

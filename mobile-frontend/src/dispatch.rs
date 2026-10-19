@@ -124,11 +124,13 @@ pub fn prime_host_with_bootstrap_for_tests(
         release_version: None,
     };
     let mut bootstrap = BootstrapHostPayload {
+        workbench_support: Default::default(),
         self_improvement: Default::default(),
         tychat: Default::default(),
         dots: Default::default(),
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
+            workbenches: Default::default(),
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
@@ -3903,6 +3905,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 0,
                 &protocol::CommandErrorPayload {
+                    workbench_reason: None,
                     context: None,
                     request_id: None,
                     stream: StreamPath("/host/mobile-session-list-error".to_owned()),
@@ -4481,11 +4484,13 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Thinking,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
+            workbench_support: Default::default(),
             self_improvement: Default::default(),
             tychat: protocol::TychatStatePayload::default(),
             dots: Default::default(),
             agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
+                workbenches: Default::default(),
                 resume_previous_agents: settings_model::default_resume_previous_agents(),
                 pause_swarms_on_restart: false,
                 review: Default::default(),
@@ -4865,6 +4870,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    workbench_reason: None,
                     context: None,
                     request_id: None,
                     stream: instance_stream.clone(),
@@ -4922,6 +4928,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 2,
                 &CommandErrorPayload {
+                    workbench_reason: None,
                     context: None,
                     request_id: None,
                     stream: instance_stream.clone(),
@@ -4981,6 +4988,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    workbench_reason: None,
                     context: None,
                     request_id: None,
                     stream: instance_stream.clone(),

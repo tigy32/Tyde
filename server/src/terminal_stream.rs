@@ -27,6 +27,7 @@ pub(crate) enum TerminalLaunchCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalLaunchInfo {
     pub project_id: Option<ProjectId>,
+    pub execution_project: Option<protocol::Project>,
     pub root: Option<ProjectRootPath>,
     pub cwd: String,
     pub cols: u16,
@@ -498,6 +499,9 @@ fn build_terminal_command(launch: &TerminalLaunchInfo) -> Result<(GroupCommand, 
     command.env("TERM", "xterm-256color");
     command.env("PATH", process_env::initialize_process_env()?);
     command.current_dir(&launch.cwd);
+    if let Some(project) = &launch.execution_project {
+        command.in_project(project.clone());
+    }
     Ok((command, program))
 }
 

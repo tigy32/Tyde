@@ -2826,6 +2826,7 @@ mod wasm_tests {
             settings.insert(
                 HOST.to_owned(),
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     review: Default::default(),
                     self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Codex],

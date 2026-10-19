@@ -547,11 +547,11 @@ fn install_click_listener(state: AppState) {
                 }
             });
         } else {
-            let roots = state
-                .active_project_info_untracked()
-                .map(|project| project.project.root_paths())
-                .unwrap_or_default();
-            if let Some(path) = resolve_chat_file_href(&href, &roots) {
+            let project = state.active_project_info_untracked();
+            let path = project
+                .as_ref()
+                .and_then(|project| resolve_chat_file_href(&href, &project.project));
+            if let Some(path) = path {
                 crate::actions::open_project_path(&state, path);
             } else {
                 log::warn!("ignoring unsupported chat link target: {href}");
@@ -665,11 +665,12 @@ pub(crate) fn install_file_drop_navigation_guard() {
     });
 }
 
-fn resolve_chat_file_href(href: &str, project_roots: &[ProjectRootPath]) -> Option<ProjectPath> {
+fn resolve_chat_file_href(href: &str, project: &protocol::Project) -> Option<ProjectPath> {
+    let project_roots = project.root_paths();
     let decoded = percent_decode_path(href).unwrap_or_else(|| href.to_owned());
-    let normalized = normalize_file_reference(&decoded)?;
+    let normalized = project.host_path_for_runtime(&normalize_file_reference(&decoded)?)?;
 
-    if let Some(path) = project_path_from_absolute(&normalized, project_roots) {
+    if let Some(path) = project_path_from_absolute(&normalized, &project_roots) {
         return Some(path);
     }
 
@@ -1554,6 +1555,122 @@ mod wasm_tests {
         .as_string()
         .expect("project-access frames serialize");
         serde_json::from_str(&raw).expect("decode project-access frames")
+    }
+
+    #[wasm_bindgen_test]
+    async fn bubblewrap_chat_file_link_reads_the_host_worktree() {
+        let host_id = "chat-path-host";
+        let project_id = protocol::ProjectId("chat-path-workbench".to_owned());
+        let state = AppState::new();
+        install_connection_bridge(host_id);
+        let sent = js_sys::eval(r#"
+            (() => {
+                let settled;
+                const sent = new Promise(resolve => { settled = resolve; });
+                const invoke = window.__TAURI__.core.invoke;
+                window.__TAURI__.core.invoke = (cmd, args) => {
+                    const result = invoke(cmd, args);
+                    if (cmd === 'send_host_line' && JSON.parse(args.line).kind === 'code_intel_subscribe_file') {
+                        result.then(() => settled(JSON.stringify(window.__connection_seq_frames)));
+                    }
+                    return result;
+                };
+                return sent;
+            })()
+        "#).unwrap().dyn_into::<js_sys::Promise>().unwrap();
+        state.host_streams.update(|streams| {
+            streams.insert(host_id.to_owned(), StreamPath(format!("/host/{host_id}")));
+        });
+        state.projects.set(vec![crate::state::ProjectInfo {
+            host_id: host_id.to_owned(),
+            project: protocol::Project {
+                id: project_id.clone(),
+                name: "Chat path workbench".to_owned(),
+                sort_order: 0,
+                source: protocol::ProjectSource::GitWorkbench {
+                    parent_project_id: protocol::ProjectId("chat-path-parent".to_owned()),
+                    branch: protocol::GitBranchName("chat-path".to_owned()),
+                    roots: vec![protocol::WorkbenchRoot {
+                        parent_root: ProjectRootPath("/host/project".to_owned()),
+                        worktree_root: ProjectRootPath("/host/project--chat-path".to_owned()),
+                    }],
+                    environment: protocol::WorkbenchEnvironment::Bubblewrap {
+                        manifest_path: protocol::HostAbsPath(
+                            "/host/workbench/manifest.json".to_owned(),
+                        ),
+                        logical_root: ProjectRootPath("/workspace".to_owned()),
+                        support: Default::default(),
+                        lifecycle: Default::default(),
+                        initialization: protocol::WorkbenchInitialization::Cold,
+                    },
+                },
+            },
+        }]);
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+        install_click_listener(state.clone());
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let handle = leptos::mount::mount_to(container.clone(), || {
+            view! {
+                <div class="chat-card-body" inner_html=crate::markdown::render_markdown(
+                    "[Open source](/workspace/src/main.rs)"
+                ) />
+            }
+        });
+        let link = container
+            .query_selector("a")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        assert_eq!(link.text_content().as_deref(), Some("Open source"));
+        link.click();
+        assert_eq!(
+            state.pending_file_opens.get_untracked().len(),
+            1,
+            "clicking the runtime path must request a file open"
+        );
+        let frames: serde_json::Value = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(sent)
+                .await
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        let read: Envelope = serde_json::from_value(
+            frames
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|frame| frame["envelope"]["kind"] == "project_read_file")
+                .unwrap()["envelope"]
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            read.stream,
+            StreamPath(format!("/project/{}", project_id.0))
+        );
+        let payload: protocol::ProjectReadFilePayload = read.parse_payload().unwrap();
+        assert_eq!(
+            payload.path.root,
+            ProjectRootPath("/host/project--chat-path".to_owned())
+        );
+        assert_eq!(payload.path.relative_path, "src/main.rs");
+        CLICK_LISTENER_HANDLE.with(|slot| slot.borrow_mut().take().unwrap().remove());
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]

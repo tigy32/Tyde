@@ -38,6 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::process_env;
@@ -45,24 +46,73 @@ use crate::process_env;
 pub const DEBUG_REPO_ROOT_HEADER: &str = "x-tyde-debug-repo-root";
 const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DebugMcpHandle {
     pub url: String,
+    project_host: Arc<std::sync::OnceLock<crate::host::WeakHostHandle>>,
+    instances: Option<mpsc::UnboundedSender<InstanceCommand>>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for DebugMcpHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebugMcpHandle")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DebugMcpHandle {
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            url: String::new(),
+            project_host: Arc::new(std::sync::OnceLock::new()),
+            instances: None,
+        }
+    }
+
+    pub(crate) fn bind_host(&self, host: &crate::host::HostHandle) -> Result<(), String> {
+        self.project_host
+            .set(crate::host::WeakHostHandle::downgrade(host))
+            .map_err(|_| "Debug MCP host ownership is already bound".to_owned())
+    }
+
+    pub(crate) async fn stop_workbench(&self, project_id: &ProjectId) -> Result<(), String> {
+        let Some(instances) = &self.instances else {
+            return Ok(());
+        };
+        let (reply, result) = oneshot::channel();
+        instances
+            .send(InstanceCommand::CloseProject {
+                project_id: project_id.clone(),
+                reply,
+            })
+            .map_err(|_| "Dev instance actor stopped".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Dev instance cleanup did not complete".to_owned())?
+    }
+}
+
 struct DebugMcpState {
     instances: mpsc::UnboundedSender<InstanceCommand>,
+    project_host: Arc<std::sync::OnceLock<crate::host::WeakHostHandle>>,
 }
 
 enum InstanceCommand {
-    Insert {
-        record: Box<DevInstanceRecord>,
-        reply: oneshot::Sender<()>,
+    Start {
+        project_dir: PathBuf,
+        input: StartInstanceToolInput,
+        execution_project: Option<Box<Project>>,
+        cancellation: CancellationToken,
+        reply: oneshot::Sender<Result<StartInstanceResult, String>>,
+    },
+    CloseProject {
+        project_id: ProjectId,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Remove {
         id: String,
-        reply: oneshot::Sender<Option<DevInstanceRecord>>,
+        reply: oneshot::Sender<Result<DevInstanceSummary, String>>,
     },
     List {
         reply: oneshot::Sender<Vec<DevInstanceSummary>>,
@@ -83,83 +133,266 @@ enum InstanceCommand {
     },
 }
 
-fn start_instance_registry() -> mpsc::UnboundedSender<InstanceCommand> {
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+struct PendingDevStart {
+    project_id: Option<ProjectId>,
+    cancellation: CancellationToken,
+    reply: oneshot::Sender<Result<StartInstanceResult, String>>,
+}
+
+struct DevStartFailure {
+    message: String,
+    cleanup_error: Option<String>,
+}
+
+impl From<String> for DevStartFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            cleanup_error: None,
+        }
+    }
+}
+
+impl DevStartFailure {
+    fn with_cleanup(mut self, error: String) -> Self {
+        self.message = format!("{}; {error}", self.message);
+        self.cleanup_error = Some(match self.cleanup_error {
+            Some(previous) => format!("{previous}; {error}"),
+            None => error,
+        });
+        self
+    }
+}
+
+#[derive(Default)]
+struct ClosingDevProject {
+    replies: Vec<oneshot::Sender<Result<(), String>>>,
+    error: Option<String>,
+}
+
+fn start_instance_registry(mut receiver: mpsc::UnboundedReceiver<InstanceCommand>) {
     tokio::spawn(async move {
         let mut records = HashMap::<String, DevInstanceRecord>::new();
-        while let Some(command) = receiver.recv().await {
-            match command {
-                InstanceCommand::Insert { record, reply } => {
-                    assert!(
-                        records
-                            .insert(record.instance_id.clone(), *record)
-                            .is_none(),
-                        "duplicate dev instance id inserted"
-                    );
-                    let _ = reply.send(());
-                }
-                InstanceCommand::Remove { id, reply } => {
-                    let _ = reply.send(records.remove(&id));
-                }
-                InstanceCommand::List { reply } => {
-                    let mut summaries = records
-                        .values_mut()
-                        .map(dev_instance_summary)
-                        .collect::<Vec<_>>();
-                    summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
-                    let _ = reply.send(summaries);
-                }
-                InstanceCommand::Address { id, reply } => {
-                    let _ = reply.send(
-                        records
-                            .get(&id)
-                            .map(|record| record.ui_debug_addr)
-                            .ok_or_else(|| format!("unknown instance_id '{id}'")),
-                    );
-                }
-                InstanceCommand::Output {
-                    id,
-                    cursor,
-                    max_bytes,
-                    reply,
-                } => {
-                    let _ = reply.send(
-                        records
-                            .get(&id)
+        let mut closed_projects = std::collections::HashSet::new();
+        let mut closing = HashMap::<ProjectId, ClosingDevProject>::new();
+        let mut starts = tokio::task::JoinSet::new();
+        let mut pending = HashMap::<tokio::task::Id, PendingDevStart>::new();
+        let mut receiving = true;
+        loop {
+            let command = tokio::select! {
+                command = receiver.recv(), if receiving => match command {
+                    Some(command) => Some(command),
+                    None => {
+                        receiving = false;
+                        for start in pending.values() {
+                            start.cancellation.cancel();
+                        }
+                        None
+                    },
+                },
+                completed = starts.join_next_with_id(), if !starts.is_empty() => {
+                    if let Some(completed) = completed {
+                        let (id, result) = match completed {
+                            Ok(value) => value,
+                            Err(error) => (error.id(), Err(DevStartFailure::from(
+                                "DEV startup task failed".to_owned(),
+                            ).with_cleanup("DEV startup cleanup could not be confirmed".to_owned()))),
+                        };
+                        if let Some(start) = pending.remove(&id) {
+                            let result = match result {
+                                Ok((record, result)) => {
+                                    if start.reply.is_closed() || start.project_id.as_ref().is_some_and(|project| closed_projects.contains(project)) {
+                                        match stop_record(record).await {
+                                            Ok(_) => Err("DEV startup ownership was withdrawn; its processes were stopped".to_owned()),
+                                            Err(error) => {
+                                                if let Some(project) = &start.project_id
+                                                    && let Some(state) = closing.get_mut(project) {
+                                                        state.error = Some(error.clone());
+                                                    }
+                                                Err(error)
+                                            }
+                                        }
+                                    } else if records.contains_key(&record.instance_id) {
+                                        match stop_record(record).await {
+                                            Ok(_) => Err("Duplicate DEV instance identity".to_owned()),
+                                            Err(error) => Err(error),
+                                        }
+                                    } else {
+                                        records.insert(record.instance_id.clone(), record);
+                                        Ok(result)
+                                    }
+                                },
+                                Err(error) => {
+                                    if let Some(project) = &start.project_id
+                                        && let Some(state) = closing.get_mut(project)
+                                        && let Some(cleanup) = error.cleanup_error {
+                                            state.error = Some(cleanup);
+                                        }
+                                    Err(error.message)
+                                },
+                            };
+                            let _ = start.reply.send(result);
+                        }
+                    }
+                    None
+                },
+                else => break,
+            };
+            if let Some(command) = command {
+                match command {
+                    InstanceCommand::Start {
+                        project_dir,
+                        input,
+                        execution_project,
+                        cancellation,
+                        reply,
+                    } => {
+                        let project_id =
+                            execution_project.as_ref().map(|project| project.id.clone());
+                        if cancellation.is_cancelled() {
+                            let _ =
+                                reply.send(Err("DEV startup cancelled before launch".to_owned()));
+                        } else if project_id
+                            .as_ref()
+                            .is_some_and(|project| closed_projects.contains(project))
+                        {
+                            let _ = reply.send(Err(
+                                "Workbench is being removed; no DEV process was launched"
+                                    .to_owned(),
+                            ));
+                        } else {
+                            let task = starts.spawn(build_instance(
+                                project_dir,
+                                input,
+                                execution_project.map(|project| *project),
+                                cancellation.clone(),
+                            ));
+                            pending.insert(
+                                task.id(),
+                                PendingDevStart {
+                                    project_id,
+                                    cancellation,
+                                    reply,
+                                },
+                            );
+                        }
+                    }
+                    InstanceCommand::CloseProject { project_id, reply } => {
+                        closed_projects.insert(project_id.clone());
+                        for start in pending.values() {
+                            if start.project_id.as_ref() == Some(&project_id) {
+                                start.cancellation.cancel();
+                            }
+                        }
+                        closing
+                            .entry(project_id.clone())
+                            .or_default()
+                            .replies
+                            .push(reply);
+                        let ids = records
+                            .iter()
+                            .filter(|(_, record)| record.project_id.as_ref() == Some(&project_id))
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        for id in ids {
+                            if let Some(record) = records.remove(&id)
+                                && let Err(error) = stop_record(record).await
+                            {
+                                closing.entry(project_id.clone()).or_default().error = Some(error);
+                            }
+                        }
+                    }
+                    InstanceCommand::Remove { id, reply } => {
+                        let result = match records.remove(&id) {
+                            Some(record) => stop_record(record).await,
+                            None => Err("Unknown DEV instance".to_owned()),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    InstanceCommand::List { reply } => {
+                        let mut summaries = records
+                            .values_mut()
+                            .map(dev_instance_summary)
+                            .collect::<Vec<_>>();
+                        summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+                        let _ = reply.send(summaries);
+                    }
+                    InstanceCommand::Address { id, reply } => {
+                        let _ = reply.send(
+                            records
+                                .get(&id)
+                                .map(|record| record.ui_debug_addr)
+                                .ok_or_else(|| format!("unknown instance_id '{id}'")),
+                        );
+                    }
+                    InstanceCommand::Output {
+                        id,
+                        cursor,
+                        max_bytes,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            records
+                                .get(&id)
+                                .map(|record| {
+                                    record
+                                        .startup_output
+                                        .lock()
+                                        .expect("startup output mutex poisoned")
+                                        .read(cursor, max_bytes)
+                                })
+                                .ok_or_else(|| format!("unknown instance_id '{id}'")),
+                        );
+                    }
+                    InstanceCommand::Snapshot { id, reply } => {
+                        let result = records
+                            .get_mut(&id)
                             .map(|record| {
-                                record
+                                let output_cursor = record
                                     .startup_output
                                     .lock()
                                     .expect("startup output mutex poisoned")
-                                    .read(cursor, max_bytes)
+                                    .next_cursor();
+                                let instance = dev_instance_summary(record);
+                                DebugSnapshotResult {
+                                    ready: instance.status == "running",
+                                    instance,
+                                    output_cursor,
+                                    capabilities: debug_capabilities(),
+                                }
                             })
-                            .ok_or_else(|| format!("unknown instance_id '{id}'")),
-                    );
+                            .ok_or_else(|| format!("unknown instance_id '{id}'"));
+                        let _ = reply.send(result);
+                    }
                 }
-                InstanceCommand::Snapshot { id, reply } => {
-                    let result = records
-                        .get_mut(&id)
-                        .map(|record| {
-                            let output_cursor = record
-                                .startup_output
-                                .lock()
-                                .expect("startup output mutex poisoned")
-                                .next_cursor();
-                            let instance = dev_instance_summary(record);
-                            DebugSnapshotResult {
-                                ready: instance.status == "running",
-                                instance,
-                                output_cursor,
-                                capabilities: debug_capabilities(),
-                            }
-                        })
-                        .ok_or_else(|| format!("unknown instance_id '{id}'"));
-                    let _ = reply.send(result);
+            }
+            let settled = closing
+                .keys()
+                .filter(|project| {
+                    !pending
+                        .values()
+                        .any(|start| start.project_id.as_ref() == Some(*project))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for project in settled {
+                if let Some(state) = closing.remove(&project) {
+                    let result = match state.error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                    for reply in state.replies {
+                        let _ = reply.send(result.clone());
+                    }
                 }
             }
         }
+        for (_, record) in records {
+            if let Err(error) = stop_record(record).await {
+                tracing::error!(reason = %error, "DEV actor cleanup failed");
+            }
+        }
     });
-    sender
 }
 
 impl DebugMcpState {
@@ -177,8 +410,39 @@ impl DebugMcpState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct DevBuildProcesses {
+    frontend: Option<AsyncGroupChild>,
+    desktop: Option<AsyncGroupChild>,
+    captures: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl DevBuildProcesses {
+    async fn stop(mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for child in [&mut self.desktop, &mut self.frontend]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = child.kill().await {
+                errors.push(format!("DEV process cleanup failed: {error}"));
+            }
+        }
+        for task in self.captures.drain(..) {
+            if let Err(error) = task.await {
+                errors.push(format!("DEV output capture did not join: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
 struct DevInstanceRecord {
+    project_id: Option<ProjectId>,
     instance_id: String,
     project_dir: PathBuf,
     frontend_port: u16,
@@ -497,6 +761,12 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
     let local_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read debug MCP listener addr: {err}"))?;
+    let project_host = Arc::new(std::sync::OnceLock::new());
+    let (instances, instance_commands) = mpsc::unbounded_channel();
+    let state = Arc::new(DebugMcpState {
+        instances: instances.clone(),
+        project_host: project_host.clone(),
+    });
     std::thread::Builder::new()
         .name("tyde-debug-mcp".to_string())
         .spawn(move || {
@@ -505,9 +775,7 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
                 .build()
                 .expect("failed to build debug MCP runtime");
             runtime.block_on(async move {
-                let state = Arc::new(DebugMcpState {
-                    instances: start_instance_registry(),
-                });
+                start_instance_registry(instance_commands);
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio debug MCP listener");
                 let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
@@ -532,6 +800,8 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
 
     Ok(DebugMcpHandle {
         url: format!("http://{local_addr}/mcp"),
+        project_host,
+        instances: Some(instances),
     })
 }
 
@@ -541,6 +811,67 @@ async fn start_instance(
     input: StartInstanceToolInput,
 ) -> Result<StartInstanceResult, String> {
     let project_dir = resolve_project_dir(repo_root, &input.project_dir)?;
+    let host = state
+        .project_host
+        .get()
+        .and_then(crate::host::WeakHostHandle::upgrade)
+        .ok_or_else(|| "Debug MCP host ownership is not ready".to_owned())?;
+    let projects = host.list_projects().await?;
+    let mut execution_project = None;
+    let mut unresolved_roots = false;
+    for project in projects {
+        let mut matches = false;
+        for root in project.root_paths() {
+            match tokio::fs::canonicalize(&root.0).await {
+                Ok(canonical_root) => matches |= canonical_root == project_dir,
+                Err(_) => unresolved_roots = true,
+            }
+        }
+        if matches {
+            if execution_project.is_some() {
+                return Err("DEV source belongs to multiple projects; remove the ambiguous root assignment before launching".to_owned());
+            }
+            execution_project = Some(project);
+        }
+    }
+    if execution_project.is_none() && unresolved_roots {
+        return Err("Cannot establish DEV source ownership while registered roots are unavailable; repair the unavailable root assignments before launching an unregistered source".to_owned());
+    }
+    let cancellation = CancellationToken::new();
+    let cancel_on_drop = cancellation.clone().drop_guard();
+    let result = state
+        .instance_request(|reply| InstanceCommand::Start {
+            project_dir,
+            input,
+            execution_project: execution_project.map(Box::new),
+            cancellation,
+            reply,
+        })
+        .await?;
+    cancel_on_drop.disarm();
+    result
+}
+
+async fn build_instance(
+    project_dir: PathBuf,
+    input: StartInstanceToolInput,
+    execution_project: Option<Project>,
+    cancellation: CancellationToken,
+) -> Result<(DevInstanceRecord, StartInstanceResult), DevStartFailure> {
+    let logical_project_dir = match execution_project.as_ref().map(|project| &project.source) {
+        Some(ProjectSource::GitWorkbench {
+            environment: protocol::WorkbenchEnvironment::Bubblewrap { logical_root, .. },
+            ..
+        }) => PathBuf::from(&logical_root.0),
+        Some(
+            ProjectSource::GitWorkbench {
+                environment: protocol::WorkbenchEnvironment::Native,
+                ..
+            }
+            | ProjectSource::Standalone { .. },
+        )
+        | None => project_dir.clone(),
+    };
     let instance_id = Uuid::new_v4().simple().to_string();
     let frontend_port = reserve_loopback_port()?;
     let host_port = reserve_loopback_port()?;
@@ -555,6 +886,8 @@ async fn start_instance(
         .transpose()?;
     let store_dir = dev_instance_store_dir(&instance_id);
     let mut startup_cleanup = DevInstanceStartupCleanup::new(store_dir.clone());
+    let mut processes = DevBuildProcesses::default();
+    let result: Result<_, DevStartFailure> = async {
     std::fs::create_dir_all(&store_dir).map_err(|err| {
         format!(
             "failed to create dev instance store dir {}: {err}",
@@ -578,7 +911,10 @@ async fn start_instance(
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut frontend_command =
-        devtools_protocol::frontend::command(&project_dir, &store_dir, frontend_port)?;
+        devtools_protocol::frontend::command(&logical_project_dir, &store_dir, frontend_port)?;
+    if let Some(project) = &execution_project {
+        frontend_command.in_project(project.clone());
+    }
     frontend_command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -587,100 +923,140 @@ async fn start_instance(
         &store_dir,
         prepared_hermes.as_ref(),
     )?;
-    let mut frontend_child = frontend_command
-        .group_spawn()
-        .await
-        .map_err(|error| format!("failed to spawn dev frontend: {error}"))?;
-    let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
-        STARTUP_LOG_TAIL_BYTES,
-    )));
-    let stdout = frontend_child
-        .take_stdout()
-        .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
-    let stderr = frontend_child
-        .take_stderr()
-        .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
-    let mut startup_capture_tasks = vec![
-        tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
-        tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
-    ];
+        processes.frontend = Some(
+            frontend_command
+                .group_spawn()
+                .await
+                .map_err(|error| format!("failed to spawn dev frontend: {error}"))?,
+        );
+        let frontend_child = processes
+            .frontend
+            .as_mut()
+            .ok_or_else(|| "DEV frontend ownership missing".to_owned())?;
+        let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
+            STARTUP_LOG_TAIL_BYTES,
+        )));
+        let stdout = frontend_child
+            .take_stdout()
+            .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
+        let stderr = frontend_child
+            .take_stderr()
+            .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
+        processes.captures = vec![
+            tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
+            tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+        ];
 
-    if let Err(error) =
-        devtools_protocol::frontend::wait_until_ready(&mut frontend_child, frontend_port).await
-    {
-        return Err(with_startup_diagnostics(error, &startup_output));
+        let readiness = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err("DEV startup cancelled".to_owned()),
+            result = devtools_protocol::frontend::wait_until_ready(frontend_child, frontend_port) => result,
+        };
+        if let Err(error) = readiness {
+            return Err(with_startup_diagnostics(error, &startup_output).into());
+        }
+        tracing::debug!("dev frontend ready before desktop launch");
+        let mut command = tauri_dev_command(&config_path)?;
+        if let Some(project) = &execution_project {
+            command.in_project(project.clone());
+        }
+        command
+            .current_dir(&logical_project_dir)
+            .env("TYDE_DEV_INSTANCE", "1")
+            .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
+            .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
+
+        processes.desktop = Some(
+            command
+                .group_spawn()
+                .await
+                .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?,
+        );
+        let child = processes
+            .desktop
+            .as_mut()
+            .ok_or_else(|| "DEV desktop ownership missing".to_owned())?;
+
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
+        let stderr = child
+            .take_stderr()
+            .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
+        processes.captures.extend([
+            tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
+            tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+        ]);
+
+        let mut record = DevInstanceRecord {
+            project_id: execution_project.as_ref().map(|project| project.id.clone()),
+            instance_id: instance_id.clone(),
+            project_dir,
+            frontend_port,
+            host_addr,
+            ui_debug_addr,
+            frontend_url: frontend_url.clone(),
+            config_path,
+            store_dir,
+            hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
+            startup_output,
+            startup_capture_tasks: std::mem::take(&mut processes.captures),
+            child: processes
+                .desktop
+                .take()
+                .ok_or_else(|| "DEV desktop ownership missing".to_owned())?,
+            frontend_child: processes
+                .frontend
+                .take()
+                .ok_or_else(|| "DEV frontend ownership missing".to_owned())?,
+            started_at_ms: now_ms(),
+        };
+
+        let readiness = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err("DEV startup cancelled".to_owned()),
+            result = wait_for_instance_ready(&mut record) => result,
+        };
+        if let Err(error) = readiness {
+            let error = DevStartFailure::from(error);
+            return match stop_record(record).await {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(error.with_cleanup(cleanup)),
+            };
+        }
+
+        let result = StartInstanceResult {
+            instance_id: instance_id.clone(),
+            status: "ready",
+            project_dir: record.project_dir.display().to_string(),
+            store_dir: record.store_dir.display().to_string(),
+            session_store_path: record.store_dir.join("sessions.json").display().to_string(),
+            stores_ephemeral: true,
+            hermes_environment: record.hermes_environment.clone(),
+            frontend_url: frontend_url.clone(),
+            host_addr: record.host_addr.to_string(),
+            ui_debug_addr: record.ui_debug_addr.to_string(),
+        };
+
+        startup_cleanup.disarm();
+        Ok((record, result))
     }
-    tracing::debug!("dev frontend ready before desktop launch");
-    let mut command = tauri_dev_command(&config_path)?;
-    command
-        .current_dir(&project_dir)
-        .env("TYDE_DEV_INSTANCE", "1")
-        .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
-        .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
-
-    let mut child = command
-        .group_spawn()
-        .await
-        .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
-
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
-    startup_capture_tasks.extend([
-        tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
-        tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
-    ]);
-
-    let mut record = DevInstanceRecord {
-        instance_id: instance_id.clone(),
-        project_dir,
-        frontend_port,
-        host_addr,
-        ui_debug_addr,
-        frontend_url: frontend_url.clone(),
-        config_path,
-        store_dir,
-        hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
-        startup_output,
-        startup_capture_tasks,
-        child,
-        frontend_child,
-        started_at_ms: now_ms(),
-    };
-
-    if let Err(err) = wait_for_instance_ready(&mut record).await {
-        let _ = record.child.kill().await;
-        return Err(err);
+    .await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(mut error) => {
+            if let Err(cleanup) = processes.stop().await {
+                error = error.with_cleanup(cleanup);
+            }
+            if let Err(cleanup) = startup_cleanup.cleanup() {
+                error = error.with_cleanup(cleanup);
+            }
+            Err(error)
+        }
     }
-
-    let result = StartInstanceResult {
-        instance_id: instance_id.clone(),
-        status: "ready",
-        project_dir: record.project_dir.display().to_string(),
-        store_dir: record.store_dir.display().to_string(),
-        session_store_path: record.store_dir.join("sessions.json").display().to_string(),
-        stores_ephemeral: true,
-        hermes_environment: record.hermes_environment.clone(),
-        frontend_url: frontend_url.clone(),
-        host_addr: record.host_addr.to_string(),
-        ui_debug_addr: record.ui_debug_addr.to_string(),
-    };
-
-    state
-        .instance_request(|reply| InstanceCommand::Insert {
-            record: Box::new(record),
-            reply,
-        })
-        .await?;
-    startup_cleanup.disarm();
-
-    Ok(result)
 }
 
 fn configure_dev_instance_environment(
@@ -906,26 +1282,37 @@ async fn stop_instance(
     state: &Arc<DebugMcpState>,
     instance_id: &str,
 ) -> Result<DevInstanceSummary, String> {
-    let mut record = state
+    state
         .instance_request(|reply| InstanceCommand::Remove {
             id: instance_id.to_owned(),
             reply,
         })
         .await?
-        .ok_or_else(|| format!("unknown instance_id '{instance_id}'"))?;
-    record
-        .child
-        .kill()
-        .await
-        .map_err(|error| format!("failed to stop dev desktop: {error}"))?;
-    record
-        .frontend_child
-        .kill()
-        .await
-        .map_err(|error| format!("failed to stop dev frontend: {error}"))?;
-    let _ = tokio::fs::remove_file(&record.config_path).await;
-    let _ = tokio::fs::remove_dir_all(&record.store_dir).await;
-    Ok(dev_instance_summary(&mut record))
+}
+
+async fn stop_record(mut record: DevInstanceRecord) -> Result<DevInstanceSummary, String> {
+    let mut errors = Vec::new();
+    if let Err(error) = record.child.kill().await {
+        errors.push(format!("failed to stop dev desktop: {error}"));
+    }
+    if let Err(error) = record.frontend_child.kill().await {
+        errors.push(format!("failed to stop dev frontend: {error}"));
+    }
+    for task in record.startup_capture_tasks.drain(..) {
+        if let Err(error) = task.await {
+            errors.push(format!("DEV output capture did not join: {error}"));
+        }
+    }
+    let mut files = DevInstanceStartupCleanup::new(record.store_dir.clone());
+    files.track_config(record.config_path.clone());
+    if let Err(error) = files.cleanup() {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(dev_instance_summary(&mut record))
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn list_instances(state: &Arc<DebugMcpState>) -> Result<Vec<DevInstanceSummary>, String> {
@@ -1031,14 +1418,6 @@ async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), S
         }
         match record.child.try_wait() {
             Ok(Some(exit_status)) => {
-                for mut task in record.startup_capture_tasks.drain(..) {
-                    if timeout(Duration::from_millis(250), &mut task)
-                        .await
-                        .is_err()
-                    {
-                        task.abort();
-                    }
-                }
                 return Err(with_startup_diagnostics(
                     format!(
                         "dev instance {} exited before ready: {exit_status}",

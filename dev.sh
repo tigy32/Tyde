@@ -739,6 +739,12 @@ run_check_stages() {
     local wasm_pid tail_pid wasm_status=0 tail_status=0 status
     local n_wasm n_loader n_docs n_contract
     local native_temp_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tyde-native-tmp/$(printf '%s' "$PWD" | hash_text | cut -c 1-12)"
+    local native_target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+    if [[ "$native_target_dir" != /* ]]; then
+        native_target_dir="$PWD/$native_target_dir"
+    fi
+    export TYDE_TEST_PROCESS_EXECUTABLE="$native_target_dir/debug/tyde-server"
+    export TYDE_RTC_FIXTURE_EXECUTABLE="$native_target_dir/debug/tyde-rtc-fixture"
 
     run_stage "Test tooling syntax" 1 python3 -c 'from pathlib import Path; [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in Path("tools").glob("*.py")]'
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
@@ -768,7 +774,6 @@ run_check_stages() {
     mkdir -p "$native_temp_dir"
     run_stage "cargo nextest run" "$repetitions" \
         env TMPDIR="$native_temp_dir" \
-            TYDE_TEST_PROCESS_EXECUTABLE="${CARGO_TARGET_DIR:-$PWD/target}/debug/tyde-server" \
             cargo nextest run
 
     n_wasm=$((STAGE_NUMBER + 1))
@@ -783,7 +788,6 @@ run_check_stages() {
         trap - EXIT INT TERM HUP
         run_stage_at "$n_wasm" "wasm browser tests" "$repetitions" \
             env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" \
-                TYDE_TEST_PROCESS_EXECUTABLE="${CARGO_TARGET_DIR:-$PWD/target}/debug/tyde-server" \
                 tools/run-wasm-tests.sh
     ) &
     wasm_pid=$!

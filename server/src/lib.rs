@@ -38,6 +38,7 @@ pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
 pub(crate) mod voice;
 pub(crate) mod voice_aws;
+pub(crate) mod workbench;
 pub(crate) mod workflows;
 
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
@@ -169,3 +170,28 @@ pub fn dots_connection_schema() -> Result<String, String> {
 pub mod host_launch;
 
 pub(crate) mod self_improvement;
+
+#[cfg(feature = "test-support")]
+pub async fn prepare_workbench_environment(
+    root: &std::path::Path,
+    environment_root: &std::path::Path,
+) -> Result<protocol::WorkbenchEnvironment, String> {
+    workbench::prepare(root, environment_root)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub async fn finish_workbench_environment(
+    environment: &protocol::WorkbenchEnvironment,
+    discard_artifacts: bool,
+) -> Result<(), String> {
+    if !discard_artifacts {
+        return Err(
+            "Sealing a snapshot requires the canonical Project and its source root".to_owned(),
+        );
+    }
+    workbench::finish(environment)
+        .await
+        .map_err(|error| error.to_string())
+}

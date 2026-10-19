@@ -3024,6 +3024,7 @@ mod wasm_tests {
                 settings.insert(
                     host.clone(),
                     HostSettings {
+                        workbenches: Default::default(),
                         review: Default::default(),
                         self_improvement: Default::default(),
                         enabled_backends: vec![
@@ -3233,6 +3234,7 @@ mod wasm_tests {
                 settings.insert(
                     host,
                     HostSettings {
+                        workbenches: Default::default(),
                         enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
                         default_backend: Some(BackendKind::Codex),
                         default_launch_profile_id: Some(protocol::LaunchProfileId(

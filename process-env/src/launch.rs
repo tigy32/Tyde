@@ -14,6 +14,60 @@ use tokio_util::sync::CancellationToken;
 // state lock, including when a backend is stuck shutting down.
 tokio::task_local! {
     static PROCESS_OWNER: ProcessOwner;
+    static WORKBENCH_PROJECT: Option<protocol::Project>;
+}
+
+pub async fn project_scope<F: std::future::Future>(
+    project: Option<protocol::Project>,
+    future: F,
+) -> F::Output {
+    WORKBENCH_PROJECT.scope(project, Box::pin(future)).await
+}
+
+pub fn current_project() -> Option<protocol::Project> {
+    WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten()
+}
+
+pub fn require_nested_namespaces() -> Result<(), String> {
+    let Some(project) = current_project() else {
+        return Ok(());
+    };
+    if let protocol::ProjectSource::GitWorkbench {
+        environment: protocol::WorkbenchEnvironment::Bubblewrap { support, .. },
+        ..
+    } = project.source
+    {
+        match support.nested_namespaces {
+            protocol::WorkbenchAvailability::Available => {}
+            protocol::WorkbenchAvailability::Unsupported { message, .. } => return Err(message),
+        }
+    }
+    Ok(())
+}
+
+pub fn runtime_path(path: &std::path::Path) -> std::path::PathBuf {
+    WORKBENCH_PROJECT
+        .try_with(|project| {
+            let Some(project) = project else {
+                return path.to_path_buf();
+            };
+            let protocol::ProjectSource::GitWorkbench {
+                roots,
+                environment: protocol::WorkbenchEnvironment::Bubblewrap { logical_root, .. },
+                ..
+            } = &project.source
+            else {
+                return path.to_path_buf();
+            };
+            match roots
+                .first()
+                .and_then(|root| path.strip_prefix(&root.worktree_root.0).ok())
+            {
+                Some(relative) => std::path::Path::new(&logical_root.0).join(relative),
+                None => path.to_path_buf(),
+            }
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 type SharedProcess = Arc<std::sync::Mutex<OwnedProcess>>;
@@ -86,6 +140,13 @@ impl PendingLaunch {
             elapsed_ms = %self.started.elapsed().as_millis(),
             "backend process launch"
         );
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TYDE_DIAGNOSE_PROCESS_PHASES").is_some() {
+            eprintln!(
+                "Native launch diagnostic: ticket={} phase={phase:?}",
+                self.ticket
+            );
+        }
         #[cfg(all(feature = "test-support", target_os = "linux"))]
         if let Some(probe) = &self.probe {
             probe.phase(phase);
@@ -231,9 +292,11 @@ where
 {
     let future = Box::pin(future);
     let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
+    let workbench = WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten();
     #[cfg(all(feature = "test-support", target_os = "linux"))]
     let probe = test_support::CURRENT_PROBE.try_with(Clone::clone).ok();
     tokio::spawn(async move {
+        let future = project_scope(workbench, future);
         #[cfg(all(feature = "test-support", target_os = "linux"))]
         let future = async move {
             match probe {
@@ -417,6 +480,7 @@ pub struct GroupCommand {
     stdio: [Option<ProcessStdio>; 3],
     session: SessionMode,
     independent: Option<IndependentProcess>,
+    workbench: Option<protocol::Project>,
     #[cfg(all(feature = "test-support", target_os = "linux"))]
     probe: Option<test_support::Probe>,
 }
@@ -436,12 +500,68 @@ pub(crate) fn raw_command(program: impl AsRef<std::ffi::OsStr>) -> GroupCommand 
         stdio: [const { None }; 3],
         session: SessionMode::Group,
         independent: None,
+        workbench: WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten(),
         #[cfg(all(feature = "test-support", target_os = "linux"))]
         probe: test_support::current_probe(),
     }
 }
 
 impl GroupCommand {
+    pub fn in_project(&mut self, project: protocol::Project) -> &mut Self {
+        self.workbench = Some(project);
+        self
+    }
+
+    fn wrap_workbench(mut self) -> std::io::Result<Self> {
+        let Some(project) = self.workbench.take() else {
+            return Ok(self);
+        };
+        let protocol::ProjectSource::GitWorkbench {
+            roots,
+            environment:
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    manifest_path,
+                    logical_root,
+                    ..
+                },
+            ..
+        } = &project.source
+        else {
+            return Ok(self);
+        };
+        if !cfg!(target_os = "linux") || roots.len() != 1 {
+            return Err(std::io::Error::other(
+                "Bubblewrap requires Linux and one authoritative source root",
+            ));
+        }
+        let root = std::path::Path::new(&roots[0].worktree_root.0);
+        let cwd = match &self.cwd {
+            Some(cwd) => match cwd.strip_prefix(root) {
+                Ok(relative) => std::path::Path::new(&logical_root.0).join(relative),
+                Err(_) => cwd.clone(),
+            },
+            None => std::path::PathBuf::from(&logical_root.0),
+        };
+        // The launcher applies cwd before the namespace exists. Only the
+        // runner's inner --chdir may use the stable logical mount.
+        self.cwd = Some(root.to_path_buf());
+        let helper = std::path::Path::new(&manifest_path.0).with_file_name("runner.py");
+        let mut args = vec![
+            helper.into_os_string(),
+            "launch".into(),
+            manifest_path.0.as_str().into(),
+            root.as_os_str().to_owned(),
+            cwd.into_os_string(),
+            self.program,
+        ];
+        args.append(&mut self.args);
+        self.program = process_env::find_executable_in_path("python3")
+            .ok_or_else(|| std::io::Error::other("Bubblewrap runtime requires host Python 3"))?
+            .into_os_string();
+        self.args = args;
+        Ok(self)
+    }
+
     #[cfg(unix)]
     pub(crate) fn new_session(&mut self) -> &mut Self {
         self.session = SessionMode::New;
@@ -556,6 +676,7 @@ async fn launch(
     spec: GroupCommand,
     #[cfg(unix)] admission: Option<DeferredPlan>,
 ) -> std::io::Result<AsyncGroupChild> {
+    let spec = spec.wrap_workbench()?;
     let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
     let launch = Arc::new(PendingLaunch {
         ticket: NEXT_LAUNCH_TICKET.fetch_add(1, Ordering::Relaxed),

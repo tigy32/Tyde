@@ -815,6 +815,7 @@ fn is_known_backend_kind(value: &serde_json::Value) -> bool {
 
 fn empty_settings() -> HostSettings {
     HostSettings {
+        workbenches: Default::default(),
         tychat: protocol::TychatSettings::default(),
         chatgpt_dots_enabled: false,
         resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -1000,6 +1001,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
     };
 
     Ok(HostSettings {
+        workbenches: settings.workbenches,
         tychat: settings.tychat,
         chatgpt_dots_enabled: settings.chatgpt_dots_enabled,
         resume_previous_agents: settings.resume_previous_agents,

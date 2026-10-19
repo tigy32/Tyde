@@ -216,14 +216,15 @@ async fn run_connection_with_origin(
             project_files,
         )
         .await;
-    let host_for_attachments = host.clone();
-    tokio::spawn(async move {
-        for attachment in deferred_attachments {
-            host_for_attachments
-                .attach_deferred_agent_stream(attachment)
-                .await;
-        }
-    });
+    // Replay may be held independently on each actor. Awaiting one attach
+    // before starting the next strands unrelated agents behind that replay.
+    let mut bootstrap_attachments = tokio::task::JoinSet::new();
+    for attachment in deferred_attachments {
+        let host = host.clone();
+        bootstrap_attachments.spawn(async move {
+            host.attach_deferred_agent_stream(attachment).await;
+        });
+    }
 
     let cancel = CancellationToken::new();
 
@@ -366,6 +367,18 @@ async fn run_connection_with_origin(
     catalog_refresh_task.abort();
     let _ = catalog_refresh_task.await;
 
+    bootstrap_attachments.abort_all();
+    let mut result = result;
+    while let Some(attachment) = bootstrap_attachments.join_next().await {
+        if let Err(error) = attachment
+            && !error.is_cancelled()
+        {
+            tracing::error!("Bootstrap attachment task failed");
+            result = Err(FrameError::Io(std::io::Error::other(
+                "Bootstrap attachment task failed",
+            )));
+        }
+    }
     host.unregister_host_stream(&host_stream).await;
     normalize_peer_disconnect(result)
 }

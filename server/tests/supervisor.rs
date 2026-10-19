@@ -2008,6 +2008,18 @@ async fn replacement_compaction_reports_required_close_failure() {
         )
         .await;
     fixture.finish_turn(&agent).await;
+    let session = compaction_session_id(&mut fixture, "replacement close failure").await;
+    let replacement_turn = MockGateHandle::new();
+    let replacement_launch = fixture
+        .reserve_next_mock_launch(
+            "replacement close failure",
+            MockScript::one(MockTurn::text_completion_after_gate(
+                "replacement remains usable",
+                &replacement_turn,
+            ))
+            .with_unbounded_echo(),
+        )
+        .await;
     let close_gate = fixture
         .host_for_test()
         .install_restore_marker_withdraw_test_gate()
@@ -2018,8 +2030,27 @@ async fn replacement_compaction_reports_required_close_failure() {
         .await
         .expect("request replacement compaction");
     close_gate.wait_until_entered().await;
-    let failure = fixture.fail_next_session_commit();
-    close_gate.release_one();
+    eprintln!("Required close fixture diagnostic: phase=old-close-held");
+    replacement_turn.wait_until_entered().await;
+    let replacement = fixture
+        .next_frame_matching("replacement advertised", |event| {
+            event.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("replacement NewAgent");
+    // Gate13 proved a database-wide hook is stolen by replacement writes.
+    // Fail only the old session's real marker-removal transaction.
+    let failure = fixture.fail_restoration_withdrawal(&session);
+    replacement_turn.release_one();
+    fixture::finish_turn_on(&mut fixture.client, &replacement.instance_stream)
+        .await
+        .assert_stream_end_contains("replacement remains usable");
+    eprintln!("Required close fixture diagnostic: phase=replacement-recovery-settled");
+    // The gate only holds the initial close decision. Close the gate now so
+    // a stolen injection fails the protocol assertion instead of hanging at
+    // the later settled-close visit to this same boundary.
+    drop(close_gate);
     let terminal = fixture
         .next_frame_matching("replacement compaction terminal", |env| {
             env.kind == FrameKind::AgentCompactNotify
@@ -2048,8 +2079,9 @@ async fn replacement_compaction_reports_required_close_failure() {
             .as_deref()
             .is_some_and(|message| message.contains("could not close"))
     );
+    eprintln!("Required close fixture diagnostic: phase=failed-outcome-published");
     drop(failure);
-    drop(close_gate);
+    drop(replacement_launch);
     let (_, snapshot) = fixture.connect_with_bootstrap().await;
     assert!(
         snapshot

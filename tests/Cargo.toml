@@ -10,6 +10,7 @@ mobile-pairing = { path = "../mobile-pairing" }
 server = { path = "../server", features = ["test-support"] }
 tyde-dev-driver = { path = "../dev-driver" }
 tyde-agent-adapter = { path = "../agent-adapter" }
+tyde-process-env = { path = "../process-env" }
 futures-util = "0.3"
 axum = "0.8"
 base64.workspace = true

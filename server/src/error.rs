@@ -19,6 +19,7 @@ pub(crate) struct AppError {
     pub message: String,
     pub fatal: bool,
     pub source: Option<AnyhowError>,
+    pub workbench_reason: Option<protocol::WorkbenchUnsupportedReason>,
 }
 
 impl AppError {
@@ -50,6 +51,7 @@ impl AppError {
             message: source.to_string(),
             fatal: false,
             source: Some(source),
+            workbench_reason: None,
         }
     }
 
@@ -70,6 +72,11 @@ impl AppError {
         self
     }
 
+    pub fn with_workbench_reason(mut self, reason: protocol::WorkbenchUnsupportedReason) -> Self {
+        self.workbench_reason = Some(reason);
+        self
+    }
+
     pub fn code(&self) -> CommandErrorCode {
         match self.kind {
             AppErrorKind::InvalidInput => CommandErrorCode::InvalidInput,
@@ -86,6 +93,7 @@ impl AppError {
         request_kind: FrameKind,
     ) -> CommandErrorPayload {
         CommandErrorPayload {
+            workbench_reason: self.workbench_reason,
             context: None,
             request_id: None,
             stream: request_stream,
@@ -109,6 +117,7 @@ impl AppError {
             message: message.into(),
             fatal,
             source: None,
+            workbench_reason: None,
         }
     }
 }

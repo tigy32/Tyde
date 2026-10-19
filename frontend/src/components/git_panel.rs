@@ -2699,6 +2699,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                workbench_reason: None,
                 context: None,
                 request_id: Some(request_id.clone()),
                 stream: StreamPath("/project/proj-1".to_owned()),
@@ -2785,6 +2786,7 @@ mod wasm_tests {
             m.insert(
                 "h1".to_owned(),
                 settings_model::HostSettings {
+                    workbenches: Default::default(),
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),

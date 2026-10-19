@@ -118,6 +118,7 @@ pub fn seed_state(state: &AppState) {
     });
     state.host_settings_by_host.update(|settings| {
         let mut host_settings = HostSettings {
+            workbenches: Default::default(),
             review: Default::default(),
             self_improvement: Default::default(),
             enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],

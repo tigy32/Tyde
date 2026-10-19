@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::write_seq::peek_write_seq;
 
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 struct StoreFile {
@@ -152,6 +152,10 @@ impl ProjectStore {
             .map_err(ProjectStoreError::internal)?
             .join(".tyde")
             .join("projects.json"))
+    }
+
+    pub(crate) fn environment_directory(&self) -> crate::error::AppResult<PathBuf> {
+        crate::workbench::environment_directory(&self.path)
     }
 
     pub fn list(&self) -> Result<Vec<Project>, ProjectStoreError> {
@@ -404,6 +408,7 @@ impl ProjectStore {
         name: String,
         branch: GitBranchName,
         roots: Vec<WorkbenchRoot>,
+        environment: protocol::WorkbenchEnvironment,
     ) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
@@ -447,10 +452,39 @@ impl ProjectStore {
                 parent_project_id,
                 branch,
                 roots,
+                environment,
             },
         };
         let mut records = self.records.clone();
         records.insert(id.0.clone(), project.clone());
+        self.persist_candidate(records)?;
+        Ok(project)
+    }
+
+    pub(crate) fn set_workbench_lifecycle(
+        &mut self,
+        id: &ProjectId,
+        lifecycle: protocol::WorkbenchEnvironmentLifecycle,
+    ) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
+        let mut records = self.records.clone();
+        let project = records
+            .get_mut(&id.0)
+            .ok_or_else(|| ProjectStoreError::not_found("Workbench no longer exists"))?;
+        let ProjectSource::GitWorkbench {
+            environment:
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    lifecycle: current, ..
+                },
+            ..
+        } = &mut project.source
+        else {
+            return Err(ProjectStoreError::invalid_input(
+                "Expected a Bubblewrap workbench environment",
+            ));
+        };
+        *current = lifecycle;
+        let project = project.clone();
         self.persist_candidate(records)?;
         Ok(project)
     }
@@ -519,14 +553,18 @@ impl ProjectStore {
         })?;
         let version = value.get("version").and_then(serde_json::Value::as_u64);
         match version {
-            Some(version) if version == STORE_VERSION as u64 => {
+            Some(version) if version == STORE_VERSION as u64 || version == 2 => {
                 let store = serde_json::from_value::<StoreFile>(value).map_err(|err| {
                     ProjectStoreError::internal(format!(
                         "Failed to parse project store {}: {err}",
                         path.display()
                     ))
                 })?;
-                Ok((store.write_seq, store.records, false))
+                Ok((
+                    store.write_seq,
+                    store.records,
+                    version != STORE_VERSION as u64,
+                ))
             }
             Some(version) => Err(ProjectStoreError::internal(format!(
                 "Unsupported project store version {} in {}",
@@ -900,6 +938,7 @@ fn workbench_load_problem(records: &HashMap<String, Project>, project: &Project)
         parent_project_id,
         branch,
         roots,
+        ..
     } = &project.source
     else {
         return None;
