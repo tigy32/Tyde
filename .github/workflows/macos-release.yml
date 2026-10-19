@@ -18,10 +18,10 @@ on:
         type: choice
         options: [aarch64-apple-darwin, x86_64-apple-darwin]
       operation:
-        description: 'Build once, or explicitly resume retained bytes (no compilation)'
+        description: 'Build/resume one architecture, assemble, or explicitly finalize stable'
         required: true
         type: choice
-        options: [build, package, submit-app, submit-server, submit-dmg, resume, assemble]
+        options: [build, package, submit-app, submit-server, submit-dmg, resume, assemble, finalize]
       retained_run_id:
         description: 'Resume/assemble: selected checkpoint workflow run ID'
         type: string
@@ -29,8 +29,12 @@ on:
         description: 'Resume/assemble: exact checkpoint artifact ID, not a filename'
         type: string
       fragments_run_id:
-        description: 'Assemble only: original same-source Release run with other platform fragments'
+        description: 'Assemble/finalize: original same-source Release run with platform fragments'
         type: string
+      confirm_publish:
+        description: 'Explicit approval to deploy frozen mobile web and publish the verified stable draft'
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       version:
@@ -55,9 +59,14 @@ on:
         type: string
         default: ''
 
+      confirm_publish:
+        type: boolean
+        default: false
+
 permissions:
   contents: write
   actions: read
+  id-token: write
 
 concurrency:
   group: macos-release-${{ inputs.version }}-${{ inputs.target }}
@@ -66,6 +75,9 @@ concurrency:
 jobs:
   payload:
     runs-on: ${{ inputs.target == 'aarch64-apple-darwin' && 'macos-15' || 'macos-15-intel' }}
+    concurrency:
+      group: ${{ inputs.operation == 'finalize' && 'mobile-web-manifest' || format('macos-payload-{0}-{1}', inputs.version, inputs.target) }}
+      cancel-in-progress: false
     env:
       RELEASE_TAG: ${{ inputs.version }}
       TYDE_RELEASE_TAG: ${{ inputs.version }}
@@ -100,7 +112,7 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
           git -C .release-controller merge-base --is-ancestor "$CONTROLLER_SHA" origin/main
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
-          case '${{ inputs.operation }}' in build|package|submit-app|submit-server|submit-dmg|resume|assemble) ;; *) exit 1 ;; esac
+          case '${{ inputs.operation }}' in build|package|submit-app|submit-server|submit-dmg|resume|assemble|finalize) ;; *) exit 1 ;; esac
           case "$MACOS_TARGET" in aarch64-apple-darwin|x86_64-apple-darwin) ;; *) exit 1 ;; esac
           cat > "$RUNNER_TEMP/macos-controller" <<'SH'
           #!/usr/bin/env bash
@@ -112,6 +124,13 @@ jobs:
           SH
           chmod +x "$RUNNER_TEMP/macos-controller"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Require explicit stable publication approval
+        if: inputs.operation == 'finalize'
+        env:
+          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+        run: |
+          test "$CONFIRM_PUBLISH" = true
+          case "$RELEASE_TAG" in *-*) echo '::error::Finalization is stable-only'; exit 1 ;; esac
       - name: Verify draft and frozen source before any packaging
         run: macos-controller verify
       - name: Restore explicitly selected checkpoint
@@ -131,7 +150,7 @@ jobs:
           python3 .release-controller/tools/provision-native-build-tools.py \
             --root "$RUNNER_TEMP/tyde-native-build-tools" --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
       - name: Install repository Rust toolchain
-        if: inputs.operation == 'build'
+        if: inputs.operation == 'build' || inputs.operation == 'finalize'
         shell: bash
         run: |
           export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
@@ -144,7 +163,7 @@ jobs:
         if: inputs.operation == 'build' || inputs.operation == 'package'
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Install trunk
-        if: inputs.operation == 'build'
+        if: inputs.operation == 'build' || inputs.operation == 'finalize'
         uses: taiki-e/install-action@v2
         with:
           tool: trunk@0.21.14
@@ -243,7 +262,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Write completion Apple API key
-        if: inputs.operation != 'assemble'
+        if: inputs.operation != 'assemble' && inputs.operation != 'finalize'
         shell: bash
         env:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
@@ -263,7 +282,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: macos-controller submit --kind server
       - name: Checkpoint server submission immediately
-        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-server')
+        if: always() && env.MACOS_PAYLOAD_RETAINED == 'true' && (inputs.operation == 'build' || inputs.operation == 'submit-server')
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ inputs.target }}-${{ github.run_attempt }}-server
@@ -277,7 +296,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: macos-controller submit --kind app
       - name: Checkpoint app submission immediately
-        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-app')
+        if: always() && env.MACOS_PAYLOAD_RETAINED == 'true' && (inputs.operation == 'build' || inputs.operation == 'submit-app')
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ inputs.target }}-${{ github.run_attempt }}-app
@@ -291,7 +310,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: macos-controller package
       - name: Checkpoint signed DMG before remote submission
-        if: always() && (inputs.operation == 'build' || inputs.operation == 'package')
+        if: always() && env.MACOS_PAYLOAD_RETAINED == 'true' && (inputs.operation == 'build' || inputs.operation == 'package')
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ inputs.target }}-${{ github.run_attempt }}-dmg-retained
@@ -310,7 +329,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: macos-controller submit --kind dmg
       - name: Checkpoint DMG submission immediately
-        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-dmg')
+        if: always() && env.MACOS_PAYLOAD_RETAINED == 'true' && (inputs.operation == 'build' || inputs.operation == 'submit-dmg')
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ inputs.target }}-${{ github.run_attempt }}-submitted
@@ -342,13 +361,41 @@ jobs:
         env:
           FRAGMENTS_RUN: ${{ inputs.fragments_run_id }}
         run: macos-controller assemble --fragments-run-id "$FRAGMENTS_RUN"
+      - name: Validate AWS deploy role
+        if: inputs.operation == 'finalize'
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+        run: test -n "$AWS_DEPLOY_ROLE_ARN"
+      - name: Configure AWS credentials
+        if: inputs.operation == 'finalize'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+      - name: Finalize verified stable draft after frozen-source deployment
+        if: inputs.operation == 'finalize'
+        env:
+          FRAGMENTS_RUN: ${{ inputs.fragments_run_id }}
+        run: macos-controller finalize --fragments-run-id "$FRAGMENTS_RUN" --confirm
+      - name: Inspect retained payload state
+        id: retention
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${RETAINED:-}" && -f "$RETAINED/receipt.json" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo 'Retained payload receipt present; preserve bytes and phase evidence'
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'No retained payload: operation stopped before a payload receipt existed; no checkpoint created'
+          fi
       - name: Stamp final checkpoint provenance
-        if: always() && (inputs.operation == 'build' || steps.restore.outcome == 'success')
+        if: always() && steps.retention.outputs.available == 'true' && inputs.operation != 'finalize' && (inputs.operation == 'build' || steps.restore.outcome == 'success')
         shell: bash
         run: |
           if [[ -f "$RETAINED/receipt.json" ]]; then macos-controller checkpoint; fi
       - name: Retain checkpoint on success, failure, or cancellation
-        if: always()
+        if: always() && steps.retention.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ inputs.target }}-${{ github.run_attempt }}-final
@@ -361,6 +408,7 @@ jobs:
             ${{ env.RETAINED }}/updater/
             ${{ env.RETAINED }}/assembly.json
             ${{ env.RETAINED }}/tyde-update.json
+            ${{ env.RETAINED }}/finalization.json
           if-no-files-found: error
           retention-days: 30
       - name: Retain desktop startup logs

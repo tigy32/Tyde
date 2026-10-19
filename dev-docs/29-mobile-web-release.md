@@ -270,7 +270,10 @@ detects drift.
 
 `macos-release.yml` is the macOS packaging path, called by `release.yml` for
 normal releases and dispatched separately for an approved architecture-only
-repair. It never tags, publishes, deploys mobile web, or builds other platforms.
+repair. Build/resume/assemble never publish or deploy mobile web; the separate,
+explicitly approved stable `finalize` operation deploys and publishes without
+building any desktop/headless platform. No recovery operation tags or promotes
+source.
 The application checkout is **`source_sha` at the existing tag**. The controller
 checkout is **the dispatch ref's exact `github.sha`**, independently checked
 against main ancestry. All new helpers execute from `.release-controller/`,
@@ -322,6 +325,44 @@ its latest valid checkpoint. Do not rerun the build job to resume. Dispatch
   asset set exists does it upload the aggregate `tyde-update.json`. It does not
   publish. No fragment or asset is trusted merely because its filename matches.
 
+- `finalize`: requires `confirm_publish=true` and a stable tag. Restore the
+  selected completed checkpoint and explicitly select the original fragment
+  run again. Recompute the signed aggregate read-only and require its exact
+  remote bytes, all 22 stable assets including MSI, each GitHub asset's size and
+  SHA-256, every updater's pinned-key minisign signature, valid headless ZIPs,
+  Linux installer checksums, and both DMGs' image/signature/stapled-ticket and
+  Gatekeeper checks. The repaired architecture's desktop/server/updater bytes
+  must match its retained output hashes. This checks integrity, not execution
+  of Windows/Linux binaries on a macOS runner or new notarization of old assets.
+  Run the existing `web/deploy/deploy.sh --confirm --live-manifest-base
+  --source-root <frozen-source>` from an immutable controller-tooling snapshot,
+  under the same global `mobile-web-manifest` writer lock. Only the mobile web
+  bundle is built, from the frozen checkout; newer application files are never
+  copied into it. Verify the S3 manifest against the frozen protocol and the
+  public manifest/JS/WASM SRI and WASM MIME using existing verification helpers.
+  Recheck source/tag/draft identity and unchanged asset IDs/sizes/hashes before
+  publishing that verified release ID with the normal stable semantics:
+  `draft=false`, `prerelease=false`, `make_latest="true"`. Reread published state,
+  asset metadata and latest stable. Any deploy/coherence/integrity failure blocks
+  publication. A failure after the PATCH requires inspecting published state,
+  never blindly repeating publication. Published releases remain immutable.
+
+Draft lookup has one path: paginate the release list, require a unique exact-tag
+match, and verify its ID/tag/channel/draft state by ID. It never tries the
+published-only tag endpoint. API/auth/rate/transport errors fail closed with a
+controlled operation name, HTTP status (or explicitly unavailable), and gh exit
+code; raw headers, bodies, credentials and private IDs are not printed. The
+read-only operational probe uses the same lookup as packaging:
+
+```sh
+python3 tools/macos_release.py lookup-draft --repository tigy32/Tyde --tag v0.9.5
+```
+
+The host probe on 2026-10-19 passed against the actual existing draft: 19 assets,
+all 19 with SHA-256 metadata, no mutation or secret setup. This does not establish
+the failed runner's undisclosed HTTP status, future runner-token access, live
+Apple acceptance, or successful deployment/publication.
+
 Every mutation requires an existing draft with the correct channel, unchanged
 remote tag, coherent source versions, and source/controller main ancestry.
 Restore checks repository/workflow/run/controller provenance, artifact transport
@@ -329,8 +370,11 @@ SHA-256, and every retained payload digest. Missing receipts/outputs, wrong
 source/architecture/digests and published releases fail closed. A prior ambiguous
 submission-start without an ID requires private reconciliation; no operation
 silently resubmits it or chooses another artifact. Final checkpoints are uploaded
-with `always()` on success, failure and cancellation; the pre-network checkpoints
-already exist if a runner is abruptly lost. Inspect successful artifact-upload
+with `always()` on success, failure and cancellation when a receipt exists;
+a preflight failure before any payload explicitly reports **no retained payload**
+and skips empty uploads rather than generating secondary retention errors or a
+fake checkpoint. The pre-network checkpoints already exist if a runner is
+abruptly lost. Inspect successful artifact-upload
 receipts: an interrupted upload is not durable storage. Runner work copies,
 keychain, certificate and API key are cleaned separately; signed originals and
 phase receipts remain in Actions for 30 days. Export a checkpoint securely before
@@ -341,16 +385,98 @@ recovery evidence or release assets.
 ### Frozen v0.9.5 operational handoff
 
 The discarded ARM DMG from the old run cannot be recovered from its submission
-ID. After this controller lands, the Lander must obtain authorization for **one
-new ARM-only build**, then dispatch this workflow from the landed controller
-commit with `operation=build`, `version=v0.9.5`,
-`source_sha=83ad2d3c03b4c2661adb22ad435dd073a9530bab`, and
-`target=aarch64-apple-darwin`. This builds only that frozen tag, not main's newer
-mobile/features. Successful Linux/Windows/Intel platforms are not rebuilt.
-If remote completion fails, use the selected checkpoint and explicit operations
-above. Once ARM succeeds, `assemble` can reuse the verified other-platform
-fragments from Release run `39193235317` with explicit same-source provenance.
-Any missing/expired fragment, invalid signature, missing stable MSI or asset
-mismatch blocks aggregation rather than triggering a rebuild or partial publish.
-The Lander retains authority for final integrity verification and publication;
-this tooling change authorizes neither a build nor a release action.
+ID. Canonical ARM run `39226704908`, attempt 1, stopped in draft preflight before
+compilation or Apple submission; it produced no payload/checkpoint to resume.
+After this bugfix lands through ordinary committed-workbench and clean-main
+validation, the Lander needs authorization for **one ARM-only build**. Nothing
+in this implementation or recipe authorizes its execution. Do not rerun the
+failed original multi-platform release workflow or mark its jobs green.
+
+Run the landed main workflow/controller, never helpers from the old app tag:
+
+```sh
+REPO=tigy32/Tyde
+SOURCE=83ad2d3c03b4c2661adb22ad435dd073a9530bab
+
+# Read-only preflight, no credential setup or mutations:
+python3 tools/macos_release.py lookup-draft --repository "$REPO" --tag v0.9.5
+
+# Only after approval for ONE new ARM build:
+gh workflow run macos-release.yml --repo "$REPO" --ref main \
+  -f operation=build -f version=v0.9.5 -f source_sha="$SOURCE" \
+  -f target=aarch64-apple-darwin
+```
+
+Record the **exact dispatched run ID**, not a guessed latest run. Check its
+immutable `head_sha` is the landed controller main SHA, and watch completion:
+
+```sh
+RUN='<exact dispatched run ID>'
+gh api "repos/$REPO/actions/runs/$RUN" \
+  --jq '{head_sha,path,head_branch,status,conclusion}'
+gh run watch "$RUN" --repo "$REPO" --exit-status
+gh api "repos/$REPO/actions/runs/$RUN/artifacts?per_page=100" \
+  --jq '.artifacts[] | {id,name,expired,digest}'
+```
+
+This builds only frozen stable 83ad, not main's 0.9.6 application. Successful
+Linux x64/ARM, Windows and Intel platforms are reused, never rebuilt.
+If completion fails, select its exact valid checkpoint, preferably the final
+artifact containing the latest phase receipt. Use **one explicit phase** and
+record the new run/artifact for each continuation:
+
+```sh
+CHECKPOINT_RUN='<exact selected checkpoint run ID>'
+CHECKPOINT_ARTIFACT='<exact selected artifact ID>'
+# If the DMG submission ID already exists, only resume (no submit/build):
+gh workflow run macos-release.yml --repo "$REPO" --ref main \
+  -f operation=resume -f version=v0.9.5 -f source_sha="$SOURCE" \
+  -f target=aarch64-apple-darwin \
+  -f retained_run_id="$CHECKPOINT_RUN" \
+  -f retained_artifact_id="$CHECKPOINT_ARTIFACT"
+```
+
+For earlier checkpoints select `submit-server` / `submit-app` only when neither
+a submission nor prior submission-start exists; `package` to complete those
+submissions and retain signed DMG/updater; `submit-dmg` to submit that retained
+DMG once; then `resume`. Ambiguous submission starts require private
+reconciliation, not resubmission. Unknown Apple/network routes and Intel upload
+422 causes remain unresolved; this fix does not claim to repair them.
+
+After completed ARM upload, select its completed final checkpoint. Assemble
+only; this is **not** publication approval:
+
+```sh
+COMPLETE_RUN='<exact completed ARM checkpoint run ID>'
+COMPLETE_ARTIFACT='<exact completed ARM checkpoint artifact ID>'
+gh workflow run macos-release.yml --repo "$REPO" --ref main \
+  -f operation=assemble -f version=v0.9.5 -f source_sha="$SOURCE" \
+  -f target=aarch64-apple-darwin \
+  -f retained_run_id="$COMPLETE_RUN" \
+  -f retained_artifact_id="$COMPLETE_ARTIFACT" \
+  -f fragments_run_id=39193235317
+```
+
+Watch that exact assembly run. Missing/expired fragments, wrong source, invalid
+signatures, missing stable MSI or incomplete assets block it. Once assembly
+succeeds and the owner explicitly approves final deployment/publication of
+v0.9.5, use the same completed ARM checkpoint and source-bound fragment run:
+
+```sh
+gh workflow run macos-release.yml --repo "$REPO" --ref main \
+  -f operation=finalize -f confirm_publish=true \
+  -f version=v0.9.5 -f source_sha="$SOURCE" \
+  -f target=aarch64-apple-darwin \
+  -f retained_run_id="$COMPLETE_RUN" \
+  -f retained_artifact_id="$COMPLETE_ARTIFACT" \
+  -f fragments_run_id=39193235317
+```
+
+Watch the exact finalization run, then inspect its retained `finalization.json`
+privately and its published stable/latest state. This supported path verifies,
+deploys frozen mobile web and publishes without depending on the old failed
+build DAG. `assemble`, `lookup-draft`, `verify`, builds and resumes cannot invoke
+it implicitly; `confirm_publish` defaults false and CLI `finalize` also requires
+`--confirm`. The existing beta-only `./dev.sh release publish` remains unchanged.
+No ad hoc `gh release edit`, source/tag promotion, rebuild of successful
+platforms, validation attestation, or version-only source gate is introduced.

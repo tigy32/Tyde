@@ -20,6 +20,7 @@ from urllib.parse import unquote
 from check_release_version import collect_versions
 from set_release_version import normalize_tag
 import update_manifest
+import release_tool
 
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 CONTROLLER = Path(__file__).resolve().parents[1]
@@ -29,10 +30,10 @@ class ControllerError(ValueError):
     pass
 
 
-def command(argv, *, cwd=None):
+def command(argv, *, cwd=None, operation=None):
     result = subprocess.run([str(a) for a in argv], cwd=cwd, capture_output=True)
     if result.returncode:
-        raise ControllerError(f"{Path(str(argv[0])).name} failed (exit {result.returncode})")
+        raise ControllerError(f"{operation or Path(str(argv[0])).name} failed (exit {result.returncode})")
     return result.stdout
 
 
@@ -56,27 +57,80 @@ def save(path, data):
     temporary.replace(path)
 
 
-def api(args, endpoint, binary=False):
-    argv = ["gh", "api", f"repos/{args.repository}/{endpoint}"]
+def api(args, endpoint, binary=False, *, operation=None, method="GET", body=None):
+    # Log only controlled operation names and status codes, never raw gh output:
+    # headers/bodies/errors may contain credentials, signed URLs or private IDs.
+    operation = operation or ("artifact-download" if binary else "metadata-read")
+    argv = ["gh", "api", f"repos/{args.repository}/{endpoint}", "--include", "--method", method]
     if binary:
         argv += ["-H", "Accept: application/octet-stream"]
-    raw = command(argv)
+    if body is not None:
+        argv += ["--input", "-"]
+    result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None, capture_output=True)
+    raw = result.stdout
+    statuses = []
+    while raw.startswith(b"HTTP/"):
+        header, separator, body = raw.partition(b"\r\n\r\n")
+        if not separator:
+            header, separator, body = raw.partition(b"\n\n")
+        match = re.match(rb"HTTP/[^ ]+ (\d{3})\b", header)
+        if not separator or not match:
+            raise ControllerError(f"GitHub {operation}: malformed HTTP response")
+        statuses.append(int(match[1]))
+        raw = body
+    status = statuses[-1] if statuses else None
+    if result.returncode or status is None or not 200 <= status < 300:
+        if status is None:
+            match = re.search(rb"\bHTTP (\d{3})\b", result.stderr)
+            status = int(match[1]) if match else None
+        category = {401: "authentication rejected", 403: "authorization or rate limit rejected",
+                    404: "not found", 429: "rate limit rejected"}.get(status, "API/transport failure")
+        raise ControllerError(f"GitHub {operation}: HTTP {status if status else 'unavailable'}; {category} (gh exit {result.returncode})")
     return raw if binary else json.loads(raw)
 
 
-def draft(args):
-    release = api(args, f"releases/tags/{args.tag}")
-    if release["tag_name"] != args.tag or release["draft"] is not True:
-        raise ControllerError("Published release is immutable or release tag mismatches")
-    if release["prerelease"] != ("-" in args.tag):
+def pages(args, endpoint, *, operation):
+    values = []
+    page = 1
+    while True:
+        batch = api(args, f"{endpoint}?per_page=100&page={page}", operation=operation)
+        if not isinstance(batch, list):
+            raise ControllerError(f"GitHub {operation}: expected a page array")
+        values.extend(batch)
+        if len(batch) < 100:
+            return values
+        page += 1
+
+
+def release_by_id(args, release_id, *, published=False):
+    release = api(args, f"releases/{release_id}", operation="release-by-ID")
+    if (release["id"] != release_id or release["tag_name"] != args.tag
+            or release["draft"] is not (not published)):
+        raise ControllerError("Published release is immutable or release ID/tag/state mismatches")
+    if release["prerelease"] is not ("-" in args.tag):
         raise ControllerError("Release channel mismatches tag")
+    release["assets"] = pages(args, f"releases/{release_id}/assets", operation="release-assets")
     return release
 
 
-def context(args):
+def draft(args):
+    matches = [r for r in pages(args, "releases", operation="release-list") if r["tag_name"] == args.tag]
+    if len(matches) != 1:
+        raise ControllerError("Expected one unique exact-tag draft release")
+    release_id = matches[0]["id"]
+    if type(release_id) is not int or release_id <= 0 or matches[0]["draft"] is not True:
+        raise ControllerError("Published release is immutable or release ID is invalid")
+    return release_by_id(args, release_id)
+
+
+def selection(args):
     normalize_tag(args.tag)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         raise ControllerError("Invalid repository")
+
+
+def context(args):
+    selection(args)
     for root, sha in ((CONTROLLER, args.controller_sha), (args.source, args.source_sha)):
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or git(root, "rev-parse", "HEAD") != sha:
             raise ControllerError("Source/controller commit mismatch")
@@ -376,7 +430,7 @@ if (!crypto.verify(null, Buffer.concat([sig.subarray(10), Buffer.from(lines[2].s
     command(["node", "-e", script, config, payload, signature])
 
 
-def assemble(args):
+def assemble(args, *, upload_manifest=True):
     if not args.fragments_run_id:
         raise ControllerError("Assembly requires explicit same-source fragment run")
     data = receipt(args)
@@ -430,34 +484,150 @@ def assemble(args):
         manifest = root / "tyde-update.json"
         update_manifest.assemble(argparse.Namespace(tag=args.tag, repository=args.repository, fragments=fragments, output=manifest))
         # Validate the entire release asset set before writing the aggregate, never publish a partial.
-        import release_tool
         candidate = draft(args)
         candidate["assets"] = [a for a in candidate["assets"] if a["name"] != "tyde-update.json"] + [{"name": "tyde-update.json"}]
         release_tool.validate_release(candidate, args.tag)
-        command(["gh", "release", "upload", args.tag, manifest, "--repo", args.repository, "--clobber"])
-        shutil.copyfile(manifest, args.retained / "tyde-update.json")
-        save(args.retained / "assembly.json", {"repository": args.repository, "tag": args.tag,
-             "source_sha": args.source_sha, "controller_sha": args.controller_sha,
-             "manifest_sha256": digest(manifest), "assets": asset_receipts})
+        assembly = {"repository": args.repository, "tag": args.tag,
+                    "source_sha": args.source_sha, "controller_sha": args.controller_sha,
+                    "manifest_sha256": digest(manifest), "assets": asset_receipts}
+        if upload_manifest:
+            command(["gh", "release", "upload", args.tag, manifest, "--repo", args.repository, "--clobber"])
+            shutil.copyfile(manifest, args.retained / "tyde-update.json")
+            save(args.retained / "assembly.json", assembly)
+        return assembly
+
+def asset_snapshot(release):
+    return {a["name"]: {k: a[k] for k in ("id", "size", "digest")} for a in release["assets"]}
+
+
+def verify_release_payloads(args, assembly, root):
+    release = draft(args)
+    release_tool.validate_release(release, args.tag)
+    data = receipt(args)
+    for asset in release["assets"]:
+        name = asset["name"]
+        if Path(name).name != name:
+            raise ControllerError("Unsafe release asset name")
+        path = root / name
+        path.write_bytes(api(args, f"releases/assets/{asset['id']}", binary=True, operation="release-asset-download"))
+        sha = digest(path)
+        if asset.get("size") != path.stat().st_size or asset.get("digest") != "sha256:" + sha:
+            raise ControllerError("Release asset size/SHA-256 mismatch or missing digest")
+        if name in assembly["assets"] and sha != assembly["assets"][name]["sha256"]:
+            raise ControllerError("Release asset changed since signature verification")
+        retained_name = f"output/{name}" if not name.startswith("tyde-update-") else f"output/artifacts/{name}"
+        if retained_name in data["outputs"] and sha != data["outputs"][retained_name]:
+            raise ControllerError("Release asset differs from retained source-bound output")
+        if name == "tyde-update.json" and sha != assembly["manifest_sha256"]:
+            raise ControllerError("Aggregate manifest differs from verified same-source fragments")
+        if name.startswith("tyde-server-"):
+            with zipfile.ZipFile(path) as archive:
+                binary = "tyde-server.exe" if "windows" in name else "tyde-server"
+                if archive.namelist() != [binary] or archive.getinfo(binary).file_size == 0 or archive.testzip() is not None:
+                    raise ControllerError("Invalid headless server archive")
+        if name.endswith(".dmg"):
+            command(["hdiutil", "verify", path])
+            command(["codesign", "--verify", "--strict", path])
+            command(["xcrun", "stapler", "validate", path])
+            command(["spctl", "-a", "-v", "-t", "open", "--context", "context:primary-signature", path])
+    for path in root.glob("*.sha256"):
+        package = path.with_suffix("")
+        fields = path.read_text().split()
+        if (len(fields) != 2 or fields[0].lower() != digest(package)
+                or Path(fields[1].lstrip("*")).name != package.name):
+            raise ControllerError("Linux installer checksum mismatch")
+    return release
+
+
+def verify_mobile_web(args, root):
+    manifest = root / "mobile-manifest.json"
+    command(["aws", "s3", "cp", "s3://tycode-static/tyde/manifest.json", manifest, "--region", "us-west-2"])
+    command([sys.executable, CONTROLLER / "tools/check_mobile_web_manifest.py", "--manifest", manifest,
+             "--protocol-source", args.source / "protocol/src/types.rs", args.tag])
+    value = json.loads(manifest.read_text())
+    live = root / "public-manifest.json"
+    command(["curl", "--fail", "--silent", "--show-error", "--location", "--output", live,
+             "https://tycode.dev/tyde/manifest.json"])
+    version = normalize_tag(args.tag)
+    if json.loads(live.read_text())["versions"][version] != value["versions"][version]:
+        raise ControllerError("Public mobile manifest differs from deployed entry")
+    plan = release_tool.manifest_plan(value, args.tag, "https://tycode.dev")
+    for index, item in enumerate(plan["items"]):
+        body, headers = root / f"body-{index}", root / f"headers-{index}"
+        command(["curl", "--fail", "--silent", "--show-error", "--location", "--output", body,
+                 "--dump-header", headers, item["url"]])
+        release_tool.validate_download(body, item["integrity"],
+                                       release_tool.header_content_type(headers.read_text()), item["wasm"])
+
+
+def finalize(args):
+    if not args.confirm or "-" in args.tag:
+        raise ControllerError("Finalization requires explicit --confirm and an approved stable tag")
+    # Assembly stays read-only here: finalization requires the complete remote
+    # aggregate already uploaded by the separately selected assemble operation.
+    assembly = assemble(args, upload_manifest=False)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assets = root / "assets"
+        assets.mkdir()
+        release = verify_release_payloads(args, assembly, assets)
+        snapshot = asset_snapshot(release)
+        # deploy.sh writes its generated manifest. Give immutable controller
+        # tooling a disposable copy; never overwrite frozen application files.
+        deploy = root / "deploy"
+        deploy.mkdir()
+        archive = root / "deploy.tar"
+        command(["git", "-C", CONTROLLER, "archive", "--output", archive, args.controller_sha, "web", "tools"])
+        command(["tar", "-xf", archive, "-C", deploy])
+        command(["bash", deploy / "web/deploy/deploy.sh", args.tag, "--confirm", "--live-manifest-base",
+                 "--source-root", args.source], cwd=args.source, operation="frozen-source mobile-web deployment")
+        verify_mobile_web(args, root)
+        context(args)
+        current = draft(args)
+        if current["id"] != release["id"] or asset_snapshot(current) != snapshot:
+            raise ControllerError("Draft assets changed during deployment; refusing publication")
+        save(args.retained / "finalization.json", {"tag": args.tag, "source_sha": args.source_sha,
+             "controller_sha": args.controller_sha, "assets": snapshot, "mobile_web": "verified", "state": "publishing"})
+        api(args, f"releases/{release['id']}", operation="publish-stable", method="PATCH",
+            body={"draft": False, "prerelease": False, "make_latest": "true"})
+        published = release_by_id(args, release["id"], published=True)
+        release_tool.validate_release(published, args.tag, require_published=True)
+        latest = api(args, "releases/latest", operation="verify-latest-stable")
+        if latest["id"] != release["id"] or latest["tag_name"] != args.tag:
+            raise ControllerError("Published stable is not latest; inspect publication before any further action")
+        if asset_snapshot(published) != snapshot:
+            raise ControllerError("Published asset metadata changed; inspect publication before any further action")
+        save(args.retained / "finalization.json", {"tag": args.tag, "source_sha": args.source_sha,
+             "controller_sha": args.controller_sha, "assets": snapshot, "mobile_web": "verified", "state": "published"})
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("verify", "prepare", "submit", "complete", "upload", "restore", "checkpoint", "assemble", "package"))
+    parser.add_argument("operation", choices=("verify", "prepare", "submit", "complete", "upload", "restore", "checkpoint", "assemble", "package", "finalize", "lookup-draft"))
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--controller-sha", required=True)
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--target", choices=TARGETS, required=True)
-    parser.add_argument("--retained", type=Path, required=True)
+    parser.add_argument("--source-sha")
+    parser.add_argument("--controller-sha")
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--retained", type=Path)
     parser.add_argument("--kind", choices=("app", "server", "dmg"))
     parser.add_argument("--run-id")
     parser.add_argument("--artifact-id")
     parser.add_argument("--fragments-run-id")
+    parser.add_argument("--confirm", action="store_true")
     args = parser.parse_args()
-    args.source = args.source.resolve()
-    args.retained = args.retained.resolve()
     try:
+        selection(args)
+        if args.operation == "lookup-draft":
+            release = draft(args)
+            hashes = sum(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", a.get("digest") or "")) for a in release["assets"])
+            print(f"Exact-tag draft lookup: PASS; channel verified; assets={len(release['assets'])}; SHA-256 metadata={hashes}; mutations=0")
+            return 0
+        if not all((args.source, args.source_sha, args.controller_sha, args.target, args.retained)):
+            raise ControllerError("Operation requires explicit source/controller/target/retained arguments")
+        args.source = args.source.resolve()
+        args.retained = args.retained.resolve()
         context(args)
         if args.operation == "verify":
             pass
@@ -477,9 +647,12 @@ def main():
             submit(args)
         else:
             {"prepare": prepare, "package": package, "complete": complete, "upload": upload,
-             "checkpoint": checkpoint, "assemble": assemble}[args.operation](args)
+             "checkpoint": checkpoint, "assemble": assemble, "finalize": finalize}[args.operation](args)
+        if args.operation in ("prepare", "restore") and os.environ.get("GITHUB_ENV"):
+            with open(os.environ["GITHUB_ENV"], "a") as env:
+                env.write("MACOS_PAYLOAD_RETAINED=true\n")
         print(f"macOS {args.operation}: PASS ({args.target}); no tests or validation attestation created")
-    except (ControllerError, OSError, ValueError, KeyError) as error:
+    except (ControllerError, OSError, ValueError, KeyError, RuntimeError, zipfile.BadZipFile) as error:
         # Parser/I/O values can contain private submission IDs; never dump them.
         message = str(error) if isinstance(error, ControllerError) else type(error).__name__
         print(f"macOS controller: {message}", file=sys.stderr)

@@ -897,6 +897,11 @@ class MacosControllerFlowTests(unittest.TestCase):
         self.downloads = {}
         self.uploads = {}
         self.published = False
+        self.http_requests = []
+        self.http_failures = {}
+        self.asset_overrides = {}
+        self.release_overrides = {}
+        self.extra_releases = []
         self.wait_entered = threading.Event()
         self.wait_release = threading.Event()
         self.block_wait = False
@@ -906,10 +911,31 @@ class MacosControllerFlowTests(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 key = self.path.removeprefix(f"/repos/{owner.repository}/")
-                if key == f"releases/tags/{owner.tag}":
-                    value = {"id": 1, "tag_name": owner.tag, "draft": not owner.published,
-                             "prerelease": False, "assets": [{"id": i, "name": n} for i, n in enumerate(owner.uploads)]}
-                    raw = json.dumps(value).encode()
+                owner.http_requests.append(("GET", key))
+                if key in owner.http_failures:
+                    self.send_error(owner.http_failures[key], "PRIVATE-ID SECRET Authorization: bearer fixture")
+                    return
+                release = {"id": 1, "tag_name": owner.tag, "draft": not owner.published,
+                           "prerelease": False, **owner.release_overrides}
+                assets = [{"id": i, "name": n, "size": len(b), "digest": "sha256:" + hashlib.sha256(b).hexdigest(),
+                           **owner.asset_overrides.get(n, {})} for i, (n, b) in enumerate(owner.uploads.items())]
+                if key.startswith("releases/tags/"):
+                    # GitHub's published-release tag route does not see this draft.
+                    self.send_error(404)
+                    return
+                elif key.startswith("releases?per_page=100&page="):
+                    page = int(key.rsplit("=", 1)[1])
+                    raw = json.dumps((owner.extra_releases + [release])[(page-1)*100:page*100]).encode()
+                elif key == "releases/latest" and owner.published:
+                    raw = json.dumps(release).encode()
+                elif key == "releases/1":
+                    raw = json.dumps(release).encode()
+                elif key.startswith("releases/1/assets?per_page=100&page="):
+                    page = int(key.rsplit("=", 1)[1])
+                    raw = json.dumps(assets[(page-1)*100:page*100]).encode()
+                elif key.startswith("tyde/"):
+                    path = owner.root / "s3" / key
+                    raw = path.read_bytes()
                 elif key in owner.responses:
                     raw = json.dumps(owner.responses[key]).encode()
                 elif key in owner.downloads:
@@ -927,6 +953,17 @@ class MacosControllerFlowTests(unittest.TestCase):
                 self.end_headers()
                 with contextlib.suppress(BrokenPipeError):
                     self.wfile.write(raw)
+
+            def do_PATCH(self):
+                owner.http_requests.append(("PATCH", "publish-stable"))
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path != f"/repos/{owner.repository}/releases/1" or body != {"draft": False, "prerelease": False, "make_latest": "true"}:
+                    self.send_error(422)
+                    return
+                owner.published = True
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
 
             def do_POST(self):
                 name = self.path.removeprefix("/upload/")
@@ -986,14 +1023,21 @@ if (process.argv[2] === 'generate') {
         value = json.loads(config.read_text())
         value["plugins"]["updater"]["pubkey"] = key
         config.write_text(json.dumps(value))
+        (self.controller / "protocol/src").mkdir(parents=True, exist_ok=True)
+        (self.controller / "protocol/src/types.rs").write_text("pub const PROTOCOL_VERSION: u32 = 41;\n")
+        (self.controller / "mobile-frontend").mkdir()
+        (self.controller / "mobile-frontend/index.html").write_text("frozen mobile source")
+        (self.controller / "tools").mkdir()
+        for name in ("check_release_version.py", "set_release_version.py"):
+            shutil.copyfile(TOOLS_DIR / name, self.controller / "tools" / name)
         self.git(self.controller, "add", ".")
         self.git(self.controller, "commit", "-qm", "Frozen application")
         self.source_sha = self.git(self.controller, "rev-parse", "HEAD")
         self.git(self.controller, "tag", self.tag)
         tools = self.controller / "tools"
-        tools.mkdir()
-        for name in ("macos_release.py", "update_manifest.py", "set_release_version.py", "check_release_version.py", "release_tool.py", "check_mobile_web_manifest.py"):
+        for name in ("macos_release.py", "update_manifest.py", "set_release_version.py", "check_release_version.py", "release_tool.py", "check_mobile_web_manifest.py", "merge_mobile_web_manifest.py"):
             shutil.copyfile(TOOLS_DIR / name, tools / name)
+        shutil.copytree(REPO_ROOT / "web", self.controller / "web")
         self.git(self.controller, "add", ".")
         self.git(self.controller, "commit", "-qm", "Controller tooling")
         self.controller_sha = self.git(self.controller, "rev-parse", "HEAD")
@@ -1020,13 +1064,63 @@ if (process.argv[2] === 'generate') {
 import io,json,os,pathlib,shutil,subprocess,sys,urllib.request,zipfile
 name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]; root=pathlib.Path(os.environ['FIXTURE_ROOT'])
 with open(os.environ['FIXTURE_LOG'],'a') as f: f.write(json.dumps([name,*[a for a in args if not len(a)==36]])+'\n')
-def request(path,data=None):
- return urllib.request.urlopen(urllib.request.Request(os.environ['FIXTURE_HTTP']+path,data=data)).read()
+def request(path,data=None,method=None):
+ return urllib.request.urlopen(urllib.request.Request(os.environ['FIXTURE_HTTP']+path,data=data,method=method)).read()
 if name=='gh':
- if args[0]=='api': sys.stdout.buffer.write(request('/'+args[1])); sys.exit()
+ if args[0]=='api':
+  method=args[args.index('--method')+1] if '--method' in args else 'GET'
+  fields=json.load(sys.stdin) if '--input' in args else None
+  try:
+   raw=request('/'+args[1],json.dumps(fields).encode() if fields else None,method)
+   if '--include' in args: sys.stdout.buffer.write(b'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n')
+   sys.stdout.buffer.write(raw)
+  except urllib.error.HTTPError as e:
+   if '--include' in args: sys.stdout.buffer.write(f'HTTP/2.0 {e.code} Error\r\n\r\n'.encode())
+   print(f'gh: PRIVATE-ID SECRET Authorization: bearer fixture (HTTP {e.code})',file=sys.stderr)
+   sys.exit(1)
+  sys.exit()
  if args[:2]==['release','upload']:
   path=pathlib.Path(args[3]); request('/upload/'+path.name,path.read_bytes()); sys.exit()
  raise SystemExit(21)
+if name=='trunk':
+ if (root/'deploy-failure').exists(): raise SystemExit(32)
+ source=pathlib.Path.cwd()
+ if (source/'index.html').read_text()!='frozen mobile source': raise SystemExit(33)
+ dist=pathlib.Path(args[args.index('--dist')+1]); dist.mkdir(parents=True,exist_ok=True)
+ (dist/'mobile-fixture.js').write_text('export default "frozen mobile fixture";')
+ (dist/'mobile-fixture_bg.wasm').write_bytes(b'\0asm\1\0\0\0')
+ (dist/'index.html').write_text('<script type="module">import init from "./mobile-fixture.js";</script><meta name="tyde-follow-selected-host" content="1">')
+ sys.exit()
+if name=='aws':
+ def mapped(value):
+  return root/'s3'/value.removeprefix('s3://tycode-static/') if value.startswith('s3://') else pathlib.Path(value)
+ if args[0]=='cloudfront': print('{}'); sys.exit()
+ if args[:2]==['s3api','head-object']:
+  key=args[args.index('--key')+1]; path=root/'s3'/key
+  if not path.is_file(): raise SystemExit(34)
+  if '--query' in args:
+   query=args[args.index('--query')+1]
+   print('application/wasm' if query=='ContentType' else 'no-store, max-age=0, must-revalidate' if key=='tyde/manifest.json' else 'public, max-age=60, must-revalidate')
+  else: print('{}')
+  sys.exit()
+ if args[0]=='s3':
+  src,dst=mapped(args[2]),mapped(args[3])
+  if '--recursive' in args or args[1]=='sync':
+   if src!=dst:
+    for path in src.rglob('*'):
+     if path.is_file() and not (args[2].endswith('web/loader/') and path.name=='manifest.json'):
+      target=dst/path.relative_to(src); target.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(path,target)
+  else:
+   dst.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(src,dst)
+  sys.exit()
+ raise SystemExit(35)
+if name=='curl':
+ url=args[-1]; raw=request('/repos/fixture/Tyde/'+url.removeprefix('https://tycode.dev/'))
+ if (root/'public-corruption').exists() and url.endswith('.wasm'): raw=b'corrupt'
+ pathlib.Path(args[args.index('--output')+1]).write_bytes(raw)
+ if '--dump-header' in args:
+  pathlib.Path(args[args.index('--dump-header')+1]).write_text('HTTP/2 200 OK\nContent-Type: '+('application/wasm' if url.endswith('.wasm') else 'application/javascript')+'\n')
+ sys.exit()
 if name=='lipo': print('x86_64' if (root/'wrong-arch').exists() else 'arm64')
 elif name=='codesign': pass
 elif name=='route': print('destination: 17.0.0.1\ngateway: 192.0.2.1\ninterface: en0')
@@ -1070,8 +1164,11 @@ elif name=='xcrun':
 else: raise SystemExit(27)
 ''')
         stub.chmod(0o755)
-        for name in ("gh", "codesign", "lipo", "ditto", "hdiutil", "npx", "xcrun", "spctl", "route", "dscacheutil", "cargo"):
+        for name in ("gh", "codesign", "lipo", "ditto", "hdiutil", "npx", "xcrun", "spctl", "route", "dscacheutil", "cargo", "trunk", "aws", "curl"):
             (self.bin / name).symlink_to(stub)
+        live = self.root / "s3/tyde/manifest.json"
+        live.parent.mkdir(parents=True)
+        live.write_text(json.dumps({"schemaVersion": 1, "minSupported": "0.8.19", "blocked": [], "versions": {}}))
 
     def git(self, root, *args):
         return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.PIPE).decode().strip()
@@ -1114,6 +1211,55 @@ else: raise SystemExit(27)
         self.cli("submit", "--kind", "app")
         self.cli("package")
         self.cli("submit", "--kind", "dmg")
+
+    def retention_state(self, available):
+        workflow = (REPO_ROOT / ".github/workflows/macos-release.yml").read_text()
+        step = workflow.split("      - name: Inspect retained payload state\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in step.split("        run: |\n", 1)[1].splitlines())
+        output = self.root / "retention-output"
+        output.write_text("")
+        result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                env=dict(self.env, RETAINED=str(self.retained), GITHUB_OUTPUT=str(output)),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), f"available={str(available).lower()}\n")
+        return result.stdout
+
+    def test_draft_lookup_pagination_http_failures_and_no_payload(self):
+        # Reproduce the real published-only tag route while the same auth can
+        # read this exact draft through list/by-ID. Execute both CLI boundaries.
+        result = subprocess.run(["gh", "api", f"repos/{self.repository}/releases/tags/{self.tag}"],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 404", result.stderr)
+        self.http_requests.clear()
+        self.extra_releases = [{"id": i+2, "tag_name": f"v0.0.{i}", "draft": False} for i in range(100)]
+        self.cli("lookup-draft")
+        self.cli("verify")
+        self.assertIn(("GET", "releases?per_page=100&page=2"), self.http_requests)
+        self.assertIn(("GET", "releases/1"), self.http_requests)
+        self.assertFalse(any("releases/tags/" in path for _, path in self.http_requests))
+        for status in (401, 403, 404, 429, 500):
+            self.http_failures["releases?per_page=100&page=2"] = status
+            result = self.cli("verify", succeeds=False)
+            self.assertIn(f"release-list: HTTP {status}", result.stderr)
+            self.assertFalse(self.retained.exists())
+            self.assertIn("No retained payload", self.retention_state(False))
+        self.http_failures.clear()
+        self.extra_releases = [{"id": 2, "tag_name": self.tag, "draft": True}]
+        self.cli("verify", succeeds=False)
+        self.extra_releases = []
+        self.release_overrides["tag_name"] = "v9.9.9"
+        self.cli("verify", succeeds=False)
+        self.release_overrides.clear()
+        self.http_failures["releases/1"] = 403
+        result = self.cli("verify", succeeds=False)
+        self.assertIn("release-by-ID: HTTP 403", result.stderr)
+        self.http_failures.clear()
+        self.cli("prepare")
+        self.assertIn("Retained payload receipt present", self.retention_state(True))
+        self.assertFalse(self.uploads)
+        self.assertFalse(self.published)
 
     def test_network_failure_explicit_restore_complete_without_compile(self):
         # The pre-fix release.yml coupled submit/wait and uploaded only afterward.
@@ -1214,6 +1360,16 @@ else: raise SystemExit(27)
             name = asset["name"]
             if name not in self.uploads and name != "tyde-update.json":
                 self.uploads[name] = saved.get(name, b"other completed platform asset")
+        for name in release_tool.HEADLESS_ASSETS:
+            buffer = io.BytesIO()
+            with __import__('zipfile').ZipFile(buffer, "w") as archive:
+                archive.writestr("tyde-server.exe" if "windows" in name else "tyde-server", b"completed server")
+            if self.target not in name:
+                self.uploads[name] = buffer.getvalue()
+        for name in list(self.uploads):
+            if name.endswith(".sha256"):
+                package = name.removesuffix(".sha256")
+                self.uploads[name] = f"{hashlib.sha256(self.uploads[package]).hexdigest()}  /build/{package}\n".encode()
         msi = f"Tyde_{version}_x64_en-US.msi"
         del self.uploads[msi]
         self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
@@ -1234,6 +1390,48 @@ else: raise SystemExit(27)
         self.assertIn("darwin-aarch64", manifest["platforms"])
         self.assertIn("darwin-x86_64", manifest["platforms"])
         self.assertTrue((self.retained / "assembly.json").is_file())
+        self.assertFalse(self.published)
+        self.log.write_text("")
+        self.cli("finalize", "--fragments-run-id", "10", succeeds=False)
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", "--source-sha", "b" * 40, succeeds=False)
+        self.asset_overrides[msi] = {"digest": "sha256:" + "0" * 64}
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.asset_overrides.clear()
+        missing = self.uploads.pop(msi)
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.uploads[msi] = missing
+        original_manifest = self.uploads["tyde-update.json"]
+        self.uploads["tyde-update.json"] = b'{}'
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.uploads["tyde-update.json"] = original_manifest
+        self.published = True
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.published = False
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any(c[0] in ("trunk", "aws") for c in commands))
+        self.assertFalse(any(method == "PATCH" for method, _ in self.http_requests))
+        (self.root / "deploy-failure").touch()
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.assertFalse(self.published)
+        (self.root / "deploy-failure").unlink()
+        (self.root / "public-corruption").touch()
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.assertFalse(self.published)
+        (self.root / "public-corruption").unlink()
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm")
+        self.assertTrue(self.published)
+        finalization = json.loads((self.retained / "finalization.json").read_text())
+        self.assertEqual(finalization["state"], "published")
+        self.assertEqual(len(finalization["assets"]), 22)
+        self.assertEqual(finalization["source_sha"], self.source_sha)
+        live = json.loads((self.root / "s3/tyde/manifest.json").read_text())
+        self.assertEqual(live["versions"][version]["protocolVersion"], 41)
+        self.assertFalse(self.git(self.source, "status", "--porcelain", "--untracked-files=no"))
+        self.assertFalse(self.git(self.controller, "status", "--porcelain", "--untracked-files=no"))
+        self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.assertEqual(sum(method == "PATCH" for method, _ in self.http_requests), 1)
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any(c[0] == "cargo" or "submit" in c or (c[0] == "npx" and "build" in c) for c in commands))
 
     def test_rejects_mismatches_security_failures_and_published_mutations(self):
         (self.root / "wrong-arch").touch()
@@ -1287,6 +1485,7 @@ else: raise SystemExit(27)
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
         self.assertNotEqual(process.returncode, 0)
+        self.retention_state(True)
         data = json.loads((self.retained / "receipt.json").read_text())
         self.assertEqual(data["events"][-1], {"phase": "wait-dmg", "state": "started"})
         self.seal_artifact(20, self.retained)
