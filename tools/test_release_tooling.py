@@ -869,6 +869,56 @@ esac
 
 
 
+class MacosWorkflowParserTests(unittest.TestCase):
+    def test_recovery_workflow_contexts_with_real_actionlint(self):
+        import platform
+        import tarfile
+        import urllib.request
+
+        version = "1.7.12"
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+        architectures = {"x86_64": "amd64", "amd64": "amd64",
+                         "aarch64": "arm64", "arm64": "arm64"}
+        target = f"{system}_{architectures[machine]}"
+        checksums = {
+            "linux_amd64": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            "linux_arm64": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+            "darwin_amd64": "5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644",
+            "darwin_arm64": "aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f",
+        }
+        expected = checksums[target]
+        cache = REPO_ROOT / "target/workflow-parser"
+        cache.mkdir(parents=True, exist_ok=True)
+        archive = cache / f"actionlint_{version}_{target}.tar.gz"
+        if not archive.exists():
+            url = f"https://github.com/rhysd/actionlint/releases/download/v{version}/{archive.name}"
+            with urllib.request.urlopen(url) as response:
+                raw = response.read()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), expected)
+            archive.write_bytes(raw)
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "actionlint"
+            with tarfile.open(archive) as bundle:
+                binary.write_bytes(bundle.extractfile("actionlint").read())
+            binary.chmod(0o755)
+            command = [str(binary), "-shellcheck=", "-pyflakes=", "-no-color", "-"]
+            workflow = (REPO_ROOT / ".github/workflows/macos-release.yml").read_text()
+            result = subprocess.run(command, input=workflow, capture_output=True, text=True,
+                                    cwd=REPO_ROOT)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            # Restore the rejected context at the same job-level boundary.
+            rejected = workflow.replace("    env:\n", "    env:\n"
+                "      RETAINED: ${{ runner.temp }}/macos-retained\n"
+                "      EVIDENCE: ${{ runner.temp }}/macos-build-evidence\n", 1)
+            result = subprocess.run(command, input=rejected, capture_output=True, text=True,
+                                    cwd=REPO_ROOT)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn('context "runner" is not allowed here', result.stdout)
+
+
 class MacosControllerFlowTests(unittest.TestCase):
     """Real Git, CLI processes, HTTP artifact transport and updater cryptography.
 

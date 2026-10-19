@@ -85,11 +85,15 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       CONTROLLER_SHA: ${{ github.sha }}
       MACOS_TARGET: ${{ inputs.target }}
-      RETAINED: ${{ runner.temp }}/macos-retained
-      EVIDENCE: ${{ runner.temp }}/macos-build-evidence
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
+      - name: Initialize recovery paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'RETAINED=%s/macos-retained\nEVIDENCE=%s/macos-build-evidence\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
