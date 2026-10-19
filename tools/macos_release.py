@@ -12,6 +12,7 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,8 @@ from check_release_version import collect_versions
 from set_release_version import normalize_tag
 import update_manifest
 import release_tool
+
+SERVER_MEMBER = "release/tyde-server"
 
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 CONTROLLER = Path(__file__).resolve().parents[1]
@@ -376,12 +379,53 @@ def download(args, artifact_id, run_id, output):
     if metadata.get("digest") != "sha256:" + hashlib.sha256(raw).hexdigest():
         raise ControllerError("Artifact transport digest mismatch or missing digest")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        for entry in archive.infolist():
-            path = Path(entry.filename)
-            if path.is_absolute() or ".." in path.parts or entry.external_attr >> 16 & 0o170000 == 0o120000:
-                raise ControllerError("Unsafe retained artifact path")
+        verify_archive_paths(archive)
         archive.extractall(output)
     return metadata
+
+
+def verify_archive_paths(archive, *, app=False):
+    entries = {}
+    for entry in archive.infolist():
+        name = entry.filename
+        key = name.removesuffix("/")
+        parts = key.split("/")
+        mode = entry.external_attr >> 16
+        if app:
+            valid_mode = mode in ((0o40755,) if entry.is_dir() else (0o100644, 0o100755))
+        else:
+            # Transport permissions vary by runner OS and are not restored by
+            # extractall; only ordinary files/directories without special bits.
+            kind = stat.S_IFDIR if entry.is_dir() else stat.S_IFREG
+            valid_mode = stat.S_IFMT(mode) == kind and mode & 0o7000 == 0
+        if (entry.orig_filename != name or key in entries
+                or any(part in ("", ".", "..") for part in parts) or "\\" in name or ":" in name
+                or entry.create_system != 3 or not valid_mode
+                or (app and parts[0] != "Tyde.app")):
+            raise ControllerError("Unsafe retained archive path, mode or duplicate")
+        entries[key] = entry
+    for key in entries:
+        for parent in Path(key).parents:
+            if str(parent) in entries and not entries[str(parent)].is_dir():
+                raise ControllerError("Retained archive file/directory conflict")
+
+
+def verify_server_archive(path):
+    with zipfile.ZipFile(path) as archive:
+        entries = archive.infolist()
+        if (len(entries) != 1 or entries[0].orig_filename != SERVER_MEMBER
+                or entries[0].filename != SERVER_MEMBER
+                or entries[0].create_system != 3 or entries[0].external_attr >> 16 != 0o100755
+                or entries[0].file_size == 0 or archive.testzip() is not None):
+            raise ControllerError("Invalid macOS server archive: require one regular executable release/tyde-server")
+
+
+def verify_app_archive(path):
+    with zipfile.ZipFile(path) as archive:
+        verify_archive_paths(archive, app=True)
+        if ("Tyde.app/Contents/Info.plist" not in archive.namelist()
+                or "Tyde.app/Contents/MacOS/tyde" not in archive.namelist() or archive.testzip() is not None):
+            raise ControllerError("Incomplete retained application archive")
 
 
 def receipt(args):
@@ -401,6 +445,8 @@ def receipt(args):
     if set(data["payloads"]) != expected:
         raise ControllerError("Incomplete retained payload receipt")
     verify_files(args.retained, data["payloads"])
+    verify_server_archive(args.retained / "server.zip")
+    verify_app_archive(args.retained / "app.zip")
     return data
 
 
@@ -504,6 +550,8 @@ def prepare(args):
     args.retained.mkdir(parents=True)
     command(["ditto", "-c", "-k", "--keepParent", app, args.retained / "app.zip"])
     command(["ditto", "-c", "-k", "--keepParent", server, args.retained / "server.zip"])
+    verify_server_archive(args.retained / "server.zip")
+    verify_app_archive(args.retained / "app.zip")
     data = {"schema": 1, "repository": args.repository, "tag": args.tag,
             "source_sha": args.source_sha, "target": args.target,
             "controller_sha": args.controller_sha, "run_id": os.environ["GITHUB_RUN_ID"],
@@ -603,7 +651,7 @@ def package(args):
     command(["ditto", "-x", "-k", args.retained / "app.zip", work])
     command(["ditto", "-x", "-k", args.retained / "server.zip", work])
     app = work / "Tyde.app"
-    verify_app(args, app, work / "tyde-server")
+    verify_app(args, app, work / SERVER_MEMBER)
     gatekeeper(args, data, "app", app)
     bundle = work / "bundle/macos"
     bundle.mkdir(parents=True)
@@ -795,10 +843,13 @@ def verify_release_payloads(args, assembly, root):
         if name == "tyde-update.json" and sha != assembly["manifest_sha256"]:
             raise ControllerError("Aggregate manifest differs from verified same-source fragments")
         if name.startswith("tyde-server-"):
-            with zipfile.ZipFile(path) as archive:
-                binary = "tyde-server.exe" if "windows" in name else "tyde-server"
-                if archive.namelist() != [binary] or archive.getinfo(binary).file_size == 0 or archive.testzip() is not None:
-                    raise ControllerError("Invalid headless server archive")
+            if name in {f"tyde-server-{target}.zip" for target in TARGETS}:
+                verify_server_archive(path)
+            else:
+                with zipfile.ZipFile(path) as archive:
+                    binary = "tyde-server.exe" if "windows" in name else "tyde-server"
+                    if archive.namelist() != [binary] or archive.getinfo(binary).file_size == 0 or archive.testzip() is not None:
+                        raise ControllerError("Invalid headless server archive")
         if name.endswith(".dmg"):
             command(["hdiutil", "verify", path])
             command(["codesign", "--verify", "--strict", path])

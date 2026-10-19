@@ -596,3 +596,53 @@ it implicitly; `confirm_publish` defaults false and CLI `finalize` also requires
 `--confirm`. The existing beta-only `./dev.sh release publish` remains unchanged.
 No ad hoc `gh release edit`, source/tag promotion, rebuild of successful
 platforms, validation attestation, or version-only source gate is introduced.
+
+### Signed macOS server ZIP contract
+
+`prepare` archives the signed file at
+`target/<target>/release/tyde-server` with
+`ditto -c -k --keepParent`. The canonical macOS ZIP has exactly one member:
+`release/tyde-server`, a nonempty Unix regular executable with mode `100755`.
+`prepare` validates that output before recording a signed checkpoint. Every
+receipt consumer validates the same contract after checking payload hashes;
+`package` verifies the extracted `work/release/tyde-server`. Completion copies
+that ZIP byte-for-byte to the headless release asset, and finalization checks
+this same macOS layout. Linux and Windows headless layouts are unchanged.
+There is no root-member alternative or archive search.
+
+ARM run `39260355030` (controller `25038b19`, frozen stable source `83ad2d3c`)
+retained artifact `12194400987` with this exact layout and executable mode.
+Its transport SHA-256 is
+`fede32580e071b6f1f97d0bbad34d119dac694e4fef60753e7fb071c78cdda05`;
+its server ZIP SHA-256 is
+`49b0617293c4dd4fb5a8414e38a295f6e82131708899e487cec3f4762cd3ed6e`.
+Both submissions were Accepted. The former package consumer instead requested
+`work/tyde-server`, and finalization also expected a root-level server member.
+This is an archive contract mismatch, not evidence of source, signing or Apple
+rejection. The original raw lipo stderr was redacted, so no more specific tool
+failure diagnosis is claimed.
+
+The CLI regression uses real ZIP bytes, Git checkouts and HTTP artifact
+transport, with platform-command substitutes on non-macOS hosts. Its producer
+models the observed file-input ditto layout, and its lipo substitute now rejects
+missing paths. Previously the producer substitute stripped `release/` and lipo
+reported success regardless of path existence, masking the mismatch. The flow
+restores an Accepted checkpoint after deleting the build products, packages it
+without submitting/waiting/building, and checks unchanged signed ZIP bytes and
+submission records. Malformed members are rejected through restore even when
+payload and transport hashes match. These tests do not establish actual macOS
+stapler/Gatekeeper behavior; a separately authorized retained-checkpoint
+continuation must establish that on macOS. No rebuild or resubmission is needed
+to exercise the corrected package path.
+
+An additional continuation flow checks out the actual original `25038b19`
+controller and frozen `83ad2d3c` source from real Git history, runs that
+controller's `prepare` producer with small product substitutes, and seals an
+Accepted checkpoint using the original run/artifact metadata. It deletes the
+build products, restores through the corrected controller, proves the original
+controller fails at lipo, and proves the corrected consumer reaches signature
+verification and the explicit Gatekeeper-rejection boundary without compiling
+or resubmitting. This is a fixture artifact, not the retained signed production
+payload or a claim that Apple verification passed. The complete synthetic
+package flow separately covers updater/DMG continuation. Fixture product modes
+are explicit, matching observed `644`/`755` rather than inheriting host umask.

@@ -1108,9 +1108,12 @@ if (process.argv[2] === 'generate') {
         app = self.bundle / "bundle/macos/Tyde.app/Contents"
         (app / "MacOS").mkdir(parents=True)
         (app / "MacOS/tyde").write_bytes(b"signed desktop")
+        (app / "MacOS/tyde").chmod(0o755)
         import plistlib
         (app / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.2.3"}))
+        (app / "Info.plist").chmod(0o644)
         (self.bundle / "tyde-server").write_bytes(b"signed server")
+        (self.bundle / "tyde-server").chmod(0o755)
         stub = self.bin / "fixture-command"
         stub.write_text("#!" + sys.executable + "\n" + r'''
 import io,json,os,pathlib,shutil,subprocess,sys,urllib.request,zipfile
@@ -1173,7 +1176,9 @@ if name=='curl':
  if '--dump-header' in args:
   pathlib.Path(args[args.index('--dump-header')+1]).write_text('HTTP/2 200 OK\nContent-Type: '+('application/wasm' if url.endswith('.wasm') else 'application/javascript')+'\n')
  sys.exit()
-if name=='lipo': print('x86_64' if (root/'wrong-arch').exists() else 'arm64')
+if name=='lipo':
+ if not pathlib.Path(args[-1]).is_file(): raise SystemExit(1)
+ print('x86_64' if (root/'wrong-arch').exists() else 'arm64')
 elif name=='codesign': pass
 elif name=='route': print('destination: 17.0.0.1\ngateway: 192.0.2.1\ninterface: en0')
 elif name=='dscacheutil': print('ip_address: 17.0.0.1')
@@ -1186,7 +1191,7 @@ elif name=='ditto':
   source=pathlib.Path(args[3])
   with zipfile.ZipFile(args[4],'w') as z:
    for p in source.rglob('*') if source.is_dir() else [source]:
-    if p.is_file(): z.write(p,p.relative_to(source.parent))
+    if p.is_file(): z.write(p,p.relative_to(source.parent if source.is_dir() else source.parent.parent))
  else: shutil.copytree(*args)
 elif name=='hdiutil':
  if args[0]=='create':
@@ -1251,7 +1256,11 @@ else: raise SystemExit(27)
         buffer = io.BytesIO()
         with __import__('zipfile').ZipFile(buffer, "w") as archive:
             for path in folder.rglob("*"):
-                if path.is_file(): archive.write(path, path.relative_to(folder))
+                if path.is_file():
+                    entry = __import__('zipfile').ZipInfo.from_file(path, str(path.relative_to(folder)))
+                    if name == "update-x86_64-pc-windows-msvc":
+                        entry.external_attr = 0o100666 << 16
+                    archive.writestr(entry, path.read_bytes())
         raw = buffer.getvalue()
         self.responses[f"actions/artifacts/{artifact_id}"] = {
             "id": artifact_id, "name": name, "expired": False,
@@ -1530,6 +1539,164 @@ else: raise SystemExit(27)
         self.assertFalse(self.uploads)
         self.assertFalse(self.published)
 
+    def test_signed_server_archive_contract_restore_and_package(self):
+        import zipfile
+
+        self.prepare()
+        original = {name: (self.retained / name).read_bytes() for name in ("server.zip", "app.zip")}
+        with zipfile.ZipFile(io.BytesIO(original["server.zip"])) as archive:
+            self.assertEqual(archive.namelist(), ["release/tyde-server"])
+            self.assertEqual(archive.getinfo("release/tyde-server").external_attr >> 16, 0o100755)
+        # The observed ditto file producer keeps release/, unlike a directory
+        # producer. Prove that the old consumer's exact CLI path is absent.
+        extracted = self.root / "old-consumer"
+        subprocess.run(["ditto", "-x", "-k", self.retained / "server.zip", extracted], env=self.env, check=True)
+        old = subprocess.run(["lipo", "-archs", extracted / "tyde-server"], env=self.env, capture_output=True)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertEqual((extracted / "release/tyde-server").read_bytes(), b"signed server")
+        self.cli("submit", "--kind", "server")
+        self.cli("submit", "--kind", "app")
+        data = json.loads((self.retained / "receipt.json").read_text())
+        for submission in data["submissions"].values():
+            submission["status"] = "Accepted"
+        data["phase"] = "accepted-app"
+        (self.retained / "receipt.json").write_text(json.dumps(data))
+        self.seal_artifact(20, self.retained)
+        shutil.rmtree(self.retained)
+        shutil.rmtree(self.source / "target")
+        self.log.write_text("")
+        self.cli("restore", "--run-id", "10", "--artifact-id", "20")
+        self.cli("package")
+        packaged = json.loads((self.retained / "receipt.json").read_text())
+        self.assertTrue(packaged["packaged"])
+        self.assertEqual(packaged["submissions"], data["submissions"])
+        self.assertEqual(original, {name: (self.retained / name).read_bytes() for name in original})
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIn(["lipo", "-archs", str(self.retained / "work/release/tyde-server")], commands)
+        self.assertFalse(any("submit" in c or "wait" in c or "build" in c or c[0] == "cargo" for c in commands))
+        self.assertFalse(self.uploads)
+        self.assertFalse(self.published)
+
+        # Correct payload and transport hashes do not bless unsafe ZIP members.
+        # Exercise rejection through restore, before any extraction/tool use.
+        baseline = self.root / "unsafe-checkpoint"
+        baseline.mkdir()
+        (baseline / "receipt.json").write_text(json.dumps(data))
+        (baseline / "app.zip").write_bytes(original["app.zip"])
+        cases = [
+            [("tyde-server", 0o100755)],
+            [("release/tyde-server", 0o120777)],
+            [("release/tyde-server", 0o104755)],
+            [("release/tyde-server", 0o100644)],
+            [("release/tyde-server/", 0o40755)],
+            [("/release/tyde-server", 0o100755)],
+            [("release/../tyde-server", 0o100755)],
+            [("release\\tyde-server", 0o100755)],
+            [("release/tyde-server", 0o100755)] * 2,
+            [("release/tyde-server", 0o100755), ("extra", 0o100644)],
+        ]
+        import warnings
+        for members in cases:
+            with self.subTest(members=members):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)  # Deliberate duplicate ZIP member.
+                    with zipfile.ZipFile(baseline / "server.zip", "w") as archive:
+                        for name, mode in members:
+                            entry = zipfile.ZipInfo(name)
+                            entry.create_system = 3
+                            entry.external_attr = mode << 16
+                            archive.writestr(entry, b"signed server")
+                data["payloads"]["server.zip"] = hashlib.sha256((baseline / "server.zip").read_bytes()).hexdigest()
+                (baseline / "receipt.json").write_text(json.dumps(data))
+                self.seal_artifact(21, baseline)
+                shutil.rmtree(self.retained)
+                self.log.write_text("")
+                result = self.cli("restore", "--run-id", "10", "--artifact-id", "21", succeeds=False)
+                self.assertIn("Invalid macOS server archive", result.stderr)
+                commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+                self.assertFalse(any(c[0] in ("ditto", "lipo", "xcrun", "hdiutil") for c in commands))
+
+    def test_original_checkpoint_provenance_with_corrected_controller(self):
+        import plistlib
+        import zipfile
+
+        original_bundle = self.bundle
+        self.tag = "v0.9.5"
+        self.source_sha = "83ad2d3c03b4c2661adb22ad435dd073a9530bab"
+        original_controller = "25038b19a98fa2cc3a13d85f76c6eef81928746c"
+        original_run = 39260355030
+        artifact_id = 12194400987
+        candidate_sha = self.git(REPO_ROOT, "rev-parse", "HEAD")
+        self.source = self.root / "checkpoint-source"
+        legacy = self.root / "checkpoint-producer"
+        candidate = self.root / "checkpoint-consumer"
+        for checkout, revision in ((self.source, self.source_sha), (legacy, original_controller),
+                                   (candidate, candidate_sha)):
+            self.git(self.root, "clone", "--shared", "--no-checkout", "-q", str(REPO_ROOT), str(checkout))
+            self.git(checkout, "checkout", "-q", "--detach", revision)
+        self.git(candidate, "update-ref", "refs/heads/main", candidate_sha)
+        origin = self.root / "checkpoint-origin.git"
+        self.git(self.root, "clone", "--shared", "--bare", "-q", str(candidate), str(origin))
+        for checkout in (self.source, legacy, candidate):
+            self.git(checkout, "remote", "set-url", "origin", f"https://github.com/{self.repository}.git")
+            self.git(checkout, "config", f"url.file://{origin}.insteadOf", f"https://github.com/{self.repository}.git")
+            self.git(checkout, "update-ref", "refs/remotes/origin/main", candidate_sha)
+        self.controller = legacy
+        self.controller_sha = original_controller
+        self.env["GITHUB_RUN_ID"] = str(original_run)
+        self.responses[f"actions/runs/{original_run}"] = self.run_metadata(original_run)
+        self.bundle = self.source / f"target/{self.target}/release"
+        shutil.copytree(original_bundle, self.bundle)
+        info = self.bundle / "bundle/macos/Tyde.app/Contents/Info.plist"
+        info.write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.9.5"}))
+        # Execute the original controller's actual prepare producer and source
+        # guards with small signed-product substitutes, not a handbuilt receipt.
+        self.prepare()
+        with zipfile.ZipFile(self.retained / "server.zip") as archive:
+            self.assertEqual(archive.namelist(), ["release/tyde-server"])
+        self.cli("submit", "--kind", "server")
+        self.cli("submit", "--kind", "app")
+        data = json.loads((self.retained / "receipt.json").read_text())
+        for submission in data["submissions"].values():
+            submission["status"] = "Accepted"
+        data["phase"] = "accepted-app"
+        (self.retained / "receipt.json").write_text(json.dumps(data))
+        original = {name: (self.retained / name).read_bytes() for name in ("app.zip", "server.zip")}
+        self.seal_artifact(artifact_id, self.retained, run_id=original_run)
+        shutil.rmtree(self.retained)
+        shutil.rmtree(self.source / "target")
+        self.controller = candidate
+        self.controller_sha = candidate_sha
+        self.env["GITHUB_RUN_ID"] = "11"
+        self.responses["actions/runs/11"] = self.run_metadata(11)
+        self.cli("restore", "--run-id", str(original_run), "--artifact-id", str(artifact_id))
+        self.log.write_text("")
+        old_argv = self.argv("package")
+        old_argv[1] = str(legacy / "tools/macos_release.py")
+        old_argv[old_argv.index("--controller-sha") + 1] = original_controller
+        old = subprocess.run(old_argv, env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("lipo: process-error (exit 1", old.stderr)
+        # Stop at an explicit Gatekeeper rejection: real Apple verification and
+        # the production updater key are not simulated as proven by this flow.
+        (self.root / "reject-spctl").touch()
+        self.log.write_text("")
+        corrected = self.cli("package", succeeds=False)
+        self.assertIn("gatekeeper-app failed", corrected.stderr)
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIn(["lipo", "-archs", str(self.retained / "work/release/tyde-server")], commands)
+        self.assertIn(["codesign", "--verify", "--strict", str(self.retained / "work/release/tyde-server")], commands)
+        self.assertFalse(any("submit" in c or "wait" in c or "build" in c or c[0] == "cargo" for c in commands))
+        resumed = json.loads((self.retained / "receipt.json").read_text())
+        self.assertEqual(resumed["controller_sha"], original_controller)
+        self.assertEqual(resumed["run_id"], str(original_run))
+        self.assertEqual(resumed["source_sha"], self.source_sha)
+        self.assertEqual(resumed["submissions"], data["submissions"])
+        self.assertEqual(original, {name: (self.retained / name).read_bytes() for name in original})
+        self.assertFalse((self.retained / "signed.dmg").exists())
+        self.assertFalse(self.uploads)
+        self.assertFalse(self.published)
+
     def test_network_failure_explicit_restore_complete_without_compile(self):
         # The pre-fix release.yml coupled submit/wait and uploaded only afterward.
         # Execute that original CLI boundary before the retained flow, including
@@ -1632,7 +1799,11 @@ else: raise SystemExit(27)
         for name in release_tool.HEADLESS_ASSETS:
             buffer = io.BytesIO()
             with __import__('zipfile').ZipFile(buffer, "w") as archive:
-                archive.writestr("tyde-server.exe" if "windows" in name else "tyde-server", b"completed server")
+                member = "release/tyde-server" if "apple-darwin" in name else "tyde-server.exe" if "windows" in name else "tyde-server"
+                entry = __import__('zipfile').ZipInfo(member)
+                entry.create_system = 3
+                entry.external_attr = 0o100755 << 16
+                archive.writestr(entry, b"completed server")
             if self.target not in name:
                 self.uploads[name] = buffer.getvalue()
         for name in list(self.uploads):
