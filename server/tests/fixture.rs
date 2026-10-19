@@ -50,6 +50,7 @@ pub const ROUTINE_CONTROL_PLANE_KINDS: &[FrameKind] = &[
     FrameKind::SessionSchemas,
     FrameKind::LaunchProfileCatalogNotify,
     FrameKind::BackendSetup,
+    FrameKind::SelfImprovementNotify,
 ];
 
 #[allow(dead_code)]

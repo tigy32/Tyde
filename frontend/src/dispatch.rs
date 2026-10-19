@@ -151,6 +151,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         release_version: None,
     };
     let mut bootstrap = BootstrapHostPayload {
+        self_improvement: Default::default(),
         tychat: protocol::TychatStatePayload::default(),
         dots: Default::default(),
         agents_with_background_work: Vec::new(),
@@ -158,6 +159,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
+            self_improvement: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             default_launch_profile_id: None,
@@ -393,6 +395,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_bootstrap payload: {error}"),
             ),
         },
+        FrameKind::SelfImprovementNotify => {
+            match envelope.parse_payload::<protocol::SelfImprovementState>() {
+                Ok(payload) => state.self_improvement_by_host.update(|hosts| {
+                    hosts.insert(host_id.to_owned(), payload);
+                }),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("Invalid self-improvement state: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentTurnStateNotify => {
             match envelope.parse_payload::<protocol::AgentTurnStateNotifyPayload>() {
                 Ok(payload) => {
@@ -6810,6 +6826,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         payload.team_members.len(),
     );
 
+    state.self_improvement_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.self_improvement);
+    });
     state.dots_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.dots);
     });
@@ -7667,6 +7686,7 @@ pub(crate) mod restore_fixtures {
             FrameKind::HostBootstrap,
             seq,
             &HostBootstrapPayload {
+                self_improvement: Default::default(),
                 tychat: protocol::TychatStatePayload::default(),
                 dots: Default::default(),
                 agents_with_background_work: Vec::new(),
@@ -7674,6 +7694,7 @@ pub(crate) mod restore_fixtures {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: Vec::new(),
                     default_backend: None,
                     default_launch_profile_id: None,

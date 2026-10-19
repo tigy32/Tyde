@@ -155,6 +155,10 @@ impl HostSettingsStore {
             .join("settings.json"))
     }
 
+    pub(crate) fn learning_journal_path(&self) -> PathBuf {
+        self.path.with_file_name("self-improvement.json")
+    }
+
     pub fn get(&self) -> Result<HostSettings, String> {
         Self::read_from_disk(&self.path)
     }
@@ -816,6 +820,7 @@ fn empty_settings() -> HostSettings {
         resume_previous_agents: settings_model::default_resume_previous_agents(),
         pause_swarms_on_restart: false,
         review: settings_model::ReviewSettings::default(),
+        self_improvement: Default::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
         default_launch_profile_id: None,
@@ -1013,6 +1018,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         tyde_agent_control_max_depth: settings.tyde_agent_control_max_depth,
         delegation_launch_profile_order,
         review: settings.review,
+        self_improvement: settings.self_improvement,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,

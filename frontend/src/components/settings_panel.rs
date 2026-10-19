@@ -413,6 +413,7 @@ enum SettingsTab {
     Review,
     McpServers,
     Steering,
+    SelfImprovement,
     Skills,
     CodeIntelligence,
     Voice,
@@ -447,6 +448,7 @@ impl SettingsTab {
             Self::Review => "Review",
             Self::McpServers => "MCP Servers",
             Self::Steering => "Steering",
+            Self::SelfImprovement => "Self-improvement",
             Self::Skills => "Skills",
             Self::CodeIntelligence => "Code Intelligence",
             Self::Voice => "Voice",
@@ -471,6 +473,7 @@ impl SettingsTab {
             | Self::CustomAgents
             | Self::McpServers
             | Self::Steering
+            | Self::SelfImprovement
             | Self::Skills
             | Self::CodeIntelligence
             | Self::Voice
@@ -676,6 +679,15 @@ impl SettingsTab {
                 "Headers",
                 "New MCP server",
             ],
+            Self::SelfImprovement => &[
+                "Self-improvement",
+                "feedback",
+                "analyzer",
+                "Suggest",
+                "Automatic",
+                "steering",
+                "review aspects",
+            ],
             Self::Steering => &[
                 "Steering",
                 "Scope",
@@ -738,7 +750,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 20] = [
+const ALL_TABS: [SettingsTab; 21] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
@@ -752,6 +764,7 @@ const ALL_TABS: [SettingsTab; 20] = [
     SettingsTab::CustomAgents,
     SettingsTab::McpServers,
     SettingsTab::Steering,
+    SettingsTab::SelfImprovement,
     SettingsTab::Skills,
     SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
@@ -777,7 +790,7 @@ const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 13] = [
+const HOST_GROUP_TABS: [SettingsTab; 14] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
@@ -785,6 +798,7 @@ const HOST_GROUP_TABS: [SettingsTab; 13] = [
     SettingsTab::Review,
     SettingsTab::CustomAgents,
     SettingsTab::Steering,
+    SettingsTab::SelfImprovement,
     SettingsTab::Skills,
     SettingsTab::McpServers,
     SettingsTab::CodeIntelligence,
@@ -997,6 +1011,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Review => view! { <ReviewSettingsTab /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
+                                    SettingsTab::SelfImprovement => view! { <SelfImprovementTab /> }.into_any(),
                                     SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
                                     SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
@@ -8929,6 +8944,212 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
     }
 }
 
+#[component]
+fn SelfImprovementTab() -> impl IntoView {
+    use protocol::{
+        LearningAnalyzer, LearningConfig, LearningMode, LearningRule, SelfImprovementAction,
+    };
+    let state = expect_context::<AppState>();
+    let store = StoredValue::new(state.clone());
+    let scope = RwSignal::new(None::<SteeringScope>);
+    let usage_open = RwSignal::new(false);
+    let proposal_editor = RwSignal::new(None::<protocol::LearningChange>);
+    let steering_editor = RwSignal::new(None::<SteeringForm>);
+    let aspect_editor = RwSignal::new(None::<(String, protocol::ReviewAspectConfig)>);
+    Effect::new(move |_| {
+        let state = store.get_value();
+        let host = state.selected_host_id.get();
+        scope.set(
+            state
+                .active_project
+                .get()
+                .filter(|project| Some(&project.host_id) == host.as_ref())
+                .map(|project| SteeringScope::Project(project.project_id)),
+        );
+        proposal_editor.set(None);
+        steering_editor.set(None);
+        aspect_editor.set(None);
+    });
+    let config = Memo::new(move |_| {
+        let settings = store.get_value().selected_host_settings()?;
+        Some(match scope.get()? {
+            SteeringScope::Host => settings.self_improvement.host,
+            SteeringScope::Project(id) => settings
+                .self_improvement
+                .projects
+                .get(&id)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    });
+    let snapshot = Memo::new(move |_| {
+        let state = store.get_value();
+        state
+            .selected_host_id
+            .get()
+            .and_then(|host| state.self_improvement_by_host.get().get(&host).cloned())
+            .unwrap_or_default()
+    });
+    let scope_state = Memo::new(move |_| {
+        snapshot
+            .get()
+            .scopes
+            .into_iter()
+            .find(|state| Some(&state.scope) == scope.get().as_ref())
+    });
+    let save = Callback::new(move |config: LearningConfig| {
+        let path = match scope.get_untracked() {
+            Some(SteeringScope::Host) => "/self_improvement/host".to_owned(),
+            Some(SteeringScope::Project(id)) => format!(
+                "/self_improvement/projects/{}",
+                settings_model::escape_pointer_token(&id.0)
+            ),
+            None => return,
+        };
+        send_host_replace(&store.get_value(), path, config);
+    });
+    view! {
+        <section class="self-improvement-settings">
+            <header class="learning-heading"><div><h2 class="settings-panel-title">"Self-improvement"</h2><p class="settings-description">"Turn durable feedback into steering and review aspects."</p></div>
+                <label class="settings-toggle-row"><input type="checkbox" role="switch" aria-label="Enable self-improvement" disabled=move || config.get().is_none()
+                    prop:checked=move || config.get().is_some_and(|config| config.enabled)
+                    on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.enabled = event_target_checked(&ev); save.run(config); }/><span>"Enabled"</span></label>
+            </header>
+            <div class="learning-config">
+                <div class="learning-row"><label>"Mode"</label><div><div class="review-segments" role="group" aria-label="Self-improvement mode">
+                    {[LearningMode::Suggest, LearningMode::Automatic].into_iter().map(move |mode| view! { <button type="button" aria-pressed=move || config.get().is_some_and(|config| config.mode == mode) disabled=move || config.get().is_none()
+                        on:click=move |_| if let Some(mut config) = config.get_untracked() { config.mode = mode; save.run(config); }>{if mode == LearningMode::Suggest { "Suggest" } else { "Automatic" }}</button> }).collect_view()}
+                </div><p class="settings-description">{move || if config.get().is_some_and(|config| config.mode == LearningMode::Automatic) { "Add and update learned rules automatically. Human-owned edits still require approval." } else { "Review proposals before applying. Nothing changes until you Apply." }}</p></div></div>
+                <div class="learning-row"><label for="learning-scope">"Scope"</label><div>
+                    <select id="learning-scope" class="settings-select" aria-label="Self-improvement scope" prop:value=move || match scope.get() { Some(SteeringScope::Host) => "host".into(), Some(SteeringScope::Project(id)) => id.0, None => String::new() }
+                        on:change=move |ev| { let value = event_target_value(&ev); scope.set(if value.is_empty() { None } else if value == "host" { Some(SteeringScope::Host) } else { Some(SteeringScope::Project(ProjectId(value))) }); }>
+                        <option value="">"Choose this project"</option>
+                        {move || { let state = store.get_value(); let host = state.selected_host_id.get(); state.projects.get().into_iter().filter(|project| Some(&project.host_id) == host.as_ref()).map(|project| view! { <option value=project.project.id.0>{format!("This project · {}", project.project.name)}</option> }).collect_view() }}
+                        <option value="host">"Host-wide (explicit opt-in)"</option>
+                    </select><p class="settings-description">"Host-wide learning is separate and off by default. Only the selected scope can be changed."</p>
+                </div></div>
+                <div class="learning-row"><label>"Analyzer"</label><div class="learning-analyzer">
+                    <select class="settings-select" aria-label="Analyzer backend" disabled=move || config.get().is_none() prop:value=move || config.get().and_then(|config| config.analyzer).map(|analyzer| format!("{:?}", analyzer.backend_kind)).unwrap_or_default()
+                        on:change=move |ev| { let value = event_target_value(&ev); if let Some(mut config) = config.get_untracked() { config.analyzer = snapshot.get_untracked().analyzers.into_iter().find(|option| format!("{:?}", option.backend_kind) == value).map(|option| LearningAnalyzer { backend_kind: option.backend_kind, model: String::new() }); save.run(config); } }>
+                        <option value="">"Select explicitly"</option>{move || snapshot.get().analyzers.into_iter().map(|option| { let supported = matches!(option.capability, protocol::LearningAnalyzerCapability::ToolFreeReusable); view! { <option value=format!("{:?}", option.backend_kind) disabled=!supported>{format!("{:?} · {}", option.backend_kind, if supported { "tool-free" } else { "unsupported" })}</option> } }).collect_view()}
+                    </select>
+                    <select class="settings-select" aria-label="Analyzer model" disabled=move || config.get().and_then(|config| config.analyzer).is_none() prop:value=move || config.get().and_then(|config| config.analyzer).map(|analyzer| analyzer.model).unwrap_or_default()
+                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { if let Some(analyzer) = &mut config.analyzer { analyzer.model = event_target_value(&ev); } save.run(config); }>
+                        <option value="">"Select a low-cost model"</option>
+                        {move || { let state = store.get_value(); let model_options = state.selected_host_id.get().and_then(|host| state.session_schemas.get().get(&host).cloned()).unwrap_or_default().into_values().find_map(|entry| match entry { SessionSchemaEntry::Ready { schema } if schema.backend_kind == BackendKind::Codex => Some(schema.fields), _ => None }).unwrap_or_default().into_iter().find(|field| field.key == "model").and_then(|field| match field.field_type { SessionSettingFieldType::Select { options, .. } => Some(options), _ => None }).unwrap_or_default(); model_options.into_iter().map(|option| view! { <option value=option.value>{option.label}</option> }).collect_view() }}
+                    </select>
+                    <p class="settings-description">"Uses your selected provider. Low reasoning effort; no tools, shell, MCP, or sign-in changes. Other backends do not yet support this helper mode."</p>
+                </div></div>
+                <div class="learning-row"><label>"Run on"</label><div><span>"New user messages"</span><p class="settings-description">"Every new human input, even while an agent is working. Assistant replies and tool activity never trigger analysis."</p></div></div>
+                <div class="learning-row"><label>"Can update"</label><div class="learning-targets">
+                    <label><input type="checkbox" aria-label="Learn steering" prop:checked=move || config.get().is_some_and(|config| config.steering) disabled=move || config.get().is_none()
+                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.steering = event_target_checked(&ev); save.run(config); }/>"Steering"</label>
+                    <label><input type="checkbox" aria-label="Learn review aspects" prop:checked=move || config.get().is_some_and(|config| config.review_aspects) disabled=move || config.get().is_none()
+                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.review_aspects = event_target_checked(&ev); save.run(config); }/>"Review aspects"</label>
+                </div></div>
+                <footer class="learning-footer"><span>{move || scope_state.get().map(|state| match state.status {
+                    protocol::LearningStatus::Disabled => "Disabled · no model calls".into(), protocol::LearningStatus::Ready => "Ready".into(), protocol::LearningStatus::Running => format!("Analyzing · {} queued", state.queued), protocol::LearningStatus::Unsupported { reason } => format!("Unsupported · {reason}"), protocol::LearningStatus::Failed { reason } => format!("Analysis failed · {reason}"),
+                }).unwrap_or_else(|| "Disabled · no model calls".into())}</span><span>{move || scope_state.get().and_then(|state| state.last_checked_ms).map(|time| format!("Last checked {}", js_sys::Date::new(&JsValue::from_f64(time as f64)).to_iso_string().as_string().unwrap_or_default())).unwrap_or_else(|| "Not checked yet".into())}</span><button class="settings-btn" on:click=move |_| usage_open.update(|open| *open = !*open)>"View usage"</button></footer>
+            </div>
+            <p class="settings-description">"Learning never interrupts the current turn. Canonical steering is loaded by new and resumed sessions; running sessions keep their launch policy. Editing a learned rule in its normal editor protects it from future automatic edits."</p>
+            <Show when=move || snapshot.get().error.is_some()><p role="alert">{move || snapshot.get().error}</p></Show>
+            <Show when=move || usage_open.get()><section aria-label="Analyzer usage"><h3>"Analyzer usage"</h3>{move || snapshot.get().usage.into_iter().filter(|usage| Some(&usage.scope) == scope.get().as_ref()).map(|usage| view! { <p>{format!("{:?} · {} · {} human inputs · {}", usage.analyzer.backend_kind, usage.analyzer.model, usage.input_ids.len(), learning_usage_label(&usage.usage))}</p> }).collect_view() }</section></Show>
+            <h3>"Recent changes"</h3>
+            <p class="settings-description">"Before, after, reason, and originating feedback. Undo is revision-checked and never overwrites a later edit."</p>
+            {move || { let changes = snapshot.get().changes.into_iter().filter(|change| Some(&change.scope) == scope.get().as_ref()).collect::<Vec<_>>();
+                if changes.is_empty() { view! { <p class="settings-description">"No changes in this scope."</p> }.into_any() } else { changes.into_iter().map(move |change| {
+                    let id = change.id.clone(); let undo_id = id.clone(); let dismiss_id = id.clone(); let edit = change.clone();
+                    let origin = change.origin_agent_id.clone();
+                    let pending = matches!(change.status, protocol::LearningChangeStatus::Pending);
+                    let applied = matches!(change.status, protocol::LearningChangeStatus::Applied);
+                    let before = change.operation.before.as_ref().map(learning_rule_label).unwrap_or_else(|| "New rule".into());
+                    let after = learning_rule_label(&change.operation.after);
+                    let status = match &change.status { protocol::LearningChangeStatus::Pending if change.requires_approval => "Human approval required".into(), protocol::LearningChangeStatus::Pending => "Suggested".into(), protocol::LearningChangeStatus::Applied => "Applied".into(), protocol::LearningChangeStatus::Applying => "Applying".into(), protocol::LearningChangeStatus::Undoing => "Undoing".into(), protocol::LearningChangeStatus::Undone => "Undone".into(), protocol::LearningChangeStatus::Dismissed => "Dismissed".into(), protocol::LearningChangeStatus::Conflict { reason } => format!("Conflict · {reason}") };
+                    view! { <article class="learning-change"><header><strong>{status}</strong><div>
+                        {pending.then(|| view! { <button class="settings-btn" on:click=move |_| send_learning_action(store.get_value(), SelfImprovementAction::Apply { id: id.clone() })>"Apply"</button> })}
+                        {applied.then(|| view! { <button class="settings-btn" on:click=move |_| send_learning_action(store.get_value(), SelfImprovementAction::Undo { id: undo_id.clone() })>"Undo"</button> })}
+                        {(pending || applied).then(|| view! { <button class="settings-btn" on:click=move |_| {
+                            if pending { proposal_editor.set(Some(edit.clone())); } else { let state = store.get_value(); match &edit.operation.after {
+                                LearningRule::Steering { steering } => { let current = state.selected_host_id.get_untracked().and_then(|host| state.steering.get_untracked().get(&host).and_then(|rules| rules.get(&steering.id).cloned())); if let Some(current) = current { steering_editor.set(Some(SteeringForm::from_steering(&current))); } }
+                                LearningRule::ReviewAspect { id, .. } => { if let Some(current) = state.selected_host_settings().and_then(|settings| settings.review.aspects.get(id).cloned()) { aspect_editor.set(Some((id.clone(), current))); } }
+                            } }
+                        }>"Edit"</button> })}
+                        {pending.then(|| view! { <button class="settings-btn" on:click=move |_| send_learning_action(store.get_value(), SelfImprovementAction::Dismiss { id: dismiss_id.clone() })>"Dismiss"</button> })}
+                    </div></header><dl><dt>"Before"</dt><dd>{before}</dd><dt>"After"</dt><dd>{after}</dd><dt>"Reason"</dt><dd>{change.operation.reason}</dd><dt>"Feedback"</dt><dd>{change.origin_message}</dd></dl>
+                    <button class="settings-btn" on:click=move |_| { let state = store.get_value(); if let Some(agent) = state.agents.get_untracked().into_iter().find(|agent| agent.agent_id == origin && Some(&agent.host_id) == state.selected_host_id.get_untracked().as_ref()) { state.settings_open.set(false); crate::components::agents_panel::open_agent_chat(&state, &agent); } else { crate::notices::report_settings_error(&state, "The originating conversation is not currently open. Its input identity remains in the audit record."); } }>"View feedback"</button></article> }
+                }).collect_view().into_any() }
+            }}
+            {move || proposal_editor.get().map(|change| view! { <LearningProposalEditor change on_close=Callback::new(move |()| proposal_editor.set(None)) /> })}
+            {move || steering_editor.get().map(|form| view! { <SteeringEditor form editor_signal=steering_editor /> })}
+            {move || aspect_editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| aspect_editor.set(None)) /> })}
+        </section>
+    }
+}
+
+fn learning_rule_label(rule: &protocol::LearningRule) -> String {
+    match rule {
+        protocol::LearningRule::Steering { steering } => {
+            format!("{} — {}", steering.title, steering.content)
+        }
+        protocol::LearningRule::ReviewAspect { aspect, .. } => {
+            format!("{} — {}", aspect.name, aspect.instructions)
+        }
+    }
+}
+fn learning_usage_label(usage: &protocol::TaskTokenUsageScope) -> String {
+    match usage {
+        protocol::TaskTokenUsageScope::Known { usage }
+        | protocol::TaskTokenUsageScope::Partial { usage, .. } => {
+            let count = |value: Option<u64>| {
+                value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unreported".into())
+            };
+            format!(
+                "{} total · {} input · {} cached · {} output · {} reasoning",
+                usage.total_tokens,
+                count(usage.input_tokens),
+                count(usage.cached_prompt_tokens),
+                count(usage.output_tokens),
+                count(usage.reasoning_tokens)
+            )
+        }
+        protocol::TaskTokenUsageScope::Unavailable { .. } => "Usage unavailable".into(),
+    }
+}
+fn send_learning_action(state: AppState, action: protocol::SelfImprovementAction) {
+    let Some((host, stream)) = state.selected_host_stream_untracked() else {
+        return;
+    };
+    spawn_local(async move {
+        let _ = send_frame(&host, stream, FrameKind::SelfImprovementAction, &action).await;
+    });
+}
+#[component]
+fn LearningProposalEditor(
+    change: protocol::LearningChange,
+    on_close: Callback<()>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let (old_title, old_content) = match &change.operation.after {
+        protocol::LearningRule::Steering { steering } => {
+            (steering.title.clone(), steering.content.clone())
+        }
+        protocol::LearningRule::ReviewAspect { aspect, .. } => {
+            (aspect.name.clone(), aspect.instructions.clone())
+        }
+    };
+    let title = RwSignal::new(old_title);
+    let content = RwSignal::new(old_content);
+    let reason = RwSignal::new(change.operation.reason.clone());
+    view! { <div class="settings-editor-overlay"><section role="dialog" aria-label="Edit learning proposal" class="settings-editor"><h3>"Edit proposal"</h3>
+        <label>"Title"<input aria-label="Proposal title" prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev)) /></label>
+        <label>"Instruction"<textarea aria-label="Proposal instruction" prop:value=move || content.get() on:input=move |ev| content.set(event_target_value(&ev)) /></label>
+        <label>"Reason"<input aria-label="Proposal reason" prop:value=move || reason.get() on:input=move |ev| reason.set(event_target_value(&ev)) /></label>
+        <p>"Saving edits only the proposal. Apply it separately."</p><button class="settings-btn" on:click=move |_| { let mut after = change.operation.after.clone(); match &mut after { protocol::LearningRule::Steering { steering } => { steering.title = title.get_untracked(); steering.content = content.get_untracked(); }, protocol::LearningRule::ReviewAspect { aspect, .. } => { aspect.name = title.get_untracked(); aspect.instructions = content.get_untracked(); } } send_learning_action(state.clone(), protocol::SelfImprovementAction::Edit { id: change.id.clone(), after, reason: reason.get_untracked() }); on_close.run(()); }>"Save proposal"</button><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button>
+    </section></div> }
+}
+
 // ── Steering ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -9728,6 +9949,7 @@ mod wasm_tests {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     default_launch_profile_id: None,
@@ -12273,6 +12495,7 @@ mod wasm_tests {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     default_launch_profile_id: None,
@@ -13165,6 +13388,7 @@ mod wasm_tests {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
+            self_improvement: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             default_launch_profile_id: None,
@@ -16005,6 +16229,7 @@ mod wasm_tests {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     default_launch_profile_id: None,
@@ -20199,5 +20424,242 @@ mod wasm_tests {
         drop(handle);
         container.remove();
         style.remove();
+    }
+    #[wasm_bindgen_test]
+    async fn self_improvement_settings_and_audit_actions_follow_typed_state() {
+        use protocol::{
+            HumanInputId, LearningAnalyzerCapability, LearningAnalyzerOption, LearningChange,
+            LearningChangeId, LearningChangeStatus, LearningMode, LearningOperation, LearningRule,
+            SelfImprovementState,
+        };
+        let calls = install_settings_send_stub();
+        let state = AppState::new();
+        let host = "learning-dom";
+        // Connection routing is installed before bootstrap in the real app;
+        // bootstrap alone deliberately does not invent an outbound stream.
+        state.host_streams.update(|streams| {
+            streams.insert(host.into(), protocol::StreamPath(format!("/host/{host}")));
+        });
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |_| {});
+        state.selected_host_id.set(Some(host.into()));
+        let container = make_container();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <SelfImprovementTab /> }
+        });
+        next_tick().await;
+        let select = container
+            .query_selector("select[aria-label='Self-improvement scope']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        select.set_value("host");
+        let event_init = web_sys::EventInit::new();
+        event_init.set_bubbles(true);
+        select
+            .dispatch_event(
+                &web_sys::Event::new_with_event_init_dict("change", &event_init).unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        let enabled = container
+            .query_selector("input[aria-label='Enable self-improvement']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlInputElement>()
+            .unwrap();
+        assert!(
+            !enabled.checked(),
+            "Learning is off by default, including host-wide learning"
+        );
+        assert!(
+            !enabled.disabled(),
+            "Selected connected scope must be editable"
+        );
+        assert!(state.selected_host_stream_untracked().is_some());
+        enabled.click();
+        next_tick().await;
+        let ops = recorded_settings_write_ops(&calls);
+        assert!(
+            ops.iter()
+                .any(|op| op["path"] == "/self_improvement/host" && op["value"]["enabled"] == true),
+            "The real control must emit a persisted settings write"
+        );
+        find_button_by_text(&container, "Automatic")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(recorded_settings_write_ops(&calls).iter().any(
+            |op| op["value"]["mode"] == serde_json::to_value(LearningMode::Automatic).unwrap()
+        ));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("New user messages")
+        );
+        assert!(!container.text_content().unwrap().contains("Idle trigger"));
+        let change = LearningChange {
+            id: LearningChangeId("dom-change".into()),
+            scope: SteeringScope::Host,
+            operation: LearningOperation {
+                before: None,
+                after: LearningRule::Steering {
+                    steering: Steering {
+                        id: SteeringId("dom-rule".into()),
+                        scope: SteeringScope::Host,
+                        title: "Focus".into(),
+                        content: "Keep changes focused.".into(),
+                    },
+                },
+                reason: "Explicit durable feedback".into(),
+                origin_id: HumanInputId("dom-input".into()),
+            },
+            origin_agent_id: protocol::AgentId("dom-agent".into()),
+            origin_message: "For future work, keep changes focused.".into(),
+            created_at_ms: 1,
+            status: LearningChangeStatus::Pending,
+            requires_approval: false,
+            expected_revision: 0,
+            applied_revision: None,
+        };
+        let mut snapshot = SelfImprovementState {
+            analyzers: vec![LearningAnalyzerOption {
+                backend_kind: BackendKind::Codex,
+                capability: LearningAnalyzerCapability::ToolFreeReusable,
+            }],
+            changes: vec![change],
+            ..Default::default()
+        };
+        let stream = state.host_streams.get_untracked()[host].clone();
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host,
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::SelfImprovementNotify,
+                0,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Suggested"));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Explicit durable feedback")
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("For future work, keep changes focused.")
+        );
+        assert!(
+            state
+                .steering
+                .get_untracked()
+                .get(host)
+                .is_none_or(|rules| rules.is_empty()),
+            "Rendering a suggestion cannot write canonical rules"
+        );
+        find_button_by_text(&container, "Edit").unwrap().click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            dialog
+                .text_content()
+                .unwrap()
+                .contains("Apply it separately")
+        );
+        let content = dialog
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        content.set_value("Keep changes focused and report limitations.");
+        content
+            .dispatch_event(
+                &web_sys::Event::new_with_event_init_dict("input", &event_init).unwrap(),
+            )
+            .unwrap();
+        find_button_by_text(&container, "Save proposal")
+            .unwrap()
+            .click();
+        next_tick().await;
+        find_button_by_text(&container, "Apply").unwrap().click();
+        next_tick().await;
+        let actions = calls
+            .iter()
+            .filter_map(|entry| {
+                let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                if entry.get(0).as_string()?.as_str() != "send_host_line" {
+                    return None;
+                }
+                let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
+                let envelope: protocol::Envelope =
+                    serde_json::from_str(args["line"].as_str()?).ok()?;
+                (envelope.kind == FrameKind::SelfImprovementAction).then(|| {
+                    envelope
+                        .parse_payload::<protocol::SelfImprovementAction>()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(actions.iter().any(|action| matches!(action, protocol::SelfImprovementAction::Edit { after: LearningRule::Steering { steering }, .. } if steering.content.contains("limitations"))));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, protocol::SelfImprovementAction::Apply { .. }))
+        );
+        snapshot.changes[0].status = LearningChangeStatus::Applied;
+        snapshot.changes[0].applied_revision = Some(1);
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host,
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::SelfImprovementNotify,
+                1,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Apply").is_none());
+        find_button_by_text(&container, "Undo").unwrap().click();
+        next_tick().await;
+        snapshot.changes[0].status = LearningChangeStatus::Conflict {
+            reason: "A subsequent human edit is protected".into(),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host,
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::SelfImprovementNotify,
+                2,
+                &snapshot,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("A subsequent human edit is protected")
+        );
+        assert!(find_button_by_text(&container, "Undo").is_none());
+        drop(handle);
+        container.remove();
     }
 }

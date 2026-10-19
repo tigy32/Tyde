@@ -58,6 +58,8 @@ pub struct HostSettings {
     #[serde(default)]
     pub review: ReviewSettings,
     #[serde(default)]
+    pub self_improvement: protocol::SelfImprovementSettings,
+    #[serde(default)]
     pub enabled_backends: Vec<BackendKind>,
     #[serde(default)]
     pub default_backend: Option<BackendKind>,
@@ -148,6 +150,7 @@ impl Default for HostSettings {
             resume_previous_agents: default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: ReviewSettings::default(),
+            self_improvement: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             default_launch_profile_id: None,

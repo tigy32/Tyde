@@ -759,13 +759,19 @@ pub(crate) struct HostState {
     pub review_registry: ReviewRegistryHandle,
     pub team_registry: TeamRegistryHandle,
     pub project_store: Arc<Mutex<ProjectStore>>,
-    pub settings_store: Arc<Mutex<HostSettingsStore>>,
+    pub settings_store: Arc<HostSettingsStore>,
+    #[cfg(feature = "test-support")]
+    settings_lifecycle_test_gate: Option<(String, Arc<SpawnOperationTestGateInner>)>,
+    #[cfg(feature = "test-support")]
+    settings_queued_test_gate: Option<(String, Arc<SpawnOperationTestGateInner>)>,
+    #[cfg(feature = "test-support")]
+    learning_projection_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     pub agents_view_preferences_store: Option<Arc<Mutex<AgentsViewPreferencesStore>>>,
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub custom_agent_store: Arc<Mutex<CustomAgentStore>>,
     pub mcp_server_store: Arc<Mutex<McpServerStore>>,
-    pub steering_store: Arc<Mutex<SteeringStore>>,
+    pub steering_store: Arc<SteeringStore>,
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pending_agent_sessions: HashMap<AgentId, SessionId>,
@@ -916,7 +922,79 @@ fn installed_backend_version(
         .and_then(|setup| setup.installed_version.clone())
 }
 
+enum SettingsMutation {
+    Write(Box<protocol::SettingsWritePayload>, Stream),
+    Native(Box<protocol::BackendNativeSettingsWritePayload>, Stream),
+    Action(Box<protocol::InvokeSettingsActionPayload>, Stream),
+    TychatPair(String),
+}
+struct SettingsApplyCommand {
+    mutation: SettingsMutation,
+    reply: oneshot::Sender<AppResult<()>>,
+}
+fn spawn_settings_apply_actor(
+    host: WeakHostHandle,
+    mut commands: mpsc::UnboundedReceiver<SettingsApplyCommand>,
+) {
+    let mut stopped = host.config.state.clone();
+    let worker = async move {
+        loop {
+            let command = tokio::select! {
+                command = commands.recv() => match command { Some(command) => command, None => break },
+                changed = stopped.changed() => { if changed.is_err() { break; } else { continue; } },
+            };
+            let Some(host) = host.upgrade() else {
+                break;
+            };
+            if host.config.settings_in_flight(true).is_err() {
+                let _ = command.reply.send(Err(AppError::internal(
+                    "settings_apply",
+                    anyhow!("Configuration actor stopped"),
+                )));
+                continue;
+            }
+            let result = match command.mutation {
+                SettingsMutation::Write(payload, output) => {
+                    host.settings_write_now(*payload, &output).await
+                }
+                SettingsMutation::Native(payload, output) => {
+                    host.backend_native_settings_write_now(*payload, &output)
+                        .await
+                }
+                SettingsMutation::Action(payload, output) => {
+                    host.invoke_settings_action_now(*payload, &output).await
+                }
+                SettingsMutation::TychatPair(code) => host
+                    .pair_tychat_now(code)
+                    .await
+                    .map_err(|reason| AppError::conflict("tychat_pair", reason)),
+            };
+            if let Err(reason) = host.config.settings_in_flight(false) {
+                tracing::error!(reason = %reason, "Settings lifecycle ended after configuration actor stopped");
+            }
+            let _ = command.reply.send(result);
+        }
+    };
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(worker);
+    } else {
+        std::thread::Builder::new()
+            .name("tyde-settings-apply".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(worker),
+                    Err(_) => tracing::error!("Cannot create settings lifecycle runtime"),
+                }
+            })
+            .expect("start settings lifecycle actor");
+    }
+}
+
 pub struct HostHandle {
+    pub(crate) config: crate::self_improvement::ConfigHandle,
     restart: Arc<RestartShutdown>,
     state: Arc<Mutex<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
@@ -930,7 +1008,7 @@ pub struct HostHandle {
     /// reporting a stale "current" etag. Never held across non-settings
     /// work; the general host-state lock is still released around backend
     /// I/O.
-    settings_apply_lock: Arc<Mutex<()>>,
+    settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
     spawn_operations: SpawnOperationHandle,
     spawn_operation_owner: Option<Arc<SpawnOperationOwner>>,
 }
@@ -1134,36 +1212,39 @@ impl SpawnOperationTerminalClaim {
 }
 
 pub(crate) struct WeakHostHandle {
+    config: crate::self_improvement::ConfigHandle,
     restart: Weak<RestartShutdown>,
     state: Weak<Mutex<HostState>>,
     workflow_save_lock: Weak<Mutex<()>>,
     backend_setup_refresh_lock: Weak<Mutex<()>>,
     session_schema_refresh_lock: Weak<Mutex<()>>,
-    settings_apply_lock: Weak<Mutex<()>>,
+    settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
     spawn_operations: SpawnOperationHandle,
 }
 
 impl WeakHostHandle {
     pub(crate) fn downgrade(host: &HostHandle) -> Self {
         Self {
+            config: host.config.clone(),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
-            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
+            settings_apply_tx: host.settings_apply_tx.clone(),
             spawn_operations: host.spawn_operations.clone(),
         }
     }
 
     pub(crate) fn upgrade(&self) -> Option<HostHandle> {
         Some(HostHandle {
+            config: self.config.clone(),
             restart: self.restart.upgrade()?,
             state: self.state.upgrade()?,
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
             backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
             session_schema_refresh_lock: self.session_schema_refresh_lock.upgrade()?,
-            settings_apply_lock: self.settings_apply_lock.upgrade()?,
+            settings_apply_tx: self.settings_apply_tx.clone(),
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         })
@@ -1173,12 +1254,13 @@ impl WeakHostHandle {
 impl Clone for HostHandle {
     fn clone(&self) -> Self {
         Self {
+            config: self.config.clone(),
             restart: Arc::clone(&self.restart),
             state: Arc::clone(&self.state),
             workflow_save_lock: Arc::clone(&self.workflow_save_lock),
             backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::clone(&self.session_schema_refresh_lock),
-            settings_apply_lock: Arc::clone(&self.settings_apply_lock),
+            settings_apply_tx: self.settings_apply_tx.clone(),
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         }
@@ -1188,6 +1270,7 @@ impl Clone for HostHandle {
 impl Drop for HostHandle {
     fn drop(&mut self) {
         if let Some(owner) = self.spawn_operation_owner.as_ref() {
+            self.config.stop();
             owner.begin_shutdown();
         }
     }
@@ -1870,7 +1953,7 @@ impl HostHandle {
         {
             return None;
         }
-        let settings = match state.settings_store.lock().await.get() {
+        let settings = match state.settings_store.get() {
             Ok(settings) => settings,
             Err(error) => {
                 tracing::error!(%error, "usage wake-up cannot read settings; not sending");
@@ -1918,7 +2001,7 @@ impl HostHandle {
                 return None;
             }
             let usage = state.usage_limits_tx.borrow().settings;
-            let settings = state.settings_store.lock().await.get();
+            let settings = state.settings_store.get();
             let enabled = match settings {
                 Ok(settings) => settings.enabled_backends,
                 Err(error) => {
@@ -2322,6 +2405,29 @@ impl HostHandle {
         InstalledAgentNameGate { inner }
     }
 
+    pub async fn install_settings_lifecycle_test_gates(
+        &self,
+        applying: &str,
+        queued: &str,
+    ) -> (
+        InstalledSpawnOperationTestGate,
+        InstalledSpawnOperationTestGate,
+    ) {
+        let applying_gate = new_spawn_operation_test_gate();
+        let queued_gate = new_spawn_operation_test_gate();
+        let mut state = self.state.lock().await;
+        state.settings_lifecycle_test_gate = Some((applying.into(), applying_gate.shared()));
+        state.settings_queued_test_gate = Some((queued.into(), queued_gate.shared()));
+        (applying_gate, queued_gate)
+    }
+
+    pub async fn install_learning_projection_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        self.state.lock().await.learning_projection_test_gate = Some(gate.shared());
+        gate
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn install_restart_stop_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         *self
@@ -2867,8 +2973,6 @@ impl HostHandle {
                 .collect();
             match state
                 .settings_store
-                .lock()
-                .await
                 .seed_installed_backends_if_fresh(&installed)
             {
                 Ok(true) => tracing::info!(
@@ -2931,8 +3035,6 @@ impl HostHandle {
 
         let settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for registration: {err}"));
         let refresh_dynamic_session_schemas = settings
@@ -3034,8 +3136,6 @@ impl HostHandle {
 
         let steering = state
             .steering_store
-            .lock()
-            .await
             .list()
             .unwrap_or_else(|err| panic!("failed to list steering for host registration: {err}"));
 
@@ -3185,7 +3285,7 @@ impl HostHandle {
         let dots_snapshot = state.dots.state.borrow().clone();
         drop(state);
         tracing::info!(target: "tyde::connection_bootstrap", agent_count = agents.len(), elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap descriptors completed");
-        let task_token_usages = match usage_sources {
+        let mut task_token_usages = match usage_sources {
             Some((handles, closed_snapshots, live_agent_ids, agent_sessions)) => {
                 task_token_usage_rollups_from_handles(
                     handles,
@@ -3198,12 +3298,14 @@ impl HostHandle {
             None => Vec::new(),
         };
 
+        attach_learning_accounting(&mut task_token_usages, self.config.usage().await);
         tracing::info!(target: "tyde::connection_bootstrap", elapsed_ms = bootstrap_started.elapsed().as_millis(), "host bootstrap usage completed");
         let (settings_doc, configured_secrets, settings_etag) = {
-            let store = settings_store_for_projection.lock().await;
+            let store = Arc::clone(&settings_store_for_projection);
             settings_wire_projection(&store, &settings)
         };
         let bootstrap = HostBootstrapPayload {
+            self_improvement: self.config.projection(),
             tychat: tychat_snapshot,
             dots: dots_snapshot,
             agents_with_background_work,
@@ -3572,6 +3674,7 @@ impl HostHandle {
         self.spawn_agent_with_origin_config_and_team(
             payload,
             SpawnAgentContext {
+                human_input: true,
                 operation_terminal_claim: Some(terminal_claim),
                 ..Default::default()
             },
@@ -3700,6 +3803,7 @@ impl HostHandle {
                 );
                 tychat.bridge.abort().await;
                 tychat.release_process_lock();
+                host.config.wait_stopped().await;
                 host.restart.complete.send_replace(true);
             });
         }
@@ -4758,6 +4862,7 @@ impl HostHandle {
             ));
         }
         let SpawnAgentContext {
+            human_input,
             mut origin,
             input_origin,
             resolved_spawn_config_override,
@@ -4941,8 +5046,6 @@ impl HostHandle {
             None => None,
         };
         let host_settings = settings_store
-            .lock()
-            .await
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for spawn: {err}"));
         let agent_depth = parent_agent_depth
@@ -5058,7 +5161,7 @@ impl HostHandle {
                 } else {
                     let custom_agents = custom_agent_store.lock().await;
                     let mcp_servers = mcp_server_store.lock().await;
-                    let steering = steering_store.lock().await;
+                    let steering = Arc::clone(&steering_store);
                     let skills = skill_store.lock().await;
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
@@ -5345,7 +5448,7 @@ impl HostHandle {
                     {
                         let custom_agents = custom_agent_store.lock().await;
                         let mcp_servers = mcp_server_store.lock().await;
-                        let steering = steering_store.lock().await;
+                        let steering = Arc::clone(&steering_store);
                         let skills = skill_store.lock().await;
                         (
                             None,
@@ -5375,7 +5478,7 @@ impl HostHandle {
                     } else {
                         let custom_agents = custom_agent_store.lock().await;
                         let mcp_servers = mcp_server_store.lock().await;
-                        let steering = steering_store.lock().await;
+                        let steering = Arc::clone(&steering_store);
                         let skills = skill_store.lock().await;
                         match resolve_spawn_config(ResolveSpawnConfigRequest {
                             backend_kind: record.backend_kind,
@@ -5402,7 +5505,7 @@ impl HostHandle {
                 } else {
                     let custom_agents = custom_agent_store.lock().await;
                     let mcp_servers = mcp_server_store.lock().await;
-                    let steering = steering_store.lock().await;
+                    let steering = Arc::clone(&steering_store);
                     let skills = skill_store.lock().await;
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind: record.backend_kind,
@@ -5640,7 +5743,7 @@ impl HostHandle {
                     {
                         let custom_agents = custom_agent_store.lock().await;
                         let mcp_servers = mcp_server_store.lock().await;
-                        let steering = steering_store.lock().await;
+                        let steering = Arc::clone(&steering_store);
                         let skills = skill_store.lock().await;
                         (
                             None,
@@ -5670,7 +5773,7 @@ impl HostHandle {
                     } else {
                         let custom_agents = custom_agent_store.lock().await;
                         let mcp_servers = mcp_server_store.lock().await;
-                        let steering = steering_store.lock().await;
+                        let steering = Arc::clone(&steering_store);
                         let skills = skill_store.lock().await;
                         match resolve_spawn_config(ResolveSpawnConfigRequest {
                             backend_kind,
@@ -5699,7 +5802,7 @@ impl HostHandle {
                 } else {
                     let custom_agents = custom_agent_store.lock().await;
                     let mcp_servers = mcp_server_store.lock().await;
-                    let steering = steering_store.lock().await;
+                    let steering = Arc::clone(&steering_store);
                     let skills = skill_store.lock().await;
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
@@ -6169,6 +6272,14 @@ impl HostHandle {
                 ..state.swarm_startup_test_gates.clone()
             };
             let tychat = state.tychat.clone();
+            let human_prompt = human_input
+                .then(|| {
+                    request
+                        .initial_input
+                        .as_ref()
+                        .map(|input| input.message.clone())
+                })
+                .flatten();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
@@ -6192,6 +6303,20 @@ impl HostHandle {
                     backend_storage,
                 },
             );
+            if let Some(message) = human_prompt {
+                let input = protocol::AcceptedHumanInput {
+                    id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                    source: protocol::HumanInputSource::Chat,
+                    agent_id: spawned.start.agent_id.clone(),
+                    session_id: spawned.start.session_id.clone(),
+                    project_id: spawned.start.project_id.clone(),
+                    message,
+                    assistant_context: String::new(),
+                };
+                if let Err(reason) = self.config.record_accepted_human(input) {
+                    tracing::error!(reason = %reason, "Cannot journal accepted launch input");
+                }
+            }
             if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
                 state
                     .spawn_publication_claims
@@ -6517,7 +6642,7 @@ impl HostHandle {
             return request;
         };
         let settings_store = Arc::clone(&self.state.lock().await.settings_store);
-        let settings = match settings_store.lock().await.get() {
+        let settings = match settings_store.get() {
             Ok(settings) => settings,
             Err(error) => {
                 tracing::warn!(%error, "failed to read host settings while resolving backend launch");
@@ -6554,7 +6679,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.settings_store)
         };
-        let settings = match settings_store.lock().await.get() {
+        let settings = match settings_store.get() {
             Ok(settings) => settings,
             Err(error) => {
                 tracing::warn!(%error, "failed to read host settings; ignoring spawn cost hint");
@@ -7313,11 +7438,9 @@ impl HostHandle {
                 ));
             }
         }
-        let deleted_steering_ids = state
-            .steering_store
-            .lock()
+        let deleted_steering_ids = self
+            .delete_learning_project_rules(&payload.id)
             .await
-            .delete_for_project(&payload.id)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let detached_session_ids = state
             .session_store
@@ -7683,11 +7806,9 @@ impl HostHandle {
         }
 
         let mut state = self.state.lock().await;
-        let deleted_steering_ids = state
-            .steering_store
-            .lock()
+        let deleted_steering_ids = self
+            .delete_learning_project_rules(&payload.id)
             .await
-            .delete_for_project(&payload.id)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let deleted_sessions = !deleted_session_ids.is_empty();
         let deleted_session_ids = deleted_session_ids.into_iter().collect();
@@ -7989,11 +8110,10 @@ impl HostHandle {
                 ),
             ));
         }
-        let steering = state
-            .steering_store
-            .lock()
+        let steering = self
+            .config
+            .steering(payload.steering)
             .await
-            .upsert(payload.steering)
             .map_err(|error| steering_store_error(OPERATION, error))?;
         fan_out_steering_notify(&mut state, SteeringNotifyPayload::Upsert { steering }).await;
         Ok(())
@@ -8002,11 +8122,10 @@ impl HostHandle {
     pub(crate) async fn delete_steering(&self, payload: SteeringDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "steering_delete";
         let mut state = self.state.lock().await;
-        let id = state
-            .steering_store
-            .lock()
+        let id = self
+            .config
+            .delete_steering(payload.id)
             .await
-            .delete(&payload.id)
             .map_err(|error| steering_store_error(OPERATION, error))?;
         fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
         Ok(())
@@ -8988,13 +9107,14 @@ impl HostHandle {
             let state = self.state.lock().await;
             task_token_usage_sources_for_state(&state)
         };
-        let payloads = task_token_usage_rollups_from_handles(
+        let mut payloads = task_token_usage_rollups_from_handles(
             handles,
             closed_snapshots,
             &live_agent_ids,
             &agent_sessions,
         )
         .await;
+        attach_learning_accounting(&mut payloads, self.config.usage().await);
         let mut state = self.state.lock().await;
         fan_out_task_token_usages(&mut state, payloads).await;
     }
@@ -9002,10 +9122,18 @@ impl HostHandle {
     pub(crate) async fn backend_native_settings_write(
         &self,
         payload: protocol::BackendNativeSettingsWritePayload,
+        output: &Stream,
+    ) -> AppResult<()> {
+        self.queue_settings_apply(SettingsMutation::Native(Box::new(payload), output.clone()))
+            .await
+    }
+
+    async fn backend_native_settings_write_now(
+        &self,
+        payload: protocol::BackendNativeSettingsWritePayload,
         host_output_stream: &Stream,
     ) -> AppResult<()> {
         const OPERATION: &str = "backend_native_settings_write";
-        let _settings_apply_guard = self.settings_apply_lock.lock().await;
         let outcome = crate::backend::write_native_settings(
             payload.backend,
             payload.settings,
@@ -9021,7 +9149,7 @@ impl HostHandle {
 
         let current_etag = {
             let state = self.state.lock().await;
-            let store = state.settings_store.lock().await;
+            let store = Arc::clone(&state.settings_store);
             let settings = store
                 .get()
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
@@ -9058,10 +9186,18 @@ impl HostHandle {
     pub(crate) async fn invoke_settings_action(
         &self,
         payload: protocol::InvokeSettingsActionPayload,
+        output: &Stream,
+    ) -> AppResult<()> {
+        self.queue_settings_apply(SettingsMutation::Action(Box::new(payload), output.clone()))
+            .await
+    }
+
+    async fn invoke_settings_action_now(
+        &self,
+        payload: protocol::InvokeSettingsActionPayload,
         host_output_stream: &Stream,
     ) -> AppResult<()> {
         const OPERATION: &str = "invoke_settings_action";
-        let _settings_apply_guard = self.settings_apply_lock.lock().await;
         let outcome: Result<Vec<String>, String> = Err(format!(
             "{:?} does not support settings resource actions",
             payload.backend
@@ -9075,7 +9211,7 @@ impl HostHandle {
 
         let current_etag = {
             let state = self.state.lock().await;
-            let store = state.settings_store.lock().await;
+            let store = Arc::clone(&state.settings_store);
             let settings = store
                 .get()
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
@@ -9143,7 +9279,50 @@ impl HostHandle {
     }
 
     /// Apply an atomic, compare-and-swap settings write.
+    async fn queue_settings_apply(&self, mutation: SettingsMutation) -> AppResult<()> {
+        #[cfg(feature = "test-support")]
+        let queued_gate = match &mutation {
+            SettingsMutation::Write(payload, _) => self
+                .state
+                .lock()
+                .await
+                .settings_queued_test_gate
+                .as_ref()
+                .filter(|(id, _)| *id == payload.write_id.0)
+                .map(|(_, gate)| gate.clone()),
+            _ => None,
+        };
+        let (reply, response) = oneshot::channel();
+        self.settings_apply_tx
+            .send(SettingsApplyCommand { mutation, reply })
+            .map_err(|_| {
+                AppError::internal(
+                    "settings_apply",
+                    anyhow!("Settings lifecycle actor stopped"),
+                )
+            })?;
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = queued_gate {
+            let _ = gate.entered_tx.send(());
+        }
+        response.await.map_err(|_| {
+            AppError::internal(
+                "settings_apply",
+                anyhow!("Settings lifecycle did not complete"),
+            )
+        })?
+    }
+
     pub(crate) async fn settings_write(
+        &self,
+        payload: protocol::SettingsWritePayload,
+        output: &Stream,
+    ) -> AppResult<()> {
+        self.queue_settings_apply(SettingsMutation::Write(Box::new(payload), output.clone()))
+            .await
+    }
+
+    async fn settings_write_now(
         &self,
         payload: protocol::SettingsWritePayload,
         host_output_stream: &Stream,
@@ -9180,10 +9359,9 @@ impl HostHandle {
 
         // Keep each write's CAS, backend propagation, fanout, and result in
         // one order even while the general host-state lock is released for I/O.
-        let _settings_apply_guard = self.settings_apply_lock.lock().await;
         let state = self.state.lock().await;
         let settings_store = Arc::clone(&state.settings_store);
-        let store = settings_store.lock().await;
+        let store = Arc::clone(&settings_store);
         let current = store
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
@@ -9567,7 +9745,7 @@ impl HostHandle {
 
         // Commit before external propagation so a downstream failure cannot
         // leave external state changed while the host store remains stale.
-        let committed = match store.replace(candidate) {
+        let committed = match self.config.replace(current.clone(), candidate).await {
             Ok(committed) => committed,
             Err(message) => {
                 drop(store);
@@ -9623,8 +9801,22 @@ impl HostHandle {
                 .await;
             }
         }
+        #[cfg(feature = "test-support")]
+        {
+            let gate = self
+                .state
+                .lock()
+                .await
+                .settings_lifecycle_test_gate
+                .as_ref()
+                .filter(|(id, _)| *id == write_id.0)
+                .map(|(_, gate)| gate.clone());
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
+            }
+        }
         let new_etag = {
-            let store = settings_store.lock().await;
+            let store = Arc::clone(&settings_store);
             let (_doc, _configured_secrets, etag) = settings_wire_projection(&store, &committed);
             etag
         };
@@ -9926,7 +10118,7 @@ impl HostHandle {
         if skip {
             return setup::stub_backend_setup();
         }
-        let settings = settings_store.lock().await.get().ok();
+        let settings = settings_store.get().ok();
         let acp_agents = settings
             .as_ref()
             .map(setup::configured_acp_setup_agents)
@@ -10050,8 +10242,6 @@ impl HostHandle {
             let state = self.state.lock().await;
             let settings = state
                 .settings_store
-                .lock()
-                .await
                 .get()
                 .expect("load settings for discovery");
             let pending = settings
@@ -10109,11 +10299,7 @@ impl HostHandle {
                 state.discovered_launch_profiles.clone(),
             )
         };
-        let settings = settings_store
-            .lock()
-            .await
-            .get()
-            .expect("load settings for discovery");
+        let settings = settings_store.get().expect("load settings for discovery");
         let root = backend_probe_workspace_root(root.as_deref());
         let mut schemas = previous.clone();
         let mut profiles = previous_profiles;
@@ -10680,7 +10866,7 @@ impl HostHandle {
     }
 
     pub(crate) async fn list_steering(&self) -> Result<Vec<protocol::Steering>, String> {
-        self.state.lock().await.steering_store.lock().await.list()
+        self.state.lock().await.steering_store.list()
     }
 
     pub(crate) async fn agent_message_origin(
@@ -11426,12 +11612,12 @@ impl HostHandle {
     }
 
     pub(crate) async fn read_settings(&self) -> Result<settings_model::HostSettings, String> {
-        self.state.lock().await.settings_store.lock().await.get()
+        self.state.lock().await.settings_store.get()
     }
 
     pub(crate) async fn review_session_schemas(&self) -> Result<Vec<SessionSchemaEntry>, String> {
         let state = self.state.lock().await;
-        let settings = state.settings_store.lock().await.get()?;
+        let settings = state.settings_store.get()?;
         Ok(session_schemas_for_enabled_backends(
             &state,
             &settings.enabled_backends,
@@ -11440,7 +11626,7 @@ impl HostHandle {
 
     pub(crate) async fn read_launch_profile_catalog(&self) -> Result<LaunchProfileCatalog, String> {
         let state = self.state.lock().await;
-        let settings = state.settings_store.lock().await.get()?;
+        let settings = state.settings_store.get()?;
         Ok(launch_profile_catalog_for_settings(&state, &settings))
     }
 
@@ -11745,8 +11931,6 @@ impl HostHandle {
             (parent_depth, Arc::clone(&state.settings_store))
         };
         let max_depth = settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| format!("failed to load host settings: {error}"))?
             .tyde_agent_control_max_depth;
@@ -12263,7 +12447,7 @@ impl HostHandle {
             } else {
                 Vec::new()
             };
-            let settings = state.settings_store.lock().await.get().map_err(|error| {
+            let settings = state.settings_store.get().map_err(|error| {
                 AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
             })?;
             (
@@ -12349,7 +12533,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             let custom_agents = state.custom_agent_store.lock().await;
             let mcp_servers = state.mcp_server_store.lock().await;
-            let steering = state.steering_store.lock().await;
+            let steering = Arc::clone(&state.steering_store);
             let skills = state.skill_store.lock().await;
             resolve_spawn_config(ResolveSpawnConfigRequest {
                 backend_kind: definition.summary.coordinator.backend,
@@ -13728,8 +13912,6 @@ impl HostHandle {
             .map_err(|error| project_command_error(operation, error))?;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(operation, anyhow!(error)))?
             .code_intel;
@@ -13762,8 +13944,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -13795,8 +13975,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -13828,8 +14006,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -13861,8 +14037,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -13894,8 +14068,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -13927,8 +14099,6 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         let code_intel_settings = state
             .settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .code_intel;
@@ -14679,10 +14849,9 @@ impl HostHandle {
             ));
         }
 
-        let host_settings =
-            settings_store.lock().await.get().map_err(|error| {
-                format!("failed to load host settings for review target: {error}")
-            })?;
+        let host_settings = settings_store
+            .get()
+            .map_err(|error| format!("failed to load host settings for review target: {error}"))?;
         let startup_mcp_servers = startup_mcp_servers_for_settings(
             &host_settings,
             &project_roots,
@@ -14695,7 +14864,7 @@ impl HostHandle {
         let mut resolved_spawn_config = {
             let custom_agents = custom_agent_store.lock().await;
             let mcp_servers = mcp_server_store.lock().await;
-            let steering = steering_store.lock().await;
+            let steering = Arc::clone(&steering_store);
             let skills = skill_store.lock().await;
             resolve_spawn_config(ResolveSpawnConfigRequest {
                 backend_kind,
@@ -14904,7 +15073,13 @@ impl HostHandle {
             .review
             .aspects
             .iter()
-            .filter(|(_, a)| a.enabled)
+            .filter(|(id, a)| {
+                a.enabled
+                    && match settings.review.aspect_scopes.get(*id) {
+                        None | Some(SteeringScope::Host) => true,
+                        Some(SteeringScope::Project(scope)) => scope == project_id,
+                    }
+            })
             .map(|(id, a)| protocol::ReviewAspectSnapshot {
                 id: id.clone(),
                 name: a.name.clone(),
@@ -15300,7 +15475,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             let custom_agents = state.custom_agent_store.lock().await;
             let mcp_servers = state.mcp_server_store.lock().await;
-            let steering = state.steering_store.lock().await;
+            let steering = Arc::clone(&state.steering_store);
             let skills = state.skill_store.lock().await;
             resolve_spawn_config(ResolveSpawnConfigRequest {
                 backend_kind,
@@ -16602,7 +16777,17 @@ fn spawn_host_inner(
         tx: spawn_operation_tx,
         owner: Arc::downgrade(&spawn_operations),
     };
+    let settings_store = Arc::new(settings_store);
+    let steering_store = Arc::new(steering_store);
+    let config = crate::self_improvement::ConfigHandle::spawn(
+        Arc::clone(&settings_store),
+        Arc::clone(&steering_store),
+        use_mock_backend,
+        stopped.clone(),
+    )?;
+    let (settings_apply_tx, settings_apply_rx) = mpsc::unbounded_channel();
     let host = HostHandle {
+        config,
         restart: Arc::new(RestartShutdown {
             stopped,
             swarm_registry: Some(swarm_registry.clone()),
@@ -16622,14 +16807,20 @@ fn spawn_host_inner(
             review_registry,
             team_registry: TeamRegistryHandle::spawn(team_store),
             project_store,
-            settings_store: Arc::new(Mutex::new(settings_store)),
+            settings_store,
+            #[cfg(feature = "test-support")]
+            settings_lifecycle_test_gate: None,
+            #[cfg(feature = "test-support")]
+            settings_queued_test_gate: None,
+            #[cfg(feature = "test-support")]
+            learning_projection_test_gate: None,
             agents_view_preferences_store: agents_view_preferences_store
                 .map(|store| Arc::new(Mutex::new(store))),
             session_store,
             transcript_store,
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
             mcp_server_store: Arc::new(Mutex::new(mcp_server_store)),
-            steering_store: Arc::new(Mutex::new(steering_store)),
+            steering_store,
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
             pending_agent_sessions: HashMap::new(),
@@ -16740,19 +16931,21 @@ fn spawn_host_inner(
         workflow_save_lock: Arc::new(Mutex::new(())),
         backend_setup_refresh_lock: Arc::new(Mutex::new(())),
         session_schema_refresh_lock: Arc::new(Mutex::new(())),
-        settings_apply_lock: Arc::new(Mutex::new(())),
+        settings_apply_tx,
         spawn_operations: spawn_operation_handle.clone(),
         spawn_operation_owner: Some(Arc::clone(&spawn_operations)),
     };
 
+    spawn_settings_apply_actor(WeakHostHandle::downgrade(&host), settings_apply_rx);
     let spawn_operation_worker = spawn_host_spawn_operation_task(
         WeakHostHandle {
+            config: host.config.clone(),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
-            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
+            settings_apply_tx: host.settings_apply_tx.clone(),
             spawn_operations: spawn_operation_handle,
         },
         spawn_operation_rx,
@@ -16783,12 +16976,13 @@ fn spawn_host_inner(
     };
     spawn_agent_turn_state_fanout_task(
         WeakHostHandle {
+            config: host.config.clone(),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
-            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
+            settings_apply_tx: host.settings_apply_tx.clone(),
             spawn_operations: host.spawn_operations.clone(),
         },
         agent_turn_state_transitions,
@@ -16890,6 +17084,12 @@ fn spawn_host_inner(
         .expect("newly created host state must be unlocked")
         .workflow_mcp = workflow_mcp;
 
+    spawn_learning_projection(
+        WeakHostHandle::downgrade(&host),
+        host.config.state.clone(),
+        host.restart.stopped.clone(),
+    );
+
     swarms::spawn_swarm_dispatch_task(host.clone(), swarm_dispatch_rx);
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
     spawn_host_review_delivery_task(
@@ -16934,6 +17134,7 @@ fn spawn_host_inner(
 
 /// Everything a spawn needs beyond the request itself.
 struct SpawnAgentContext {
+    human_input: bool,
     origin: AgentOrigin,
     input_origin: Option<protocol::MessageOrigin>,
     resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
@@ -16953,6 +17154,7 @@ struct SpawnAgentContext {
 impl Default for SpawnAgentContext {
     fn default() -> Self {
         Self {
+            human_input: false,
             origin: AgentOrigin::User,
             input_origin: None,
             resolved_spawn_config_override: None,
@@ -17087,8 +17289,6 @@ impl HostHandle {
     async fn restore_open_agents(&self) -> Result<(), String> {
         let settings_store = Arc::clone(&self.state.lock().await.settings_store);
         let resume_previous_agents = settings_store
-            .lock()
-            .await
             .get()
             .map_err(|error| format!("failed to read agent restoration preference: {error}"))?
             .resume_previous_agents;
@@ -20464,6 +20664,7 @@ fn task_token_usage_rollup_for_root(
     let descendant_usage =
         aggregate_task_token_usage(ordered.iter().skip(1).map(|entry| &entry.usage));
     Some(TaskTokenUsagePayload {
+        helper_usage: Vec::new(),
         root_agent_id: root.start.agent_id.clone(),
         root_session_id: agent_session_id(&root.start, agent_sessions),
         total,
@@ -20538,7 +20739,7 @@ fn agent_session_id(
         .or_else(|| agent_sessions.get(&start.agent_id).cloned())
 }
 
-fn aggregate_task_token_usage<'a>(
+pub(crate) fn aggregate_task_token_usage<'a>(
     usages: impl Iterator<Item = &'a TaskTokenUsageScope>,
 ) -> TaskTokenUsageAggregate {
     let mut usage = TaskTokenUsageAmount::zero();
@@ -20931,8 +21132,6 @@ async fn agent_team_validation_refs(
         .collect::<HashSet<_>>();
     let enabled_backend_kinds = state
         .settings_store
-        .lock()
-        .await
         .get()
         .map_err(|error| AppError::internal(operation, anyhow!(error)))?
         .enabled_backends
@@ -21122,7 +21321,7 @@ async fn fan_out_host_settings(
     // configured-secret side channel, and the etag are properties of the
     // settings state, not of the connection.
     let payload = {
-        let store = state.settings_store.lock().await;
+        let store = Arc::clone(&state.settings_store);
         host_settings_frame_payload(&store, &settings)
     };
 
@@ -21414,8 +21613,6 @@ async fn fan_out_current_agents_view_preferences(state: &mut HostState) {
 async fn fan_out_session_schemas(state: &mut HostState, force_emit: bool) {
     let enabled_backends = state
         .settings_store
-        .lock()
-        .await
         .get()
         .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
         .enabled_backends;
@@ -21838,14 +22035,9 @@ fn capacity_now_ms() -> u64 {
 }
 
 async fn fan_out_launch_profile_catalog(state: &mut HostState) {
-    let settings = state
-        .settings_store
-        .lock()
-        .await
-        .get()
-        .unwrap_or_else(|err| {
-            panic!("failed to load host settings for launch profile catalog: {err}")
-        });
+    let settings = state.settings_store.get().unwrap_or_else(|err| {
+        panic!("failed to load host settings for launch profile catalog: {err}")
+    });
     let catalog = launch_profile_catalog_for_settings(state, &settings);
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -23032,4 +23224,254 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+impl HostHandle {
+    pub(crate) async fn accept_learning_input(
+        &self,
+        agent_id: &AgentId,
+        id: protocol::HumanInputId,
+        source: protocol::HumanInputSource,
+        message: String,
+    ) -> Result<bool, String> {
+        let handle = self
+            .agent_handle(agent_id)
+            .await
+            .ok_or("Human input target is unavailable")?;
+        let snapshot = handle.snapshot();
+        let assistant_context = match handle.read_latest_output().await {
+            Some(Ok(protocol::AgentControlOutput::Message { text })) => {
+                text.chars().take(4096).collect()
+            }
+            Some(Ok(
+                protocol::AgentControlOutput::Empty | protocol::AgentControlOutput::Error { .. },
+            )) => String::new(),
+            _ => {
+                let reason = "Cannot read the accepted human input's assistant context; no analysis was scheduled".to_owned();
+                self.config.report_input_failure(reason.clone())?;
+                return Err(reason);
+            }
+        };
+        self.config
+            .human(protocol::AcceptedHumanInput {
+                id,
+                source,
+                agent_id: agent_id.clone(),
+                session_id: snapshot.session_id,
+                project_id: snapshot.project_id,
+                message,
+                assistant_context,
+            })
+            .await
+    }
+    pub(crate) async fn learning_action(
+        &self,
+        action: protocol::SelfImprovementAction,
+    ) -> AppResult<()> {
+        self.config
+            .action(action)
+            .await
+            .map_err(|reason| AppError::conflict("self_improvement_action", reason))
+    }
+    async fn delete_learning_project_rules(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<protocol::SteeringId>, String> {
+        self.config.delete_project(project.clone()).await
+    }
+    #[cfg(feature = "test-support")]
+    pub async fn stop_learning_for_test(&self) {
+        let mut closed = self.config.state.clone();
+        self.config.stop();
+        while closed.changed().await.is_ok() {}
+    }
+    #[cfg(feature = "test-support")]
+    pub fn set_learning_script_for_test(
+        &self,
+        script: crate::backend::mock::MockScript,
+    ) -> Result<(), String> {
+        self.config.mock_script(script)
+    }
+}
+
+fn spawn_learning_projection(
+    host: WeakHostHandle,
+    mut learning: watch::Receiver<protocol::SelfImprovementState>,
+    stopped: CancellationToken,
+) {
+    let worker = async move {
+        let Some(initial_host) = host.upgrade() else {
+            return;
+        };
+        let mut canonical_revision = learning.borrow().canonical_revision;
+        let initial = initial_host.state.lock().await;
+        let mut previous_steering = match initial.steering_store.list() {
+            Ok(rules) => rules,
+            Err(reason) => {
+                tracing::error!(reason = %reason, "Cannot initialize steering projection");
+                return;
+            }
+        };
+        let mut previous_settings = match initial.settings_store.get() {
+            Ok(settings) => Some(settings),
+            Err(reason) => {
+                tracing::error!(reason = %reason, "Cannot initialize settings projection");
+                return;
+            }
+        };
+        drop(initial);
+        drop(initial_host);
+        loop {
+            let closed = tokio::select! { _ = stopped.cancelled() => break, changed = learning.changed() => changed.is_err() };
+            let mut snapshot = learning.borrow_and_update().clone();
+            if closed {
+                let reason = "Self-improvement configuration and accounting are unavailable; the current author turn is not interrupted".to_owned();
+                snapshot.error = Some(reason.clone());
+                for scope in &mut snapshot.scopes {
+                    scope.status = protocol::LearningStatus::Failed {
+                        reason: reason.clone(),
+                    };
+                }
+            }
+            let Some(host) = host.upgrade() else {
+                break;
+            };
+            #[cfg(feature = "test-support")]
+            if snapshot.canonical_revision != canonical_revision {
+                let gate = host.state.lock().await.learning_projection_test_gate.take();
+                if let Some(gate) = gate {
+                    wait_for_spawn_operation_test_gate_inner(&gate).await;
+                }
+            }
+            let mut state = host.state.lock().await;
+            if snapshot.canonical_revision != canonical_revision {
+                match (state.steering_store.list(), state.settings_store.get()) {
+                    (Ok(current), Ok(settings)) => {
+                        for old in &previous_steering {
+                            if !current.iter().any(|rule| rule.id == old.id) {
+                                fan_out_steering_notify(
+                                    &mut state,
+                                    SteeringNotifyPayload::Delete { id: old.id.clone() },
+                                )
+                                .await;
+                            }
+                        }
+                        for steering in &current {
+                            if !previous_steering.contains(steering) {
+                                fan_out_steering_notify(
+                                    &mut state,
+                                    SteeringNotifyPayload::Upsert {
+                                        steering: steering.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        previous_steering = current;
+                        if previous_settings.as_ref() != Some(&settings) {
+                            fan_out_host_settings(&mut state, settings.clone(), false).await;
+                        }
+                        previous_settings = Some(settings);
+                        canonical_revision = snapshot.canonical_revision;
+                    }
+                    (Err(reason), _) | (_, Err(reason)) => {
+                        tracing::error!(reason = %reason, "Cannot project canonical learned changes");
+                        snapshot.error = Some("A learned change was saved, but its canonical steering or settings could not be read. Restore the canonical store; the next self-improvement event will reproject the unapplied revision. The author turn is not interrupted.".into());
+                        snapshot.canonical_revision = canonical_revision;
+                    }
+                }
+            }
+            let usage_changed = !snapshot.usage.is_empty();
+            match serde_json::to_value(snapshot) {
+                Ok(value) => {
+                    state.host_streams.retain(|_, subscriber| {
+                        emit_or_queue_host_frame(
+                            subscriber,
+                            FrameKind::SelfImprovementNotify,
+                            value.clone(),
+                        )
+                        .is_ok()
+                    });
+                }
+                Err(_) => tracing::error!("Cannot serialize self-improvement state"),
+            }
+            drop(state);
+            if usage_changed {
+                host.fan_out_task_token_usages().await;
+            }
+            if closed {
+                break;
+            }
+        }
+    };
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(worker);
+    } else {
+        let _ = std::thread::Builder::new()
+            .name("tyde-learning-projection".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(worker),
+                    Err(_) => tracing::error!("Cannot start learning projection runtime"),
+                }
+            });
+    }
+}
+
+fn attach_learning_usage(
+    payloads: &mut [TaskTokenUsagePayload],
+    usage: &[protocol::LearningUsage],
+) {
+    for payload in payloads {
+        payload.helper_usage = usage
+            .iter()
+            .filter(|usage| {
+                usage
+                    .origin_agent_ids
+                    .iter()
+                    .any(|id| payload.breakdown.iter().any(|entry| &entry.agent_id == id))
+                    || usage.origin_session_ids.iter().any(|id| {
+                        payload
+                            .breakdown
+                            .iter()
+                            .any(|entry| entry.session_id.as_ref() == Some(id))
+                    })
+            })
+            .cloned()
+            .collect();
+        payload.total = aggregate_task_token_usage(
+            payload
+                .breakdown
+                .iter()
+                .map(|entry| &entry.usage)
+                .chain(payload.helper_usage.iter().map(|usage| &usage.usage)),
+        );
+    }
+}
+
+fn attach_learning_accounting(
+    payloads: &mut [TaskTokenUsagePayload],
+    result: Result<Vec<protocol::LearningUsage>, String>,
+) {
+    match result {
+        Ok(usage) => attach_learning_usage(payloads, &usage),
+        Err(reason) => {
+            tracing::error!(reason = %reason, "Analyzer accounting unavailable; publishing explicitly incomplete totals");
+            for payload in payloads {
+                let unknown = TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::HelperAccountingUnavailable,
+                };
+                payload.total = aggregate_task_token_usage(
+                    payload
+                        .breakdown
+                        .iter()
+                        .map(|entry| &entry.usage)
+                        .chain(std::iter::once(&unknown)),
+                );
+            }
+        }
+    }
 }

@@ -149,6 +149,7 @@ pub enum HostEvent {
     ProjectNotify(ProjectNotifyPayload),
     CustomAgentNotify(CustomAgentNotifyPayload),
     SteeringNotify(SteeringNotifyPayload),
+    SelfImprovementNotify(protocol::SelfImprovementState),
     SkillNotify(SkillNotifyPayload),
     McpServerNotify(McpServerNotifyPayload),
     TychatState(protocol::TychatStatePayload),
@@ -1111,6 +1112,16 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::CustomAgentNotify(payload)).await;
+            true
+        }
+        FrameKind::SelfImprovementNotify => {
+            let payload: protocol::SelfImprovementState = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::SelfImprovementNotify(payload))
+                .await;
             true
         }
         FrameKind::SteeringNotify => {

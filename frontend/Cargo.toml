@@ -27,6 +27,7 @@ web-sys = { version = "0.3", features = [
     "DomRect",
     "DragEvent",
     "Element",
+    "EventInit",
     "EventTarget",
     "File",
     "FileList",

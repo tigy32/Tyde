@@ -406,6 +406,7 @@ enum AgentCommand {
     DeliverMessage {
         input: AgentInput,
         redirect: RunningTurnRedirect,
+        human: Option<HumanDelivery>,
         reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
     },
     Compact {
@@ -1420,7 +1421,8 @@ fn token_usage_reason_from_task_reason(
         }
         TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
         | TaskTokenUsageUnavailableReason::BackendDidNotReport
-        | TaskTokenUsageUnavailableReason::AgentUnavailable => {
+        | TaskTokenUsageUnavailableReason::AgentUnavailable
+        | TaskTokenUsageUnavailableReason::HelperAccountingUnavailable => {
             TokenUsageUnavailableReason::BackendDidNotReport
         }
     }
@@ -1605,6 +1607,26 @@ impl AgentHandle {
         receipt.wait().await.map_err(|error| error.to_string())
     }
 
+    pub(crate) fn enqueue_human_input(
+        &self,
+        input: AgentInput,
+        id: protocol::HumanInputId,
+        config: crate::self_improvement::ConfigHandle,
+    ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
+        let (reply, receipt) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::DeliverMessage {
+                input,
+                redirect: RunningTurnRedirect::SteerElseInterrupt,
+                human: Some(HumanDelivery { id, config }),
+                reply,
+            })
+            .map_err(|_| {
+                AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned())
+            })?;
+        Ok(AgentDeliveryReceipt(receipt))
+    }
+
     pub(crate) async fn set_tyde_permissions(
         &self,
         access: protocol::AgentTydePermissions,
@@ -1633,6 +1655,7 @@ impl AgentHandle {
             .send(AgentCommand::DeliverMessage {
                 input,
                 redirect,
+                human: None,
                 reply,
             })
             .map_err(|_| {
@@ -3305,6 +3328,7 @@ pub(crate) fn spawn_agent_actor(
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log = AgentEventLog::default();
         let mut latest_output = AgentControlLatestOutput::default();
+        let mut accepted_human_inputs = HashMap::<protocol::HumanInputId, protocol::AcceptedHumanInput>::new();
         let mut replay_state = AgentReplayState::default();
         let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
         let mut last_backend_event_at: Option<Instant> = None;
@@ -3757,7 +3781,7 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
                         AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is starting".into())); }
-                        AgentCommand::DeliverMessage { input, redirect, reply } => {
+                        AgentCommand::DeliverMessage { input, redirect, human, reply } => {
 
                             if matches!(
                                 redirect,
@@ -3766,6 +3790,7 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
+                            let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
@@ -6726,12 +6751,13 @@ pub(crate) fn spawn_agent_actor(
                     // the `SendInput` arm below must resolve it on every exit.
                     // An unresolved acknowledgement drops with this iteration,
                     // which the caller reads as a failed delivery.
-                    let mut delivery_ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>> = None;
+                    let mut delivery_ack: Option<DeliveryAcknowledgement<'_>> = None;
                     let mut redirect = RunningTurnRedirect::SteerElseInterrupt;
                     let command = match command {
                         AgentCommand::DeliverMessage {
                             input,
                             redirect: delivery_redirect,
+                            human,
                             reply,
                         } => {
 
@@ -6744,6 +6770,7 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
+                            let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
                             AgentCommand::SendInput(input)
@@ -7436,7 +7463,7 @@ pub(crate) fn spawn_agent_actor(
                                             // still true, so acknowledging
                                             // without this would leave the agent
                                             // Idle with a message it never ran.
-                                            mark_agent_work_pending(&status_handle).await;
+                                            if reply.is_control() { mark_agent_work_pending(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
                                         }
                                         if supersedes_blocking_question {
@@ -7522,8 +7549,8 @@ pub(crate) fn spawn_agent_actor(
                                                         // the message and will
                                                         // send it when the
                                                         // self-started turn ends.
-                                                        mark_agent_turn_active(&status_handle)
-                                                            .await;
+                                                        if reply.is_control() { mark_agent_turn_active(&status_handle)
+                                                            .await; }
                                                         let _ = reply.send(Ok(()));
                                                     }
                                                 }
@@ -7706,7 +7733,7 @@ pub(crate) fn spawn_agent_actor(
                                                 // response, but the active-before-
                                                 // acknowledge contract has to hold
                                                 // for whatever reaches here.
-                                                mark_agent_turn_active(&status_handle).await;
+                                                if reply.is_control() { mark_agent_turn_active(&status_handle).await; }
                                             }
                                             let _ = reply.send(Ok(()));
                                         }
@@ -7765,7 +7792,7 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
-                                            mark_agent_work_pending(&status_handle).await;
+                                            if reply.is_control() { mark_agent_work_pending(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
                                         }
                                         continue;
@@ -7783,7 +7810,7 @@ pub(crate) fn spawn_agent_actor(
                                         {
                                         SteerOutcome::Accepted => {
                                             if let Some(reply) = delivery_ack.take() {
-                                                mark_agent_turn_active(&status_handle).await;
+                                                if reply.is_control() { mark_agent_turn_active(&status_handle).await; }
                                                 let _ = reply.send(Ok(()));
                                             }
                                             if let Some(review_id) = review_origin {
@@ -7850,7 +7877,7 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
-                                            mark_agent_turn_active(&status_handle).await;
+                                            if reply.is_control() { mark_agent_turn_active(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
                                         }
                                     }
@@ -10510,7 +10537,13 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
-            AgentCommand::DeliverMessage { reply, .. } => {
+            AgentCommand::DeliverMessage { human, reply, .. } => {
+                            if human.is_some() {
+                                let payload = relay_input_rejected_payload(&current_start.agent_id);
+                                append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &payload).await;
+                                let _ = reply.send(Err(AgentDeliveryFailure::Reported(DELIVERY_REJECTED_RELAY.to_owned())));
+                                continue;
+                            }
                             // A relay mirrors a backend-native child and never
                             // accepts direct input. Answering the caller is the
                             // whole fix: the old path left the target marked
@@ -11022,13 +11055,14 @@ async fn finish_actor_close(
 pub(crate) enum AgentDeliveryFailure {
     Busy,
     Rejected(String),
+    Reported(String),
 }
 
 impl std::fmt::Display for AgentDeliveryFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => formatter.write_str("Swarm delivery deferred: member is busy"),
-            Self::Rejected(message) => formatter.write_str(message),
+            Self::Rejected(message) | Self::Reported(message) => formatter.write_str(message),
         }
     }
 }
@@ -11113,6 +11147,116 @@ async fn apply_agent_tyde_permissions(
     Ok(())
 }
 
+struct HumanDelivery {
+    id: protocol::HumanInputId,
+    config: crate::self_improvement::ConfigHandle,
+}
+
+struct HumanAcknowledgement<'a> {
+    config: crate::self_improvement::ConfigHandle,
+    input: protocol::AcceptedHumanInput,
+    accepted: &'a mut HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
+}
+struct DeliveryAcknowledgement<'a> {
+    reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    human: Option<HumanAcknowledgement<'a>>,
+}
+impl DeliveryAcknowledgement<'_> {
+    fn is_control(&self) -> bool {
+        self.human.is_none()
+    }
+    fn send(
+        self,
+        result: Result<(), AgentDeliveryFailure>,
+    ) -> Result<(), Result<(), AgentDeliveryFailure>> {
+        if result.is_ok()
+            && let Some(human) = self.human
+        {
+            human
+                .accepted
+                .insert(human.input.id.clone(), human.input.clone());
+            if let Err(reason) = human.config.record_accepted_human(human.input) {
+                return self.reply.send(Err(AgentDeliveryFailure::Rejected(format!("The author accepted this input, but learning is unavailable: {reason}. Do not resend the author input."))));
+            }
+        }
+        self.reply.send(result)
+    }
+}
+
+fn prepare_delivery_ack<'a>(
+    reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    human: Option<HumanDelivery>,
+    input: &AgentInput,
+    start: &AgentStartPayload,
+    latest: &AgentControlOutput,
+    accepted: &'a mut HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
+) -> Option<DeliveryAcknowledgement<'a>> {
+    let Some(human) = human else {
+        return Some(DeliveryAcknowledgement { reply, human: None });
+    };
+    if let Some(previous) = accepted.get(&human.id) {
+        let result = human
+            .config
+            .record_accepted_human(previous.clone())
+            .map_err(AgentDeliveryFailure::Rejected);
+        let _ = reply.send(result);
+        return None;
+    }
+    if human.config.human_was_seen(&human.id) {
+        let _ = reply.send(Ok(()));
+        return None;
+    }
+    let (message, source) = match input {
+        AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload) => {
+            let source = if payload.tool_response.is_some() {
+                protocol::HumanInputSource::AskUserAnswer
+            } else if matches!(input, AgentInput::SteerMessage(_)) {
+                protocol::HumanInputSource::Steering
+            } else {
+                protocol::HumanInputSource::Chat
+            };
+            let text = match &payload.tool_response {
+                Some(protocol::SendMessageToolResponse::AskUserQuestion { answer, .. }) => {
+                    answer.clone()
+                }
+                Some(protocol::SendMessageToolResponse::ExitPlanMode {
+                    feedback: Some(feedback),
+                    ..
+                }) => feedback.clone(),
+                _ => payload.message.clone(),
+            };
+            (text, source)
+        }
+        _ => {
+            let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                "Human input must be a chat message, steering message, or answer".into(),
+            )));
+            return None;
+        }
+    };
+    let assistant_context = match latest {
+        AgentControlOutput::Message { text } => text.chars().take(4096).collect(),
+        AgentControlOutput::Empty | AgentControlOutput::Error { .. } => String::new(),
+    };
+    let input = protocol::AcceptedHumanInput {
+        id: human.id,
+        source,
+        agent_id: start.agent_id.clone(),
+        session_id: start.session_id.clone(),
+        project_id: start.project_id.clone(),
+        message,
+        assistant_context,
+    };
+    Some(DeliveryAcknowledgement {
+        reply,
+        human: Some(HumanAcknowledgement {
+            config: human.config,
+            input,
+            accepted,
+        }),
+    })
+}
+
 /// Rejection reasons for an acknowledged [`AgentCommand::DeliverMessage`].
 ///
 /// These reach the agent-control caller as the tool's error text, so they
@@ -11140,15 +11284,18 @@ const DELIVERY_NOT_ACKNOWLEDGED: &str = "agent actor did not acknowledge the mes
 /// Returns whether there was an acknowledgement to resolve, so a shared
 /// rejection site can skip the transcript error it would otherwise append for
 /// fire-and-forget input.
-fn reject_agent_delivery(
-    ack: Option<oneshot::Sender<Result<(), AgentDeliveryFailure>>>,
-    reason: &str,
-) -> bool {
+fn reject_agent_delivery(ack: Option<DeliveryAcknowledgement<'_>>, reason: &str) -> bool {
     let Some(reply) = ack else {
         return false;
     };
-    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(reason.to_owned())));
-    true
+    let control = reply.is_control();
+    let failure = if control {
+        AgentDeliveryFailure::Rejected(reason.to_owned())
+    } else {
+        AgentDeliveryFailure::Reported(reason.to_owned())
+    };
+    let _ = reply.send(Err(failure));
+    control
 }
 
 fn relay_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
@@ -11841,7 +11988,22 @@ async fn park_terminal_agent(
             AgentCommand::TychatSend { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
-            AgentCommand::DeliverMessage { reply, .. } => {
+            AgentCommand::DeliverMessage { human, reply, .. } => {
+                if human.is_some() {
+                    let payload = terminal_input_rejected_payload(&current_start.agent_id);
+                    append_event(
+                        &format!("/agent/{}", current_start.agent_id),
+                        event_log,
+                        subscribers,
+                        FrameKind::AgentError,
+                        &payload,
+                    )
+                    .await;
+                    let _ = reply.send(Err(AgentDeliveryFailure::Reported(
+                        DELIVERY_REJECTED_TERMINAL.to_owned(),
+                    )));
+                    continue;
+                }
                 // The fire-and-forget arm above answers a client with a typed
                 // transcript rejection because a human is watching this chat.
                 // An acknowledged delivery has a caller to answer instead, and
@@ -12075,7 +12237,22 @@ async fn park_relay_terminal_agent(
             AgentCommand::TychatSend { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
-            AgentCommand::DeliverMessage { reply, .. } => {
+            AgentCommand::DeliverMessage { human, reply, .. } => {
+                if human.is_some() {
+                    let payload = terminal_input_rejected_payload(&current_start.agent_id);
+                    append_event(
+                        canonical_stream,
+                        event_log,
+                        subscribers,
+                        FrameKind::AgentError,
+                        &payload,
+                    )
+                    .await;
+                    let _ = reply.send(Err(AgentDeliveryFailure::Reported(
+                        DELIVERY_REJECTED_TERMINAL.to_owned(),
+                    )));
+                    continue;
+                }
                 // Parked relay: terminal is the more actionable of the two
                 // reasons, since resume/fork applies and "does not accept
                 // direct input" would read as a routing mistake.
@@ -16264,4 +16441,202 @@ fn title_case_word(word: &str) -> String {
     out.extend(first.to_uppercase());
     out.push_str(&chars.as_str().to_ascii_lowercase());
     out
+}
+
+pub(crate) struct LearningHelper {
+    backend: BackendHandle,
+    events: EventStream,
+    _workspace: tempfile::TempDir,
+    kind: BackendKind,
+}
+
+impl LearningHelper {
+    pub(crate) async fn start(
+        analyzer: &protocol::LearningAnalyzer,
+        prompt: String,
+        use_mock: bool,
+        mock_launch: Option<crate::backend::mock::MockLaunch>,
+    ) -> Result<Self, String> {
+        if !matches!(
+            crate::backend::learning_analyzer_capability(analyzer.backend_kind),
+            protocol::LearningAnalyzerCapability::ToolFreeReusable
+        ) {
+            return Err(
+                "Reusable tool-free analysis is currently supported only by Codex".to_owned(),
+            );
+        }
+        let workspace = tempfile::tempdir().map_err(|_| "Cannot create analyzer workspace")?;
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "model".into(),
+            protocol::SessionSettingValue::String(analyzer.model.clone()),
+        );
+        values.0.insert(
+            "reasoning_effort".into(),
+            protocol::SessionSettingValue::String("low".into()),
+        );
+        let mut config = agent_name_generation_spawn_config(Some(values));
+        config.mock_launch = mock_launch;
+        let (backend, events, _) = spawn_backend(
+            use_mock,
+            analyzer.backend_kind,
+            vec![workspace.path().to_string_lossy().into_owned()],
+            config,
+            SendMessagePayload {
+                message: prompt,
+                images: None,
+                origin: Some(MessageOrigin::System),
+                tool_response: None,
+            },
+        )
+        .await
+        .map_err(|_| {
+            "Analyzer backend failed to start; check selected model and backend setup".to_owned()
+        })?;
+        Ok(Self {
+            backend,
+            events,
+            _workspace: workspace,
+            kind: if use_mock {
+                BackendKind::Claude
+            } else {
+                analyzer.backend_kind
+            },
+        })
+    }
+
+    pub(crate) async fn send(&self, prompt: String) -> Result<(), String> {
+        match self
+            .backend
+            .send_with_outcome(AgentInput::SendMessage(SendMessagePayload {
+                message: prompt,
+                images: None,
+                origin: Some(MessageOrigin::System),
+                tool_response: None,
+            }))
+            .await
+        {
+            crate::backend::SendOutcome::Accepted => Ok(()),
+            crate::backend::SendOutcome::Busy(_) => {
+                Err("Analyzer refused a serialized batch as busy".into())
+            }
+            crate::backend::SendOutcome::Closed => Err("Analyzer context closed".into()),
+        }
+    }
+
+    pub(crate) async fn collect(
+        &mut self,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> (
+        Result<protocol::LearningAnalysis, String>,
+        TaskTokenUsageScope,
+    ) {
+        let mut tracker = AgentActivityStatsTracker::for_backend(self.kind);
+        let mut output = None;
+        let mut streamed = String::new();
+        let mut failure = None;
+        let mut seq = 0;
+        loop {
+            let next = tokio::select! { _ = cancelled.cancelled() => { failure = Some("Analyzer was disabled or reconfigured".into()); break; }, event = self.events.recv_backend() => event };
+            let Some(event) = next else {
+                break;
+            };
+            seq += 1;
+            match event {
+                crate::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
+                    tracker.observe_model_request_token_usage(usage, seq);
+                }
+                crate::backend::BackendEvent::Chat(mut event) => {
+                    tracker.observe_chat_event(&mut event, seq, &streamed);
+                    match event {
+                        ChatEvent::StreamDelta(delta) => {
+                            if streamed.len() + delta.text.len() > 32768 {
+                                failure =
+                                    Some("Analyzer exceeded its structured output budget".into());
+                                break;
+                            }
+                            streamed.push_str(&delta.text);
+                        }
+                        ChatEvent::StreamEnd(end)
+                            if matches!(end.message.sender, MessageSender::Assistant { .. }) =>
+                        {
+                            if !end.message.tool_calls.is_empty()
+                                || end.message.content.len() > 32768
+                            {
+                                failure =
+                                    Some("Analyzer violated the tool-free output contract".into());
+                                break;
+                            }
+                            output = Some(end.message.content);
+                        }
+                        ChatEvent::MessageAdded(message)
+                            if matches!(message.sender, MessageSender::Error) =>
+                        {
+                            failure = Some("Analyzer provider reported a failure".into());
+                            break;
+                        }
+                        ChatEvent::ToolRequest(_) | ChatEvent::ToolExecutionCompleted(_) => {
+                            failure = Some("Analyzer violated the tool-free contract".into());
+                            break;
+                        }
+                        ChatEvent::TypingStatusChanged(false) if output.is_some() => break,
+                        ChatEvent::OperationCancelled(_) | ChatEvent::RetryAttempt(_) => {
+                            failure = Some("Analyzer was cancelled or attempted a retry".into());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    failure = Some("Analyzer emitted an unexpected lifecycle event".into());
+                    break;
+                }
+            }
+        }
+        let usage = if tracker.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+            if tracker.token_usage_by_source.is_empty() {
+                TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
+                }
+            } else {
+                let aggregate =
+                    crate::host::aggregate_task_token_usage(tracker.token_usage_by_source.values());
+                match aggregate.status {
+                    protocol::TaskTokenUsageStatus::Known => TaskTokenUsageScope::Known {
+                        usage: Box::new(aggregate.usage),
+                    },
+                    protocol::TaskTokenUsageStatus::Partial {
+                        unavailable_count,
+                        reasons,
+                    }
+                    | protocol::TaskTokenUsageStatus::Unavailable {
+                        unavailable_count,
+                        reasons,
+                    } => TaskTokenUsageScope::Partial {
+                        usage: Box::new(aggregate.usage),
+                        unavailable_count,
+                        reasons,
+                    },
+                }
+            }
+        } else {
+            tracker.usage_snapshot().0
+        };
+        let result = match failure {
+            Some(reason) => Err(reason),
+            None => output
+                .ok_or_else(|| "Analyzer ended without a completed response".to_owned())
+                .and_then(|text| {
+                    serde_json::from_str(&text).map_err(|_| {
+                        "Analyzer returned invalid structured results; no changes applied"
+                            .to_owned()
+                    })
+                }),
+        };
+        (result, usage)
+    }
+
+    pub(crate) async fn shutdown(self) {
+        self.backend.shutdown().await;
+    }
 }

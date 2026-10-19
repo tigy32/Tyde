@@ -383,7 +383,9 @@ impl fmt::Display for ReviewSuggestionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProjectId(pub String);
 
@@ -1060,6 +1062,9 @@ pub enum FrameKind {
     CustomAgentUpsert,
     CustomAgentDelete,
     SteeringUpsert,
+    HumanInput,
+    SelfImprovementAction,
+    SelfImprovementNotify,
     SteeringDelete,
     SkillRefresh,
     BackendSettingsRefresh,
@@ -1282,6 +1287,9 @@ impl fmt::Display for FrameKind {
             Self::WorkbenchRemove => f.write_str("workbench_remove"),
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
+            Self::HumanInput => f.write_str("human_input"),
+            Self::SelfImprovementAction => f.write_str("self_improvement_action"),
+            Self::SelfImprovementNotify => f.write_str("self_improvement_notify"),
             Self::SteeringUpsert => f.write_str("steering_upsert"),
             Self::SteeringDelete => f.write_str("steering_delete"),
             Self::SkillRefresh => f.write_str("skill_refresh"),
@@ -1767,6 +1775,8 @@ pub struct WorkflowRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBootstrapPayload<S = Value> {
+    #[serde(default)]
+    pub self_improvement: crate::SelfImprovementState,
     #[serde(default)]
     pub tychat: TychatStatePayload,
     #[serde(default)]
@@ -4707,6 +4717,8 @@ pub struct AgentActivityStatsPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTokenUsagePayload {
+    #[serde(default)]
+    pub helper_usage: Vec<crate::LearningUsage>,
     pub root_agent_id: AgentId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_session_id: Option<SessionId>,
@@ -4866,6 +4878,7 @@ pub enum TaskTokenUsageStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskTokenUsageUnavailableReason {
+    HelperAccountingUnavailable,
     NoAssistantTurnCompleted,
     BackendDidNotReport,
     ProviderScopeAmbiguous,
@@ -4945,7 +4958,7 @@ pub struct Steering {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SteeringScope {
     Host,
@@ -7004,6 +7017,8 @@ pub struct ReviewSettings {
     /// Preserved pre-team selections, available to explicitly restore.
     #[serde(default)]
     pub saved_reviewer_selections: BTreeMap<String, Vec<ReviewReviewerConfig>>,
+    #[serde(default)]
+    pub aspect_scopes: BTreeMap<String, SteeringScope>,
     pub enabled: bool,
     #[serde(default)]
     pub aspects: BTreeMap<String, ReviewAspectConfig>,
@@ -7017,6 +7032,7 @@ impl Default for ReviewSettings {
             default_mode: ReviewMode::ReviewTeam,
             team: Default::default(),
             saved_reviewer_selections: BTreeMap::new(),
+            aspect_scopes: BTreeMap::new(),
         }
     }
 }

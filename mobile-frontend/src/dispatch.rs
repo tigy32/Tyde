@@ -124,6 +124,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         release_version: None,
     };
     let mut bootstrap = BootstrapHostPayload {
+        self_improvement: Default::default(),
         tychat: Default::default(),
         dots: Default::default(),
         agents_with_background_work: Vec::new(),
@@ -131,6 +132,7 @@ pub fn prime_host_with_bootstrap_for_tests(
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
+            self_improvement: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             default_launch_profile_id: None,
@@ -4479,6 +4481,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Thinking,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
+            self_improvement: Default::default(),
             tychat: protocol::TychatStatePayload::default(),
             dots: Default::default(),
             agents_with_background_work: Vec::new(),
@@ -4486,6 +4489,7 @@ mod wasm_tests {
                 resume_previous_agents: settings_model::default_resume_previous_agents(),
                 pause_swarms_on_restart: false,
                 review: Default::default(),
+                self_improvement: Default::default(),
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),
                 default_launch_profile_id: None,

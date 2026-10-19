@@ -167,3 +167,5 @@ pub fn dots_connection_schema() -> Result<String, String> {
 }
 
 pub mod host_launch;
+
+pub(crate) mod self_improvement;

@@ -474,6 +474,30 @@ impl Connection {
             .await
     }
 
+    pub async fn self_improvement_action(
+        &mut self,
+        action: protocol::SelfImprovementAction,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SelfImprovementAction, &action)
+            .await
+    }
+
+    pub async fn human_input(
+        &mut self,
+        stream: &StreamPath,
+        payload: protocol::HumanInputPayload,
+    ) -> Result<(), FrameError> {
+        let seq = self.outgoing_seq.get(stream).copied().ok_or_else(|| {
+            FrameError::Json(serde_json::Error::io(std::io::Error::other(
+                "Human input stream has not been opened",
+            )))
+        })?;
+        let envelope = Envelope::from_payload(stream.clone(), FrameKind::HumanInput, seq, &payload)
+            .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn settings_write(
         &mut self,
         payload: protocol::SettingsWritePayload,
@@ -1552,6 +1576,10 @@ impl Connection {
                 }
                 FrameKind::TychatState => {
                     let _: protocol::TychatStatePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SelfImprovementNotify => {
+                    let _: protocol::SelfImprovementState =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::MobileAccessState => {

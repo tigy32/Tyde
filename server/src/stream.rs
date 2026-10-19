@@ -761,6 +761,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SessionSchemas
         | FrameKind::SessionSettings
         | FrameKind::LaunchProfileCatalogNotify
+        | FrameKind::SelfImprovementNotify
         | FrameKind::HostBootstrap
         | FrameKind::AgentBootstrap
         | FrameKind::ProjectBootstrap
@@ -770,6 +771,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         FrameKind::Hello
         | FrameKind::Welcome
         | FrameKind::Reject
+        | FrameKind::HumanInput
+        | FrameKind::SelfImprovementAction
         | FrameKind::SettingsWrite
         | FrameKind::BackendNativeSettingsWrite
         | FrameKind::InvokeSettingsAction

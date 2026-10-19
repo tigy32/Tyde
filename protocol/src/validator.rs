@@ -897,6 +897,8 @@ impl ProtocolValidator {
             FrameKind::CustomAgentDelete => {
                 parse_host_payload::<CustomAgentDeletePayload>(self, envelope, "CustomAgentDelete")
             }
+            FrameKind::SelfImprovementAction => parse_host_payload::<crate::SelfImprovementAction>(self, envelope, "SelfImprovementAction"),
+            FrameKind::SelfImprovementNotify => parse_host_payload::<crate::SelfImprovementState>(self, envelope, "SelfImprovementNotify"),
             FrameKind::SteeringUpsert => {
                 parse_host_payload::<SteeringUpsertPayload>(self, envelope, "SteeringUpsert")
             }
@@ -1350,6 +1352,16 @@ impl ProtocolValidator {
                         "Message access must target the started agent on this stream".to_owned(),
                     ));
                 }
+            }
+            FrameKind::HumanInput => {
+                let _: crate::HumanInputPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("Invalid human input: {error}"),
+                    )
+                })?;
             }
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}

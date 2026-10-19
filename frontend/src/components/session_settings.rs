@@ -744,6 +744,9 @@ fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'sta
         TaskTokenUsageUnavailableReason::BackendDidNotReport => "backend did not report",
         TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous => "provider scope ambiguous",
         TaskTokenUsageUnavailableReason::AgentUnavailable => "agent unavailable",
+        TaskTokenUsageUnavailableReason::HelperAccountingUnavailable => {
+            "analyzer accounting unavailable"
+        }
     }
 }
 
@@ -2204,6 +2207,7 @@ mod wasm_tests {
     /// reported usage, so the task total is Partial.
     fn partial_rollup(root: &str, root_in: u64, root_out: u64) -> TaskTokenUsagePayload {
         TaskTokenUsagePayload {
+            helper_usage: Vec::new(),
             root_agent_id: AgentId(root.to_owned()),
             root_session_id: None,
             total: TaskTokenUsageAggregate {

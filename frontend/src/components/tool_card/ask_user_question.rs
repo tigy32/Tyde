@@ -1218,8 +1218,14 @@ mod wasm_tests {
             ("host-1".to_owned(), "/agent/agent-1/inst".to_owned())
         );
         let envelope: protocol::Envelope = serde_json::from_str(&last_send_line(&calls)).unwrap();
-        assert_eq!(envelope.kind, FrameKind::SendMessage);
-        let payload: SendMessagePayload = envelope.parse_payload().unwrap();
+        assert_eq!(envelope.kind, FrameKind::HumanInput);
+        let human: protocol::HumanInputPayload = envelope.parse_payload().unwrap();
+        assert_eq!(human.action, protocol::HumanInputAction::Send);
+        assert!(
+            !human.id.0.is_empty(),
+            "Question answers need a replay identity"
+        );
+        let payload = human.input;
         let Some(SendMessageToolResponse::AskUserQuestion {
             tool_call_id,
             structured_answers: Some(answers),

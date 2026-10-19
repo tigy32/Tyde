@@ -3286,6 +3286,7 @@ mod wasm_tests {
                     resume_previous_agents: settings_model::default_resume_previous_agents(),
                     pause_swarms_on_restart: false,
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: None,
                     default_launch_profile_id: None,

@@ -1332,6 +1332,7 @@ mod wasm_tests {
                 host_id(),
                 HostSettings {
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
                     ..HostSettings::default()

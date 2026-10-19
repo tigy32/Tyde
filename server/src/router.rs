@@ -314,6 +314,11 @@ pub(crate) async fn route_client_envelope(
                     parse_payload(&envelope, "custom_agent_delete")?;
                 host.delete_custom_agent(payload).await?;
             }
+            FrameKind::SelfImprovementAction => {
+                let payload: protocol::SelfImprovementAction =
+                    parse_payload(&envelope, "self_improvement_action")?;
+                host.learning_action(payload).await?;
+            }
             FrameKind::SteeringUpsert => {
                 let payload: SteeringUpsertPayload = parse_payload(&envelope, "steering_upsert")?;
                 host.upsert_steering(payload).await?;
@@ -609,6 +614,35 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await?;
             }
+            FrameKind::HumanInput => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: protocol::HumanInputPayload = parse_payload(&envelope, "human_input")?;
+                if !matches!(
+                    payload.input.origin,
+                    None | Some(protocol::MessageOrigin::User)
+                ) {
+                    return Err(AppError::invalid(
+                        "human_input",
+                        "human input cannot claim server or agent provenance",
+                    ));
+                }
+                ensure_non_empty("human_input", "id", &payload.id.0)?;
+                validate_message_images("human_input", payload.input.images.as_deref())?;
+                let input = match payload.action {
+                    protocol::HumanInputAction::Send => AgentInput::SendMessage(payload.input),
+                    protocol::HumanInputAction::Steer => AgentInput::SteerMessage(payload.input),
+                };
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    input,
+                    stream_path,
+                    host_output_stream,
+                    Some(payload.id),
+                )
+                .await;
+            }
             FrameKind::SendMessage => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
@@ -635,6 +669,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::SendMessage(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -664,6 +699,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::SteerMessage(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -677,6 +713,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::GoalControl(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -692,6 +729,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::EditQueuedMessage(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -707,6 +745,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::CancelQueuedMessage(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -722,6 +761,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::SendQueuedMessageNow(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -837,6 +877,7 @@ pub(crate) async fn route_client_envelope(
                     AgentInput::UpdateSessionSettings(payload),
                     stream_path,
                     host_output_stream,
+                    None,
                 )
                 .await;
             }
@@ -1769,6 +1810,7 @@ async fn deliver_agent_input(
     input: AgentInput,
     stream_path: StreamPath,
     host_output_stream: &Stream,
+    human_id: Option<protocol::HumanInputId>,
 ) {
     match host.deliver_swarm_private_input(&agent_id, &input).await {
         Ok(true) => return,
@@ -1794,6 +1836,37 @@ async fn deliver_agent_input(
     }
     let reason = match host.agent_handle(&agent_id).await {
         Some(agent) => {
+            if matches!(
+                &input,
+                AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload)
+                    if matches!(payload.origin, None | Some(protocol::MessageOrigin::User))
+            ) {
+                let id = human_id
+                    .unwrap_or_else(|| protocol::HumanInputId(uuid::Uuid::new_v4().to_string()));
+                let receipt = agent.enqueue_human_input(input, id, host.config.clone());
+                let stream = host_output_stream.with_path(stream_path);
+                tokio::spawn(async move {
+                    let result = match receipt {
+                        Ok(receipt) => receipt.wait().await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        if matches!(error, crate::agent::AgentDeliveryFailure::Reported(_)) {
+                            return;
+                        }
+                        let payload = AgentErrorPayload {
+                            agent_id,
+                            code: AgentErrorCode::Internal,
+                            message: error.to_string(),
+                            fatal: false,
+                        };
+                        if let Ok(value) = serde_json::to_value(payload) {
+                            let _ = stream.send_value(FrameKind::AgentError, value);
+                        }
+                    }
+                });
+                return;
+            }
             if agent.send_input(input).await {
                 return;
             }

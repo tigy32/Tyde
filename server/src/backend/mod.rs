@@ -2757,3 +2757,15 @@ pub(crate) fn validate_custom_launch_profile(
     }
     with_backend_type!(profile.backend_kind, |B| B::validate_launch_config(&profile.id, profile.acp.as_ref()), removed => Err("Tycode has been removed".to_owned()))
 }
+
+pub(crate) fn learning_analyzer_capability(
+    kind: BackendKind,
+) -> protocol::LearningAnalyzerCapability {
+    match kind {
+        BackendKind::Codex => protocol::LearningAnalyzerCapability::ToolFreeReusable,
+        _ => protocol::LearningAnalyzerCapability::Unsupported {
+            reason: "This backend does not support Tyde's reusable tool-free analyzer contract"
+                .into(),
+        },
+    }
+}

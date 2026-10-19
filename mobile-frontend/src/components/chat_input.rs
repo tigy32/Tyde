@@ -3025,6 +3025,7 @@ mod wasm_tests {
                     host.clone(),
                     HostSettings {
                         review: Default::default(),
+                        self_improvement: Default::default(),
                         enabled_backends: vec![
                             BackendKind::Codex,
                             BackendKind::Claude,

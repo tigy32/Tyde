@@ -749,6 +749,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::CommandError(_)
                 | HostEvent::CustomAgentNotify(_)
                 | HostEvent::SteeringNotify(_)
+                | HostEvent::SelfImprovementNotify(_)
                 | HostEvent::SkillNotify(_)
                 | HostEvent::McpServerNotify(_)
                 | HostEvent::WorkflowNotify(_)

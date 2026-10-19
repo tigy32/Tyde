@@ -309,7 +309,46 @@ pub async fn send_frame_unreported<T: Serialize>(
         seq,
         kind
     );
-    let envelope = match Envelope::from_payload(stream.clone(), kind, seq, payload) {
+    let human_input = if matches!(kind, FrameKind::SendMessage | FrameKind::SteerMessage) {
+        Some(
+            serde_json::from_value::<protocol::SendMessagePayload>(
+                serde_json::to_value(payload).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let human_payload = match human_input {
+        Some(input) if matches!(input.origin, None | Some(protocol::MessageOrigin::User)) => {
+            let mut bytes = [0_u8; 16];
+            web_sys::window()
+                .ok_or("Browser window is unavailable")?
+                .crypto()
+                .map_err(|_| "Browser crypto is unavailable")?
+                .get_random_values_with_u8_array(&mut bytes)
+                .map_err(|_| "Cannot create human input identity")?;
+            Some(protocol::HumanInputPayload {
+                id: protocol::HumanInputId(
+                    bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+                ),
+                action: if kind == FrameKind::SteerMessage {
+                    protocol::HumanInputAction::Steer
+                } else {
+                    protocol::HumanInputAction::Send
+                },
+                input,
+            })
+        }
+        _ => None,
+    };
+    let encoded = match human_payload {
+        Some(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::HumanInput, seq, &payload)
+        }
+        None => Envelope::from_payload(stream.clone(), kind, seq, payload),
+    };
+    let envelope = match encoded {
         Ok(envelope) => envelope,
         Err(error) => {
             release_seq_if_last(host_id, &stream, reservation);

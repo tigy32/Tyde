@@ -16,7 +16,8 @@ fn fail(code: SwarmErrorCode, message: impl Into<String>) -> SwarmFailure {
 fn delivery_failure(error: crate::agent::AgentDeliveryFailure) -> SwarmFailure {
     let code = match &error {
         crate::agent::AgentDeliveryFailure::Busy => SwarmErrorCode::Busy,
-        crate::agent::AgentDeliveryFailure::Rejected(_) => SwarmErrorCode::Lifecycle,
+        crate::agent::AgentDeliveryFailure::Rejected(_)
+        | crate::agent::AgentDeliveryFailure::Reported(_) => SwarmErrorCode::Lifecycle,
     };
     fail(code, error.to_string())
 }
@@ -202,8 +203,6 @@ async fn validate_retained_session_locked(
             None => {
                 let settings = state
                     .settings_store
-                    .lock()
-                    .await
                     .get()
                     .map_err(|error| fail(SwarmErrorCode::Storage, error))?;
                 launch_profile_catalog_for_settings(state, &settings).entries.iter().any(|entry| matches!(entry,

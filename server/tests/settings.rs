@@ -126,6 +126,7 @@ fn expected_empty_settings() -> HostSettings {
         resume_previous_agents: settings_model::default_resume_previous_agents(),
         pause_swarms_on_restart: false,
         review: Default::default(),
+        self_improvement: Default::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
         default_launch_profile_id: None,
@@ -365,6 +366,7 @@ async fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
             pause_swarms_on_restart: false,
             review: Default::default(),
+            self_improvement: Default::default(),
             enabled_backends: vec![
                 BackendKind::Kiro,
                 BackendKind::Claude,
@@ -1496,42 +1498,20 @@ async fn settings_write_keyed_launch_profiles_preserve_disjoint_edits() {
     );
 }
 
-/// The settings-apply lifecycle (CAS read, commit, propagation, fanout,
-/// refreshes, result) is serialized across writers: while one write's slow
-/// post-commit refresh window is open, a second write must not commit or
-/// fan out. Otherwise subscribers could finish on a superseded snapshot and
-/// the first writer's `current_etag` would be stale — breaking the
-/// draft-clear correlation. A slow Hermes probe holds
-/// the first write's refresh window open deterministically while the
-/// second write arrives.
+/// Two real protocol clients write while a deterministic post-commit gate
+/// holds the first lifecycle open. The second command is acknowledged queued
+/// before release; fanout/result correlation and persisted values must stay
+/// serialized. No provider latency or real delay is part of the oracle.
 #[tokio::test]
 async fn settings_write_lifecycle_is_serialized_across_writers() {
-    let _env_guard = env_lock().lock().await;
-    let temp_home = tempfile::tempdir().expect("create temp HOME");
-    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
-    let _hermes_python =
-        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-
-    let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(Vec::new()).await;
+    let mut fixture = Fixture::new_with_mock_backend_for_enabled_backends(Vec::new()).await;
     let mut second = fixture.connect().await;
-    // Applied after fixture startup so only the write-triggered refresh
-    // probes are slowed.
-    let slow_hermes = temp_home.path().join("slow-hermes-python");
-    std::fs::write(&slow_hermes, "#!/bin/sh\nsleep 1\nexit 1\n").expect("write slow Hermes probe");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&slow_hermes)
-            .expect("stat slow Hermes probe")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&slow_hermes, permissions)
-            .expect("make slow Hermes probe executable");
-    }
-    let _slow_hermes_python =
-        EnvVarGuard::set("HERMES_PYTHON", slow_hermes.to_string_lossy().to_string());
-
-    // W1: opens a multi-second refresh window (real Hermes probes).
+    // The committed W1 document is held before its correlated result. W2's
+    // queue-admission event proves it arrived inside that lifecycle window.
+    let (applying, queued) = fixture
+        .host_for_test()
+        .install_settings_lifecycle_test_gates("w-serial-hermes", "w-serial-scalar")
+        .await;
     send_settings_write(
         &mut fixture.client,
         "w-serial-hermes",
@@ -1542,8 +1522,7 @@ async fn settings_write_lifecycle_is_serialized_across_writers() {
         )],
     )
     .await;
-    // W2 arrives while W1's window is open.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    applying.wait_until_entered().await;
     send_settings_write(
         &mut second,
         "w-serial-scalar",
@@ -1554,6 +1533,8 @@ async fn settings_write_lifecycle_is_serialized_across_writers() {
         )],
     )
     .await;
+    queued.wait_until_entered().await;
+    applying.release_one();
 
     // W1's issuer: exactly ONE fanout (W1's own document) may precede W1's
     // result, and the result's etag must equal that fanout's etag — the

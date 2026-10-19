@@ -2445,7 +2445,10 @@ mod wasm_tests {
         let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
         let envelope: JsonValue =
             serde_json::from_str(args["line"].as_str().expect("normal frame")).unwrap();
-        assert_eq!(envelope["kind"], "send_message");
+        assert_eq!(
+            assert_human_payload(&envelope, protocol::HumanInputAction::Send)["message"],
+            "Apply this correction"
+        );
         stub_send_host_line();
         container.remove();
     }
@@ -2748,6 +2751,21 @@ mod wasm_tests {
         callback.call1(&JsValue::NULL, &event).unwrap();
     }
 
+    fn assert_human_payload(envelope: &JsonValue, action: protocol::HumanInputAction) -> JsonValue {
+        let envelope: protocol::Envelope =
+            serde_json::from_value(envelope.clone()).expect("outgoing protocol envelope");
+        assert_eq!(envelope.kind, FrameKind::HumanInput);
+        let payload: protocol::HumanInputPayload = envelope
+            .parse_payload()
+            .expect("typed human input boundary");
+        assert_eq!(payload.action, action);
+        assert!(
+            !payload.id.0.is_empty(),
+            "Human input needs a replay identity"
+        );
+        serde_json::to_value(payload.input).expect("human message contents")
+    }
+
     fn send_message_payloads(calls: &js_sys::Array) -> Vec<JsonValue> {
         calls
             .iter()
@@ -2759,9 +2777,10 @@ mod wasm_tests {
                     .and_then(|line| serde_json::from_str::<JsonValue>(line).ok())
             })
             .filter(|envelope| {
-                envelope.get("kind").and_then(|kind| kind.as_str()) == Some("send_message")
+                envelope.get("kind").and_then(|kind| kind.as_str()) == Some("human_input")
+                    && envelope["payload"]["action"] == "send"
             })
-            .filter_map(|envelope| envelope.get("payload").cloned())
+            .map(|envelope| assert_human_payload(&envelope, protocol::HumanInputAction::Send))
             .collect()
     }
 
@@ -2808,6 +2827,7 @@ mod wasm_tests {
                 HOST.to_owned(),
                 settings_model::HostSettings {
                     review: Default::default(),
+                    self_improvement: Default::default(),
                     enabled_backends: vec![BackendKind::Codex],
                     default_backend: Some(BackendKind::Codex),
                     ..Default::default()
@@ -4324,8 +4344,10 @@ mod wasm_tests {
         let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
         let envelope: JsonValue =
             serde_json::from_str(args["line"].as_str().expect("outgoing frame")).unwrap();
-        assert_eq!(envelope["kind"], "steer_message");
-        assert_eq!(envelope["payload"]["message"], "use the other parser");
+        assert_eq!(
+            assert_human_payload(&envelope, protocol::HumanInputAction::Steer)["message"],
+            "use the other parser"
+        );
         assert_eq!(
             interrupt_frames(&calls),
             0,
@@ -4360,8 +4382,10 @@ mod wasm_tests {
         let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
         let envelope: JsonValue =
             serde_json::from_str(args["line"].as_str().expect("outgoing frame")).unwrap();
-        assert_eq!(envelope["kind"], "steer_message");
-        assert_eq!(envelope["payload"]["message"], "and keep the old tests");
+        assert_eq!(
+            assert_human_payload(&envelope, protocol::HumanInputAction::Steer)["message"],
+            "and keep the old tests"
+        );
         assert_eq!(
             interrupt_frames(&calls),
             0,
@@ -4404,14 +4428,17 @@ mod wasm_tests {
                 2,
                 "Cancel + send must send exactly two frames"
             );
-            for (index, kind) in [(0, "interrupt"), (1, "send_message")] {
+            for (index, kind) in [(0, "interrupt"), (1, "human_input")] {
                 let args: JsonValue =
                     serde_json::from_str(&calls.get(index).as_string().unwrap()).unwrap();
                 let envelope: JsonValue =
                     serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
                 assert_eq!(envelope["kind"], kind, "Cancel must precede send");
                 if index == 1 {
-                    assert_eq!(envelope["payload"]["message"], "stop and redirect");
+                    assert_eq!(
+                        assert_human_payload(&envelope, protocol::HumanInputAction::Send)["message"],
+                        "stop and redirect"
+                    );
                 }
             }
             let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
@@ -4457,13 +4484,15 @@ mod wasm_tests {
         assert_eq!(calls.length(), 1);
         let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
         let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["kind"], "steer_message");
-        assert_eq!(envelope["payload"]["message"], "steer with control");
+        assert_eq!(
+            assert_human_payload(&envelope, protocol::HumanInputAction::Steer)["message"],
+            "steer with control"
+        );
 
         for (failure_kind, alt, expected_calls) in [
             ("interrupt", false, 1),
-            ("send_message", false, 2),
-            ("steer_message", true, 1),
+            ("send", false, 2),
+            ("steer", true, 1),
         ] {
             let calls = stub_send_recording();
             js_sys::eval(&format!(r#"
@@ -4471,8 +4500,12 @@ mod wasm_tests {
                 const recordingInvoke = window.__TAURI__.core.invoke;
                 window.__TAURI__.core.invoke = function(cmd, args) {{
                     const result = recordingInvoke(cmd, args);
-                    if (cmd === 'send_host_line' && JSON.parse(args.line).kind === '{failure_kind}') {{
-                        return Promise.reject('test transport failure');
+                    if (cmd === 'send_host_line') {{
+                        const frame = JSON.parse(args.line);
+                        if (frame.kind === '{failure_kind}' ||
+                            (frame.kind === 'human_input' && frame.payload.action === '{failure_kind}')) {{
+                            return Promise.reject('test transport failure');
+                        }}
                     }}
                     return result;
                 }};

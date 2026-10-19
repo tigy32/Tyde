@@ -1,3 +1,5 @@
+pub mod self_improvement;
+pub use self_improvement::*;
 #[cfg(feature = "framing")]
 pub mod framing;
 pub mod hermes_config;
