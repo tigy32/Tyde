@@ -868,5 +868,433 @@ esac
 
 
 
+
+class MacosControllerFlowTests(unittest.TestCase):
+    """Real Git, CLI processes, HTTP artifact transport and updater cryptography.
+
+    Apple CLI doubles model network and verification outcomes on non-macOS hosts;
+    they do not establish real Apple signing/notarization coverage.
+    """
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.controller = self.root / "controller"
+        self.source = self.root / "source"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.controller.mkdir()
+        self.log = self.root / "commands.jsonl"
+        self.retained = self.root / "retained"
+        self.target = "aarch64-apple-darwin"
+        self.repository = "fixture/Tyde"
+        self.tag = "v1.2.3"
+        self.responses = {}
+        self.downloads = {}
+        self.uploads = {}
+        self.published = False
+        self.wait_entered = threading.Event()
+        self.wait_release = threading.Event()
+        self.block_wait = False
+        self.addCleanup(self.wait_release.set)
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                key = self.path.removeprefix(f"/repos/{owner.repository}/")
+                if key == f"releases/tags/{owner.tag}":
+                    value = {"id": 1, "tag_name": owner.tag, "draft": not owner.published,
+                             "prerelease": False, "assets": [{"id": i, "name": n} for i, n in enumerate(owner.uploads)]}
+                    raw = json.dumps(value).encode()
+                elif key in owner.responses:
+                    raw = json.dumps(owner.responses[key]).encode()
+                elif key in owner.downloads:
+                    raw = owner.downloads[key]
+                elif key.startswith("releases/assets/"):
+                    raw = list(owner.uploads.values())[int(key.rsplit("/", 1)[1])]
+                elif key == "wait-event":
+                    owner.wait_entered.set()
+                    owner.wait_release.wait()
+                    raw = b"{}"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.end_headers()
+                with contextlib.suppress(BrokenPipeError):
+                    self.wfile.write(raw)
+
+            def do_POST(self):
+                name = self.path.removeprefix("/upload/")
+                owner.uploads[name] = self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=self.server.serve_forever)
+        worker.start()
+        def close_server():
+            self.wait_release.set()
+            self.server.shutdown()
+            self.server.server_close()
+            worker.join()
+        self.addCleanup(close_server)
+        self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                        FIXTURE_ROOT=str(self.root), FIXTURE_LOG=str(self.log),
+                        FIXTURE_HTTP=f"http://127.0.0.1:{self.server.server_port}",
+                        APPLE_SIGNING_IDENTITY="fixture", APPLE_API_ISSUER="fixture",
+                        APPLE_API_KEY="fixture", APPLE_API_KEY_PATH=str(self.root / "key.p8"),
+                        GITHUB_RUN_ID="10", GITHUB_RUN_ATTEMPT="1", PYTHONDONTWRITEBYTECODE="1")
+        self.git(self.controller, "init", "-q")
+        self.git(self.controller, "symbolic-ref", "HEAD", "refs/heads/main")
+        self.git(self.controller, "config", "user.name", "Release fixture")
+        self.git(self.controller, "config", "user.email", "fixture@example.invalid")
+        for source in version_check.release_version_paths(REPO_ROOT):
+            target = self.controller / source.relative_to(REPO_ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        set_release_version.set_release_version(self.controller, self.tag)
+        self.crypto = self.root / "crypto.cjs"
+        self.crypto.write_text(r"""
+const fs = require('node:fs'), crypto = require('node:crypto');
+const root = process.env.FIXTURE_ROOT;
+if (process.argv[2] === 'generate') {
+ const {publicKey, privateKey} = crypto.generateKeyPairSync('ed25519');
+ fs.writeFileSync(root + '/signing-key.pem', privateKey.export({format:'pem',type:'pkcs8'}));
+ const raw = publicKey.export({format:'der',type:'spki'}).subarray(-32);
+ const key = Buffer.concat([Buffer.from('Ed'),Buffer.from('12345678'),raw]);
+ console.log(Buffer.from('untrusted comment: fixture\n'+key.toString('base64')+'\n').toString('base64'));
+} else {
+ const file = process.argv[2], key = fs.readFileSync(root + '/signing-key.pem');
+ const sig = crypto.sign(null, crypto.createHash('blake2b512').update(fs.readFileSync(file)).digest(), key), comment = 'fixture';
+ const envelope = Buffer.concat([Buffer.from('ED12345678'),sig]);
+ const global = crypto.sign(null,Buffer.concat([sig,Buffer.from(comment)]),key);
+ const text = 'untrusted comment: fixture\n'+envelope.toString('base64')+'\ntrusted comment: '+comment+'\n'+global.toString('base64')+'\n';
+ fs.writeFileSync(file+'.sig',Buffer.from(text).toString('base64'));
+}
+""")
+        key = subprocess.check_output(["node", self.crypto, "generate"], env=self.env).decode().strip()
+        config = self.controller / "frontend/tauri-shell/tauri.conf.json"
+        value = json.loads(config.read_text())
+        value["plugins"]["updater"]["pubkey"] = key
+        config.write_text(json.dumps(value))
+        self.git(self.controller, "add", ".")
+        self.git(self.controller, "commit", "-qm", "Frozen application")
+        self.source_sha = self.git(self.controller, "rev-parse", "HEAD")
+        self.git(self.controller, "tag", self.tag)
+        tools = self.controller / "tools"
+        tools.mkdir()
+        for name in ("macos_release.py", "update_manifest.py", "set_release_version.py", "check_release_version.py", "release_tool.py", "check_mobile_web_manifest.py"):
+            shutil.copyfile(TOOLS_DIR / name, tools / name)
+        self.git(self.controller, "add", ".")
+        self.git(self.controller, "commit", "-qm", "Controller tooling")
+        self.controller_sha = self.git(self.controller, "rev-parse", "HEAD")
+        self.git(self.controller, "update-ref", "refs/remotes/origin/main", self.controller_sha)
+        self.git(self.root, "clone", "--bare", "-q", str(self.controller), str(self.root / "origin.git"))
+        self.git(self.controller, "config", f"url.file://{self.root}/origin.git.insteadOf", f"https://github.com/{self.repository}.git")
+        self.git(self.controller, "remote", "add", "origin", f"https://github.com/{self.repository}.git")
+        self.git(self.root, "clone", "-q", str(self.controller), str(self.source))
+        self.git(self.source, "remote", "set-url", "origin", f"https://github.com/{self.repository}.git")
+        self.git(self.source, "config", f"url.file://{self.root}/origin.git.insteadOf", f"https://github.com/{self.repository}.git")
+        self.git(self.source, "update-ref", "refs/remotes/origin/main", self.controller_sha)
+        self.git(self.source, "checkout", "-q", self.tag)
+        self.assertFalse((self.source / "tools/macos_release.py").exists())
+        self.responses["actions/runs/10"] = self.run_metadata(10)
+        self.bundle = self.source / f"target/{self.target}/release"
+        app = self.bundle / "bundle/macos/Tyde.app/Contents"
+        (app / "MacOS").mkdir(parents=True)
+        (app / "MacOS/tyde").write_bytes(b"signed desktop")
+        import plistlib
+        (app / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.2.3"}))
+        (self.bundle / "tyde-server").write_bytes(b"signed server")
+        stub = self.bin / "fixture-command"
+        stub.write_text("#!" + sys.executable + "\n" + r'''
+import io,json,os,pathlib,shutil,subprocess,sys,urllib.request,zipfile
+name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]; root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+with open(os.environ['FIXTURE_LOG'],'a') as f: f.write(json.dumps([name,*[a for a in args if not len(a)==36]])+'\n')
+def request(path,data=None):
+ return urllib.request.urlopen(urllib.request.Request(os.environ['FIXTURE_HTTP']+path,data=data)).read()
+if name=='gh':
+ if args[0]=='api': sys.stdout.buffer.write(request('/'+args[1])); sys.exit()
+ if args[:2]==['release','upload']:
+  path=pathlib.Path(args[3]); request('/upload/'+path.name,path.read_bytes()); sys.exit()
+ raise SystemExit(21)
+if name=='lipo': print('x86_64' if (root/'wrong-arch').exists() else 'arm64')
+elif name=='codesign': pass
+elif name=='route': print('destination: 17.0.0.1\ngateway: 192.0.2.1\ninterface: en0')
+elif name=='dscacheutil': print('ip_address: 17.0.0.1')
+elif name=='spctl':
+ if (root/'reject-spctl').exists(): raise SystemExit(3)
+elif name=='ditto':
+ if args[:2]==['-x','-k']:
+  with zipfile.ZipFile(args[2]) as z: z.extractall(args[3])
+ elif args[:3]==['-c','-k','--keepParent']:
+  source=pathlib.Path(args[3])
+  with zipfile.ZipFile(args[4],'w') as z:
+   for p in source.rglob('*') if source.is_dir() else [source]:
+    if p.is_file(): z.write(p,p.relative_to(source.parent))
+ else: shutil.copytree(*args)
+elif name=='hdiutil':
+ if args[0]=='create':
+  staging=pathlib.Path(args[args.index('-srcfolder')+1])
+  if not (staging/'Tyde.app/stapled').exists(): raise SystemExit(22)
+  pathlib.Path(args[-1]).write_bytes(b'signed image containing stapled app')
+elif name=='npx':
+ if 'build' in args: raise SystemExit(23)
+ subprocess.run(['node',root/'crypto.cjs',args[-1]],check=True)
+elif name=='xcrun':
+ if args[:2]==['notarytool','submit']:
+  if '--wait' in args: raise SystemExit(68)
+  print(json.dumps({'id':{'server.zip':'1','app.zip':'2','signed.dmg':'3'}[pathlib.Path(args[2]).name]*8+'-1111-1111-1111-111111111111'}))
+ elif args[:2]==['notarytool','wait']:
+  if (root/'block-wait').exists(): request('/repos/fixture/Tyde/wait-event')
+  if (root/'network-failure').exists():
+   print('NSURLErrorDomain Code=-1009 https://appstoreconnect.apple.com/notary/v2/submissions/PRIVATE-ID?token=SECRET',file=sys.stderr)
+   raise SystemExit(68)
+  print(json.dumps({'id':args[2],'status':'Invalid' if (root/'invalid-notary').exists() else 'Accepted'}))
+ elif args[0]=='stapler':
+  path=pathlib.Path(args[2])
+  if args[1]=='staple':
+   if path.is_dir(): (path/'stapled').write_text('ticket')
+   else: path.write_bytes(path.read_bytes()+b' stapled')
+  elif path.is_dir() and not (path/'stapled').exists(): raise SystemExit(25)
+ else: raise SystemExit(26)
+else: raise SystemExit(27)
+''')
+        stub.chmod(0o755)
+        for name in ("gh", "codesign", "lipo", "ditto", "hdiutil", "npx", "xcrun", "spctl", "route", "dscacheutil", "cargo"):
+            (self.bin / name).symlink_to(stub)
+
+    def git(self, root, *args):
+        return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.PIPE).decode().strip()
+
+    def run_metadata(self, run_id):
+        return {"id": run_id, "repository": {"full_name": self.repository},
+                "head_repository": {"full_name": self.repository}, "head_sha": self.controller_sha,
+                "head_branch": "main", "path": ".github/workflows/release.yml",
+                "display_title": f"Release {self.tag} @ {self.source_sha}"}
+
+    def argv(self, operation, *extra):
+        return [sys.executable, str(self.controller / "tools/macos_release.py"), operation,
+                "--repository", self.repository, "--tag", self.tag, "--source-sha", self.source_sha,
+                "--controller-sha", self.controller_sha, "--source", str(self.source),
+                "--target", self.target, "--retained", str(self.retained), *extra]
+
+    def cli(self, operation, *extra, succeeds=True):
+        result = subprocess.run(self.argv(operation, *extra), env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+        self.assertNotIn("PRIVATE-ID", result.stdout + result.stderr)
+        self.assertNotIn("SECRET", result.stdout + result.stderr)
+        return result
+
+    def seal_artifact(self, artifact_id, folder, run_id=10, name=None):
+        buffer = io.BytesIO()
+        with __import__('zipfile').ZipFile(buffer, "w") as archive:
+            for path in folder.rglob("*"):
+                if path.is_file(): archive.write(path, path.relative_to(folder))
+        raw = buffer.getvalue()
+        self.responses[f"actions/artifacts/{artifact_id}"] = {
+            "id": artifact_id, "name": name, "expired": False,
+            "workflow_run": {"id": run_id, "head_sha": self.controller_sha},
+            "digest": "sha256:" + hashlib.sha256(raw).hexdigest()}
+        self.downloads[f"actions/artifacts/{artifact_id}/zip"] = raw
+        return self.responses[f"actions/artifacts/{artifact_id}"]
+
+    def retained_dmg(self):
+        self.cli("prepare")
+        self.cli("submit", "--kind", "server")
+        self.cli("submit", "--kind", "app")
+        self.cli("package")
+        self.cli("submit", "--kind", "dmg")
+
+    def test_network_failure_explicit_restore_complete_without_compile(self):
+        # The pre-fix release.yml coupled submit/wait and uploaded only afterward.
+        # Execute that original CLI boundary before the retained flow, including
+        # disposal of the failed runner's workspace. No old full gate is needed.
+        legacy = self.root / "legacy-runner"
+        legacy.mkdir()
+        legacy_dmg = legacy / "signed.dmg"
+        legacy_dmg.write_bytes(b"signed legacy image")
+        before = subprocess.run(["bash", "-e", "-c",
+            'codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$MACOS_DMG"; '
+            'xcrun notarytool submit "$MACOS_DMG" --issuer "$APPLE_API_ISSUER" '
+            '--key-id "$APPLE_API_KEY" --key "$APPLE_API_KEY_PATH" --wait; '
+            'xcrun stapler staple "$MACOS_DMG"; xcrun stapler validate "$MACOS_DMG"; '
+            'spctl -a -t open --context context:primary-signature -v "$MACOS_DMG"; '
+            'gh release upload v1.2.3 "$MACOS_DMG" --clobber'],
+            env=dict(self.env, MACOS_DMG=str(legacy_dmg)), capture_output=True)
+        self.assertEqual(before.returncode, 68)
+        self.assertFalse(self.uploads)
+        shutil.rmtree(legacy)
+        self.cli("complete", succeeds=False)
+        self.retained_dmg()
+        original = {p.name: p.read_bytes() for p in self.retained.glob("*.zip")}
+        original["signed.dmg"] = (self.retained / "signed.dmg").read_bytes()
+        (self.root / "network-failure").touch()
+        self.cli("complete", succeeds=False)
+        receipt = json.loads((self.retained / "receipt.json").read_text())
+        self.assertEqual(receipt["phase"], "submitted-dmg")
+        self.assertEqual(set(receipt["submissions"]), {"app", "server", "dmg"})
+        self.assertEqual(receipt["events"][-1]["network_codes"], ["-1009"])
+        (self.retained / "signed.dmg").unlink()
+        self.cli("complete", succeeds=False)
+        (self.retained / "signed.dmg").write_bytes(original["signed.dmg"])
+        self.assertNotIn("PRIVATE-ID", json.dumps(receipt))
+        self.assertNotIn("SECRET", json.dumps(receipt))
+        self.seal_artifact(20, self.retained)
+        shutil.rmtree(self.retained)
+        shutil.rmtree(self.source / "target")
+        (self.root / "network-failure").unlink()
+        self.responses["actions/runs/11"] = self.run_metadata(11)
+        self.env["GITHUB_RUN_ID"] = "11"
+        self.cli("restore", "--run-id", "10", "--artifact-id", "20")
+        self.log.write_text("")
+        self.cli("complete")
+        self.cli("upload")
+        self.cli("checkpoint")
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any("submit" in c or "build" in c or c[0] == "cargo" for c in commands))
+        self.assertIn(["xcrun", "stapler", "validate", str(self.retained / "work/Tyde_1.2.3_aarch64-apple-darwin.dmg")], commands)
+        self.assertEqual(len(self.uploads), 3)
+        self.assertTrue(next(v for n, v in self.uploads.items() if n.endswith(".dmg")).endswith(b"stapled"))
+        self.assertEqual(original, {name: (self.retained / name).read_bytes() for name in original})
+        self.seal_artifact(21, self.retained, run_id=11)
+        shutil.rmtree(self.retained)
+        self.cli("restore", "--run-id", "11", "--artifact-id", "21")
+        self.assertEqual(json.loads((self.retained / "receipt.json").read_text())["phase"], "complete")
+
+    def test_complete_aggregate_requires_same_source_signed_assets_and_stable_msi(self):
+        self.retained_dmg()
+        self.cli("complete")
+        self.cli("upload")
+        artifacts = []
+        saved = {}
+        version = "1.2.3"
+        for index, (target, (base, patterns)) in enumerate(release_tool.update_manifest.TARGETS.items()):
+            if target == self.target:
+                continue
+            folder = self.root / target
+            folder.mkdir()
+            entries = {}
+            installers = dict(patterns)
+            if base.startswith("windows"):
+                installers["msi"] = ""
+            for installer in installers:
+                if installer == "app":
+                    name = f"tyde-update-{version}-{target}.app.tar.gz"
+                elif installer == "nsis":
+                    name = f"Tyde_{version}_x64-setup.exe"
+                elif installer == "msi":
+                    name = f"Tyde_{version}_x64_en-US.msi"
+                else:
+                    arch = "amd64" if "x86_64" in target else "aarch64"
+                    name = next(a["name"] for a in release_assets(self.tag) if a["name"].endswith({"appimage": ".AppImage", "deb": ".deb", "rpm": ".rpm"}[installer])
+                                and (arch in a["name"] or (arch == "amd64" and "x86_64" in a["name"]) or (arch == "aarch64" and "arm64" in a["name"])))
+                payload = self.root / name
+                payload.write_bytes(f"signed {target} {installer}".encode())
+                subprocess.run(["node", self.crypto, payload], env=self.env, check=True)
+                signature = payload.with_name(name + ".sig").read_text()
+                entry = {"url": f"https://github.com/{self.repository}/releases/download/{self.tag}/{name}", "signature": signature}
+                entries[f"{base}-{installer}"] = entry
+                if installer in {"app", "appimage", "nsis"}:
+                    entries[base] = entry
+                saved[name] = payload.read_bytes()
+            (folder / f"update-{target}.json").write_text(json.dumps({"version": version, "platforms": entries}))
+            artifacts.append(self.seal_artifact(30 + index, folder, name=f"update-{target}"))
+        self.responses["actions/runs/10/artifacts?per_page=100"] = {"total_count": len(artifacts), "artifacts": artifacts}
+        for asset in release_assets(self.tag):
+            name = asset["name"]
+            if name not in self.uploads and name != "tyde-update.json":
+                self.uploads[name] = saved.get(name, b"other completed platform asset")
+        msi = f"Tyde_{version}_x64_en-US.msi"
+        del self.uploads[msi]
+        self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
+        self.assertNotIn("tyde-update.json", self.uploads)
+        self.uploads[msi] = saved[msi]
+        linux = next(name for name in saved if name.endswith(".AppImage"))
+        self.uploads[linux] = b"wrong bytes with correct filename"
+        self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
+        self.assertNotIn("tyde-update.json", self.uploads)
+        self.uploads[linux] = saved[linux]
+        self.responses["actions/runs/10"]["display_title"] = "Release wrong source"
+        self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
+        self.responses["actions/runs/10"] = self.run_metadata(10)
+        self.cli("assemble", "--fragments-run-id", "10")
+        manifest = json.loads(self.uploads["tyde-update.json"])
+        self.assertEqual(manifest["version"], version)
+        self.assertIn("windows-x86_64-msi", manifest["platforms"])
+        self.assertIn("darwin-aarch64", manifest["platforms"])
+        self.assertIn("darwin-x86_64", manifest["platforms"])
+        self.assertTrue((self.retained / "assembly.json").is_file())
+
+    def test_rejects_mismatches_security_failures_and_published_mutations(self):
+        (self.root / "wrong-arch").touch()
+        self.cli("prepare", succeeds=False)
+        (self.root / "wrong-arch").unlink()
+        self.retained_dmg()
+        self.cli("submit", "--kind", "dmg", succeeds=False)
+        self.cli("package", succeeds=False)
+        self.cli("complete", "--source-sha", "b" * 40, succeeds=False)
+        self.cli("complete", "--target", "x86_64-apple-darwin", succeeds=False)
+        dmg = self.retained / "signed.dmg"
+        payload = dmg.read_bytes()
+        dmg.write_bytes(b"corrupt")
+        self.cli("complete", succeeds=False)
+        dmg.write_bytes(payload)
+        self.published = True
+        self.cli("complete", succeeds=False)
+        self.cli("upload", succeeds=False)
+        self.published = False
+        (self.root / "invalid-notary").touch()
+        self.cli("complete", succeeds=False)
+        (self.root / "invalid-notary").unlink()
+        (self.root / "reject-spctl").touch()
+        self.cli("complete", succeeds=False)
+        self.cli("upload", succeeds=False)
+        (self.root / "reject-spctl").unlink()
+        self.cli("complete")
+        updater = next((self.retained / "output/artifacts").iterdir())
+        updater.write_bytes(b"corrupt signed updater")
+        self.cli("upload", succeeds=False)
+        self.assertFalse(self.uploads)
+        self.seal_artifact(20, self.retained)
+        shutil.rmtree(self.retained)
+        self.cli("restore", "--run-id", "99", "--artifact-id", "20", succeeds=False)
+        self.responses["actions/runs/10"]["head_repository"]["full_name"] = "wrong/repo"
+        self.cli("restore", "--run-id", "10", "--artifact-id", "20", succeeds=False)
+
+    def test_cancellation_retains_submission_and_payload_checkpoint(self):
+        import signal
+        self.retained_dmg()
+        (self.root / "block-wait").touch()
+        process = subprocess.Popen(self.argv("complete"), env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            self.wait_entered.wait()
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate()
+        finally:
+            self.wait_release.set()
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+        self.assertNotEqual(process.returncode, 0)
+        data = json.loads((self.retained / "receipt.json").read_text())
+        self.assertEqual(data["events"][-1], {"phase": "wait-dmg", "state": "started"})
+        self.seal_artifact(20, self.retained)
+        shutil.rmtree(self.retained)
+        (self.root / "block-wait").unlink()
+        self.cli("restore", "--run-id", "10", "--artifact-id", "20")
+        self.cli("complete")
+
+
 if __name__ == "__main__":
     unittest.main()

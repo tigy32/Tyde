@@ -265,3 +265,92 @@ loader can choose the matching `/tyde/v<release>/` bundle.
 Protocol-stamped bundles can use the loader repair path when the app explicitly
 dispatches `tyde:repair-needed`, such as after in-app QR/protocol validation
 detects drift.
+
+## Explicit macOS artifact recovery
+
+`macos-release.yml` is the macOS packaging path, called by `release.yml` for
+normal releases and dispatched separately for an approved architecture-only
+repair. It never tags, publishes, deploys mobile web, or builds other platforms.
+The application checkout is **`source_sha` at the existing tag**. The controller
+checkout is **the dispatch ref's exact `github.sha`**, independently checked
+against main ancestry. All new helpers execute from `.release-controller/`,
+not from the old application tag. The frozen source's own build scripts and
+configuration still build that source; no newer application files are copied
+into it. Controller changes follow the normal validated-main implementation
+contract above; recovery generates no test attestation and adds no version-only
+test/build gate.
+
+Before any notarization, `prepare` retains signed `app.zip`, signed `server.zip`,
+and a source/tag/architecture/SHA-256 receipt. App and server submissions use
+`notarytool submit --output-format json` **without `--wait`**. Each submission ID
+is saved privately in the receipt immediately after the submission returns,
+then uploaded as an immutable Actions checkpoint before waiting. `package`
+waits on those exact IDs with `notarytool wait`, requires `Accepted`, staples
+and validates the app, and runs Gatekeeper. It then creates the DMG **containing
+the stapled app**, signs it, and retains its digest plus the stapled, signed
+updater before submitting the DMG. That submission ID is checkpointed before
+DMG wait/staple/validate/Gatekeeper. A standalone binary's ZIP is notarized but
+cannot itself be stapled; this is Apple's documented standalone-binary contract.
+
+A network failure does not establish a signing rejection. Receipts retain exact
+started/completed phases, exit codes, Apple endpoint hostnames, network error
+codes, DNS results and route/interface observations, never raw tool output,
+credentials, submission URLs or signed upload URLs. They are diagnostic evidence,
+not a claim of an Apple-wide outage or a fix for an unknown route failure.
+Submission IDs alone never stand in for missing payload bytes. Apple documents
+submission IDs, waiting, container tickets and stapling in its
+[custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
+
+After inspecting a failed run, select the **exact artifact ID and run ID** of
+its latest valid checkpoint. Do not rerun the build job to resume. Dispatch
+`macos-release.yml` from a reviewed, landed controller commit with the same
+`version`, `source_sha`, and `target`, and select exactly one operation:
+
+- `submit-server` / `submit-app`: submit that retained payload, only if no
+  submission or prior submission-start event exists.
+- `package`: finish app/server notarization and produce/retain the signed DMG
+  and updater, without compiling either application or server.
+- `submit-dmg`: submit the newly retained DMG once, without waiting.
+- `resume`: wait for the retained DMG submission, staple, validate, Gatekeeper,
+  then upload only the completed architecture's verified outputs to the draft.
+- `assemble`: select the completed macOS checkpoint and `fragments_run_id` of
+  the original same-source Release run. Download its other-platform updater
+  fragments through run-bound artifact IDs/digests, cryptographically verify
+  every referenced updater against the tagged application's pinned public key,
+  and compare this architecture's uploaded updater to its retained hash. Only
+  after every platform (including stable MSI) and the complete expected release
+  asset set exists does it upload the aggregate `tyde-update.json`. It does not
+  publish. No fragment or asset is trusted merely because its filename matches.
+
+Every mutation requires an existing draft with the correct channel, unchanged
+remote tag, coherent source versions, and source/controller main ancestry.
+Restore checks repository/workflow/run/controller provenance, artifact transport
+SHA-256, and every retained payload digest. Missing receipts/outputs, wrong
+source/architecture/digests and published releases fail closed. A prior ambiguous
+submission-start without an ID requires private reconciliation; no operation
+silently resubmits it or chooses another artifact. Final checkpoints are uploaded
+with `always()` on success, failure and cancellation; the pre-network checkpoints
+already exist if a runner is abruptly lost. Inspect successful artifact-upload
+receipts: an interrupted upload is not durable storage. Runner work copies,
+keychain, certificate and API key are cleaned separately; signed originals and
+phase receipts remain in Actions for 30 days. Export a checkpoint securely before
+expiry if recovery is delayed. After verified release completion, the Lander may
+explicitly delete the selected Actions artifacts; no automatic cleanup deletes
+recovery evidence or release assets.
+
+### Frozen v0.9.5 operational handoff
+
+The discarded ARM DMG from the old run cannot be recovered from its submission
+ID. After this controller lands, the Lander must obtain authorization for **one
+new ARM-only build**, then dispatch this workflow from the landed controller
+commit with `operation=build`, `version=v0.9.5`,
+`source_sha=83ad2d3c03b4c2661adb22ad435dd073a9530bab`, and
+`target=aarch64-apple-darwin`. This builds only that frozen tag, not main's newer
+mobile/features. Successful Linux/Windows/Intel platforms are not rebuilt.
+If remote completion fails, use the selected checkpoint and explicit operations
+above. Once ARM succeeds, `assemble` can reuse the verified other-platform
+fragments from Release run `39193235317` with explicit same-source provenance.
+Any missing/expired fragment, invalid signature, missing stable MSI or asset
+mismatch blocks aggregation rather than triggering a rebuild or partial publish.
+The Lander retains authority for final integrity verification and publication;
+this tooling change authorizes neither a build nor a release action.

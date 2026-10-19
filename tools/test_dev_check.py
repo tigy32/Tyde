@@ -2190,9 +2190,11 @@ fi
                         "runner-owned executable\n",
                     )
                 tested.append(workflow.name)
+        # The new macOS workflow successfully exercises the isolated installer
+        # above; retain that boundary in the required workflow inventory too.
         self.assertEqual(tested, [
-            "check.yml", "mobile-web-release.yml", "pretag-release-build.yml",
-            "release.yml", "release.yml",
+            "check.yml", "macos-release.yml", "mobile-web-release.yml",
+            "pretag-release-build.yml", "release.yml", "release.yml",
         ])
 
     def test_pr_uses_canonical_check_and_packaging_runs_no_suites(self) -> None:

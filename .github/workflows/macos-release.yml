@@ -1,0 +1,385 @@
+name: macOS release payloads
+run-name: macOS ${{ inputs.operation }} ${{ inputs.version }} @ ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing approved draft tag'
+        required: true
+        type: string
+      source_sha:
+        description: 'Exact approved tagged application commit'
+        required: true
+        type: string
+      target:
+        description: 'Only this architecture is operated on'
+        required: true
+        type: choice
+        options: [aarch64-apple-darwin, x86_64-apple-darwin]
+      operation:
+        description: 'Build once, or explicitly resume retained bytes (no compilation)'
+        required: true
+        type: choice
+        options: [build, package, submit-app, submit-server, submit-dmg, resume, assemble]
+      retained_run_id:
+        description: 'Resume/assemble: selected checkpoint workflow run ID'
+        type: string
+      retained_artifact_id:
+        description: 'Resume/assemble: exact checkpoint artifact ID, not a filename'
+        type: string
+      fragments_run_id:
+        description: 'Assemble only: original same-source Release run with other platform fragments'
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      operation:
+        type: string
+        default: build
+      retained_run_id:
+        type: string
+        default: ''
+      retained_artifact_id:
+        type: string
+        default: ''
+      fragments_run_id:
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: macos-release-${{ inputs.version }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  payload:
+    runs-on: ${{ inputs.target == 'aarch64-apple-darwin' && 'macos-15' || 'macos-15-intel' }}
+    env:
+      RELEASE_TAG: ${{ inputs.version }}
+      TYDE_RELEASE_TAG: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      CONTROLLER_SHA: ${{ github.sha }}
+      MACOS_TARGET: ${{ inputs.target }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-controller
+          fetch-depth: 0
+      - name: Verify selected application and executed controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RETAINED=$RUNNER_TEMP/macos-retained" >> "$GITHUB_ENV"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C .release-controller rev-parse HEAD)" = "$CONTROLLER_SHA"
+          git fetch --no-tags origin main
+          git -C .release-controller fetch --no-tags origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          git -C .release-controller merge-base --is-ancestor "$CONTROLLER_SHA" origin/main
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
+          case '${{ inputs.operation }}' in build|package|submit-app|submit-server|submit-dmg|resume|assemble) ;; *) exit 1 ;; esac
+          case "$MACOS_TARGET" in aarch64-apple-darwin|x86_64-apple-darwin) ;; *) exit 1 ;; esac
+          cat > "$RUNNER_TEMP/macos-controller" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec python3 "$GITHUB_WORKSPACE/.release-controller/tools/macos_release.py" "$@" \
+            --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
+            --source-sha "$SOURCE_SHA" --controller-sha "$CONTROLLER_SHA" \
+            --source "$GITHUB_WORKSPACE" --target "$MACOS_TARGET" --retained "$RETAINED"
+          SH
+          chmod +x "$RUNNER_TEMP/macos-controller"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Verify draft and frozen source before any packaging
+        run: macos-controller verify
+      - name: Restore explicitly selected checkpoint
+        id: restore
+        if: inputs.operation != 'build'
+        env:
+          RETAINED_RUN: ${{ inputs.retained_run_id }}
+          RETAINED_ARTIFACT: ${{ inputs.retained_artifact_id }}
+        run: macos-controller restore --run-id "$RETAINED_RUN" --artifact-id "$RETAINED_ARTIFACT"
+      - name: Record continuation checkpoint provenance
+        if: inputs.operation != 'build'
+        run: macos-controller checkpoint
+      - name: Provision native build tools
+        if: inputs.operation == 'build'
+        shell: bash
+        run: |
+          python3 .release-controller/tools/provision-native-build-tools.py \
+            --root "$RUNNER_TEMP/tyde-native-build-tools" --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
+      - name: Install repository Rust toolchain
+        if: inputs.operation == 'build'
+        shell: bash
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          ./dev.sh rust-toolchain
+      - name: Install build Rust targets
+        if: inputs.operation == 'build'
+        run: rustup target add "$MACOS_TARGET"
+      - name: Install frontend and updater signer CLI
+        if: inputs.operation == 'build' || inputs.operation == 'package'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install trunk
+        if: inputs.operation == 'build'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+      - name: Rust cache
+        if: inputs.operation == 'build'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          prefix-key: release
+          cache-bin: false
+      - name: Validate Apple signing secrets
+        if: inputs.operation == 'build' || inputs.operation == 'package'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY_CONTENT APPLE_API_KEY APPLE_API_ISSUER; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::Missing required Apple signing secret(s): %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Import Apple certificate
+        if: inputs.operation == 'build' || inputs.operation == 'package'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY"
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
+              | head -n 1)
+          fi
+
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            echo "::error::Could not find a Developer ID Application signing identity in APPLE_CERTIFICATE"
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+            exit 1
+          fi
+
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build frozen source and sign payloads without notarization
+        if: inputs.operation == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          tools/build-mobile-web-bundle.sh
+          TYDE_MOBILE_BUNDLE_DIR="$GITHUB_WORKSPACE/target/mobile-web" \
+            cargo build --release --target "$MACOS_TARGET" -p tyde-server --bin tyde-server
+          # Do not let Tauri notarize before signed bytes have been retained.
+          (cd frontend/tauri-shell && env -u APPLE_API_KEY_PATH -u APPLE_API_KEY -u APPLE_API_ISSUER \
+            npx --prefix ../.. --no-install tauri build --target "$MACOS_TARGET" --bundles app)
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" \
+            "target/$MACOS_TARGET/release/tyde-server"
+          python3 .release-controller/tools/smoke_desktop_release.py \
+            --binary "target/$MACOS_TARGET/release/bundle/macos/Tyde.app/Contents/MacOS/tyde" \
+            --expected-version "$RELEASE_TAG" --log-directory "$RUNNER_TEMP/desktop-startup"
+          macos-controller prepare
+      - name: Checkpoint signed bytes before any notarization
+        if: inputs.operation == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-retained
+          path: ${{ env.RETAINED }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Write completion Apple API key
+        if: inputs.operation != 'assemble'
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_API_KEY_CONTENT"
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          API_KEY_PATH="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+      - name: Submit server once without waiting
+        if: inputs.operation == 'build' || inputs.operation == 'submit-server'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: macos-controller submit --kind server
+      - name: Checkpoint server submission immediately
+        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-server')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-server
+          path: ${{ env.RETAINED }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Submit app once without waiting
+        if: inputs.operation == 'build' || inputs.operation == 'submit-app'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: macos-controller submit --kind app
+      - name: Checkpoint app submission immediately
+        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-app')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-app
+          path: ${{ env.RETAINED }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Notarize and staple retained app, retain signed DMG and updater
+        if: inputs.operation == 'build' || inputs.operation == 'package'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: macos-controller package
+      - name: Checkpoint signed DMG before remote submission
+        if: always() && (inputs.operation == 'build' || inputs.operation == 'package')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-dmg-retained
+          path: |
+            ${{ env.RETAINED }}/receipt.json
+            ${{ env.RETAINED }}/app.zip
+            ${{ env.RETAINED }}/server.zip
+            ${{ env.RETAINED }}/signed.dmg
+            ${{ env.RETAINED }}/updater/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Submit DMG once without waiting
+        if: inputs.operation == 'build' || inputs.operation == 'submit-dmg'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: macos-controller submit --kind dmg
+      - name: Checkpoint DMG submission immediately
+        if: always() && (inputs.operation == 'build' || inputs.operation == 'submit-dmg')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-submitted
+          path: |
+            ${{ env.RETAINED }}/receipt.json
+            ${{ env.RETAINED }}/app.zip
+            ${{ env.RETAINED }}/server.zip
+            ${{ env.RETAINED }}/signed.dmg
+            ${{ env.RETAINED }}/updater/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Complete retained submissions without compiling
+        if: inputs.operation == 'build' || inputs.operation == 'resume'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: macos-controller complete
+      - name: Upload verified completed macOS payloads to draft
+        if: inputs.operation == 'build' || inputs.operation == 'resume'
+        run: macos-controller upload
+      - uses: actions/upload-artifact@v4
+        if: inputs.operation == 'build' || inputs.operation == 'resume'
+        with:
+          name: update-${{ inputs.target }}
+          path: ${{ env.RETAINED }}/output/update-${{ inputs.target }}.json
+          if-no-files-found: error
+      - name: Assemble all verified same-source platform fragments
+        if: inputs.operation == 'assemble'
+        env:
+          FRAGMENTS_RUN: ${{ inputs.fragments_run_id }}
+        run: macos-controller assemble --fragments-run-id "$FRAGMENTS_RUN"
+      - name: Stamp final checkpoint provenance
+        if: always() && (inputs.operation == 'build' || steps.restore.outcome == 'success')
+        shell: bash
+        run: |
+          if [[ -f "$RETAINED/receipt.json" ]]; then macos-controller checkpoint; fi
+      - name: Retain checkpoint on success, failure, or cancellation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-final
+          path: |
+            ${{ env.RETAINED }}/receipt.json
+            ${{ env.RETAINED }}/app.zip
+            ${{ env.RETAINED }}/server.zip
+            ${{ env.RETAINED }}/signed.dmg
+            ${{ env.RETAINED }}/output/
+            ${{ env.RETAINED }}/updater/
+            ${{ env.RETAINED }}/assembly.json
+            ${{ env.RETAINED }}/tyde-update.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain desktop startup logs
+        if: always() && inputs.operation == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-startup-${{ inputs.target }}
+          path: ${{ runner.temp }}/desktop-startup/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Cleanup temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_status=0
+          if [[ -f "$RUNNER_TEMP/app-signing.keychain-db" ]]; then
+            if ! security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db"; then cleanup_status=1; fi
+          fi
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          rm -rf "$RUNNER_TEMP/private_keys" "$RETAINED/work"
+          exit "$cleanup_status"
