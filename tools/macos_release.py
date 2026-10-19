@@ -102,6 +102,12 @@ class Eligibility(Enum):
     SIGNED = "signed-checkpoint"
 
 
+class GitHubResponse(Enum):
+    JSON = "json"
+    ARTIFACT_ZIP = "artifact-zip"
+    RELEASE_ASSET = "release-asset"
+
+
 def stderr_context(raw):
     # Never print tool output verbatim: even Git can echo a credentialed URL.
     text = raw.decode(errors="replace").lower()
@@ -192,18 +198,22 @@ def save(path, data):
     temporary.replace(path)
 
 
-def api(args, endpoint, binary=False, *, operation=None, method="GET", body=None):
+def api(args, endpoint, *, response=GitHubResponse.JSON, operation=None, method="GET", body=None):
     # Log only controlled operation names and status codes, never raw gh output:
     # headers/bodies/errors may contain credentials, signed URLs or private IDs.
-    operation = operation or ("artifact-download" if binary else "metadata-read")
+    operation = operation or {GitHubResponse.JSON: "metadata-read", GitHubResponse.ARTIFACT_ZIP: "artifact-download",
+                              GitHubResponse.RELEASE_ASSET: "release-asset-download"}[response]
     argv = ["gh", "api", f"repos/{args.repository}/{endpoint}", "--include", "--method", method]
-    if binary:
-        argv += ["-H", "Accept: application/octet-stream"]
+    # Actions ZIP negotiates the API redirect as JSON, unlike Release assets.
+    # gh follows the signed redirect and --include reports the final response.
+    accept = "application/octet-stream" if response is GitHubResponse.RELEASE_ASSET else "application/vnd.github+json"
+    argv += ["-H", f"Accept: {accept}"]
     if body is not None:
         argv += ["--input", "-"]
     result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None, capture_output=True)
     raw = result.stdout
     statuses = []
+    content_type = None
     while raw.startswith(b"HTTP/"):
         header, separator, body = raw.partition(b"\r\n\r\n")
         if not separator:
@@ -212,16 +222,23 @@ def api(args, endpoint, binary=False, *, operation=None, method="GET", body=None
         if not separator or not match:
             raise ControllerError(f"GitHub {operation}: malformed HTTP response")
         statuses.append(int(match[1]))
+        content_type = next((line.split(b":", 1)[1].strip().split(b";", 1)[0].lower()
+                             for line in header.splitlines() if line.lower().startswith(b"content-type:")), None)
         raw = body
     status = statuses[-1] if statuses else None
-    if result.returncode or status is None or not 200 <= status < 300:
+    if result.returncode or status != 200:
         if status is None:
             match = re.search(rb"\bHTTP (\d{3})\b", result.stderr)
             status = int(match[1]) if match else None
         category = {401: "authentication rejected", 403: "authorization or rate limit rejected",
                     404: "not found", 429: "rate limit rejected"}.get(status, "API/transport failure")
         raise ControllerError(f"GitHub {operation}: HTTP {status if status else 'unavailable'}; {category} (gh exit {result.returncode})")
-    return raw if binary else json.loads(raw)
+    expected = {GitHubResponse.JSON: {b"application/json"},
+                GitHubResponse.ARTIFACT_ZIP: {b"application/zip"},
+                GitHubResponse.RELEASE_ASSET: {b"application/octet-stream"}}[response]
+    if content_type not in expected:
+        raise ControllerError(f"GitHub {operation}: unexpected response media type")
+    return json.loads(raw) if response is GitHubResponse.JSON else raw
 
 
 def pages(args, endpoint, *, operation):
@@ -373,15 +390,25 @@ def provenance(args, run_id, controller_sha=None):
 
 def download(args, artifact_id, run_id, output):
     metadata = api(args, f"actions/artifacts/{artifact_id}")
-    if metadata["expired"] or str(metadata["workflow_run"]["id"]) != str(run_id):
+    if (str(metadata["id"]) != str(artifact_id) or metadata["expired"]
+            or str(metadata["workflow_run"]["id"]) != str(run_id)):
         raise ControllerError("Expired artifact or wrong artifact run provenance")
-    raw = api(args, f"actions/artifacts/{artifact_id}/zip", binary=True)
+    raw = api(args, f"actions/artifacts/{artifact_id}/zip", response=GitHubResponse.ARTIFACT_ZIP)
+    if metadata.get("size_in_bytes") != len(raw):
+        raise ControllerError("Artifact transport size mismatch or missing size")
     if metadata.get("digest") != "sha256:" + hashlib.sha256(raw).hexdigest():
         raise ControllerError("Artifact transport digest mismatch or missing digest")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         verify_archive_paths(archive)
         archive.extractall(output)
     return metadata
+
+
+def download_asset(args, asset):
+    raw = api(args, f"releases/assets/{asset['id']}", response=GitHubResponse.RELEASE_ASSET)
+    if asset.get("size") != len(raw) or asset.get("digest") != "sha256:" + hashlib.sha256(raw).hexdigest():
+        raise ControllerError("Release asset size/SHA-256 mismatch or missing digest")
+    return raw
 
 
 def verify_archive_paths(archive, *, app=False):
@@ -796,7 +823,7 @@ def assemble(args, *, upload_manifest=True):
                 if len(matches) != 1:
                     raise ControllerError("Missing or ambiguous updater release asset")
                 payload = root / name
-                payload.write_bytes(api(args, f"releases/assets/{matches[0]['id']}", binary=True))
+                payload.write_bytes(download_asset(args, matches[0]))
                 verify_update(config, payload, entry["signature"])
                 if target == args.target and digest(payload) != data["outputs"].get(f"output/artifacts/{name}"):
                     raise ControllerError("Release updater differs from retained source-bound output")
@@ -831,10 +858,8 @@ def verify_release_payloads(args, assembly, root):
         if Path(name).name != name:
             raise ControllerError("Unsafe release asset name")
         path = root / name
-        path.write_bytes(api(args, f"releases/assets/{asset['id']}", binary=True, operation="release-asset-download"))
+        path.write_bytes(download_asset(args, asset))
         sha = digest(path)
-        if asset.get("size") != path.stat().st_size or asset.get("digest") != "sha256:" + sha:
-            raise ControllerError("Release asset size/SHA-256 mismatch or missing digest")
         if name in assembly["assets"] and sha != assembly["assets"][name]["sha256"]:
             raise ControllerError("Release asset changed since signature verification")
         retained_name = f"output/{name}" if not name.startswith("tyde-update-") else f"output/artifacts/{name}"

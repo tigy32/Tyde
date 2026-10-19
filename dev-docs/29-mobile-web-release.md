@@ -646,3 +646,51 @@ or resubmitting. This is a fixture artifact, not the retained signed production
 payload or a claim that Apple verification passed. The complete synthetic
 package flow separately covers updater/DMG continuation. Fixture product modes
 are explicit, matching observed `644`/`755` rather than inheriting host umask.
+
+### GitHub download negotiation
+
+Actions artifact ZIP and Release asset endpoints have different contracts.
+[Actions artifact download](https://docs.github.com/en/rest/actions/artifacts#download-an-artifact)
+negotiates with `Accept: application/vnd.github+json` and returns a signed ZIP
+redirect. [Release asset download](https://docs.github.com/en/rest/releases/assets#get-a-release-asset)
+requires `Accept: application/octet-stream` for bytes, with either a direct
+response or a redirect. The controller uses `gh api` for both, letting gh follow
+redirects without logging signed URLs; it requires the final HTTP 200 and
+endpoint-specific content type, then checks metadata size and SHA-256 before
+consuming bytes. It never retries through an alternate transport.
+
+The package-only run `39276264731` failed before packaging because the shared
+binary flag sent octet-stream to Actions. Read-only live requests reproduced
+HTTP 415 with that header and downloaded the exact selected retained artifact
+with JSON negotiation (HTTP 302 → 200, `application/zip`). Release asset GETs
+returned HTTP 302 → 200 with octet-stream. One-byte read-only Range probes for
+each of the eight existing draft upload MIME families returned octet-stream;
+partial HTTP 206 responses are **not** accepted by the controller.
+
+`tools/probe_macos_downloads.py` is a separate, opt-in live regression, not part
+of the deterministic gate. With existing gh authentication, explicit selection
+and a fresh private output directory, it verifies the live source tag, original
+receipt hash, transport and payload hashes, run/controller provenance, all four
+same-source fragment downloads, and the Intel draft updater signature using
+the exact frozen source key:
+
+```sh
+python3 tools/probe_macos_downloads.py \
+  --repository tigy32/Tyde --tag v0.9.5 \
+  --source-sha 83ad2d3c03b4c2661adb22ad435dd073a9530bab \
+  --producer-sha 25038b19a98fa2cc3a13d85f76c6eef81928746c \
+  --run-id 39260355030 --artifact-id 12194400987 \
+  --fragments-run-id 39193235317 --target aarch64-apple-darwin \
+  --receipt-sha256 2877cd96c3df2164d8f06ac8a5bcb440fdc31160904cf0f793af779ef9a8e3a2 \
+  --output /absolute/path/to/new-private-evidence
+```
+
+For the red regression, supply `--controller-file` pointing to the pre-fix
+`macos_release.py` saved from Git; it fails at GitHub with HTTP 415, not a
+fixture assertion. The corrected probe passes with the original receipt and
+Accepted statuses unchanged. It executes no recovery context, package, Apple,
+upload, deployment, or publication operation. In particular it cannot attest
+macOS Gatekeeper or future 22-asset finalization, and does not bypass the
+unlanded controller's recovery main-ancestry guard. Deterministic CLI/HTTP flows
+separately exercise status/media/provenance/hash rejection and both direct and
+redirected Release responses; they are not proof of GitHub behavior.

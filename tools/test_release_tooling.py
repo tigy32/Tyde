@@ -951,6 +951,8 @@ class MacosControllerFlowTests(unittest.TestCase):
         self.published = False
         self.http_requests = []
         self.http_failures = {}
+        self.http_content_types = {}
+        self.direct_release_assets = False
         self.asset_overrides = {}
         self.release_overrides = {}
         self.extra_releases = []
@@ -964,9 +966,24 @@ class MacosControllerFlowTests(unittest.TestCase):
             def do_GET(self):
                 key = self.path.removeprefix(f"/repos/{owner.repository}/")
                 owner.http_requests.append(("GET", key))
+                binary = key.startswith("downloads/")
+                if binary:
+                    key = key.removeprefix("downloads/")
                 if key in owner.http_failures:
                     self.send_error(owner.http_failures[key], "PRIVATE-ID SECRET Authorization: bearer fixture")
                     return
+                artifact_zip = key.startswith("actions/artifacts/") and key.endswith("/zip")
+                release_asset = key.startswith("releases/assets/")
+                if (artifact_zip or release_asset) and not binary:
+                    expected = "application/vnd.github+json" if artifact_zip else "application/octet-stream"
+                    if self.headers.get("Accept") != expected:
+                        self.send_error(415)
+                        return
+                    if artifact_zip or not owner.direct_release_assets:
+                        self.send_response(302)
+                        self.send_header("Location", f"/repos/{owner.repository}/downloads/{key}")
+                        self.end_headers()
+                        return
                 release = {"id": 1, "tag_name": owner.tag, "draft": not owner.published,
                            "prerelease": False, **owner.release_overrides}
                 assets = [{"id": i, "name": n, "size": len(b), "digest": "sha256:" + hashlib.sha256(b).hexdigest(),
@@ -1002,6 +1019,8 @@ class MacosControllerFlowTests(unittest.TestCase):
                     self.send_error(404)
                     return
                 self.send_response(200)
+                content_type = "application/zip" if artifact_zip else "application/octet-stream" if release_asset else "application/json"
+                self.send_header("Content-Type", owner.http_content_types.get(key, content_type))
                 self.end_headers()
                 with contextlib.suppress(BrokenPipeError):
                     self.wfile.write(raw)
@@ -1014,6 +1033,7 @@ class MacosControllerFlowTests(unittest.TestCase):
                     return
                 owner.published = True
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b"{}")
 
@@ -1126,8 +1146,12 @@ if name=='gh':
   method=args[args.index('--method')+1] if '--method' in args else 'GET'
   fields=json.load(sys.stdin) if '--input' in args else None
   try:
-   raw=request('/'+args[1],json.dumps(fields).encode() if fields else None,method)
-   if '--include' in args: sys.stdout.buffer.write(b'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n')
+   headers=dict(args[i+1].split(':',1) for i,a in enumerate(args) if a=='-H')
+   headers={k:v.strip() for k,v in headers.items()}
+   req=urllib.request.Request(os.environ['FIXTURE_HTTP']+'/'+args[1],data=json.dumps(fields).encode() if fields else None,method=method,headers=headers)
+   with urllib.request.urlopen(req) as response:
+    raw=response.read()
+    if '--include' in args: sys.stdout.buffer.write(f'HTTP/2.0 {response.status} OK\r\nContent-Type: {response.headers.get("Content-Type", "")}\r\n\r\n'.encode())
    sys.stdout.buffer.write(raw)
   except urllib.error.HTTPError as e:
    if '--include' in args: sys.stdout.buffer.write(f'HTTP/2.0 {e.code} Error\r\n\r\n'.encode())
@@ -1265,6 +1289,7 @@ else: raise SystemExit(27)
         self.responses[f"actions/artifacts/{artifact_id}"] = {
             "id": artifact_id, "name": name, "expired": False,
             "workflow_run": {"id": run_id, "head_sha": self.controller_sha},
+            "size_in_bytes": len(raw),
             "digest": "sha256:" + hashlib.sha256(raw).hexdigest()}
         self.downloads[f"actions/artifacts/{artifact_id}/zip"] = raw
         return self.responses[f"actions/artifacts/{artifact_id}"]
@@ -1564,8 +1589,32 @@ else: raise SystemExit(27)
         self.seal_artifact(20, self.retained)
         shutil.rmtree(self.retained)
         shutil.rmtree(self.source / "target")
+        endpoint = "actions/artifacts/20/zip"
+        for status in (206, 403, 410, 415, 500):
+            self.http_failures[endpoint] = status
+            result = self.cli("restore", "--run-id", "10", "--artifact-id", "20", succeeds=False)
+            self.assertIn(f"artifact-download: HTTP {status}", result.stderr)
+            self.assertFalse(self.retained.exists())
+        self.http_failures.clear()
+        for content_type in ("application/json", "text/html", "application/octet-stream"):
+            self.http_content_types[endpoint] = content_type
+            result = self.cli("restore", "--run-id", "10", "--artifact-id", "20", succeeds=False)
+            self.assertIn("artifact-download: unexpected response media type", result.stderr)
+            self.assertFalse(self.retained.exists())
+        self.http_content_types.clear()
+        metadata = self.responses["actions/artifacts/20"]
+        for key, value, message in (("id", 21, "provenance"), ("workflow_run", {"id": 11}, "provenance"),
+                                    ("size_in_bytes", 0, "transport size mismatch"),
+                                    ("digest", "sha256:" + "0" * 64, "transport digest mismatch")):
+            original_value = metadata[key]
+            metadata[key] = value
+            result = self.cli("restore", "--run-id", "10", "--artifact-id", "20", succeeds=False)
+            self.assertIn(message, result.stderr)
+            self.assertFalse(self.retained.exists())
+            metadata[key] = original_value
         self.log.write_text("")
         self.cli("restore", "--run-id", "10", "--artifact-id", "20")
+        self.assertIn(("GET", "downloads/" + endpoint), self.http_requests)
         self.cli("package")
         packaged = json.loads((self.retained / "receipt.json").read_text())
         self.assertTrue(packaged["packaged"])
@@ -1823,6 +1872,12 @@ else: raise SystemExit(27)
         self.responses["actions/runs/10"]["display_title"] = "Release wrong source"
         self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
         self.responses["actions/runs/10"] = self.run_metadata(10)
+        updater_name = next(name for name in self.uploads if name.startswith("tyde-update-"))
+        asset_endpoint = f"releases/assets/{list(self.uploads).index(updater_name)}"
+        self.http_content_types[asset_endpoint] = "application/json"
+        result = self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
+        self.assertIn("release-asset-download: unexpected response media type", result.stderr)
+        self.http_content_types.clear()
         self.cli("assemble", "--fragments-run-id", "10")
         manifest = json.loads(self.uploads["tyde-update.json"])
         self.assertEqual(manifest["version"], version)
@@ -1831,6 +1886,7 @@ else: raise SystemExit(27)
         self.assertIn("darwin-x86_64", manifest["platforms"])
         self.assertTrue((self.retained / "assembly.json").is_file())
         self.assertFalse(self.published)
+        self.direct_release_assets = True
         self.log.write_text("")
         self.cli("finalize", "--fragments-run-id", "10", succeeds=False)
         self.cli("finalize", "--fragments-run-id", "10", "--confirm", "--source-sha", "b" * 40, succeeds=False)
