@@ -91,6 +91,22 @@ pub fn install(root: NodeRef<leptos::html::Div>) {
     Effect::new(move |_| {
         let Some(root) = root.get() else { return };
         let root: web_sys::HtmlElement = (*root).clone();
+        // WebKit iOS (`RemoteLayerTreeViews.mm` `touchActionsForPoint`) returns
+        // `TouchAction::Auto` inside `WKChildScrollView` (`overflow-y: auto`
+        // regions like `.chat-messages` and `.view-body`), bypassing
+        // `WKTouchActionGestureRecognizer`. WebKit's second double-tap zoom
+        // gate (`WebPage::potentialTapAtPosition` ->
+        // `DisableDoubleTapGesturesDuringTapIfNecessary`) checks
+        // `Element::allowsDoubleTapGesture()` (`!touchAction().isAuto()`) only
+        // when `nodeRespondingToClickEvents` finds a DOM ancestor with a direct
+        // `click` listener (Leptos delegates `on:click` to `window`, not the
+        // element). Installing a direct no-op `onclick` on `.mobile-app`
+        // ensures every tap inside child scroll views resolves `.mobile-app`
+        // (or a closer interactive descendant) with `touch-action: manipulation`
+        // and suppresses double-tap page zoom.
+        let click_noop = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(|_| {});
+        root.set_onclick(Some(click_noop.as_ref().unchecked_ref()));
+        let cleanup_root = root.clone();
         let mounted = Rc::new(RefCell::new(None));
         let target = root.clone();
         let owner = mounted.clone();
@@ -161,6 +177,8 @@ pub fn install(root: NodeRef<leptos::html::Div>) {
             log::error!("Shared mobile shell could not mount: {error:?}");
         }
         let held = send_wrapper::SendWrapper::new((
+            cleanup_root,
+            click_noop,
             observer,
             callback,
             style_observer,
@@ -168,9 +186,19 @@ pub fn install(root: NodeRef<leptos::html::Div>) {
             mounted,
         ));
         on_cleanup(move || {
-            let (observer, callback, style_observer, style_callback, mounted) = held.take();
+            let (
+                cleanup_root,
+                click_noop,
+                observer,
+                callback,
+                style_observer,
+                style_callback,
+                mounted,
+            ) = held.take();
+            cleanup_root.set_onclick(None);
             observer.disconnect();
             style_observer.disconnect();
+            drop(click_noop);
             drop(callback);
             drop(style_callback);
             mounted.borrow_mut().take();

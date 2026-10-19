@@ -1594,7 +1594,7 @@ mod wasm_tests {
         }));
     }
 
-    fn mount_active_chat(container: HtmlElement) -> AppState {
+    fn mount_active_chat(container: HtmlElement) -> (AppState, impl Drop) {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
         let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
@@ -1607,8 +1607,8 @@ mod wasm_tests {
             provide_context(state);
             view! { <ChatView /> }
         });
-        std::mem::forget(handle);
-        state_handle.borrow().as_ref().unwrap().clone()
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        (state, handle)
     }
 
     async fn sleep_ms(millis: i32) {
@@ -1752,7 +1752,7 @@ mod wasm_tests {
         container.style().set_property("left", "0").unwrap();
         container.style().set_property("width", "390px").unwrap();
         container.style().set_property("height", "700px").unwrap();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let parent = state.active_agent.get_untracked().unwrap();
         let owner = parent.as_agent_ref();
         let mut child = make_agent(&owner.local_host_id, "Release verification");
@@ -2443,7 +2443,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn native_goal_state_controls_the_summary_and_send_menu() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let owner = state
             .active_agent
             .get_untracked()
@@ -2550,7 +2550,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn typed_live_reasoning_is_visible_in_the_active_stream() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -2623,7 +2623,7 @@ mod wasm_tests {
     async fn a_rejected_interrupt_is_surfaced_and_says_the_agent_is_still_running() {
         let _guard = crate::bridge::test_reject_sends();
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -2673,7 +2673,7 @@ mod wasm_tests {
     async fn a_terminated_agent_offers_no_stop_and_does_not_claim_it_is_responding() {
         let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -2772,7 +2772,7 @@ mod wasm_tests {
     async fn an_interrupt_dispatched_before_the_fatal_frame_never_reaches_the_dead_stream() {
         let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let active = state.active_agent.get_untracked().expect("active agent");
         state.agent_turn_active.update(|m| {
             m.insert(active.as_agent_ref(), true);
@@ -2825,7 +2825,7 @@ mod wasm_tests {
     async fn an_admitted_interrupt_claims_nothing() {
         let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -2870,7 +2870,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn a_failed_load_replaces_the_spinner_with_a_recovery_action() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -2939,7 +2939,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn a_dropped_connection_ends_the_spinner() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -3091,7 +3091,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn chat_auto_scrolls_to_bottom_when_user_is_sticky() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, mount) = mount_active_chat(container.clone());
         next_tick().await;
         let scroller = chat_scroller(&container);
         scroller
@@ -3111,12 +3111,20 @@ mod wasm_tests {
             scroller.client_height(),
             scroller.scroll_height()
         );
+        drop(mount);
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input']")
+                .unwrap()
+                .is_none(),
+            "ending a chat fixture must unmount its composer before later hit tests"
+        );
     }
 
     #[wasm_bindgen_test]
     async fn chat_does_not_auto_scroll_after_user_scrolls_up() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         next_tick().await;
         let scroller = chat_scroller(&container);
         scroller
@@ -3165,7 +3173,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn prior_history_indicator_shows_load_control_without_rows() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         next_tick().await;
 
         let agent_ref = state
@@ -3347,7 +3355,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <ChatView /> }
         });
-        std::mem::forget(handle);
+        let _mount = handle;
         let state = state_handle.borrow().as_ref().unwrap().clone();
         settle_autoscroll().await;
 
@@ -3706,7 +3714,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn mobile_header_shows_deferred_and_compacting_context_status() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -3763,7 +3771,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn mobile_transcript_renders_one_marker_in_event_order() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
@@ -4271,7 +4279,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn back_action_clears_viewing_chat() {
         let container = make_container();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         state.viewing_chat.set(true);
         next_tick().await;
 
@@ -4342,7 +4350,7 @@ mod wasm_tests {
         crate::components::test_styles::ensure_styles_loaded();
         let container = make_container();
         container.style().set_property("width", "390px").unwrap();
-        let state = mount_active_chat(container.clone());
+        let (state, _mount) = mount_active_chat(container.clone());
         settle_autoscroll().await;
         assert!(
             context_bar(&container).is_none(),

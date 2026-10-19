@@ -979,15 +979,55 @@ mod wasm_tests {
         );
         let hit = |target: &web_sys::Element| {
             let bounds = target.get_bounding_client_rect();
-            web_sys::window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .element_from_point(
-                    (bounds.x() + bounds.width() / 2.0) as f32,
-                    (bounds.y() + bounds.height() / 2.0) as f32,
-                )
-                .is_some_and(|node| &node == target || target.contains(Some(&node)))
+            let window = web_sys::window().unwrap();
+            let document = window.document().unwrap();
+            let node = document.element_from_point(
+                (bounds.x() + bounds.width() / 2.0) as f32,
+                (bounds.y() + bounds.height() / 2.0) as f32,
+            );
+            let reachable = node
+                .as_ref()
+                .is_some_and(|node| node == target || target.contains(Some(node)));
+            console_log!(
+                "Session settings hit test: target={:?}, connected={}, bounds=({}, {}, {}, {}), viewport={}x{}, reachable={}, hit={:?}",
+                target.get_attribute("data-mobile-test"),
+                target.is_connected(),
+                bounds.x(),
+                bounds.y(),
+                bounds.width(),
+                bounds.height(),
+                window.inner_width().unwrap().as_f64().unwrap(),
+                window.inner_height().unwrap().as_f64().unwrap(),
+                reachable,
+                node.as_ref()
+                    .map(|node| (node.tag_name(), node.class_name())),
+            );
+            if !reachable {
+                for (label, start) in [("target", Some(target.clone())), ("hit", node)] {
+                    let mut ancestor = start;
+                    while let Some(element) = ancestor {
+                        let bounds = element.get_bounding_client_rect();
+                        let style = window.get_computed_style(&element).unwrap().unwrap();
+                        console_log!(
+                            "Session settings {label} ancestor: tag={}, class={}, bounds=({}, {}, {}, {}), position={}, z-index={}, overflow={}/{}, pointer-events={}, visibility={}",
+                            element.tag_name(),
+                            element.class_name(),
+                            bounds.x(),
+                            bounds.y(),
+                            bounds.width(),
+                            bounds.height(),
+                            style.get_property_value("position").unwrap(),
+                            style.get_property_value("z-index").unwrap(),
+                            style.get_property_value("overflow-x").unwrap(),
+                            style.get_property_value("overflow-y").unwrap(),
+                            style.get_property_value("pointer-events").unwrap(),
+                            style.get_property_value("visibility").unwrap(),
+                        );
+                        ancestor = element.parent_element();
+                    }
+                }
+            }
+            reachable
         };
         assert!(
             hit(settings_item.unchecked_ref()),

@@ -16,6 +16,9 @@
     <link data-trunk rel="copy-file" href="voice-capture-worklet.js" />
     <link data-trunk rel="copy-file" href="voice-playback-worklet.js" />
     <style>
+        *, *::before, *::after {
+            touch-action: manipulation;
+        }
         html, body {
             margin: 0;
             width: 100%;

@@ -23,8 +23,11 @@
   --safe-right: env(safe-area-inset-right, 0px);
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+  touch-action: manipulation;
 }
 
 html,

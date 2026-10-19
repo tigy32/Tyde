@@ -83,10 +83,22 @@
 
 /* ── Reset ──────────────────────────────────────────────────────────── */
 
+/* Suppress accidental iOS Safari double-tap smart magnification across all
+   mobile surfaces while preserving ordinary pan scrolling and intentional
+   two-finger pinch zoom. `touch-action` is not an inherited CSS property, so
+   setting `manipulation` only on `html, body` leaves descendant containers
+   (`.bottom-nav`, `.view-header`, `.chat-header`, `.chat-bottom-dock`,
+   `.chat-messages`, `.view-body`, sheets, modals, and code blocks) with
+   computed `touch-action: auto`, which re-enables WebKit's double-tap zoom
+   gesture recognizer. Paired with the direct `.mobile-app` click listener in
+   `shell::install`, universal `touch-action: manipulation` suppresses
+   double-tap zoom across both fixed chrome and `overflow-y: auto` child
+   scroll views. */
 *, *::before, *::after {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+    touch-action: manipulation;
 }
 
 /* iOS paints the root element's background across the whole window — the

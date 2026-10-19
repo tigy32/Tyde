@@ -544,3 +544,126 @@ values, identifiers, attributes containing user content, or conversation text.
 The script has no network, storage, console logging or collection/export UI.
 This separates browser zoom from text inflation, keyboard pan and stale layout
 without adding a second viewport owner or shipped client telemetry.
+
+## Double-tap zoom suppression (2026-10-18)
+
+### Root cause in WebKit iOS
+
+Rapid double-taps on the bottom tab bar (`.bottom-nav` gaps/edges and non-button
+surfaces), headers (`.view-header`, `.chat-header`), composer dock margins
+(`.chat-bottom-dock`), and scrollable content panes (`.chat-messages`,
+`.view-body`) triggered native iOS smart-zoom / double-tap page zoom
+(`visualViewport.scale` jumping to `1.02`–`1.60`).
+
+Two separate WebKit mechanisms governed this behavior:
+
+1. **`touch-action` is not an inherited CSS property.** Setting
+   `touch-action: manipulation` only on `html, body` (`mobile-frontend/styles.css`,
+   `mobile-frontend/index.html`, `web/loader/loader.css`) and `.btn, .nav-tab`
+   left all non-button descendants (`<nav>`, `<header>`, `<footer>`, `<div>`,
+   `<p>`, `.bottom-nav`, `.view-header`, `.chat-header`, `.chat-bottom-dock`,
+   `.chat-messages`, `.view-body`) with computed `touch-action: auto`. In WebKit's
+   UIProcess (`WKTouchActionGestureRecognizer` + `RemoteLayerTreeViews.mm`), hit
+   testing consults the deepest layer's `eventRegion.touchActionsForPoint()`;
+   descendants with `touch-action: auto` therefore re-enabled the native
+   double-tap zoom gesture recognizer.
+2. **`WKChildScrollView` (`overflow-y: auto`) bypasses `touchActionsForPoint`.**
+   In `RemoteLayerTreeViews.mm`, `touchActionsForPoint(rootView, point)` walks
+   layer views and returns `WebCore::TouchAction::Auto` immediately upon hitting
+   a `WKChildScrollView` whose scrolled content is not in a separate child
+   compositing layer with its own event region. Consequently, CSS
+   `touch-action: manipulation` alone does **not** stop double-tap zoom inside
+   `overflow-y: auto` child scroll containers (`.chat-messages`, `.view-body`).
+   WebKit's second double-tap gate in `WebPage::potentialTapAtPosition`
+   (`WebPageCocoa.mm`) sends
+   `Messages::WebPageProxy::DisableDoubleTapGesturesDuringTapIfNecessary` when
+   `m_potentialTapNode` (`localRootFrame->nodeRespondingToClickEvents(...)`) is
+   non-null and `!m_potentialTapNode->allowsDoubleTapGesture()`
+   (`Element.cpp`: `!renderStyle()->touchAction().isAuto()`). Because Leptos
+   delegates `on:click` to `window` rather than registering a direct DOM `click`
+   listener on elements, non-button targets inside `.chat-messages` and
+   `.view-body` had `m_potentialTapNode == nullptr`, so WebKit skipped the
+   `allowsDoubleTapGesture()` check and allowed double-tap zoom inside child
+   scroll views.
+
+### Fix and preserved capabilities
+
+1. `mobile-frontend/styles.css`, `mobile-frontend/index.html`, and
+   `web/loader/loader.css` apply `touch-action: manipulation` across
+   `*, *::before, *::after` in addition to `html, body`, so every rendered
+   surface in the loader, shell, and mounted app computes
+   `touch-action: manipulation`.
+2. `mobile-frontend/src/shell.rs` (`shell::install`) registers a direct no-op
+   `onclick` listener on the `.mobile-app` root `HtmlElement` (and clears it on
+   unmount). Every tap inside `.mobile-app` — including non-interactive nodes
+   inside `overflow-y: auto` `WKChildScrollView` regions — now resolves at least
+   `.mobile-app` in `nodeRespondingToClickEvents()`, sees
+   `touch-action: manipulation` (`allowsDoubleTapGesture() == false`), and
+   disables WebKit's double-tap zoom gesture for that tap.
+3. Viewport metadata remains zoom-enabled (`maximum-scale` / `user-scalable`
+   untouched), preserving intentional two-finger pinch-zoom, ordinary vertical
+   scrolling (`overflow-y: auto`), text selection (`user-select`), and input
+   focus without zoom (`>= 16px` editable typography).
+
+### Physical iPhone 12 / iOS 26.6 Mobile Safari verification and scope limits
+
+Content-free evidence is retained on the development host under
+`/home/tyggs/Tyde/mobile-double-tap-zoom-evidence/` (`evidence-summary.json`,
+`cloud-state.json`, and `interactive/`). Device: AWS Device Farm physical
+iPhone 12 (`iPhone13,2`), iOS 26.6, Mobile Safari (`Safari/604.1`), ordinary
+browser mode via temporary private HTTPS tunnel. All owned Device Farm projects,
+runs, and local broker/tunnel processes were cleaned up on completion.
+
+Honest fixture scope: the physical-device harness served **reduced DOM captured
+from the real compiled Leptos fixture**, paired with the exact source
+`mobile-frontend/styles.css`, `web/loader/loader.css`, and byte-identical shared
+`vendor/web-shell/shell.js` + `shell.css`. It is a representative production-CSS
+and shared-shell fixture, **not** a full running-Wasm or live host-protocol QA
+session.
+
+| Surface & native gesture (`iPhone 12`, iOS 26.6 Safari) | Before (`HEAD`) `visualViewport.scale` | After (fix) `visualViewport.scale` | Notes |
+| --- | --- | --- | --- |
+| `.bottom-nav` inter-pill gap double-tap (`x=195, y=712`) | `1.600000` (RED) | `1.000000` (GREEN) | Primary reported tab-bar zoom |
+| `.bottom-nav` active tab button double-tap (`x=240, y=712`) | `1.000000` | `1.000000` (GREEN) | Button already had `manipulation` |
+| `.bottom-nav` outer edge double-tap (`x=14, y=712`) | `1.000000` | `1.000000` (GREEN) | Stays unzoomed |
+| Sessions `.view-header` double-tap (`x=200, y=72`) | `1.600000` (RED) | `1.000000` (GREEN) | Header double-tap zoom eliminated |
+| Chat `.chat-header` double-tap (`x=200, y=72`) | `1.000000` | `1.000000` (GREEN) | Stays unzoomed |
+| Chat `.chat-message` inside `.chat-messages` (`x=200, y=220`) | `1.021745` (`1.600000` with CSS-only) (RED) | `1.000000` (GREEN) | Requires both universal `touch-action: manipulation` and `.mobile-app` direct `onclick` |
+| Chat `.chat-bottom-dock` margin double-tap (`x=12..15, y=712`) | `1.489687` (RED) | `1.000000` (GREEN) | Composer dock zoom eliminated |
+| Sessions search `<input>` tap focus | `1.000000` (`16px`) | `1.000000` (`16px`, `height=389`) | Focus + keyboard contraction preserved |
+| Chat composer `<textarea>` tap focus (`x=150, y=712`) | `1.000000` (`16px`) | `1.000000` (`16px`, `height=389`, `offsetTop=310`) | Focus + keyboard pan preserved |
+| Chat `.chat-messages` vertical drag scroll | `scrollTop > 0` | `scrollTop = 418`, `scale = 1.000000` | Ordinary scrolling preserved |
+| Two-finger native pinch-in (`scale: 2.0`) | `> 1.0` | `1.948789` (GREEN) | Intentional pinch-zoom preserved |
+
+### Mounted Wasm regression coverage
+
+In `mobile-frontend/src/app.rs` (`one_chat_mount_preserves_transcript_and_composer_draft`),
+`assert_manipulation_gesture_policy` verifies on the real mounted `AppSurface`
+in headless Chrome that `documentElement`, `body`, `.mobile-app`, and every
+rendered descendant across workspace tabs (`bottom-nav`, tab buttons,
+`sessions-view`) and chat view (`chat-header`, `chat-messages`,
+`chat-transcript`, `chat-message`, `chat-bottom-dock`, `chat-input-container`,
+`chat-input`, `chat-send`, `chat-send-menu-toggle`) compute
+`touch-action: manipulation`, that `.mobile-app` has its direct `onclick`
+listener installed while mounted and cleaned up on unmount, and that
+`.chat-messages` retains `overflow-y: auto` and `.chat-transcript` retains text
+selection (`user-select != none`).
+
+### Collateral DOM gate repair
+
+The recovered final gate failed the running-agent session-settings reachability
+assertion. Instrumented Chrome output located that row at `(577, 109, 178, 44)`
+in a `780 x 437` viewport, but its center hit another fixture's
+`.chat-input-row.tws-composer` at `(0, 125.515625, 780, 56)`. That composer's
+ancestor chain reached the shared document body without entering the current
+`.mobile-app`; this was a stale test mount, not a clipped settings menu.
+
+The chat-view helper and failed-load flow discarded their Leptos unmount
+handles, leaving live chat controls in the shared document after their tests.
+They now retain scoped mount guards, and the existing scroll flow also asserts
+that dropping its mount removes the composer. All settings/Stop hit tests,
+agent-stream routing, response preservation, and draft assertions remain.
+Content-free hit/ancestor geometry diagnostics remain in the settings flow.
+No gesture CSS, production behavior, or physical-device evidence changed.
+Native text selection and image-specific zoom remain unverified by the physical
+fixture; selectable computed styles and page pinch are not substitutes for them.

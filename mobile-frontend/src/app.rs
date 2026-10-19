@@ -2764,6 +2764,64 @@ mod wasm_tests {
         );
         assert_bottom_gap(&nav, 8.0);
 
+        fn assert_manipulation_gesture_policy(
+            document: &web_sys::Document,
+            required_selectors: &[&str],
+        ) {
+            let window = document.default_view().unwrap();
+            for root in [
+                document.document_element().unwrap(),
+                document.body().unwrap().into(),
+            ] {
+                let style = window.get_computed_style(&root).unwrap().unwrap();
+                assert_eq!(
+                    style.get_property_value("touch-action").unwrap(),
+                    "manipulation",
+                    "document root surface {} must disable double-tap zoom via touch-action: manipulation",
+                    root.tag_name()
+                );
+            }
+            for selector in required_selectors {
+                let element = document
+                    .query_selector(selector)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("expected mounted mobile surface {selector}"));
+                let style = window.get_computed_style(&element).unwrap().unwrap();
+                assert_eq!(
+                    style.get_property_value("touch-action").unwrap(),
+                    "manipulation",
+                    "mobile surface {selector} must use touch-action: manipulation"
+                );
+            }
+            let app_root = document
+                .query_selector(".mobile-app")
+                .unwrap()
+                .expect("expected mounted .mobile-app root")
+                .unchecked_into::<HtmlElement>();
+            assert!(
+                app_root.onclick().is_some(),
+                ".mobile-app root must install a direct onclick listener so WebKit iOS potentialTapAtPosition resolves a click-responding ancestor with touch-action: manipulation inside WKChildScrollView scrollers"
+            );
+            let all = document
+                .query_selector_all(".mobile-app, .mobile-app *")
+                .unwrap();
+            assert!(all.length() > 0, "expected mounted .mobile-app subtree");
+            for index in 0..all.length() {
+                let element = all
+                    .item(index)
+                    .unwrap()
+                    .unchecked_into::<web_sys::Element>();
+                let style = window.get_computed_style(&element).unwrap().unwrap();
+                assert_eq!(
+                    style.get_property_value("touch-action").unwrap(),
+                    "manipulation",
+                    "every rendered mobile element and overflow scroller must keep touch-action: manipulation (tag={}, class={})",
+                    element.tag_name(),
+                    element.class_name()
+                );
+            }
+        }
+
         async fn focus_readable_control(
             document: &web_sys::Document,
             selector: &str,
@@ -2776,15 +2834,16 @@ mod wasm_tests {
                 .dyn_into::<HtmlElement>()
                 .unwrap();
             let window = document.default_view().unwrap();
-            let font = window
-                .get_computed_style(&control)
-                .unwrap()
-                .unwrap()
-                .get_property_value("font-size")
-                .unwrap();
+            let style = window.get_computed_style(&control).unwrap().unwrap();
+            let font = style.get_property_value("font-size").unwrap();
             assert!(
                 font.trim_end_matches("px").parse::<f64>().unwrap() >= minimum_font,
                 "native editing text must not trigger iOS focus magnification: {selector}, {font}"
+            );
+            assert_eq!(
+                style.get_property_value("touch-action").unwrap(),
+                "manipulation",
+                "editable control must also suppress double-tap page zoom: {selector}"
             );
             control.focus().unwrap();
             next_tick().await;
@@ -2803,8 +2862,72 @@ mod wasm_tests {
             control
         }
 
+        state.active_tab.set(MobileTab::Sessions);
+        next_tick().await;
+        assert_manipulation_gesture_policy(
+            &frame_document,
+            &[
+                ".mobile-app",
+                ".tws-content",
+                ".tws-bottom",
+                "[data-mobile-test='bottom-nav']",
+                "[data-mobile-test='nav-tab-home']",
+                "[data-mobile-test='nav-tab-agents']",
+                "[data-mobile-test='nav-tab-sessions']",
+                "[data-mobile-test='nav-tab-settings']",
+                "[data-mobile-test='sessions-view']",
+            ],
+        );
+
         state.viewing_chat.set(true);
         next_tick().await;
+        assert_manipulation_gesture_policy(
+            &frame_document,
+            &[
+                ".mobile-app",
+                ".chat-header",
+                "[data-mobile-test='chat-back']",
+                "[data-mobile-test='chat-more']",
+                "[data-mobile-test='chat-messages']",
+                "[data-mobile-test='chat-transcript']",
+                ".chat-message",
+                "[data-mobile-test='chat-bottom-dock']",
+                "[data-mobile-test='chat-input-container']",
+                "[data-mobile-test='chat-input']",
+                "[data-mobile-test='chat-send']",
+                "[data-mobile-test='chat-send-menu-toggle']",
+            ],
+        );
+        let live_scroller = frame_document
+            .query_selector("[data-mobile-test='chat-messages']")
+            .unwrap()
+            .unwrap();
+        let scroller_style = frame
+            .content_window()
+            .unwrap()
+            .get_computed_style(&live_scroller)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scroller_style.get_property_value("overflow-y").unwrap(),
+            "auto",
+            "chat scroller must preserve ordinary vertical scrolling"
+        );
+        let live_transcript = frame_document
+            .query_selector("[data-mobile-test='chat-transcript']")
+            .unwrap()
+            .unwrap();
+        let transcript_style = frame
+            .content_window()
+            .unwrap()
+            .get_computed_style(&live_transcript)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            transcript_style.get_property_value("user-select").unwrap(),
+            "none",
+            "chat transcript must preserve text selection"
+        );
         focus_readable_control(&frame_document, "[data-mobile-test='chat-input']", 16.0).await;
         for selector in [
             "[data-mobile-test='chat-more']",
@@ -2881,17 +3004,19 @@ mod wasm_tests {
             .set_property("font-size", "20px")
             .unwrap();
         focus_readable_control(&frame_document, ".pairing-paste-input", 20.0).await;
-        container
+        let app_root = container
             .query_selector(".mobile-app")
             .unwrap()
             .unwrap()
             .dyn_into::<HtmlElement>()
-            .unwrap()
-            .style()
-            .set_property("font-size", "24px")
             .unwrap();
+        app_root.style().set_property("font-size", "24px").unwrap();
         focus_readable_control(&frame_document, ".pairing-paste-input", 24.0).await;
         drop(mount);
+        assert!(
+            app_root.onclick().is_none(),
+            "unmount clears .mobile-app direct onclick listener"
+        );
         assert!(
             !frame_document
                 .document_element()
