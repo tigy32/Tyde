@@ -5031,12 +5031,23 @@ async fn project_watcher_follows_worktree_git_metadata() {
     );
     write_file(&worktree.join(".gitignore"), "target/\n");
     write_file(&worktree.join("target/deep/cache"), "artifact");
-    let primary = create_project_with_real_roots(
+    let (primary_ready_tx, primary_ready_rx) = tokio::sync::oneshot::channel();
+    let primary_ready = fixture.on_project_scan(
+        repo.path().to_owned(),
+        server::ScanPoint::WatcherReady,
+        move || {
+            let _ = primary_ready_tx.send(());
+        },
+    );
+    let primary = create_project(
         &mut fixture.client,
         "Primary shared Git watches",
         vec![repo.path().to_string_lossy().into_owned()],
     )
     .await;
+    expect_project_bootstrap(&mut fixture.client, "primary bootstrap").await;
+    primary_ready_rx.await.unwrap();
+    drop(primary_ready);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let ready = fixture.on_project_scan(
         worktree.clone(),
@@ -5045,14 +5056,13 @@ async fn project_watcher_follows_worktree_git_metadata() {
             let _ = ready_tx.send(());
         },
     );
-    let project = create_project_with_real_roots(
+    let project = create_project(
         &mut fixture.client,
         "Worktree watches",
         vec![worktree.to_string_lossy().into_owned()],
     )
     .await;
-    // Bootstrap and a quiet 100 ms do not imply the background Git/ignore walk
-    // has installed watches. The unmodified test lost its first write under load.
+    expect_project_bootstrap(&mut fixture.client, "worktree bootstrap").await;
     (ready_rx).await.unwrap();
     drop(ready);
     #[cfg(target_os = "linux")]
@@ -5086,6 +5096,108 @@ async fn project_watcher_follows_worktree_git_metadata() {
         status.roots[0].branch.as_deref() == Some("renamed-watch-branch")
     }))
     .await;
+    let old_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    git(
+        &worktree,
+        &["commit", "-m", "Advance staged source for ref watches"],
+    );
+    let new_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(old_head, new_head, "staged source must advance HEAD");
+    expect_project_git_status_matching(
+        &mut fixture.client,
+        "committed worktree source",
+        |status| {
+            status.roots.iter().any(|entry| {
+                entry.root == root && entry.head_oid.as_deref() == Some(new_head.as_str())
+            })
+        },
+    )
+    .await;
+    git(
+        &worktree,
+        &["config", "branch.renamed-watch-branch.remote", "."],
+    );
+    for leaf in ["flat", "nested/deep/upstream"] {
+        let reference = format!("refs/heads/{leaf}");
+        git(
+            &worktree,
+            &["config", "branch.renamed-watch-branch.merge", &reference],
+        );
+        for (phase, target, ahead) in [
+            ("create", Some(old_head.as_str()), 1),
+            ("advance", Some(new_head.as_str()), 0),
+            ("rewind", Some(old_head.as_str()), 1),
+            ("delete", None, 0),
+        ] {
+            // A new ref directory can contain files before its watch exists.
+            // Observe that directory's completed reconciliation on creation;
+            // all other steps observe the actual ref leaf's completed event.
+            #[cfg(target_os = "linux")]
+            let (reconciliation, processed, mut reconciled_rx, processed_rx) = {
+                let path = repo
+                    .path()
+                    .join(".git")
+                    .join(if leaf != "flat" && phase == "create" {
+                        "refs/heads/nested"
+                    } else {
+                        &reference
+                    });
+                let (reconciled_tx, reconciled_rx) = tokio::sync::oneshot::channel();
+                let reconciliation = fixture.on_project_scan(
+                    path.clone(),
+                    server::ScanPoint::WatcherReconcile,
+                    move || {
+                        let _ = reconciled_tx.send(());
+                    },
+                );
+                let (processed_tx, processed_rx) = tokio::sync::oneshot::channel();
+                let processed =
+                    fixture.on_project_scan(path, server::ScanPoint::WatcherProcessed, move || {
+                        let _ = processed_tx.send(());
+                    });
+                (reconciliation, processed, reconciled_rx, processed_rx)
+            };
+            match target {
+                Some(target) => git(&worktree, &["update-ref", &reference, target]),
+                None => git(&worktree, &["update-ref", "-d", &reference]),
+            }
+            #[cfg(target_os = "linux")]
+            {
+                processed_rx.await.expect("real ref event completed");
+                let reconciled = match reconciled_rx.try_recv() {
+                    Ok(()) => true,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        panic!("reconciliation observer closed before event completion")
+                    }
+                };
+                let directory_created = leaf != "flat" && phase == "create";
+                eprintln!(
+                    "worktree ref event: phase={phase} directory_created={directory_created} reconciled={reconciled}"
+                );
+                assert_eq!(
+                    reconciled, directory_created,
+                    "ref leaves must refresh Git without rebuilding inventory; new ref directories must reconcile"
+                );
+                drop((reconciliation, processed));
+            }
+            let status = expect_project_git_status_matching(
+                &mut fixture.client,
+                "shared upstream ref change",
+                |status| {
+                    status.roots.iter().any(|entry| {
+                        entry.root == root
+                            && entry.branch.as_deref() == Some("renamed-watch-branch")
+                            && entry.head_oid.as_deref() == Some(new_head.as_str())
+                            && entry.ahead == ahead
+                            && entry.behind == 0
+                    })
+                },
+            )
+            .await;
+            assert_eq!(status.roots.len(), 1, "exact linked-worktree status root");
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         assert!(!directory_has_inotify_watch(&worktree.join("target/deep")));

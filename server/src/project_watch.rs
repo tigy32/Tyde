@@ -731,6 +731,7 @@ impl WatchState {
         }
         let mut relevant = Vec::new();
         let mut reconcile = event.need_rescan();
+        let mut ref_leaf_paths = 0;
         for path in &event.paths {
             let directory = self.registered.contains(path) || path.is_dir();
             if directory {
@@ -746,9 +747,12 @@ impl WatchState {
                     || (candidate.file_name().is_some_and(|name| name == "refs")
                         && path.starts_with(candidate))
             });
-            if let Some((_, synthetic)) = git {
+            if let Some((candidate, synthetic)) = git {
                 relevant.push(synthetic.clone());
-                reconcile = true;
+                reconcile |= directory;
+                if !directory && candidate.file_name().is_some_and(|name| name == "refs") {
+                    ref_leaf_paths += 1;
+                }
             }
             if self.inventory.controls.contains(path)
                 || (directory
@@ -801,7 +805,24 @@ impl WatchState {
                 }
             }
         }
+        if ref_leaf_paths > 0 {
+            tracing::debug!(
+                event_kind = ?event.kind,
+                input_paths = event.paths.len(),
+                ref_leaf_paths,
+                reconcile,
+                lost_events = event.need_rescan(),
+                "classified project Git ref filesystem event"
+            );
+        }
         if reconcile {
+            #[cfg(feature = "test-support")]
+            for path in &event.paths {
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherReconcile,
+                );
+            }
             let removes_paths = matches!(
                 event.kind,
                 EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
@@ -860,6 +881,13 @@ impl WatchState {
         }
         relevant.sort();
         relevant.dedup();
+        #[cfg(feature = "test-support")]
+        for path in &event.paths {
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherProcessed,
+            );
+        }
         event.paths = relevant;
         Ok((!event.paths.is_empty()).then_some(event))
     }

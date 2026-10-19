@@ -3537,6 +3537,8 @@ pub mod scan_test_support {
         WatcherInitialized,
         WatcherReady,
         WatcherProcess,
+        WatcherReconcile,
+        WatcherProcessed,
         WatcherOverflow,
         WatcherFailure,
         WatcherUnwatchFailed,
