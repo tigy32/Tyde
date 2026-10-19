@@ -96,6 +96,7 @@ pub fn ProjectRail() -> impl IntoView {
 
     let expanded = RwSignal::new(false);
     let toggle_expanded = move |_| expanded.update(|value| *value = !*value);
+    let layouts = state.sidebar_layout;
     let nav_class = move || {
         if expanded.get() {
             "project-rail expanded"
@@ -110,7 +111,7 @@ pub fn ProjectRail() -> impl IntoView {
     let on_add_click = move |_| open_project_browser(&state_for_add);
 
     view! {
-        <nav class=nav_class>
+        <nav class=nav_class aria-label="Projects" style=move || if layouts.get().mode == crate::sidebar_layout::InterfaceMode::Vibe { "display:none" } else { "" }>
             <div class="rail-items">
                 <button class="rail-toggle" on:click=toggle_expanded title=toggle_title>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1362,11 +1363,13 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                 <h2 class="modal-title">"Edit project"</h2>
                 <div class="modal-body">
                     <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser, crate::notices::NoticeScope::Project(project.host_id.clone(), project.project_id.clone())] />
-                    <p>{move || info.get().map(|info| format!("Project: {}", info.project.name)).unwrap_or_else(|| "Project is no longer available".into())}</p>
+                    <Show when=move || info.get().is_none()><p role="status">"Project is no longer available"</p></Show>
                     <label class="modal-label" for="project-editor-name">"Project name"</label>
-                    <input id="project-editor-name" class="modal-input" node_ref=input prop:value=move || name.get()
-                        on:input=move |ev| name.set(event_target_value(&ev)) />
-                    <button class="modal-button" disabled=move || name.get().trim().is_empty() || info.get().is_none() on:click=save>"Save name"</button>
+                    <div class="project-editor-name-row">
+                        <input id="project-editor-name" class="modal-input" node_ref=input prop:value=move || name.get()
+                            on:input=move |ev| name.set(event_target_value(&ev)) />
+                        <button class="modal-button" disabled=move || name.get().trim().is_empty() || info.with(|info| info.as_ref().is_none_or(|info| info.project.name == name.get().trim())) on:click=save>"Save name"</button>
+                    </div>
                     <h3>"Source roots"</h3>
                     <p class="project-roots-help">"Removing a source root disconnects it from this project. Files stay on disk."</p>
                     {move || info.get().map(|info| {
@@ -1546,6 +1549,9 @@ mod wasm_tests {
 
     fn make_state_with_fixture() -> AppState {
         let state = AppState::new();
+        state
+            .sidebar_layout
+            .update(|layouts| layouts.mode = crate::sidebar_layout::InterfaceMode::Dinosaur);
         state
             .configured_hosts
             .set(vec![local_host("host-a", "Local")]);

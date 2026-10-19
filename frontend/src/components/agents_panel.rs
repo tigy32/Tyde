@@ -1216,6 +1216,7 @@ fn folder_toggle(
     collapsed: RwSignal<HashSet<String>>,
     key: String,
     label: String,
+    display_label: String,
     count: usize,
 ) -> impl IntoView {
     let toggle_key = key.clone();
@@ -1247,7 +1248,7 @@ fn folder_toggle(
                 width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path d="m6 3 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
-            <span class="agent-folder-label">{label.clone()}</span>
+            <span class="agent-folder-label">{display_label}</span>
             <span class="agent-folder-count" aria-hidden="true">{count}</span>
         </button>
     }
@@ -1814,7 +1815,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 }.into_any()
                                                             } else {
                                                                 view! {
-                                                                    {folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), member_count)}
+                                                                    {folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name.clone(), member_count)}
                                                                 }.into_any()
                                                             }
                                                         }}
@@ -1848,7 +1849,7 @@ pub fn AgentsPanel() -> impl IntoView {
                         };
                         view! {
                             <section class="agent-sidebar-host-section" data-host-id=host.key>
-                                <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
+                                <div class="agent-sidebar-host-header" aria-label=format!("Host: {}", host.label)>{host.label.clone()}</div>
                                 <div
                                     class="agent-sidebar-default-tree"
                                     on:dragover=move |ev: web_sys::DragEvent| {
@@ -1872,13 +1873,13 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
                                                 let edit_name = format!("Edit project {}", project.label);
                                                 let projects_heading = (first_project.as_ref() == Some(&project.key)).then(|| view! {
-                                                    <div class="agent-projects-heading"><span>"Projects"</span><button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button></div>
+                                                    <div class="agent-projects-heading"><button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button></div>
                                                 });
                                                 view! {
                                                     {projects_heading}
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">
-                                                            {folder_toggle(collapsed_folders, folder_key.clone(), heading, member_count)}
+                                                            {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
                                                             {target.map(|target| view! {
                                                                 <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
                                                                     on:click=move |_| editor.set(Some(target.clone()))>"✎"</button>
@@ -2472,9 +2473,30 @@ fn agent_card(
         let active = state.active_agent;
         Memo::new(move |_| active.get().as_ref() == Some(&selected_agent))
     };
-    let details_name = name.clone();
     let details_host = agent.host_id.clone();
     let details_workspace = agent.workspace_roots.join(" · ");
+    let context_agent = agent_ref(&agent);
+    let context_agents = state.agents;
+    let context_projects = state.projects;
+    let workbench_context = Memo::new(move |_| {
+        context_agents.with(|agents| {
+            let agent = agents
+                .iter()
+                .find(|agent| agent_ref(agent) == context_agent)?;
+            context_projects.with(|projects| {
+                let project = projects.iter().find(|project| {
+                    project.host_id == agent.host_id
+                        && Some(&project.project.id) == agent.project_id.as_ref()
+                })?;
+                match &project.project.source {
+                    protocol::ProjectSource::GitWorkbench { .. } => {
+                        Some(project.project.name.clone())
+                    }
+                    protocol::ProjectSource::Standalone { .. } => None,
+                }
+            })
+        })
+    });
     let role_target = agent_chat_ref(&agent);
     let role_agents = state.agents;
     let tyde_permissions = Signal::derive(move || {
@@ -2622,6 +2644,7 @@ fn agent_card(
                     } else {
                         view! {
                             <span class="agent-card-name">{name.clone()}{is_tychat.then_some(" · Tychat")}</span>
+                            {move || workbench_context.get().map(|name| view! { <span class="agent-workbench-context" title=format!("Workbench: {name}")>{name.clone()}</span> })}
                         }.into_any()
                     }
                 }}
@@ -2703,6 +2726,7 @@ fn agent_card(
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
+                <div class="sidebar-card-meta">
                 <span class="agent-tyde-permissions" title=move || format!("Tyde permissions: {}", tyde_permissions.get().label())
                     aria-label=move || format!("Tyde permissions: {}", tyde_permissions.get().label())>
                     <crate::components::chat_view::TydePermissionsIcon permissions=tyde_permissions />
@@ -2710,12 +2734,13 @@ fn agent_card(
                 <Show when=move || show_backend_labels.get()>
                     <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
                 </Show>
-                <strong>{details_name}</strong>
-                <div>{backend_label(backend)}" · "{move || status_label(&derived.get())}</div>
-                <div>{details_host}</div>
-                <div class="sidebar-card-workspace">{details_workspace}</div>
-            <div class="agent-card-bottom">
                 <span class="agent-card-time">{relative_time(created)}</span>
+                </div>
+                <details class="sidebar-card-technical">
+                    <summary>"Workspace details"</summary>
+                    <dl><dt>"Host"</dt><dd>{details_host}</dd><dt>"Source roots"</dt><dd class="sidebar-card-workspace">{details_workspace}</dd></dl>
+                </details>
+            <div class="agent-card-bottom">
                 {move || custom_agent_name().map(|n| {
                     let title = format!("Custom agent: {n}");
                     view! {
@@ -3719,6 +3744,13 @@ mod wasm_tests {
             "Review authentication flow",
             true,
         );
+        state.agents.update(|agents| {
+            agents
+                .iter_mut()
+                .find(|agent| agent.agent_id.0 == "compact-card")
+                .unwrap()
+                .workspace_roots = vec!["/workspace/ui-review".into()]
+        });
         state.sessions.set(vec![SessionInfo {
             host_id: "local".to_owned(),
             summary: SessionSummary {
@@ -3845,6 +3877,54 @@ mod wasm_tests {
             Some("true")
         );
         let details_text = details.text_content().unwrap_or_default();
+        let title = agent
+            .query_selector(".agent-card-name")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            !details_text.contains(&title),
+            "Expanded information must not repeat the visible chat title"
+        );
+        let technical = details
+            .query_selector(".sidebar-card-technical")
+            .unwrap()
+            .expect("Technical details stay accessible");
+        let roots = technical
+            .query_selector("dd.sidebar-card-workspace")
+            .unwrap()
+            .unwrap();
+        assert!(!technical.has_attribute("open"));
+        let compact_height = agent.get_bounding_client_rect().height();
+        technical
+            .query_selector("summary")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        // Closed native details can retain child rectangles in Chrome. Their
+        // contribution to the visible card, not that cached child box, matters.
+        let technical_height = agent.get_bounding_client_rect().height();
+        eprintln!(
+            "Technical disclosure geometry: compact={compact_height}, open={technical_height}"
+        );
+        assert!(technical.has_attribute("open"));
+        assert!(
+            technical_height > compact_height,
+            "Opening technical details makes room for the source roots"
+        );
+        assert_eq!(roots.text_content().unwrap(), "/workspace/ui-review");
+        technical
+            .query_selector("summary")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
         assert!(
             details_text.contains("Claude"),
             "the expanded row names its backend, got: {details_text:?}"
@@ -4371,6 +4451,9 @@ mod wasm_tests {
         let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
+        state
+            .sidebar_layout
+            .update(|layouts| layouts.mode = crate::sidebar_layout::InterfaceMode::Dinosaur);
         seed_sidebar_group_fixture(&state);
         for host in ["local", "remote"] {
             push_agent(&state, host, "unscoped", "Unscoped chat", true);
@@ -4391,13 +4474,18 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let text = container.text_content().unwrap_or_default();
+        let text = container
+            .query_selector(".agents-panel")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap_or_default();
         for expected in [
-            "Host: Local Host",
-            "Project: Alpha Project",
-            "Project: Beta Project",
-            "Host: Remote Host",
-            "Project: Gamma Project",
+            "Local Host",
+            "Alpha Project",
+            "Beta Project",
+            "Remote Host",
+            "Gamma Project",
         ] {
             assert!(
                 text.contains(expected),
@@ -4405,21 +4493,12 @@ mod wasm_tests {
             );
         }
 
-        assert!(
-            text_position(&text, "Host: Local Host")
-                < text_position(&text, "Project: Alpha Project")
-        );
-        assert!(
-            text_position(&text, "Project: Alpha Project")
-                < text_position(&text, "Parent Alpha Agent")
-        );
-        assert!(
-            text_position(&text, "Parent Alpha Agent")
-                < text_position(&text, "Project: Beta Project")
-        );
-        assert!(text_position(&text, "Project: Beta Project") < text_position(&text, "Beta Agent"));
-        assert!(text_position(&text, "Beta Agent") < text_position(&text, "Host: Remote Host"));
-        assert!(text_position(&text, "Host: Remote Host") < text_position(&text, "Gamma Agent"));
+        assert!(text_position(&text, "Local Host") < text_position(&text, "Alpha Project"));
+        assert!(text_position(&text, "Alpha Project") < text_position(&text, "Parent Alpha Agent"));
+        assert!(text_position(&text, "Parent Alpha Agent") < text_position(&text, "Beta Project"));
+        assert!(text_position(&text, "Beta Project") < text_position(&text, "Beta Agent"));
+        assert!(text_position(&text, "Beta Agent") < text_position(&text, "Remote Host"));
+        assert!(text_position(&text, "Remote Host") < text_position(&text, "Gamma Agent"));
 
         for host in ["local", "remote"] {
             let section = container
@@ -4501,8 +4580,13 @@ mod wasm_tests {
         }
         let text = container.text_content().unwrap_or_default();
         assert!(
-            !text.contains("Project: alpha-workbench"),
-            "workbench agents must not create separate project headings"
+            container
+                .query_selector(
+                    ".agent-sidebar-project-header [aria-label='Project: alpha-workbench']"
+                )
+                .unwrap()
+                .is_none(),
+            "Workbench context belongs on its row, not a second project heading"
         );
         let alpha = container
             .query_selector("[data-project-key='local:alpha']")
@@ -4516,7 +4600,7 @@ mod wasm_tests {
             );
         }
         assert!(!alpha_text.contains("Remote Collision Agent"));
-        assert!(text.contains("Project: Remote Collision"));
+        assert!(text.contains("Remote Collision"));
 
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
@@ -4635,7 +4719,7 @@ mod wasm_tests {
         );
         let sidebar = container.query_selector(".agents-panel").unwrap().unwrap();
         let text = sidebar.text_content().unwrap();
-        assert!(text.contains("Project: Renamed Alpha"));
+        assert!(text.contains("Renamed Alpha"));
         assert!(text.contains("Workbench Agent"));
         assert!(!text.contains("Remote Collision Agent"));
 
@@ -4797,10 +4881,10 @@ mod wasm_tests {
         }
 
         let text = container.text_content().unwrap_or_default();
-        let alpha = text_position(&text, "Project: Alpha Project");
+        let alpha = text_position(&text, "Alpha Project");
         let parent = text_position(&text, "Parent Alpha Agent");
         let child = text_position(&text, "Child Alpha Agent");
-        let beta = text_position(&text, "Project: Beta Project");
+        let beta = text_position(&text, "Beta Project");
         assert!(
             alpha < parent && parent < child && child < beta,
             "parent and child should render together inside Alpha before Beta; got {text:?}"
@@ -4889,6 +4973,20 @@ mod wasm_tests {
             .unwrap()
             .unwrap();
         assert!(editor.text_content().unwrap().contains("/tmp/second"));
+        let name_field = editor
+            .query_selector("#project-editor-name")
+            .unwrap()
+            .unwrap();
+        let save_button = editor.query_selector("button").unwrap().unwrap();
+        assert!(
+            save_button.has_attribute("disabled"),
+            "Unchanged names cannot enqueue redundant renames"
+        );
+        assert!(
+            save_button.get_bounding_client_rect().left()
+                >= name_field.get_bounding_client_rect().right(),
+            "Name and Save share one compact row"
+        );
         let input = editor
             .query_selector("input")
             .unwrap()
@@ -4899,6 +4997,7 @@ mod wasm_tests {
         input
             .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
+        next_tick().await;
         editor
             .query_selector("button")
             .unwrap()
@@ -4950,7 +5049,17 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(!editor.text_content().unwrap().contains("/tmp/second"));
-        assert!(editor.text_content().unwrap().contains("Renamed Alpha"));
+        // The name now appears only in the editable field; input values are
+        // excluded from textContent. Save disabling also verifies the server echo.
+        assert_eq!(input.value(), "Renamed Alpha");
+        assert!(
+            editor
+                .query_selector("button")
+                .unwrap()
+                .unwrap()
+                .has_attribute("disabled"),
+            "The acknowledged name no longer offers a redundant Save"
+        );
         // Open the existing host browser without switching the selected project.
         let before = state.active_project.get_untracked();
         let add = editor.query_selector_all("button").unwrap();
@@ -5475,7 +5584,7 @@ mod wasm_tests {
             section.get_bounding_client_rect().bottom()
                 <= normal_project.get_bounding_client_rect().top()
         );
-        assert!(local_text.find("Pinned").unwrap() < local_text.find("Project: Alpha").unwrap());
+        assert!(local_text.find("Pinned").unwrap() < local_text.find("Alpha").unwrap());
         assert!(local_text.find("Pinned").unwrap() < local_text.find("Review Group").unwrap());
         assert_eq!(
             container
@@ -5608,17 +5717,22 @@ mod wasm_tests {
             );
             assert!(container.query_selector(&format!(".agent-sidebar-host-section [data-host-id='{host}'][data-agent-id='beta-agent']")).unwrap().is_none(), "Pins are never duplicated in ordinary groups");
         }
-        for mode in ["vibe", "dinosaur"] {
-            let select = container
-                .query_selector("[aria-label='Interface mode']")
+        for mode in ["Vibe", "Dinosaur"] {
+            container
+                .query_selector("button[aria-label='Interface mode']")
                 .unwrap()
                 .unwrap()
-                .dyn_into::<web_sys::HtmlSelectElement>()
-                .unwrap();
-            select.set_value(mode);
-            select
-                .dispatch_event(&web_sys::Event::new("change").unwrap())
-                .unwrap();
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            container
+                .query_selector(&format!("[role='menuitemradio'][aria-label='{mode}']"))
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
             next_tick().await;
             assert_eq!(
                 container
@@ -6148,18 +6262,8 @@ mod wasm_tests {
             .unwrap();
         assert!(bamboo.text_content().unwrap().contains("Bamboo Crew"));
         assert!(!bamboo.text_content().unwrap().contains("Remote Crew"));
-        assert!(
-            !container
-                .text_content()
-                .unwrap()
-                .contains("Project: bamboo-bench")
-        );
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("Project: Remote bench")
-        );
+        assert!(!container.text_content().unwrap().contains("bamboo-bench"));
+        assert!(container.text_content().unwrap().contains("Remote bench"));
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
         state.agents_view_preferences.set(preferences);
@@ -6173,7 +6277,7 @@ mod wasm_tests {
             }
             let text = container.text_content().unwrap();
             assert!(
-                text.contains("Project: Bamboo Project") && text.contains("Bamboo Crew"),
+                text.contains("Bamboo Project") && text.contains("Bamboo Crew"),
                 "parent and sibling selections retain the swarm under its parent"
             );
             assert!(!text.contains("Normal Agent") && !text.contains("Remote Crew"));
@@ -9118,7 +9222,22 @@ mod wasm_tests {
                 "the parent group must include {name}"
             );
         }
-        assert!(!grouped_text.contains("Task workbench"));
+        assert!(
+            after
+                .query_selector(
+                    ".agent-sidebar-project-header [aria-label='Project: Task workbench']"
+                )
+                .unwrap()
+                .is_none(),
+            "A workbench does not split its parent group"
+        );
+        assert!(
+            after
+                .query_selector("[title='Workbench: Task workbench']")
+                .unwrap()
+                .is_some(),
+            "The grouped row still identifies its actual workbench"
+        );
         assert_eq!(
             container
                 .query_selector_all("[data-project-key]")

@@ -59,6 +59,7 @@ pub fn Workbench() -> impl IntoView {
 
     let layouts = state.sidebar_layout;
     let layout_blocked = state.sidebar_storage_blocked;
+    let tab_drag = state.sidebar_drag;
     let left_visible = move || {
         !layout_blocked.get()
             && layouts.with(|l| l.current().left.visible && !l.current().left.tabs.is_empty())
@@ -235,25 +236,33 @@ pub fn Workbench() -> impl IntoView {
         let left = if left_visible() {
             format!("minmax(160px, min({}px, 35%))", left_width.get())
         } else {
-            "28px".into()
+            "0px".into()
         };
         let right = if right_visible() {
             format!("minmax(160px, min({}px, 35%))", right_width.get())
         } else {
-            "28px".into()
+            "0px".into()
         };
-        format!("grid-template-columns:{left} 4px minmax(200px, 1fr) 4px {right}")
+        let left_handle = if left_visible() { 4 } else { 0 };
+        let right_handle = if right_visible() { 4 } else { 0 };
+        format!(
+            "grid-template-columns:{left} {left_handle}px minmax(200px, 1fr) {right_handle}px {right}"
+        )
     };
     let bottom_style = move || format!("height:{}px", bottom_height.get() as i32);
 
     view! {
         <div class="workbench" node_ref=workbench_ref>
             <div class="workbench-main sidebar-workspace" style=grid_style>
-                <div class="sidebar-bar sidebar-bar-left" node_ref=left_bar_ref><DockZone position=DockPosition::Left /></div>
+                <div class="sidebar-bar sidebar-bar-left" node_ref=left_bar_ref
+                    class:sidebar-empty-drop-target=move || !left_visible() && tab_drag.get().is_some()
+                    style=move || if left_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=DockPosition::Left /></div>
                 <div class="resize-handle resize-handle-h sidebar-resize-left" style=move || if left_visible() { "" } else { "visibility:hidden" } on:mousedown=on_left_handle></div>
                 <div class="sidebar-center"><CenterZone /></div>
                 <div class="resize-handle resize-handle-h sidebar-resize-right" style=move || if right_visible() { "" } else { "visibility:hidden" } on:mousedown=on_right_handle></div>
-                <div class="sidebar-bar sidebar-bar-right" node_ref=right_bar_ref><DockZone position=DockPosition::Right /></div>
+                <div class="sidebar-bar sidebar-bar-right" node_ref=right_bar_ref
+                    class:sidebar-empty-drop-target=move || !right_visible() && tab_drag.get().is_some()
+                    style=move || if right_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=DockPosition::Right /></div>
                 <SidebarPanels />
                 <div class="sidebar-layout-error" role="alert" style=move || if layout_blocked.get() { "" } else { "display:none" }>"Sidebar layout unavailable. Open Settings → Appearance → Reset sidebar layout to continue."</div>
             </div>
@@ -293,13 +302,31 @@ mod wasm_tests {
             .unwrap()
     }
 
-    fn mode(container: &web_sys::HtmlElement, value: &str) {
-        let select = element(container, "[aria-label='Interface mode']")
-            .dyn_into::<web_sys::HtmlSelectElement>()
-            .unwrap();
-        select.set_value(value);
-        select
-            .dispatch_event(&web_sys::Event::new("change").unwrap())
+    async fn mode(container: &web_sys::HtmlElement, value: &str) {
+        element(container, "[aria-label='Interface mode']").click();
+        tick().await;
+        let label = match value {
+            "vibe" => "Vibe",
+            "dinosaur" => "Dinosaur",
+            _ => panic!("Unknown test interface mode"),
+        };
+        element(
+            container,
+            &format!("[role='menuitemradio'][aria-label='{label}']"),
+        )
+        .click();
+    }
+
+    fn press(element: &web_sys::HtmlElement, name: &str) {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_key(name);
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        element
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                    .unwrap(),
+            )
             .unwrap();
     }
 
@@ -310,7 +337,7 @@ mod wasm_tests {
             view! {
                 <style>{include_str!("../../styles.css")}</style>
                 <div style="height:720px;width:1100px;display:flex;flex-direction:column">
-                    <crate::components::header::Header /><Workbench />
+                    <crate::components::header::Header /><div class="app-body"><crate::components::project_rail::ProjectRail /><Workbench /></div>
                 </div>
             }
         })
@@ -375,6 +402,98 @@ mod wasm_tests {
             1,
             "Both modes must reuse one Agents mount"
         );
+        let trigger = element(&container, "[aria-label='Interface mode']");
+        assert_eq!(
+            trigger.tag_name(),
+            "BUTTON",
+            "Mode choice uses the app toolbar, not a native select"
+        );
+        trigger.focus().unwrap();
+        press(&trigger, "ArrowDown");
+        tick().await;
+        let chosen = element(&container, "[role='menuitemradio'][aria-checked='true']");
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&chosen))
+        );
+        press(&chosen, "End");
+        tick().await;
+        assert_eq!(
+            document
+                .active_element()
+                .unwrap()
+                .get_attribute("aria-label")
+                .as_deref(),
+            Some("Dinosaur")
+        );
+        press(&chosen, "Escape");
+        tick().await;
+        assert!(container.query_selector("[role='menu']").unwrap().is_none());
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&trigger))
+        );
+        trigger.click();
+        tick().await;
+        element(&container, ".header-mode-backdrop").click();
+        tick().await;
+        assert_eq!(
+            trigger.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            element(&container, "nav[aria-label='Projects']")
+                .get_bounding_client_rect()
+                .width(),
+            0.0
+        );
+        assert_eq!(
+            element(&container, ".sidebar-bar-left")
+                .get_bounding_client_rect()
+                .width(),
+            0.0
+        );
+        let center_left = element(&container, ".sidebar-center")
+            .get_bounding_client_rect()
+            .left();
+        assert_eq!(
+            center_left,
+            element(&container, ".workbench")
+                .get_bounding_client_rect()
+                .left(),
+            "Vibe reserves no rail, empty tab bar or resize gutter"
+        );
+        let tab = element(&container, ".sidebar-bar-right button[aria-label='Agents']");
+        tab.dispatch_event(&web_sys::DragEvent::new("dragstart").unwrap())
+            .unwrap();
+        tick().await;
+        assert!(
+            element(&container, ".sidebar-bar-left")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0,
+            "An empty-side drop target appears during drag"
+        );
+        assert_eq!(
+            element(&container, ".sidebar-center")
+                .get_bounding_client_rect()
+                .left(),
+            center_left,
+            "The transient drop target must not displace chat"
+        );
+        tab.dispatch_event(&web_sys::DragEvent::new("dragend").unwrap())
+            .unwrap();
+        tick().await;
+        assert_eq!(
+            element(&container, ".sidebar-bar-left")
+                .get_bounding_client_rect()
+                .width(),
+            0.0
+        );
         let agents = element(&container, ".agents-panel");
         let search = element(&container, ".agents-panel input")
             .dyn_into::<web_sys::HtmlInputElement>()
@@ -431,8 +550,15 @@ mod wasm_tests {
                 .unwrap()
                 .is_same_node(Some(&textarea))
         );
-        mode(&container, "dinosaur");
+        mode(&container, "dinosaur").await;
         tick().await;
+        assert!(
+            element(&container, "nav[aria-label='Projects']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0,
+            "The developer rail remains available in Dinosaur"
+        );
         assert!(
             element(&container, ".sidebar-bar-left")
                 .text_content()
@@ -523,7 +649,7 @@ mod wasm_tests {
             tabs_before
         );
         assert!(textarea.is_same_node(Some(&element(&container, ".chat-textarea"))));
-        mode(&container, "vibe");
+        mode(&container, "vibe").await;
         tick().await;
         assert_eq!(
             element(&container, ".sidebar-bar-left button.dock-tab")
@@ -550,9 +676,10 @@ mod wasm_tests {
         tick().await;
         assert_eq!(
             element(&container, "[aria-label='Interface mode']")
-                .dyn_into::<web_sys::HtmlSelectElement>()
+                .text_content()
                 .unwrap()
-                .value(),
+                .trim()
+                .to_ascii_lowercase(),
             "vibe"
         );
         assert_eq!(
@@ -573,7 +700,7 @@ mod wasm_tests {
                 .width(),
             280.0
         );
-        mode(&container, "dinosaur");
+        mode(&container, "dinosaur").await;
         tick().await;
         assert!(
             element(&container, ".sidebar-bar-left")
@@ -661,9 +788,10 @@ mod wasm_tests {
         tick().await;
         assert_eq!(
             element(&container, "[aria-label='Interface mode']")
-                .dyn_into::<web_sys::HtmlSelectElement>()
+                .text_content()
                 .unwrap()
-                .value(),
+                .trim()
+                .to_ascii_lowercase(),
             "dinosaur",
             "Recognized upgraded clients retain developer panes"
         );
@@ -690,16 +818,17 @@ mod wasm_tests {
             Some("[\"project:local:legacy\"]"),
             "Migration preserves canonical folder choices"
         );
-        mode(&container, "vibe");
+        mode(&container, "vibe").await;
         tick().await;
         drop(handle);
         let handle = shell(&container, AppState::new());
         tick().await;
         assert_eq!(
             element(&container, "[aria-label='Interface mode']")
-                .dyn_into::<web_sys::HtmlSelectElement>()
+                .text_content()
                 .unwrap()
-                .value(),
+                .trim()
+                .to_ascii_lowercase(),
             "vibe",
             "Migration runs once; the explicit last mode wins thereafter"
         );

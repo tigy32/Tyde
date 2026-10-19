@@ -144,6 +144,107 @@ fn user_notice_signal() -> ArcRwSignal<Option<UserNotice>> {
 }
 
 #[component]
+fn InterfaceModeMenu() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let layouts = state.sidebar_layout;
+    let blocked = state.sidebar_storage_blocked;
+    let open = RwSignal::new(false);
+    let focused = RwSignal::new(InterfaceMode::Vibe);
+    let trigger = NodeRef::<leptos::html::Button>::new();
+    let vibe = NodeRef::<leptos::html::Button>::new();
+    let dinosaur = NodeRef::<leptos::html::Button>::new();
+    let restore_focus = move || {
+        if let Some(button) = trigger.get_untracked()
+            && let Err(error) = button.focus()
+        {
+            report_user_error(format!("Cannot focus interface mode control: {error:?}"));
+        }
+    };
+    let close = move || {
+        open.set(false);
+        restore_focus();
+    };
+    let show = move || {
+        if !blocked.get_untracked() {
+            focused.set(layouts.with_untracked(|layouts| layouts.mode));
+            open.set(true);
+        }
+    };
+    let choose = move |mode| {
+        if !blocked.get_untracked() {
+            layouts.update(|layouts| layouts.mode = mode);
+        }
+        close();
+    };
+    Effect::new(move |_| {
+        if blocked.get() {
+            open.set(false);
+        }
+        if open.get() {
+            let button = match focused.get() {
+                InterfaceMode::Vibe => vibe.get(),
+                InterfaceMode::Dinosaur => dinosaur.get(),
+            };
+            if let Some(button) = button
+                && let Err(error) = button.focus()
+            {
+                report_user_error(format!("Cannot focus interface mode option: {error:?}"));
+            }
+        }
+    });
+    view! {
+        <div class="header-mode-menu">
+            <button type="button" class="header-btn header-mode-button" node_ref=trigger
+                disabled=move || blocked.get()
+                aria-label="Interface mode" aria-haspopup="menu" aria-controls="interface-mode-menu"
+                aria-expanded=move || open.get().to_string() aria-describedby="interface-mode-description"
+                on:click=move |_| if open.get_untracked() { close(); } else { show(); }
+                on:keydown=move |ev: web_sys::KeyboardEvent| {
+                    if matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp") {
+                        ev.prevent_default();
+                        ev.stop_propagation();
+                        show();
+                    }
+                }
+            >
+                {move || if blocked.get() { "Layout unavailable" } else { match layouts.get().mode { InterfaceMode::Vibe => "Vibe", InterfaceMode::Dinosaur => "Dinosaur" } }}
+                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <Show when=move || open.get()>
+                <div class="header-mode-backdrop" on:click=move |_| close()></div>
+                <div id="interface-mode-menu" class="header-mode-options" role="menu" aria-label="Choose interface mode"
+                    on:keydown=move |ev: web_sys::KeyboardEvent| {
+                        ev.stop_propagation();
+                        match ev.key().as_str() {
+                            "Escape" => { ev.prevent_default(); close(); }
+                            "Tab" => close(),
+                            "ArrowDown" | "ArrowUp" | "ArrowLeft" | "ArrowRight" => {
+                                ev.prevent_default();
+                                focused.update(|mode| *mode = match mode { InterfaceMode::Vibe => InterfaceMode::Dinosaur, InterfaceMode::Dinosaur => InterfaceMode::Vibe });
+                            }
+                            "Home" => { ev.prevent_default(); focused.set(InterfaceMode::Vibe); }
+                            "End" => { ev.prevent_default(); focused.set(InterfaceMode::Dinosaur); }
+                            _ => {}
+                        }
+                    }
+                >
+                    <button type="button" role="menuitemradio" aria-label="Vibe" node_ref=vibe
+                        aria-checked=move || (layouts.get().mode == InterfaceMode::Vibe).to_string()
+                        on:focus=move |_| focused.set(InterfaceMode::Vibe)
+                        on:click=move |_| choose(InterfaceMode::Vibe)
+                    ><span>"Vibe"<small>"Chat and agents"</small></span><span class="header-mode-check" aria-hidden="true">{move || (layouts.get().mode == InterfaceMode::Vibe).then_some("✓")}</span></button>
+                    <button type="button" role="menuitemradio" aria-label="Dinosaur" node_ref=dinosaur
+                        aria-checked=move || (layouts.get().mode == InterfaceMode::Dinosaur).to_string()
+                        on:focus=move |_| focused.set(InterfaceMode::Dinosaur)
+                        on:click=move |_| choose(InterfaceMode::Dinosaur)
+                    ><span>"Dinosaur"<small>"Full developer tools"</small></span><span class="header-mode-check" aria-hidden="true">{move || (layouts.get().mode == InterfaceMode::Dinosaur).then_some("✓")}</span></button>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+#[component]
 pub fn Header() -> impl IntoView {
     let state = expect_context::<AppState>();
     let user_notice = user_notice_signal();
@@ -200,7 +301,6 @@ pub fn Header() -> impl IntoView {
             },
         );
 
-    let layouts = state.sidebar_layout;
     let layout_blocked = state.sidebar_storage_blocked;
     let feedback = state.feedback_open;
     let settings = state.settings_open;
@@ -255,21 +355,7 @@ pub fn Header() -> impl IntoView {
             <header class="header">
                 <div class="header-left">
                     <span class="header-title">"Tyde"</span>
-                    <select class="header-mode" disabled=move || layout_blocked.get() aria-label="Interface mode" aria-describedby="interface-mode-description" title="Vibe: agents and history. Dinosaur: full developer tools."
-                        prop:value=move || if layout_blocked.get() { "unavailable" } else { match layouts.get().mode { InterfaceMode::Vibe => "vibe", InterfaceMode::Dinosaur => "dinosaur" } }
-                        on:change=move |ev| {
-                            let mode = match event_target_value(&ev).as_str() {
-                                "vibe" => InterfaceMode::Vibe,
-                                "dinosaur" => InterfaceMode::Dinosaur,
-                                _ => { report_user_error("Unknown interface mode"); return; }
-                            };
-                            layouts.update(|layouts| layouts.mode = mode);
-                        }
-                    >
-                        <option value="unavailable" disabled=true hidden=true>"Layout unavailable"</option>
-                        <option value="vibe">"Vibe"</option>
-                        <option value="dinosaur">"Dinosaur"</option>
-                    </select>
+                    <InterfaceModeMenu />
                     <span id="interface-mode-description" class="visually-hidden">"Vibe shows Agents and History. Dinosaur includes Files, Git, Search, Refs and advanced tools."</span>
                     <div class="header-status">
                         <span class={status_class}></span>

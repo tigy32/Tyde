@@ -60,7 +60,7 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                 let menu_previous = state.clone();
                 let menu_next = state.clone();
                 view! {
-                    <div class="dock-tab-item" class:sidebar-drop-before=move || dragged.get().is_some() && hover.get() == Some(tab)
+                    <div class="dock-tab-item" style=move || if layouts.with(|l| l.current().pane(side).visible) { "" } else { "display:none" } class:sidebar-drop-before=move || dragged.get().is_some() && hover.get() == Some(tab)
                         on:dragover=move |ev: web_sys::DragEvent| {
                             if dragged.get_untracked().is_some() { ev.prevent_default(); ev.stop_propagation(); hover.set(Some(tab)); over.set(true); }
                         }
@@ -105,7 +105,7 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                     </div>
                 }
             } />
-            <span class="sidebar-empty-target" style=move || if layouts.with(|l| l.current().pane(side).tabs.is_empty()) { "" } else { "display:none" } title="Drag sidebar tabs here">"⋮"</span>
+            <span class="sidebar-empty-target" style=move || if dragged.get().is_some() && layouts.with(|l| { let pane = l.current().pane(side); !pane.visible || pane.tabs.is_empty() }) { "" } else { "display:none" }>"Drop tabs here"</span>
         </div>
     }
 }
