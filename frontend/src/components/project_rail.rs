@@ -149,18 +149,19 @@ pub fn ProjectRail() -> impl IntoView {
                         let top_level = {
                             let host_id = host_id_for_top_filter.clone();
                             move || {
-                                let host_id = host_id.clone();
-                                state.projects.get()
-                                    .into_iter()
-                                    .filter(move |project| {
-                                        project.host_id == host_id
-                                            && matches!(
-                                                project.project.source,
-                                                ProjectSource::Standalone { .. }
-                                            )
-                                    })
-                                    .map(|info| info.project.id)
-                                    .collect::<Vec<_>>()
+                                state.projects.with(|projects| {
+                                    projects
+                                        .iter()
+                                        .filter(|project| {
+                                            project.host_id == host_id
+                                                && matches!(
+                                                    project.project.source,
+                                                    ProjectSource::Standalone { .. }
+                                                )
+                                        })
+                                        .map(|info| info.project.id.clone())
+                                        .collect::<Vec<_>>()
+                                })
                             }
                         };
 
@@ -260,18 +261,17 @@ fn ProjectGroup(
         let host_id = workbenches_host.clone();
         let parent_id = workbenches_parent.clone();
         move || {
-            let host_id = host_id.clone();
-            let parent_id = parent_id.clone();
             let state = expect_context::<AppState>();
-            state
-                .projects
-                .get()
-                .into_iter()
-                .filter(move |info| {
-                    info.host_id == host_id && info.project.parent_project_id() == Some(&parent_id)
-                })
-                .map(|info| info.project.id)
-                .collect::<Vec<_>>()
+            state.projects.with(|projects| {
+                projects
+                    .iter()
+                    .filter(|info| {
+                        info.host_id == host_id
+                            && info.project.parent_project_id() == Some(&parent_id)
+                    })
+                    .map(|info| info.project.id.clone())
+                    .collect::<Vec<_>>()
+            })
         }
     };
 
@@ -332,12 +332,14 @@ fn ProjectRow(
     let project_signal = {
         let state = state.clone();
         move || {
-            state.projects.get().into_iter().find_map(|info| {
-                if info.host_id == host_id_for_lookup && info.project.id == project_id_for_lookup {
-                    Some(info.project)
-                } else {
-                    None
-                }
+            state.projects.with(|projects| {
+                projects
+                    .iter()
+                    .find(|info| {
+                        info.host_id == host_id_for_lookup
+                            && info.project.id == project_id_for_lookup
+                    })
+                    .map(|info| info.project.clone())
             })
         }
     };
@@ -714,12 +716,14 @@ fn ProjectContextMenuItems(
     let project_signal: Memo<Option<Project>> = {
         let state = state.clone();
         Memo::new(move |_| {
-            state.projects.get().into_iter().find_map(|info| {
-                if info.host_id == host_id_for_lookup && info.project.id == project_id_for_lookup {
-                    Some(info.project)
-                } else {
-                    None
-                }
+            state.projects.with(|projects| {
+                projects
+                    .iter()
+                    .find(|info| {
+                        info.host_id == host_id_for_lookup
+                            && info.project.id == project_id_for_lookup
+                    })
+                    .map(|info| info.project.clone())
             })
         })
     };
@@ -740,8 +744,10 @@ fn ProjectContextMenuItems(
         let host_id = project.host_id.clone();
         let project_id = project.project_id.clone();
         Memo::new(move |_| {
-            state.projects.get().iter().any(|info| {
-                info.host_id == host_id && info.project.parent_project_id() == Some(&project_id)
+            state.projects.with(|projects| {
+                projects.iter().any(|info| {
+                    info.host_id == host_id && info.project.parent_project_id() == Some(&project_id)
+                })
             })
         })
     };

@@ -4366,6 +4366,9 @@ mod wasm_tests {
     /// server-provided labels that users see in the rest of the UI.
     #[wasm_bindgen_test]
     async fn sidebar_renders_host_and_project_section_headers() {
+        crate::dispatch::clear_host_seqs("local");
+        crate::dispatch::clear_host_seqs("remote");
+        let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
@@ -4373,7 +4376,17 @@ mod wasm_tests {
             push_agent(&state, host, "unscoped", "Unscoped chat", true);
         }
 
-        let _handle = mount_panel(&container, state.clone());
+        CenterWorkspaceWidth::forget_measurement();
+        let mounted = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <crate::components::project_rail::ProjectRail />
+                <AgentsPanel />
+                <crate::components::project_rail::ProjectEditor />
+            }
+        });
         for _ in 0..4 {
             next_tick().await;
         }
@@ -4530,6 +4543,204 @@ mod wasm_tests {
                 );
             }
         }
+
+        let rail = container.query_selector("nav").unwrap().unwrap();
+        rail.query_selector("button[title='Expand']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let rail_button = |name: &str| {
+            rail.query_selector(&format!("button[title='{name}']"))
+                .unwrap()
+                .expect("named rail button")
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        let selected_button = rail_button("alpha-workbench-two");
+        let selected = state.active_project.get_untracked();
+        let notify = |seq, payload| {
+            dispatch_frame(
+                &state,
+                "local",
+                StreamPath("/host/local".into()),
+                FrameKind::ProjectNotify,
+                seq,
+                &payload,
+            );
+        };
+        let mut beta = project_info("local", "beta", "Renamed Beta", 0).project;
+        beta.source = ProjectSource::Standalone {
+            roots: vec![
+                ProjectRootPath("/tmp/beta".into()),
+                ProjectRootPath("/tmp/extra-root".into()),
+            ],
+        };
+        let alpha = project_info("local", "alpha", "Renamed Alpha", 3).project;
+        let mut workbench = state.projects.with(|projects| {
+            projects
+                .iter()
+                .find(|info| info.host_id == "local" && info.project.id.0 == "alpha-workbench-two")
+                .unwrap()
+                .project
+                .clone()
+        });
+        workbench.name = "Renamed workbench".into();
+        workbench.sort_order = 0;
+        for (seq, project) in [alpha, beta.clone(), workbench.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            notify(
+                seq as u64,
+                protocol::ProjectNotifyPayload::Upsert { project },
+            );
+        }
+        next_tick().await;
+        assert_eq!(
+            selected_button.get_attribute("title").as_deref(),
+            Some("Renamed workbench")
+        );
+        assert!(
+            selected_button
+                .text_content()
+                .unwrap()
+                .contains("Renamed workbench")
+        );
+        assert_eq!(state.active_project.get_untracked(), selected);
+        let buttons = rail.query_selector_all(".rail-project-row button").unwrap();
+        let labels: Vec<_> = (0..buttons.length())
+            .map(|i| {
+                buttons
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap()
+                    .get_attribute("title")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Renamed Beta",
+                "Renamed Alpha",
+                "Renamed workbench",
+                "alpha-workbench",
+                "Gamma Project",
+                "Remote Collision"
+            ]
+        );
+        let sidebar = container.query_selector(".agents-panel").unwrap().unwrap();
+        let text = sidebar.text_content().unwrap();
+        assert!(text.contains("Project: Renamed Alpha"));
+        assert!(text.contains("Workbench Agent"));
+        assert!(!text.contains("Remote Collision Agent"));
+
+        rail_button("Renamed Beta")
+            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
+            .unwrap();
+        next_tick().await;
+        let menu_buttons = container
+            .query_selector_all(".context-menu button")
+            .unwrap();
+        (0..menu_buttons.length())
+            .filter_map(|i| menu_buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().unwrap().contains("Edit project"))
+            .unwrap()
+            .click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[role='dialog'][aria-label='Edit project']")
+            .unwrap()
+            .unwrap();
+        assert!(editor.text_content().unwrap().contains("/tmp/extra-root"));
+        beta.source = ProjectSource::Standalone {
+            roots: vec![ProjectRootPath("/tmp/replaced-root".into())],
+        };
+        notify(3, protocol::ProjectNotifyPayload::Upsert { project: beta });
+        next_tick().await;
+        let text = editor.text_content().unwrap();
+        assert!(text.contains("/tmp/replaced-root"));
+        assert!(!text.contains("/tmp/extra-root"));
+        assert!(!text.contains("/tmp/beta"));
+        assert_eq!(
+            state.active_project.get_untracked(),
+            selected,
+            "editing another project's catalog must not change selection"
+        );
+        let editor_buttons = editor.query_selector_all("button").unwrap();
+        (0..editor_buttons.length())
+            .filter_map(|i| editor_buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().as_deref() == Some("Done"))
+            .unwrap()
+            .click();
+        rail_button("Renamed Alpha").click();
+        next_tick().await;
+        selected_button.click();
+        next_tick().await;
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .any(|(kind, _, stream)| kind == "project_accessed"
+                    && stream == "/project/alpha-workbench-two")
+        );
+
+        notify(
+            4,
+            protocol::ProjectNotifyPayload::Delete { project: workbench },
+        );
+        next_tick().await;
+        assert!(
+            rail.query_selector("button[title='Renamed workbench']")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(ActiveProjectRef {
+                host_id: "local".into(),
+                project_id: ProjectId("alpha".into()),
+            })
+        );
+        let remote = rail_button("Remote Collision");
+        remote.click();
+        next_tick().await;
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(ActiveProjectRef {
+                host_id: "remote".into(),
+                project_id: ProjectId("alpha-workbench".into()),
+            })
+        );
+        let text = sidebar.text_content().unwrap();
+        assert!(text.contains("Remote Collision Agent"));
+        assert!(!text.contains("Workbench Agent"));
+        dispatch_frame(
+            &state,
+            "remote",
+            StreamPath("/host/remote".into()),
+            FrameKind::ProjectNotify,
+            0,
+            &protocol::ProjectNotifyPayload::Delete {
+                project: project_info("remote", "alpha-workbench", "Remote Collision", 1).project,
+            },
+        );
+        next_tick().await;
+        assert!(
+            rail.query_selector("button[title='Remote Collision']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            rail_button("alpha-workbench")
+                .text_content()
+                .unwrap()
+                .contains("alpha-workbench")
+        );
+        assert!(state.active_project.get_untracked().is_none());
     }
 
     /// Parent/child sub-agent nesting remains inside the host/project leaf:
