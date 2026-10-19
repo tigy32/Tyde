@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from enum import Enum
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 from urllib.parse import unquote
 
@@ -24,21 +26,151 @@ import release_tool
 
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 CONTROLLER = Path(__file__).resolve().parents[1]
+MACOS_SCHEMA = "frontend/tauri-shell/gen/schemas/macOS-schema.json"
+DESKTOP_SCHEMA = "frontend/tauri-shell/gen/schemas/desktop-schema.json"
+SCHEMA_PRODUCER = {
+    "tauri-build": {"version": "2.6.3", "checksum": "bc9ce40b16101cb6ea63d3e221567affd1c3a9205f95d7bc574941a10636b632"},
+    "tauri-utils": {"version": "2.9.3", "checksum": "3e176a18e67764923c4f1ce66f25ae4abe5f688384d5eb1a0fa6c77f3d90f887"},
+}
 
 
 class ControllerError(ValueError):
     pass
 
 
+class SourceState(Enum):
+    FROZEN = "frozen"
+    POST_BUILD = "post-build"
+
+
+class GeneratedContract(Enum):
+    UNAVAILABLE = "strict-tracked-source"
+    MACOS_SCHEMA = "pinned-tauri-macos-capability-schema-v1"
+
+
+class GitGuardError(ControllerError):
+    def __init__(self, event, outcome):
+        self.event = event
+        self.outcome = outcome
+        super().__init__("Git guard: " + json.dumps(event, sort_keys=True))
+
+
+class Checkout(Enum):
+    CONTROLLER = "controller"
+    SOURCE = "frozen-source"
+
+
+class GitOperation(Enum):
+    HEAD = "resolve-head"
+    ORIGIN = "origin-config"
+    DIFF = "tracked-diff"
+    ANCESTRY = "main-ancestry"
+    REMOTE_TAG = "remote-tag"
+    TAG = "local-tag"
+    BLOB = "frozen-blob"
+    TREE = "frozen-entry"
+    DIFF_DETAILS = "tracked-change-details"
+
+
+class GitResult(Enum):
+    PASS = "pass"
+    CHANGED = "tracked-source-changed"
+    NO_ORIGIN = "origin-config-missing"
+    NOT_ANCESTOR = "not-main-ancestor"
+    PROCESS_ERROR = "process-error"
+    GENERATED = "verified-generated-metadata"
+
+
+class EvidencePhase(Enum):
+    PREFLIGHT = "pre-build-source-verified"
+    CAPTURED = "compiled-quarantine"
+    REJECTED = "post-build-rejected"
+    SOURCE_VERIFIED = "post-build-source-verified"
+
+
+class BuildOutcome(Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    CANCELLED = "cancelled"
+
+
+class Eligibility(Enum):
+    QUARANTINED = "quarantined-non-releasable"
+    SIGNED = "signed-checkpoint"
+
+
+def stderr_context(raw):
+    # Never print tool output verbatim: even Git can echo a credentialed URL.
+    text = raw.decode(errors="replace").lower()
+    for category, patterns in (
+        ("unsafe-ownership", ("dubious ownership",)),
+        ("not-a-repository", ("not a git repository",)),
+        ("invalid-config", ("bad config", "invalid config")),
+        ("missing-ref-or-object", ("not a valid", "unknown revision", "bad revision", "ambiguous argument", "bad object")),
+        ("authentication-rejected", ("authentication failed", "could not read username", "permission denied (publickey)")),
+        ("transport-error", ("could not resolve host", "unable to access", "failed to connect", "ssl", "tls")),
+        ("filesystem-error", ("permission denied", "index.lock", "unable to create")),
+    ):
+        if any(pattern in text for pattern in patterns):
+            return category
+    return "redacted-tool-error" if raw else "empty"
+
+
 def command(argv, *, cwd=None, operation=None):
-    result = subprocess.run([str(a) for a in argv], cwd=cwd, capture_output=True)
+    label = operation or Path(str(argv[0])).name
+    try:
+        result = subprocess.run([str(a) for a in argv], cwd=cwd, capture_output=True)
+    except OSError as error:
+        raise ControllerError(f"{label}: process-start-error (errno {error.errno})") from None
     if result.returncode:
-        raise ControllerError(f"{operation or Path(str(argv[0])).name} failed (exit {result.returncode})")
+        raise ControllerError(f"{label}: process-error (exit {result.returncode}; "
+                              f"stderr={stderr_context(result.stderr)}; stderr_bytes={len(result.stderr)}; "
+                              f"stdout_bytes={len(result.stdout)})")
     return result.stdout
 
 
-def git(root, *args):
-    return command(["git", "-C", root, *args]).decode().strip()
+def git(root, checkout, operation, *values, events):
+    argv = {
+        GitOperation.HEAD: ["rev-parse", "HEAD"],
+        GitOperation.ORIGIN: ["config", "--get", "remote.origin.url"],
+        GitOperation.DIFF: ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "--exit-code", "HEAD", "--"],
+        GitOperation.ANCESTRY: ["merge-base", "--is-ancestor", *values, "refs/remotes/origin/main"],
+        GitOperation.REMOTE_TAG: ["ls-remote", "origin", *values],
+        GitOperation.TAG: ["rev-parse", *values],
+        GitOperation.BLOB: ["show", *values],
+        GitOperation.TREE: ["ls-tree", *values],
+        GitOperation.DIFF_DETAILS: ["diff", "--no-ext-diff", "--no-textconv", "--raw", "--no-abbrev", "-z", "HEAD", "--"],
+    }[operation]
+    event = {"checkout": checkout.value, "operation": operation.value}
+    events.append(event)
+    try:
+        result = subprocess.run(["git", "-C", str(root), *argv], capture_output=True)
+    except OSError as error:
+        event.update(result=GitResult.PROCESS_ERROR.value, errno=error.errno, exit_code=None)
+        raise ControllerError(f"Git {checkout.value}/{operation.value}: process-start-error (errno {error.errno})") from None
+    outcome = GitResult.PASS if result.returncode == 0 else GitResult.PROCESS_ERROR
+    if result.returncode == 1:
+        outcome = {GitOperation.DIFF: GitResult.CHANGED, GitOperation.ORIGIN: GitResult.NO_ORIGIN,
+                   GitOperation.ANCESTRY: GitResult.NOT_ANCESTOR}.get(operation, GitResult.PROCESS_ERROR)
+    event.update(result=outcome.value, exit_code=result.returncode,
+                 stderr=stderr_context(result.stderr), stderr_bytes=len(result.stderr))
+    if operation is GitOperation.HEAD and result.returncode == 0:
+        value = result.stdout.decode().strip()
+        if re.fullmatch(r"[0-9a-f]{40}", value):
+            event["observed_sha"] = value
+    if operation is GitOperation.ORIGIN:
+        event["config_present"] = False if outcome is GitResult.NO_ORIGIN else bool(result.stdout) if result.returncode == 0 else None
+    if operation is GitOperation.DIFF and outcome in (GitResult.PASS, GitResult.CHANGED):
+        paths = result.stdout.decode(errors="replace").split("\0")
+        paths = [path for path in paths if path]
+        safe = [path for path in paths if re.fullmatch(r"[A-Za-z0-9_./+-]{1,200}", path)
+                and not Path(path).is_absolute() and ".." not in Path(path).parts
+                and not re.search(r"[A-Za-z0-9]{24}|secret|token|private|password", path, re.I)]
+        event.update(changed_path_count=len(paths), changed_paths=safe[:50],
+                     undisclosed_path_count=len(paths) - len(safe[:50]))
+    if outcome is not GitResult.PASS:
+        raise GitGuardError(event, outcome)
+    return result.stdout if operation is GitOperation.BLOB else result.stdout.decode().strip()
 
 
 def digest(path):
@@ -129,25 +261,95 @@ def selection(args):
         raise ControllerError("Invalid repository")
 
 
+def generated_contract(args):
+    entries = git(args.source, Checkout.SOURCE, GitOperation.TREE, args.source_sha, "--",
+                  MACOS_SCHEMA, DESKTOP_SCHEMA, events=args.git_events).splitlines()
+    if len(entries) != 2 or any(not entry.startswith("100644 blob ") for entry in entries):
+        return {"kind": GeneratedContract.UNAVAILABLE.value}
+    lock = tomllib.loads(git(args.source, Checkout.SOURCE, GitOperation.BLOB,
+                            f"{args.source_sha}:Cargo.lock", events=args.git_events).decode())
+    for name, pin in SCHEMA_PRODUCER.items():
+        matches = [p for p in lock["package"] if p["name"] == name]
+        if (len(matches) != 1 or any(matches[0].get(k) != v for k, v in pin.items())
+                or matches[0].get("source") != "registry+https://github.com/rust-lang/crates.io-index"):
+            return {"kind": GeneratedContract.UNAVAILABLE.value}
+    before = git(args.source, Checkout.SOURCE, GitOperation.BLOB,
+                 f"{args.source_sha}:{MACOS_SCHEMA}", events=args.git_events)
+    expected = git(args.source, Checkout.SOURCE, GitOperation.BLOB,
+                   f"{args.source_sha}:{DESKTOP_SCHEMA}", events=args.git_events)
+    return {"kind": GeneratedContract.MACOS_SCHEMA.value, "path": MACOS_SCHEMA,
+            "before_sha256": hashlib.sha256(before).hexdigest(), "after_sha256": hashlib.sha256(expected).hexdigest(),
+            "git_mode": "100644", "expected_from_frozen_path": DESKTOP_SCHEMA,
+            "producer": SCHEMA_PRODUCER, "producer_function": "tauri_utils::acl::schema::generate_capability_schema",
+            "verification": "exact-frozen-desktop-schema-bytes-and-regular-mode"}
+
+
+def source_diff(args, contract):
+    try:
+        git(args.source, Checkout.SOURCE, GitOperation.DIFF, events=args.git_events)
+    except GitGuardError as error:
+        if (error.outcome is not GitResult.CHANGED or contract["kind"] != GeneratedContract.MACOS_SCHEMA.value
+                or error.event["changed_path_count"] != 1 or error.event["changed_paths"] != [MACOS_SCHEMA]):
+            raise
+        # This producer writes only derived JSON schema here and copies those
+        # same bytes to desktop-schema. Every other tracked path stays strict.
+        details = git(args.source, Checkout.SOURCE, GitOperation.DIFF_DETAILS, events=args.git_events).split("\0")
+        path = args.source / MACOS_SCHEMA
+        if (len(details) != 3 or details[1] != MACOS_SCHEMA
+                or not re.fullmatch(r":100644 100644 [0-9a-f]{40} [0-9a-f]{40} M", details[0])
+                or path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o111
+                or digest(path) != contract["after_sha256"]):
+            raise error
+        error.event["result"] = GitResult.GENERATED.value
+        error.event["generated_output"] = contract
+        args.observed_generated.append(contract)
+
+
 def context(args):
     selection(args)
-    for root, sha in ((CONTROLLER, args.controller_sha), (args.source, args.source_sha)):
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or git(root, "rev-parse", "HEAD") != sha:
-            raise ControllerError("Source/controller commit mismatch")
-        remote = git(root, "config", "--get", "remote.origin.url")
+    args.observed_generated = []
+    contract = {"kind": GeneratedContract.UNAVAILABLE.value}
+    for root, sha, checkout in ((CONTROLLER, args.controller_sha, Checkout.CONTROLLER),
+                                (args.source, args.source_sha, Checkout.SOURCE)):
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ControllerError(f"{checkout.value}: invalid expected commit")
+        if git(root, checkout, GitOperation.HEAD, events=args.git_events) != sha:
+            raise ControllerError(f"{checkout.value}: commit mismatch")
+        remote = git(root, checkout, GitOperation.ORIGIN, events=args.git_events)
         if remote not in (f"https://github.com/{args.repository}.git", f"https://github.com/{args.repository}", f"git@github.com:{args.repository}.git"):
-            raise ControllerError("Wrong repository provenance")
-        git(root, "diff", "--exit-code", "HEAD", "--")
-        git(root, "merge-base", "--is-ancestor", sha, "refs/remotes/origin/main")
-    remote_tags = dict(line.split()[::-1] for line in git(args.source, "ls-remote", "origin", f"refs/tags/{args.tag}", f"refs/tags/{args.tag}^{{}}").splitlines())
+            raise ControllerError(f"{checkout.value}: wrong repository provenance (origin present)")
+        if checkout is Checkout.CONTROLLER:
+            git(root, checkout, GitOperation.DIFF, events=args.git_events)
+        else:
+            if args.source_state == SourceState.POST_BUILD.value:
+                pre = json.loads((args.evidence / "pre-build.json").read_text())
+                if (pre["phase"] != EvidencePhase.PREFLIGHT.value
+                        or any(pre["provenance"][key] != value for key, value in {
+                            "source_sha": args.source_sha, "controller_sha": args.controller_sha,
+                            "repository": args.repository, "tag": args.tag, "target": args.target,
+                            "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                        }.items())):
+                    raise ControllerError("Missing/mismatched strict pre-build source provenance")
+                contract = generated_contract(args)
+                if pre["generated_contract"] != contract:
+                    raise ControllerError("Frozen generated-output contract changed")
+            source_diff(args, contract)
+        git(root, checkout, GitOperation.ANCESTRY, sha, events=args.git_events)
+    remote_tags = dict(line.split()[::-1] for line in git(args.source, Checkout.SOURCE, GitOperation.REMOTE_TAG,
+                      f"refs/tags/{args.tag}", f"refs/tags/{args.tag}^{{}}", events=args.git_events).splitlines())
     remote_source = remote_tags.get(f"refs/tags/{args.tag}^{{}}", remote_tags.get(f"refs/tags/{args.tag}"))
     if remote_source != args.source_sha:
         raise ControllerError("Remote source tag changed or missing")
-    if git(args.source, "rev-parse", f"refs/tags/{args.tag}^{{commit}}") != args.source_sha:
+    if git(args.source, Checkout.SOURCE, GitOperation.TAG, f"refs/tags/{args.tag}^{{commit}}", events=args.git_events) != args.source_sha:
         raise ControllerError("Source tag mismatch")
     if set(collect_versions(args.source).values()) != {normalize_tag(args.tag)}:
         raise ControllerError("Source release version mismatch")
     draft(args)
+    return {"state": "verified", "source_sha": args.source_sha, "controller_sha": args.controller_sha, "tag": args.tag,
+            "repository": args.repository, "target": args.target,
+            "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "checks": ["checkout-commits", "origin-repositories", "tracked-inputs-and-derived-output-contract", "main-ancestry",
+                       "local-and-remote-tag", "source-versions", "exact-tag-draft"]}
 
 
 def provenance(args, run_id, controller_sha=None):
@@ -162,7 +364,7 @@ def provenance(args, run_id, controller_sha=None):
     elif not (run["head_sha"] == args.source_sha and run["head_branch"] == args.tag
               or run["display_title"] == f"Release {args.tag} @ {args.source_sha}"):
         raise ControllerError("Fragment run source mismatch")
-    git(CONTROLLER, "merge-base", "--is-ancestor", run["head_sha"], "refs/remotes/origin/main")
+    git(CONTROLLER, Checkout.CONTROLLER, GitOperation.ANCESTRY, run["head_sha"], events=args.git_events)
     return run
 
 
@@ -183,6 +385,8 @@ def download(args, artifact_id, run_id, output):
 
 
 def receipt(args):
+    if (args.retained / "quarantine.json").exists():
+        raise ControllerError("Quarantined compiled evidence is not a signed checkpoint; refusing resume/publication")
     path = args.retained / "receipt.json"
     data = json.loads(path.read_text())
     if any(data.get(k) != v for k, v in {
@@ -222,7 +426,76 @@ def verify_app(args, app, server):
     command(["codesign", "--verify", "--deep", "--strict", app])
 
 
+def capture(args):
+    # Archive only the known build products, before any post-build introspection.
+    path = args.evidence / "quarantine.json"
+    if path.exists():
+        raise ControllerError("Compiled evidence already captured; cannot overwrite or promote quarantine")
+    data = {"schema": "macos-compiled-evidence-v1", "phase": EvidencePhase.CAPTURED.value,
+            "eligibility": Eligibility.QUARANTINED.value,
+            "requested_source_sha": args.source_sha, "requested_controller_sha": args.controller_sha,
+            "repository": args.repository, "tag": args.tag, "target": args.target,
+            "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "build_outcome": args.build_outcome, "product_origin": "paths-at-end-of-build-attempt",
+            "payloads": {}, "binaries": {}, "absent_products": [], "pre_build": None, "post_build": None,
+            "not_verified": ["binary-version", "architecture", "code-signatures", "notarization",
+                             "stapler", "gatekeeper", "updater-chain"]}
+    save(path, data)
+    bundle = args.source / f"target/{args.target}/release"
+    for kind, product, binary in (
+        ("app", bundle / "bundle/macos/Tyde.app", Path("Contents/MacOS/tyde")),
+        ("server", bundle / "tyde-server", None),
+    ):
+        if not product.exists():
+            data["absent_products"].append(kind)
+            save(path, data)
+            continue
+        if product.is_symlink():
+            raise ControllerError("Unsafe compiled product symlink; refusing evidence capture")
+        archive = args.evidence / f"compiled-{kind}.tar.gz"
+        command(["tar", "-czf", archive, "-C", product.parent, product.name], operation=f"archive-compiled-{kind}")
+        data["payloads"][archive.name] = digest(archive)
+        save(path, data)
+        executable = product / binary if binary else product
+        if executable.is_file() and not executable.is_symlink():
+            data["binaries"][kind] = {"sha256": digest(executable), "size": executable.stat().st_size}
+            save(path, data)
+    try:
+        if not (args.evidence / "pre-build.json").is_file():
+            raise ControllerError("Pre-build source provenance missing; quarantine is not releasable")
+        pre = json.loads((args.evidence / "pre-build.json").read_text())
+        data["pre_build"] = pre
+        save(path, data)
+        post = context(args)
+        if pre["provenance"] != post:
+            raise ControllerError("Pre-build source provenance missing or mismatched")
+        data["post_build"] = post
+        data["generated_metadata"] = args.observed_generated
+        if args.build_outcome != BuildOutcome.SUCCESS.value:
+            raise ControllerError("Build attempt did not succeed; retained quarantine only")
+        if data["absent_products"] or set(data["binaries"]) != {"app", "server"}:
+            raise ControllerError("Compiled app/server incomplete; retained partial quarantine only")
+        data["phase"] = EvidencePhase.SOURCE_VERIFIED.value
+        save(path, data)
+    except (ControllerError, OSError, ValueError, KeyError) as error:
+        data["phase"] = EvidencePhase.REJECTED.value
+        data["post_build"] = {"state": "rejected", "git": args.git_events}
+        data["failure"] = str(error) if isinstance(error, ControllerError) else type(error).__name__
+        save(path, data)
+        raise
+
+
 def prepare(args):
+    if (args.evidence / "prepare-rejected.json").exists():
+        raise ControllerError("Prior post-build rejection is permanent; cannot promote quarantine")
+    evidence = json.loads((args.evidence / "quarantine.json").read_text())
+    if (evidence["schema"] != "macos-compiled-evidence-v1"
+            or evidence["phase"] != EvidencePhase.SOURCE_VERIFIED.value
+            or evidence["eligibility"] != Eligibility.QUARANTINED.value
+            or evidence["post_build"] != args.verified_context
+            or evidence["generated_metadata"] != args.observed_generated):
+        raise ControllerError("Post-build provenance rejected; compiled quarantine cannot become a checkpoint")
+    verify_files(args.evidence, evidence["payloads"])
     if args.retained.exists():
         raise ControllerError("Retention directory already exists; select explicit resume")
     app = args.source / f"target/{args.target}/release/bundle/macos/Tyde.app"
@@ -235,6 +508,7 @@ def prepare(args):
             "source_sha": args.source_sha, "target": args.target,
             "controller_sha": args.controller_sha, "run_id": os.environ["GITHUB_RUN_ID"],
             "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "phase": "retained",
+            "eligibility": Eligibility.SIGNED.value, "generated_metadata": evidence["generated_metadata"],
             "checkpoint_run_id": os.environ["GITHUB_RUN_ID"], "checkpoint_controller_sha": args.controller_sha,
             "payloads": {name: digest(args.retained / name) for name in ("app.zip", "server.zip")},
             "submissions": {}, "events": []}
@@ -603,7 +877,7 @@ def finalize(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("verify", "prepare", "submit", "complete", "upload", "restore", "checkpoint", "assemble", "package", "finalize", "lookup-draft"))
+    parser.add_argument("operation", choices=("verify", "capture", "prepare", "submit", "complete", "upload", "restore", "checkpoint", "assemble", "package", "finalize", "lookup-draft"))
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--source-sha")
@@ -611,12 +885,17 @@ def main():
     parser.add_argument("--source", type=Path)
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--retained", type=Path)
+    parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--build-outcome", choices=[value.value for value in BuildOutcome])
+    parser.add_argument("--source-state", choices=[value.value for value in SourceState], default=SourceState.FROZEN.value)
     parser.add_argument("--kind", choices=("app", "server", "dmg"))
     parser.add_argument("--run-id")
     parser.add_argument("--artifact-id")
     parser.add_argument("--fragments-run-id")
     parser.add_argument("--confirm", action="store_true")
     args = parser.parse_args()
+    args.git_events = []
+    failure = None
     try:
         selection(args)
         if args.operation == "lookup-draft":
@@ -624,12 +903,32 @@ def main():
             hashes = sum(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", a.get("digest") or "")) for a in release["assets"])
             print(f"Exact-tag draft lookup: PASS; channel verified; assets={len(release['assets'])}; SHA-256 metadata={hashes}; mutations=0")
             return 0
-        if not all((args.source, args.source_sha, args.controller_sha, args.target, args.retained)):
-            raise ControllerError("Operation requires explicit source/controller/target/retained arguments")
+        if not all((args.source, args.source_sha, args.controller_sha, args.target, args.retained, args.evidence)):
+            raise ControllerError("Operation requires explicit source/controller/target/retained/evidence arguments")
         args.source = args.source.resolve()
         args.retained = args.retained.resolve()
-        context(args)
-        if args.operation == "verify":
+        args.evidence = args.evidence.resolve()
+        args.evidence.mkdir(parents=True, exist_ok=True)
+        if args.evidence == args.retained or args.evidence in args.retained.parents or args.retained in args.evidence.parents:
+            raise ControllerError("Compiled evidence and signed checkpoints must be separate directories")
+        if args.operation == "capture":
+            if not args.build_outcome or args.source_state != SourceState.POST_BUILD.value:
+                raise ControllerError("Capture requires explicit build outcome and post-build source state")
+            capture(args)
+        elif args.operation == "verify":
+            if args.source_state != SourceState.FROZEN.value:
+                raise ControllerError("Pre-build verify requires strict frozen source state")
+            pre = args.evidence / "pre-build.json"
+            data = {"phase": EvidencePhase.PREFLIGHT.value, "provenance": context(args),
+                    "generated_contract": generated_contract(args)}
+            if pre.exists():
+                if json.loads(pre.read_text()) != data:
+                    raise ControllerError("Pre-build provenance changed; refusing overwrite")
+            else:
+                save(pre, data)
+        else:
+            args.verified_context = context(args)
+        if args.operation in ("verify", "capture"):
             pass
         elif args.operation == "restore":
             if args.retained.exists() or not args.run_id or not args.artifact_id:
@@ -655,8 +954,18 @@ def main():
     except (ControllerError, OSError, ValueError, KeyError, RuntimeError, zipfile.BadZipFile) as error:
         # Parser/I/O values can contain private submission IDs; never dump them.
         message = str(error) if isinstance(error, ControllerError) else type(error).__name__
+        failure = message
+        if args.operation == "prepare" and args.evidence and args.evidence.is_dir():
+            save(args.evidence / "prepare-rejected.json",
+                 {"phase": EvidencePhase.REJECTED.value, "eligibility": Eligibility.QUARANTINED.value,
+                  "failure": message, "git": args.git_events})
         print(f"macOS controller: {message}", file=sys.stderr)
         return 1
+    finally:
+        if args.evidence and args.evidence.is_dir():
+            save(args.evidence / f"diagnostics-{args.operation}.json",
+                 {"operation": args.operation, "result": "rejected" if failure else "pass",
+                  "failure": failure, "git": args.git_events})
     return 0
 
 

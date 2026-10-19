@@ -382,15 +382,131 @@ expiry if recovery is delayed. After verified release completion, the Lander may
 explicitly delete the selected Actions artifacts; no automatic cleanup deletes
 recovery evidence or release assets.
 
+### Post-build rejection and quarantined evidence
+
+The workflow records pre-build checkout/tag/version/draft provenance in a
+separate evidence directory, then builds the frozen source. Its `capture` step
+runs even after a failed build attempt (but not a skipped one). Before **any**
+post-build Git, version, draft, signature or architecture introspection, it
+archives only the known `Tyde.app` and `tyde-server` product paths with real tar,
+without following symlinks, and records archive SHA-256 plus executable sizes
+and SHA-256. Missing products and the build step's actual outcome are explicit;
+files present after a failed attempt are not claimed to be fresh successful
+outputs. Partial capture and failure diagnostics are preserved too. No runner
+home, signing key, certificate, keychain or private-key directory is archived.
+
+`quarantine.json` has its own schema, typed phase and
+`quarantined-non-releasable` eligibility. It records requested commits, the
+available pre/post source provenance, failed guard observations, and explicitly
+unverified binary version, architecture, signatures, notarization, stapling,
+Gatekeeper and updater chain. A successful source inspection does **not** change
+this eligibility. An immediate quarantine artifact upload precedes server
+signing verification/startup smoke/`prepare`; a separate `always()` artifact
+retains diagnostics and quarantine receipts after later failures or cancellation. Inspect
+the action's successful upload receipt: files on a lost runner are not durable.
+
+Only a successful build with matching pre/post source provenance may proceed to
+`prepare`. It rechecks unchanged application inputs and the bounded derived
+metadata contract below, tag, versions, draft, binary version,
+architecture and code signatures and creates a **separate signed checkpoint**.
+A rejected source observation remains rejected even if somebody later cleans
+the checkout. Quarantine archives are never extracted or promoted by the
+controller. Restore, submission, package, completion, upload, assembly and
+finalization reject quarantine as a checkpoint. Existing signed-checkpoint
+resume and the Accepted-notary/stapler/Gatekeeper/updater checks remain required;
+there is no quarantine-resume or publication bypass.
+
+Git diagnostics name the operation and checkout role, exit code, and semantic
+result: missing origin config, tracked changes, non-ancestry, or process failure.
+Diffs use name-only/NUL-delimited output, not patches or external diff tools;
+counts and bounded safe relative paths are retained. Failed invocations retain
+stderr category and byte count, never raw stderr, credentials, remote URLs,
+submission identifiers or tool output. Missing refs and repository/config errors
+are not reported as successful cleanliness checks. Diagnostics remain available
+when no signed receipt can exist.
+
+For run `39233563294` (controller `da1e598d`, frozen source `83ad2d3c`), actual ARM
+compilation and desktop startup smoke passed, but post-build `prepare` failed
+before a signed checkpoint or Apple submission. The old helper discarded Git
+stdout/stderr, so **the exact failed guard remains unknown**. The only retained
+artifact contained four startup/tracing logs and no binaries. This fixes those
+confirmed diagnostic/retention defects; it does not certify the original RCA,
+recover the lost bytes or authorize another compile.
+
+Local real checkouts of those exact commits pass the eight local Git guards
+before and after the workflow's `npm ci --ignore-scripts --no-audit --no-fund`.
+Installed `tauri-build 2.6.3` (`src/acl.rs`, `save_acl_manifests`/`build`) and
+`tauri-utils 2.9.3` (`src/acl/schema.rs`, `generate_capability_schema`) establish
+that Tauri writes tracked schema files. A local replay of an already
+ordinary-built native build-script against a clean, real frozen 83ad checkout
+confirms this path without compiling the app: the script exits 0, and only
+`frontend/tauri-shell/gen/schemas/macOS-schema.json` changes. Its SHA-256 changes
+from `6f5f8d7fb9c5b031c3abe83fee0184d9148db6d4cd59ba82bd585cada035004e`
+to `f3210b918a4926d01dcda27c2f975d3aec67c43a723c741ac166ab0b86b15445`,
+matching the already-tracked desktop/Linux schema with `app-updates`.
+
+The replay uses the pinned Tauri/plugin permission inputs, target
+`aarch64-apple-darwin`, release-mode metadata, and a PATH without compiler/build
+tools. An exec trace shows only the existing build-script process, no child
+compilation. The actual da1 helper then fails with the same opaque Git exit 1,
+before creating a checkpoint. This proves a **real local generated-source
+mutation and guard rejection**, not which guard failed in the historical runner.
+The first replay omitted three plugin metadata inputs and failed capability
+validation after writing schemas; that incomplete result is retained separately,
+not used as the successful reproduction. No macOS application compile or CI
+probe was performed.
+
+The pinned producer hardcodes `gen/schemas`; neither its schema function
+parameters nor `tauri-build::Attributes` provide an out-of-tree schema directory.
+Changing `OUT_DIR` does not redirect this file. Its schema JSON is derived editor
+metadata, not a capability/application input: `tauri-build` parses
+`capabilities/**/*`, validates those permissions against plugin manifests, and
+copies the resolved ACL/capabilities to `OUT_DIR`. Pinned `tauri-codegen 2.6.3`
+reads those `OUT_DIR` ACL/capability files to construct runtime authority, not the
+platform schema. Tauri also documents these JSON schemas as editor validation
+and autocompletion data in [Schema Files](https://v2.tauri.app/security/capabilities/#schema-files).
+The installed producer/consumer source files match the cached crate archives;
+their SHA-256 checksums match frozen 83ad's Cargo.lock.
+
+The controller now explicitly distinguishes strict `frozen` preflight from
+`post-build` source inspection. Preflight requires the entire tracked checkout
+and controller to be clean and records a source/run-bound contract from frozen
+Git blobs. Post-build inspection may account for **only** this one regular
+100644 `macOS-schema.json`, with exactly the frozen desktop schema's SHA-256,
+under the audited tauri-build 2.6.3 / tauri-utils 2.9.3 registry checksums. The
+receipt records the path, before/after hashes, unchanged mode, pinned producer
+and exact-match verification method; it is not a fabricated producer execution
+attestation. Initial dirty checkouts, any other bytes/path/mode/symlink,
+Cargo.lock, application/capability/ACL/desktop-schema or controller mutations
+still reject. Unsupported producer versions get strict tracked-source checking,
+not a broader exception. No file is ignored, reset, restored or changed by the
+guard. Signed checkpoints carry the derived-output receipt; quarantine remains
+non-releasable even when this bounded inspection succeeds.
+
+A corrected local flow runs strict preflight, the real existing native generator,
+and the new post-build guard through real nested Git checkouts, local Git/HTTP
+transport and CLI/archive boundaries: generation and source inspection pass;
+Cargo.lock, Rust source, capability, controller, mode and symlink mutations
+reject. Archived product bytes in this flow are explicitly local fixtures, not
+newly compiled/signed macOS binaries. Automated regression replays the exact
+recorded generator bytes and exercises signed preparation with Apple process
+doubles, additional ACL/desktop-schema mutations, and failure quarantine.
+The original run's exact failure remains unknown and is not claimed fixed. Any diagnostic Actions probe or further ARM compile requires a
+new parent/Lander plan and authorization; the consumed ARM compile authorization
+is not reusable. Old notary network failures and Intel upload 422 are not claimed
+fixed. Beta/stable validated-main and frozen-source contracts are unchanged.
+
 ### Frozen v0.9.5 operational handoff
 
 The discarded ARM DMG from the old run cannot be recovered from its submission
 ID. Canonical ARM run `39226704908`, attempt 1, stopped in draft preflight before
 compilation or Apple submission; it produced no payload/checkpoint to resume.
-After this bugfix lands through ordinary committed-workbench and clean-main
-validation, the Lander needs authorization for **one ARM-only build**. Nothing
-in this implementation or recipe authorizes its execution. Do not rerun the
-failed original multi-platform release workflow or mark its jobs green.
+That historical authorization was subsequently consumed by ARM run
+`39233563294`, which passed compilation/smoke but lost its binaries at the
+post-build Git boundary described above. **No additional ARM compile is
+currently authorized.** Any later action belongs to the Lander after a newly
+approved plan; the historical command below is not authorization to execute it.
+Do not rerun the failed original multi-platform release workflow or mark its jobs green.
 
 Run the landed main workflow/controller, never helpers from the old app tag:
 

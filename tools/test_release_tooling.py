@@ -890,6 +890,8 @@ class MacosControllerFlowTests(unittest.TestCase):
         self.controller.mkdir()
         self.log = self.root / "commands.jsonl"
         self.retained = self.root / "retained"
+        self.evidence = self.root / "evidence"
+        self.source_state = "frozen"
         self.target = "aarch64-apple-darwin"
         self.repository = "fixture/Tyde"
         self.tag = "v1.2.3"
@@ -1183,9 +1185,12 @@ else: raise SystemExit(27)
         return [sys.executable, str(self.controller / "tools/macos_release.py"), operation,
                 "--repository", self.repository, "--tag", self.tag, "--source-sha", self.source_sha,
                 "--controller-sha", self.controller_sha, "--source", str(self.source),
-                "--target", self.target, "--retained", str(self.retained), *extra]
+                "--target", self.target, "--retained", str(self.retained), "--evidence", str(self.evidence),
+                "--source-state", "frozen" if operation == "verify" else self.source_state, *extra]
 
     def cli(self, operation, *extra, succeeds=True):
+        if operation == "restore":
+            self.source_state = "frozen"
         result = subprocess.run(self.argv(operation, *extra), env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
         self.assertNotIn("PRIVATE-ID", result.stdout + result.stderr)
@@ -1205,8 +1210,14 @@ else: raise SystemExit(27)
         self.downloads[f"actions/artifacts/{artifact_id}/zip"] = raw
         return self.responses[f"actions/artifacts/{artifact_id}"]
 
+    def prepare(self, succeeds=True):
+        self.cli("verify")
+        self.source_state = "post-build"
+        self.cli("capture", "--build-outcome", "success")
+        return self.cli("prepare", succeeds=succeeds)
+
     def retained_dmg(self):
-        self.cli("prepare")
+        self.prepare()
         self.cli("submit", "--kind", "server")
         self.cli("submit", "--kind", "app")
         self.cli("package")
@@ -1224,6 +1235,214 @@ else: raise SystemExit(27)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text(), f"available={str(available).lower()}\n")
         return result.stdout
+
+    def test_actual_frozen_git_failure_preserves_quarantine_not_a_checkpoint(self):
+        import tarfile
+
+        # Use the actual frozen application and landed controller, not the
+        # happy synthetic version/permissions fixture used for Apple flows.
+        original_bundle = self.bundle
+        self.tag = "v0.9.5"
+        self.source_sha = "83ad2d3c03b4c2661adb22ad435dd073a9530bab"
+        old_controller_sha = "da1e598d0402c06cbdccdc671533906121ec258a"
+        self.source = self.root / "actual-source"
+        self.git(self.root, "clone", "--shared", "--no-checkout", "-q", str(REPO_ROOT), str(self.source))
+        self.git(self.source, "checkout", "-q", "--detach", self.source_sha)
+        legacy = self.root / "legacy-controller"
+        self.git(self.root, "clone", "--shared", "--no-checkout", "-q", str(REPO_ROOT), str(legacy))
+        self.git(legacy, "checkout", "-q", "--detach", old_controller_sha)
+        self.controller = self.source / ".release-controller"
+        self.git(self.root, "clone", "--shared", "--no-checkout", "-q", str(REPO_ROOT), str(self.controller))
+        self.git(self.controller, "checkout", "-q", "--detach", old_controller_sha)
+        self.git(self.controller, "config", "user.name", "Release fixture")
+        self.git(self.controller, "config", "user.email", "fixture@example.invalid")
+        shutil.copyfile(TOOLS_DIR / "macos_release.py", self.controller / "tools/macos_release.py")
+        self.git(self.controller, "add", "tools/macos_release.py")
+        self.git(self.controller, "commit", "-qm", "Candidate controller")
+        self.controller_sha = self.git(self.controller, "rev-parse", "HEAD")
+        self.git(self.controller, "update-ref", "refs/heads/main", self.controller_sha)
+        origin = self.root / "actual-origin.git"
+        self.git(self.root, "clone", "--shared", "--bare", "-q", str(self.controller), str(origin))
+        for root in (self.source, self.controller, legacy):
+            self.git(root, "remote", "set-url", "origin", f"https://github.com/{self.repository}.git")
+            self.git(root, "config", f"url.file://{origin}.insteadOf", f"https://github.com/{self.repository}.git")
+            self.git(root, "fetch", "--no-tags", "origin", "main")
+            self.git(root, "update-ref", "refs/remotes/origin/main", self.controller_sha)
+        self.responses["actions/runs/10"] = self.run_metadata(10)
+        self.bundle = self.source / f"target/{self.target}/release"
+        shutil.copytree(original_bundle, self.bundle)
+        self.cli("verify")
+        generated = self.source / "frontend/tauri-shell/gen/schemas/macOS-schema.json"
+        clean_bytes = generated.read_bytes()
+        # Deliberately injected tracked mutation, NOT a claimed reproduction
+        # of the unobserved run's actual changed path or macOS generator output.
+        generated.write_bytes(clean_bytes + b"\n")
+        before = self.argv("prepare")
+        before[1] = str(legacy / "tools/macos_release.py")
+        before[before.index("--controller-sha") + 1] = old_controller_sha
+        del before[before.index("--evidence"):]
+        result = subprocess.run(before, env=self.env, cwd=self.source, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("git failed (exit 1)", result.stderr)
+        self.assertNotIn("tracked-diff", result.stderr)
+        self.assertFalse(self.retained.exists())
+        self.assertFalse(any(self.evidence.glob("compiled-*")))
+
+        (self.root / "key.p8").write_text("SECRET PRIVATE-ID signing material must not be archived")
+        self.source_state = "post-build"
+        wrapper = self.bin / "macos-controller"
+        argv = self.argv("capture")
+        wrapper.write_text("#!/bin/sh\nexec " + __import__("shlex").join(argv[:2]) + ' "$@" ' + __import__("shlex").join(argv[3:]) + "\n")
+        wrapper.chmod(0o755)
+        workflow = (REPO_ROOT / ".github/workflows/macos-release.yml").read_text()
+        step = workflow.split("      - name: Capture compiled quarantine before post-build checks\n", 1)[1].split("\n      - ", 1)[0]
+        script = step.split("        run: ", 1)[1]
+        result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                env=dict(self.env, BUILD_OUTCOME="success"), cwd=self.source,
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('"checkout": "frozen-source"', result.stderr)
+        self.assertIn('"result": "tracked-source-changed"', result.stderr)
+        self.assertIn('"changed_path_count": 1', result.stderr)
+        self.assertIn("frontend/tauri-shell/gen/schemas/macOS-schema.json", result.stderr)
+        data = json.loads((self.evidence / "quarantine.json").read_text())
+        self.assertEqual(data["phase"], "post-build-rejected")
+        self.assertEqual(data["eligibility"], "quarantined-non-releasable")
+        self.assertEqual(data["pre_build"]["provenance"]["source_sha"], self.source_sha)
+        self.assertEqual(data["post_build"]["state"], "rejected")
+        self.assertIn("code-signatures", data["not_verified"])
+        self.assertIn("notarization", data["not_verified"])
+        for kind, name, expected in (("app", "Tyde.app/Contents/MacOS/tyde", b"signed desktop"),
+                                      ("server", "tyde-server", b"signed server")):
+            path = self.evidence / f"compiled-{kind}.tar.gz"
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), data["payloads"][path.name])
+            self.assertEqual(data["binaries"][kind]["sha256"], hashlib.sha256(expected).hexdigest())
+            with tarfile.open(path) as archive:
+                self.assertEqual(archive.extractfile(name).read(), expected)
+                self.assertFalse(any("key.p8" in item.name or "private_keys" in item.name for item in archive))
+        self.assertFalse(self.retained.exists())
+        self.assertIn("No retained payload", self.retention_state(False))
+        self.cli("prepare", succeeds=False)
+        generated.write_bytes(clean_bytes)  # Undo only this fixture's known injection.
+        self.cli("prepare", succeeds=False)  # Cleaning source cannot bless quarantine.
+        self.seal_artifact(80, self.evidence)
+        shutil.rmtree(self.source / "target")
+        self.cli("restore", "--run-id", "10", "--artifact-id", "80", succeeds=False)
+        self.assertTrue((self.retained / "compiled-app.tar.gz").is_file())
+        self.assertFalse((self.retained / "receipt.json").exists())
+        for operation, extra in (("complete", ()), ("upload", ()), ("package", ()), ("checkpoint", ()),
+                                 ("submit", ("--kind", "app")), ("assemble", ("--fragments-run-id", "10")),
+                                 ("finalize", ("--fragments-run-id", "10", "--confirm"))):
+            result = self.cli(operation, *extra, succeeds=False)
+            self.assertIn("Quarantined compiled evidence is not a signed checkpoint", result.stderr)
+        self.assertFalse(self.uploads)
+        self.assertFalse(self.published)
+
+        # Distinguish the other exit-1 guard results and genuine invocation
+        # errors on BOTH real checkouts; never disclose the configured URL.
+        for root, label in ((self.controller, "controller"), (self.source, "frozen-source")):
+            self.git(root, "config", "--unset", "remote.origin.url")
+            result = self.cli("verify", succeeds=False)
+            self.assertIn(f'"checkout": "{label}"', result.stderr)
+            self.assertIn('"result": "origin-config-missing"', result.stderr)
+            self.assertIn('"config_present": false', result.stderr)
+            self.git(root, "config", "remote.origin.url", f"https://github.com/{self.repository}.git")
+            self.git(root, "update-ref", "refs/remotes/origin/main", self.git(root, "rev-list", "--max-parents=0", "HEAD").splitlines()[0])
+            result = self.cli("verify", succeeds=False)
+            self.assertIn('"result": "not-main-ancestor"', result.stderr)
+            self.assertIn('"exit_code": 1', result.stderr)
+            self.git(root, "update-ref", "-d", "refs/remotes/origin/main")
+            result = self.cli("verify", succeeds=False)
+            self.assertIn('"result": "process-error"', result.stderr)
+            self.assertIn('"stderr": "missing-ref-or-object"', result.stderr)
+            self.assertIn('"exit_code": 128', result.stderr)
+            self.git(root, "update-ref", "refs/remotes/origin/main", self.controller_sha)
+        self.git(self.controller, "config", "remote.origin.url", "https://SECRET:PRIVATE-ID@example.invalid/Tyde.git")
+        self.cli("verify", succeeds=False)
+        diagnostics = "\n".join(path.read_text() for path in self.evidence.glob("*.json"))
+        self.assertNotIn("PRIVATE-ID", diagnostics)
+        self.assertNotIn("SECRET", diagnostics)
+        self.assertNotIn("example.invalid", diagnostics)
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any(c[0] in {"xcrun", "cargo", "npx", "aws"} for c in commands))
+
+        # Replay the exact successful native producer output recorded by the
+        # no-compile RCA: these are the frozen desktop schema's identical bytes.
+        self.git(self.controller, "config", "remote.origin.url", f"https://github.com/{self.repository}.git")
+        self.evidence = self.root / "derived-evidence"
+        self.retained = self.root / "derived-retained"
+        self.source_state = "frozen"
+        self.cli("verify")
+        desktop = self.source / "frontend/tauri-shell/gen/schemas/desktop-schema.json"
+        expected_schema = desktop.read_bytes()
+        self.assertEqual(hashlib.sha256(clean_bytes).hexdigest(), "6f5f8d7fb9c5b031c3abe83fee0184d9148db6d4cd59ba82bd585cada035004e")
+        self.assertEqual(hashlib.sha256(expected_schema).hexdigest(), "f3210b918a4926d01dcda27c2f975d3aec67c43a723c741ac166ab0b86b15445")
+        shutil.copytree(original_bundle, self.bundle)
+        import plistlib
+        (self.bundle / "bundle/macos/Tyde.app/Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleShortVersionString": "0.9.5"}))
+        generated.write_bytes(expected_schema)
+        self.cli("verify", succeeds=False)  # The initial checkout is ALWAYS strict.
+        self.source_state = "post-build"
+        self.cli("capture", "--build-outcome", "success")
+        observed = json.loads((self.evidence / "quarantine.json").read_text())
+        self.assertEqual(observed["eligibility"], "quarantined-non-releasable")
+        derived = observed["generated_metadata"]
+        self.assertEqual(len(derived), 1)
+        self.assertEqual(derived[0]["path"], "frontend/tauri-shell/gen/schemas/macOS-schema.json")
+        self.assertEqual(derived[0]["before_sha256"], hashlib.sha256(clean_bytes).hexdigest())
+        self.assertEqual(derived[0]["after_sha256"], hashlib.sha256(expected_schema).hexdigest())
+        self.assertEqual(derived[0]["producer"]["tauri-utils"]["version"], "2.9.3")
+        self.cli("prepare")
+        signed = json.loads((self.retained / "receipt.json").read_text())
+        self.assertEqual(signed["eligibility"], "signed-checkpoint")
+        self.assertEqual(signed["generated_metadata"], derived)
+        self.cli("checkpoint")
+        for root, relative in (
+            (self.source, "Cargo.lock"), (self.source, "protocol/src/types.rs"),
+            (self.source, "frontend/tauri-shell/capabilities/default.json"),
+            (self.source, "frontend/tauri-shell/gen/schemas/desktop-schema.json"),
+            (self.source, "frontend/tauri-shell/gen/schemas/acl-manifests.json"),
+            (self.controller, "tools/check_release_version.py"),
+            (self.controller, "frontend/tauri-shell/gen/schemas/macOS-schema.json"),
+        ):
+            path = root / relative
+            original = path.read_bytes()
+            path.write_bytes(original + b"\n")
+            self.cli("checkpoint", succeeds=False)
+            path.write_bytes(original)
+        generated.chmod(0o755)
+        self.cli("checkpoint", succeeds=False)
+        generated.chmod(0o644)
+        generated.unlink()
+        generated.symlink_to(desktop)
+        self.cli("checkpoint", succeeds=False)
+        generated.unlink()
+        generated.write_bytes(expected_schema)
+        generated.write_bytes(expected_schema + b"\n")  # Same path, unknown bytes: reject.
+        self.cli("checkpoint", succeeds=False)
+        generated.write_bytes(expected_schema)
+        self.cli("checkpoint")
+
+        # Even a valid derived output does not bless a real input mutation or
+        # make its compiled products resumable after failed post-build checks.
+        generated.write_bytes(clean_bytes)
+        self.evidence = self.root / "other-failure-evidence"
+        self.retained = self.root / "other-failure-retained"
+        self.source_state = "frozen"
+        self.cli("verify")
+        generated.write_bytes(expected_schema)
+        lock = self.source / "Cargo.lock"
+        lock.write_bytes(lock.read_bytes() + b"\n")
+        self.source_state = "post-build"
+        self.cli("capture", "--build-outcome", "success", succeeds=False)
+        rejected = json.loads((self.evidence / "quarantine.json").read_text())
+        self.assertEqual(rejected["phase"], "post-build-rejected")
+        self.assertEqual(rejected["eligibility"], "quarantined-non-releasable")
+        self.assertEqual(len(rejected["payloads"]), 2)
+        self.cli("prepare", succeeds=False)
+        self.assertFalse(self.retained.exists())
+
 
     def test_draft_lookup_pagination_http_failures_and_no_payload(self):
         # Reproduce the real published-only tag route while the same auth can
@@ -1256,7 +1475,7 @@ else: raise SystemExit(27)
         result = self.cli("verify", succeeds=False)
         self.assertIn("release-by-ID: HTTP 403", result.stderr)
         self.http_failures.clear()
-        self.cli("prepare")
+        self.prepare()
         self.assertIn("Retained payload receipt present", self.retention_state(True))
         self.assertFalse(self.uploads)
         self.assertFalse(self.published)
@@ -1435,8 +1654,9 @@ else: raise SystemExit(27)
 
     def test_rejects_mismatches_security_failures_and_published_mutations(self):
         (self.root / "wrong-arch").touch()
-        self.cli("prepare", succeeds=False)
+        self.prepare(succeeds=False)
         (self.root / "wrong-arch").unlink()
+        shutil.rmtree(self.evidence)
         self.retained_dmg()
         self.cli("submit", "--kind", "dmg", succeeds=False)
         self.cli("package", succeeds=False)

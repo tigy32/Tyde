@@ -85,6 +85,8 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       CONTROLLER_SHA: ${{ github.sha }}
       MACOS_TARGET: ${{ inputs.target }}
+      RETAINED: ${{ runner.temp }}/macos-retained
+      EVIDENCE: ${{ runner.temp }}/macos-build-evidence
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
@@ -104,7 +106,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RETAINED=$RUNNER_TEMP/macos-retained" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git -C .release-controller rev-parse HEAD)" = "$CONTROLLER_SHA"
           git fetch --no-tags origin main
@@ -117,10 +118,12 @@ jobs:
           cat > "$RUNNER_TEMP/macos-controller" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          exec python3 "$GITHUB_WORKSPACE/.release-controller/tools/macos_release.py" "$@" \
+          source_state=frozen
+          if [[ '${{ inputs.operation }}' == build && "$1" != verify ]]; then source_state=post-build; fi
+          exec python3 "$GITHUB_WORKSPACE/.release-controller/tools/macos_release.py" "$@" --source-state "$source_state" \
             --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
             --source-sha "$SOURCE_SHA" --controller-sha "$CONTROLLER_SHA" \
-            --source "$GITHUB_WORKSPACE" --target "$MACOS_TARGET" --retained "$RETAINED"
+            --source "$GITHUB_WORKSPACE" --target "$MACOS_TARGET" --retained "$RETAINED" --evidence "$EVIDENCE"
           SH
           chmod +x "$RUNNER_TEMP/macos-controller"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
@@ -235,7 +238,8 @@ jobs:
 
           echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
-      - name: Build frozen source and sign payloads without notarization
+      - name: Build frozen source without notarization
+        id: compile
         if: inputs.operation == 'build'
         shell: bash
         run: |
@@ -247,6 +251,24 @@ jobs:
           # Do not let Tauri notarize before signed bytes have been retained.
           (cd frontend/tauri-shell && env -u APPLE_API_KEY_PATH -u APPLE_API_KEY -u APPLE_API_ISSUER \
             npx --prefix ../.. --no-install tauri build --target "$MACOS_TARGET" --bundles app)
+      - name: Capture compiled quarantine before post-build checks
+        if: always() && inputs.operation == 'build' && steps.compile.outcome != 'skipped'
+        env:
+          BUILD_OUTCOME: ${{ steps.compile.outcome }}
+        run: macos-controller capture --build-outcome "$BUILD_OUTCOME"
+      - name: Retain compiled quarantine before signing verification
+        if: always() && inputs.operation == 'build' && steps.compile.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-quarantine
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Sign server, smoke desktop and validate signed checkpoint
+        if: inputs.operation == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
           codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" \
             "target/$MACOS_TARGET/release/tyde-server"
           python3 .release-controller/tools/smoke_desktop_release.py \
@@ -410,6 +432,14 @@ jobs:
             ${{ env.RETAINED }}/tyde-update.json
             ${{ env.RETAINED }}/finalization.json
           if-no-files-found: error
+          retention-days: 30
+      - name: Always retain controller diagnostics and quarantine receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ inputs.target }}-${{ github.run_attempt }}-diagnostics
+          path: ${{ env.EVIDENCE }}/*.json
+          if-no-files-found: warn
           retention-days: 30
       - name: Retain desktop startup logs
         if: always() && inputs.operation == 'build'
