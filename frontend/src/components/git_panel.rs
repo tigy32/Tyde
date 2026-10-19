@@ -338,9 +338,9 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
         base_oid: selection.base_oid.clone(),
         tip_oid: selection.tip_oid.clone(),
     };
-    let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
+    let dialog_open = RwSignal::new(false);
     let click_state = state.clone();
-    let on_click = move |_| {
+    let on_click = move |plan: protocol::ReviewPlan| {
         if !reason().is_empty() {
             return;
         }
@@ -359,7 +359,9 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
             return;
         }
         let payload = protocol::ReviewActionPayload::StartAiReview {
-            mode: review_mode.get_untracked(),
+            author_agent_id: plan.author_agent_id.clone(),
+            expected_plan: Some(Box::new(plan.clone())),
+            mode: Some(plan.mode),
             backend_kind: None,
             cost_hint: None,
             instructions: None,
@@ -386,8 +388,11 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
             }
         });
     };
+    let start = Callback::new(on_click);
     view! {
-        <crate::components::review_view::ReviewModePicker selection=review_mode />
+        {move || dialog_open.get().then(|| target.get()).flatten().map(|(host_id, review_id)| view! {
+            <crate::components::review_view::ReviewDialog host_id review_id on_start=start on_close=Callback::new(move |()| dialog_open.set(false)) />
+        })}
         <button
             class="gp-review-open-btn gp-commit-ai-review"
             data-test="gp-commit-ai-review"
@@ -400,7 +405,7 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
                     reason
                 }
             }
-            on:click=on_click
+            on:click=move |_| dialog_open.set(true)
         >
             "AI review"
         </button>
@@ -2742,6 +2747,16 @@ mod wasm_tests {
         assert!(!ai_review.has_attribute("disabled"));
         click(&ai_review);
         next_tick().await;
+        crate::components::review_view::wasm_tests::publish_default_review_plan(
+            &state,
+            "h1",
+            &ReviewId("rev-1".to_owned()),
+        );
+        next_tick().await;
+        let start = query(&container, ".review-dialog footer button:last-child").unwrap();
+        assert!(!start.has_attribute("disabled"));
+        click(&start);
+        next_tick().await;
         let sent = sent_lines_joined();
         assert!(
             sent.contains("start_ai_review") && sent.contains("/review/rev-1"),
@@ -2764,6 +2779,8 @@ mod wasm_tests {
     }
 
     fn seed_host_settings(state: &AppState) {
+        state.selected_host_id.set(Some("h1".to_owned()));
+
         state.host_settings_by_host.update(|m| {
             m.insert(
                 "h1".to_owned(),
@@ -3642,7 +3659,7 @@ mod wasm_tests {
             review.ai_reviewer.status = protocol::ReviewAiReviewerStatus::Completed;
             review.ai_reviewer.rounds.push(protocol::ReviewRound {
                 request_id: None,
-                mode: Some(protocol::ReviewMode::Deep),
+                mode: Some(protocol::ReviewMode::ReviewTeam),
                 id: "round-1".to_owned(),
                 snapshot_id: Some("snapshot-1".to_owned()),
                 scope: Default::default(),
@@ -3763,10 +3780,10 @@ mod wasm_tests {
                 && group.contains("Test coverage · Codex")
         );
         assert!(group.contains("Frozen original test instructions"));
-        // Historical wire mode `deep` now renders Heavy; retain the exact completion count.
+        // Historical `deep` renders Review team; retain the exact completion count.
         assert!(
             main.inner_text()
-                .contains("Heavy · 2 of 2 reviewers completed")
+                .contains("Review team · 2 of 2 reviewers completed")
         );
         click(
             &query(&main, "[data-test=review-actions-toggle]").expect("Review actions disclosure"),

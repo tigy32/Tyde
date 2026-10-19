@@ -4083,6 +4083,7 @@ pub struct AppState {
     /// deltas to the entry. The first event on subscribe is always
     /// `ReviewEvent::Snapshot` which seeds (or replaces) the entry.
     pub reviews: RwSignal<HashMap<ReviewId, Review>>,
+    pub review_plans: RwSignal<HashMap<ReviewId, protocol::ReviewPlan>>,
     /// Per-project review summary lists, populated from
     /// `ProjectEventPayload::ReviewListChanged` on each project stream.
     /// Used by the project rail / git panel indicator to show "open
@@ -4468,6 +4469,7 @@ impl AppState {
             agents_view_overlay_generation: RwSignal::new(0),
             sessions_panel_filters: RwSignal::new(SessionsPanelFilters::default()),
             reviews: RwSignal::new(HashMap::new()),
+            review_plans: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
             review_create_pending: RwSignal::new(HashMap::new()),
             review_action_pending: RwSignal::new(HashMap::new()),
@@ -7060,6 +7062,9 @@ impl AppState {
         });
         self.reviews.update(|map| {
             map.retain(|_, review| !host_project_ids.contains(&review.project_id));
+        });
+        self.review_plans.update(|map| {
+            map.retain(|review_id, _| !host_review_ids.contains(review_id));
         });
         self.review_action_pending.update(|map| {
             map.retain(|review_id, _| !host_review_ids.contains(review_id));

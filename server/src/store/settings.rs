@@ -244,6 +244,9 @@ impl HostSettingsStore {
         else {
             return Ok(());
         };
+        if review.contains_key("team") {
+            return Ok(());
+        }
         let before = review.clone();
         let light = review.remove("light");
         let claude = review.remove("claude");
@@ -291,6 +294,30 @@ impl HostSettingsStore {
             return Err(
                 "Review settings contain both legacy provider and heavy configurations".to_owned(),
             );
+        }
+        let lite = review
+            .remove("lite")
+            .ok_or("Missing migrated Lite reviewers")?;
+        let heavy = review
+            .remove("heavy")
+            .ok_or("Missing migrated Heavy reviewers")?;
+        let deep = review.get("default_mode").and_then(Value::as_str) == Some("deep");
+        review.insert(
+            "team".to_owned(),
+            serde_json::json!({
+                "layout": if deep { "every_combination" } else { "per_reviewer" },
+                "reviewers": if deep { &heavy } else { &lite }, "aspect_assignments": {}
+            }),
+        );
+        review.insert(
+            "saved_reviewer_selections".to_owned(),
+            serde_json::json!({"Lite": lite, "Heavy": heavy}),
+        );
+        if review
+            .get("default_mode")
+            .is_none_or(|mode| matches!(mode.as_str(), Some("light" | "deep")))
+        {
+            review.insert("default_mode".to_owned(), serde_json::json!("review_team"));
         }
         if *review != before {
             tracing::info!("converted review execution settings to independent reviewer lists");
@@ -816,13 +843,15 @@ fn empty_settings() -> HostSettings {
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
-    for (mode, reviewers) in [
-        ("Lite", &settings.review.lite),
-        ("Heavy", &settings.review.heavy),
-    ] {
-        if reviewers.is_empty() {
-            return Err(format!("{mode} requires at least one reviewer"));
-        }
+    for (mode, reviewers) in std::iter::once(("Review team", &settings.review.team.reviewers))
+        .chain(
+            settings
+                .review
+                .saved_reviewer_selections
+                .iter()
+                .map(|(name, reviewers)| (name.as_str(), reviewers)),
+        )
+    {
         let mut ids = std::collections::HashSet::new();
         for reviewer in reviewers {
             if reviewer.id.0.trim().is_empty() || reviewer.name.trim().is_empty() {

@@ -1745,6 +1745,7 @@ fn apply_review_event(
         review_id: review_id.clone(),
     };
     match event {
+        ReviewEventPayload::Plan { .. } | ReviewEventPayload::InlineGuidance { .. } => {}
         ReviewEventPayload::Snapshot { review } => {
             state.review_errors.update(|errors| {
                 errors.remove(&key);

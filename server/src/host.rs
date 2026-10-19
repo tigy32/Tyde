@@ -5626,7 +5626,12 @@ impl HostHandle {
                     mut resolved_spawn_config,
                     startup_warning,
                     startup_failure,
-                ) = if let Some(stored_custom_agent_id) = record.custom_agent_id.as_ref() {
+                ) = if let Some(resolved) = resolved_spawn_config_override
+                    .clone()
+                    .filter(|_| review_startup_deferred)
+                {
+                    (None, resolved, None, None)
+                } else if let Some(stored_custom_agent_id) = record.custom_agent_id.as_ref() {
                     if custom_agent_store
                         .lock()
                         .await
@@ -5762,11 +5767,23 @@ impl HostHandle {
                     }
                 };
                 let (sanitized_settings, settings_failure, settings_warning) =
-                    sanitize_stored_session_settings(
-                        backend_kind,
-                        session_settings_schema.as_ref(),
-                        record.session_settings.clone(),
-                    );
+                    if review_startup_deferred {
+                        let failure = record.session_settings.as_ref().and_then(|settings| {
+                            session_settings_startup_failure(
+                                backend_kind,
+                                session_settings_schema.as_ref(),
+                                settings,
+                                "inherited reviewer",
+                            )
+                        });
+                        (record.session_settings.clone(), failure, None)
+                    } else {
+                        sanitize_stored_session_settings(
+                            backend_kind,
+                            session_settings_schema.as_ref(),
+                            record.session_settings.clone(),
+                        )
+                    };
                 let startup_failure = startup_failure
                     .or(non_resumable_failure)
                     .or(backend_support_failure)
@@ -5801,13 +5818,25 @@ impl HostHandle {
                     tyde_permissions: Default::default(),
                     restoration: restoration.clone(),
                     name: resolved_name,
-                    origin: AgentOrigin::User,
+                    origin: if review_startup_deferred {
+                        origin
+                    } else {
+                        AgentOrigin::User
+                    },
                     custom_agent_id: effective_custom_agent_id,
                     team_id: None,
                     team_member_id: None,
                     workflow: None,
-                    parent_agent_id: None,
-                    parent_session_id: None,
+                    parent_agent_id: if review_startup_deferred {
+                        payload.parent_agent_id
+                    } else {
+                        None
+                    },
+                    parent_session_id: if review_startup_deferred {
+                        parent_session_id
+                    } else {
+                        None
+                    },
                     project_id,
                     backend_kind,
                     launch_profile_id: None,
@@ -14284,6 +14313,109 @@ impl HostHandle {
             let state = self.state.lock().await;
             state.review_registry.clone()
         };
+        if matches!(
+            &payload,
+            ReviewActionPayload::Preview { .. } | ReviewActionPayload::StartAiReview { .. }
+        ) {
+            let preview = async {
+                let review = review_registry
+                    .handle(review_id.clone())
+                    .await?
+                    .snapshot()
+                    .await?;
+                let (author, mode, expected) = match &payload {
+                    ReviewActionPayload::Preview {
+                        author_agent_id,
+                        mode,
+                    } => (author_agent_id.clone(), Some(*mode), None),
+                    ReviewActionPayload::StartAiReview {
+                        author_agent_id,
+                        mode,
+                        expected_plan,
+                        ..
+                    } => (author_agent_id.clone(), *mode, expected_plan.as_deref()),
+                    _ => return Err("Invalid review configuration action".to_owned()),
+                };
+                let plan = self.review_plan(&review.project_id, author, mode).await?;
+                if matches!(&payload, ReviewActionPayload::Preview { .. }) {
+                    return Ok(Some(protocol::ReviewEventPayload::Plan { plan }));
+                }
+                if expected.is_some_and(|expected| expected != &plan) {
+                    let updated = serde_json::to_value(protocol::ReviewEventPayload::Plan { plan })
+                        .map_err(|error| error.to_string())?;
+                    review_output_stream
+                        .send_value(FrameKind::ReviewEvent, updated)
+                        .map_err(|_| {
+                            "Review output closed before the updated preview".to_owned()
+                        })?;
+                    return Err(
+                        "Review configuration changed. Check the updated preview before starting."
+                            .to_owned(),
+                    );
+                }
+                if let Some(reason) = &plan.unavailable_reason {
+                    return Err(reason.clone());
+                }
+                if plan.mode == protocol::ReviewMode::Inline {
+                    let author = plan
+                        .author_agent_id
+                        .clone()
+                        .ok_or("Choose the authoring agent")?;
+                    let scope = match &payload {
+                        ReviewActionPayload::StartAiReview { scope, .. } => scope,
+                        _ => return Err("Inline scope is missing".to_owned()),
+                    };
+                    let message = Self::inline_review_guidance(&plan, scope)?;
+                    let handle = self
+                        .agent_handle(&author)
+                        .await
+                        .ok_or("The authoring agent is no longer open")?;
+                    if !handle
+                        .send_input(protocol::AgentInput::SendMessage(
+                            protocol::SendMessagePayload {
+                                message,
+                                images: None,
+                                origin: Some(protocol::MessageOrigin::Review {
+                                    review_id: review_id.clone(),
+                                }),
+                                tool_response: None,
+                            },
+                        ))
+                        .await
+                    {
+                        return Err(
+                            "The authoring agent stopped before receiving Inline guidance"
+                                .to_owned(),
+                        );
+                    }
+                    return Ok(Some(protocol::ReviewEventPayload::InlineGuidance {
+                        author_agent_id: author,
+                    }));
+                }
+                Ok(None)
+            }
+            .await;
+            let event = match preview {
+                Ok(None) => None,
+                Ok(Some(event)) => Some(event),
+                Err(message) => Some(protocol::ReviewEventPayload::Error {
+                    error: protocol::ReviewErrorPayload {
+                        code: protocol::ReviewErrorCode::ReviewerBackendUnsupported,
+                        message,
+                        fatal: false,
+                        context: protocol::ReviewErrorContext::StartAiReview,
+                    },
+                }),
+            };
+            if let Some(event) = event {
+                let value = serde_json::to_value(event)
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                review_output_stream
+                    .send_value(FrameKind::ReviewEvent, value)
+                    .map_err(|_| AppError::internal(OPERATION, anyhow!("review output closed")))?;
+                return Ok(());
+            }
+        }
         let interrupted_reviewers = if matches!(
             payload,
             ReviewActionPayload::StopAiReview
@@ -14710,6 +14842,256 @@ impl HostHandle {
         registry.project_reviews(project_id).await
     }
 
+    pub(crate) async fn review_plan(
+        &self,
+        project_id: &protocol::ProjectId,
+        author: Option<AgentId>,
+        mode: Option<protocol::ReviewMode>,
+    ) -> Result<protocol::ReviewPlan, String> {
+        let settings = self.read_settings().await?;
+        self.review_plan_with_settings(project_id, author, mode, &settings)
+            .await
+    }
+
+    async fn review_plan_with_settings(
+        &self,
+        project_id: &protocol::ProjectId,
+        author: Option<AgentId>,
+        mode: Option<protocol::ReviewMode>,
+        settings: &settings_model::HostSettings,
+    ) -> Result<protocol::ReviewPlan, String> {
+        use protocol::{
+            ReviewAssignment, ReviewForkCapability, ReviewMode, ReviewReviewerTarget,
+            ReviewTeamLayout,
+        };
+        let mode = mode.unwrap_or(settings.review.default_mode);
+        let fork_capability = match &author {
+            None => ReviewForkCapability::Unsupported { reason: "Choose the authoring agent to inherit its context. Alternatively use explicitly configured team reviewers.".to_owned() },
+            Some(id) => {
+                if self.project_id_for_agent(id).await.as_ref() != Some(project_id) {
+                    return Err("The authoring agent must belong to this review's project".to_owned());
+                }
+                let start = self.agent_start_snapshot(id).await.ok_or("The authoring agent is no longer open")?;
+                let store = { self.state.lock().await.session_store.clone() };
+                let record = match start.session_id {
+                    Some(session) => store.get(&session).await,
+                    None => None,
+                };
+                match record {
+                    None => ReviewForkCapability::Unsupported { reason: "The authoring agent has no established native session yet. Wait for startup to complete.".to_owned() },
+                    Some(record) => {
+                        let (storage, schema) = {
+                            let state = self.state.lock().await;
+                            (state.backend_storage.clone(), session_schema_for_backend(&state, record.backend_kind, record.launch_profile_id.as_ref()))
+                        };
+                        let inherited_failure = record.session_settings.as_ref().and_then(|values| session_settings_startup_failure(record.backend_kind, schema.as_ref(), values, "inherited reviewer"));
+                        if !crate::backend::capabilities_for_backend_kind(record.backend_kind).contains(tyde_agent_adapter::BackendCapability::ForkSession) {
+                            ReviewForkCapability::Unsupported { reason: format!("{}. Use Inline or an explicitly selected team backend/model.", crate::backend::backend_fork_unsupported_message(record.backend_kind)) }
+                        } else if !crate::backend::capabilities_for_backend_kind(record.backend_kind).contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly) {
+                            ReviewForkCapability::Unsupported { reason: format!("{0:?} supports native forks, but does not support enforced read-only reviewers. Use Inline or a supported explicit team source.", record.backend_kind) }
+                        } else if !session_record_is_resumable(&record, &storage) {
+                            ReviewForkCapability::Unsupported { reason: "The author's native session is not resumable. Use Inline or an explicit team reviewer.".to_owned() }
+                        } else if inherited_failure.is_some() {
+                            ReviewForkCapability::Unsupported { reason: "The author’s inherited model/settings are no longer supported by this backend’s current schema. Update the author’s settings or use Inline; reviewer forks never substitute defaults.".to_owned() }
+                        } else {
+                            ReviewForkCapability::Supported { session_id: record.id, backend_kind: record.backend_kind, session_settings: record.session_settings.unwrap_or_default() }
+                        }
+                    }
+                }
+            }
+        };
+        let aspects = settings
+            .review
+            .aspects
+            .iter()
+            .filter(|(_, a)| a.enabled)
+            .map(|(id, a)| protocol::ReviewAspectSnapshot {
+                id: id.clone(),
+                name: a.name.clone(),
+                description: a.description.clone(),
+                instructions: a.instructions.clone(),
+            })
+            .collect::<Vec<_>>();
+        let team = &settings.review.team;
+        // This is also the launch schedule; the UI never schedules reviewers.
+        let pairs = |layout| -> Result<
+            Vec<(
+                protocol::ReviewReviewerConfig,
+                Vec<protocol::ReviewAspectSnapshot>,
+            )>,
+            String,
+        > {
+            match layout {
+                ReviewTeamLayout::PerAspect => aspects
+                    .iter()
+                    .map(|aspect| {
+                        let id = team.aspect_assignments.get(&aspect.id).ok_or_else(|| {
+                            format!("Assign a reviewer source to {}", aspect.name)
+                        })?;
+                        let reviewer =
+                            team.reviewers.iter().find(|r| &r.id == id).ok_or_else(|| {
+                                format!(
+                                    "The assigned source for {} was removed; choose a source",
+                                    aspect.name
+                                )
+                            })?;
+                        Ok((reviewer.clone(), vec![aspect.clone()]))
+                    })
+                    .collect(),
+                ReviewTeamLayout::PerReviewer => Ok(team
+                    .reviewers
+                    .iter()
+                    .map(|r| (r.clone(), aspects.clone()))
+                    .collect()),
+                ReviewTeamLayout::EveryCombination => Ok(team
+                    .reviewers
+                    .iter()
+                    .flat_map(|r| aspects.iter().map(move |a| (r.clone(), vec![a.clone()])))
+                    .collect()),
+            }
+        };
+        let layout_counts = [
+            ReviewTeamLayout::PerAspect,
+            ReviewTeamLayout::PerReviewer,
+            ReviewTeamLayout::EveryCombination,
+        ]
+        .into_iter()
+        .map(|layout| protocol::ReviewLayoutCount {
+            layout,
+            agent_count: match layout {
+                ReviewTeamLayout::PerAspect => aspects.len(),
+                ReviewTeamLayout::PerReviewer => team.reviewers.len(),
+                ReviewTeamLayout::EveryCombination => team.reviewers.len() * aspects.len(),
+            },
+        })
+        .collect();
+        let schedule = match mode {
+            ReviewMode::Inline => Ok(Vec::new()),
+            ReviewMode::SingleReviewer => Ok(vec![(
+                protocol::ReviewReviewerConfig {
+                    id: protocol::ReviewReviewerId("author-fork".to_owned()),
+                    name: "Fork current agent".to_owned(),
+                    target: ReviewReviewerTarget::ForkCurrentAgent,
+                },
+                aspects.clone(),
+            )]),
+            ReviewMode::ReviewTeam => pairs(team.layout),
+        };
+        let mut assignments = Vec::new();
+        let mut unavailable_reason = if !settings.review.enabled {
+            Some("Reviews are disabled in Settings → Review".to_owned())
+        } else if aspects.is_empty() && !settings.review.aspects.is_empty() {
+            Some("Select at least one review aspect".to_owned())
+        } else if mode == ReviewMode::Inline && author.is_none() {
+            Some("Choose the authoring agent for Inline guidance".to_owned())
+        } else {
+            None
+        };
+        match schedule {
+            Err(error) => unavailable_reason = Some(error),
+            Ok(schedule) => {
+                if mode != ReviewMode::Inline && schedule.is_empty() {
+                    unavailable_reason = Some("Add at least one reviewer source".to_owned());
+                }
+                for (reviewer, selected_aspects) in schedule {
+                    let resolved = match &reviewer.target {
+                        ReviewReviewerTarget::ForkCurrentAgent => match &fork_capability {
+                            ReviewForkCapability::Supported { session_id, backend_kind, session_settings } => Ok((*backend_kind, session_settings.clone(), Some(session_id.clone()))),
+                            ReviewForkCapability::Unsupported { reason } => Err(reason.clone()),
+                        },
+                        ReviewReviewerTarget::Default => settings.default_backend.map(|kind| (kind, Default::default(), None)).ok_or_else(|| "Choose a host default backend or configure an explicit reviewer source".to_owned()),
+                        ReviewReviewerTarget::Explicit { backend_kind, session_settings } => Ok((*backend_kind, session_settings.clone(), None)),
+                    };
+                    match resolved {
+                        Err(error) => unavailable_reason = Some(error),
+                        Ok((backend_kind, session_settings, fork_from_session_id)) => {
+                            if !settings.enabled_backends.contains(&backend_kind) {
+                                unavailable_reason = Some(format!(
+                                    "Review backend {backend_kind:?} is disabled. Enable it or choose a different source."
+                                ));
+                            }
+                            let name = if mode == ReviewMode::ReviewTeam
+                                && team.layout != ReviewTeamLayout::PerReviewer
+                            {
+                                format!(
+                                    "{} · {}",
+                                    selected_aspects
+                                        .iter()
+                                        .map(|a| a.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    reviewer.name
+                                )
+                            } else {
+                                reviewer.name
+                            };
+                            assignments.push(ReviewAssignment {
+                                reviewer_id: reviewer.id,
+                                name,
+                                target: reviewer.target,
+                                backend_kind,
+                                session_settings,
+                                aspects: selected_aspects,
+                                fork_from_session_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(protocol::ReviewPlan {
+            mode,
+            author_agent_id: author,
+            configuration: settings.review.clone(),
+            default_backend: settings.default_backend,
+            enabled_backends: settings.enabled_backends.clone(),
+            layout: team.layout,
+            layout_counts,
+            fork_capability,
+            assignments,
+            aspects,
+            unavailable_reason,
+        })
+    }
+
+    pub(crate) async fn agent_inline_review_guidance(
+        &self,
+        caller: &AgentId,
+        mode: Option<protocol::ReviewMode>,
+        scope: &protocol::ReviewAiScope,
+    ) -> Result<Option<String>, String> {
+        let project = self
+            .project_id_for_agent(caller)
+            .await
+            .ok_or("The authoring agent has no project")?;
+        let plan = self
+            .review_plan(&project, Some(caller.clone()), mode)
+            .await?;
+        if plan.mode != protocol::ReviewMode::Inline {
+            return Ok(None);
+        }
+        if let Some(error) = &plan.unavailable_reason {
+            return Err(error.clone());
+        }
+        Self::inline_review_guidance(&plan, scope).map(Some)
+    }
+
+    fn inline_review_guidance(
+        plan: &protocol::ReviewPlan,
+        scope: &protocol::ReviewAiScope,
+    ) -> Result<String, String> {
+        let scope = serde_json::to_string(scope).map_err(|error| error.to_string())?;
+        let guidance = plan
+            .aspects
+            .iter()
+            .map(|a| format!("## {}\n{}", a.name, a.instructions))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok(format!(
+            "Inline review guidance\nScope: {scope}\nSelf-review using your existing context. Apply all selected aspects below. You may fix issues directly and decide whether to proceed. Do not spawn reviewers or create Review-panel findings for this inline review. This is guidance, not a completion certification.\n\n{guidance}"
+        ))
+    }
+
     pub(crate) async fn request_agent_review(
         &self,
         caller: AgentId,
@@ -14740,68 +15122,37 @@ impl HostHandle {
             return Err("Reviews are disabled in Settings → Review".to_owned());
         }
         let mode = request.mode.unwrap_or(settings.review.default_mode);
-        let configured = !settings.review.aspects.is_empty();
-        let aspects = settings
-            .review
-            .aspects
-            .clone()
-            .into_iter()
-            .filter(|(_, a)| a.enabled)
-            .map(|(id, a)| protocol::ReviewAspectSnapshot {
-                id,
-                name: a.name,
-                description: a.description,
-                instructions: a.instructions,
-            })
-            .collect::<Vec<_>>();
-        if aspects.is_empty()
-            && (configured || request.requested_by.is_some() || mode == protocol::ReviewMode::Deep)
+        let plan = self
+            .review_plan_with_settings(
+                &request.review.project_id,
+                request.requested_by.clone(),
+                Some(mode),
+                &settings,
+            )
+            .await?;
+        if request
+            .expected_plan
+            .as_deref()
+            .is_some_and(|expected| expected != &plan)
         {
-            return Err("Add and enable review aspects in Settings → Review first".to_owned());
+            return Err("Review configuration or author session changed; check the updated preview before starting".to_owned());
+        }
+        if let Some(error) = plan.unavailable_reason {
+            return Err(error);
+        }
+        if mode == protocol::ReviewMode::Inline {
+            return Err(
+                "Inline reviews return guidance to the author; they never spawn reviewers"
+                    .to_owned(),
+            );
         }
         if request.backend_kind.is_some() {
-            return Err("Per-run review backend overrides are no longer supported; configure reviewers in Settings → Review".to_owned());
+            return Err(
+                "Configure reviewer sources in Settings → Review instead of overriding the backend"
+                    .to_owned(),
+            );
         }
-        let reviewers = match mode {
-            protocol::ReviewMode::Light => settings.review.lite.clone(),
-            protocol::ReviewMode::Deep => settings.review.heavy.clone(),
-        };
-        let mut assignments = Vec::new();
-        for reviewer in reviewers {
-            let config = match &reviewer.target {
-                protocol::ReviewReviewerTarget::Default => settings_model::ReviewExecutionConfig {
-                    backend_kind: settings
-                        .default_backend
-                        .or_else(|| settings.enabled_backends.first().copied())
-                        .ok_or_else(|| {
-                            "Review requires a host default backend or enabled backend".to_owned()
-                        })?,
-                    session_settings: Default::default(),
-                },
-                protocol::ReviewReviewerTarget::Explicit {
-                    backend_kind,
-                    session_settings,
-                } => settings_model::ReviewExecutionConfig {
-                    backend_kind: *backend_kind,
-                    session_settings: session_settings.clone(),
-                },
-            };
-            match mode {
-                protocol::ReviewMode::Light => {
-                    assignments.push((reviewer.name.clone(), aspects.clone(), reviewer, config))
-                }
-                protocol::ReviewMode::Deep => {
-                    for aspect in &aspects {
-                        assignments.push((
-                            format!("{} · {}", aspect.name, reviewer.name),
-                            vec![aspect.clone()],
-                            reviewer.clone(),
-                            config.clone(),
-                        ));
-                    }
-                }
-            }
-        }
+        let assignments = plan.assignments;
         let mut retired = std::collections::HashSet::new();
         for execution in request
             .review
@@ -14812,13 +15163,13 @@ impl HostHandle {
         {
             for member in &execution.reviewers {
                 let retained = execution.mode == Some(mode)
-                    && assignments.iter().any(|(_, aspects, reviewer, _)| {
-                        member.reviewer_id.as_ref() == Some(&reviewer.id)
+                    && assignments.iter().any(|assignment| {
+                        member.reviewer_id.as_ref() == Some(&assignment.reviewer_id)
                             && member
                                 .aspects
                                 .iter()
                                 .map(|a| &a.id)
-                                .eq(aspects.iter().map(|a| &a.id))
+                                .eq(assignment.aspects.iter().map(|a| &a.id))
                     });
                 if !retained && let Some(id) = &member.agent_id {
                     retired.insert(id.clone());
@@ -14832,8 +15183,22 @@ impl HostHandle {
         tracing::info!(review_id = %request.review_id, ?mode, assignment_count = assignments.len(), "launching configured advisory reviewers");
         let host_settings = &settings;
         let enabled_backends = &settings.enabled_backends;
-        let results = futures_util::future::join_all(assignments.into_iter().map(
-            |(name, aspects, reviewer, config)| async move {
+        let results =
+            futures_util::future::join_all(assignments.into_iter().map(|assignment| async move {
+                let protocol::ReviewAssignment {
+                    reviewer_id,
+                    name,
+                    target,
+                    backend_kind,
+                    session_settings,
+                    aspects,
+                    fork_from_session_id,
+                } = assignment;
+                let config = settings_model::ReviewExecutionConfig {
+                    backend_kind,
+                    session_settings,
+                };
+
                 let mut instructions = aspects
                     .iter()
                     .map(|a| format!("## {}\n{}", a.name, a.instructions))
@@ -14846,7 +15211,7 @@ impl HostHandle {
                 let result = if enabled_backends.contains(&config.backend_kind) {
                     self.spawn_ai_reviewer_member(
                         request,
-                        (&reviewer.id, &aspects, mode),
+                        (&reviewer_id, &aspects, mode, fork_from_session_id.as_ref()),
                         &name,
                         &instructions,
                         &config,
@@ -14862,8 +15227,8 @@ impl HostHandle {
                 protocol::ReviewReviewerRun {
                     context_key: result.as_ref().ok().map(|(_, key, _)| key.clone()),
                     reused_context: result.as_ref().is_ok_and(|(_, _, reused)| *reused),
-                    reviewer_id: Some(reviewer.id),
-                    target: Some(reviewer.target),
+                    reviewer_id: Some(reviewer_id),
+                    target: Some(target),
                     session_settings: config.session_settings,
                     aspects,
                     name,
@@ -14876,16 +15241,8 @@ impl HostHandle {
                     agent_id: result.as_ref().ok().map(|(id, _, _)| id.clone()),
                     error: result.err(),
                 }
-            },
-        ))
-        .await;
-        if !configured
-            && results.len() == 1
-            && request.requested_by.is_none()
-            && let Some(error) = results.first().and_then(|r| r.error.clone())
-        {
-            return Err(error);
-        }
+            }))
+            .await;
         Ok((mode, results))
     }
 
@@ -14896,13 +15253,14 @@ impl HostHandle {
             &protocol::ReviewReviewerId,
             &[protocol::ReviewAspectSnapshot],
             protocol::ReviewMode,
+            Option<&SessionId>,
         ),
         name: &str,
         instructions: &str,
         config: &settings_model::ReviewExecutionConfig,
         host_settings: &settings_model::HostSettings,
     ) -> Result<(AgentId, String, bool), String> {
-        let (reviewer_id, aspects, mode) = assignment;
+        let (reviewer_id, aspects, mode, fork_from_session_id) = assignment;
         let backend_kind = config.backend_kind;
         let instructions_len = request.instructions.as_ref().map_or(0, String::len);
         let roots = request
@@ -14976,6 +15334,10 @@ impl HostHandle {
             "access_mode": reviewer_spawn_config.access_mode,
             "excluded_tool_categories": reviewer_spawn_config.excluded_tool_categories,
         });
+        if let Some(source) = fork_from_session_id {
+            configuration["fork_source"] =
+                serde_json::to_value(source).map_err(|error| error.to_string())?;
+        }
         // Settings and MCP headers use HashMaps; iteration order is not configuration.
         configuration.sort_all_objects();
         let context_key = format!(
@@ -15060,15 +15422,23 @@ impl HostHandle {
             custom_agent_id: None,
             parent_agent_id: request.requested_by.clone(),
             project_id: Some(request.review.project_id.clone()),
-            params: SpawnAgentParams::New {
-                workspace_roots: roots,
-                prompt,
-                images: None,
-                backend_kind,
-                launch_profile_id: None,
-                cost_hint: request.cost_hint,
-                access_mode: protocol::BackendAccessMode::EnforcedReadOnly,
-                session_settings: Some(config.session_settings.clone()),
+            params: match fork_from_session_id {
+                Some(session) => SpawnAgentParams::Fork {
+                    from_session_id: session.clone(),
+                    prompt,
+                    images: None,
+                    access_mode: Some(protocol::BackendAccessMode::EnforcedReadOnly),
+                },
+                None => SpawnAgentParams::New {
+                    workspace_roots: roots,
+                    prompt,
+                    images: None,
+                    backend_kind,
+                    launch_profile_id: None,
+                    cost_hint: request.cost_hint,
+                    access_mode: protocol::BackendAccessMode::EnforcedReadOnly,
+                    session_settings: Some(config.session_settings.clone()),
+                },
             },
         };
         tracing::debug!(

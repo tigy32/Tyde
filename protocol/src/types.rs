@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 83;
+pub const PROTOCOL_VERSION: u32 = 84;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -6941,21 +6941,168 @@ pub struct ReviewFileSnapshot {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewAspectConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub instructions: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewExecutionConfig {
+    pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReviewerConfig {
+    pub id: ReviewReviewerId,
+    pub name: String,
+    pub target: ReviewReviewerTarget,
+}
+
+pub fn default_reviewers() -> Vec<ReviewReviewerConfig> {
+    vec![ReviewReviewerConfig {
+        id: ReviewReviewerId("default".to_owned()),
+        name: "AI Review".to_owned(),
+        target: ReviewReviewerTarget::Default,
+    }]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewTeamConfig {
+    #[serde(default)]
+    pub layout: ReviewTeamLayout,
+    #[serde(default = "default_reviewers")]
+    pub reviewers: Vec<ReviewReviewerConfig>,
+    #[serde(default)]
+    pub aspect_assignments: BTreeMap<String, ReviewReviewerId>,
+}
+
+impl Default for ReviewTeamConfig {
+    fn default() -> Self {
+        Self {
+            layout: Default::default(),
+            reviewers: default_reviewers(),
+            aspect_assignments: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSettings {
+    #[serde(default)]
+    pub default_mode: ReviewMode,
+    #[serde(default)]
+    pub team: ReviewTeamConfig,
+    /// Preserved pre-team selections, available to explicitly restore.
+    #[serde(default)]
+    pub saved_reviewer_selections: BTreeMap<String, Vec<ReviewReviewerConfig>>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub aspects: BTreeMap<String, ReviewAspectConfig>,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            aspects: BTreeMap::new(),
+            default_mode: ReviewMode::ReviewTeam,
+            team: Default::default(),
+            saved_reviewer_selections: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewMode {
+    Inline,
+    SingleReviewer,
     #[default]
-    Light,
-    Deep,
+    #[serde(alias = "light", alias = "deep")]
+    ReviewTeam,
 }
 
 impl ReviewMode {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Light => "Lite",
-            Self::Deep => "Heavy",
+            Self::Inline => "Inline",
+            Self::SingleReviewer => "Single reviewer",
+            Self::ReviewTeam => "Review team",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTeamLayout {
+    PerAspect,
+    #[default]
+    PerReviewer,
+    EveryCombination,
+}
+
+impl ReviewTeamLayout {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PerAspect => "Per aspect",
+            Self::PerReviewer => "Per reviewer",
+            Self::EveryCombination => "Every combination",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewForkCapability {
+    Supported {
+        session_id: SessionId,
+        backend_kind: BackendKind,
+        session_settings: SessionSettingsValues,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAssignment {
+    pub reviewer_id: ReviewReviewerId,
+    pub name: String,
+    pub target: ReviewReviewerTarget,
+    pub backend_kind: BackendKind,
+    pub session_settings: SessionSettingsValues,
+    pub aspects: Vec<ReviewAspectSnapshot>,
+    pub fork_from_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewLayoutCount {
+    pub layout: ReviewTeamLayout,
+    pub agent_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPlan {
+    pub mode: ReviewMode,
+    pub author_agent_id: Option<AgentId>,
+    pub configuration: ReviewSettings,
+    pub default_backend: Option<BackendKind>,
+    pub enabled_backends: Vec<BackendKind>,
+    pub layout: ReviewTeamLayout,
+    pub layout_counts: Vec<ReviewLayoutCount>,
+    pub fork_capability: ReviewForkCapability,
+    pub assignments: Vec<ReviewAssignment>,
+    pub aspects: Vec<ReviewAspectSnapshot>,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6975,6 +7122,7 @@ pub struct ReviewReviewerId(pub String);
 pub enum ReviewReviewerTarget {
     #[default]
     Default,
+    ForkCurrentAgent,
     Explicit {
         backend_kind: BackendKind,
         #[serde(default)]
@@ -7122,6 +7270,10 @@ pub enum ReviewSubmitTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewActionPayload {
+    Preview {
+        mode: ReviewMode,
+        author_agent_id: Option<AgentId>,
+    },
     StopAiReview,
     AddComment {
         location: ReviewLocation,
@@ -7143,6 +7295,10 @@ pub enum ReviewActionPayload {
     },
     StartAiReview {
         #[serde(default)]
+        author_agent_id: Option<AgentId>,
+        #[serde(default)]
+        expected_plan: Option<Box<ReviewPlan>>,
+        #[serde(default)]
         mode: Option<ReviewMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_kind: Option<BackendKind>,
@@ -7161,6 +7317,7 @@ pub enum ReviewActionPayload {
 impl ReviewActionPayload {
     pub const fn kind_name(&self) -> &'static str {
         match self {
+            Self::Preview { .. } => "preview",
             Self::StopAiReview => "stop_ai_review",
             Self::AddComment { .. } => "add_comment",
             Self::UpdateComment { .. } => "update_comment",
@@ -7178,6 +7335,8 @@ impl ReviewActionPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewEventPayload {
+    Plan { plan: ReviewPlan },
+    InlineGuidance { author_agent_id: AgentId },
     Snapshot { review: Review },
     CommentUpsert { comment: ReviewComment },
     CommentDelete { comment_id: ReviewCommentId },
@@ -7191,6 +7350,8 @@ pub enum ReviewEventPayload {
 impl ReviewEventPayload {
     pub const fn kind_name(&self) -> &'static str {
         match self {
+            Self::Plan { .. } => "plan",
+            Self::InlineGuidance { .. } => "inline_guidance",
             Self::Snapshot { .. } => "snapshot",
             Self::CommentUpsert { .. } => "comment_upsert",
             Self::CommentDelete { .. } => "comment_delete",

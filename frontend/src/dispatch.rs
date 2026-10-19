@@ -2901,6 +2901,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 Ok(payload) => {
                     let parse_dt = crate::perf::now_ms() - parse_t0;
                     let variant = match &payload {
+                        ReviewEventPayload::Plan { .. } => "Plan",
+                        ReviewEventPayload::InlineGuidance { .. } => "InlineGuidance",
                         ReviewEventPayload::Snapshot { .. } => "Snapshot",
                         ReviewEventPayload::CommentUpsert { .. } => "CommentUpsert",
                         ReviewEventPayload::CommentDelete { .. } => "CommentDelete",
@@ -2918,6 +2920,15 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         &format!(" variant={variant} bytes={payload_bytes} took={parse_dt:.1}ms"),
                     );
                     let apply_t0 = crate::perf::now_ms();
+                    if let ReviewEventPayload::Error { error } = &payload {
+                        crate::notices::report_error(
+                            crate::notices::NoticeScope::Review(
+                                host_id.to_owned(),
+                                review_id.clone(),
+                            ),
+                            error.message.clone(),
+                        );
+                    }
                     apply_review_event(state, &review_id, payload);
                     let apply_dt = crate::perf::now_ms() - apply_t0;
                     crate::perf::log_phase(
@@ -3880,6 +3891,18 @@ fn resolve_review_id(stream: &StreamPath) -> Option<ReviewId> {
 
 fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEventPayload) {
     match payload {
+        ReviewEventPayload::Plan { plan } => {
+            state.review_plans.update(|plans| {
+                plans.insert(review_id.clone(), plan);
+            });
+        }
+        ReviewEventPayload::InlineGuidance { .. } => {
+            state.review_action_pending.update(|gates| {
+                if let Some(gate) = gates.get_mut(review_id) {
+                    gate.start_ai = false;
+                }
+            });
+        }
         ReviewEventPayload::Snapshot { review } => {
             let comments = review.comments.len();
             let suggestions = review.suggestions.len();

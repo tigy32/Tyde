@@ -2376,175 +2376,187 @@ fn AiSummariesTab() -> impl IntoView {
 #[component]
 fn ReviewSettingsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_settings = state.clone();
-    let settings = Memo::new(move |_| {
-        state_for_settings
-            .selected_host_settings()
-            .map(|s| s.review)
-    });
+    let toggle_state = state.clone();
+    view! {
+        <section class="review-settings">
+            <h2 class="settings-panel-title">"Review"</h2>
+            <label class="settings-toggle-row"><span>"Enable reviews"</span><input type="checkbox" role="switch" aria-label="Enable reviews"
+                prop:checked=move || state.selected_host_settings().is_some_and(|s| s.review.enabled)
+                on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) /></label>
+            <ReviewConfigurationFields />
+        </section>
+    }
+}
+
+#[component]
+pub(super) fn ReviewConfigurationFields(
+    #[prop(optional)] plan: Option<Signal<Option<protocol::ReviewPlan>>>,
+    #[prop(optional)] compact: bool,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let settings_state = state.clone();
+    let settings = Memo::new(move |_| settings_state.selected_host_settings().map(|s| s.review));
     let editor = RwSignal::new(None::<(String, settings_model::ReviewAspectConfig)>);
     let execution_editor = RwSignal::new(None::<(String, settings_model::ReviewReviewerConfig)>);
     let deleting = RwSignal::new(None::<(String, String)>);
-    let state_for_host = state.clone();
+    let scope_state = state.clone();
     Effect::new(move |_| {
-        state_for_host.selected_host_id.track();
+        scope_state.selected_host_id.track();
         editor.set(None);
         execution_editor.set(None);
         deleting.set(None);
     });
-    let toggle_state = state.clone();
-    let list_state = state.clone();
-    let delete_state = state.clone();
-    let mode_state = state.clone();
+    let mode_state = StoredValue::new(state.clone());
+    let layout_state = StoredValue::new(state.clone());
+    let aspect_state = StoredValue::new(state.clone());
+    let reviewer_state = StoredValue::new(state.clone());
+    let add_state = StoredValue::new(state.clone());
+    let delete_state = StoredValue::new(state.clone());
+    let restore_state = StoredValue::new(state.clone());
     view! {
-        <section class="review-settings">
-            <h2 class="settings-panel-title">"Review"</h2>
-            <p class="settings-description settings-panel-intro">"Choose what AI reviews look for and which agents run them."</p>
-            <div class="settings-field">
-                <div class="settings-toggle-row">
-                    <div>
-                        <label class="settings-label">"Enable reviews"</label>
-                        <p class="settings-description">"Allow AI reviews on this host, from the review panel or requested by agents."</p>
-                    </div>
-                    <label class="settings-toggle">
-                        <input type="checkbox" role="switch" aria-label="Enable reviews"
-                            prop:checked=move || settings.get().is_some_and(|s| s.enabled)
-                            disabled=move || settings.get().is_none()
-                            on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) />
-                        <span class="settings-toggle-slider"></span>
-                    </label>
-                </div>
-            </div>
-            <div class="settings-field">
-                <label class="settings-label">"Default review depth"</label>
-                <p class="settings-description">"Lite gives each reviewer every enabled aspect. Heavy runs each reviewer once per aspect."</p>
-                <select class="settings-select" aria-label="Default review depth"
-                    prop:value=move || if settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::Deep) { "deep" } else { "light" }
-                    on:change=move |ev| send_host_replace(&mode_state, "/review/default_mode", event_target_value(&ev))>
-                    <option value="light">"Lite · each reviewer covers all aspects"</option>
-                    <option value="deep">"Heavy · each reviewer per aspect"</option>
-                </select>
-            </div>
-            <div class="review-settings-list-heading">
-                <h3 class="settings-section-title">"Aspects"</h3>
-                <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.aspects.values().filter(|a| a.enabled).count()))}</span>
-                <button class="settings-btn settings-btn-primary" disabled=move || settings.get().is_none()
-                    on:click=move |_| {
-                        editor.set(Some((generate_id(), settings_model::ReviewAspectConfig {
-                            name: String::new(), description: String::new(), instructions: String::new(), enabled: true,
-                        })));
-                    }>"+ Add aspect"</button>
-            </div>
-            <div class="review-settings-list">
-                {move || {
-                    let state = list_state.clone();
-                    settings.get().map(|s| s.aspects.into_iter().map(|(id, reviewer)| {
-                        let edit_id = id.clone();
-                        let edit_reviewer = reviewer.clone();
-                        let delete_id = id.clone();
-                        let delete_name = reviewer.name.clone();
-                        let path = format!("/review/aspects/{}/enabled", settings_model::escape_pointer_token(&id));
-                        let state = state.clone();
-                        let label = format!("Enable {}", reviewer.name);
-                        view! {
-                            <div class="review-settings-row">
-                                <label class="settings-toggle">
-                                    <input type="checkbox" role="switch" aria-label=label prop:checked=reviewer.enabled
-                                        on:change=move |ev| send_host_replace(&state, path.clone(), event_target_checked(&ev)) />
-                                    <span class="settings-toggle-slider"></span>
-                                </label>
-                                <div class="review-settings-row-copy">
-                                    <strong>{reviewer.name}</strong>
-                                    <span>{reviewer.description}</span>
-                                </div>
-                                <button class="settings-btn" on:click=move |_| editor.set(Some((edit_id.clone(), edit_reviewer.clone())))>"Edit"</button>
-                                <button class="settings-btn" on:click=move |_| deleting.set(Some((delete_id.clone(), delete_name.clone())))>"Delete"</button>
-                            </div>
-                        }
-                    }).collect_view())
-                }}
-                <Show when=move || settings.get().is_some_and(|s| s.aspects.is_empty())>
-                    <div class="review-settings-empty">
-                        <strong>"What should your reviews look for?"</strong>
-                        <p>"Add an aspect for each focus area, such as test quality, comments, or scope."</p>
-                    </div>
-                </Show>
-            </div>
-            <h3 class="settings-section-title">"Reviewers"</h3>
-            <p class="settings-description">"Reviewers use the default backend and its settings unless configured. A failed review never counts as clean."</p>
-            {[("lite", "Lite"), ("heavy", "Heavy")].into_iter().map(|(key, label)| {
-                let add_state = state.clone();
-                let rows_state = state.clone();
-                view! {
-                    <section class="review-settings-group">
-                        <div class="review-settings-list-heading">
-                            <h4>{format!("{label} reviewers")}</h4>
-                            <button class="settings-btn" disabled=move || settings.get().is_none() on:click=move |_| {
-                                let path = format!("/review/{key}");
-                                send_host_change(&add_state, move |doc| {
-                                    let original = doc.pointer(&path).cloned().ok_or("Reviewer list is unavailable")?;
-                                    let mut reviewers: Vec<settings_model::ReviewReviewerConfig> = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
-                                    reviewers.push(settings_model::ReviewReviewerConfig {
-                                        id: protocol::ReviewReviewerId(generate_id()), name: format!("Reviewer {}", reviewers.len() + 1), target: protocol::ReviewReviewerTarget::Default,
-                                    });
-                                    Ok(vec![SettingOp::Replace { path, value: serde_json::to_value(reviewers).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
-                                });
-                            }>{format!("+ Add {label} reviewer")}</button>
-                        </div>
-                        <div class="review-settings-list">
-                        {move || {
-                            let row_state = rows_state.clone();
-                            settings.get().map(|s| {
-                                let reviewers = if key == "lite" { s.lite } else { s.heavy };
-                                let singleton = reviewers.len() == 1;
-                                reviewers.into_iter().enumerate().map(|(index, reviewer)| {
-                                    let edit = reviewer.clone();
-                                    let id = reviewer.id.clone();
-                                    let remove_state = row_state.clone();
-                                    let target = match &reviewer.target {
-                                        protocol::ReviewReviewerTarget::Default => "Default backend and settings (inherited at launch)".to_owned(),
-                                        protocol::ReviewReviewerTarget::Explicit { backend_kind, .. } => backend_label(*backend_kind).to_owned(),
-                                    };
-                                    view! {
-                                        <div class="review-settings-row">
-                                            <div class="review-settings-row-copy"><strong>{reviewer.name}</strong><span>{target}</span></div>
-                                            <button class="settings-btn" on:click=move |_| execution_editor.set(Some((format!("/review/{key}/{index}"), edit.clone())))>{format!("Configure {label} reviewer")}</button>
-                                            <button class="settings-btn" disabled=singleton on:click=move |_| {
-                                                let path = format!("/review/{key}");
-                                                let id = id.clone();
-                                                send_host_change(&remove_state, move |doc| {
-                                                    let original = doc.pointer(&path).cloned().ok_or("Reviewer list is unavailable")?;
-                                                    let mut reviewers: Vec<settings_model::ReviewReviewerConfig> = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
-                                                    reviewers.retain(|r| r.id != id);
-                                                    Ok(vec![SettingOp::Replace { path, value: serde_json::to_value(reviewers).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
-                                                });
-                                            }>{format!("Remove {label} reviewer")}</button>
-                                        </div>
-                                    }
-                                }).collect_view()
-                            })
-                        }}
-                        </div>
-                    </section>
-                }
+        <div class="review-segments" role="group" aria-label="Review mode">
+            {[protocol::ReviewMode::Inline, protocol::ReviewMode::SingleReviewer, protocol::ReviewMode::ReviewTeam].into_iter().map(|mode| {
+                let state = mode_state.get_value();
+                view! { <button type="button" aria-pressed=move || settings.get().is_some_and(|s| s.default_mode == mode)
+                    title=move || if mode == protocol::ReviewMode::SingleReviewer { plan.and_then(|p| p.get()).and_then(|p| match p.fork_capability { protocol::ReviewForkCapability::Unsupported { reason } => Some(reason), _ => None }).unwrap_or_default() } else { String::new() }
+                    on:click=move |_| send_host_replace(&state, "/review/default_mode", mode)>{mode.label()}</button> }
             }).collect_view()}
-            {move || editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| editor.set(None)) /> })}
-            {move || execution_editor.get().map(|execution| view! {
-                <ReviewAspectEditor id=String::new() reviewer=settings_model::ReviewAspectConfig {
-                    name: String::new(), description: String::new(), instructions: String::new(), enabled: true,
-                } execution=execution on_close=Callback::new(move |()| execution_editor.set(None)) />
-            })}
-            {move || deleting.get().map(|(id, name)| {
-                let state = delete_state.clone();
-                view! { <SettingsConfirmDialog
-                    title="Delete aspect?".to_owned() body=format!("Remove {name} from future reviews?") confirm_label="Delete aspect".to_owned()
-                    on_cancel=Callback::new(move |()| deleting.set(None))
-                    on_confirm=Callback::new(move |()| {
-                        send_host_remove(&state, format!("/review/aspects/{}", settings_model::escape_pointer_token(&id)));
-                        deleting.set(None);
-                    }) /> }
-            })}
-        </section>
+        </div>
+        <Show when=move || settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::ReviewTeam)>
+            <h3>"Team layout"</h3>
+            <div class="review-segments" role="group" aria-label="Team layout">
+                {[protocol::ReviewTeamLayout::PerAspect, protocol::ReviewTeamLayout::PerReviewer, protocol::ReviewTeamLayout::EveryCombination].into_iter().map(|layout| {
+                    let state = layout_state.get_value();
+                    view! { <button type="button" aria-pressed=move || settings.get().is_some_and(|s| s.team.layout == layout)
+                        on:click=move |_| send_host_replace(&state, "/review/team/layout", layout)>
+                        <span>{layout.label()}</span>
+                        {move || plan.and_then(|p| p.get()).and_then(|p| p.layout_counts.into_iter().find(|c| c.layout == layout)).map(|c| view! { <small>{format!("{} agents", c.agent_count)}</small> })}
+                    </button> }
+                }).collect_view()}
+            </div>
+        </Show>
+        <div class="review-configuration-columns">
+            <section class="review-aspects-column">
+                <h3>"Aspects "<small>{move || settings.get().map_or(0, |s| s.aspects.values().filter(|a| a.enabled).count())}</small></h3>
+                <div class="review-settings-list">
+                    {move || settings.get().map(|s| {
+                        let mapping = s.default_mode == protocol::ReviewMode::ReviewTeam && s.team.layout == protocol::ReviewTeamLayout::PerAspect;
+                        let team = s.team;
+                        s.aspects.into_iter().map(|(id, aspect)| {
+                            let edit_id = id.clone(); let edit = aspect.clone();
+                            let delete_id = id.clone(); let delete_name = aspect.name.clone();
+                            let state = aspect_state.get_value(); let mapping_state = state.clone();
+                            let enabled_path = format!("/review/aspects/{}/enabled", settings_model::escape_pointer_token(&id));
+                            let mapping_path = format!("/review/team/aspect_assignments/{}", settings_model::escape_pointer_token(&id));
+                            let assigned = team.aspect_assignments.get(&id).map(|r| r.0.clone()).unwrap_or_default();
+                            let sources = team.reviewers.clone();
+                            let label = format!("Enable {}", aspect.name);
+                            let edit_label = format!("Edit {}", aspect.name);
+                            view! { <div class="review-settings-row">
+                                <label class="review-aspect-label"><input type="checkbox" aria-label=label prop:checked=aspect.enabled
+                                    on:change=move |ev| send_host_replace(&state, enabled_path.clone(), event_target_checked(&ev)) /><span>{aspect.name}</span></label>
+                                <button type="button" class="settings-btn review-aspect-edit" aria-label=edit_label on:click=move |_| editor.set(Some((edit_id.clone(), edit.clone())))>"Edit"</button>
+                                {(!compact).then(|| view! { <button type="button" class="settings-btn" on:click=move |_| deleting.set(Some((delete_id.clone(), delete_name.clone())))>"Delete"</button> })}
+                                {mapping.then(|| view! { <label class="review-aspect-assignment"><span>"Reviewer source"</span><select class="settings-select" aria-label="Reviewer source for aspect" prop:value=assigned
+                                    on:change=move |ev| send_host_replace(&mapping_state, mapping_path.clone(), protocol::ReviewReviewerId(event_target_value(&ev)))>
+                                    <option value="">"Choose a source…"</option>
+                                    {sources.into_iter().map(|r| view! { <option value=r.id.0>{r.name}</option> }).collect_view()}
+                                </select></label> })}
+                            </div> }
+                        }).collect_view()
+                    })}
+                </div>
+                <Show when=move || settings.get().is_some_and(|s| s.aspects.is_empty())><p class="review-settings-empty">"What should your reviews look for?"</p></Show>
+                <button type="button" class="review-add-link" on:click=move |_| editor.set(Some((generate_id(), settings_model::ReviewAspectConfig { name: String::new(), description: String::new(), instructions: String::new(), enabled: true })))>"+ Add aspect"</button>
+            </section>
+            <Show when=move || settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::ReviewTeam)>
+                <section class="review-reviewers-column"><h3>"Reviewers "<small>{move || settings.get().map_or(0, |s| s.team.reviewers.len())}</small></h3>
+                    <div class="review-settings-list">
+                        {move || settings.get().map(|s| {
+                            let enabled = reviewer_state.get_value().selected_host_settings().map(|s| s.enabled_backends).unwrap_or_default();
+                            s.team.reviewers.into_iter().enumerate().map(|(index, reviewer)| {
+                                let edit = reviewer.clone(); let id = reviewer.id.clone();
+                                let source_state = reviewer_state.get_value(); let remove_state = reviewer_state.get_value();
+                                let source_path = format!("/review/team/reviewers/{index}/target");
+                                let source_value = match &reviewer.target { protocol::ReviewReviewerTarget::Default => "default".to_owned(), protocol::ReviewReviewerTarget::ForkCurrentAgent => "fork_current_agent".to_owned(), protocol::ReviewReviewerTarget::Explicit { backend_kind, .. } => backend_value(*backend_kind).to_owned() };
+                                let summary_target = reviewer.target.clone();
+                                let mut available = enabled.clone();
+                                if let protocol::ReviewReviewerTarget::Explicit { backend_kind, .. } = &reviewer.target && !available.contains(backend_kind) {
+                                    available.push(*backend_kind);
+                                }
+                                view! { <div class="review-settings-row review-source-row">
+                                    <div class="review-settings-row-copy"><strong>{reviewer.name}</strong><small>{move || {
+                                        if summary_target == protocol::ReviewReviewerTarget::ForkCurrentAgent && let Some(p) = plan.and_then(|p| p.get()) && let protocol::ReviewForkCapability::Supported { backend_kind, session_settings, .. } = p.fork_capability {
+                                            return review_source_label(&protocol::ReviewReviewerTarget::Explicit { backend_kind, session_settings });
+                                        }
+                                        review_source_label(&summary_target)
+                                    }}</small>
+                                        <select class="settings-select" aria-label="Reviewer source" prop:value=source_value on:change=move |ev| {
+                                            let value = event_target_value(&ev);
+                                            let target = match value.as_str() {
+                                                "fork_current_agent" => protocol::ReviewReviewerTarget::ForkCurrentAgent,
+                                                "default" => protocol::ReviewReviewerTarget::Default,
+                                                _ => match parse_backend_kind(&value) { Some(backend_kind) => protocol::ReviewReviewerTarget::Explicit { backend_kind, session_settings: Default::default() }, None => return },
+                                            };
+                                            send_host_replace(&source_state, source_path.clone(), target);
+                                        }>
+                                            <option value="fork_current_agent">"Fork current agent"</option>
+                                            <option value="default">"Host default (saved selection)"</option>
+                                            {available.into_iter().map(|kind| view! { <option value=backend_value(kind)>{backend_label(kind)}</option> }).collect_view()}
+                                        </select>
+                                    </div>
+                                    <button type="button" class="settings-btn" on:click=move |_| execution_editor.set(Some((format!("/review/team/reviewers/{index}"), edit.clone())))>"Configure reviewer"</button>
+                                    <button type="button" class="settings-btn" aria-label="Remove reviewer" on:click=move |_| {
+                                        let id = id.clone();
+                                        send_host_change(&remove_state, move |doc| {
+                                            let original = doc.pointer("/review/team").cloned().ok_or("Review team unavailable")?;
+                                            let mut team: protocol::ReviewTeamConfig = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
+                                            team.reviewers.retain(|r| r.id != id);
+                                            team.aspect_assignments.retain(|_, source| source != &id);
+                                            Ok(vec![SettingOp::Replace { path: "/review/team".to_owned(), value: serde_json::to_value(team).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
+                                        });
+                                    }>"×"</button>
+                                </div> }
+                            }).collect_view()
+                        })}
+                    </div>
+                    <button type="button" class="review-add-link" on:click=move |_| send_host_change(&add_state.get_value(), move |doc| {
+                        let original = doc.pointer("/review/team/reviewers").cloned().ok_or("Reviewers unavailable")?;
+                        let mut reviewers: Vec<protocol::ReviewReviewerConfig> = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
+                        reviewers.push(protocol::ReviewReviewerConfig { id: protocol::ReviewReviewerId(generate_id()), name: format!("Reviewer {}", reviewers.len() + 1), target: protocol::ReviewReviewerTarget::ForkCurrentAgent });
+                        Ok(vec![SettingOp::Replace { path: "/review/team/reviewers".to_owned(), value: serde_json::to_value(reviewers).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
+                    })>"+ Add reviewer"</button>
+                    {move || settings.get().map(|s| s.saved_reviewer_selections.into_iter().map(|(name, reviewers)| {
+                        let state = restore_state.get_value();
+                        view! { <button type="button" class="review-add-link" on:click=move |_| send_host_replace(&state, "/review/team/reviewers", reviewers.clone())>{format!("Use saved {name} reviewers")}</button> }
+                    }).collect_view())}
+                </section>
+            </Show>
+        </div>
+        {move || editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| editor.set(None)) /> })}
+        {move || execution_editor.get().map(|execution| view! { <ReviewAspectEditor id=String::new() reviewer=settings_model::ReviewAspectConfig { name: String::new(), description: String::new(), instructions: String::new(), enabled: true } execution on_close=Callback::new(move |()| execution_editor.set(None)) /> })}
+        {move || deleting.get().map(|(id, name)| { let state = delete_state.get_value(); view! { <SettingsConfirmDialog title="Delete aspect?".to_owned() body=format!("Remove {name} from future reviews?") confirm_label="Delete aspect".to_owned() on_cancel=Callback::new(move |()| deleting.set(None)) on_confirm=Callback::new(move |()| { send_host_remove(&state, format!("/review/aspects/{}", settings_model::escape_pointer_token(&id))); deleting.set(None); }) /> } })}
+    }
+}
+
+pub(super) fn review_source_label(target: &protocol::ReviewReviewerTarget) -> String {
+    match target {
+        protocol::ReviewReviewerTarget::Default => {
+            "Default backend and settings (inherited at launch)".to_owned()
+        }
+        protocol::ReviewReviewerTarget::ForkCurrentAgent => {
+            "Fork current agent · inherited backend/model".to_owned()
+        }
+        protocol::ReviewReviewerTarget::Explicit {
+            backend_kind,
+            session_settings,
+        } => {
+            let model = match session_settings.0.get("model") {
+                Some(SessionSettingValue::String(model)) => format!(" · {model}"),
+                _ => String::new(),
+            };
+            format!("{}{model}", backend_label(*backend_kind))
+        }
     }
 }
 
@@ -2575,8 +2587,12 @@ fn ReviewAspectEditor(
     );
     let description = RwSignal::new(reviewer.description);
     let instructions = RwSignal::new(reviewer.instructions);
+    let fork = RwSignal::new(target == protocol::ReviewReviewerTarget::ForkCurrentAgent);
     let (kind, settings) = match target {
-        protocol::ReviewReviewerTarget::Default => (None, SessionSettingsValues::default()),
+        protocol::ReviewReviewerTarget::Default
+        | protocol::ReviewReviewerTarget::ForkCurrentAgent => {
+            (None, SessionSettingsValues::default())
+        }
         protocol::ReviewReviewerTarget::Explicit {
             backend_kind,
             session_settings,
@@ -2631,7 +2647,15 @@ fn ReviewAspectEditor(
         .selected_host_settings_untracked()
         .and_then(|s| serde_json::to_value(s).ok())
         .and_then(|s| s.pointer(&path).cloned());
+    let editor_host = state.selected_host_id.get_untracked();
     let save = move |_| {
+        if state.selected_host_id.get_untracked() != editor_host {
+            crate::notices::report_settings_error(
+                &state,
+                "The review editor's host changed. Reopen the editor on the intended host.",
+            );
+            return;
+        }
         if !is_execution
             && (name.get_untracked().trim().is_empty()
                 || instructions.get_untracked().trim().is_empty())
@@ -2648,12 +2672,16 @@ fn ReviewAspectEditor(
             serde_json::to_value(settings_model::ReviewReviewerConfig {
                 id: id.clone(),
                 name: name.get_untracked().trim().to_owned(),
-                target: match backend.get_untracked() {
-                    None => protocol::ReviewReviewerTarget::Default,
-                    Some(backend_kind) => protocol::ReviewReviewerTarget::Explicit {
-                        backend_kind,
-                        session_settings: values.get_untracked(),
-                    },
+                target: if fork.get_untracked() {
+                    protocol::ReviewReviewerTarget::ForkCurrentAgent
+                } else {
+                    match backend.get_untracked() {
+                        None => protocol::ReviewReviewerTarget::Default,
+                        Some(backend_kind) => protocol::ReviewReviewerTarget::Explicit {
+                            backend_kind,
+                            session_settings: values.get_untracked(),
+                        },
+                    }
                 },
             })
         } else {
@@ -2734,9 +2762,11 @@ fn ReviewAspectEditor(
                 </Show>
                 <Show when=move || is_execution>
                 <label class="settings-form-label"><span>"Backend"</span>
-                    <select class="settings-select" prop:value=move || backend.get().map(backend_value).unwrap_or("default") on:change=move |ev| {
-                        backend.set(parse_backend_kind(&event_target_value(&ev))); values.set(SessionSettingsValues::default());
+                    <select class="settings-select" prop:value=move || if fork.get() { "fork_current_agent" } else { backend.get().map(backend_value).unwrap_or("default") } on:change=move |ev| {
+                        let value = event_target_value(&ev); fork.set(value == "fork_current_agent");
+                        backend.set(parse_backend_kind(&value)); values.set(SessionSettingsValues::default());
                     }>
+                        <option value="fork_current_agent">"Fork current agent"</option>
                         <option value="default">"Default backend and settings"</option>
                         {move || {
                             let mut backends = state_for_options.get_value().selected_host_settings().map(|s| s.enabled_backends).unwrap_or_default();
@@ -2745,7 +2775,8 @@ fn ReviewAspectEditor(
                         }}
                     </select>
                 </label>
-                <Show when=move || backend.get().is_none()><p class="settings-description">"Inherit the host default backend and its current default settings when the review starts."</p></Show>
+                <Show when=move || fork.get()><p class="settings-description">"Inherit the author’s backend, model and native context in an independent session. Forks still consume tokens."</p></Show>
+                <Show when=move || !fork.get() && backend.get().is_none()><p class="settings-description">"Inherit the host default backend and its current default settings when the review starts."</p></Show>
                 <Show when=move || backend.get().is_some()>
                 {move || {
                     let schema = state_for_schema.get_value().selected_host_id.get().and_then(|host| state_for_schema.get_value().session_schemas.get().get(&host).and_then(|schemas| backend.get().and_then(|kind| schemas.get(&kind))).cloned());
@@ -7392,7 +7423,7 @@ pub(super) fn next_settings_write_id() -> SettingsWriteId {
     })
 }
 
-fn send_host_change(
+pub(super) fn send_host_change(
     state: &AppState,
     prepare: impl FnOnce(&Value) -> Result<Vec<SettingOp>, String>,
 ) {
@@ -19549,7 +19580,7 @@ mod wasm_tests {
                 "toolset".to_owned(),
                 SessionSettingValue::String("legacy".to_owned()),
             );
-            hosts.get_mut(&host).unwrap().review.heavy[0].target =
+            hosts.get_mut(&host).unwrap().review.team.reviewers[0].target =
                 protocol::ReviewReviewerTarget::Explicit {
                     backend_kind: BackendKind::Hermes,
                     session_settings,
@@ -19560,7 +19591,7 @@ mod wasm_tests {
             view! { <ReviewSettingsTab /> }
         });
         next_tick().await;
-        find_button_by_text(&container, "Configure Heavy reviewer")
+        find_button_by_text(&container, "Configure reviewer")
             .unwrap()
             .click();
         next_tick().await;
@@ -19595,7 +19626,7 @@ mod wasm_tests {
         }
         let writes = recorded_settings_write_ops(&calls);
         let saved = writes.last().unwrap();
-        assert_eq!(saved["path"], "/review/heavy/0");
+        assert_eq!(saved["path"], "/review/team/reviewers/0");
         assert_eq!(
             saved["value"]["target"]["session_settings"],
             serde_json::json!({ "model": { "string": "opus" } }),
@@ -19613,7 +19644,7 @@ mod wasm_tests {
         install_launch_profile_host(&state, Vec::new());
         let host = state.selected_host_id.get_untracked().unwrap();
         state.host_settings_by_host.update(|hosts| {
-            hosts.get_mut(&host).unwrap().review.lite[0].target =
+            hosts.get_mut(&host).unwrap().review.team.reviewers[0].target =
                 protocol::ReviewReviewerTarget::Explicit {
                     backend_kind: BackendKind::Hermes,
                     session_settings: Default::default(),
@@ -19656,10 +19687,10 @@ mod wasm_tests {
         });
         next_tick().await;
         assert!(
-            container.text_content().unwrap().contains("Lite reviewers"),
-            "Review settings must expose independent Lite and Heavy reviewer lists"
+            container.text_content().unwrap().contains("Reviewers"),
+            "Review settings must expose canonical reviewer sources"
         );
-        let add = find_button_by_text(&container, "Configure Lite reviewer").unwrap();
+        let add = find_button_by_text(&container, "Configure reviewer").unwrap();
         add.click();
         next_tick().await;
         let dialog = container
@@ -19735,7 +19766,7 @@ mod wasm_tests {
         }
         let writes = recorded_settings_write_ops(&calls);
         let saved = writes.last().unwrap();
-        assert_eq!(saved["path"], "/review/lite/0");
+        assert_eq!(saved["path"], "/review/team/reviewers/0");
         assert_eq!(
             saved["value"]["target"]["session_settings"]["model"]["string"],
             "opus"
@@ -19805,39 +19836,38 @@ mod wasm_tests {
         let initial = state.host_settings_by_host.get_untracked()[&host]
             .review
             .clone();
-        assert!(container.text_content().unwrap().contains("Lite reviewers"));
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("Heavy reviewers")
-        );
+        assert!(container.text_content().unwrap().contains("Reviewers"));
+        assert!(container.text_content().unwrap().contains("Reviewers"));
         assert!(
             container
                 .text_content()
                 .unwrap()
                 .contains("Default backend and settings (inherited at launch)")
         );
-        let remove: web_sys::HtmlButtonElement =
-            find_button_by_text(&container, "Remove Lite reviewer")
-                .unwrap()
-                .dyn_into()
-                .unwrap();
-        assert!(remove.disabled(), "Every mode must retain a reviewer");
-        find_button_by_text(&container, "+ Add Lite reviewer")
+        let remove: web_sys::HtmlButtonElement = container
+            .query_selector("button[aria-label='Remove reviewer']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !remove.disabled(),
+            "A draft team can be empty; the server plan blocks launch"
+        );
+        find_button_by_text(&container, "+ Add reviewer")
             .unwrap()
             .click();
         next_tick().await;
         let writes = recorded_settings_write_ops(&calls);
         let added = writes.last().unwrap();
-        assert_eq!(added["path"], "/review/lite");
+        assert_eq!(added["path"], "/review/team/reviewers");
         let reviewers: Vec<settings_model::ReviewReviewerConfig> =
             serde_json::from_value(added["value"].clone()).unwrap();
         assert_eq!(reviewers.len(), 2);
         assert_ne!(reviewers[0].id, reviewers[1].id);
-        state
-            .host_settings_by_host
-            .update(|hosts| hosts.get_mut(&host).unwrap().review.lite = reviewers.clone());
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().review.team.reviewers = reviewers.clone()
+        });
         next_tick().await;
         assert!(
             container.text_content().unwrap().contains("Reviewer 2"),
@@ -19846,18 +19876,21 @@ mod wasm_tests {
         assert_eq!(
             state.host_settings_by_host.get_untracked()[&host]
                 .review
-                .heavy,
-            initial.heavy
+                .saved_reviewer_selections,
+            initial.saved_reviewer_selections
         );
-        find_button_by_text(&container, "Remove Lite reviewer")
+        container
+            .query_selector("button[aria-label='Remove reviewer']")
             .unwrap()
+            .unwrap()
+            .unchecked_into::<HtmlElement>()
             .click();
         next_tick().await;
         let writes = recorded_settings_write_ops(&calls);
         let removed = writes.last().unwrap();
-        assert_eq!(removed["path"], "/review/lite");
+        assert_eq!(removed["path"], "/review/team");
         let remaining: Vec<settings_model::ReviewReviewerConfig> =
-            serde_json::from_value(removed["value"].clone()).unwrap();
+            serde_json::from_value(removed["value"]["reviewers"].clone()).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(
             remaining[0].id, reviewers[1].id,
@@ -19865,9 +19898,9 @@ mod wasm_tests {
         );
         state
             .host_settings_by_host
-            .update(|hosts| hosts.get_mut(&host).unwrap().review.lite = remaining);
+            .update(|hosts| hosts.get_mut(&host).unwrap().review.team.reviewers = remaining);
         next_tick().await;
-        find_button_by_text(&container, "Configure Heavy reviewer")
+        find_button_by_text(&container, "Configure reviewer")
             .unwrap()
             .click();
         next_tick().await;
@@ -19879,29 +19912,30 @@ mod wasm_tests {
             dialog
                 .text_content()
                 .unwrap()
-                .contains("Inherit the host default backend")
+                .contains("Inherit the author’s backend, model and native context")
         );
         find_button_by_text(&container, "Save execution settings")
             .unwrap()
             .click();
         next_tick().await;
         let writes = recorded_settings_write_ops(&calls);
-        assert_eq!(writes.last().unwrap()["path"], "/review/heavy/0");
-        assert_eq!(writes.last().unwrap()["value"]["target"]["kind"], "default");
-        let mode: HtmlSelectElement = container
-            .query_selector("[aria-label='Default review depth']")
+        assert_eq!(writes.last().unwrap()["path"], "/review/team/reviewers/0");
+        assert_eq!(
+            writes.last().unwrap()["value"]["target"]["kind"],
+            "fork_current_agent"
+        );
+        let modes = container
+            .query_selector("[aria-label='Review mode']")
             .unwrap()
-            .unwrap()
-            .dyn_into()
             .unwrap();
-        assert!(mode.text_content().unwrap().contains("Lite"));
-        assert!(mode.text_content().unwrap().contains("Heavy"));
-        mode.set_value("deep");
-        dispatch_event_from_js(mode.unchecked_ref(), "change", None);
+        assert!(modes.text_content().unwrap().contains("Inline"));
+        assert!(modes.text_content().unwrap().contains("Single reviewer"));
+        assert!(modes.text_content().unwrap().contains("Review team"));
+        find_button_by_text(&container, "Inline").unwrap().click();
         next_tick().await;
         let writes = recorded_settings_write_ops(&calls);
         assert_eq!(writes.last().unwrap()["path"], "/review/default_mode");
-        assert_eq!(writes.last().unwrap()["value"], "deep");
+        assert_eq!(writes.last().unwrap()["value"], "inline");
         let assert_button_surface = |button: &web_sys::HtmlElement| {
             let rect = button.get_bounding_client_rect();
             let computed = web_sys::window()
@@ -20111,6 +20145,56 @@ mod wasm_tests {
                 .text_content()
                 .unwrap()
                 .contains("Regression coverage")
+        );
+
+        let original_host_settings = state
+            .host_settings_by_host
+            .with_untracked(|hosts| hosts[&host].clone());
+        state.host_settings_by_host.update(|hosts| {
+            hosts.insert("other-review-host".to_owned(), original_host_settings);
+        });
+        find_button_by_text(&container, "+ Add aspect")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let name: HtmlInputElement = editor
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        set_input_value(&name, "Host-specific draft");
+        let instructions: web_sys::HtmlTextAreaElement = editor
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        instructions.set_value("Keep this guidance on its originating host");
+        dispatch_event_from_js(instructions.unchecked_ref(), "input", None);
+        next_tick().await;
+        let old_save = find_button_by_text(&container, "Save aspect").unwrap();
+        let before_switch = recorded_settings_write_ops(&calls).len();
+        state
+            .selected_host_id
+            .set(Some("other-review-host".to_owned()));
+        old_save.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_none(),
+            "Changing hosts must close an aspect draft"
+        );
+        assert_eq!(
+            recorded_settings_write_ops(&calls).len(),
+            before_switch,
+            "A retained editor must never save into another host"
         );
         drop(handle);
         container.remove();

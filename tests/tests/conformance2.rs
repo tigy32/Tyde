@@ -1997,6 +1997,84 @@ async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+async fn real_review_context_forks<B: Backend>(host: &mut Harness<B>) {
+    let author_word = format!("AUTHOR_{}", uuid::Uuid::new_v4().simple());
+    let private_word = format!("REVIEWER_{}", uuid::Uuid::new_v4().simple());
+    let prompt = remember_prompt(&author_word);
+    let author = spawn_agent(host, &prompt).await;
+    let started = collect_turn(host, &author, &prompt).await;
+    assert!(
+        started.final_text().contains(MEMORIZED_MARKER),
+        "Author must settle its context before forking"
+    );
+    let inherited = read_session_settings(host).await;
+    assert_clean_close(host, &author).await;
+    host.config.session_settings = Some(inherited.clone());
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    let prompt = format!(
+        "Recall the original codeword I asked you to remember. Also remember a separate reviewer-only codeword {private_word}; never write it to a file. Reply with the original codeword and REVIEWER_READY. Do not use any tools."
+    );
+    let first = fork_agent(host, &author.session_id, &prompt).await;
+    assert!(
+        first.session_id != author.session_id,
+        "Review fork must have an independent native identity"
+    );
+    let first_turn = collect_turn(host, &first, &prompt).await;
+    assert!(
+        first_turn.final_text().contains(&author_word),
+        "A fresh session or transcript-only presentation cannot satisfy inherited model context"
+    );
+    assert_eq!(
+        first_turn.tool_requests().count(),
+        0,
+        "Review context recall must not read files or invoke tools"
+    );
+    assert!(
+        read_session_settings(host).await.0.get("model") == inherited.0.get("model"),
+        "Reviewer must inherit the author's selected model"
+    );
+    assert_clean_close(host, &first).await;
+    let prompt = "Recall the original codeword. If a reviewer-only codeword was also supplied in this conversation, include it; otherwise include NO_REVIEWER_CODEWORD. Do not use tools.";
+    let second = fork_agent(host, &author.session_id, prompt).await;
+    assert!(
+        second.session_id != author.session_id && second.session_id != first.session_id,
+        "Each aspect combination needs its own independent author-context fork"
+    );
+    let second_turn = collect_turn(host, &second, prompt).await;
+    assert!(
+        second_turn.final_text().contains(&author_word),
+        "Sibling must inherit original author context"
+    );
+    assert!(
+        second_turn.final_text().contains("NO_REVIEWER_CODEWORD")
+            && !second_turn.final_text().contains(&private_word),
+        "Sibling forks must not inherit another reviewer's private turn"
+    );
+    assert_eq!(second_turn.tool_requests().count(), 0);
+    assert_clean_close(host, &second).await;
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::Unrestricted;
+    let resumed = resume_agent(host, &author.session_id).await;
+    let author_turn = ask(host, &resumed, prompt).await;
+    assert!(
+        author_turn.final_text().contains(&author_word)
+            && author_turn.final_text().contains("NO_REVIEWER_CODEWORD")
+            && !author_turn.final_text().contains(&private_word),
+        "Review forks must leave author context unchanged"
+    );
+    assert_eq!(author_turn.tool_requests().count(), 0);
+    assert_clean_close(host, &resumed).await;
+    assert_universal_contract(&[started, first_turn, second_turn, author_turn]);
+}
+conformance2_scenario!(
+    real_review_context_forks,
+    [
+        BackendCapability::ForkSession,
+        BackendCapability::ResumeSession,
+        BackendCapability::SessionSettings,
+        BackendCapability::EnforcedReadOnly
+    ]
+);
+
 async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
     host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
     host.config.resolved_spawn_config.excluded_tool_categories =

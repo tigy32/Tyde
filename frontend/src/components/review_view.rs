@@ -465,9 +465,9 @@ pub(crate) fn ReviewSidebar(
         let ai_reason = ai_reason.clone();
         move || !ai_reason().is_empty()
     };
-    let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
+    let dialog_open = RwSignal::new(false);
     let live_for_run_ai = live_for_ai;
-    let on_run_ai = move |_| {
+    let on_run_ai = move |plan: protocol::ReviewPlan| {
         let rid = review_for_ai.clone();
         // Mirror the disabled gate: never spawn a reviewer when the extra
         // gate forbids it (e.g. no reviewable changes — empty diff).
@@ -524,7 +524,9 @@ pub(crate) fn ReviewSidebar(
         let target_rid = rid.clone();
         spawn_local(async move {
             let payload = ReviewActionPayload::StartAiReview {
-                mode: review_mode.get_untracked(),
+                author_agent_id: plan.author_agent_id.clone(),
+                expected_plan: Some(Box::new(plan.clone())),
+                mode: Some(plan.mode),
                 backend_kind: None,
                 cost_hint: cost,
                 instructions: inst,
@@ -756,11 +758,14 @@ pub(crate) fn ReviewSidebar(
             }
         });
     };
+    let dialog_host = host_id.clone();
+    let dialog_review = review_id.clone();
+    let start_review = Callback::new(on_run_ai);
     view! {
         <div class="review-sidebar">
+            {move || dialog_open.get().then(|| view! { <ReviewDialog host_id=dialog_host.clone() review_id=dialog_review.clone() on_start=start_review on_close=Callback::new(move |()| dialog_open.set(false)) /> })}
             <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Review(host_id.clone(), review_id.clone())] />
             <div class="review-sidebar-section">
-                <ReviewModePicker selection=review_mode />
                 <div class="review-ai-row">
                     <button
                         class="review-btn primary review-run-ai-btn"
@@ -772,7 +777,8 @@ pub(crate) fn ReviewSidebar(
                             // the user should always see the reviewer's
                             // current configuration when they kick it off.
                             ai_disclosure_open.set(true);
-                            on_run_ai(ev);
+                            let _ = ev;
+                            dialog_open.set(true);
                         }
                     >
                         {move || if configuration.get().is_some_and(|s| !s.aspects.is_empty()) { "Run review" } else { "Run AI reviewer" }}
@@ -2463,7 +2469,7 @@ fn ReviewRounds(review: Review) -> impl IntoView {
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
+pub(crate) mod wasm_tests {
     use super::*;
     use crate::state::AgentInfo;
     use crate::wasm_test_support::Mounted;
@@ -2724,7 +2730,7 @@ mod wasm_tests {
             review.ai_reviewer.rounds.push(protocol::ReviewRound {
                 request_id: None,
                 id: id.to_owned(),
-                mode: Some(protocol::ReviewMode::Light),
+                mode: Some(protocol::ReviewMode::ReviewTeam),
                 snapshot_id: None,
                 scope: protocol::ReviewAiScope::WorkingTree,
                 started_at_ms: 1,
@@ -3822,6 +3828,10 @@ mod wasm_tests {
         default: Option<BackendKind>,
         enabled: Vec<BackendKind>,
     ) {
+        state.selected_host_id.set(Some("h1".to_owned()));
+        state.host_streams.update(|hosts| {
+            hosts.insert("h1".to_owned(), StreamPath("/host/h1".to_owned()));
+        });
         state.host_settings_by_host.update(|m| {
             m.insert(
                 "h1".to_owned(),
@@ -4132,69 +4142,319 @@ mod wasm_tests {
         );
     }
 
-    /// Default AI review delegates backend choice to the server: with no
-    /// explicit picker selection, `StartAiReview.backend_kind` is `null`.
+    pub(crate) fn publish_default_review_plan(state: &AppState, host: &str, review: &ReviewId) {
+        let settings = state.host_settings_untracked(host).unwrap();
+        let plan = protocol::ReviewPlan {
+            mode: settings.review.default_mode,
+            configuration: settings.review,
+            default_backend: settings.default_backend,
+            enabled_backends: settings.enabled_backends,
+            author_agent_id: None,
+            layout: protocol::ReviewTeamLayout::PerReviewer,
+            layout_counts: vec![
+                protocol::ReviewLayoutCount {
+                    layout: protocol::ReviewTeamLayout::PerAspect,
+                    agent_count: 0,
+                },
+                protocol::ReviewLayoutCount {
+                    layout: protocol::ReviewTeamLayout::PerReviewer,
+                    agent_count: 1,
+                },
+                protocol::ReviewLayoutCount {
+                    layout: protocol::ReviewTeamLayout::EveryCombination,
+                    agent_count: 0,
+                },
+            ],
+            fork_capability: protocol::ReviewForkCapability::Unsupported {
+                reason: "Choose the authoring agent".to_owned(),
+            },
+            assignments: vec![protocol::ReviewAssignment {
+                reviewer_id: protocol::ReviewReviewerId("default".to_owned()),
+                name: "AI Review".to_owned(),
+                target: protocol::ReviewReviewerTarget::Default,
+                backend_kind: settings.default_backend.unwrap(),
+                session_settings: Default::default(),
+                aspects: Vec::new(),
+                fork_from_session_id: None,
+            }],
+            aspects: Vec::new(),
+            unavailable_reason: None,
+        };
+        publish_review_plan(state, host, review, plan);
+    }
+
+    fn publish_review_plan(
+        state: &AppState,
+        host: &str,
+        review: &ReviewId,
+        plan: protocol::ReviewPlan,
+    ) {
+        let event = protocol::Envelope::from_payload(
+            protocol::StreamPath(format!("/review/{}", review.0)),
+            protocol::FrameKind::ReviewEvent,
+            0,
+            &protocol::ReviewEventPayload::Plan { plan },
+        )
+        .unwrap();
+        crate::dispatch::clear_stream_seq_for_tests(host, &event.stream);
+        crate::dispatch::dispatch_envelope(state, host, event);
+    }
+
     #[wasm_bindgen_test]
-    async fn run_ai_sends_none_backend_by_default() {
+    async fn review_dialog_uses_server_preview_and_rejects_stale_configuration() {
         ensure_styles_loaded();
         record_bridge();
         let container = make_container();
         let holder = mount_sidebar(container.clone(), make_review());
-        // A default backend exists so Run AI is enabled, but the user makes
-        // no explicit pick.
-        seed_host_settings(
-            &holder.borrow().clone().unwrap(),
-            Some(BackendKind::Codex),
-            vec![BackendKind::Codex],
-        );
-        next_tick().await;
-        next_tick().await;
-
-        let run_btn =
-            find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
-        run_btn.click();
-        next_tick().await;
-
-        wasm_bindgen_test::console_log!(
-            "Review launch button disabled={}",
-            run_btn.has_attribute("disabled")
-        );
-        let sent = sent_lines_joined();
-        assert!(
-            sent.contains("start_ai_review"),
-            "a StartAiReview frame must be sent; sent: {sent}"
-        );
-        // `backend_kind: None` is omitted from the wire (skip_serializing_if),
-        // so the default path carries no concrete backend — the server picks.
-        assert!(
-            !sent.contains("\"backend_kind\""),
-            "default AI review must omit backend_kind (server resolves the \
-             default); sent: {sent}"
-        );
-        assert!(
-            sent.contains("\"mode\":null"),
-            "No depth override delegates to host settings"
-        );
         let state = holder.borrow().clone().unwrap();
+        seed_host_settings(&state, Some(BackendKind::Codex), vec![BackendKind::Codex]);
+        next_tick().await;
+        find_button_by_text(&container, "Run AI reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(sent_lines_joined().contains("\"kind\":\"preview\""));
+        assert!(
+            !sent_lines_joined().contains("start_ai_review"),
+            "Opening configuration must not launch reviewers"
+        );
+        let start = find_button_by_text(&container, "Start review").unwrap();
+        assert!(
+            start.has_attribute("disabled"),
+            "No schedule is invented before the server preview"
+        );
+        publish_default_review_plan(&state, "h1", &make_review().id);
+        next_tick().await;
+        assert!(!start.has_attribute("disabled"));
+        state
+            .host_settings_by_host
+            .update(|hosts| hosts.get_mut("h1").unwrap().default_backend = None);
+        next_tick().await;
+        assert!(
+            start.has_attribute("disabled"),
+            "A host default change must invalidate its resolved source preview"
+        );
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("h1").unwrap().default_backend = Some(BackendKind::Codex)
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("0 aspects · 1 agents")
+        );
+        start.click();
+        next_tick().await;
+        let sent = sent_lines_joined();
+        assert!(sent.contains("start_ai_review") && sent.contains("\"expected_plan\""));
+        let lines: Vec<protocol::Envelope> = sent
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let action: protocol::ReviewActionPayload = lines
+            .iter()
+            .rev()
+            .find(|line| line.kind == FrameKind::ReviewAction)
+            .unwrap()
+            .parse_payload()
+            .unwrap();
+        assert!(
+            matches!(
+                action,
+                protocol::ReviewActionPayload::StartAiReview {
+                    backend_kind: None,
+                    mode: Some(protocol::ReviewMode::ReviewTeam),
+                    expected_plan: Some(_),
+                    ..
+                }
+            ),
+            "Start must preserve the server-owned sources, not override a backend"
+        );
         state
             .review_action_pending
             .update(|pending| pending.clear());
-        let picker: web_sys::HtmlSelectElement = container
-            .query_selector("[aria-label='Review depth']")
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("h1").unwrap().review.default_mode = protocol::ReviewMode::SingleReviewer
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Run AI reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let start = find_button_by_text(&container, "Start review").unwrap();
+        assert!(
+            start.has_attribute("disabled"),
+            "Changing mode invalidates the previous preview"
+        );
+        let mut plan = state.review_plans.get_untracked()[&make_review().id].clone();
+        plan.mode = protocol::ReviewMode::SingleReviewer;
+        plan.configuration = state.host_settings_untracked("h1").unwrap().review;
+        plan.assignments.clear();
+        plan.unavailable_reason = Some(
+            "This backend cannot fork a native context. Use Inline or an explicit team source."
+                .to_owned(),
+        );
+        publish_review_plan(&state, "h1", &make_review().id, plan.clone());
+        next_tick().await;
+        assert!(start.has_attribute("disabled"));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Use Inline or an explicit team source")
+        );
+        assert!(
+            container
+                .query_selector("[aria-label='Reviewer source']")
+                .unwrap()
+                .is_none(),
+            "Single reviewer has no separate model/source picker"
+        );
+        find_button_by_text(&container, "Cancel").unwrap().click();
+        next_tick().await;
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("h1").unwrap().review.default_mode = protocol::ReviewMode::Inline
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Run AI reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        plan.mode = protocol::ReviewMode::Inline;
+        plan.configuration = state.host_settings_untracked("h1").unwrap().review;
+        plan.unavailable_reason = None;
+        publish_review_plan(&state, "h1", &make_review().id, plan);
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("No reviewer agents or panel findings")
+        );
+
+        find_button_by_text(&container, "+ Add aspect")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[aria-label='Close review editor']")
+            .unwrap()
+            .unwrap()
+            .closest("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let name: web_sys::HtmlInputElement = editor
+            .query_selector("input")
             .unwrap()
             .unwrap()
             .dyn_into()
             .unwrap();
-        picker.set_value("deep");
-        picker
-            .dispatch_event(&web_sys::Event::new("change").unwrap())
+        name.set_value("Trust boundaries");
+        name.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let guidance: web_sys::HtmlTextAreaElement = editor
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        guidance.set_value("Inspect each privilege boundary");
+        guidance
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
         next_tick().await;
-        run_btn.click();
+        find_button_by_text(&container, "Save aspect")
+            .unwrap()
+            .click();
         next_tick().await;
+        let writes: Vec<protocol::Envelope> = sent_lines_joined()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|e: &protocol::Envelope| e.kind == FrameKind::SettingsWrite)
+            .collect();
+        let write: serde_json::Value =
+            serde_json::to_value(&writes.last().unwrap().payload).unwrap();
+        let op = &write["ops"][0];
+        let path = op["path"].as_str().unwrap();
+        let id = path.strip_prefix("/review/aspects/").unwrap().to_owned();
+        let aspect: protocol::ReviewAspectConfig =
+            serde_json::from_value(op["value"].clone()).unwrap();
+        assert_eq!(aspect.instructions, "Inspect each privilege boundary");
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut("h1")
+                .unwrap()
+                .review
+                .aspects
+                .insert(id.clone(), aspect);
+        });
+        next_tick().await;
+        let edit: web_sys::HtmlElement = container
+            .query_selector("[aria-label='Edit Trust boundaries']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        edit.focus().unwrap();
+        edit.click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[aria-label='Close review editor']")
+            .unwrap()
+            .unwrap()
+            .closest("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let name: web_sys::HtmlInputElement = editor
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(name.value(), "Trust boundaries");
         assert!(
-            sent_lines_joined().contains("\"mode\":\"deep\""),
-            "The selected depth must reach the review launch request"
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&name))
+        );
+        name.set_value("Security");
+        name.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let guidance: web_sys::HtmlTextAreaElement = editor
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(guidance.value(), "Inspect each privilege boundary");
+        guidance.set_value("Inspect authentication and authorization");
+        guidance
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        find_button_by_text(&container, "Save aspect")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let writes: Vec<protocol::Envelope> = sent_lines_joined()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|e: &protocol::Envelope| e.kind == FrameKind::SettingsWrite)
+            .collect();
+        let write: serde_json::Value =
+            serde_json::to_value(&writes.last().unwrap().payload).unwrap();
+        assert_eq!(
+            write["ops"][0]["path"], path,
+            "Editing retains the canonical aspect identity"
+        );
+        assert_eq!(
+            write["ops"][0]["value"]["instructions"],
+            "Inspect authentication and authorization"
         );
     }
 
@@ -4221,22 +4481,33 @@ mod wasm_tests {
                 .is_none(),
             "Backend choices belong to the independent mode lists, not this launch form"
         );
-        let mode = container
-            .query_selector("[aria-label='Review depth']")
-            .unwrap()
-            .unwrap();
-        let labels = mode.text_content().unwrap();
-        assert!(labels.contains("Lite") && labels.contains("Heavy"));
         find_button_by_text(&container, "Run AI reviewer")
             .unwrap()
             .click();
         next_tick().await;
-        let sent = sent_lines_joined();
-        assert!(sent.contains("start_ai_review"));
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let text = dialog.text_content().unwrap();
         assert!(
-            !sent.contains("\"backend_kind\""),
-            "Review launch must preserve the server-owned reviewer lists"
+            text.contains("Inline")
+                && text.contains("Single reviewer")
+                && text.contains("Review team")
         );
+        assert!(
+            text.contains("Per aspect")
+                && text.contains("Per reviewer")
+                && text.contains("Every combination")
+        );
+        let state = holder.borrow().clone().unwrap();
+        publish_default_review_plan(&state, "h1", &make_review().id);
+        next_tick().await;
+        find_button_by_text(&container, "Start review")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(sent_lines_joined().contains("start_ai_review"));
     }
 
     /// Helper: locate a button whose visible text contains `needle`.
@@ -4327,7 +4598,7 @@ mod wasm_tests {
     async fn main_review_actions_run_ai_targets_workspace_review() {
         record_bridge();
         let container = make_container();
-        let _mounted = mount_review_actions_surface(
+        let holder = mount_review_actions_surface(
             container.clone(),
             vec![dirty_root("/repo-a"), dirty_root("/repo-b")],
             make_review(),
@@ -4356,10 +4627,17 @@ mod wasm_tests {
         btn.click();
         next_tick().await;
 
+        let state = holder.borrow().clone().unwrap();
+        publish_default_review_plan(&state, "h1", &make_review().id);
+        next_tick().await;
+        find_button_by_text(&container, "Start review")
+            .unwrap()
+            .click();
+        next_tick().await;
         let sent = sent_lines_joined();
         assert!(
             sent.contains("start_ai_review"),
-            "Run AI must send a StartAiReview action; sent: {sent}"
+            "Confirmed review must send StartAiReview on the workspace stream"
         );
         let expected_stream = format!("/review/{}", make_review().id.0);
         assert!(
@@ -4500,14 +4778,231 @@ mod wasm_tests {
 }
 
 #[component]
-pub(crate) fn ReviewModePicker(selection: RwSignal<Option<protocol::ReviewMode>>) -> impl IntoView {
+pub(crate) fn ReviewDialog(
+    host_id: String,
+    review_id: ReviewId,
+    on_start: Callback<protocol::ReviewPlan>,
+    on_close: Callback<()>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let project_state = state.clone();
+    let project_review = review_id.clone();
+    let project = Memo::new(move |_| {
+        project_state
+            .reviews
+            .with(|reviews| reviews.get(&project_review).map(|r| r.project_id.clone()))
+    });
+    let author = RwSignal::new(
+        state
+            .active_agent
+            .get_untracked()
+            .filter(|a| {
+                a.host_id == host_id
+                    && state.agents.with_untracked(|agents| {
+                        agents.iter().any(|agent| {
+                            agent.agent_id == a.agent_id
+                                && agent.project_id == project.get_untracked()
+                        })
+                    })
+            })
+            .map(|a| a.agent_id),
+    );
+    let settings_state = state.clone();
+    let settings_host = host_id.clone();
+    let configuration = Memo::new(move |_| {
+        settings_state
+            .host_settings_by_host
+            .with(|hosts| hosts.get(&settings_host).map(|s| s.review.clone()))
+    });
+    let environment_state = state.clone();
+    let environment_host = host_id.clone();
+    let launch_environment = Memo::new(move |_| {
+        environment_state.host_settings_by_host.with(|hosts| {
+            hosts
+                .get(&environment_host)
+                .map(|settings| (settings.default_backend, settings.enabled_backends.clone()))
+        })
+    });
+    let plan_state = state.clone();
+    let plan_review = review_id.clone();
+    let context_state = state.clone();
+    let context_host = host_id.clone();
+    let author_context = Memo::new(move |_| {
+        author.get().and_then(|id| {
+            context_state.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.host_id == context_host && agent.agent_id == id)
+                    .map(|agent| {
+                        (
+                            agent.session_id.clone(),
+                            agent.backend_kind,
+                            context_state
+                                .agent_session_settings
+                                .with(|settings| settings.get(&id).cloned()),
+                        )
+                    })
+            })
+        })
+    });
+    let plan = Memo::new(move |_| {
+        plan_state.review_plans.with(|plans| {
+            plans
+                .get(&plan_review)
+                .filter(|p| {
+                    Some(&p.configuration) == configuration.get().as_ref()
+                        && Some((p.default_backend, p.enabled_backends.clone()))
+                            == launch_environment.get()
+                        && p.author_agent_id == author.get()
+                        && match (&p.fork_capability, author_context.get()) {
+                            (
+                                protocol::ReviewForkCapability::Supported {
+                                    session_id,
+                                    backend_kind,
+                                    session_settings,
+                                },
+                                Some((session, backend, settings)),
+                            ) => {
+                                session.as_ref() == Some(session_id)
+                                    && backend == *backend_kind
+                                    && settings
+                                        .as_ref()
+                                        .is_none_or(|settings| settings == session_settings)
+                            }
+                            _ => true,
+                        }
+                })
+                .cloned()
+        })
+    });
+    let preview_host = host_id.clone();
+    let preview_review = review_id.clone();
+    Effect::new(move |_| {
+        let Some(configuration) = configuration.get() else {
+            return;
+        };
+        let author_agent_id = author.get();
+        author_context.track();
+        launch_environment.track();
+        let host = preview_host.clone();
+        let review = preview_review.clone();
+        spawn_local(async move {
+            if let Err(error) = send_review_action_inner(
+                &host,
+                review,
+                ReviewActionPayload::Preview {
+                    mode: configuration.default_mode,
+                    author_agent_id,
+                },
+            )
+            .await
+            {
+                log::error!("Could not request review preview: {error}");
+            }
+        });
+    });
+    let selection_state = state.clone();
+    let selected_host = host_id.clone();
+    let host_matches =
+        Memo::new(move |_| selection_state.selected_host_id.get().as_ref() == Some(&selected_host));
+    let author_state = state.clone();
+    let author_host = host_id.clone();
+    let modal = NodeRef::<leptos::html::Div>::new();
+    let cancel = NodeRef::<leptos::html::Button>::new();
+    let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> = StoredValue::new_local(
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|e| e.dyn_into().ok()),
+    );
+    Effect::new(move |_| {
+        if let Some(button) = cancel.get() {
+            let _ = button.focus();
+        }
+    });
+    on_cleanup(move || {
+        if let Some(opener) = opener.get_value() {
+            let _ = opener.focus();
+        }
+    });
+    let on_key = move |ev: web_sys::KeyboardEvent| {
+        let Some(dialog) = modal.get() else {
+            return;
+        };
+        // Nested aspect/source editors own their own focus and Escape handling.
+        if ev
+            .target()
+            .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
+            .and_then(|e| e.closest("[role='dialog']").ok().flatten())
+            .is_some_and(|e| !e.is_same_node(Some(&dialog)))
+        {
+            return;
+        }
+        if ev.key() == "Escape" {
+            ev.prevent_default();
+            ev.stop_propagation();
+            on_close.run(());
+        }
+        if ev.key() == "Tab" {
+            let Ok(nodes) = dialog.query_selector_all("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])") else { return; };
+            let first = nodes
+                .item(0)
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+            let last = nodes
+                .item(nodes.length().saturating_sub(1))
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+            let active = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element());
+            if let (Some(first), Some(last), Some(active)) = (first, last, active) {
+                if ev.shift_key() && active.is_same_node(Some(&first)) {
+                    ev.prevent_default();
+                    let _ = last.focus();
+                } else if !ev.shift_key() && active.is_same_node(Some(&last)) {
+                    ev.prevent_default();
+                    let _ = first.focus();
+                }
+            }
+        }
+    };
     view! {
-        <select class="review-backend-select" aria-label="Review depth"
-            prop:value=move || match selection.get() { None => "", Some(protocol::ReviewMode::Light) => "light", Some(protocol::ReviewMode::Deep) => "deep" }
-            on:change=move |ev| selection.set(match event_target_value(&ev).as_str() { "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None })>
-            <option value="">"Default review depth"</option>
-            <option value="light">"Lite · each reviewer covers all aspects"</option>
-            <option value="deep">"Heavy · each reviewer per aspect"</option>
-        </select>
+        <div class="settings-confirm-overlay">
+            <div class="review-dialog" role="dialog" aria-modal="true" aria-label="Review" node_ref=modal on:keydown=on_key>
+                <header><h2>"Review"</h2><button type="button" class="settings-btn" aria-label="Close review" on:click=move |_| on_close.run(())>"×"</button></header>
+                <div class="review-dialog-body">
+                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Review(host_id.clone(), review_id.clone())] />
+                    <label class="review-author-picker"><span>"Authoring agent"</span><select class="settings-select" aria-label="Authoring agent" prop:value=move || author.get().map(|id| id.0).unwrap_or_default()
+                        on:change=move |ev| { let id = event_target_value(&ev); author.set((!id.is_empty()).then_some(protocol::AgentId(id))); }>
+                        <option value="">"Choose author (required for Inline / forks)"</option>
+                        {move || author_state.agents.get().into_iter().filter(|a| a.host_id == author_host && project.get().is_some() && a.project_id == project.get()).map(|a| view! { <option value=a.agent_id.0>{a.name}</option> }).collect_view()}
+                    </select></label>
+                    <Show when=move || host_matches.get() fallback=|| view! { <p role="alert">"Select this review’s host before editing its configuration."</p> }>
+                        <crate::components::settings_panel::ReviewConfigurationFields compact=true plan=Signal::derive(move || plan.get()) />
+                    </Show>
+                    <section class="review-team-preview" aria-label="Team preview">
+                        <h3>"Team preview"</h3>
+                        {move || plan.get().map(|p| {
+                            if p.mode == protocol::ReviewMode::Inline {
+                                view! { <p>"Self-review in the author’s existing context. No reviewer agents or panel findings."</p> }.into_any()
+                            } else {
+                                p.assignments.into_iter().map(|assignment| {
+                                    let aspects = assignment.aspects.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+                                    let actual_source = crate::components::settings_panel::review_source_label(&protocol::ReviewReviewerTarget::Explicit { backend_kind: assignment.backend_kind, session_settings: assignment.session_settings });
+                                    let source = if assignment.target == protocol::ReviewReviewerTarget::ForkCurrentAgent { format!("Fork current agent · {actual_source}") } else { actual_source };
+                                    view! { <div class="review-preview-row"><span>{if aspects.is_empty() { "General review".to_owned() } else { aspects }}</span><span>{source}</span></div> }
+                                }).collect_view().into_any()
+                            }
+                        })}
+                        <p role="status">{move || plan.get().and_then(|p| p.unavailable_reason).unwrap_or_else(|| if plan.get().is_none() { "Updating preview…".to_owned() } else { String::new() })}</p>
+                    </section>
+                </div>
+                <footer><span>{move || plan.get().map(|p| format!("{} aspects · {} agents", p.aspects.len(), p.assignments.len()))}</span>
+                    <button type="button" class="settings-btn" node_ref=cancel on:click=move |_| on_close.run(())>"Cancel"</button>
+                    <button type="button" class="settings-btn settings-btn-primary" disabled=move || !host_matches.get() || plan.get().is_none_or(|p| p.unavailable_reason.is_some()) on:click=move |_| {
+                        if let Some(plan) = plan.get_untracked().filter(|p| p.unavailable_reason.is_none()) { on_start.run(plan); on_close.run(()); }
+                    }>"Start review"</button>
+                </footer>
+            </div>
+        </div>
     }
 }

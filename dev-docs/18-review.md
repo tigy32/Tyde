@@ -426,16 +426,65 @@ files, Git status, diffs, review comments, or review navigation.
 ### AI review
 
 `StartAiReview` and the canonical `tyde_review` tool accept optional
-`mode: light | deep` (displayed Lite / Heavy). Omitting mode uses the configured
-default. Lite preserves one independent reviewer per configured entry, with all
-enabled aspects. Heavy preserves one independent reviewer per entry/aspect.
-Configured models and settings remain independent, including same-backend
-reviewers. Per-run backend overrides are rejected.
+`mode: inline | single_reviewer | review_team`. Omitting mode uses the
+configured default. The matte Review dialog edits that same host configuration,
+not temporary aspect definitions. Add aspect opens the name/guidance editor;
+each existing aspect has a keyboard/touch-accessible Edit action. Edits retain
+stable IDs, enabled state and prior finding/execution snapshots.
+
+- **Inline** returns every selected aspect's instructions to the current
+  authoring agent as tool guidance (or sends a review-origin prompt to the
+  explicitly selected author in the UI). It creates no reviewers, execution
+  records or panel findings. The author may fix issues and decide to proceed;
+  this is not completion certification.
+- **Single reviewer** makes one native author-context fork, inheriting its
+  backend/model, covering all selected aspects. No separate model picker.
+- **Review team** uses stable source entries under `/review/team/reviewers`.
+  A source is `fork_current_agent` or an explicit backend/session-settings
+  target. Preserved host-default selections remain editable. `per_aspect`
+  requires an explicit aspect-ID → reviewer-ID mapping in
+  `/review/team/aspect_assignments`; `per_reviewer` assigns all aspects to
+  each source; `every_combination` creates an independent source/aspect
+  reviewer. Three aspects and two sources therefore schedule six independent
+  reviewers, including three separate author-context forks if one source is
+  Fork current agent.
+
+`tyde_preview_review` and the UI's `Preview` action return the same typed
+`ReviewPlan` used to schedule work: assignments, counts, canonical
+configuration, fork capability and actionable unavailability. A UI launch
+carries its expected plan; changed configuration or author session rejects
+that launch instead of silently scheduling a different team. The server owns
+assignment selection and lifecycle. UI state only projects typed events.
+Settings tools expose `review_default_mode` and `review_team`; aspects remain
+managed by the existing list/upsert/delete tools and storage.
+
+Forks use `Backend::fork`, never transcript copying or fresh-provider
+substitution. Codex calls native `thread/fork` and Claude uses `--resume` with
+`--fork-session`; both provide separate provider identities. Primary API
+sources: [Codex fork protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)
+and [Claude CLI reference](https://code.claude.com/docs/en/cli-reference).
+Muse exposes native `session/fork` in its adapter but currently rejects
+`EnforcedReadOnly`, so protected review forks are explicitly unavailable.
+Other adapters without `ForkSession` are also explicitly unsupported. Installed
+provider incompatibility remains a typed startup failure, never a clean
+review or a fresh-spawn fallback. Forks consume tokens. The scoped
+`real_review_context_forks` conformance case verifies inherited model context,
+selected model, independent sibling identity, and author/sibling isolation
+against every backend declaring ForkSession, ResumeSession, SessionSettings
+and EnforcedReadOnly (currently Codex and Claude).
+
+Scoped provider evidence (2026-10-19): `real_review_context_forks` passed on
+Claude Haiku (`haiku`, low effort) and Codex GPT Luna (`gpt-5.6-luna`, low
+reasoning), nextest run `d8c1f4d9-8bba-4bfa-a231-9ce3f180d915`. Both tests
+completed in 21.453 seconds total after compilation. The scenario uses native
+fork/resume calls, never injected history, and requires tool-free recall of
+random author context, distinct native identities, inherited model settings,
+and absence of reviewer-private context in siblings and the resumed author.
 
 `tyde_review` lives only on the long-running agent-await MCP surface. Supply a
 caller-chosen `request_id` (1–128 bytes): a new ID requests work; repeating an ID
 reattaches to the same persisted execution even if its response was interrupted.
-The call launches configured reviewers, event-waits without a local work timer,
+For non-inline modes the call launches configured reviewers and event-waits without a local work timer,
 and returns only review ID, honest completed/incomplete/failed state, new finding
 count, outstanding count across all prior findings, and failure count. Completion
 means the reviewers finished, not approval or proof that all code was inspected.
@@ -475,15 +524,24 @@ are assigned an execution only where historical attribution is unambiguous.
 The UI retains its inline accept/reject/navigation and reviewer history.
 
 Before any typed settings read, startup migrates `review.agents` into aspects,
-then migrates legacy execution settings. Untouched Light (Codex, empty settings)
-and untouched Heavy (both empty) become singleton inherit-default lists, even
-when the old default mode was Heavy. Nondefault Light targets/settings remain
-explicit; customized Heavy retains its old Claude and Codex pair as ordinary
-entries. Explicitly selecting the old defaults is indistinguishable from never
-changing them and deliberately becomes inheritance. Aspect IDs, text, enabled
-flags and the selected default mode are retained. Migration is idempotent;
-obsolete setting writes fail rather than silently disappearing. Mixed legacy
-and new execution keys are rejected as ambiguous.
+then migrates legacy execution settings. Existing Lite selections become a
+per-reviewer team; Heavy selections become an every-combination team. Both
+old lists are preserved under `/review/saved_reviewer_selections`, including
+stable reviewer IDs, targets and model settings; the UI offers explicit
+restoration of either saved list. Earlier provider-specific defaults migrate
+as before: untouched defaults become a singleton host-default source;
+customized provider selections stay explicit. Aspect IDs, text, switches and
+finding history remain intact. Migration is idempotent. Historical light/deep
+mode values decode as team executions, with their frozen assignment snapshots
+unchanged. Legacy mode aliases on tool calls select the currently configured
+team layout; new callers use the canonical three names.
+
+Compatible follow-ups retain the existing reviewer-context key and reuse
+completed reviewers. Existing non-fork keys are not gratuitously invalidated;
+fork context keys additionally include their native source identity. Changed
+aspect guidance, source/model configuration or closed sessions invalidate only
+the affected contexts. Failed contexts stay failures until explicitly closed
+or reconfigured; no automatic replacement masks a failure.
 
 Reviewers use the workbench's exact project roots and enforced read-only access,
 with ordinary native read tools, read-only Git operations and review-feedback

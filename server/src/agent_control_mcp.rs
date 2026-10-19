@@ -1020,6 +1020,13 @@ struct ReviewToolInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ReviewPreviewInput {
+    #[serde(default)]
+    mode: Option<protocol::ReviewMode>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReviewPageInput {
     #[serde(default)]
     offset: usize,
@@ -1204,7 +1211,7 @@ pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> serde_json::
 #[tool_router]
 impl TydeAgentControlMcpServer {
     #[tool(
-        description = "Run the configured advisory reviewers and event-wait for completion, without a local work timer. Lite uses each reviewer for all aspects; Heavy preserves each reviewer/aspect assignment. Returns only review_id, completed/incomplete/failed status, new_finding_count and outstanding_count. Completed means reviewers finished, not approval or coverage. Use a new request_id for a follow-up; repeat the same request_id to reattach after cancellation without starting duplicate work. Findings are never injected into chat. List outstanding findings, read details by ID, edit text without resolving, or batch-resolve with concrete reasons. Failures are never clean reviews. Working tree is default; committed_range requires exact root/base_oid/tip_oid. No commits or stashes are created."
+        description = "Inline returns all selected aspect guidance to you for self-review, without spawning agents or creating findings. Single reviewer genuinely forks your native session, inheriting backend/model. Review team uses the configured source/layout schedule (per_aspect, per_reviewer, every_combination). Unsupported forks fail explicitly; no fresh-agent substitution. Use tyde_preview_review to inspect the actual schedule. Non-inline modes event-wait for advisory completion without a local work timer. Returns only review_id, completed/incomplete/failed status, new_finding_count and outstanding_count. Completed means reviewers finished, not approval or coverage. Use a new request_id for a follow-up; repeat the same request_id to reattach after cancellation without starting duplicate work. Findings are never injected into chat. List outstanding findings, read details by ID, edit text without resolving, or batch-resolve with concrete reasons. Failures are never clean reviews. Working tree is default; committed_range requires exact root/base_oid/tip_oid. No commits or stashes are created."
     )]
     async fn tyde_review(
         &self,
@@ -1217,6 +1224,19 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
+        match self
+            .host
+            .agent_inline_review_guidance(&caller, input.mode, &input.scope)
+            .await
+        {
+            Ok(Some(guidance)) => {
+                return ok_json(
+                    json!({"mode": "inline", "status": "guidance", "guidance": guidance}),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return Ok(err_text(error)),
+        }
         let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
             Arc::clone(&self.await_request_cancellations),
             caller.clone(),
@@ -1271,6 +1291,31 @@ impl TydeAgentControlMcpServer {
         match result {
             Ok(result) => ok_json(result),
             Err(failure) => failure.into_tool_result("tyde_review"),
+        }
+    }
+
+    #[tool(
+        description = "Preview the server-owned review schedule and native fork capability for your current project/author session. Returns canonical configuration, assignments, counts and actionable unsupported reasons. Does not run a review or spend model tokens."
+    )]
+    async fn tyde_preview_review(
+        &self,
+        Parameters(input): Parameters<ReviewPreviewInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_preview_review").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let Some(project) = self.host.project_id_for_agent(&caller).await else {
+            return Ok(err_text("Caller has no project"));
+        };
+        match self
+            .host
+            .review_plan(&project, Some(caller), input.mode)
+            .await
+        {
+            Ok(plan) => ok_json(plan),
+            Err(error) => Ok(err_text(error)),
         }
     }
 

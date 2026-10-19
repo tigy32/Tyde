@@ -1288,24 +1288,29 @@ projects at once.
   built in: **Default** (used whenever no other agent is picked — edit it to
   customize every plain chat), **Orchestrator** (coordinates multi-backend
   plan/implement/review workflows), and **Help** (you).
-- **Review aspects.** Settings → Review defines backend-independent focus
-  instructions. Lite mode runs each configured reviewer on all enabled aspects;
-  Heavy runs each reviewer separately per enabled aspect. Independent reviewer
-  lists live at /review/lite and /review/heavy; both initially contain one
-  reviewer inheriting the default backend and its settings at launch. Set the
-  default mode at /review/default_mode (wire values light or deep). The
-  `tyde_config_set_setting` variants are `review_default_mode` (mode) and
-  `review_reviewers` (mode, reviewers). Each reviewer has a stable id, name,
-  and target: {kind: "default"} or {kind: "explicit", backend_kind,
-  session_settings}. Multiple entries may use the same backend. Use
-  `tyde_config_list_review_aspects`, `tyde_config_upsert_review_aspect`, and
-  `tyde_config_delete_review_aspect` to manage them. Use `reviews_enabled` in
-  `tyde_config_set_setting` for the master switch. Never run a paid review just
-  to configure it. Coding agents call `tyde_request_review`; the selected mode
-  launches reviewers as its sub-agents. Await the returned review_id and round_id
-  with `tyde_await_review`, then read findings with `tyde_get_review`. Review
-  completion never injects conversation messages.
-  Agents can record dispositions and request another round after fixes.
+- **Reviews.** Settings → Review defines stable, backend-independent aspects
+  (name, description, instructions, enabled). Inline returns their guidance to
+  the author for self-review, with no reviewer agents or panel findings.
+  Single reviewer forks the author's native session and inherits backend/model.
+  Review team uses /review/team: layout is per_aspect (explicit
+  aspect_assignments from aspect ID to reviewer ID), per_reviewer (all aspects
+  per source), or every_combination (one independent source/aspect reviewer).
+  Sources have stable id, name, and target: {kind: "fork_current_agent"},
+  {kind: "explicit", backend_kind, session_settings}, or a preserved host
+  default selection {kind: "default"}. Forks consume tokens; unsupported
+  capabilities fail explicitly, never substitute a fresh agent.
+  Use tyde_preview_review for the server-owned assignments and capability.
+  Configure review_default_mode (inline, single_reviewer, review_team) and
+  review_team (team) through tyde_config_set_setting. Use
+  tyde_config_list_review_aspects, tyde_config_upsert_review_aspect, and
+  tyde_config_delete_review_aspect for canonical aspects. Edits retain IDs and
+  history. Use reviews_enabled for the master switch. Saved Lite/Heavy
+  reviewer selections remain available for explicit restoration.
+  tyde_review on the await server uses a stable request_id to reattach after
+  cancellation. Non-inline completion returns review_id and counts, not
+  approval. Findings never arrive as injected messages. List/read findings by
+  ID, edit text without resolving, and batch-resolve with concrete reasons.
+  A new request_id continues compatible reviewer contexts after fixes.
 - **Teams.** Settings-free multi-agent rosters: a manager coordinates report
   members, each with a role, personality, backend, and optional custom
   agent. Managed from the Teams panel.

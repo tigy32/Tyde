@@ -1136,6 +1136,28 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
     let picker_open = RwSignal::new(false);
 
     let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
+    let selected_author = RwSignal::new(None::<protocol::AgentId>);
+    let author_state = ctx.state.clone();
+    let author_host = ctx.host.clone();
+    let author_project = project.project_id.clone();
+    let authors = Memo::new(move |_| {
+        author_state.agents.with(|agents| {
+            agents
+                .iter()
+                .filter(|agent| {
+                    agent.local_host_id == author_host
+                        && agent.project_id.as_ref() == Some(&author_project)
+                        && agent.fatal_error.is_none()
+                })
+                .map(|agent| (agent.agent_id.clone(), agent.name.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    let author = Memo::new(move |_| {
+        selected_author
+            .get()
+            .filter(|id| authors.with(|agents| agents.iter().any(|(agent, _)| agent == id)))
+    });
     let ctx_ai = ctx.clone();
     let on_ai = Callback::new(move |_: ()| {
         let ctx = ctx_ai.clone();
@@ -1145,6 +1167,8 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                 &ctx.host,
                 ctx.review_id.clone(),
                 protocol::ReviewActionPayload::StartAiReview {
+                    author_agent_id: author.get_untracked(),
+                    expected_plan: None,
                     mode: review_mode.get_untracked(),
                     backend_kind: None,
                     cost_hint: None,
@@ -1203,11 +1227,26 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                     }
                 }}
             </div>
-            <label>"Review depth"
-                <select aria-label="Review depth" on:change=move |ev| review_mode.set(match event_target_value(&ev).as_str() {
-                    "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None,
+            <label>"Review mode"
+                <select aria-label="Review mode" on:change=move |ev| review_mode.set(match event_target_value(&ev).as_str() {
+                    "inline" => Some(protocol::ReviewMode::Inline),
+                    "single_reviewer" => Some(protocol::ReviewMode::SingleReviewer),
+                    "review_team" => Some(protocol::ReviewMode::ReviewTeam), _ => None,
                 })>
-                    <option value="">"Default"</option><option value="light">"Lite · all aspects per reviewer"</option><option value="deep">"Heavy · each reviewer per aspect"</option>
+                    <option value="">"Default"</option>
+                    <option value="inline">"Inline"</option>
+                    <option value="single_reviewer">"Single reviewer"</option>
+                    <option value="review_team">"Review team · configured layout"</option>
+                </select>
+            </label>
+            <label>"Authoring agent"
+                <select aria-label="Authoring agent" prop:value=move || author.get().map(|id| id.0).unwrap_or_default()
+                    on:change=move |ev| {
+                        let id = event_target_value(&ev);
+                        selected_author.set((!id.is_empty()).then_some(protocol::AgentId(id)));
+                    }>
+                    <option value="">"Choose author (required for Inline / forks)"</option>
+                    {move || authors.get().into_iter().map(|(id, name)| view! { <option value=id.0>{name}</option> }).collect_view()}
                 </select>
             </label>
             <div class="project-diff-review-actions">
@@ -2378,14 +2417,13 @@ mod wasm_tests {
         );
         assert!(sent.contains("\"mode\":null"));
         let picker: web_sys::HtmlSelectElement = container
-            .query_selector("[aria-label='Review depth']")
+            .query_selector("[aria-label='Review mode']")
             .unwrap()
             .unwrap()
             .dyn_into()
             .unwrap();
-        assert!(picker.text_content().unwrap().contains("Lite"));
-        assert!(picker.text_content().unwrap().contains("Heavy"));
-        picker.set_value("deep");
+        assert!(picker.text_content().unwrap().contains("Review team"));
+        picker.set_value("review_team");
         picker
             .dispatch_event(&web_sys::Event::new("change").unwrap())
             .unwrap();
@@ -2393,8 +2431,67 @@ mod wasm_tests {
         ai_btn.dyn_ref::<HtmlElement>().unwrap().click();
         next_tick().await;
         assert!(
-            sent_lines_joined().contains("\"mode\":\"deep\""),
-            "Mobile must send the selected review depth"
+            sent_lines_joined().contains("\"mode\":\"review_team\""),
+            "Mobile must send the selected review mode"
+        );
+
+        let state = holder.borrow().clone().unwrap();
+        state.agents.set(vec![
+            fixture_agent(&host, "p-1", "review-author", "Review author"),
+            fixture_agent(&host, "other-project", "wrong-project", "Other project"),
+            fixture_agent(
+                &LocalHostId("other-host".to_owned()),
+                "p-1",
+                "wrong-host",
+                "Other host",
+            ),
+        ]);
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().review.default_mode = protocol::ReviewMode::Inline;
+        });
+        next_tick().await;
+        let author: web_sys::HtmlSelectElement = container
+            .query_selector("[aria-label='Authoring agent']")
+            .unwrap()
+            .expect("author-dependent reviews need an explicit project author picker")
+            .dyn_into()
+            .unwrap();
+        let options = author.text_content().unwrap();
+        assert!(options.contains("Review author"));
+        assert!(!options.contains("Other project") && !options.contains("Other host"));
+        author.set_value("review-author");
+        author
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        for mode in ["", "inline", "single_reviewer", "review_team"] {
+            picker.set_value(mode);
+            picker
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            ai_btn.dyn_ref::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let frames = crate::bridge::test_sent_lines();
+            let action = frames.last().unwrap();
+            assert!(action.contains("\"author_agent_id\":\"review-author\""));
+            if mode.is_empty() {
+                assert!(action.contains("\"mode\":null"));
+            } else {
+                assert!(action.contains(&format!("\"mode\":\"{mode}\"")));
+            }
+            assert!(!action.contains("\"backend_kind\""));
+        }
+        state.agents.set(Vec::new());
+        next_tick().await;
+        assert_eq!(author.value(), "", "a removed author cannot stay selected");
+        ai_btn.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        assert!(
+            !crate::bridge::test_sent_lines()
+                .last()
+                .unwrap()
+                .contains("review-author"),
+            "a stale author must not be sent to the server"
         );
     }
 

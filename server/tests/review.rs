@@ -386,6 +386,23 @@ async fn spawn_project_agent_with_prompt(
     prompt: &str,
     wait_until_idle: bool,
 ) -> (NewAgentPayload, SessionId) {
+    spawn_review_author(
+        client,
+        project,
+        prompt,
+        wait_until_idle,
+        BackendKind::Claude,
+    )
+    .await
+}
+
+async fn spawn_review_author(
+    client: &mut client::Connection,
+    project: &Project,
+    prompt: &str,
+    wait_until_idle: bool,
+    backend_kind: BackendKind,
+) -> (NewAgentPayload, SessionId) {
     client
         .spawn_agent(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
@@ -397,7 +414,7 @@ async fn spawn_project_agent_with_prompt(
                 workspace_roots: project_roots(project),
                 prompt: prompt.to_owned(),
                 images: None,
-                backend_kind: BackendKind::Claude,
+                backend_kind,
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
@@ -1065,6 +1082,8 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         .review_action(
             &summary.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -1225,6 +1244,8 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -1326,6 +1347,8 @@ async fn committed_ai_review_uses_scope_without_materialized_diff_context() {
         .review_action(
             &review_id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -1514,7 +1537,7 @@ async fn advisory_review_does_not_depend_on_full_context_transport() {
         .await
         .enqueue(MockTurn::gated_echo(&gate))
         .await;
-    let second = start_review_call(&caller, "large-context-followup", "light");
+    let second = start_review_call(&caller, "large-context-followup", "review_team");
     gate.wait_until_entered().await;
     let running = subscribe_review_with_payload(
         &mut client,
@@ -2163,6 +2186,8 @@ async fn committed_comments_share_the_workspace_review() {
         .review_action(
             &review_id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -2770,6 +2795,8 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
         .review_action(
             &review_a.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -3039,6 +3066,8 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
         .review_action(
             &review_a.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -3063,6 +3092,8 @@ async fn project_reviews_stay_responsive_during_reviewer_startup() {
         .review_action(
             &review_a.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -3600,6 +3631,8 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
                 mode: None,
                 backend_kind: None,
                 cost_hint: None,
@@ -4380,7 +4413,7 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
         assert!(!snapshot.diffs.is_empty());
         if review.id.0 == SUBMITTED_ID {
             let legacy = &snapshot.ai_reviewer.rounds[0];
-            assert_eq!(legacy.mode, Some(protocol::ReviewMode::Deep));
+            assert_eq!(legacy.mode, Some(protocol::ReviewMode::ReviewTeam));
             assert_eq!(legacy.reviewers[0].name, "Legacy reviewer");
             assert!(legacy.reviewers[0].reviewer_id.is_none());
             assert!(legacy.reviewers[0].target.is_none());
@@ -4941,11 +4974,13 @@ async fn review_settings_migration_preserves_customization() {
     }}).to_string()).await;
     let review_settings = serde_json::to_value(&fixture.bootstrap.settings.review).unwrap();
     assert_eq!(
-        review_settings["lite"][0]["target"]["kind"], "default",
+        review_settings["saved_reviewer_selections"]["Lite"][0]["target"]["kind"], "default",
         "Migrated Lite must inherit the host default at launch"
     );
     assert_eq!(
-        review_settings["heavy"].as_array().map(Vec::len),
+        review_settings["saved_reviewer_selections"]["Heavy"]
+            .as_array()
+            .map(Vec::len),
         Some(1),
         "Untouched Heavy must not retain the old provider pairing"
     );
@@ -4965,27 +5000,40 @@ async fn review_settings_migration_preserves_customization() {
         }}).to_string()).await;
         let before = serde_json::to_value(&legacy.bootstrap.settings.review).unwrap();
         assert_eq!(
-            before["default_mode"], "deep",
-            "Migration preserves the selected mode, not the old execution pairing"
+            before["default_mode"], "review_team",
+            "Migration maps Heavy to the team combination layout"
+        );
+        assert_eq!(before["team"]["layout"], "every_combination");
+        assert_eq!(
+            before["team"]["reviewers"],
+            before["saved_reviewer_selections"]["Heavy"]
         );
         assert_eq!(
-            before["heavy"].as_array().unwrap().len(),
+            before["saved_reviewer_selections"]["Heavy"]
+                .as_array()
+                .unwrap()
+                .len(),
             if customized { 2 } else { 1 }
         );
         assert_eq!(
-            before["lite"][0]["target"]["kind"],
+            before["saved_reviewer_selections"]["Lite"][0]["target"]["kind"],
             if customized { "explicit" } else { "default" }
         );
         if customized {
             assert_eq!(
-                before["lite"][0]["target"]["session_settings"]["model"]["string"],
+                before["saved_reviewer_selections"]["Lite"][0]["target"]["session_settings"]["model"]
+                    ["string"],
                 "sonnet"
             );
             assert_eq!(
-                before["heavy"][0]["target"]["session_settings"]["effort"]["string"],
+                before["saved_reviewer_selections"]["Heavy"][0]["target"]["session_settings"]["effort"]
+                    ["string"],
                 "high"
             );
-            assert_eq!(before["lite"][0]["target"]["backend_kind"], "claude");
+            assert_eq!(
+                before["saved_reviewer_selections"]["Lite"][0]["target"]["backend_kind"],
+                "claude"
+            );
         }
         let after = legacy.restart_host().await;
         assert_eq!(
@@ -5169,7 +5217,9 @@ async fn advisory_review_preserves_turn_errors_and_cost_changes() {
             .review_action(
                 &review.id,
                 ReviewActionPayload::StartAiReview {
-                    mode: Some(protocol::ReviewMode::Light),
+                    author_agent_id: None,
+                    expected_plan: None,
+                    mode: Some(protocol::ReviewMode::ReviewTeam),
                     backend_kind: None,
                     cost_hint: Some(hint),
                     instructions: None,
@@ -5349,7 +5399,7 @@ async fn advisory_review_reuses_context_and_keeps_compact_audit() {
             .enqueue(MockTurn::gated_echo(&gate))
             .await;
     }
-    let second = start_review_call(&caller, "second", "light");
+    let second = start_review_call(&caller, "second", "review_team");
     gate.wait_until_entered().await;
     gate.wait_until_entered().await;
     let second_state = wait_review_execution(&mut client, &review.id, 2).await;
@@ -5666,7 +5716,7 @@ async fn advisory_review_reuses_context_and_keeps_compact_audit() {
 async fn advisory_review_reattaches_and_exposes_failures_and_configuration_changes() {
     let mut fixture = Fixture::new_with_settings_file(&json!({"settings": {
         "default_backend": "claude", "enabled_backends": ["claude"],
-        "review": {"enabled": true, "aspects": {
+        "review": {"enabled": true, "default_mode": "deep", "aspects": {
             "one": {"name": "One", "description": "One", "instructions": "Inspect one", "enabled": true},
             "two": {"name": "Two", "description": "Two", "instructions": "Inspect two", "enabled": true}
         }, "heavy": [
@@ -5697,7 +5747,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
                 .collect(),
         )
         .await;
-    let original = start_review_call(&caller, "reattach", "deep");
+    let original = start_review_call(&caller, "reattach", "review_team");
     for _ in 0..4 {
         gate.wait_until_entered().await;
     }
@@ -5711,7 +5761,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     );
     original.abort();
     assert!(original.await.unwrap_err().is_cancelled());
-    let reattached = start_review_call(&caller, "reattach", "deep");
+    let reattached = start_review_call(&caller, "reattach", "review_team");
     for _ in 0..4 {
         gate.release_one();
     }
@@ -5722,7 +5772,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         &caller.await_url,
         Some(&caller.authorization),
         "tyde_review",
-        json!({"request_id": "reattach", "mode": "deep"}),
+        json!({"request_id": "reattach", "mode": "review_team"}),
     )
     .await;
     assert_eq!(again, done);
@@ -5769,7 +5819,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         .map(|agent| agent.instance_stream.clone())
         .collect::<Vec<_>>();
     assert_eq!(reviewer_streams.len(), 4);
-    let stopped = start_review_call(&caller, "stop", "deep");
+    let stopped = start_review_call(&caller, "stop", "review_team");
     for _ in 0..4 {
         gate.wait_until_entered().await;
     }
@@ -5858,7 +5908,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         &caller.await_url,
         Some(&caller.authorization),
         "tyde_review",
-        json!({"request_id": "config", "mode": "deep"}),
+        json!({"request_id": "config", "mode": "review_team"}),
     )
     .await;
     assert!(!failed);
@@ -5900,7 +5950,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         )
         .await;
     // A different requester owns independent reviewers, not the prior caller's contexts.
-    let parent_close = start_review_call(&peer_caller, "parent-close", "deep");
+    let parent_close = start_review_call(&peer_caller, "parent-close", "review_team");
     for _ in 0..4 {
         gate.wait_until_entered().await;
     }
@@ -5927,7 +5977,14 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
             MockScript::one(MockTurn::gated_held_text("Host restarts", &gate)),
         )
         .await;
-    let restart = start_review_call(&caller, "restart", "light");
+    let current = serde_json::to_value(&fixture.bootstrap.settings.review.team).unwrap();
+    let replacement = protocol::ReviewTeamConfig::default();
+    client
+        .replace_setting("/review/team", &replacement, current)
+        .await
+        .unwrap();
+    expect_host_settings(&mut client, "switch to one reviewer for restart").await;
+    let restart = start_review_call(&caller, "restart", "review_team");
     gate.wait_until_entered().await;
     gate.release_one();
     fixture.restart_host().await;
@@ -5941,4 +5998,552 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         ReviewAiReviewerStatus::Failed
     );
     drop(reservation);
+}
+
+#[tokio::test]
+async fn review_modes_share_persisted_aspects_and_exact_source_assignments() {
+    use server::backend::Backend;
+    let mut schema = server::backend::codex::CodexBackend::session_settings_schema();
+    if let protocol::SessionSettingFieldType::Select { options, .. } = &mut schema
+        .fields
+        .iter_mut()
+        .find(|field| field.key == "model")
+        .unwrap()
+        .field_type
+    {
+        options.push(protocol::SelectOption {
+            value: "review-model".to_owned(),
+            label: "Review model".to_owned(),
+        });
+    }
+    let mut changed_schema = schema.clone();
+    if let protocol::SessionSettingFieldType::Select { options, .. } = &mut changed_schema
+        .fields
+        .iter_mut()
+        .find(|field| field.key == "model")
+        .unwrap()
+        .field_type
+    {
+        *options = vec![protocol::SelectOption {
+            value: "replacement-model".to_owned(),
+            label: "Replacement".to_owned(),
+        }];
+    }
+    let runtime = server::HostRuntimeConfig {
+        mock_backend_discovery: [(
+            BackendKind::Codex,
+            server::backend::mock::MockDiscovery::new(vec![
+                Ok(server::backend::BackendDiscovery {
+                    schema,
+                    launch_profiles: Vec::new(),
+                }),
+                Ok(server::backend::BackendDiscovery {
+                    schema: changed_schema,
+                    launch_profiles: Vec::new(),
+                }),
+            ]),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(runtime, &json!({"settings": {
+        "enabled_backends": ["claude", "codex", "grok"], "default_backend": "claude",
+        "review": {"enabled": true, "default_mode": "inline", "team": {
+            "layout": "every_combination", "reviewers": [
+                {"id": "author", "name": "Current agent", "target": {"kind": "fork_current_agent"}},
+                {"id": "other", "name": "Selected model", "target": {"kind": "explicit", "backend_kind": "codex", "session_settings": {"model": {"string": "review-model"}}}}
+            ], "aspect_assignments": {"correctness": "other", "security": "author", "architecture": "other"}
+        }, "aspects": {
+            "correctness": {"name": "Correctness", "instructions": "Inspect product correctness", "enabled": true},
+            "security": {"name": "Security", "instructions": "Inspect trust boundaries", "enabled": true},
+            "architecture": {"name": "Architecture", "instructions": "Inspect typed ownership", "enabled": true}
+        }}
+    }}).to_string()).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Grok)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    seed_repo(root.path());
+    let mut client = fixture.connect().await;
+    let project = create_project(&mut client, root.path()).await;
+    let _author_reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::new().with_unbounded_echo().with_user_bubbles(),
+        )
+        .await;
+    let (author, author_session) = spawn_idle_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &author).await;
+    let caller = fixture.agent_control_caller(&author.agent_id).await;
+    let (failed, inline) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_review",
+        json!({"request_id": "inline", "mode": "inline"}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(inline["status"], "guidance");
+    for name in ["Correctness", "Security", "Architecture"] {
+        assert!(inline["guidance"].as_str().unwrap().contains(name));
+    }
+    let unchanged = subscribe_review(&mut client, &review.id).await;
+    assert!(unchanged.ai_reviewer.rounds.is_empty() && unchanged.suggestions.is_empty());
+    let (_, host) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        host.agents.len(),
+        1,
+        "Inline guidance must never create reviewers"
+    );
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                mode: Some(protocol::ReviewMode::Inline),
+                author_agent_id: Some(author.agent_id.clone()),
+                expected_plan: None,
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .unwrap();
+    let mut accepted = false;
+    let mut delivered = false;
+    next_frame_matching_on(&mut client, "Inline guidance is delivered without a reviewer", |env| {
+        if env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::InlineGuidance { .. })) { accepted = true; }
+        if env.stream == author.instance_stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<ChatEvent>(), Ok(ChatEvent::MessageAdded(message)) if message.content.contains("Inline review guidance") && message.content.contains("Inspect trust boundaries")) { delivered = true; }
+        accepted && delivered
+    }).await;
+    let (mut inline_observer, host) = fixture.connect_with_bootstrap().await;
+    assert_eq!(host.agents.len(), 1);
+    let observer_author_stream = &host
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == author.agent_id)
+        .unwrap()
+        .instance_stream;
+    next_frame_matching_on(&mut inline_observer, "Author receives selected inline guidance", |env| {
+        if &env.stream != observer_author_stream || env.kind != FrameKind::AgentBootstrap { return false; }
+        let bootstrap: protocol::AgentBootstrapPayload = env.parse_payload().unwrap();
+        assert!(bootstrap.events.iter().any(|event| matches!(event, AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) if message.content.contains("Inline review guidance") && message.content.contains("Inspect trust boundaries"))));
+        true
+    }).await;
+    assert!(
+        subscribe_review(&mut client, &review.id)
+            .await
+            .ai_reviewer
+            .rounds
+            .is_empty()
+    );
+
+    let config_url = fixture.config_mcp_http_url().await;
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_upsert_review_aspect", json!({"aspect_id": "correctness", "aspect": {"name": "Product defects", "description": "Edited canonical aspect", "instructions": "Find actual user-visible defects", "enabled": true}})).await;
+    assert!(!failed);
+    let (failed, plan_value) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_preview_review",
+        json!({"mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    let plan: protocol::ReviewPlan = serde_json::from_value(plan_value).unwrap();
+    assert!(plan.unavailable_reason.is_none());
+    assert_eq!(plan.assignments.len(), 1);
+    assert_eq!(plan.assignments[0].aspects.len(), 3);
+    assert_eq!(plan.assignments[0].backend_kind, BackendKind::Claude);
+    assert_eq!(
+        plan.assignments[0].fork_from_session_id.as_ref(),
+        Some(&author_session)
+    );
+    let edited = plan.aspects.iter().find(|a| a.id == "correctness").unwrap();
+    assert_eq!(edited.name, "Product defects");
+    assert_eq!(edited.instructions, "Find actual user-visible defects");
+    let mut stale = plan.clone();
+    stale
+        .configuration
+        .aspects
+        .get_mut("correctness")
+        .unwrap()
+        .instructions = "Outdated instructions".to_owned();
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                mode: Some(plan.mode),
+                author_agent_id: Some(author.agent_id.clone()),
+                expected_plan: Some(Box::new(stale)),
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .unwrap();
+    next_frame_matching_on(
+        &mut client,
+        "A stale preview cannot start a review",
+        |env| {
+            if env.kind != FrameKind::ReviewEvent {
+                return false;
+            }
+            match env.parse_payload::<ReviewEventPayload>().unwrap() {
+                ReviewEventPayload::Error { error } => {
+                    assert!(error.message.contains("updated preview"));
+                    true
+                }
+                _ => false,
+            }
+        },
+    )
+    .await;
+    assert!(
+        subscribe_review(&mut client, &review.id)
+            .await
+            .ai_reviewer
+            .rounds
+            .is_empty()
+    );
+    let (failed, result) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_review",
+        json!({"request_id": "single", "mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(result["status"], "completed");
+    let single = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(single.ai_reviewer.rounds[0].reviewers.len(), 1);
+    assert_eq!(
+        single.ai_reviewer.rounds[0].reviewers[0].aspects,
+        plan.assignments[0].aspects
+    );
+    let (failed, result) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_review",
+        json!({"request_id": "single-followup", "mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(result["status"], "completed");
+    let followup = subscribe_review(&mut client, &review.id).await;
+    assert!(followup.ai_reviewer.rounds[1].reviewers[0].reused_context);
+    assert_eq!(
+        followup.ai_reviewer.rounds[0].reviewers[0].agent_id,
+        followup.ai_reviewer.rounds[1].reviewers[0].agent_id
+    );
+    let mut settings = plan.configuration;
+    for (index, layout, expected) in [
+        (2, protocol::ReviewTeamLayout::PerAspect, 3),
+        (3, protocol::ReviewTeamLayout::PerReviewer, 2),
+        (4, protocol::ReviewTeamLayout::EveryCombination, 6),
+    ] {
+        client
+            .replace_setting("/review/team/layout", layout, settings.team.layout)
+            .await
+            .unwrap();
+        settings = expect_host_settings(&mut client, "team layout saved")
+            .await
+            .settings
+            .review;
+        let (failed, value) = review_mcp_call(
+            &caller.url,
+            Some(&caller.authorization),
+            "tyde_preview_review",
+            json!({"mode": "review_team"}),
+        )
+        .await;
+        assert!(!failed);
+        let plan: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+        assert!(plan.unavailable_reason.is_none());
+        assert_eq!(plan.assignments.len(), expected);
+        assert_eq!(
+            plan.layout_counts
+                .iter()
+                .find(|count| count.layout == layout)
+                .unwrap()
+                .agent_count,
+            expected
+        );
+        for assignment in &plan.assignments {
+            match layout {
+                protocol::ReviewTeamLayout::PerReviewer => assert_eq!(assignment.aspects.len(), 3),
+                protocol::ReviewTeamLayout::PerAspect => {
+                    assert_eq!(assignment.aspects.len(), 1);
+                    assert_eq!(
+                        settings.team.aspect_assignments[&assignment.aspects[0].id],
+                        assignment.reviewer_id
+                    );
+                }
+                protocol::ReviewTeamLayout::EveryCombination => {
+                    assert_eq!(assignment.aspects.len(), 1)
+                }
+            }
+        }
+        let (failed, result) = review_mcp_call(
+            &caller.await_url,
+            Some(&caller.authorization),
+            "tyde_review",
+            json!({"request_id": format!("team-{index}"), "mode": "review_team"}),
+        )
+        .await;
+        assert!(!failed);
+        assert_eq!(result["status"], "completed");
+        let state = subscribe_review(&mut client, &review.id).await;
+        let members = &state.ai_reviewer.rounds[index].reviewers;
+        assert_eq!(members.len(), expected);
+        let ids = members
+            .iter()
+            .filter_map(|r| r.agent_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            expected,
+            "Every scheduled assignment owns an independent reviewer"
+        );
+        let (mut observer, host) = fixture.connect_with_bootstrap().await;
+        let reviewers = host
+            .agents
+            .iter()
+            .filter(|a| ids.contains(&a.agent_id))
+            .collect::<Vec<_>>();
+        let mut observed = std::collections::HashSet::new();
+        next_frame_matching_on(&mut observer, "reviewer context and guidance projected to clients", |env| {
+            if let Some(agent) = reviewers.iter().find(|agent| agent.instance_stream == env.stream) && env.kind == FrameKind::AgentBootstrap {
+                let bootstrap: protocol::AgentBootstrapPayload = env.parse_payload().unwrap();
+                assert!(agent.session_id.as_ref() != Some(&author_session), "Reviewers must not mutate the author session");
+                assert_eq!(agent.parent_agent_id.as_ref(), Some(&author.agent_id));
+                let member = members.iter().find(|r| r.agent_id.as_ref() == Some(&agent.agent_id)).unwrap();
+                let assignment_messages = bootstrap.events.iter().filter_map(|event| match event {
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => Some(&message.content),
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => Some(&end.message.content),
+                    _ => None,
+                }).filter(|message| message.contains(&format!("execution_id: {}", state.ai_reviewer.rounds[index].id))).collect::<Vec<_>>();
+                eprintln!("Review assignment bootstrap diagnostic: event_count={} current_execution_messages={} aspect_count={}", bootstrap.events.len(), assignment_messages.len(), member.aspects.len());
+                // Mock echo replies are retained as StreamEnd, not MessageAdded.
+                // Pin the current execution so inherited author guidance cannot satisfy this check.
+                for aspect in &member.aspects {
+                    assert!(assignment_messages.iter().any(|message| message.contains(&aspect.instructions)), "The actual current reviewer assignment must contain persisted guidance");
+                }
+                observed.insert(agent.agent_id.clone());
+            }
+            observed.len() == expected
+        }).await;
+    }
+    // A stale source mapping is an explicit configuration error, never round-robin.
+    let old_team = settings.team.clone();
+    settings.team.layout = protocol::ReviewTeamLayout::PerAspect;
+    settings.team.aspect_assignments.remove("security");
+    client
+        .replace_setting("/review/team", &settings.team, old_team)
+        .await
+        .unwrap();
+    settings = expect_host_settings(&mut client, "unassigned aspect saved as draft")
+        .await
+        .settings
+        .review;
+    let (failed, value) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_preview_review",
+        json!({"mode": "review_team"}),
+    )
+    .await;
+    assert!(!failed);
+    let missing: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+    assert!(
+        missing
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("Security")
+    );
+    let (failed, _) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_review",
+        json!({"request_id": "missing-assignment", "mode": "review_team"}),
+    )
+    .await;
+    assert!(failed);
+    let (unsupported, _) = spawn_review_author(
+        &mut client,
+        &project,
+        "Unsupported fork author",
+        true,
+        BackendKind::Grok,
+    )
+    .await;
+    let unsupported_caller = fixture.agent_control_caller(&unsupported.agent_id).await;
+    let (failed, value) = review_mcp_call(
+        &unsupported_caller.url,
+        Some(&unsupported_caller.authorization),
+        "tyde_preview_review",
+        json!({"mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    let unsupported_plan: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        unsupported_plan.fork_capability,
+        protocol::ReviewForkCapability::Unsupported { .. }
+    ));
+    assert!(
+        unsupported_plan
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("Inline")
+    );
+    assert!(unsupported_plan.assignments.is_empty());
+    let before = subscribe_review(&mut client, &review.id)
+        .await
+        .ai_reviewer
+        .rounds
+        .len();
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                mode: Some(unsupported_plan.mode),
+                author_agent_id: Some(unsupported.agent_id),
+                expected_plan: Some(Box::new(unsupported_plan)),
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .unwrap();
+    next_frame_matching_on(
+        &mut client,
+        "Unsupported fork fails before spawning",
+        |env| {
+            env.kind == FrameKind::ReviewEvent
+                && matches!(
+                    env.parse_payload::<ReviewEventPayload>(),
+                    Ok(ReviewEventPayload::Error { .. })
+                )
+        },
+    )
+    .await;
+    assert_eq!(
+        subscribe_review(&mut client, &review.id)
+            .await
+            .ai_reviewer
+            .rounds
+            .len(),
+        before
+    );
+
+    let (catalog_author, _) = spawn_review_author(
+        &mut client,
+        &project,
+        "Inherited model contract",
+        true,
+        BackendKind::Codex,
+    )
+    .await;
+    let inherited = protocol::SessionSettingsValues(
+        [(
+            "model".to_owned(),
+            protocol::SessionSettingValue::String("review-model".to_owned()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    client
+        .set_session_settings(
+            &catalog_author.instance_stream,
+            protocol::SetSessionSettingsPayload {
+                values: inherited.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut client, "Author selects its original model", |env| {
+        env.stream == catalog_author.instance_stream
+            && env.kind == FrameKind::SessionSettings
+            && env
+                .parse_payload::<protocol::SessionSettingsPayload>()
+                .unwrap()
+                .values
+                == inherited
+    })
+    .await;
+    let catalog_caller = fixture.agent_control_caller(&catalog_author.agent_id).await;
+    let (failed, value) = review_mcp_call(
+        &catalog_caller.url,
+        Some(&catalog_caller.authorization),
+        "tyde_preview_review",
+        json!({"mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    let original: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+    assert!(original.unavailable_reason.is_none());
+    assert_eq!(original.assignments[0].session_settings, inherited);
+    let (_, host) = fixture.connect_with_bootstrap().await;
+    let mut enabled = host.settings.enabled_backends.clone();
+    enabled.push(BackendKind::Muse);
+    client
+        .replace_setting("/enabled_backends", enabled, host.settings.enabled_backends)
+        .await
+        .unwrap();
+    expect_host_settings(&mut client, "Refresh the model catalog").await;
+    next_frame_matching_on(&mut client, "The selected model is no longer offered", |env| {
+        env.kind == FrameKind::SessionSchemas && env.parse_payload::<protocol::SessionSchemasPayload>().unwrap().schemas.iter().any(|entry| match entry {
+            protocol::SessionSchemaEntry::Ready { schema } if schema.backend_kind == BackendKind::Codex => schema.fields.iter().find(|field| field.key == "model").is_some_and(|field| matches!(&field.field_type, protocol::SessionSettingFieldType::Select { options, .. } if options.iter().any(|option| option.value == "replacement-model"))),
+            _ => false,
+        })
+    }).await;
+    let (failed, value) = review_mcp_call(
+        &catalog_caller.url,
+        Some(&catalog_caller.authorization),
+        "tyde_preview_review",
+        json!({"mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed);
+    let drifted: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        drifted.fork_capability,
+        protocol::ReviewForkCapability::Unsupported { .. }
+    ));
+    assert!(
+        drifted
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("never substitute defaults")
+    );
+    let (_, before_fork) = fixture.connect_with_bootstrap().await;
+    let (failed, _) = review_mcp_call(
+        &catalog_caller.await_url,
+        Some(&catalog_caller.authorization),
+        "tyde_review",
+        json!({"request_id": "catalog-drift", "mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(
+        failed,
+        "An obsolete inherited model must fail, never launch on a default"
+    );
+    let (_, after_fork) = fixture.connect_with_bootstrap().await;
+    assert_eq!(after_fork.agents.len(), before_fork.agents.len());
+    let after = fixture.restart_host().await;
+    assert_eq!(
+        after.settings.review, settings,
+        "Aspect edits, sources and mappings persist across host restart"
+    );
 }

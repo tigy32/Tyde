@@ -56,6 +56,7 @@ pub(crate) struct ReviewDeliveryRequest {
 }
 
 pub(crate) struct ReviewLaunchOptions {
+    pub expected_plan: Option<Box<protocol::ReviewPlan>>,
     pub mode: Option<protocol::ReviewMode>,
     pub backend_kind: Option<protocol::BackendKind>,
     pub cost_hint: Option<protocol::SpawnCostHint>,
@@ -63,6 +64,7 @@ pub(crate) struct ReviewLaunchOptions {
 }
 
 pub(crate) struct ReviewAiSpawnRequest {
+    pub expected_plan: Option<Box<protocol::ReviewPlan>>,
     pub mode: Option<protocol::ReviewMode>,
     pub review_id: ReviewId,
     pub review: Review,
@@ -285,6 +287,7 @@ impl ReviewState {
                     .start_ai_review(
                         project,
                         ReviewLaunchOptions {
+                            expected_plan: None,
                             mode,
                             backend_kind: None,
                             cost_hint: None,
@@ -515,7 +518,10 @@ impl ReviewState {
             ReviewActionPayload::RejectSuggestion { suggestion_id } => {
                 self.reject_suggestion(suggestion_id, conn).await;
             }
+            ReviewActionPayload::Preview { .. } => {}
             ReviewActionPayload::StartAiReview {
+                author_agent_id,
+                expected_plan,
                 mode,
                 backend_kind,
                 cost_hint,
@@ -526,6 +532,7 @@ impl ReviewState {
                     .start_ai_review(
                         project,
                         ReviewLaunchOptions {
+                            expected_plan,
                             mode,
                             backend_kind,
                             cost_hint,
@@ -533,7 +540,7 @@ impl ReviewState {
                         },
                         scope,
                         conn,
-                        None,
+                        author_agent_id,
                     )
                     .await;
             }
@@ -947,6 +954,7 @@ impl ReviewState {
         requested_by: Option<AgentId>,
     ) -> Result<(), String> {
         let ReviewLaunchOptions {
+            expected_plan,
             mode,
             backend_kind,
             cost_hint,
@@ -1066,6 +1074,7 @@ impl ReviewState {
         let operation = Uuid::new_v4();
         let cancellation = CancellationToken::new();
         let request = ReviewAiSpawnRequest {
+            expected_plan,
             mode,
             roots: project.root_paths(),
             execution_id: operation.to_string(),

@@ -1948,9 +1948,9 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         ),
         (
             "tyde_config_set_setting",
-            json!({"setting": {"setting": "review_reviewers", "mode": "light", "reviewers": [
+            json!({"setting": {"setting": "review_team", "team": {"layout": "per_reviewer", "reviewers": [
                 {"id": "entry-reviewer", "name": "Entry", "target": {"kind": "explicit", "backend_kind": "codex", "session_settings": {}}}
-            ]}}),
+            ]}}}),
         ),
     ] {
         let (failed, _) =
