@@ -1201,6 +1201,23 @@ pub fn pop_pending_frame_matching_on(
 pub fn agent_bootstrap_frames(env: &Envelope) -> VecDeque<Envelope> {
     assert_eq!(env.kind, FrameKind::AgentBootstrap);
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrapPayload");
+    if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name == "Authenticated config root")) {
+        let idle_transitions = payload
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false))
+                )
+            })
+            .count();
+        eprintln!(
+            "HELP CONFIG BOOTSTRAP status={:?} events={} idle_transitions={idle_transitions}",
+            payload.status,
+            payload.events.len()
+        );
+    }
     if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name.starts_with("BTW:"))) {
         eprintln!("SIDE QUESTION BOOTSTRAP activity={:?} events={:?}", payload.activity, payload.events);
     }

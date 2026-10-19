@@ -64,6 +64,11 @@ success-output = "final"
 filter = 'binary_id(server::agents) & test(agent_control_http_await_stays_active_after_exit_plan_mode_approval)'
 success-output = "final"
 
+# Retain payload-free attachment and idle-wait evidence for Help controls.
+[[profile.default.overrides]]
+filter = 'binary_id(server::agents) & test(help_controls_top_level_agents_across_projects)'
+success-output = "final"
+
 # Retain compact measured review payload and context-reuse counts.
 [[profile.default.overrides]]
 filter = 'binary_id(server::review) & (test(advisory_review_reuses_context_and_keeps_compact_audit) | test(advisory_review_does_not_depend_on_full_context_transport))'

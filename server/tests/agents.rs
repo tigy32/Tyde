@@ -12199,6 +12199,10 @@ async fn help_controls_top_level_agents_across_projects() {
         );
     }
     assert!(closed_ids.contains(&agent_id) && closed_ids.contains(&child));
+    eprintln!(
+        "HELP CONFIG subtree close observed count={}",
+        closed_ids.len()
+    );
     let listed = config_agent_tool(&url, "tyde_config_list_agents", json!({})).await;
     let listed = mcp_success_json(&listed);
     assert!(
@@ -12233,12 +12237,17 @@ async fn help_controls_top_level_agents_across_projects() {
             "Invalid target/input must fail visibly"
         );
     }
+    // Completed bootstraps omit historical typing transitions; attach before output.
+    let authenticated_gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "Authenticated config root",
-            MockScript::one(MockTurn::text("authenticated launch reply"))
-                .then(MockTurn::text("authenticated follow-up reply"))
-                .with_user_bubbles(),
+            MockScript::one(MockTurn::text_after_gate(
+                "authenticated launch reply",
+                &authenticated_gate,
+            ))
+            .then(MockTurn::text("authenticated follow-up reply"))
+            .with_user_bubbles(),
         )
         .await;
     let mut config = ordinary.clone();
@@ -12261,10 +12270,19 @@ async fn help_controls_top_level_agents_across_projects() {
         "authenticated config publication",
     )
     .await;
+    eprintln!("HELP CONFIG authenticated publication observed");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &target.instance_stream,
+        "authenticated config attached before launch output",
+    )
+    .await;
+    authenticated_gate.release_one();
     for (task, follow_up) in [
         ("Authenticated configuration launch", false),
         ("Authenticated configuration follow-up", true),
     ] {
+        eprintln!("HELP CONFIG authenticated identity wait follow_up={follow_up}");
         if follow_up {
             let sent = mcp_tool_call_as(
                 &config,
@@ -12288,6 +12306,7 @@ async fn help_controls_top_level_agents_across_projects() {
                 && matches!(&message.origin, Some(protocol::MessageOrigin::Agent {agent_id:Some(id),name}) if id == &existing.agent_id && name == &existing.name)),
             "Authenticated config calls must not fall through to anonymous Operator"
         );
+        eprintln!("HELP CONFIG authenticated idle wait follow_up={follow_up}");
         fixture::next_chat_event_matching_on(
             &mut fixture.client,
             &target.instance_stream,
@@ -12295,8 +12314,47 @@ async fn help_controls_top_level_agents_across_projects() {
             |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
         )
         .await;
+        eprintln!("HELP CONFIG authenticated idle observed follow_up={follow_up}");
     }
     fixture.mock_by_id(&target_id).await.assert_clean().await;
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_target = bootstrapped_agent(&bootstrap, &target_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &late_target.instance_stream,
+        "authenticated config completed launch replay",
+    )
+    .await;
+    let idle_transitions = replay
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false))
+            )
+        })
+        .count();
+    eprintln!(
+        "HELP CONFIG completed bootstrap status={:?} events={} idle_transitions={idle_transitions}",
+        replay.status,
+        replay.events.len()
+    );
+    assert_eq!(replay.status, AgentControlStatus::Idle);
+    for task in [
+        "Authenticated configuration launch",
+        "Authenticated configuration follow-up",
+    ] {
+        assert!(
+            replay.events.iter().any(|event| matches!(event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                if message.content == task
+                    && matches!(&message.sender, MessageSender::Agent { agent } if agent == &existing.name)
+                    && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), name }) if id == &existing.agent_id && name == &existing.name)
+            )),
+            "Completed bootstrap must preserve authenticated config identity"
+        );
+    }
 }
 
 #[tokio::test]
