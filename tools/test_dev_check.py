@@ -2192,21 +2192,16 @@ fi
                 tested.append(workflow.name)
         self.assertEqual(tested, [
             "check.yml", "mobile-web-release.yml", "pretag-release-build.yml",
-            "release-cadence.yml", "release.yml", "release.yml",
+            "release.yml", "release.yml",
         ])
 
-    def test_pr_and_local_release_guards_use_canonical_check(self) -> None:
+    def test_pr_uses_canonical_check_and_packaging_runs_no_suites(self) -> None:
         ci_env = self.env.copy()
         ci_env["CI"] = "true"
         result = self._run(env=ci_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CACHE MISS", result.stdout)
 
-        release_check = (REPO_ROOT / "tools" / "release_check.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("./dev.sh check\n", release_check)
-        self.assertNotIn("./dev.sh check --", release_check)
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")

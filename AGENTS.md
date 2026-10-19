@@ -30,7 +30,8 @@ cancellation, or a real error.
 
 `main` is always kept clean. **Do not do active development directly against
 `main`.** All work happens on a throwaway Tyde workbench and only finished,
-committed work lands on `main`. The workflow for every change is:
+committed work lands on `main`. The workflow for every ordinary implementation
+change is (version-only release bookkeeping follows the scoped policy in §5):
 
 1. **Create a fresh Tyde workbench** for the change.
 2. **Do all the work in that workbench** — make your changes there until
@@ -87,9 +88,12 @@ Every commit message must follow these rules:
 ### 2. Repository validation
 
 Full repository validation runs automatically for pull requests through
-`.github/workflows/check.yml` and is mandatory in the local release guard. It
-does not run in the GitHub release workflow. These automated checks do not
-replace the mandatory workbench and post-land `main` checks. `./dev.sh check`
+`.github/workflows/check.yml`. Beta and stable releases reuse the required
+local source validation completed before source reaches `origin/main`; neither
+runs extra suites for version-only release bookkeeping, locally or in GitHub.
+The release guard checks source preservation and versions, not test success.
+These release rules do not replace or weaken the mandatory implementation
+workbench and post-land `main` checks. `./dev.sh check`
 is the sole allowed local validation entry point; do not invoke Cargo, Clippy,
 nextest, wasm, web, or filtered test commands directly.
 
@@ -270,12 +274,26 @@ DST), only when source changes exist since the last beta. A failed unpublished
 beta can be retried without creating a new version. Version bookkeeping alone
 does not trigger a beta. This does not authorize agents to cut ad hoc releases.
 
-Nightly beta cuts are version-only release bookkeeping and do not rerun
-`./dev.sh check` or the local release guard. They retain clean-tree, source,
-version, ancestry, and upstream-race checks before pushing main and the tag.
-This exception applies only to beta preparation in Release cadence, not to
-implementation workbench/main validation, stable promotion, or manual release
-cuts through the local release guard.
+Beta and stable have the same source-validation contract: ordinary source
+changes must pass `./dev.sh check` in the committed implementation workbench
+and again on clean `main` before pushing to `origin/main`. Release preparation
+reuses that completed validation; it does not run tests or prerequisite builds
+again solely for version metadata, a promotion snapshot, or its ancestry merge.
+This applies equally to local/manual cuts and scheduled Release cadence.
+Source-preservation checks normalize only release-version values; dependency,
+application, test, configuration, and tooling changes are still source changes.
+Manual cuts refuse source differences from fetched `origin/main`: land and
+validate those changes through the ordinary implementation path first.
+
+The validated-main workflow is the authority, not a new CI attestation. Remote
+Git history cannot prove that a local test ran; release checks report source
+preservation and explicitly run no tests. They never create/copy check-cache
+records or label a version-only commit as freshly tested. Both release paths
+retain clean-tree, version, approved-source, ancestry, main, upstream-race,
+tag-existence, approval and safe-push checks. GitHub still builds, signs and
+packages the actual platform installers and checks deployment integrity. Local
+Linux validation does not replace macOS/Windows packaging or signing. PR,
+CodeQL and ordinary source CI remain unchanged.
 
 Stable promotion is **always the user's decision**. Ask for the exact beta to
 promote, then use `./dev.sh release promote vX.Y.Z-beta.N --confirm` only after
@@ -284,12 +302,14 @@ application changes; subsequent betas target `X.Y.(Z+1)`. Never force-push a
 release or rebuild an already-published release.
 
 Promotion prepares a version-only stable snapshot from the selected beta in an
-isolated workbench. After validation, an ancestry merge lands that snapshot on
-`main` while retaining newer main source and advancing its beta version. The
-stable tag identifies the validated snapshot, now an ancestor of `main`, not
-the newer main tip. This release-bookkeeping merge and snapshot are not separate
-implementation commits. Candidate, landing workbench, and clean main must all
-pass `./dev.sh check` before either main or the release tag is pushed.
+isolated workbench. After source-preservation and version checks, an ancestry
+merge lands that snapshot on `main` while retaining newer main source and
+advancing its beta version. The stable tag identifies the selected beta's
+source with stable versions, now an ancestor of `main`, not the newer main tip.
+This release-bookkeeping merge and snapshot are not implementation changes:
+candidate, landing workbench and main do not rerun `./dev.sh check` solely for
+these version-only commits. Run orchestration/checks from current main tooling;
+do not copy newer application, tests or tooling into an older beta snapshot.
 CI uses disposable Git worktrees as its isolated release workbenches; interactive
 implementation work continues to use Tyde workbenches.
 
@@ -318,8 +338,9 @@ For manual `prepare`/`cut` releases, after approval:
    `git tag --list vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`. Stop if
    it exists unless the user gives explicit further instructions.
 5. Run the canonical local release guard: `tools/release_check.sh vX.Y.Z`.
-   This includes the cached `./dev.sh check` suite, release tooling tests, and
-   mobile-web release-coherence checks. It does not
+   This checks clean main, coherent versions and unchanged source relative to
+   fetched `origin/main`, reusing the prior required local validation. It runs
+   no tests or builds and does not
    replace the clean tree, `main`, tag, approval, or push checks in this
    section. Stop if any check fails.
 6. Re-run the release-version check immediately before tagging:

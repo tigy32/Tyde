@@ -132,8 +132,12 @@ def verify_plan(root: pathlib.Path, plan: dict) -> None:
     clean(root)
     if git(root, "branch", "--show-current") != "main" or git(root, "rev-parse", "HEAD") != plan["head"]:
         raise ValueError("main moved since planning; start a new run")
+    if plan["action"] not in ("skip", "beta", "promote", "retry"):
+        raise ValueError("unknown release action")
     if plan["action"] != "skip":
         normalize_tag(plan["tag"])
+    if plan["action"] == "beta" and plan["source"] != plan["head"]:
+        raise ValueError("new betas must use current main source")
     if plan["action"] == "promote" and git(root, "rev-parse", f"{plan['beta']}^{{commit}}") != plan["source"]:
         raise ValueError("selected beta moved since planning")
     if not ancestor(root, plan["source"], "main"):
@@ -179,13 +183,18 @@ def stage(root: pathlib.Path, plan: dict, directory: pathlib.Path) -> dict:
             "landing": str(landing), "landing_branch": landing_branch, "release_sha": sha}
 
 
-def validate(root: pathlib.Path, workbench: pathlib.Path) -> None:
-    shared = root / "target"
-    shared.mkdir(exist_ok=True)
-    if workbench != root and not (workbench / "target").exists():
-        (workbench / "target").symlink_to(shared, target_is_directory=True)
-    subprocess.run(["./dev.sh", "check"], cwd=workbench, check=True)
-    clean(workbench)
+def check_source(root: pathlib.Path, source: str, tag: str) -> None:
+    clean(root)
+    if not ancestor(root, source, "HEAD"):
+        raise ValueError("release source is not an ancestor of the prepared commit")
+    if source_digest(root, source) != source_digest(root, "HEAD"):
+        raise ValueError("release changed source beyond version metadata; "
+                         "land and validate source changes first")
+    expected = normalize_tag(tag)
+    if set(versions.collect_versions(root).values()) != {expected}:
+        raise ValueError(f"tracked release versions do not match {tag}")
+    print(f"Source unchanged from {source}; prior local validation is required "
+          "by the validated-main contract (no tests run)")
 
 
 def land(root: pathlib.Path, state: dict) -> None:
@@ -194,12 +203,9 @@ def land(root: pathlib.Path, state: dict) -> None:
     landing = pathlib.Path(state["landing"])
     if git(candidate, "rev-parse", "HEAD") != state["release_sha"]:
         raise ValueError("release candidate moved after staging")
-    if state["action"] != "beta":
-        validate(root, candidate)
-        subprocess.run(["tools/release_check.sh", state["tag"]], cwd=candidate, check=True)
-    clean(candidate)
+    check_source(candidate, state["source"], state["tag"])
     if landing != candidate:
-        validate(root, landing)
+        check_source(landing, state["head"], state["next_tag"])
     landing_sha = git(landing, "rev-parse", "HEAD")
     if not ancestor(root, state["release_sha"], landing_sha):
         raise ValueError("landing does not contain the release candidate")
@@ -208,12 +214,8 @@ def land(root: pathlib.Path, state: dict) -> None:
     expected_main = state["head"] if state["action"] == "promote" else state["source"]
     if source_digest(root, expected_main) != source_digest(root, landing_sha):
         raise ValueError("landing changed main source")
-    # The checker resolves its own checkout, so execute the candidate's copy.
-    run(candidate, sys.executable, "tools/check_release_version.py", state["tag"])
     verify_plan(root, state)
     git(root, "merge", "--ff-only", landing_sha)
-    if state["action"] != "beta":
-        validate(root, root)
     clean(root)
     for path, branch in dict([(str(candidate), state["branch"]),
                               (str(landing), state["landing_branch"])]).items():
@@ -269,6 +271,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=pathlib.Path, default=ROOT, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
+    guard = commands.add_parser("guard", help="Check version-only main against already validated origin/main; run no tests")
+    guard.add_argument("tag", nargs="?")
     planning = commands.add_parser("plan")
     planning.add_argument("--catalog", type=pathlib.Path, required=True)
     planning.add_argument("--promote")
@@ -284,7 +288,12 @@ def main() -> int:
     args = parser.parse_args()
     root = args.repo_root.resolve()
     try:
-        if args.command == "plan":
+        if args.command == "guard":
+            if git(root, "branch", "--show-current") != "main":
+                raise ValueError("release guard requires main")
+            tag = args.tag or "v" + versions.read_json_version(root / "package.json")
+            check_source(root, "origin/main", tag)
+        elif args.command == "plan":
             plan = make_plan(root, json.loads(args.catalog.read_text()), args.promote)
             args.output.write_text(json.dumps(plan, indent=2) + "\n")
             print(json.dumps(plan))

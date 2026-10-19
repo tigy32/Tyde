@@ -60,80 +60,6 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Install Linux dependencies
-        if: needs.plan.outputs.action == 'promote'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
-            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config patchelf musl-tools time \
-            mold
-
-      - name: Setup Python
-        if: needs.plan.outputs.action == 'promote'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Provision native audio build tools
-        if: needs.plan.outputs.action == 'promote'
-        run: |
-          python tools/provision-native-build-tools.py \
-            --root "$RUNNER_TEMP/tyde-native-build-tools" \
-            --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
-
-      - name: Install repository Rust toolchain
-        if: needs.plan.outputs.action == 'promote'
-        shell: bash
-        run: |
-          export RUSTUP_HOME="$RUNNER_TEMP/tyde-rustup"
-          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
-          ./dev.sh rust-toolchain
-
-      - name: Setup Node.js
-        if: needs.plan.outputs.action == 'promote'
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: Install frontend dependencies
-        if: needs.plan.outputs.action == 'promote'
-        run: npm ci
-
-      - name: Install Playwright WebKit host libraries
-        if: needs.plan.outputs.action == 'promote'
-        run: tools/install-playwright-webkit-host-deps.sh
-
-      - name: Install cargo-nextest
-        if: needs.plan.outputs.action == 'promote'
-        uses: taiki-e/install-action@nextest
-
-      - name: Install pinned sccache
-        if: needs.plan.outputs.action == 'promote'
-        run: |
-          cargo install sccache --version 0.16.0 --locked --force
-          test "$(sccache --version)" = "sccache 0.16.0"
-          echo "RUSTC_WRAPPER=$(command -v sccache)" >> "$GITHUB_ENV"
-
-      - name: Rust cache
-        if: needs.plan.outputs.action == 'promote'
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-
-      - name: Install trunk
-        if: needs.plan.outputs.action == 'promote'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: trunk@0.21.14
-
-      - name: Build frontend prerequisites
-        if: needs.plan.outputs.action == 'promote'
-        run: |
-          (cd frontend && trunk build --release)
-          (cd mobile-frontend && trunk build --release)
-
       - name: Prepare and land the release
         env:
           RELEASE_PLAN: ${{ needs.plan.outputs.plan }}
@@ -154,5 +80,4 @@ jobs:
           path: |
             ${{ runner.temp }}/release-plan.json
             ${{ runner.temp }}/release-workbenches/state.json
-            target/dev-check-logs/
           if-no-files-found: ignore

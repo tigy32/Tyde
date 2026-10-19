@@ -100,18 +100,32 @@ This dispatches `Release cadence` on `main` with that explicit beta. The same
 input can be supplied manually in GitHub Actions. There is **no automatic stable
 promotion**. The example rebuilds the selected beta's exact source, changing
 only tracked version metadata to `0.9.4`; it does not include newer main changes.
-A validated version-only snapshot is merged into main's ancestry without
+A source-checked version-only snapshot is merged into main's ancestry without
 replacing newer source, and the stable tag points at that snapshot. Main advances
 to `0.9.5-beta.0`; the next beta with source changes is `0.9.5-beta.1`. The
 `.0` is bookkeeping, not a published beta. Older beta tags in the current cycle
 can be selected even when newer changes have already landed.
 
-Nightly beta preparation only changes version metadata and does not rerun
-`./dev.sh check` or the local release guard. Implementation changes still need
-the mandatory workbench and clean-main validation before they reach upstream.
-Stable promotion retains `./dev.sh check` and the release-coherence guard for
-the selected snapshot, plus `./dev.sh check` for the landing workbench and clean
-main. Both paths require clean trees, unchanged source, coherent versions, and
+Beta and stable require exactly the same local source validation: ordinary
+implementation commits pass `./dev.sh check` in their committed workbench and
+again on clean main before pushing to `origin/main`. Release preparation reuses
+that validation. Neither beta nor stable runs extra test/compilation passes for
+version-only candidates, promotion landing commits, or release bookkeeping on
+main. Release cadence installs no promotion-only suite dependencies or frontend
+prerequisite builds. Manual `cut` uses the same source-preservation/version guard
+and refuses source differences from fetched `origin/main`; land and validate
+actual changes through the ordinary implementation path first.
+
+This trusts the existing validated-main process, not a CI proof of local test
+execution. Git history cannot independently prove those tests ran. The release
+guard reports unchanged source and **no tests run**, not a new test-pass receipt.
+No check cache records are copied or forged; ordinary cache keys and gates are
+unchanged. Only release version values are normalized: changes to dependencies,
+tests, configuration or tooling cannot masquerade as version bookkeeping. When
+promoting an older beta, current main's orchestration checks that beta's source
+without copying newer tests or application changes into its snapshot.
+
+Both paths require clean trees, unchanged source, coherent versions, and
 main ancestry. The workflow atomically pushes main and the annotated tag, then
 explicitly dispatches the Release workflow with the expected tag SHA.
 Dispatch is necessary because pushes using `GITHUB_TOKEN` do not trigger another
@@ -156,22 +170,20 @@ was seen and `4` after a matching run reached a nonterminal state. A deadline
 hit while normalizing status or verifying a completed run exits `5` as a
 network/tool error.
 
-Use the canonical local guard before release builds. It runs the cached full
-repository suite and release-specific coherence tests. The GitHub release
-and mobile-web publication workflows do not run test suites or headless
-smoke tests. Headless smoke testing remains in the pre-tag build gate;
-publication retains version, signing, packaging, and deployed-manifest
-integrity checks:
+Use the canonical local guard before release builds, after fetching origin/main:
 
 ```sh
 tools/release_check.sh [v<release>]
 ```
 
-It validates the repository plus build/version/protocol/mobile-web coherence by
-generating a temporary manifest entry for the checked version instead of
-requiring `web/loader/manifest.json` to already contain the release. This guard
-does not replace the AGENTS release steps for a clean tree, `main`, tag checks,
-approval, or pushes.
+It checks clean main, coherent release versions, ancestry and version-only source
+preservation relative to `origin/main`. It runs no suites or builds and does not
+replace approval, fresh upstream/tag checks or safe pushes in `release cut`.
+The GitHub release and mobile-web publication workflows retain actual artifact
+builds, signing, packaging and deployed-manifest integrity checks, not redundant
+source suites. Linux local checks do not produce signed macOS/Windows installers.
+PR checks, CodeQL and ordinary source CI are unaffected. Headless smoke testing
+remains in the explicitly requested pre-tag build path.
 
 The native iOS shell is end-of-life. External distribution is unconfirmed, so
 if an installed native build exists, migrate to the PWA with Add to Home Screen

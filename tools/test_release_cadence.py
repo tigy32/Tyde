@@ -38,23 +38,33 @@ class ReleaseCadenceGitFlow(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
         (self.root / "tools").mkdir()
-        shutil.copyfile(ROOT / "tools/check_release_version.py", self.root / "tools/check_release_version.py")
+        for name in ("check_release_version.py", "check_transport_protocol_version.py",
+                     "release_cadence.py", "set_release_version.py", "release_tool.py",
+                     "check_mobile_web_manifest.py", "update_manifest.py",
+                     "release_check.sh", "release.sh"):
+            shutil.copy2(ROOT / "tools" / name, self.root / "tools" / name)
+        for name in ("protocol/src/types.rs", "rtc-transport/src/lib.rs",
+                     "rtc-transport/src/signaling.rs", "rtc-transport/src/native.rs",
+                     "rtc-transport/src/browser.rs"):
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, target)
         (self.root / ".gitignore").write_text("/target\n")
         (self.root / "application.txt").write_text("tested beta source\n")
         # The fixture is a real Git repository with an external check entry point.
-        # It exposes gate ordering/failure without recursively running this suite.
+        # Count heavy-gate calls without recursively running this suite.
         check = self.root / "dev.sh"
         check.write_text('''#!/bin/sh
 set -eu
+if [ "$*" = "release verify v1.2.3-beta.2" ]; then
+    printf 'verify selected published beta\\n' >> "$CADENCE_VERIFY_LOG"
+    exit 0
+fi
 test "$1" = check
 test -z "$(git status --porcelain)"
 printf '%s %s\\n' "$(git branch --show-current)" "$(git rev-parse HEAD)" >> "$CADENCE_CHECK_LOG"
-if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19; fi
 ''')
         check.chmod(0o755)
-        guard = self.root / "tools/release_check.sh"
-        guard.write_text('#!/bin/sh\nset -eu\npython3 tools/check_release_version.py "$1"\n./dev.sh check\n')
-        guard.chmod(0o755)
         self.bump("v1.2.3-beta.2")
         self.commit("Seed tested beta")
         self.beta_sha = self.git("rev-parse", "HEAD")
@@ -181,10 +191,8 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         self.assertEqual(self.git("show", "v1.2.3:application.txt"), "tested beta source")
         self.assertEqual((self.root / "application.txt").read_text(), "newer unapproved main source\n")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        checks = (self.directory / "checks").read_text().splitlines()
-        self.assertEqual([line.split()[0] for line in checks],
-                         ["release-cadence-v1.2.3", "release-cadence-v1.2.3",
-                          "release-cadence-v1.2.3-landing", "main"])
+        self.assertFalse((self.directory / "checks").exists(),
+                         "Promotion bookkeeping must run exactly as many heavy gates as beta: zero")
         self.assertNotEqual(self.plan("v1.2.3-beta.2", ok=False).returncode, 0)
         self.assertEqual(self.plan()["tag"], "v1.2.4-beta.1")
         self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
@@ -203,16 +211,30 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         self.sync()
         self.assertEqual(self.plan()["tag"], "v1.2.4-beta.1")
 
-    def test_failed_promotion_gates_and_moved_main_never_land(self):
+    def test_changed_promotion_source_dirty_landing_and_moved_main_never_land(self):
         (self.root / "application.txt").write_text("new code\n")
         self.commit("Change source")
         self.sync()
         before = self.git("rev-parse", "HEAD")
         self.plan("v1.2.3-beta.2")
         state_path, state = self.stage()
-        result = self.tool("land", "--state", str(state_path), "--confirm", ok=False,
-                           env={**self.env, "CADENCE_FAIL_BRANCH": state["branch"]})
+        candidate = pathlib.Path(state["candidate"])
+        landing = pathlib.Path(state["landing"])
+        for path in (candidate, landing):
+            source = path / "application.txt"
+            original = source.read_text()
+            source.write_text("uncommitted source change\n")
+            result = self.tool("land", "--state", str(state_path), "--confirm", ok=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not clean", result.stderr)
+            source.write_text(original)
+        source = landing / "application.txt"
+        source.write_text("committed unapproved source\n")
+        self.git("add", "application.txt", cwd=landing)
+        self.git("commit", "-m", "Tamper with landing source", cwd=landing)
+        result = self.tool("land", "--state", str(state_path), "--confirm", ok=False)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed source beyond version metadata", result.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.git("tag", "--list", state["tag"]), "")
         (self.root / "application.txt").write_text("concurrent main change\n")
@@ -225,7 +247,7 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertNotEqual(self.plan(ok=False).returncode, 0, "Unpushed main must not be released")
 
-    def test_execute_pushes_beta_main_and_tag_without_checks_before_dispatch(self):
+    def test_execute_pushes_beta_and_stable_with_identical_zero_heavy_gates(self):
         self.plan()
         self.tool("execute", "--plan", str(self.plan_path), "--directory",
                   str(self.directory / "unused"), "--confirm")
@@ -261,6 +283,24 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
             f"version={plan['tag']}", "-f", f"source_sha={sha}", "-f", "publish=true",
         ])
         self.assertEqual(self.git("status", "--porcelain"), "")
+        beta_source = self.git("show", "v1.2.3-beta.2:application.txt")
+        self.plan("v1.2.3-beta.2")
+        verification = self.directory / "verified"
+        self.tool("execute", "--plan", str(self.plan_path), "--directory",
+                  str(self.directory / "promotion"), "--confirm",
+                  env={**env, "CADENCE_VERIFY_LOG": str(verification)})
+        self.assertEqual(verification.read_text().splitlines(), ["verify selected published beta"])
+        self.assertEqual(self.git("show", "v1.2.3:application.txt"), beta_source)
+        stable_sha = self.git("rev-parse", "v1.2.3^{commit}")
+        self.git("merge-base", "--is-ancestor", stable_sha, "origin/main")
+        self.assertEqual(self.git("cat-file", "-t", "v1.2.3"), "tag")
+        self.assertTrue(self.git("ls-remote", "origin", "refs/tags/v1.2.3^{}").startswith(stable_sha + "\t"))
+        self.assertFalse((self.directory / "checks").exists(),
+                         "Beta and stable execution must both reuse source validation without heavy gates")
+        self.assertEqual(json.loads(commands.read_text()), [
+            "workflow", "run", "release.yml", "--ref", "main", "-f",
+            "version=v1.2.3", "-f", f"source_sha={stable_sha}", "-f", "publish=true",
+        ])
         runs = self.directory / "runs.json"
         runs.write_text(json.dumps([
             {"databaseId": 10, "workflowName": "Release", "headBranch": "main",
@@ -273,6 +313,77 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         selected = self.command(sys.executable, str(ROOT / "tools/release_tool.py"),
                                 "select-run", plan["tag"], sha, "--input", str(runs))
         self.assertEqual(selected.stdout.strip(), "10")
+
+    def test_manual_beta_and_stable_cut_reuse_validation_and_refuse_unsafe_source(self):
+        hooks = self.root / ".githooks"
+        hooks.mkdir()
+        shutil.copy2(ROOT / ".githooks/pre-push", hooks / "pre-push")
+        self.git("config", "core.hooksPath", ".githooks")
+        self.commit("Install release hook")
+        self.sync()
+        binary = self.directory / "bin"
+        binary.mkdir()
+        gh = binary / "gh"
+        gh.write_text('#!/bin/sh\nset -eu\ntest "$*" = "auth status"\n')
+        gh.chmod(0o755)
+        env = {**self.env, "PATH": f"{binary}:{self.env['PATH']}"}
+
+        def cut(tag, confirmed=True):
+            return self.command("tools/release.sh", "cut", tag,
+                                *(["--confirm"] if confirmed else []), "--no-wait",
+                                env=env, ok=False)
+
+        for tag in ("v1.2.3-beta.3", "v1.2.3"):
+            self.bump(tag)
+            self.commit("Prepare release version")
+            before = self.git("rev-parse", "HEAD")
+            missing = cut(tag, confirmed=False)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("requires --confirm", missing.stderr)
+            source = self.root / "application.txt"
+            original = source.read_text()
+            source.write_text("dirty source\n")
+            self.assertNotEqual(cut(tag).returncode, 0)
+            source.write_text(original)
+            self.git("checkout", "-b", "not-main")
+            self.assertNotEqual(cut(tag).returncode, 0)
+            self.git("checkout", "main")
+            self.git("branch", "-d", "not-main")
+            mismatch = self.command("tools/release_check.sh", "v1.2.3-beta.99", ok=False)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("versions do not match", mismatch.stderr)
+            # Even committed changes inside a version-bearing file are source.
+            lock = self.root / "package-lock.json"
+            original_lock = lock.read_text()
+            data = json.loads(original_lock)
+            data["packages"][""]["unvalidatedDependency"] = "new"
+            lock.write_text(json.dumps(data, indent=2) + "\n")
+            self.commit("Change dependency outside validation")
+            rejected = cut(tag)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("changed source beyond version metadata", rejected.stderr)
+            self.assertEqual(self.git("rev-parse", "origin/main"),
+                             self.git("rev-parse", f"{before}^"))
+            self.assertEqual(self.git("tag", "--list", tag), "")
+            lock.write_text(original_lock)
+            self.commit("Restore approved source")
+            self.command("git", "--git-dir", str(self.remote), "tag", tag, "refs/heads/main")
+            remote_duplicate = cut(tag)
+            self.assertNotEqual(remote_duplicate.returncode, 0)
+            self.assertIn("already exists on origin", remote_duplicate.stderr)
+            self.assertEqual(self.git("tag", "--list", tag), "")
+            self.command("git", "--git-dir", str(self.remote), "tag", "-d", tag)
+            result = cut(tag)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("no tests run", result.stdout)
+            sha = self.git("rev-parse", "HEAD")
+            self.assertTrue(self.git("ls-remote", "origin", f"refs/tags/{tag}^{{}}").startswith(sha + "\t"))
+            self.assertEqual(self.git("rev-parse", "origin/main"), sha)
+            duplicate = cut(tag)
+            self.assertNotEqual(duplicate.returncode, 0)
+            self.assertIn("already exists", duplicate.stderr)
+        self.assertFalse((self.directory / "checks").exists(),
+                         "Manual beta and stable cuts must run zero heavy gates, just like cadence")
 
     def test_workflow_creates_and_retries_drafts_after_main_workflow_changes(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
