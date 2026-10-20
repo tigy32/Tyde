@@ -766,10 +766,28 @@ async fn stale_tool_response_while_idle_does_not_wedge_follow_up() {
         })
         .await;
 
-    for malformed in [
-        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": "missing-answer"}),
-        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": "wrong-answer", "answer": []}),
-        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": null, "answer": "é\nanswer"}),
+    for (payload, diagnostic) in [
+        (serde_json::json!({}), "missing field `message`"),
+        (
+            serde_json::json!({"message": []}),
+            "invalid type: sequence, expected a string",
+        ),
+        (
+            serde_json::json!({"message": "answer", "unexpected": true}),
+            "unknown field `unexpected`, expected one of `message`, `images`, `origin`, `tool_response`",
+        ),
+        (
+            serde_json::json!({"message": "answer", "tool_response": {"kind": "AskUserQuestion", "tool_call_id": "missing-answer"}}),
+            "missing field `answer`",
+        ),
+        (
+            serde_json::json!({"message": "answer", "tool_response": {"kind": "AskUserQuestion", "tool_call_id": "wrong-answer", "answer": []}}),
+            "invalid type: sequence, expected a string",
+        ),
+        (
+            serde_json::json!({"message": "answer", "tool_response": {"kind": "AskUserQuestion", "tool_call_id": null, "answer": "é\nanswer"}}),
+            "invalid type: null, expected a string",
+        ),
     ] {
         let seq = fixture
             .client
@@ -780,7 +798,7 @@ async fn stale_tool_response_while_idle_does_not_wedge_follow_up() {
             stream: agent.stream.clone(),
             seq: *seq,
             kind: FrameKind::SendMessage,
-            payload: serde_json::json!({"message": "answer", "tool_response": malformed}),
+            payload,
         };
         *seq += 1;
         protocol::write_envelope(&mut fixture.client.writer, &envelope)
@@ -800,6 +818,11 @@ async fn stale_tool_response_while_idle_does_not_wedge_follow_up() {
         assert_eq!(error.request_kind, FrameKind::SendMessage);
         assert_eq!(error.stream, agent.stream);
         assert_eq!(error.code, protocol::CommandErrorCode::InvalidInput);
+        assert_eq!(error.operation, "send_message");
+        assert_eq!(
+            error.message,
+            format!("invalid send_message payload: {diagnostic}")
+        );
     }
 
     fixture

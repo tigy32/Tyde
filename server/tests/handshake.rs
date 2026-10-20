@@ -122,44 +122,50 @@ async fn handshake_rejects_wrong_first_frame_kind() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn handshake_rejects_invalid_stream_path() {
-    let (client_stream, server_stream) = tokio::io::duplex(8192);
-    let server_config = server::ServerConfig::current();
+async fn handshake_rejects_invalid_stream_or_sequence() {
+    for (prefix, seq, diagnostic) in [
+        ("invalid", 0, "/host/<uuid>"),
+        ("host", 1, "expected 0, got 1"),
+    ] {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server_config = server::ServerConfig::current();
 
-    let server_handle =
-        tokio::spawn(async move { server::accept(&server_config, server_stream).await });
+        let server_handle =
+            tokio::spawn(async move { server::accept(&server_config, server_stream).await });
 
-    let (read_half, mut write_half) = tokio::io::split(client_stream);
-    let mut reader = BufReader::new(read_half);
+        let (read_half, mut write_half) = tokio::io::split(client_stream);
+        let mut reader = BufReader::new(read_half);
 
-    let stream = StreamPath(format!("/invalid/{}", Uuid::new_v4()));
-    let payload = HelloPayload {
-        protocol_version: PROTOCOL_VERSION,
-        tyde_version: TYDE_VERSION,
-        client_name: "test-client".to_owned(),
-        platform: "test-platform".to_owned(),
-    };
-    let frame =
-        Envelope::from_payload(stream, FrameKind::Hello, 0, &payload).expect("invalid hello");
-    write_envelope(&mut write_half, &frame)
-        .await
-        .expect("failed to send hello frame");
+        let stream = StreamPath(format!("/{prefix}/{}", Uuid::new_v4()));
+        let payload = HelloPayload {
+            protocol_version: PROTOCOL_VERSION,
+            tyde_version: TYDE_VERSION,
+            client_name: "test-client".to_owned(),
+            platform: "test-platform".to_owned(),
+        };
+        let frame =
+            Envelope::from_payload(stream, FrameKind::Hello, seq, &payload).expect("invalid hello");
+        write_envelope(&mut write_half, &frame)
+            .await
+            .expect("failed to send hello frame");
 
-    let reject = read_envelope(&mut reader)
-        .await
-        .expect("failed to read reject frame")
-        .expect("server closed connection without reject");
-    assert_eq!(reject.kind, FrameKind::Reject);
-    let payload: RejectPayload = reject
-        .parse_payload()
-        .expect("failed to parse reject payload");
-    assert_eq!(payload.code, RejectCode::InvalidHandshake);
+        let reject = read_envelope(&mut reader)
+            .await
+            .expect("failed to read reject frame")
+            .expect("server closed connection without reject");
+        assert_eq!(reject.kind, FrameKind::Reject);
+        let payload: RejectPayload = reject
+            .parse_payload()
+            .expect("failed to parse reject payload");
+        assert_eq!(payload.code, RejectCode::InvalidHandshake);
 
-    let server_result = server_handle.await.expect("server task panicked");
-    match server_result {
-        Err(server::HandshakeError::InvalidHandshake(message)) => {
-            assert!(message.contains("/host/<uuid>"));
+        let server_result = server_handle.await.expect("server task panicked");
+        match server_result {
+            Err(server::HandshakeError::InvalidHandshake(message)) => {
+                assert!(message.contains(diagnostic));
+                assert!(payload.message.contains(diagnostic));
+            }
+            _ => panic!("expected server invalid handshake error"),
         }
-        _ => panic!("expected server invalid stream-path error"),
     }
 }

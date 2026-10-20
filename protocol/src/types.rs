@@ -1492,7 +1492,7 @@ impl Envelope {
     }
 
     pub fn parse_payload<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_value(self.payload.clone())
+        T::deserialize(&self.payload)
     }
 }
 
