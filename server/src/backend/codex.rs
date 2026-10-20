@@ -5209,9 +5209,17 @@ impl CodexInner {
         let relocation = CodexWorkspaceRelocation {
             state: Some(self.state.clone()),
         };
+        tracing::info!(target: "tyde_project_entry_diagnostic", "Codex relocation entered");
         let thread_id = self
             .state
             .with(|state| {
+                tracing::info!(target: "tyde_project_entry_diagnostic",
+                    active_turn = state.active_turn_id.is_some(), turn_reserved = state.awaiting_root_turn_start,
+                    compaction = state.pending_compaction.is_some(), user_request = state.pending_request.is_some(),
+                    pending_tools = state.pending_tool_call_ids.len(), background_commands = state.background_commands.len(),
+                    outstanding_commands = state.outstanding_command_executions.len(), pending_wakes = state.pending_background_wakes.len(),
+                    wake_in_flight = state.background_wake_request_in_flight, native_children = state.subagent_streams.len(),
+                    pending_spawns = state.pending_subagent_spawns.len(), "Codex relocation admission state");
                 if state.active_turn_id.is_some()
                     || state.awaiting_root_turn_start
                     || state.pending_compaction.is_some()
@@ -5246,6 +5254,7 @@ impl CodexInner {
             .await
             .ok_or(super::WorkspaceRelocationError::Busy)?;
         tracing::info!(?roots, "Changing Codex workspace roots");
+        tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native thread/settings/update dispatch");
         let updated = self
             .rpc
             .request(
@@ -5255,6 +5264,7 @@ impl CodexInner {
             .await;
         // Loaded thread/resume ignores root overrides. The native settings
         // setter accepts cwd; runtime roots are applied on each next turn.
+        tracing::info!(target: "tyde_project_entry_diagnostic", accepted = updated.is_ok(), "Codex native thread/settings/update result");
         relocation.finish(updated.is_ok().then(|| roots.clone()));
         updated.map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
         tracing::info!(
@@ -9199,11 +9209,13 @@ impl CodexInner {
                     self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
+                tracing::info!(target: "tyde_project_entry_diagnostic", "Codex active interrupt dispatch path");
                 // Before the interrupt, so the kill goes out while Codex still
                 // tracks the process. The cards for these commands are marked
                 // cancelled when the interrupted turn completes; killing here
                 // is what makes that report true.
                 self.terminate_foreground_commands().await;
+                tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native turn/interrupt dispatch");
                 match self
                     .rpc
                     .request_typed(
@@ -16756,6 +16768,8 @@ let stream_key = stream_key.as_str();
             question_count = normalized.len(),
             "Codex projecting pending async user questions"
         );
+        tracing::info!(target: "tyde_project_entry_diagnostic", question_count = normalized.len(),
+            "Codex native assistant item registered nonblocking question");
         {
             let tool_call_id = tool_call_id.clone();
             self.state
@@ -17988,6 +18002,7 @@ let stream_key = stream_key.as_str();
     }
 
     async fn handle_turn_completed(self: &Arc<Self>, params: &Value) {
+        tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native turn/completed received");
         let completed_turn_id = extract_turn_id(params);
         self.flush_raw_modify_failures(completed_turn_id.as_deref())
             .await;
@@ -18127,6 +18142,8 @@ let stream_key = stream_key.as_str();
                 );
                 state.active_turn_id = None;
                 state.foreground_response_completed = false;
+                tracing::info!(target: "tyde_project_entry_diagnostic", pending_async_questions = state.pending_async_questions.len(),
+                    "Codex terminal native turn keeps unanswered async questions");
                 let mut open_item_without_completion = false;
                 let mut open_item_published = false;
                 let mut interrupted_published_stream = None;
@@ -26448,7 +26465,9 @@ impl Backend for CodexBackend {
         let (reply, done) = oneshot::channel();
         let accepted = self.interrupt_tx.send(CodexInterrupt { reply }).is_ok();
         eprintln!("TYDE CODEX INTERRUPT ENQUEUE accepted={accepted}");
-        accepted && done.await.unwrap_or(false)
+        let completed = accepted && done.await.unwrap_or(false);
+        tracing::info!(target: "tyde_project_entry_diagnostic", accepted, completed, "Codex Backend interrupt returned");
+        completed
     }
 
     async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {

@@ -257,7 +257,7 @@ impl MockBackend {
         let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let events_tx = MockEventSender::new(backend_events_tx);
         let subagent_emitter = config.subagent_emitter.clone();
-        let (control, control_rx, terminal_report) = MockControl::channel();
+        let (control, control_rx, terminal_report) = MockControl::channel(command_tx.clone());
         let session_id_for_task = session_id.clone();
 
         start_mock_command_loop(
@@ -377,7 +377,7 @@ impl MockBackend {
             send_gate.or_else(|| resume_replay.as_ref().and_then(MockResumeReplay::send_gate));
         let events_tx = MockEventSender::new(backend_events_tx);
         let subagent_emitter = config.subagent_emitter.clone();
-        let (control, control_rx, terminal_report) = MockControl::channel();
+        let (control, control_rx, terminal_report) = MockControl::channel(command_tx.clone());
         let session_id_for_task = session_id.clone();
 
         if close_before_barrier {
@@ -561,7 +561,7 @@ impl MockBackend {
         let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let events_tx = MockEventSender::new(backend_events_tx);
         let subagent_emitter = config.subagent_emitter.clone();
-        let (control, control_rx, terminal_report) = MockControl::channel();
+        let (control, control_rx, terminal_report) = MockControl::channel(command_tx.clone());
         let session_id_for_task = session_id.clone();
         start_mock_command_loop(
             session_id_for_task,

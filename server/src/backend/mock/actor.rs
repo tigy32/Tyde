@@ -248,6 +248,10 @@ impl MockActor {
                                 "queued-message inputs must be handled by the agent actor before reaching the backend"
                             );
                         }
+                        MockCommand::ReadRequests { reply } => {
+                            let _ = reply.send(self.requests.clone());
+                            true
+                        }
                         MockCommand::SetWorkspaceRoots { roots, reply } => {
                             let result = match self.workspace_relocation_results.pop_front() {
                                 Some(result) => result,

@@ -53,7 +53,13 @@ impl<B: Backend> BackendSender for B {
         roots: Vec<String>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + '_>>
     {
-        Box::pin(Backend::set_workspace_roots(self, roots))
+        Box::pin(async move {
+            tracing::info!(target: "tyde_project_entry_diagnostic", "Backend relocation called");
+            let result = Backend::set_workspace_roots(self, roots).await;
+            tracing::info!(target: "tyde_project_entry_diagnostic", accepted = result.is_ok(),
+                busy = matches!(result, Err(WorkspaceRelocationError::Busy)), "Backend relocation returned");
+            result
+        })
     }
 
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
@@ -87,11 +93,24 @@ impl<B: Backend> BackendSender for B {
         &'a self,
         payload: protocol::SendMessagePayload,
     ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::SteerOutcome> + Send + 'a>> {
-        Box::pin(Backend::steer(self, payload))
+        Box::pin(async move {
+            tracing::info!(target: "tyde_project_entry_diagnostic", "Backend steer called");
+            let result = Backend::steer(self, payload).await;
+            tracing::info!(target: "tyde_project_entry_diagnostic",
+                accepted = matches!(result, crate::backend::SteerOutcome::Accepted),
+                no_active_turn = matches!(result, crate::backend::SteerOutcome::NoActiveTurn(_)),
+                unsupported = matches!(result, crate::backend::SteerOutcome::Unsupported(_)), "Backend steer returned");
+            result
+        })
     }
 
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(Backend::interrupt(self))
+        Box::pin(async move {
+            tracing::info!(target: "tyde_project_entry_diagnostic", "Backend interrupt called");
+            let result = Backend::interrupt(self).await;
+            tracing::info!(target: "tyde_project_entry_diagnostic", accepted = result, "Backend interrupt returned");
+            result
+        })
     }
 
     fn cancel_background_task<'a>(

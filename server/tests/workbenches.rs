@@ -2643,13 +2643,45 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             call_agent_control_request(config_url.clone(), None, name.to_owned(), arguments).await;
         assert!(!failed, "entry review configuration failed");
     }
+    let controller_reservation = fixture
+        .reserve_next_mock_launch("Entry controller", MockScript::one(MockTurn::text("Ready")))
+        .await;
+    let (controller, controller_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Entry controller".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&parent),
+                prompt: "Control the diagnostic flow".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(controller_reservation);
+    fixture.finish_turn(&controller).await;
     let initial = MockGateHandle::new();
     let continued = MockGateHandle::new();
     let shutdown = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "Entering worker",
-            MockScript::one(MockTurn::gated_text("Finishing the parent turn", &initial))
+            MockScript::one(MockTurn::held_text("Active turn before MCP cancellation"))
+                .then(MockTurn::held_text(
+                    "Active turn before configuration cancellation",
+                ))
+                .then(MockTurn::async_question_request(
+                    "entry-unanswered-question",
+                    &initial,
+                ))
+                .with_mid_turn_steering()
                 .with_shutdown_gate(&shutdown)
                 .with_user_bubbles(),
         )
@@ -2674,19 +2706,92 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         })
         .await;
     drop(reservation);
-    initial.wait_until_entered().await;
     fixture
-        .next_chat_event_matching(&agent, "parent turn active before entry", |event| {
+        .next_chat_event_matching(&agent, "first held turn active", |event| {
             matches!(event, protocol::ChatEvent::TypingStatusChanged(true))
         })
         .await;
+    let auth = fixture
+        .agent_control_caller(&controller_start.agent_id)
+        .await;
+    let bearer = auth
+        .authorization
+        .strip_prefix("Bearer ")
+        .expect("controller credential")
+        .to_owned();
+    for (url, name, global) in [
+        (
+            fixture.agent_control_http_url().await,
+            "tyde_send_agent_message",
+            true,
+        ),
+        (config_url.clone(), "tyde_config_send_agent_message", false),
+    ] {
+        let mut arguments = json!({"agent_id": start.agent_id, "message": "Continue after cancellation", "interrupt": true});
+        if global {
+            arguments["global"] = json!(true);
+        }
+        let (failed, _) =
+            call_agent_control_request(url, Some(bearer.clone()), name.to_owned(), arguments).await;
+        assert!(!failed, "active MCP delivery must be accepted");
+        fixture
+            .next_chat_event_matching(&agent, "interrupted held turn idle", |event| {
+                matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+        fixture
+            .next_chat_event_matching(&agent, "replacement turn active", |event| {
+                matches!(event, protocol::ChatEvent::TypingStatusChanged(true))
+            })
+            .await;
+    }
+    initial.wait_until_entered().await;
     fixture
-        .mock(&agent)
-        .await
-        .enqueue(MockTurn::gated_text(
-            "Working inside the workbench",
-            &continued,
-        ))
+        .next_chat_event_matching(
+            &agent,
+            "nonblocking question registered before entry",
+            |event| {
+                matches!(event, protocol::ChatEvent::ToolRequest(request)
+                if matches!(request.tool_type, protocol::ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::NonBlocking, ..
+                }))
+            },
+        )
+        .await;
+    let diagnostic_mock = fixture.mock(&agent).await;
+    let active_requests = diagnostic_mock.requests().await;
+    assert_eq!(
+        active_requests
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Interrupt))
+            .count(),
+        2,
+        "each active interrupt surface must reach Backend::interrupt"
+    );
+    let (failed, _) = call_agent_control_request(
+        fixture.agent_control_http_url().await,
+        Some(bearer.clone()),
+        "tyde_send_agent_message".to_owned(),
+        json!({"agent_id": start.agent_id, "message": "Steer the current turn", "global": true}),
+    )
+    .await;
+    assert!(!failed, "native steer admitted");
+    assert_eq!(
+        diagnostic_mock
+            .requests()
+            .await
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Steer(_)))
+            .count(),
+        1
+    );
+    eprintln!("ENTRY DIAGNOSTIC active surfaces: backend_interrupts=2 native_steers=1");
+    diagnostic_mock
+        .enqueue_all([
+            MockTurn::gated_text("Working inside the workbench", &continued),
+            MockTurn::workspace_roots(),
+            MockTurn::workspace_roots(),
+        ])
         .await;
     let mut observer = fixture.connect().await;
     let (failed, created) = call_agent_control(
@@ -2728,7 +2833,51 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     )
     .await;
     assert!(failed, "pending entry must not review the old project");
+    fixture
+        .client
+        .send_message(&agent.stream, "Ordinary queued work".to_owned())
+        .await
+        .unwrap();
+    let ordinary = fixture.expect_queued_messages(&agent, 1).await;
     initial.release_one();
+    fixture
+        .next_chat_event_matching(
+            &agent,
+            "idle with unanswered nonblocking question",
+            |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+    // Queueing and move admission alone must not cancel the unanswered card.
+    fixture.mock(&agent).await;
+    let held_requests = diagnostic_mock.requests_after_commands().await;
+    assert_eq!(
+        held_requests
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Interrupt))
+            .count(),
+        2
+    );
+    assert_eq!(
+        held_requests
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Input(_)))
+            .count(),
+        2
+    );
+    let (failed, _) = call_agent_control_request(
+        fixture.agent_control_http_url().await,
+        Some(bearer.clone()),
+        "tyde_send_agent_message".to_owned(),
+        json!({"agent_id": start.agent_id, "message": "Retained global input", "interrupt": true, "global": true}),
+    ).await;
+    assert!(!failed, "idle explicit interrupt must retain the message");
+    fixture
+        .next_chat_event_matching(&agent, "global interruption retires question", |event| {
+            matches!(event, protocol::ChatEvent::ToolExecutionCompleted(completion)
+            if completion.tool_call_id == "entry-unanswered-question"
+                && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. }))
+        })
+        .await;
     let changed = expect_kind(
         &mut fixture.client,
         FrameKind::AgentProjectChanged,
@@ -2755,6 +2904,19 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     assert_eq!(broadcast.project_id, changed.project_id);
     assert_eq!(broadcast.workspace_roots, changed.workspace_roots);
     continued.wait_until_entered().await;
+    let before_dispatch = diagnostic_mock.requests().await;
+    assert_eq!(
+        before_dispatch
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Input(_)))
+            .count(),
+        3,
+        "only the system continuation may start before retained input"
+    );
+    assert!(!before_dispatch.iter().any(|request| matches!(request,
+        server::backend::mock::MockRequest::Input(payload)
+            if payload.message == "Retained global input" || payload.message == "Ordinary queued work")));
+
     let (_, after) = fixture.connect_with_bootstrap().await;
     let saved = after
         .sessions
@@ -2794,10 +2956,401 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         "the client must receive the automatic continuation's assistant output"
     );
 
+    for _ in 0..2 {
+        let delivered = fixture.finish_turn(&agent).await;
+        let reported = delivered
+            .chat_events()
+            .into_iter()
+            .find_map(|event| match event {
+                protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                _ => None,
+            })
+            .expect("destination input roots");
+        assert!(
+            serde_json::from_str::<Vec<String>>(&reported).unwrap() == roots,
+            "retained input must execute only in destination"
+        );
+    }
+    fixture.mock(&agent).await;
+    let delivered_requests = diagnostic_mock.requests_after_commands().await;
+    assert_eq!(
+        delivered_requests
+            .iter()
+            .filter(|request| matches!(request, server::backend::mock::MockRequest::Interrupt))
+            .count(),
+        3
+    );
+    for message in ["Retained global input", "Ordinary queued work"] {
+        assert_eq!(
+            delivered_requests
+                .iter()
+                .filter(|request| matches!(request,
+            server::backend::mock::MockRequest::Input(payload) if payload.message == message))
+                .count(),
+            1,
+            "each retained payload must be dispatched exactly once"
+        );
+    }
+    assert_eq!(ordinary.messages.len(), 1);
+
+    // Each recovery surface needs its own unanswered card: the first
+    // successful cancellation releases entry before the next delivery.
+    for case in 0..4 {
+        let question = MockGateHandle::new();
+        let answer_turn = MockGateHandle::new();
+        let continuation_gate = MockGateHandle::new();
+        let question_id = format!("entry-recovery-question-{case}");
+        let retained = format!("Retained recovery input {case}");
+        let scheduled = case != 3;
+        let typed_answer = case == 2;
+        let destination = if case == 1 {
+            workbench_id.clone()
+        } else {
+            parent.id.clone()
+        };
+        let destination_roots = if case == 1 {
+            roots.clone()
+        } else {
+            project_roots(&parent)
+        };
+        let requests_before = diagnostic_mock.requests_after_commands().await.len();
+        let mut turns = vec![MockTurn::async_question_request(&question_id, &question)];
+        if typed_answer {
+            turns.push(MockTurn::gated_text("Answer accepted", &answer_turn));
+        }
+        if scheduled {
+            turns.push(MockTurn::gated_text(
+                "Destination continuation",
+                &continuation_gate,
+            ));
+        }
+        turns.push(MockTurn::workspace_roots());
+        diagnostic_mock.enqueue_all(turns).await;
+        fixture
+            .client
+            .send_message(
+                &agent.stream,
+                "Post another asynchronous question".to_owned(),
+            )
+            .await
+            .unwrap();
+        question.wait_until_entered().await;
+        fixture.next_chat_event_matching(&agent, "fresh unanswered card", |event| {
+            matches!(event, protocol::ChatEvent::ToolRequest(request) if request.tool_call_id == question_id)
+        }).await;
+        if scheduled {
+            let (failed, _) = call_agent_control(
+                &fixture,
+                &start.agent_id,
+                "tyde_move_to_project",
+                json!({"project_id": destination}),
+            )
+            .await;
+            assert!(
+                !failed,
+                "entry must be scheduled without cancelling the card"
+            );
+        }
+        question.release_one();
+        fixture
+            .next_chat_event_matching(&agent, "unanswered async question idle", |event| {
+                matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+        let queued = if case == 1 || typed_answer {
+            fixture
+                .client
+                .send_message(&agent.stream, retained.clone())
+                .await
+                .unwrap();
+            Some(fixture.expect_queued_messages(&agent, 1).await)
+        } else {
+            None
+        };
+        fixture.mock(&agent).await;
+        let held = diagnostic_mock.requests_after_commands().await;
+        assert_eq!(
+            held.len(),
+            requests_before + 1,
+            "idle question and pending move must not dispatch or cancel queued input"
+        );
+        match case {
+            0 | 3 => {
+                let (url, name, global) = if case == 0 {
+                    (config_url.clone(), "tyde_config_send_agent_message", false)
+                } else {
+                    (
+                        fixture.agent_control_http_url().await,
+                        "tyde_send_agent_message",
+                        true,
+                    )
+                };
+                let mut arguments =
+                    json!({"agent_id": start.agent_id, "message": retained, "interrupt": true});
+                if global {
+                    arguments["global"] = json!(true);
+                }
+                let (failed, _) = call_agent_control_request(
+                    url,
+                    Some(bearer.clone()),
+                    name.to_owned(),
+                    arguments,
+                )
+                .await;
+                assert!(!failed, "explicit idle cancellation must retain its input");
+            }
+            1 => fixture
+                .client
+                .send_queued_message_now(
+                    &agent.stream,
+                    protocol::SendQueuedMessageNowPayload {
+                        id: queued.as_ref().unwrap().messages[0].id.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            2 => fixture
+                .client
+                .send_message_payload(
+                    &agent.stream,
+                    protocol::SendMessagePayload {
+                        message: "Answer".to_owned(),
+                        images: None,
+                        origin: None,
+                        tool_response: Some(protocol::SendMessageToolResponse::AskUserQuestion {
+                            tool_call_id: question_id.clone(),
+                            answer: "Answer".to_owned(),
+                            structured_answers: None,
+                        }),
+                    },
+                )
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        fixture.next_chat_event_matching(&agent, "question terminal outcome", |event| {
+            matches!(event, protocol::ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == question_id && if typed_answer {
+                    matches!(completion.outcome, protocol::ToolExecutionOutcome::Succeeded { .. })
+                } else { matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. }) })
+        }).await;
+        if typed_answer {
+            answer_turn.wait_until_entered().await;
+            answer_turn.release_one();
+            fixture.finish_turn(&agent).await;
+        }
+        if scheduled {
+            let changed = expect_kind(
+                &mut fixture.client,
+                FrameKind::AgentProjectChanged,
+                "question recovery entry",
+            )
+            .await
+            .parse_payload::<AgentStartPayload>()
+            .unwrap();
+            assert!(changed.project_id == Some(destination.clone()));
+            assert!(changed.workspace_roots == destination_roots);
+            assert!(changed.session_id == start.session_id);
+            let broadcast = expect_kind(
+                &mut observer,
+                FrameKind::AgentProjectChanged,
+                "question recovery broadcast",
+            )
+            .await
+            .parse_payload::<AgentStartPayload>()
+            .unwrap();
+            assert!(broadcast.project_id == Some(destination.clone()));
+            continuation_gate.wait_until_entered().await;
+            let admitted = diagnostic_mock.requests().await;
+            let before_input = &admitted[requests_before..];
+            assert_eq!(
+                before_input
+                    .iter()
+                    .filter(|request| matches!(request,
+                server::backend::mock::MockRequest::Input(payload) if payload.message == retained))
+                    .count(),
+                0,
+                "retained input cannot run before the destination continuation"
+            );
+            assert_eq!(
+                before_input
+                    .iter()
+                    .filter(|request| matches!(
+                        request,
+                        server::backend::mock::MockRequest::Interrupt
+                    ))
+                    .count(),
+                usize::from(!typed_answer),
+                "each explicit cancellation reaches Backend once; typed answers never interrupt"
+            );
+            let (_, persisted) = fixture.connect_with_bootstrap().await;
+            assert!(
+                persisted
+                    .sessions
+                    .iter()
+                    .any(|session| Some(&session.id) == start.session_id.as_ref()
+                        && session.project_id == Some(destination.clone())
+                        && session.workspace_roots == destination_roots)
+            );
+            continuation_gate.release_one();
+            fixture.finish_turn(&agent).await;
+        }
+        if !scheduled {
+            fixture
+                .next_chat_event_matching(&agent, "idle cancellation acknowledged", |event| {
+                    matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+                })
+                .await;
+        }
+        let delivered = fixture.finish_turn(&agent).await;
+        let reported = delivered
+            .chat_events()
+            .into_iter()
+            .find_map(|event| match event {
+                protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                _ => None,
+            })
+            .expect("recovered input workspace report");
+        assert!(
+            serde_json::from_str::<Vec<String>>(&reported).unwrap() == destination_roots,
+            "recovered input must use actual destination roots"
+        );
+        fixture.mock(&agent).await;
+        let final_requests = diagnostic_mock.requests_after_commands().await;
+        let final_requests = &final_requests[requests_before..];
+        assert_eq!(
+            final_requests
+                .iter()
+                .filter(|request| matches!(request,
+            server::backend::mock::MockRequest::Input(payload) if payload.message == retained))
+                .count(),
+            1,
+            "each recovered input is dispatched exactly once"
+        );
+        assert_eq!(
+            final_requests
+                .iter()
+                .filter(|request| matches!(request, server::backend::mock::MockRequest::Interrupt))
+                .count(),
+            usize::from(!typed_answer)
+        );
+        eprintln!(
+            "ENTRY RECOVERY case={case} scheduled={scheduled} typed_answer={typed_answer} delivered_once=true destination_roots=true"
+        );
+    }
+
+    let (mut replay_client, replay_host) = fixture.connect_with_bootstrap().await;
+    let replay_stream = &replay_host
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .expect("recovered agent descriptor")
+        .instance_stream;
+    let replay = fixture::next_frame_matching_on(
+        &mut replay_client,
+        "recovered conversation replay",
+        |env| env.kind == FrameKind::AgentBootstrap && &env.stream == replay_stream,
+    )
+    .await
+    .parse_payload::<protocol::AgentBootstrapPayload>()
+    .unwrap();
+    // AgentBootstrap is deliberately only the last 15 messages. Fetch its
+    // typed prior-history cursor rather than claiming it is a full replay.
+    let before_seq = replay
+        .events
+        .iter()
+        .find_map(|event| match event {
+            protocol::AgentBootstrapEvent::HasPriorHistory { before_seq, .. } => Some(*before_seq),
+            _ => None,
+        })
+        .expect("coarse flow exceeds initial history tail");
+    replay_client
+        .fetch_session_history(
+            replay_stream,
+            protocol::FetchSessionHistoryPayload {
+                agent_id: start.agent_id.clone(),
+                request_id: protocol::HistoryPageRequestId(uuid::Uuid::new_v4().to_string()),
+                before_seq: Some(before_seq),
+                limit: 200,
+            },
+        )
+        .await
+        .unwrap();
+    let prior =
+        fixture::next_frame_matching_on(&mut replay_client, "recovered prior history", |env| {
+            env.kind == FrameKind::SessionHistory && &env.stream == replay_stream
+        })
+        .await
+        .parse_payload::<protocol::SessionHistoryPayload>()
+        .unwrap();
+    assert!(
+        !prior.has_more_before,
+        "bounded coarse flow history must be complete"
+    );
+    let replay_events: Vec<_> = prior
+        .events
+        .into_iter()
+        .chain(replay.events.into_iter().filter_map(|event| match event {
+            protocol::AgentBootstrapEvent::ChatEvent(event) => Some(event),
+            _ => None,
+        }))
+        .collect();
+    for message in [
+        "Retained global input".to_owned(),
+        "Ordinary queued work".to_owned(),
+    ]
+    .into_iter()
+    .chain((0..4).map(|case| format!("Retained recovery input {case}")))
+    {
+        assert_eq!(
+            replay_events
+                .iter()
+                .filter(|event| matches!(event,
+            protocol::ChatEvent::MessageAdded(entry)
+                if entry.content == message))
+                .count(),
+            1,
+            "client replay must contain each recovered input exactly once"
+        );
+    }
+    for (question_id, succeeded) in [("entry-unanswered-question".to_owned(), false)]
+        .into_iter()
+        .chain((0..4).map(|case| (format!("entry-recovery-question-{case}"), case == 2)))
+    {
+        let outcomes: Vec<_> = replay_events
+            .iter()
+            .filter_map(|event| match event {
+                protocol::ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == question_id =>
+                {
+                    Some(&completion.outcome)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "client replay must retire each question exactly once"
+        );
+        assert!(if succeeded {
+            matches!(
+                outcomes[0],
+                protocol::ToolExecutionOutcome::Succeeded { .. }
+            )
+        } else {
+            matches!(
+                outcomes[0],
+                protocol::ToolExecutionOutcome::Cancelled { .. }
+            )
+        });
+    }
+    drop(replay_client);
+
     let unrelated_workbench =
         create_workbench(&mut fixture.client, &unrelated, "feature/cross-project").await;
-    let mut previous_project = Some(workbench_id.clone());
-    let mut previous_roots = roots.clone();
+    let mut previous_project = Some(parent.id.clone());
+    let mut previous_roots = project_roots(&parent);
     for destination in [Some(&unrelated), None, Some(&unrelated_workbench)] {
         let finishing = MockGateHandle::new();
         fixture
@@ -3100,10 +3653,14 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         })
         .await;
 
+    let stop_question = MockGateHandle::new();
     fixture
         .mock(&agent)
         .await
-        .enqueue(MockTurn::held_text("Current turn before cancelled entry"))
+        .enqueue(MockTurn::async_question_request(
+            "entry-stop-question",
+            &stop_question,
+        ))
         .await;
     fixture
         .client
@@ -3123,6 +3680,13 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     )
     .await;
     assert!(!failed, "schedule existing workbench entry");
+    stop_question.wait_until_entered().await;
+    stop_question.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "stop question survives normal idle", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
     fixture.client.interrupt(&agent.stream).await.unwrap();
     let cancelled = expect_kind(
         &mut fixture.client,
@@ -3133,6 +3697,14 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     .parse_payload::<protocol::AgentErrorPayload>()
     .unwrap();
     assert!(cancelled.message.contains("entry cancelled"));
+    fixture
+        .next_chat_event_matching(&agent, "Stop retires the unanswered question", |event| {
+            matches!(event, protocol::ChatEvent::ToolExecutionCompleted(completion)
+            if completion.tool_call_id == "entry-stop-question"
+                && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. }))
+        })
+        .await;
+    eprintln!("ENTRY DIAGNOSTIC Stop while idle: move_cancelled=true question_cancelled=true");
     fixture
         .next_chat_event_matching(&agent, "cancelled turn idle", |event| {
             matches!(event, protocol::ChatEvent::TypingStatusChanged(false))

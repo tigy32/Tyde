@@ -10,6 +10,9 @@ use super::script::MockTurn;
 pub(super) enum MockCommand {
     Input(AgentInput),
     Interrupt,
+    ReadRequests {
+        reply: oneshot::Sender<Vec<MockRequest>>,
+    },
     /// The backend handed a send back as `Busy` and asked the actor to run a
     /// turn "it started on its own".
     EmitBusySelfTurn,
@@ -138,12 +141,15 @@ const TERMINAL_REPORT_MISSING: &str =
 #[derive(Debug, Clone)]
 pub struct MockControl {
     tx: mpsc::UnboundedSender<MockControlCommand>,
+    command_tx: mpsc::WeakUnboundedSender<MockCommand>,
     terminal: MockTerminalReportSlot,
     compaction_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockControl {
-    pub(super) fn channel() -> (
+    pub(super) fn channel(
+        command_tx: mpsc::UnboundedSender<MockCommand>,
+    ) -> (
         Self,
         mpsc::UnboundedReceiver<MockControlCommand>,
         MockTerminalReportSlot,
@@ -153,6 +159,7 @@ impl MockControl {
         (
             Self {
                 tx,
+                command_tx: command_tx.downgrade(),
                 terminal: Arc::clone(&terminal),
                 compaction_attempts: Arc::default(),
             },
@@ -256,6 +263,17 @@ impl MockControl {
             // report was published before the mailbox closed.
             Err(_) => self.terminal_report().requests,
         }
+    }
+
+    /// Read after earlier backend commands, while no scripted gate is held.
+    pub async fn requests_after_commands(&self) -> Vec<MockRequest> {
+        let (reply, read) = oneshot::channel();
+        self.command_tx
+            .upgrade()
+            .expect(CONTROL_CLOSED)
+            .send(MockCommand::ReadRequests { reply })
+            .expect(CONTROL_CLOSED);
+        read.await.expect(CONTROL_CLOSED)
     }
 
     /// Violations recorded by the actor, including its terminal report.

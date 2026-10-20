@@ -834,6 +834,8 @@ impl TydeConfigMcpServer {
         if input.message.trim().is_empty() {
             return Ok(err_text("message must not be empty"));
         }
+        tracing::info!(target: "tyde_project_entry_diagnostic", interrupt = input.interrupt,
+            "configuration MCP delivery authorized");
         match do_send_message(
             &self.host,
             &agent_id,

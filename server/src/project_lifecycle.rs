@@ -80,6 +80,7 @@ pub(crate) async fn run_entry(
     catalog: Arc<ProjectCatalogHandle>,
     request: ProjectEntryRequest,
 ) {
+    tracing::info!(target: "tyde_project_entry_diagnostic", "lifecycle entry resolving destination");
     let ProjectEntryRequest {
         agent_id,
         source,

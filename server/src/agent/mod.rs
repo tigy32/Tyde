@@ -4953,6 +4953,21 @@ pub(crate) fn spawn_agent_actor(
                 && pending_tool_response_ids.is_empty()
                 && open_tool_call_ids.is_empty()
                 && !status_handle.snapshot().await.has_background_work;
+            if scheduled_project_move.is_some()
+                && tracing::enabled!(target: "tyde_project_entry_diagnostic", tracing::Level::INFO)
+            {
+                let background_work = status_handle.snapshot().await.has_background_work;
+                tracing::info!(target: "tyde_project_entry_diagnostic",
+                    project_entry_ready, in_turn, backend_typing, idle_transition_armed,
+                    project_move_waiting_for_backend,
+                    running = matches!(lifecycle, ActorLifecycle::Running),
+                    compaction_blocked, active_compaction = active_compaction.is_some(),
+                    context_compaction = context_compaction.is_some(), resume_replay_gate_pending,
+                    pending_responses = pending_tool_response_ids.len(), open_tools = open_tool_call_ids.len(),
+                    background_work,
+                    grant_pending = project_entry_pending.is_some(), grant_received = project_entry_execution.is_some(),
+                    queue_len = queue.len(), "actor project entry eligibility");
+            }
             if scheduled_project_move.is_none() {
                 project_entry_pending = None;
                 project_entry_execution = None;
@@ -5029,6 +5044,7 @@ pub(crate) fn spawn_agent_actor(
                 let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
                 match result {
                     Err(ProjectMoveFailure::Busy) => {
+                        tracing::info!(target: "tyde_project_entry_diagnostic", "actor relocation result busy");
                         tracing::info!(
                             "Keeping scheduled project entry pending until backend work settles"
                         );
@@ -6914,6 +6930,9 @@ pub(crate) fn spawn_agent_actor(
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
                             backend_typing = typing;
+                            tracing::info!(target: "tyde_project_entry_diagnostic", typing, in_turn,
+                                pending_responses = pending_tool_response_ids.len(), open_tools = open_tool_call_ids.len(),
+                                queue_len = queue.len(), "actor received Backend typing");
                             if !typing && !pending_tool_response_ids.is_empty() {
                                 tracing::info!(
                                     pending_responses = pending_tool_response_ids.len(),
@@ -7028,6 +7047,9 @@ pub(crate) fn spawn_agent_actor(
                                 _ => None,
                             };
                             if pending_response_kind.is_some() {
+                                tracing::info!(target: "tyde_project_entry_diagnostic",
+                                    blocking = user_response_blocks_turn(&request.tool_type),
+                                    "actor registered user response request");
                                 pending_tool_response_ids.insert(request.tool_call_id.clone());
                                 if user_response_blocks_turn(&request.tool_type) {
                                     in_turn = true;
@@ -7069,6 +7091,11 @@ pub(crate) fn spawn_agent_actor(
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
+                            if completed_pending_response {
+                                tracing::info!(target: "tyde_project_entry_diagnostic", remaining = pending_tool_response_ids.len(),
+                                    cancelled = matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. }),
+                                    "actor retired user response request");
+                            }
                             let blocked_on_user = pending_tool_response_ids.iter().any(|id| {
                                 open_tool_requests.get(id).is_some_and(|request| {
                                     user_response_blocks_turn(&request.tool_type)
@@ -7270,7 +7297,15 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                     }
 
-                    if real_idle_transition
+                    // Cancelling an interaction after foreground idle owes an
+                    // idle marker too, but must not invent a foreground turn.
+                    if (real_idle_transition
+                        || (matches!(&event, ChatEvent::TypingStatusChanged(false))
+                            && !in_turn
+                            && pending_inputs.is_empty()
+                            && initial_follow_up.is_none()
+                            && pending_tool_response_ids.is_empty()
+                            && open_tool_call_ids.is_empty()))
                         && tychat_handoff.is_none()
                         && !resume_replay_gate_pending
                         && !usage_paused
@@ -7488,6 +7523,8 @@ pub(crate) fn spawn_agent_actor(
                             let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
+                            tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn,
+                                pending_move = scheduled_project_move.is_some(), "actor received acknowledged delivery");
                             AgentCommand::SendInput(input)
                         }
                         command => command,
@@ -7866,16 +7903,20 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                                 continue;
                             }
-                            // Steering only means something while a turn the
-                            // backend could take it into is running; everywhere
-                            // else a steer is an ordinary send.
+                            // Explicit cancellation also applies to unanswered
+                            // interactions that outlive the foreground turn.
                             let input = match input {
                                 AgentInput::SteerMessage(payload)
                                     if payload.tool_response.is_some()
-                                        || !in_turn
+                                        || (!in_turn
+                                            && !(redirect == RunningTurnRedirect::Interrupt
+                                                && !pending_tool_response_ids.is_empty()))
                                         || usage_paused
                                         || context_compaction.is_some() =>
                                 {
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn,
+                                        usage_paused, context_compaction = context_compaction.is_some(),
+                                        tool_response = payload.tool_response.is_some(), "actor normalized steer to send");
                                     AgentInput::SendMessage(payload)
                                 }
                                 input => input,
@@ -8079,6 +8120,9 @@ pub(crate) fn spawn_agent_actor(
                                                 .await,
                                         )
                                     };
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", ?admission, ?redirect, in_turn,
+                                        pending_move = scheduled_project_move.is_some(), is_tool_response,
+                                        "actor ordinary send admission");
                                     if is_tool_response
                                         && admission
                                             == Some(registry::DispatchAdmission::HostStopping)
@@ -8508,11 +8552,12 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
-                                            if reply.is_control() { mark_agent_work_pending(&status_handle).await; }
+                                            if reply.is_control() && in_turn { mark_agent_work_pending(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
                                         }
                                         continue;
                                     }
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, "actor redirect admitted");
                                     let (payload, interrupt_turn) = if redirect
                                         == RunningTurnRedirect::Interrupt
                                     {
@@ -8593,10 +8638,12 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
-                                            if reply.is_control() { mark_agent_turn_active(&status_handle).await; }
+                                            if reply.is_control() && in_turn { mark_agent_turn_active(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
                                         }
                                     }
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", interrupt_turn,
+                                        "actor redirect backend interrupt decision after receipt");
                                     if interrupt_turn
                                         && !backend
                                             .as_ref()
@@ -8607,7 +8654,7 @@ pub(crate) fn spawn_agent_actor(
                                         let payload = AgentErrorPayload {
                                             agent_id: current_start.agent_id.clone(),
                                             code: AgentErrorCode::Internal,
-                                            message: "agent backend does not support interrupt"
+                                            message: "agent backend could not interrupt"
                                                 .to_owned(),
                                             fatal: false,
                                         };
@@ -8692,6 +8739,8 @@ pub(crate) fn spawn_agent_actor(
                                     .await;
                                 }
                                 AgentInput::SendQueuedMessageNow(payload) => {
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
+                                        pending_move = scheduled_project_move.is_some(), "actor received UI send-now");
                                     let Some(index) =
                                         queue.iter().position(|entry| entry.id == payload.id)
                                     else {
@@ -8743,7 +8792,7 @@ pub(crate) fn spawn_agent_actor(
                                     .await;
 
                                     if usage_paused { continue; }
-                                    if in_turn {
+                                    if in_turn || !pending_tool_response_ids.is_empty() {
                                         if status_handle
                                             .admit_dispatch(registry::DispatchClass::Redirect)
                                             .await
@@ -8760,7 +8809,7 @@ pub(crate) fn spawn_agent_actor(
                                             let payload = AgentErrorPayload {
                                                 agent_id: current_start.agent_id.clone(),
                                                 code: AgentErrorCode::Internal,
-                                                message: "agent backend does not support interrupt"
+                                                message: "agent backend could not interrupt"
                                                     .to_owned(),
                                                 fatal: false,
                                             };
@@ -8783,6 +8832,8 @@ pub(crate) fn spawn_agent_actor(
                                         continue;
                                     }
 
+                                    tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
+                                        pending_move = scheduled_project_move.is_some(), "actor UI send-now dispatch admitted");
                                     let queued = queue
                                         .pop_front()
                                         .expect("queue front must exist after push_front");
@@ -10328,7 +10379,9 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
-
+                            tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
+                                pending_responses = pending_tool_response_ids.len(),
+                                pending_move = scheduled_project_move.is_some(), "actor received Stop");
                             if scheduled_project_move.take().is_some() {
                                 append_event(&canonical_stream, &mut event_log, &mut subscribers,
                                     FrameKind::AgentError, &AgentErrorPayload {

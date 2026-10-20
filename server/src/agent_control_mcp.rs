@@ -1840,6 +1840,8 @@ impl TydeAgentControlMcpServer {
         if let Err(error) = authorized {
             return Ok(err_text(error));
         }
+        tracing::info!(target: "tyde_project_entry_diagnostic", interrupt = input.interrupt,
+            global = input.global, "agent-control MCP delivery authorized");
         let _active = ActiveSendRequestGuard::new(Arc::clone(&self.active_send_requests));
         loop {
             let released = self.send_release.notified();
@@ -3137,11 +3139,14 @@ pub(crate) async fn do_send_message(
         origin: Some(origin),
         tool_response: None,
     };
-    if interrupt {
+    let result = if interrupt {
         handle.deliver_interrupt_message(payload).await
     } else {
         handle.deliver_steer_message(payload).await
-    }
+    };
+    tracing::info!(target: "tyde_project_entry_diagnostic", interrupt, accepted = result.is_ok(),
+        "MCP delivery actor receipt");
+    result
 }
 
 async fn do_team_describe(
