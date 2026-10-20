@@ -17457,12 +17457,9 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .sidebar-bar .dock-tab-bar { padding: 0 2px; height: 100%; min-height: 34px; flex-wrap: wrap; overflow: visible; }
 .dock-tab-item { display: flex; min-width: 0; align-items: stretch; position: relative; }
 .dock-tab-item .dock-tab { padding: 0 6px; font-size: 11px; }
-.sidebar-tab-menu { align-self: center; font-size: 12px; }
-.sidebar-tab-menu summary { list-style: none; cursor: pointer; padding: 2px; color: var(--text-tertiary); }
-.sidebar-tab-menu summary::-webkit-details-marker { display: none; }
-.sidebar-tab-actions { position: absolute; top: 100%; right: 0; width: 130px; padding: 4px; z-index: 10; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 5px; box-shadow: 0 4px 12px #0004; }
-.sidebar-tab-actions button { display: block; border: 0; width: 100%; padding: 7px; background: transparent; text-align: left; color: var(--text-primary); cursor: pointer; }
-.sidebar-tab-actions button:hover { background: var(--surface-3); }
+ .sidebar-tab-choice { display: flex; align-items: center; gap: 8px; }
+.sidebar-tab-check { width: 16px; flex-shrink: 0; color: var(--accent-primary); }
+.sidebar-tab-choice:hover, .sidebar-tab-choice:focus-visible { background: var(--surface-hover); outline: 1px solid var(--accent-primary); outline-offset: -1px; }
 .sidebar-empty-target { align-self: stretch; width: 100%; text-align: center; color: var(--text-tertiary); padding-top: 7px; }
 .sidebar-drop-over { background: color-mix(in srgb, var(--accent-primary) 16%, var(--surface-2)); outline: 2px dashed var(--accent-primary); outline-offset: -2px; }
 .sidebar-drop-before { box-shadow: inset 3px 0 var(--accent-primary); }
@@ -17472,8 +17469,10 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .header-right { flex-shrink: 0; }
 .agent-card[data-sidebar-backend] { border-left: 1px solid var(--border-primary); box-shadow: none; transition: background 0.15s; }
 .agent-card[data-sidebar-backend]:hover { box-shadow: none; }
-.agent-card-group[data-related="true"] .agent-card { background: color-mix(in srgb, var(--accent-primary) 9%, var(--surface-1)); }
-.agent-card-group .agent-card[aria-current="true"] { background: color-mix(in srgb, var(--accent-primary) 23%, var(--surface-1)); border-color: transparent; }
+.agent-card-group[data-related="true"] .agent-card { border-color: var(--border-secondary); }
+.agent-card-group .agent-card[aria-current="true"] { background: var(--accent-subtle); border-color: var(--border-secondary); }
+.agent-card[data-sidebar-backend]:hover { background: var(--surface-hover); }
+.agent-card[data-sidebar-backend]:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: -2px; }
 .agent-card-top > .sidebar-card-expand { order: 6; font-size: 16px; width: 18px; }
 .agent-card-top > .agent-card-status { order: 3; margin-left: auto; }
 .agent-card-top > .agent-card-pin { order: 5; display: none; }
@@ -17487,7 +17486,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-show-inactive[aria-expanded="true"] { color: var(--accent-primary); }
 .agent-sidebar-project-section { border: 1px solid var(--border-primary); border-radius: 6px; padding: 2px 3px 4px; margin-top: 8px; }
 .agent-sidebar-project-header { display: flex; align-items: center; gap: 3px; padding-right: 6px; }
-.agent-sidebar-project-header .agent-folder-toggle { width: auto; min-width: 0; flex: 0 1 auto; }
+.agent-sidebar-project-header .agent-folder-toggle { width: auto; min-width: 0; flex: 1; }
 .agent-sidebar-project-header .agent-folder-count { display: none; }
 .agent-sidebar-project-header .agent-folder-label { flex: 0 1 auto; font-weight: 600; }
 .agent-sidebar-project-header .agent-folder-label::before { content: '▱'; margin-right: 7px; }
@@ -17504,7 +17503,6 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .project-roots-help { font-size: 12px; color: var(--text-secondary); }
 .sidebar-bar .dock-tab-bar { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; }
 .dock-tab-item { flex-shrink: 0; }
-.sidebar-tab-actions { position: fixed; top: auto; right: auto; transform: translateX(-95px); }
 .project-root-error { display: block; color: var(--error); }
 
 .agents-panel { position: relative; }
@@ -17513,7 +17511,6 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-filter-menu summary { list-style: none; width: 28px; height: 28px; border: 1px solid var(--border-primary); border-radius: 4px; display: grid; place-items: center; color: var(--text-secondary); cursor: pointer; }
 .agents-filter-menu summary::-webkit-details-marker { display: none; }
 .agents-filter-menu .panel-filters { position: absolute; right: 0; width: 190px; padding: 8px; flex-direction: column; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 5px; box-shadow: 0 4px 12px #0004; }
-.agent-projects-heading { display: flex; justify-content: space-between; align-items: center; margin: 12px 2px 4px; text-transform: uppercase; letter-spacing: 0.1em; font-size: 10px; color: var(--text-secondary); }
 .agent-new-project { border: 0; background: transparent; color: var(--accent-link); font-size: 11px; cursor: pointer; }
 .agent-card-top > .agent-card-pin { width: 22px; height: 22px; padding: 2px; }
 
@@ -17651,12 +17648,14 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .header-mode-options button:hover, .header-mode-options button:focus-visible { background: var(--surface-3); outline: 1px solid var(--accent-primary); outline-offset: -1px; }
 .header-mode-options small { display: block; margin-top: 3px; font-size: 11px; color: var(--text-secondary); }
 .header-mode-check { color: var(--accent-primary); }
-.agent-sidebar-host-header { margin-top: 12px; }
-.agent-projects-heading { justify-content: flex-end; margin: 4px 2px; }
+.agent-sidebar-host-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; margin-top: 4px; padding: 0 4px; border-bottom: 1px solid var(--border-primary); }
+.agent-sidebar-host-header > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-sidebar-host-header .agent-new-project { flex-shrink: 0; padding: 4px 0 4px 8px; }
+.project-new-agent { flex-shrink: 0; width: 24px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: var(--text-secondary); font-size: 18px; line-height: 1; cursor: pointer; }
+.project-new-agent:hover, .project-new-agent:focus-visible { color: var(--text-primary); background: var(--surface-hover); outline: 1px solid var(--accent-primary); outline-offset: -1px; }
 .agent-sidebar-project-section { margin-top: 4px; border: 0; border-radius: 0; padding: 0; }
 .agent-sidebar-project-header { padding: 2px 5px; }
-.agent-workbench-context { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin-top: 2px; color: var(--text-secondary); font-size: 10px; font-weight: 400; }
-.agent-workbench-context::before { content: '⑂'; padding-right: 4px; }
+.agent-workbench-context { overflow-wrap: anywhere; color: var(--text-secondary); font-size: 11px; }
 .agent-card[data-expanded="true"] > .sidebar-card-details { padding: 6px 0 0 28px; }
 .agent-card > .sidebar-card-details > * + * { margin-top: 6px; }
 .sidebar-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
@@ -17678,3 +17677,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .project-editor-root { margin: 0; padding: 9px 0; border-bottom: 1px solid var(--border-subtle); }
 .project-editor-root > span { line-height: 1.5; }
 .project-editor .modal-body > .modal-button { align-self: flex-start; }
+
+.agent-sidebar-workbenches { display: flex; flex-direction: column; padding-left: 22px; }
+.agent-sidebar-workbench { display: flex; align-items: center; gap: 3px; min-height: 26px; color: var(--text-secondary); font-size: 11px; }
+.agent-sidebar-workbench > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-sidebar-workbench:hover .project-edit-pencil, .agent-sidebar-workbench:focus-within .project-edit-pencil { opacity: 1; }

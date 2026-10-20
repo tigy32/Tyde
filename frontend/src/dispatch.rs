@@ -10456,7 +10456,7 @@ mod wasm_tests {
         assert_eq!(
             state
                 .sidebar_layout
-                .with_untracked(|l| l.dinosaur.left.active),
+                .with_untracked(|l| l.current().left.active),
             Some(crate::state::SidebarTab::References)
         );
 

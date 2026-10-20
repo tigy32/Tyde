@@ -113,6 +113,31 @@ pub fn LaunchChooser(
             .map(|project| project.host_id.clone()),
         None => state.chat_context_host_id_untracked(),
     };
+    let context_label = chosen_project.as_ref().map(|target| {
+        let projects = state.projects;
+        let hosts = state.configured_hosts;
+        let target = target.clone();
+        move || {
+            let project = projects.with(|projects| {
+                projects
+                    .iter()
+                    .find(|project| {
+                        project.host_id == target.host_id && project.project.id == target.project_id
+                    })
+                    .map(|project| project.project.name.clone())
+            });
+            let host = hosts.with(|hosts| {
+                hosts
+                    .iter()
+                    .find(|host| host.id == target.host_id)
+                    .map(|host| host.label.clone())
+            });
+            match (host, project) {
+                (Some(host), Some(project)) => format!("{host} · {project}"),
+                _ => "Project unavailable".to_owned(),
+            }
+        }
+    });
     let entries_state = state.clone();
     let entries_host = host.clone();
     let entries = Memo::new(move |_| {
@@ -331,7 +356,7 @@ pub fn LaunchChooser(
             <div class="launch-chooser" role="dialog" aria-modal="true" aria-label="New agent"
                 node_ref=dialog_ref on:keydown=on_keydown>
                 <header class="launch-chooser-header">
-                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
+                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p>{context_label.map(|label| view! { <p class="launch-project-context">{label}</p> })}</div>
                     <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
                         on:click=move |_| open_sig.set(false)>"×"</button>
                 </header>

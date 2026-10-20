@@ -61,6 +61,32 @@ pub fn open_project_browser(state: &AppState) {
     );
 }
 
+pub(super) fn open_project_browser_for_host(state: &AppState, host_id: &str) {
+    let stream = state
+        .host_streams
+        .with_untracked(|streams| streams.get(host_id).cloned());
+    let Some(stream) = stream.filter(|_| {
+        matches!(
+            state.connection_status_for_host(host_id),
+            ConnectionStatus::Connected
+        )
+    }) else {
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
+            "Connect this host before creating a project.",
+        );
+        return;
+    };
+    open_browser_for(
+        state,
+        host_id.to_owned(),
+        stream,
+        BrowsePurpose::OpenProject {
+            allow_host_switch: false,
+        },
+    );
+}
+
 pub(super) fn open_project_browser_on_selected_host(state: &AppState) {
     let selected = state.selected_host_stream_untracked().filter(|(host, _)| {
         matches!(

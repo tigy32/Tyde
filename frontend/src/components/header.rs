@@ -356,7 +356,7 @@ pub fn Header() -> impl IntoView {
                 <div class="header-left">
                     <span class="header-title">"Tyde"</span>
                     <InterfaceModeMenu />
-                    <span id="interface-mode-description" class="visually-hidden">"Vibe shows Agents and History. Dinosaur includes Files, Git, Search, Refs and advanced tools."</span>
+                    <span id="interface-mode-description" class="visually-hidden">"Vibe starts with Agents and History. Dinosaur starts with developer tools. Right-click either tab strip to choose any sidebar tabs."</span>
                     <div class="header-status">
                         <span class={status_class}></span>
                         <span class="status-text" title={status_text}>{status_text}</span>

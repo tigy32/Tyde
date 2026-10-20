@@ -1,4 +1,7 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
+
+use crate::components::card_menu::{CardContextMenu, open_card_menu};
 
 use crate::components::agents_panel::AgentsPanel;
 use crate::components::file_explorer::FileExplorer;
@@ -37,11 +40,25 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
     let hover = RwSignal::new(None::<SidebarTab>);
     let over = RwSignal::new(false);
     let move_state = state.clone();
+    let checklist_state = state.clone();
+    let menu = RwSignal::new(None);
+    let anchor = NodeRef::<leptos::html::Div>::new();
     view! {
         <div class="dock-tab-bar" style=move || if blocked.get() { "display:none" } else { "" } class:sidebar-drop-over=move || over.get() && dragged.get().is_some()
             aria-label=format!("{} sidebar tabs", side.label())
+            node_ref=anchor tabindex="0" aria-haspopup="menu"
+            on:contextmenu=move |ev| open_card_menu(menu, &ev)
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "ContextMenu" || (ev.shift_key() && ev.key() == "F10") {
+                    ev.prevent_default(); ev.stop_propagation();
+                    if let Some(target) = ev.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok()) {
+                        let rect = target.get_bounding_client_rect();
+                        menu.set(Some((rect.left(), rect.bottom())));
+                    }
+                }
+            }
             on:dragover=move |ev: web_sys::DragEvent| {
-                if dragged.get_untracked().is_some() { ev.prevent_default(); over.set(true); hover.set(None); }
+                if dragged.get_untracked().is_some() { ev.prevent_default(); if let Some(data) = ev.data_transfer() { data.set_drop_effect("move"); } over.set(true); hover.set(None); }
             }
             on:dragleave=move |_| { over.set(false); hover.set(None); }
             on:drop=move |ev: web_sys::DragEvent| {
@@ -55,14 +72,10 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
             <For each=move || layouts.with(|layouts| layouts.current().pane(side).tabs.clone()) key=|tab| *tab children=move |tab| {
                 let activate = state.clone();
                 let keys = state.clone();
-                let menu_left = state.clone();
-                let menu_right = state.clone();
-                let menu_previous = state.clone();
-                let menu_next = state.clone();
                 view! {
                     <div class="dock-tab-item" style=move || if layouts.with(|l| l.current().pane(side).visible) { "" } else { "display:none" } class:sidebar-drop-before=move || dragged.get().is_some() && hover.get() == Some(tab)
                         on:dragover=move |ev: web_sys::DragEvent| {
-                            if dragged.get_untracked().is_some() { ev.prevent_default(); ev.stop_propagation(); hover.set(Some(tab)); over.set(true); }
+                            if dragged.get_untracked().is_some() { ev.prevent_default(); ev.stop_propagation(); if let Some(data) = ev.data_transfer() { data.set_drop_effect("move"); } hover.set(Some(tab)); over.set(true); }
                         }
                     >
                         <button type="button" class="dock-tab" class:active=move || layouts.with(|l| l.current().pane(side).active == Some(tab))
@@ -93,20 +106,26 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                                 }
                             }
                         >{tab.label()}</button>
-                        <details class="sidebar-tab-menu">
-                            <summary aria-label=format!("{} tab actions", tab.label()) title="Move or reorder tab">"⋯"</summary>
-                            <div class="sidebar-tab-actions">
-                                <button on:click=move |_| menu_left.move_sidebar_tab(tab, SidebarSide::Left, None)>"Move left"</button>
-                                <button on:click=move |_| menu_right.move_sidebar_tab(tab, SidebarSide::Right, None)>"Move right"</button>
-                                <button on:click=move |_| reorder(&menu_previous, tab, side, false)>"Move earlier"</button>
-                                <button on:click=move |_| reorder(&menu_next, tab, side, true)>"Move later"</button>
-                            </div>
-                        </details>
                     </div>
                 }
             } />
             <span class="sidebar-empty-target" style=move || if dragged.get().is_some() && layouts.with(|l| { let pane = l.current().pane(side); !pane.visible || pane.tabs.is_empty() }) { "" } else { "display:none" }>"Drop tabs here"</span>
         </div>
+        <CardContextMenu menu=menu label="Sidebar tabs" anchor=anchor>
+            <div>
+                {SidebarTab::ALL.into_iter().map(|tab| {
+                    let toggle = checklist_state.clone();
+                    view! {
+                        <button type="button" class="context-menu-item sidebar-tab-choice" role="menuitemcheckbox"
+                            aria-label=tab.label() aria-checked=move || layouts.with(|layouts| layouts.current().side(tab).is_some()).to_string()
+                            on:click=move |_| toggle.toggle_sidebar_tab(tab, side)>
+                            <span class="sidebar-tab-check" aria-hidden="true">{move || layouts.with(|layouts| layouts.current().side(tab).is_some()).then_some("✓")}</span>
+                            {tab.label()}
+                        </button>
+                    }
+                }).collect_view()}
+            </div>
+        </CardContextMenu>
     }
 }
 
@@ -138,7 +157,7 @@ pub fn SidebarPanels() -> impl IntoView {
             let style = move || {
                 if blocked.get() { return "display:none".into(); }
                 layouts.with(|layouts| {
-                match layouts.current().side(tab) {
+                match [SidebarSide::Left, SidebarSide::Right].into_iter().find(|side| layouts.current().pane(*side).active == Some(tab)) {
                     Some(side) => {
                         let pane = layouts.current().pane(side);
                         if pane.visible && pane.active == Some(tab) { format!("grid-column:{};grid-row:2", side.column()) } else { "display:none".into() }

@@ -6,6 +6,7 @@
 //! discoverable affordance on its own.
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 /// A point in the viewport.
 type Point = (f64, f64);
@@ -85,7 +86,16 @@ pub(crate) fn CardContextMenu(
         if menu.get().is_some()
             && let Some(element) = menu_ref.get()
         {
-            let _ = element.focus();
+            match element.query_selector("button[role^='menuitem']:not(:disabled)") {
+                Ok(Some(item)) => {
+                    if let Some(item) = item.dyn_ref::<web_sys::HtmlElement>() {
+                        let _ = item.focus();
+                    }
+                }
+                _ => {
+                    let _ = element.focus();
+                }
+            }
         }
     });
 
@@ -127,8 +137,25 @@ pub(crate) fn CardContextMenu(
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=move |ev: web_sys::KeyboardEvent| {
                     ev.stop_propagation();
-                    if ev.key() == "Escape" {
-                        close();
+                    match ev.key().as_str() {
+                        "Escape" => { ev.prevent_default(); close(); },
+                        "Tab" => close(),
+                        "ArrowDown" | "ArrowUp" | "Home" | "End" => {
+                            ev.prevent_default();
+                            let Some(element) = menu_ref.get_untracked() else { return; };
+                            let Ok(items) = element.query_selector_all("button[role^='menuitem']:not(:disabled)") else { return; };
+                            if items.length() == 0 { return; }
+                            let focused = web_sys::window().and_then(|window| window.document()).and_then(|document| document.active_element());
+                            let current = (0..items.length()).find(|index| items.item(*index).as_ref().is_some_and(|item| focused.as_ref().is_some_and(|focused| item.is_same_node(Some(focused)))));
+                            let next = match ev.key().as_str() {
+                                "Home" => 0,
+                                "End" => items.length() - 1,
+                                "ArrowUp" => current.map_or(items.length() - 1, |index| (index + items.length() - 1) % items.length()),
+                                _ => current.map_or(0, |index| (index + 1) % items.length()),
+                            };
+                            if let Some(item) = items.item(next).and_then(|item| item.dyn_into::<web_sys::HtmlElement>().ok()) { let _ = item.focus(); }
+                        },
+                        _ => {},
                     }
                 }
             >

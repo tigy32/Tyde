@@ -535,6 +535,7 @@ struct AgentProjectSection {
     key: String,
     label: String,
     project: Option<ActiveProjectRef>,
+    workbenches: Vec<ProjectInfo>,
     swarms: Vec<SidebarSwarmRef>,
     groups: Vec<AgentTreeGroup>,
 }
@@ -726,6 +727,12 @@ fn build_sidebar_sections(
             group,
         ));
     }
+    for project in &projects {
+        if project.project.parent_project_id().is_none() {
+            let key = leaf_for(project.host_id.clone(), Some(project.project.id.clone()));
+            leaf_agents.entry(key).or_default();
+        }
+    }
     for (key, swarm) in keyed_swarms {
         leaf_agents.entry(key).or_default().0.push(swarm);
     }
@@ -779,6 +786,15 @@ fn build_sidebar_sections(
                             .map(|id| format!("{}:{}", host_id, id.0))
                             .unwrap_or_else(|| format!("{host_id}:no-project")),
                         label,
+                        workbenches: projects
+                            .iter()
+                            .filter(|project| {
+                                project.host_id == host_id
+                                    && project_id.is_some()
+                                    && project.project.parent_project_id() == project_id.as_ref()
+                            })
+                            .cloned()
+                            .collect(),
                         project: project_id.map(|project_id| ActiveProjectRef {
                             host_id: host_id.clone(),
                             project_id,
@@ -841,11 +857,12 @@ fn build_sidebar_projection(
         .iter()
         .map(|host| host.id.clone())
         .collect();
-    for host in swarms
-        .iter()
-        .map(|swarm| &swarm.host_id)
-        .chain(agents.iter().map(|agent| &agent.host_id))
-    {
+    for host in projects.iter().map(|project| &project.host_id).chain(
+        swarms
+            .iter()
+            .map(|swarm| &swarm.host_id)
+            .chain(agents.iter().map(|agent| &agent.host_id)),
+    ) {
         if !host_order.contains(host) {
             host_order.push(host.clone());
         }
@@ -1508,14 +1525,55 @@ pub fn AgentsPanel() -> impl IntoView {
         })
     });
 
+    let launch_target = RwSignal::new(None::<ActiveProjectRef>);
+    let launch_open = RwSignal::new(false);
+    let launch_projects = state.projects;
+    let launch_project = Memo::new(move |_| {
+        let target = launch_target.get()?;
+        launch_projects.with(|projects| {
+            projects
+                .iter()
+                .any(|project| {
+                    project.host_id == target.host_id && project.project.id == target.project_id
+                })
+                .then_some(target)
+        })
+    });
+    let launch = Callback::new(move |target| {
+        launch_target.set(Some(target));
+        launch_open.set(true);
+    });
+
     let section_state = state.clone();
     let projection = Memo::new(move |_| {
         let snapshot = section_state.agents_view_preferences.get();
+        let projects = section_state.projects.get();
+        let active = section_state.active_project.get();
+        let show_other = current_filters.get().show_other_projects;
+        let scoped_projects = projects
+            .iter()
+            .filter(|project| {
+                show_other
+                    || active.as_ref().is_some_and(|active| {
+                        project.host_id == active.host_id
+                            && agent_ui_project_id(
+                                &projects,
+                                &project.host_id,
+                                Some(&project.project.id),
+                            ) == agent_ui_project_id(
+                                &projects,
+                                &active.host_id,
+                                Some(&active.project_id),
+                            )
+                    })
+            })
+            .cloned()
+            .collect();
         build_sidebar_projection(
             filtered_agents.get(),
             filtered_swarms.get(),
             section_state.configured_hosts.get(),
-            section_state.projects.get(),
+            scoped_projects,
             snapshot.groups,
             snapshot.pins,
         )
@@ -1619,8 +1677,8 @@ pub fn AgentsPanel() -> impl IntoView {
                         });
                         let hosts = projection.hosts.into_iter().map(|host| {
                         let default_drop_state = state.clone();
-                        let first_project = host.projects.iter().find(|project| project.project.is_some()).map(|project| project.key.clone());
-                        let no_projects = first_project.is_none();
+                        let add_project_state = state.clone();
+                        let add_project_host = host.key.clone();
                         let custom_groups = host.custom_groups;
                         let custom_groups_view = if custom_groups.is_empty() {
                             ().into_any()
@@ -1849,7 +1907,11 @@ pub fn AgentsPanel() -> impl IntoView {
                         };
                         view! {
                             <section class="agent-sidebar-host-section" data-host-id=host.key>
-                                <div class="agent-sidebar-host-header" aria-label=format!("Host: {}", host.label)>{host.label.clone()}</div>
+                                <div class="agent-sidebar-host-header">
+                                    <span aria-label=format!("Host: {}", host.label)>{host.label.clone()}</span>
+                                    <button type="button" class="agent-new-project" aria-label=format!("New project on {}", host.label)
+                                        on:click=move |_| crate::components::host_browser::open_project_browser_for_host(&add_project_state, &add_project_host)>"+ Project"</button>
+                                </div>
                                 <div
                                     class="agent-sidebar-default-tree"
                                     on:dragover=move |ev: web_sys::DragEvent| {
@@ -1872,27 +1934,40 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 let target = project.project.clone();
                                                 let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
                                                 let edit_name = format!("Edit project {}", project.label);
-                                                let projects_heading = (first_project.as_ref() == Some(&project.key)).then(|| view! {
-                                                    <div class="agent-projects-heading"><button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button></div>
-                                                });
                                                 view! {
-                                                    {projects_heading}
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">
                                                             {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
+                                                            <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span>
                                                             {target.map(|target| view! {
                                                                 <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
-                                                                    on:click=move |_| editor.set(Some(target.clone()))>"✎"</button>
+                                                                    on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"✎"</button>
+                                                                <ProjectNewAgent target=target label=project.label.clone() launch=launch />
                                                             })}
-                                                            <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span>
                                                         </div>
+                                                        {if project.workbenches.is_empty() { ().into_any() } else {
+                                                            let workbench_key = folder_key.clone();
+                                                            view! { <Show when=move || !collapsed_folders.with(|folders| folders.contains(&workbench_key))>
+                                                                <div class="agent-sidebar-workbenches">
+                                                                {project.workbenches.iter().map(|workbench| {
+                                                                    let target = ActiveProjectRef { host_id: workbench.host_id.clone(), project_id: workbench.project.id.clone() };
+                                                                    let label = workbench.project.name.clone();
+                                                                    let edit_label = format!("Edit project {label}");
+                                                                    view! { <div class="agent-sidebar-workbench" data-project-id=workbench.project.id.0.clone()>
+                                                                        <span title=label.clone()>"⑂ "{label.clone()}</span>
+                                                                        <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"✎"</button>
+                                                                        <ProjectNewAgent target=target label=label launch=launch />
+                                                                    </div> }
+                                                                }).collect_view()}
+                                                                </div>
+                                                            </Show> }.into_any()
+                                                        }}
                                                         {folder_members(state.clone(), project.swarms, project.groups, interactions.clone(), collapsed_folders, folder_key)}
                                                     </section>
                                                 }
                                             }).collect_view()}
                                 </div>
                                 {custom_groups_view}
-                                {no_projects.then(|| view! { <button class="agent-new-project" on:click={let state = state.clone(); move |_| crate::components::host_browser::open_project_browser(&state)}>"+ New project"</button> })}
                             </section>
                         }
                         }).collect_view();
@@ -1921,7 +1996,23 @@ pub fn AgentsPanel() -> impl IntoView {
                     }
                 }}
             </div>
+            <Show when=move || launch_open.get()>
+                <leptos::portal::Portal><crate::components::launch_menu::LaunchChooser open_sig=launch_open project_context=launch_project /></leptos::portal::Portal>
+            </Show>
         </div>
+    }
+}
+
+#[component]
+fn ProjectNewAgent(
+    target: ActiveProjectRef,
+    label: String,
+    launch: Callback<ActiveProjectRef>,
+) -> impl IntoView {
+    let name = format!("New agent in {label}");
+    view! {
+        <button type="button" class="project-new-agent" title=name.clone() aria-label=name
+            on:click=move |_| launch.run(target.clone())>"+"</button>
     }
 }
 
@@ -2644,7 +2735,6 @@ fn agent_card(
                     } else {
                         view! {
                             <span class="agent-card-name">{name.clone()}{is_tychat.then_some(" · Tychat")}</span>
-                            {move || workbench_context.get().map(|name| view! { <span class="agent-workbench-context" title=format!("Workbench: {name}")>{name.clone()}</span> })}
                         }.into_any()
                     }
                 }}
@@ -2736,6 +2826,7 @@ fn agent_card(
                 </Show>
                 <span class="agent-card-time">{relative_time(created)}</span>
                 </div>
+                {move || workbench_context.get().map(|name| view! { <div class="agent-workbench-context" title=format!("Workbench: {name}")>"Workbench: "{name.clone()}</div> })}
                 <details class="sidebar-card-technical">
                     <summary>"Workspace details"</summary>
                     <dl><dt>"Host"</dt><dd>{details_host}</dd><dt>"Source roots"</dt><dd class="sidebar-card-workspace">{details_workspace}</dd></dl>
@@ -3182,6 +3273,16 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen::prelude::wasm_bindgen(
+        inline_js = "export async function settle_sidebar_styles(element) { getComputedStyle(element).backgroundColor; await Promise.all(element.getAnimations().map(animation => animation.finished)); }"
+    )]
+    extern "C" {
+        #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+        async fn settle_sidebar_styles(
+            element: &web_sys::Element,
+        ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+    }
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -4459,6 +4560,30 @@ mod wasm_tests {
             push_agent(&state, host, "unscoped", "Unscoped chat", true);
         }
 
+        state.projects.update(|projects| {
+            projects.push(project_info("local", "empty", "Empty Local Project", 2));
+            projects.push(project_info("remote", "empty", "Empty Remote Project", 2));
+        });
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.insert(
+                "remote".into(),
+                protocol::LaunchProfileCatalog {
+                    entries: vec![protocol::LaunchProfileEntry::Ready {
+                        profile: protocol::LaunchProfile {
+                            id: protocol::LaunchProfileId("remote-codex".into()),
+                            kind: protocol::LaunchProfileKind::BackendDefault,
+                            label: "Codex".into(),
+                            description: None,
+                            backend_kind: BackendKind::Codex,
+                            session_settings: Default::default(),
+                        },
+                    }],
+                    default_profile_id: Some(protocol::LaunchProfileId("remote-codex".into())),
+                    home_custom_agent_id: None,
+                    custom_profile_schemas: Default::default(),
+                },
+            );
+        });
         CenterWorkspaceWidth::forget_measurement();
         let mounted = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -4529,6 +4654,189 @@ mod wasm_tests {
             );
         }
 
+        let parent = agent_card_el(&container, "parent-alpha");
+        parent.click();
+        next_tick().await;
+        let selected = container
+            .query_selector(".agent-card[aria-current='true']")
+            .unwrap()
+            .unwrap();
+        // A reactive tick can sample the real selection transition mid-color.
+        settle_sidebar_styles(&selected).await.unwrap();
+        let theme = web_sys::window().unwrap();
+        let sample = theme.document().unwrap().create_element("span").unwrap();
+        sample
+            .set_attribute("style", "background:var(--accent-subtle)")
+            .unwrap();
+        container.append_child(&sample).unwrap();
+        assert_eq!(
+            theme
+                .get_computed_style(&selected)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap(),
+            theme
+                .get_computed_style(&sample)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap(),
+            "Selection uses the existing theme token, not a filled blue mix"
+        );
+        sample.remove();
+        assert!(
+            selected.get_bounding_client_rect().height() <= 40.0,
+            "Collapsed agents remain compact"
+        );
+        assert!(
+            selected
+                .query_selector("[role='img'][aria-label='Claude']")
+                .unwrap()
+                .is_some(),
+            "Backend identity remains available"
+        );
+        for (host, label) in [("local", "Local Host"), ("remote", "Remote Host")] {
+            let header = container
+                .query_selector(&format!(
+                    "[data-host-id='{host}'] > .agent-sidebar-host-header"
+                ))
+                .unwrap()
+                .unwrap();
+            let host_name = header
+                .query_selector("span")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            let action = header
+                .query_selector("button")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            // Flex line boxes can differ by 1/128px after layout quantization.
+            assert!(
+                (action.top() + action.height() / 2.0 - host_name.top() - host_name.height() / 2.0)
+                    .abs()
+                    <= 1.0,
+                "Host and Project action share a visual row"
+            );
+            assert!(
+                action.left() >= host_name.right(),
+                "The project action must not overlap the host name"
+            );
+            assert!(header.text_content().unwrap().contains("+ Project"));
+            assert!(header.text_content().unwrap().contains(label));
+            assert!(
+                header.get_bounding_client_rect().height() <= 32.0,
+                "Host heading stays compact"
+            );
+            let empty = container
+                .query_selector(&format!("[data-project-key='{host}:empty']"))
+                .unwrap()
+                .unwrap();
+            assert!(empty.text_content().unwrap().contains("Empty"));
+            assert_eq!(empty.query_selector_all(".agent-card").unwrap().length(), 0);
+            assert_eq!(
+                empty
+                    .query_selector_all("button[title^='New agent in']")
+                    .unwrap()
+                    .length(),
+                1
+            );
+        }
+        let original_selection = state.active_project.get_untracked();
+        let original_tabs = state
+            .center_zone
+            .with_untracked(|center| (center.all_tab_ids(), center.active_tab_id()));
+        let remote_new = || {
+            container
+                .query_selector("[data-project-key='remote:empty'] button[title^='New agent in']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        remote_new().click();
+        next_tick().await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        let dialog = || {
+            document
+                .query_selector("[role='dialog'][aria-label='New agent']")
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            dialog()
+                .text_content()
+                .unwrap()
+                .contains("Remote Host · Empty Remote Project")
+        );
+        state.projects.update(|projects| {
+            projects
+                .iter_mut()
+                .find(|project| project.host_id == "remote" && project.project.id.0 == "empty")
+                .unwrap()
+                .project
+                .name = "Updated Empty Remote Project".into()
+        });
+        next_tick().await;
+        assert!(
+            dialog()
+                .text_content()
+                .unwrap()
+                .contains("Remote Host · Updated Empty Remote Project"),
+            "Live catalog updates preserve the open normal chooser"
+        );
+        assert_eq!(
+            state.active_project.get_untracked(),
+            original_selection,
+            "Opening a project chooser cannot navigate"
+        );
+        assert_eq!(
+            state
+                .center_zone
+                .with_untracked(|center| (center.all_tab_ids(), center.active_tab_id())),
+            original_tabs
+        );
+        dialog()
+            .query_selector("[aria-label='Close agent chooser']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        remote_new().click();
+        next_tick().await;
+        let buttons = dialog().query_selector_all("button").unwrap();
+        (0..buttons.length())
+            .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().as_deref() == Some("Create agent"))
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(ActiveProjectRef {
+                host_id: "remote".into(),
+                project_id: ProjectId("empty".into())
+            })
+        );
+        let draft = state
+            .center_zone
+            .with_untracked(|center| center.active_tab_id())
+            .unwrap();
+        let composer = state.composer_for(draft);
+        assert_eq!(
+            composer.selection_host.get_untracked().as_deref(),
+            Some("remote")
+        );
+        assert_eq!(
+            composer.launch_profile_id.get_untracked(),
+            Some(protocol::LaunchProfileId("remote-codex".into()))
+        );
+        state.switch_active_project(original_selection);
+        next_tick().await;
         state.projects.update(|projects| {
             for id in ["alpha-workbench", "alpha-workbench-two"] {
                 let mut workbench = project_info("local", id, id, 2);
@@ -4589,6 +4897,7 @@ mod wasm_tests {
                 .is_none(),
             "Workbench context belongs on its row, not a second project heading"
         );
+        assert!(container.query_selector("[data-project-key='local:alpha'] [data-project-id='alpha-workbench-two'] button[aria-label='New agent in alpha-workbench-two']").unwrap().is_some(), "Workbench has its own exact-project launch control under the parent");
         let alpha = container
             .query_selector("[data-project-key='local:alpha']")
             .unwrap()
@@ -4711,11 +5020,13 @@ mod wasm_tests {
             labels,
             [
                 "Renamed Beta",
+                "Empty Local Project",
                 "Renamed Alpha",
                 "Renamed workbench",
                 "alpha-workbench",
                 "Gamma Project",
-                "Remote Collision"
+                "Remote Collision",
+                "Updated Empty Remote Project"
             ]
         );
         let sidebar = container.query_selector(".agents-panel").unwrap().unwrap();
@@ -4790,6 +5101,45 @@ mod wasm_tests {
                 project_id: ProjectId("alpha".into()),
             })
         );
+        let live_empty = project_info("local", "live-empty", "Live Empty Project", 4).project;
+        notify(
+            5,
+            protocol::ProjectNotifyPayload::Upsert {
+                project: live_empty.clone(),
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".agents-panel [data-project-key='local:live-empty']")
+                .unwrap()
+                .is_none(),
+            "Current-project scope excludes unrelated empty catalog entries"
+        );
+        state.agents_view_preferences.update(|preferences| {
+            preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects
+        });
+        next_tick().await;
+        assert!(container.query_selector(".agents-panel [data-project-key='local:live-empty'] button[aria-label='New agent in Live Empty Project']").unwrap().is_some());
+        notify(
+            6,
+            protocol::ProjectNotifyPayload::Delete {
+                project: live_empty,
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".agents-panel [data-project-key='local:live-empty']")
+                .unwrap()
+                .is_none(),
+            "Catalog deletion removes empty project without a refresh"
+        );
+        state.agents_view_preferences.update(|preferences| {
+            preferences.sidebar.project_visibility =
+                AgentsSidebarProjectVisibility::CurrentProjectOnly
+        });
+        next_tick().await;
         let remote = rail_button("Remote Collision");
         remote.click();
         next_tick().await;
@@ -6264,7 +6614,21 @@ mod wasm_tests {
             .unwrap();
         assert!(bamboo.text_content().unwrap().contains("Bamboo Crew"));
         assert!(!bamboo.text_content().unwrap().contains("Remote Crew"));
-        assert!(!container.text_content().unwrap().contains("bamboo-bench"));
+        // Catalog workbenches now have launch rows, but never split the parent group.
+        assert!(
+            container
+                .query_selector("[data-project-key='local:bamboo-bench']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bamboo
+                .query_selector(
+                    "[data-project-id='bamboo-bench'] [aria-label='New agent in bamboo-bench']"
+                )
+                .unwrap()
+                .is_some()
+        );
         assert!(container.text_content().unwrap().contains("Remote bench"));
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;

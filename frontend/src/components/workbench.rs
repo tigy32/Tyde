@@ -62,11 +62,17 @@ pub fn Workbench() -> impl IntoView {
     let tab_drag = state.sidebar_drag;
     let left_visible = move || {
         !layout_blocked.get()
-            && layouts.with(|l| l.current().left.visible && !l.current().left.tabs.is_empty())
+            && layouts.with(|l| {
+                l.current().left.visible
+                    && (l.current().left.active.is_some() || !l.current().left.tabs.is_empty())
+            })
     };
     let right_visible = move || {
         !layout_blocked.get()
-            && layouts.with(|l| l.current().right.visible && !l.current().right.tabs.is_empty())
+            && layouts.with(|l| {
+                l.current().right.visible
+                    && (l.current().right.active.is_some() || !l.current().right.tabs.is_empty())
+            })
     };
     let bottom_visible = move || state.bottom_dock.get() == DockVisibility::Visible;
 
@@ -494,6 +500,12 @@ mod wasm_tests {
                 .width(),
             0.0
         );
+        assert_eq!(tab.get_attribute("draggable").as_deref(), Some("true"));
+        assert_eq!(
+            tab.parent_element().unwrap().text_content().unwrap().trim(),
+            "Agents",
+            "Whole tabs have no extra dot gutter or standalone move handle"
+        );
         let agents = element(&container, ".agents-panel");
         let search = element(&container, ".agents-panel input")
             .dyn_into::<web_sys::HtmlInputElement>()
@@ -593,7 +605,7 @@ mod wasm_tests {
             .query_selector_all("button.dock-tab")
             .unwrap();
         assert_eq!(order.item(0).unwrap().text_content().unwrap(), "History");
-        // Reorder with the keyboard, then transfer with the visible tab menu.
+        // Reorder and transfer using the existing explicit keyboard controls.
         key(
             &element(&container, ".sidebar-bar-right button[aria-label='Agents']"),
             "ArrowUp",
@@ -605,20 +617,10 @@ mod wasm_tests {
                 .unwrap(),
             "Agents"
         );
-        let summary = element(
-            &container,
-            ".sidebar-bar-right summary[aria-label='Agents tab actions']",
+        key(
+            &element(&container, ".sidebar-bar-right button[aria-label='Agents']"),
+            "ArrowLeft",
         );
-        summary.click();
-        tick().await;
-        let actions = summary.parent_element().unwrap();
-        actions
-            .query_selector("button")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlElement>()
-            .unwrap()
-            .click();
         tick().await;
         assert!(
             element(&container, ".sidebar-bar-left")
@@ -663,6 +665,235 @@ mod wasm_tests {
                 .unwrap(),
             "History"
         );
+        // One canonical checklist works from a tab or blank strip, in both modes.
+        let selections = state.sidebar_layout.with_untracked(|layouts| {
+            (
+                layouts.current().left.active,
+                layouts.current().right.active,
+            )
+        });
+        let strip = element(&container, ".sidebar-bar-right .dock-tab-bar");
+        let context = web_sys::MouseEventInit::new();
+        context.set_bubbles(true);
+        context.set_cancelable(true);
+        element(
+            &container,
+            ".sidebar-bar-right button[aria-label='History']",
+        )
+        .dispatch_event(
+            &web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &context).unwrap(),
+        )
+        .unwrap();
+        tick().await;
+        let checklist = element(&container, "[role='menu'][aria-label='Sidebar tabs']");
+        assert_eq!(
+            checklist
+                .query_selector_all("[role='menuitemcheckbox']")
+                .unwrap()
+                .length(),
+            SidebarTab::ALL.len() as u32
+        );
+        for tab in SidebarTab::ALL {
+            let choice = element(
+                &container,
+                &format!("[role='menuitemcheckbox'][aria-label='{}']", tab.label()),
+            );
+            assert_eq!(
+                choice.get_attribute("aria-checked").as_deref(),
+                Some(
+                    if matches!(tab, SidebarTab::Agents | SidebarTab::Sessions) {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                )
+            );
+        }
+        element(&container, "[role='menuitemcheckbox'][aria-label='Files']").click();
+        element(&container, "[role='menuitemcheckbox'][aria-label='Git']").click();
+        tick().await;
+        assert_eq!(
+            state.sidebar_layout.with_untracked(|layouts| (
+                layouts.current().left.active,
+                layouts.current().right.active
+            )),
+            selections,
+            "Enabling tabs must not select them"
+        );
+        assert_eq!(
+            state.sidebar_layout.get_untracked().mode,
+            crate::sidebar_layout::InterfaceMode::Vibe
+        );
+        assert_eq!(
+            state
+                .center_zone
+                .with_untracked(|center| (center.all_tab_ids(), center.active_tab_id())),
+            tabs_before
+        );
+        assert_eq!(textarea.value(), "Unsent draft\nsecond line");
+        let history_width = element(&container, "section[aria-label='History panel']")
+            .get_bounding_client_rect()
+            .width();
+        element(
+            &container,
+            "[role='menuitemcheckbox'][aria-label='History']",
+        )
+        .click();
+        tick().await;
+        assert_eq!(
+            element(&container, "section[aria-label='History panel']")
+                .get_bounding_client_rect()
+                .width(),
+            history_width,
+            "Hiding a tab retains the active view until explicit navigation"
+        );
+        assert_eq!(
+            element(
+                &container,
+                "[role='menuitemcheckbox'][aria-label='History']"
+            )
+            .get_attribute("aria-checked")
+            .as_deref(),
+            Some("false")
+        );
+        element(
+            &container,
+            "[role='menuitemcheckbox'][aria-label='History']",
+        )
+        .click();
+        tick().await;
+        assert_eq!(
+            state
+                .sidebar_layout
+                .with_untracked(|layouts| layouts.current().right.active),
+            selections.1
+        );
+        assert_eq!(
+            element(&container, "[role='menuitemcheckbox'][aria-label='Files']")
+                .get_attribute("aria-checked")
+                .as_deref(),
+            Some("true")
+        );
+        press(
+            &document
+                .active_element()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlElement>()
+                .unwrap(),
+            "End",
+        );
+        tick().await;
+        assert_eq!(
+            document
+                .active_element()
+                .unwrap()
+                .get_attribute("aria-label")
+                .as_deref(),
+            Some("Workflows")
+        );
+        press(
+            &document
+                .active_element()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlElement>()
+                .unwrap(),
+            "Escape",
+        );
+        tick().await;
+        strip
+            .dispatch_event(
+                &web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &context)
+                    .unwrap(),
+            )
+            .unwrap();
+        tick().await;
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Agents']"),
+            "Escape",
+        );
+        tick().await;
+        press(&strip, "ContextMenu");
+        tick().await;
+        for label in ["Files", "Git", "History"] {
+            element(
+                &container,
+                &format!("[role='menuitemcheckbox'][aria-label='{label}']"),
+            )
+            .click();
+        }
+        tick().await;
+        assert_eq!(
+            element(&container, "section[aria-label='History panel']")
+                .get_bounding_client_rect()
+                .width(),
+            history_width,
+            "Unchecking the final tab preserves its active panel"
+        );
+        assert!(
+            strip.get_bounding_client_rect().width() > 0.0,
+            "Retained view keeps its blank checklist anchor"
+        );
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Agents']"),
+            "Escape",
+        );
+        tick().await;
+        press(&strip, "ContextMenu");
+        tick().await;
+        assert!(
+            container
+                .query_selector("[role='menu'][aria-label='Sidebar tabs']")
+                .unwrap()
+                .is_some()
+        );
+        for label in ["Files", "Git", "History"] {
+            let choice = element(
+                &container,
+                &format!("[role='menuitemcheckbox'][aria-label='{label}']"),
+            );
+            assert_eq!(
+                choice.get_attribute("aria-checked").as_deref(),
+                Some("false")
+            );
+            choice.click();
+        }
+        tick().await;
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Agents']"),
+            "Escape",
+        );
+        tick().await;
+        mode(&container, "dinosaur").await;
+        tick().await;
+        press(
+            &element(&container, ".sidebar-bar-left .dock-tab-bar"),
+            "ContextMenu",
+        );
+        tick().await;
+        assert_eq!(
+            element(&container, "[role='menu'][aria-label='Sidebar tabs']")
+                .query_selector_all("[role='menuitemcheckbox']")
+                .unwrap()
+                .length(),
+            SidebarTab::ALL.len() as u32
+        );
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Agents']"),
+            "Escape",
+        );
+        tick().await;
+        mode(&container, "vibe").await;
+        tick().await;
+        for label in ["Files", "Git"] {
+            assert!(
+                container
+                    .query_selector(&format!(
+                        ".sidebar-bar-right button.dock-tab[aria-label='{label}']"
+                    ))
+                    .unwrap()
+                    .is_some()
+            );
+        }
         // The persisted mode, order, active choices, visibility and widths
         // restore in a fresh component tree, not just in an in-memory mirror.
         state.sidebar_layout.update(|layouts| {
@@ -688,6 +919,17 @@ mod wasm_tests {
                 .unwrap(),
             "Agents"
         );
+        for label in ["Files", "Git"] {
+            assert!(
+                container
+                    .query_selector(&format!(
+                        ".sidebar-bar-right button.dock-tab[aria-label='{label}']"
+                    ))
+                    .unwrap()
+                    .is_some(),
+                "Custom Vibe tabs survive remount/storage restore"
+            );
+        }
         assert_eq!(
             element(&container, "section[aria-label='History panel']")
                 .get_bounding_client_rect()

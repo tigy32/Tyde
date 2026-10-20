@@ -69,8 +69,11 @@ impl SidebarTab {
             Self::Workflows => "Workflows",
         }
     }
-    pub fn available(self, mode: InterfaceMode) -> bool {
-        mode == InterfaceMode::Dinosaur || matches!(self, Self::Agents | Self::Sessions)
+    pub fn default_side(self) -> SidebarSide {
+        match self {
+            Self::Files | Self::Git | Self::Search | Self::References => SidebarSide::Left,
+            Self::Agents | Self::Sessions | Self::Swarms | Self::Workflows => SidebarSide::Right,
+        }
     }
 }
 
@@ -78,6 +81,7 @@ impl SidebarTab {
 #[serde(deny_unknown_fields)]
 pub struct SidebarPane {
     pub tabs: Vec<SidebarTab>,
+    // Tab visibility changes retain the displayed panel until explicit navigation.
     pub active: Option<SidebarTab>,
     pub visible: bool,
     pub width: f64,
@@ -114,14 +118,9 @@ impl SidebarLayout {
                 tabs: SidebarTab::ALL
                     .into_iter()
                     .filter(|tab| {
-                        tab.available(mode)
-                            && !matches!(
-                                tab,
-                                SidebarTab::Files
-                                    | SidebarTab::Git
-                                    | SidebarTab::Search
-                                    | SidebarTab::References
-                            )
+                        tab.default_side() == SidebarSide::Right
+                            && (mode == InterfaceMode::Dinosaur
+                                || matches!(tab, SidebarTab::Agents | SidebarTab::Sessions))
                     })
                     .collect(),
                 active: Some(SidebarTab::Agents),
@@ -178,38 +177,34 @@ impl SidebarLayout {
         if source.active == Some(tab) {
             source.active = source.tabs.first().copied();
         }
+        for side in [SidebarSide::Left, SidebarSide::Right] {
+            if self.pane(side).active == Some(tab) {
+                let pane = self.pane_mut(side);
+                pane.active = pane.tabs.first().copied();
+            }
+        }
         let target = self.pane_mut(to);
-
         target.tabs.insert(index, tab);
         target.active = Some(tab);
         target.visible = true;
     }
     #[cfg(target_arch = "wasm32")]
-    fn validate(&self, mode: InterfaceMode) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
+        if self.left.active.is_some() && self.left.active == self.right.active {
+            return Err("Duplicated active sidebar panel".into());
+        }
         let mut found = Vec::new();
         for side in [SidebarSide::Left, SidebarSide::Right] {
             let pane = self.pane(side);
             if !pane.width.is_finite() || !(160.0..=2400.0).contains(&pane.width) {
                 return Err("Invalid sidebar width".into());
             }
-            if pane.active.is_some_and(|tab| !pane.tabs.contains(&tab))
-                || (pane.active.is_none() != pane.tabs.is_empty())
-            {
-                return Err("Invalid active sidebar tab".into());
-            }
             for tab in &pane.tabs {
-                if !tab.available(mode) || found.contains(tab) {
-                    return Err("Unavailable or duplicated sidebar tab".into());
+                if found.contains(tab) {
+                    return Err("Duplicated sidebar tab".into());
                 }
                 found.push(*tab);
             }
-        }
-        if SidebarTab::ALL
-            .into_iter()
-            .filter(|tab| tab.available(mode))
-            .any(|tab| !found.contains(&tab))
-        {
-            return Err("Missing sidebar tab".into());
         }
         Ok(())
     }
@@ -280,13 +275,39 @@ impl AppState {
             return;
         }
         self.sidebar_layout.update(|layouts| {
-            if !tab.available(layouts.mode) {
-                layouts.mode = InterfaceMode::Dinosaur;
+            let side = match layouts.current().side(tab) {
+                Some(side) => side,
+                None => {
+                    let side = tab.default_side();
+                    layouts.current_mut().pane_mut(side).tabs.push(tab);
+                    side
+                }
+            };
+            for other in [SidebarSide::Left, SidebarSide::Right] {
+                if other != side && layouts.current().pane(other).active == Some(tab) {
+                    layouts.current_mut().pane_mut(other).active = None;
+                }
             }
-            if let Some(side) = layouts.current().side(tab) {
+            {
                 let pane = layouts.current_mut().pane_mut(side);
                 pane.active = Some(tab);
                 pane.visible = true;
+            }
+        });
+    }
+    pub fn toggle_sidebar_tab(&self, tab: SidebarTab, side: SidebarSide) {
+        if self.sidebar_storage_blocked.get_untracked() {
+            return;
+        }
+        self.sidebar_layout.update(|layouts| {
+            let layout = layouts.current_mut();
+            match layout.side(tab) {
+                Some(current) => layout.pane_mut(current).tabs.retain(|item| *item != tab),
+                None => {
+                    let pane = layout.pane_mut(side);
+                    pane.tabs.push(tab);
+                    pane.visible = true;
+                }
             }
         });
     }
@@ -329,8 +350,8 @@ impl AppState {
                         .into(),
                 );
             }
-            layouts.vibe.validate(InterfaceMode::Vibe)?;
-            layouts.dinosaur.validate(InterfaceMode::Dinosaur)?;
+            layouts.vibe.validate()?;
+            layouts.dinosaur.validate()?;
             Ok(Some(layouts))
         };
         match restore() {
