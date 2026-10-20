@@ -372,7 +372,7 @@ def context(args):
                        "local-and-remote-tag", "source-versions", "exact-tag-draft"]}
 
 
-def provenance(args, run_id, controller_sha=None):
+def provenance(args, run_id, controller_sha=None, *, fragment_target=None):
     run = api(args, f"actions/runs/{run_id}")
     if (str(run["id"]) != str(run_id) or run["repository"]["full_name"] != args.repository
             or run["head_repository"]["full_name"] != args.repository
@@ -382,7 +382,11 @@ def provenance(args, run_id, controller_sha=None):
         if run["head_sha"] != controller_sha:
             raise ControllerError("Run controller mismatch")
     elif not (run["head_sha"] == args.source_sha and run["head_branch"] == args.tag
-              or run["display_title"] == f"Release {args.tag} @ {args.source_sha}"):
+              or run["path"] == ".github/workflows/release.yml"
+              and run["display_title"] == f"Release {args.tag} @ {args.source_sha}"
+              or fragment_target in TARGETS and run["path"] == ".github/workflows/macos-release.yml"
+              and run["display_title"] in {f"macOS {operation} {args.tag} @ {args.source_sha}"
+                                          for operation in ("build", "resume")}):
         raise ControllerError("Fragment run source mismatch")
     git(CONTROLLER, Checkout.CONTROLLER, GitOperation.ANCESTRY, run["head_sha"], events=args.git_events)
     return run
@@ -779,17 +783,35 @@ if (!crypto.verify(null, Buffer.concat([sig.subarray(10), Buffer.from(lines[2].s
     command(["node", "-e", script, config, payload, signature])
 
 
+def fragment_runs(raw):
+    def unique(pairs):
+        if len(dict(pairs)) != len(pairs):
+            raise ControllerError("Duplicate platform fragment run selection")
+        return dict(pairs)
+
+    runs = json.loads(raw, object_pairs_hook=unique)
+    if (not isinstance(runs, dict) or set(runs) - set(update_manifest.TARGETS)
+            or any(not isinstance(run, str) or not re.fullmatch(r"[1-9][0-9]*", run)
+                   for run in runs.values())):
+        raise ControllerError("Fragment runs require known platform keys and positive run ID strings")
+    return runs
+
+
 def assemble(args, *, upload_manifest=True):
     if not args.fragments_run_id:
         raise ControllerError("Assembly requires explicit same-source fragment run")
+    selected_runs = fragment_runs(args.fragment_runs)
     data = receipt(args)
     if data["phase"] != "complete":
         raise ControllerError("Assembly requires complete macOS outputs")
+    restored = None
+    if args.target in selected_runs:
+        restored = json.loads((args.evidence / "restore.json").read_text())
+        if selected_runs[args.target] != str(restored["run_id"]):
+            raise ControllerError("Selected architecture fragment run differs from restored complete checkpoint")
     verify_files(args.retained, data["outputs"])
     provenance(args, args.fragments_run_id)
-    artifacts = api(args, f"actions/runs/{args.fragments_run_id}/artifacts?per_page=100")
-    if artifacts["total_count"] > 100:
-        raise ControllerError("Too many artifacts; explicit bounded assembly cannot select fragments")
+    run_artifacts = {}
     release = draft(args)
     config = args.source / "frontend/tauri-shell/tauri.conf.json"
     with tempfile.TemporaryDirectory() as directory:
@@ -797,16 +819,33 @@ def assemble(args, *, upload_manifest=True):
         fragments = root / "fragments"
         fragments.mkdir()
         asset_receipts = {}
+        fragment_receipts = {}
         for target in update_manifest.TARGETS:
-            if target == args.target:
+            run_id = selected_runs.get(target, args.fragments_run_id)
+            if target == args.target and target not in selected_runs:
                 path = args.retained / f"output/update-{target}.json"
+                fragment_receipts[target] = {"run_id": data["checkpoint_run_id"],
+                                             "receipt_sha256": digest(args.retained / "receipt.json")}
             else:
+                run = provenance(args, run_id, fragment_target=target)
+                if run_id not in run_artifacts:
+                    run_artifacts[run_id] = api(args, f"actions/runs/{run_id}/artifacts?per_page=100")
+                artifacts = run_artifacts[run_id]
+                if artifacts["total_count"] > 100:
+                    raise ControllerError("Too many artifacts; explicit bounded assembly cannot select fragments")
                 matches = [a for a in artifacts["artifacts"] if a["name"] == f"update-{target}"]
                 if len(matches) != 1:
                     raise ControllerError("Missing or ambiguous same-source platform fragment")
                 folder = root / target
-                download(args, matches[0]["id"], args.fragments_run_id, folder)
+                metadata = download(args, matches[0]["id"], run_id, folder)
+                if metadata["name"] != f"update-{target}" or metadata["workflow_run"]["head_sha"] != run["head_sha"]:
+                    raise ControllerError("Fragment artifact name/controller provenance mismatch")
                 path = folder / f"update-{target}.json"
+                fragment_receipts[target] = {"run_id": run_id, "controller_sha": run["head_sha"],
+                                             "artifact_id": metadata["id"], "artifact_digest": metadata["digest"]}
+                if target == args.target and digest(path) != data["outputs"].get(f"output/update-{target}.json"):
+                    raise ControllerError("Selected fragment differs from complete checkpoint")
+            fragment_receipts[target]["sha256"] = digest(path)
             fragment = json.loads(path.read_text())
             for entry in fragment["platforms"].values():
                 prefix = f"https://github.com/{args.repository}/releases/download/{args.tag}/"
@@ -828,7 +867,7 @@ def assemble(args, *, upload_manifest=True):
                 if target == args.target and digest(payload) != data["outputs"].get(f"output/artifacts/{name}"):
                     raise ControllerError("Release updater differs from retained source-bound output")
                 asset_receipts[name] = {"sha256": digest(payload), "signature": entry["signature"], "asset_id": matches[0]["id"],
-                                        "fragment_run_id": data["checkpoint_run_id"] if target == args.target else args.fragments_run_id}
+                                        "fragment_run_id": fragment_receipts[target]["run_id"]}
             shutil.copyfile(path, fragments / path.name)
         manifest = root / "tyde-update.json"
         update_manifest.assemble(argparse.Namespace(tag=args.tag, repository=args.repository, fragments=fragments, output=manifest))
@@ -838,7 +877,8 @@ def assemble(args, *, upload_manifest=True):
         release_tool.validate_release(candidate, args.tag)
         assembly = {"repository": args.repository, "tag": args.tag,
                     "source_sha": args.source_sha, "controller_sha": args.controller_sha,
-                    "manifest_sha256": digest(manifest), "assets": asset_receipts}
+                    "manifest_sha256": digest(manifest), "checkpoint": restored,
+                    "fragments": fragment_receipts, "assets": asset_receipts}
         if upload_manifest:
             command(["gh", "release", "upload", args.tag, manifest, "--repo", args.repository, "--clobber"])
             shutil.copyfile(manifest, args.retained / "tyde-update.json")
@@ -968,6 +1008,8 @@ def main():
     parser.add_argument("--run-id")
     parser.add_argument("--artifact-id")
     parser.add_argument("--fragments-run-id")
+    parser.add_argument("--fragment-runs", default="{}",
+                        help="JSON platform-to-run-ID string map; omitted platforms retain original-run selection")
     parser.add_argument("--confirm", action="store_true")
     args = parser.parse_args()
     args.git_events = []
@@ -1016,6 +1058,9 @@ def main():
             if metadata["workflow_run"]["head_sha"] != data["checkpoint_controller_sha"]:
                 raise ControllerError("Checkpoint controller mismatch")
             provenance(args, args.run_id, data["checkpoint_controller_sha"])
+            save(args.evidence / "restore.json", {"run_id": args.run_id, "artifact_id": metadata["id"],
+                 "controller_sha": data["checkpoint_controller_sha"], "artifact_digest": metadata["digest"],
+                 "receipt_sha256": digest(args.retained / "receipt.json")})
         elif args.operation == "submit":
             if not args.kind:
                 raise ControllerError("Submit requires explicit payload kind")

@@ -31,6 +31,10 @@ on:
       fragments_run_id:
         description: 'Assemble/finalize: original same-source Release run with platform fragments'
         type: string
+      fragment_runs:
+        description: 'Assemble/finalize: JSON platform-to-run-ID string map; omitted platforms keep original selection'
+        type: string
+        default: '{}'
       confirm_publish:
         description: 'Explicit approval to deploy frozen mobile web and publish the verified stable draft'
         type: boolean
@@ -59,6 +63,9 @@ on:
         type: string
         default: ''
 
+      fragment_runs:
+        type: string
+        default: '{}'
       confirm_publish:
         type: boolean
         default: false
@@ -386,7 +393,8 @@ jobs:
         if: inputs.operation == 'assemble'
         env:
           FRAGMENTS_RUN: ${{ inputs.fragments_run_id }}
-        run: macos-controller assemble --fragments-run-id "$FRAGMENTS_RUN"
+          FRAGMENT_RUNS: ${{ inputs.fragment_runs }}
+        run: macos-controller assemble --fragments-run-id "$FRAGMENTS_RUN" --fragment-runs "$FRAGMENT_RUNS"
       - name: Validate AWS deploy role
         if: inputs.operation == 'finalize'
         env:
@@ -402,7 +410,8 @@ jobs:
         if: inputs.operation == 'finalize'
         env:
           FRAGMENTS_RUN: ${{ inputs.fragments_run_id }}
-        run: macos-controller finalize --fragments-run-id "$FRAGMENTS_RUN" --confirm
+          FRAGMENT_RUNS: ${{ inputs.fragment_runs }}
+        run: macos-controller finalize --fragments-run-id "$FRAGMENTS_RUN" --fragment-runs "$FRAGMENT_RUNS" --confirm
       - name: Inspect retained payload state
         id: retention
         if: always()

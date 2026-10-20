@@ -1886,6 +1886,77 @@ else: raise SystemExit(27)
         self.assertIn("darwin-x86_64", manifest["platforms"])
         self.assertTrue((self.retained / "assembly.json").is_file())
         self.assertFalse(self.published)
+
+        # Both Mac jobs needed recovery: only Windows/Linux fragments remain
+        # in the original run. Exercise the same CLI/HTTP/signature boundary.
+        original_artifacts = list(artifacts)
+        artifacts[:] = [a for a in artifacts if "apple-darwin" not in a["name"]]
+        self.responses["actions/runs/10/artifacts?per_page=100"] = {"total_count": len(artifacts), "artifacts": artifacts}
+        self.env["GITHUB_RUN_ID"] = "11"
+        self.source_state = "frozen"
+        self.responses["actions/runs/11"] = self.run_metadata(11)
+        self.cli("checkpoint")
+        selections = {}
+        recovered = {}
+        for run_id, target in ((11, self.target), (12, "x86_64-apple-darwin")):
+            self.responses[f"actions/runs/{run_id}"] = dict(self.run_metadata(run_id),
+                path=".github/workflows/macos-release.yml",
+                display_title=f"macOS resume {self.tag} @ {self.source_sha}")
+            folder = self.root / f"recovery-{run_id}"
+            folder.mkdir()
+            source = self.retained / "output" if target == self.target else self.root / target
+            shutil.copyfile(source / f"update-{target}.json", folder / f"update-{target}.json")
+            recovered[target] = self.seal_artifact(50 + run_id, folder, run_id=run_id, name=f"update-{target}")
+            self.responses[f"actions/runs/{run_id}/artifacts?per_page=100"] = {
+                "total_count": 1, "artifacts": [recovered[target]]}
+            selections[target] = str(run_id)
+        self.seal_artifact(70, self.retained, run_id=11)
+        shutil.rmtree(self.retained)
+        self.env["GITHUB_RUN_ID"] = "13"
+        self.responses["actions/runs/13"] = dict(self.run_metadata(13),
+            path=".github/workflows/macos-release.yml",
+            display_title=f"macOS assemble {self.tag} @ {self.source_sha}")
+        self.cli("restore", "--run-id", "11", "--artifact-id", "70")
+        self.cli("checkpoint")
+        self.assertEqual(json.loads((self.retained / "receipt.json").read_text())["checkpoint_run_id"], "13")
+        missing = self.uploads.pop("tyde-update.json")
+        result = self.cli("assemble", "--fragments-run-id", "10", succeeds=False)
+        self.assertIn("Missing or ambiguous same-source platform fragment", result.stderr)
+        for invalid in ('{"unknown":"12"}', '{"aarch64-apple-darwin":"11","aarch64-apple-darwin":"12"}',
+                        '{"aarch64-apple-darwin":"12"}', '{"aarch64-apple-darwin":11}'):
+            self.cli("assemble", "--fragments-run-id", "10", "--fragment-runs", invalid, succeeds=False)
+        selection = ("--fragments-run-id", "10", "--fragment-runs", json.dumps(selections))
+        for run_id in (11, 12):
+            run = self.responses[f"actions/runs/{run_id}"]
+            run["display_title"] = f"macOS resume {self.tag} @ {'b' * 40}"
+            result = self.cli("assemble", *selection, succeeds=False)
+            self.assertIn("Fragment run source mismatch", result.stderr)
+            run["display_title"] = f"macOS resume {self.tag} @ {self.source_sha}"
+        metadata = recovered["x86_64-apple-darwin"]
+        transport_digest = metadata.pop("digest")
+        result = self.cli("assemble", *selection, succeeds=False)
+        self.assertIn("Artifact transport digest mismatch or missing digest", result.stderr)
+        metadata["digest"] = transport_digest
+        metadata["workflow_run"]["head_sha"] = "b" * 40
+        result = self.cli("assemble", *selection, succeeds=False)
+        self.assertIn("Fragment artifact name/controller provenance mismatch", result.stderr)
+        metadata["workflow_run"]["head_sha"] = self.controller_sha
+        self.assertNotIn("tyde-update.json", self.uploads)
+        self.cli("assemble", *selection)
+        self.assertEqual(self.uploads["tyde-update.json"], missing)
+        assembly = json.loads((self.retained / "assembly.json").read_text())
+        self.assertEqual(assembly["checkpoint"]["run_id"], "11")
+        self.assertEqual(assembly["checkpoint"]["artifact_id"], 70)
+        self.assertEqual(len(assembly["fragments"]), 5)
+        for target, record in assembly["fragments"].items():
+            self.assertEqual(record["run_id"], selections.get(target, "10"))
+            self.assertEqual(record["controller_sha"], self.controller_sha)
+            self.assertTrue(record["artifact_digest"].startswith("sha256:"))
+            self.assertEqual(len(record["sha256"]), 64)
+            self.assertIn(f"actions/artifacts/{record['artifact_id']}/zip", self.downloads)
+        self.assertFalse(self.published)
+        self.responses["actions/runs/10/artifacts?per_page=100"] = {
+            "total_count": len(original_artifacts), "artifacts": original_artifacts}
         self.direct_release_assets = True
         self.log.write_text("")
         self.cli("finalize", "--fragments-run-id", "10", succeeds=False)

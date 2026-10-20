@@ -347,6 +347,63 @@ its latest valid checkpoint. Do not rerun the build job to resume. Dispatch
   publication. A failure after the PATCH requires inspecting published state,
   never blindly repeating publication. Published releases remain immutable.
 
+`fragment_runs` (CLI `--fragment-runs`) explicitly overrides individual
+platforms with a JSON object of target triples to run-ID **strings**. Omitted
+platforms keep the existing selection: this architecture's complete checkpoint,
+and `fragments_run_id` for every other platform. An explicit entry never retries
+or searches the original run. Unknown/duplicate keys and invalid IDs reject.
+Each selected run must be a main-ancestor controller with exact same-source
+Release provenance or, for a Mac fragment, the exact same-source macOS
+`build`/`resume` run title. Each artifact is selected uniquely by its canonical
+platform name, then checked against its own metadata run, controller, ID, size
+and transport digest. Assembly retains those IDs/digests and the fragment hash
+in `assembly.json`; full pinned-key verification remains mandatory. Explicitly
+selecting this architecture also requires its restored checkpoint run and exact retained
+fragment bytes. Restore provenance is retained separately from later continuation
+checkpoint stamps, including checkpoint artifact ID/digest and receipt hash.
+This adds no new build, submission, deployment or publication
+path. Stable `finalize` accepts the same map; beta publication remains the
+existing beta-only `./dev.sh release publish` path, not `finalize`.
+
+### Dual-recovery beta4 handoff
+
+For `v0.9.6-beta.4`, frozen app/source is
+`e9a12ec602d468c87075990af3e8fd0d45b2c635`. Original Release run
+`39477893943` has Windows and both Linux fragments, but neither Mac fragment:
+both Mac jobs compiled and passed native startup, then failed at the network
+completion boundary. The old assembler cannot select fragments from both
+recovery runs; this is the confirmed controller limitation, not a new Apple
+failure diagnosis. ARM recovery `39491501652` completed and retained final
+checkpoint `12296172491`. Intel is being resumed from original final checkpoint
+`12302063028`; that original artifact is **not** its eventual complete checkpoint
+or fragment run. Root must record Intel's exact successful recovery run after
+completion, and its artifact upload receipt. Do not guess a latest run.
+
+After this controller lands, Root can use ARM's existing complete checkpoint
+and explicitly select both recovered fragment runs:
+
+```sh
+REPO=tigy32/Tyde
+INTEL_COMPLETE_RUN='<exact successful Intel resume run ID>'
+FRAGMENT_RUNS=$(printf '{"aarch64-apple-darwin":"39491501652","x86_64-apple-darwin":"%s"}' "$INTEL_COMPLETE_RUN")
+gh workflow run macos-release.yml --repo "$REPO" --ref main \
+  -f operation=assemble -f version=v0.9.6-beta.4 \
+  -f source_sha=e9a12ec602d468c87075990af3e8fd0d45b2c635 \
+  -f target=aarch64-apple-darwin \
+  -f retained_run_id=39491501652 -f retained_artifact_id=12296172491 \
+  -f fragments_run_id=39477893943 -f fragment_runs="$FRAGMENT_RUNS"
+```
+
+Record and watch that exact dispatch run, checking its controller `head_sha`
+against the landed controller and its successful retained `assembly.json`.
+This only uploads the verified aggregate. No desktop build or Apple submission
+runs. Missing/expired fragments, wrong source, missing provenance, invalid
+signatures or an incomplete asset set block assembly. After successful assembly,
+Root owns the existing approved beta publication operation:
+`./dev.sh release publish v0.9.6-beta.4 --confirm`. Do not use stable `finalize`,
+create another release/tag/version, or rerun the original Release DAG.
+
+
 Draft lookup has one path: paginate the release list, require a unique exact-tag
 match, and verify its ID/tag/channel/draft state by ID. It never tries the
 published-only tag endpoint. API/auth/rate/transport errors fail closed with a

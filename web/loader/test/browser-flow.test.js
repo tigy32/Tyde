@@ -53,7 +53,7 @@ test("installed storage migrates once, then follows exact targets without losing
     }
     return value;
   };
-  const setup = `window.setupReady = new Promise((resolve,reject) => {
+  const setup = `const done=arguments[arguments.length-1];new Promise((resolve,reject) => {
     const open=indexedDB.open('tyde-mobile',1);
     open.onupgradeneeded=()=>{open.result.createObjectStore('paired_hosts');open.result.createObjectStore('psk');};
     open.onerror=()=>reject(new Error('storage setup failed'));
@@ -61,7 +61,7 @@ test("installed storage migrates once, then follows exact targets without losing
       tx.objectStore('paired_hosts').put(JSON.stringify([{localHostId:'retained-host'},{localHostId:'second-host'},{localHostId:'third-host'}]),'all');
       tx.objectStore('psk').put('fixture-only-key','retained-key');
       tx.oncomplete=()=>{db.close();localStorage.setItem('tyde.loader.version','${old}');resolve(true);};};
-  });`;
+  }).then(done,()=>done(false));`;
   // Historical root-loader contract: remembered pin, no Welcome-release API.
   // Same immutable targets, origin, worker scope and browser stores throughout.
   const legacyLoader = `import {resolveBootTarget} from './manifest-policy.js';
@@ -78,8 +78,7 @@ test("installed storage migrates once, then follows exact targets without losing
     try {
       const path = new URL(req.url, "http://fixture.invalid").pathname;
       res.setHeader("Cache-Control", "no-store");
-      if (path === "/setup") { res.setHeader("Content-Type","text/html"); res.end('<script src="/setup.js"></script>'); return; }
-      if (path === "/setup.js") { res.setHeader("Content-Type","text/javascript"); res.end(setup); return; }
+      if (path === "/setup") { res.setHeader("Content-Type","text/html"); res.end('<!doctype html><title>Loader storage setup</title>'); return; }
       if (path === "/tyde/manifest.json") {
         manifestRequests++;
         res.setHeader("Content-Type","application/json");
@@ -135,7 +134,11 @@ test("installed storage migrates once, then follows exact targets without losing
       if(check()){done(true);return;} const observer=new MutationObserver(()=>{if(check()){observer.disconnect();done(true);}});
       observer.observe(document.body,{subtree:true,childList:true,characterData:true});`);
     await navigate("/setup");
-    assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];window.setupReady.then(done);"),true);
+    assert.deepEqual(await evaluate("return [location.origin,location.pathname,document.title];"),
+      [origin,"/setup","Loader storage setup"],"storage setup must execute in the fixture document");
+    // The retained failure had no setupReady after navigation. Initialize and
+    // await the real storage transaction in one command, not a script-load side effect.
+    assert.equal(await evaluateAsync(setup),true,"storage transaction must commit before loader navigation");
     await navigate("/tyde/");
     assert.equal(await waitFor(`Client ${old}`),true);
     await evaluateAsync("const done=arguments[arguments.length-1]; navigator.serviceWorker.ready.then(()=>{if(navigator.serviceWorker.controller)done(true);else navigator.serviceWorker.addEventListener('controllerchange',()=>done(true),{once:true});});");
