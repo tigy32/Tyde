@@ -434,11 +434,42 @@ impl ConfigActor {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| "Cannot persist learning journal transaction")?;
-        std::fs::rename(temporary, &self.path)
-            .map_err(|_| "Cannot commit learning journal transaction")?;
-        std::fs::File::open(parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| "Cannot sync learning journal directory".to_owned())
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            };
+
+            let source: Vec<u16> = temporary.as_os_str().encode_wide().chain([0]).collect();
+            let destination: Vec<u16> = self.path.as_os_str().encode_wide().chain([0]).collect();
+            // Windows cannot fsync a directory opened with File::open. Commit
+            // the already-synced file with a write-through rename instead.
+            // SAFETY: both terminated paths remain valid throughout the call.
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(format!(
+                    "Cannot commit learning journal transaction: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(temporary, &self.path)
+                .map_err(|error| format!("Cannot commit learning journal transaction: {error}"))?;
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("Cannot sync learning journal directory: {error}"))
+        }
     }
     fn publish(&self) {
         let snapshot = SelfImprovementState {
