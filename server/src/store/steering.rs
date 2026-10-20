@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
     records: HashMap<String, Steering>,
+    #[serde(default)]
+    initialized_defaults: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -17,8 +19,15 @@ pub struct SteeringStore {
 
 impl SteeringStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+        let mut file = Self::read_from_disk(&path)?;
+        let store = Self { path };
+        let default = atomic_rule_guidance();
+        // Remember initialization even after deletion; absence is a user choice.
+        if file.initialized_defaults.insert(default.id.0.clone()) {
+            file.records.entry(default.id.0.clone()).or_insert(default);
+            store.save(&file)?;
+        }
+        Ok(store)
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -36,6 +45,7 @@ impl SteeringStore {
 
     pub fn list(&self) -> Result<Vec<Steering>, String> {
         let mut records = Self::read_from_disk(&self.path)?
+            .records
             .into_values()
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
@@ -49,29 +59,30 @@ impl SteeringStore {
     pub fn get(&self, id: &SteeringId) -> Option<Steering> {
         Self::read_from_disk(&self.path)
             .ok()
-            .and_then(|records| records.get(&id.0).cloned())
+            .and_then(|file| file.records.get(&id.0).cloned())
     }
 
     pub fn upsert(&self, steering: Steering) -> Result<Steering, String> {
         validate_steering(&steering)?;
-        let mut records = Self::read_from_disk(&self.path)?;
-        records.insert(steering.id.0.clone(), steering.clone());
-        self.save(&records)?;
+        let mut file = Self::read_from_disk(&self.path)?;
+        file.records.insert(steering.id.0.clone(), steering.clone());
+        self.save(&file)?;
         Ok(steering)
     }
 
     pub fn delete(&self, id: &SteeringId) -> Result<SteeringId, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
-        if records.remove(&id.0).is_none() {
+        let mut file = Self::read_from_disk(&self.path)?;
+        if file.records.remove(&id.0).is_none() {
             return Err(format!("cannot delete missing steering {}", id));
         }
-        self.save(&records)?;
+        self.save(&file)?;
         Ok(id.clone())
     }
 
     pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SteeringId>, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
-        let mut deleted = records
+        let mut file = Self::read_from_disk(&self.path)?;
+        let mut deleted = file
+            .records
             .values()
             .filter(|steering| {
                 matches!(&steering.scope, SteeringScope::Project(id) if id == project_id)
@@ -83,28 +94,29 @@ impl SteeringStore {
         }
         deleted.sort_by(|left, right| left.0.cmp(&right.0));
         for id in &deleted {
-            records.remove(&id.0);
+            file.records.remove(&id.0);
         }
-        self.save(&records)?;
+        self.save(&file)?;
         Ok(deleted)
     }
 
-    fn read_from_disk(path: &Path) -> Result<HashMap<String, Steering>, String> {
+    fn read_from_disk(path: &Path) -> Result<StoreFile, String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let records = serde_json::from_str::<StoreFile>(&contents)
-                    .map(|store| store.records)
-                    .map_err(|err| {
-                        format!("Failed to parse steering store {}: {err}", path.display())
-                    })?;
-                for steering in records.values() {
+                let file = serde_json::from_str::<StoreFile>(&contents).map_err(|err| {
+                    format!("Failed to parse steering store {}: {err}", path.display())
+                })?;
+                for steering in file.records.values() {
                     validate_steering(steering).map_err(|err| {
                         format!("Invalid steering store {}: {err}", path.display())
                     })?;
                 }
-                Ok(records)
+                Ok(file)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StoreFile {
+                records: HashMap::new(),
+                initialized_defaults: HashSet::new(),
+            }),
             Err(err) => Err(format!(
                 "Failed to read steering store {}: {err}",
                 path.display()
@@ -112,11 +124,9 @@ impl SteeringStore {
         }
     }
 
-    fn save(&self, records: &HashMap<String, Steering>) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(&StoreFile {
-            records: records.clone(),
-        })
-        .map_err(|err| format!("Failed to serialize steering store: {err}"))?;
+    fn save(&self, file: &StoreFile) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(file)
+            .map_err(|err| format!("Failed to serialize steering store: {err}"))?;
 
         let parent = self
             .path
@@ -156,4 +166,13 @@ fn validate_steering(steering: &Steering) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn atomic_rule_guidance() -> Steering {
+    Steering {
+        id: SteeringId("tyde-atomic-rule-guidance".into()),
+        scope: SteeringScope::Host,
+        title: "Maintain atomic steering and review aspects".into(),
+        content: "Keep each steering entry and review aspect concise and atomic: roughly tweet-sized is a writing guideline, not a limit. Before adding, inspect applicable entries for semantic overlap; edit or merge the existing rule and refine that same entry. Keep a prohibition and its approved exceptions together as one policy. Give genuinely independent feedback separate maintainable entries.".into(),
+    }
 }

@@ -10766,7 +10766,8 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
     let mock_turn_text = |prompt: &str| {
         format!(
             "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), tyde-config(http)] \
-             [builtin_steering: {}] mock backend response to: {prompt}",
+             [steering: {}] [builtin_steering: {}] mock backend response to: {prompt}",
+            fixture.bootstrap.steering[0].content.replace('\n', "\\n"),
             // The mock's startup summary renders newlines as literal \n.
             format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )

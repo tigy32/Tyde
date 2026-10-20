@@ -122,6 +122,18 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         BackendKind::Codex,
     ])
     .await;
+    let shipped_guidance = fixture.bootstrap.steering[0].clone();
+    let mut edited_guidance = shipped_guidance.clone();
+    edited_guidance.content =
+        "Keep one feedback policy per entry, including approved exceptions.".into();
+    fixture
+        .client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: edited_guidance.clone(),
+        })
+        .await
+        .expect("edit default before analyzer starts");
+    canonical_steering(&mut fixture, &edited_guidance.content).await;
     let main_gate = MockGateHandle::new();
     let agent = fixture
         .spawn_scripted(
@@ -136,7 +148,7 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
     fixture
         .host_for_test()
         .set_learning_script_for_test(
-            MockScript::one(MockTurn::gated_text(
+            MockScript::one(MockTurn::gated_text_for_input(
                 response(vec![
                     operation(
                         None,
@@ -149,6 +161,7 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
                         "human-one",
                     ),
                 ]),
+                format!("\n{}\n", edited_guidance.content),
                 &analyzer_gate,
             ))
             .then(MockTurn::text(response(Vec::new()))),
@@ -164,6 +177,7 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
     // This event cannot arrive if analysis incorrectly waits for author Idle:
     // the author's explicit completion gate remains closed throughout.
     analyzer_gate.wait_until_entered().await;
+
     human(
         &mut fixture,
         &agent,
@@ -265,7 +279,7 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         "Task and backend rollups must represent identical source scopes"
     );
     assert!(
-        reconnect.1.steering.is_empty(),
+        reconnect.1.steering == vec![edited_guidance],
         "Suggest cannot alter canonical steering"
     );
     assert!(
@@ -319,7 +333,7 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
     let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
     assert_eq!(
         bootstrap.steering.len(),
-        1,
+        2,
         "Automatic must edit the same canonical rule instead of duplicating it"
     );
     assert_eq!(bootstrap.settings.review.aspects.len(), 1);
@@ -328,7 +342,12 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
             .instructions
             .contains("active selection")
     );
-    let mut human_owned = bootstrap.steering[0].clone();
+    let mut human_owned = bootstrap
+        .steering
+        .iter()
+        .find(|rule| rule.id.0 == "learned-format")
+        .expect("learned rule")
+        .clone();
     human_owned.content = "Human-owned instruction must remain intact.".into();
     observer
         .steering_upsert(SteeringUpsertPayload {
@@ -363,7 +382,12 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
     assert!(conflict.error.is_some());
     let persisted = fixture.connect_with_bootstrap().await.1;
     assert_eq!(
-        persisted.steering[0].content,
+        persisted
+            .steering
+            .iter()
+            .find(|rule| rule.id.0 == "learned-format")
+            .expect("learned rule")
+            .content,
         "Human-owned instruction must remain intact."
     );
     main_gate.release_one();
@@ -383,7 +407,12 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         "Restart must not schedule another batch for accepted feedback"
     );
     assert_eq!(
-        restored.steering[0].content,
+        restored
+            .steering
+            .iter()
+            .find(|rule| rule.id.0 == "learned-format")
+            .expect("learned rule")
+            .content,
         "Human-owned instruction must remain intact."
     );
 }
@@ -981,7 +1010,7 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
             .any(|item| item.id == change.id && matches!(item.status, LearningChangeStatus::Undone))
     })
     .await;
-    assert!(fixture.connect_with_bootstrap().await.1.steering.is_empty());
+    assert!(fixture.connect_with_bootstrap().await.1.steering == fixture.bootstrap.steering);
     let LearningRule::Steering {
         steering: human_rule,
     } = revised.clone()
@@ -1016,7 +1045,15 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
                 && matches!(change.status, LearningChangeStatus::Pending))
     );
     assert_eq!(
-        fixture.connect_with_bootstrap().await.1.steering[0].content,
+        fixture
+            .connect_with_bootstrap()
+            .await
+            .1
+            .steering
+            .into_iter()
+            .find(|rule| rule.id.0 == "project-learned")
+            .expect("project learned rule")
+            .content,
         "Explain focused project changes."
     );
     let pending_id = protected
@@ -1072,5 +1109,5 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         .expect("scope failure")
     };
     assert_eq!(failed.usage.len(), 4);
-    assert_eq!(fixture.connect_with_bootstrap().await.1.steering.len(), 1);
+    assert_eq!(fixture.connect_with_bootstrap().await.1.steering.len(), 2);
 }

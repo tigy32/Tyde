@@ -1157,7 +1157,10 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     reviewer_gate.release_one();
     fixture::finish_turn_on(&mut client, &new_agent.instance_stream).await;
     assert!(
-        response.contains("[steering: Reviewer host steering\\n\\nReviewer project steering]"),
+        response.contains(&format!(
+            "[steering: {}\\n\\nReviewer host steering\\n\\nReviewer project steering]",
+            fixture.bootstrap.steering[0].content.replace('\n', "\\n")
+        )),
         "reviewer lost user steering: {response}"
     );
     assert!(

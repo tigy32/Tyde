@@ -514,7 +514,10 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
         "coordinator holds agent control without the steering for it: {response}"
     );
     assert!(
-        response.contains("[steering: Workflow host steering\\n\\nWorkflow project steering]"),
+        response.contains(&format!(
+            "[steering: {}\\n\\nWorkflow host steering\\n\\nWorkflow project steering]",
+            fixture.bootstrap.steering[0].content.replace('\n', "\\n")
+        )),
         "coordinator lost user steering: {response}"
     );
     assert!(

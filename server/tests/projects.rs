@@ -1096,7 +1096,7 @@ async fn delete_project_removes_project_scoped_steering() {
 
     let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(
-        bootstrap.steering.is_empty(),
+        bootstrap.steering == fixture.bootstrap.steering,
         "project-scoped steering should not replay after project delete"
     );
 }

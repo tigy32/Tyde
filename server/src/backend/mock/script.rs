@@ -295,6 +295,11 @@ pub struct MockTurn {
 pub(super) enum MockTurnBody {
     Steps(Vec<MockStep>),
     RenderedEcho(Option<MockGate>),
+    RenderedTextForInput {
+        text: String,
+        required: String,
+        gate: MockGate,
+    },
     RenderedHistoryJoin,
     RenderedWorkspaceRoots,
 }
@@ -311,6 +316,21 @@ impl MockTurn {
 
     pub fn text(text: impl Into<String>) -> Self {
         Self::done(text_steps(text.into(), TextShape::default()))
+    }
+
+    pub fn gated_text_for_input(
+        text: impl Into<String>,
+        required: impl Into<String>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        Self {
+            body: MockTurnBody::RenderedTextForInput {
+                text: text.into(),
+                required: required.into(),
+                gate: gate.gate(),
+            },
+            finish: MockTurnFinish::Done,
+        }
     }
 
     pub fn workspace_roots() -> Self {
@@ -973,6 +993,7 @@ impl MockTurn {
                 )),
             ),
             MockTurnBody::RenderedEcho(_)
+            | MockTurnBody::RenderedTextForInput { .. }
             | MockTurnBody::RenderedHistoryJoin
             | MockTurnBody::RenderedWorkspaceRoots => {
                 panic!("goal state requires a frozen turn")
@@ -1209,6 +1230,7 @@ impl MockTurn {
         match &mut self.body {
             MockTurnBody::Steps(steps) => steps.extend(extra),
             MockTurnBody::RenderedEcho(_)
+            | MockTurnBody::RenderedTextForInput { .. }
             | MockTurnBody::RenderedHistoryJoin
             | MockTurnBody::RenderedWorkspaceRoots => {
                 panic!("post-idle step builders apply to frozen turns, not rendered ones")
@@ -1269,6 +1291,21 @@ impl MockTurn {
                     )
                 }
             }
+            MockTurnBody::RenderedTextForInput {
+                text,
+                required,
+                gate,
+            } => text_steps(
+                if input.contains(&required) {
+                    text
+                } else {
+                    "Mock required input was absent".into()
+                },
+                TextShape {
+                    gate: Some(gate),
+                    ..TextShape::default()
+                },
+            ),
             MockTurnBody::RenderedHistoryJoin => text_steps(
                 format!(
                     "mock history: {}",

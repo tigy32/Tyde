@@ -430,7 +430,16 @@ async fn start_dev_instance_expecting_exit(
         }),
     );
     let (mut control, _) = tokio::select! {
-        result = &mut start => panic!("dev start settled before frontend readiness gate: tool_completed={}", result.is_ok()),
+        result = &mut start => {
+            let details = match result {
+                Ok(result) => result.content.into_iter().filter_map(|content| match content.raw {
+                    RawContent::Text(text) => Some(text.text.replace(CREDENTIAL_SENTINEL, "[redacted]")),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+                Err(error) => vec![error.to_string()],
+            };
+            panic!("zxcv DEV start settled before frontend readiness gate: {details:?}");
+        },
         connected = control_listener.accept() => connected.expect("frontend entered actual readiness gate"),
     };
     assert_eq!(

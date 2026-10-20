@@ -388,7 +388,7 @@ fn resolve_skill(skill_store: &SkillStore, skill_id: &SkillId) -> Result<Resolve
     ))
 }
 
-fn resolve_steering_body(
+pub(crate) fn resolve_steering_body(
     steering_store: &SteeringStore,
     project_id: Option<&ProjectId>,
 ) -> Result<String, String> {

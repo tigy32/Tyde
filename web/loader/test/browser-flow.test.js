@@ -115,7 +115,7 @@ test("installed storage migrates once, then follows exact targets without losing
       const read = chunk => { output = (output + chunk).slice(-2000); const match = /started successfully on port (\d+)/.exec(output); if (match) {resolve(Number(match[1]));} };
       driver.stdout.on("data",read);driver.stderr.on("data",read);
       driver.once("error",reject);
-      driver.once("exit",(code,signal)=>reject(new Error(`driver exited before readiness; exit=${code}; signal=${signal}`)));
+      driver.once("exit",(code,signal)=>reject(new Error(`zxcv driver exited before readiness; exit=${code}; signal=${signal}; startup=${output}`)));
     });
     request = async (path, body, method="POST") => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {method, headers:{"Content-Type":"application/json"}, ...(body ? {body:JSON.stringify(body)} : {})});

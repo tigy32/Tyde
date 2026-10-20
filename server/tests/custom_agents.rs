@@ -1408,7 +1408,10 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
     // reach the backend by name while its body stays on disk until invoked.
     assert!(text.contains("[skills: lint]"));
     assert!(!text.contains("Run cargo test -q before reporting completion."));
-    assert!(text.contains("[steering: project steering body\\n\\nhost steering body]"));
+    assert!(text.contains(&format!(
+        "[steering: project steering body\\n\\n{}\\n\\nhost steering body]",
+        fixture.bootstrap.steering[0].content.replace('\n', "\\n")
+    )));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1766,6 +1769,11 @@ async fn reserved_mcp_name_returns_upsert_error() {
 #[tokio::test(start_paused = true)]
 async fn steering_ordering_combines_host_and_project_by_title() {
     let mut fixture = Fixture::new().await;
+    assert_eq!(fixture.bootstrap.steering.len(), 1);
+    let default = fixture.bootstrap.steering[0].clone();
+    assert_eq!(default.id.0, "tyde-atomic-rule-guidance");
+    assert_eq!(default.scope, SteeringScope::Host);
+    assert!(default.content.contains("writing guideline, not a limit"));
     ensure_dir("/tmp/ordering-project");
     let host_steering = Steering {
         id: SteeringId("host-zulu".to_string()),
@@ -1833,7 +1841,94 @@ async fn steering_ordering_combines_host_and_project_by_title() {
     let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     let text = expect_turn_text(&mut fixture.client, "steering turn").await;
-    assert!(text.contains("[steering: project alpha\\n\\nhost zulu]"));
+    assert!(text.contains(&format!(
+        "[steering: project alpha\\n\\n{}\\n\\nhost zulu]",
+        fixture.bootstrap.steering[0].content.replace('\n', "\\n")
+    )));
+    assert_eq!(text.matches(&default.content).count(), 1);
+
+    let mut edited = default.clone();
+    edited.content = "Keep related feedback together, with its exceptions.".into();
+    fixture
+        .client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: edited.clone(),
+        })
+        .await
+        .expect("edit shipped default");
+    let _ = expect_next_event(&mut fixture.client, "default edit").await;
+    let bootstrap = fixture.restart_host().await;
+    assert!(bootstrap.steering.contains(&edited));
+    assert_eq!(bootstrap.steering.len(), 3);
+
+    // Help uses the same host steering as ordinary agents, not a fixed copy.
+    for deleted in [false, true] {
+        if deleted {
+            fixture
+                .client
+                .steering_delete(SteeringDeletePayload {
+                    id: default.id.clone(),
+                })
+                .await
+                .expect("remove shipped default");
+            let _ = expect_next_event(&mut fixture.client, "default delete").await;
+            let bootstrap = fixture.restart_host().await;
+            assert!(!bootstrap.steering.iter().any(|rule| rule.id == default.id));
+            assert_eq!(bootstrap.steering.len(), 2);
+        }
+        let (help, _) = fixture
+            .spawn_with(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some(format!("editable-default-help-{deleted}")),
+                custom_agent_id: Some(CustomAgentId("tyde-help".into())),
+                parent_agent_id: None,
+                project_id: Some(project.id.clone()),
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec!["/tmp/ordered-steering".into()],
+                    prompt: "Explain steering".into(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await;
+        let turn = fixture.finish_turn(&help).await;
+        let output = turn
+            .chat_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(output.contains(&edited.content), !deleted);
+        assert!(!output.contains(&default.content));
+        assert!(output.contains("project alpha"));
+        assert!(output.contains("host zulu"));
+    }
+
+    // An existing installation has records but no default-initialization marker.
+    let path = fixture.store_dir().join("steering.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read persisted steering"))
+            .expect("parse persisted steering");
+    legacy
+        .as_object_mut()
+        .expect("store object")
+        .remove("initialized_defaults");
+    fs::write(
+        &path,
+        serde_json::to_vec(&legacy).expect("encode legacy store"),
+    )
+    .expect("install legacy store");
+    let upgraded = fixture.restart_host().await;
+    assert!(upgraded.steering.contains(&default));
+    assert_eq!(upgraded.steering.len(), 3);
+    let reloaded = fixture.restart_host().await;
+    assert_eq!(reloaded.steering, upgraded.steering);
 }
 
 /// Agents reach for another backend's CLI unless told otherwise, and a
