@@ -478,10 +478,12 @@ details summary:focus:not(:focus-visible) {
 .session-setting-select {
     appearance: none;
     -webkit-appearance: none;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-image:
+        linear-gradient(45deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px)),
+        linear-gradient(135deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px));
     background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 12px 12px;
+    background-position: right 14px center, right 10px center;
+    background-size: 4px 4px;
 }
 
 .center-host-select {
@@ -9806,10 +9808,12 @@ math merror {
     font-size: 1rem;
     color: var(--text-primary);
     background-color: var(--surface-1);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-image:
+        linear-gradient(45deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px)),
+        linear-gradient(135deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px));
     background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 12px 12px;
+    background-position: right 14px center, right 10px center;
+    background-size: 4px 4px;
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     cursor: pointer;
@@ -10028,10 +10032,12 @@ math merror {
     font-size: 1rem;
     color: var(--text-primary);
     background-color: var(--surface-2);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-image:
+        linear-gradient(45deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px)),
+        linear-gradient(135deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px));
     background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 12px 12px;
+    background-position: right 14px center, right 10px center;
+    background-size: 4px 4px;
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     outline: none;
@@ -13294,10 +13300,12 @@ pre.tool-error-pre {
     width: 100%;
     box-sizing: border-box;
     background-color: var(--surface-0);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-image:
+        linear-gradient(45deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px)),
+        linear-gradient(135deg, transparent calc(50% - 0.75px), #a0a0a0 calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px));
     background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 12px 12px;
+    background-position: right 14px center, right 10px center;
+    background-size: 4px 4px;
     color: var(--text-primary);
     border: 1px solid var(--border-primary);
     border-radius: 6px;

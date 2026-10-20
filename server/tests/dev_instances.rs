@@ -57,18 +57,24 @@ exit 3
 
 const FAKE_NODE: &str = r#"#!/usr/bin/python3
 import http.server,json,os,pathlib,socket,sys
+proof=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.frontend')
+def record(phase,port=None):
+    details={'phase':phase,'pid':os.getpid()}
+    if port is not None: details['port']=port
+    proof.write_text(json.dumps(details))
+    print(f'DEV FRONTEND phase={phase} port={port}',flush=True)
 control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
+record('control-connected')
+record('validating-frontend-arguments')
 assert sys.argv[1].endswith('/tools/trunk-command.mjs'), 'frontend-script-argument'
 assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv, 'frontend-serve-arguments'
+record('validating-workbench-namespace')
 if sys.argv[1].startswith('/mnt/tyde-workspace/'):
  assert os.getcwd()=='/mnt/tyde-workspace', 'frontend-logical-cwd'
  assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-private-namespace'
+record('parsing-port')
 port=int(sys.argv[sys.argv.index('--port')+1])
-proof=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.frontend')
-def record(phase):
-    proof.write_text(json.dumps({'phase':phase,'port':port,'pid':os.getpid()}))
-    print(f'DEV FRONTEND phase={phase} port={port}',flush=True)
 record('launched')
 ready=False
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -83,10 +89,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200);self.end_headers();self.wfile.write(b'<html>fixture</html>')
         record('response-served')
     def log_message(self,*args):pass
+record('binding',port)
 server=http.server.HTTPServer(('127.0.0.1',port),Handler)
-record('bound')
+record('bound',port)
 control.sendall(b'B'+port.to_bytes(2,'big'))
-record('awaiting-request')
+record('awaiting-request',port)
 server.serve_forever()
 "#;
 
@@ -492,36 +499,20 @@ async fn start_dev_instance_expecting_exit(
                 .content
                 .iter()
                 .filter_map(|content| match &content.raw {
-                    RawContent::Text(text) => Some(text.text.as_str()),
+                    RawContent::Text(text) => {
+                        Some(text.text.replace(CREDENTIAL_SENTINEL, "[redacted]"))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let phase = std::fs::read(&producer_proof)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|value| {
-                    value
-                        .get("phase")
-                        .and_then(|phase| phase.as_str())
-                        .map(str::to_owned)
-                });
-            let assertions: Vec<_> = [
-                "frontend-script-argument",
-                "frontend-serve-arguments",
-                "frontend-logical-cwd",
-                "frontend-private-namespace",
-            ]
-            .into_iter()
-            .filter(|label| output.contains(label))
-            .collect();
+            let producer = match std::fs::read_to_string(&producer_proof) {
+                Ok(value) => value,
+                Err(error) => format!("producer_proof_unavailable={:?}", error.kind()),
+            };
             panic!(
-                "DEV READINESS scenario={scenario:?} phase=control-before-bound-closed error={:?} producer_phase={phase:?} assertion_markers={assertions:?} address_in_use={} permission_denied={} traceback={} child_exit={} tool_error={}",
+                "DEV READINESS scenario={scenario:?} phase=control-before-bound-closed error={:?} producer={producer:?} startup_output={output:?} tool_error={}",
                 error.kind(),
-                output.contains("Address already in use"),
-                output.contains("Permission denied"),
-                output.contains("Traceback"),
-                output.contains("exited before ready"),
                 result.is_error == Some(true)
             );
         }

@@ -2461,8 +2461,9 @@ mod wasm_tests {
             "none",
             "the host picker must not use the glossy platform control"
         );
+        let background_image = computed(&host, "background-image");
         assert!(
-            computed(&host, "background-image").starts_with("url("),
+            !background_image.is_empty() && background_image != "none",
             "the flat host picker still needs a visible dropdown chevron"
         );
         assert!(

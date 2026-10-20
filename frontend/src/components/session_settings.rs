@@ -1957,11 +1957,9 @@ mod wasm_tests {
                 "none",
                 "session dropdowns must not use the glossy platform control"
             );
+            let background_image = computed.get_property_value("background-image").unwrap();
             assert!(
-                computed
-                    .get_property_value("background-image")
-                    .unwrap()
-                    .starts_with("url("),
+                !background_image.is_empty() && background_image != "none",
                 "flat session dropdowns still need a visible chevron"
             );
             assert!(
