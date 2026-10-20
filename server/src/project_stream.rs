@@ -3628,7 +3628,7 @@ pub mod scan_test_support {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum ScanPoint {
         ActorStarting,
         Metadata,
@@ -3639,6 +3639,7 @@ pub mod scan_test_support {
         WatcherProcess,
         WatcherReconcile,
         WatcherProcessed,
+        WatcherRenameProcessed,
         WatcherOverflow,
         WatcherDropped,
         WatcherFailure,

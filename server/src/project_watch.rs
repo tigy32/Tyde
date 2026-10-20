@@ -941,6 +941,20 @@ impl WatchState {
                 crate::project_stream::scan_test_support::ScanPoint::WatcherProcessed,
             );
         }
+        #[cfg(feature = "test-support")]
+        if matches!(event.kind, EventKind::Modify(notify::event::ModifyKind::Name(mode))
+            if matches!(mode, notify::event::RenameMode::Both | notify::event::RenameMode::Any)
+                || (!cfg!(target_os = "linux") && mode == notify::event::RenameMode::To))
+        {
+            // Linux emits From, To, Both; the paired event completes destination
+            // re-registration. Other native backends can report only To or Any.
+            for path in &event.paths {
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherRenameProcessed,
+                );
+            }
+        }
         event.paths = relevant;
         Ok((!event.paths.is_empty()).then_some(event))
     }

@@ -6,7 +6,8 @@ use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
 use crate::state::{
-    AppState, ConnectionStatus, DiffViewMode, NativeSettingsSaveState, ToolOutputMode,
+    AppState, ConnectionStatus, DefaultSendAction, DiffViewMode, NativeSettingsSaveState,
+    ToolOutputMode,
 };
 
 use protocol::{
@@ -37,6 +38,8 @@ use crate::send::{
     steering_delete, steering_upsert,
 };
 use protocol::{clear_invalid_dependent_select_values, options_including_current};
+
+const STORAGE_DEFAULT_SEND_ACTION: &str = "tyde-default-send-action";
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
@@ -322,6 +325,8 @@ pub fn restore_appearance(state: &AppState) {
     );
     state.theme.set(theme.to_owned());
     let Some(storage) = storage else {
+        state.default_send_action.set(None);
+        log::error!("could not read default send action: local storage is unavailable");
         return;
     };
 
@@ -350,6 +355,24 @@ pub fn restore_appearance(state: &AppState) {
     if let Ok(Some(tabs_str)) = storage.get_item(STORAGE_TABS_ENABLED) {
         let enabled = tabs_str != "false";
         state.tabs_enabled.set(enabled);
+    }
+
+    let send_action = match storage.get_item(STORAGE_DEFAULT_SEND_ACTION) {
+        Ok(Some(value)) => {
+            DefaultSendAction::from_value(&value).ok_or("The saved default send action is invalid.")
+        }
+        Ok(None) => Ok(DefaultSendAction::CancelAndSend),
+        Err(error) => {
+            log::error!("failed to read default send action: {error:?}");
+            Err("Could not read the saved default send action.")
+        }
+    };
+    match send_action {
+        Ok(action) => state.default_send_action.set(Some(action)),
+        Err(message) => {
+            state.default_send_action.set(None);
+            log::error!("{message}");
+        }
     }
 
     match storage.get_item(STORAGE_DIFF_VIEW_MODE) {
@@ -404,6 +427,7 @@ enum SettingsTab {
     Hosts,
     Appearance,
     Display,
+    Composer,
     AiSummaries,
     Supervisor,
     UsageManagement,
@@ -440,6 +464,7 @@ impl SettingsTab {
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
             Self::Display => "Code & Output Display",
+            Self::Composer => "Composer",
             Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
             Self::UsageManagement => "Usage Limits",
@@ -465,7 +490,9 @@ impl SettingsTab {
     /// control separately from device-local updater preferences.
     fn scope(self) -> SettingsScope {
         match self {
-            Self::Updates | Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
+            Self::Updates | Self::Hosts | Self::Appearance | Self::Display | Self::Composer => {
+                SettingsScope::Device
+            }
             Self::AiSummaries
             | Self::Supervisor
             | Self::UsageManagement
@@ -536,6 +563,16 @@ impl SettingsTab {
                 "Dinosaur",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
+            ],
+            Self::Composer => &[
+                "Composer",
+                "Chat",
+                "Interrupt",
+                "Default send action",
+                "Cancel + send",
+                "Queue",
+                "Steer",
+                "Enter",
             ],
             Self::Display => &[
                 "Code & Output Display",
@@ -763,11 +800,12 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 22] = [
+const ALL_TABS: [SettingsTab; 23] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::Display,
+    SettingsTab::Composer,
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
@@ -789,11 +827,12 @@ const ALL_TABS: [SettingsTab; 22] = [
 ];
 
 /// Device-local tabs, listed under the "This Device" sidebar group.
-const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
+const DEVICE_GROUP_TABS: [SettingsTab; 5] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::Display,
+    SettingsTab::Composer,
 ];
 
 /// Host-scoped tabs, listed under a sidebar group titled with the selected
@@ -1018,6 +1057,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Updates => view! { <crate::components::app_updates::UpdatesSettings /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                     SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
+                                    SettingsTab::Composer => view! { <ComposerSettings /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
                                     SettingsTab::UsageManagement => view! { <UsageManagementTab /> }.into_any(),
@@ -2093,6 +2133,52 @@ fn AppearanceTab() -> impl IntoView {
                     <span class="settings-toggle-slider"></span>
                 </label>
             </div>
+        </div>
+    }
+}
+
+#[component]
+pub(crate) fn ComposerSettings() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        <h2 class="settings-panel-title">"Composer"</h2>
+        <div class="settings-field">
+            <label class="settings-label" for="default-send-action">"Default send action"</label>
+            <p class="settings-description">"Enter and the send button use this action while an agent is working. Idle agents receive a normal message. The More send actions menu overrides it for one message. Shift+Enter inserts a newline. Saved on this device."</p>
+            <Show when=move || state.default_send_action.get().is_none()>
+                <p role="alert">"Your saved default send action could not be loaded. Enable local storage and choose an action to enable default sending. Explicit send actions remain available."</p>
+            </Show>
+            <select id="default-send-action" class="settings-select"
+                prop:value=move || match state.default_send_action.get() {
+                    Some(action) => action.value(),
+                    None => "",
+                }
+                on:change=move |ev: web_sys::Event| {
+                    let select: web_sys::HtmlSelectElement = event_target(&ev);
+                    let selected = select.value();
+                    select.set_value(state.default_send_action.get_untracked().map_or("", DefaultSendAction::value));
+                    let Some(action) = DefaultSendAction::from_value(&selected) else {
+                        log::error!("invalid default send action selection");
+                        return;
+                    };
+                    let Some(storage) = local_storage() else {
+                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action: local storage is unavailable.");
+                        return;
+                    };
+                    if let Err(error) = storage.set_item(STORAGE_DEFAULT_SEND_ACTION, action.value()) {
+                        log::error!("failed to save default send action: {error:?}");
+                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action.");
+                        return;
+                    }
+                    select.set_value(action.value());
+                    state.default_send_action.set(Some(action));
+                }
+            >
+                <option value="" disabled>"Choose a default send action"</option>
+                <option value="cancel_and_send">"Cancel + send"</option>
+                <option value="queue">"Queue"</option>
+                <option value="steer">"Steer"</option>
+            </select>
         </div>
     }
 }

@@ -59,11 +59,11 @@ const FAKE_NODE: &str = r#"#!/usr/bin/python3
 import http.server,json,os,pathlib,socket,sys
 control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
-assert sys.argv[1].endswith('/tools/trunk-command.mjs')
-assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv
+assert sys.argv[1].endswith('/tools/trunk-command.mjs'), 'frontend-script-argument'
+assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv, 'frontend-serve-arguments'
 if sys.argv[1].startswith('/mnt/tyde-workspace/'):
- assert os.getcwd()=='/mnt/tyde-workspace'
- assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE']
+ assert os.getcwd()=='/mnt/tyde-workspace', 'frontend-logical-cwd'
+ assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-private-namespace'
 port=int(sys.argv[sys.argv.index('--port')+1])
 proof=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.frontend')
 def record(phase):
@@ -480,10 +480,53 @@ async fn start_dev_instance_expecting_exit(
         },
         connected = control_listener.accept() => connected.expect("frontend entered actual readiness gate"),
     };
-    assert_eq!(
-        control.read_u8().await.expect("frontend control gate"),
-        b'B'
-    );
+    let marker = match control.read_u8().await {
+        Ok(marker) => marker,
+        Err(error) => {
+            drop(release_probe);
+            let result = start
+                .as_mut()
+                .await
+                .expect("frontend failure settles start");
+            let output = result
+                .content
+                .iter()
+                .filter_map(|content| match &content.raw {
+                    RawContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let phase = std::fs::read(&producer_proof)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| {
+                    value
+                        .get("phase")
+                        .and_then(|phase| phase.as_str())
+                        .map(str::to_owned)
+                });
+            let assertions: Vec<_> = [
+                "frontend-script-argument",
+                "frontend-serve-arguments",
+                "frontend-logical-cwd",
+                "frontend-private-namespace",
+            ]
+            .into_iter()
+            .filter(|label| output.contains(label))
+            .collect();
+            panic!(
+                "DEV READINESS scenario={scenario:?} phase=control-before-bound-closed error={:?} producer_phase={phase:?} assertion_markers={assertions:?} address_in_use={} permission_denied={} traceback={} child_exit={} tool_error={}",
+                error.kind(),
+                output.contains("Address already in use"),
+                output.contains("Permission denied"),
+                output.contains("Traceback"),
+                output.contains("exited before ready"),
+                result.is_error == Some(true)
+            );
+        }
+    };
+    assert_eq!(marker, b'B');
     assert!(
         !desktop_marker.exists(),
         "desktop started before frontend was ready"

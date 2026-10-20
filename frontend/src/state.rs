@@ -53,6 +53,40 @@ pub enum ToolOutputMode {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultSendAction {
+    CancelAndSend,
+    Queue,
+    Steer,
+}
+
+impl DefaultSendAction {
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::CancelAndSend => "cancel_and_send",
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "cancel_and_send" => Some(Self::CancelAndSend),
+            "queue" => Some(Self::Queue),
+            "steer" => Some(Self::Steer),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CancelAndSend => "Cancel + send",
+            Self::Queue => "Queue",
+            Self::Steer => "Steer",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionStatus {
     Disconnected,
@@ -3980,6 +4014,7 @@ pub struct AppState {
     pub diff_view_mode: RwSignal<DiffViewMode>,
     pub diff_context_mode: RwSignal<DiffContextMode>,
     pub tool_output_mode: RwSignal<ToolOutputMode>,
+    pub default_send_action: RwSignal<Option<DefaultSendAction>>,
     pub custom_agents: RwSignal<HashMap<String, HashMap<CustomAgentId, CustomAgent>>>,
     pub mcp_servers: RwSignal<HashMap<String, HashMap<McpServerId, McpServerConfig>>>,
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
@@ -4420,6 +4455,7 @@ impl AppState {
             diff_view_mode: RwSignal::new(DiffViewMode::Unified),
             diff_context_mode: RwSignal::new(DiffContextMode::Hunks),
             tool_output_mode: RwSignal::new(ToolOutputMode::Compact),
+            default_send_action: RwSignal::new(Some(DefaultSendAction::CancelAndSend)),
             custom_agents: RwSignal::new(HashMap::new()),
             mcp_servers: RwSignal::new(HashMap::new()),
             steering: RwSignal::new(HashMap::new()),

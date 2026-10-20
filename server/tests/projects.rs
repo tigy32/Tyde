@@ -5052,16 +5052,21 @@ fn watch_completion(
 ) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let hook = fixture.on_project_scan(path.to_owned(), point, move || {
+        eprintln!("PROJECT WATCH COMPLETION point={point:?}");
         let _ = tx.send(());
     });
     (hook, rx)
 }
 
 async fn expect_watched_listing(client: &mut client::Connection, path: &str, present: bool) {
+    eprintln!("PROJECT WATCH WAIT begin=listing fixture_entry={path} present={present}");
+    let mut frames = 0;
     next_frame_matching_on(
         client,
         "watcher listing reflects filesystem state",
         |event| {
+            frames += 1;
+            eprintln!("PROJECT WATCH LISTING frame={frames} kind={:?}", event.kind);
             assert_ne!(event.kind, FrameKind::CommandError);
             event.kind == FrameKind::ProjectFileList && {
                 let listing = event.parse_payload::<ProjectFileListPayload>().unwrap();
@@ -5073,6 +5078,9 @@ async fn expect_watched_listing(client: &mut client::Connection, path: &str, pre
         },
     )
     .await;
+    eprintln!(
+        "PROJECT WATCH WAIT end=listing fixture_entry={path} present={present} frames={frames}"
+    );
 }
 
 async fn expect_watched_write(
@@ -5086,12 +5094,15 @@ async fn expect_watched_write(
         relative_path: relative_path.to_owned(),
     };
     let absolute = Path::new(&path.root.0).join(relative_path);
+    eprintln!("PROJECT WATCH WAIT begin=observe-before-write fixture_entry={relative_path}");
     client
         .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
         .await
         .unwrap();
     let before = expect_project_file_contents(client, "observe file before watched write").await;
+    eprintln!("PROJECT WATCH WAIT end=observe-before-write fixture_entry={relative_path}");
     fs::write(&absolute, contents).unwrap();
+    eprintln!("PROJECT WATCH WAIT begin=invalidation fixture_entry={relative_path}");
     next_frame_matching_on(client, "watched file invalidation", |event| {
         assert_ne!(event.kind, FrameKind::CommandError);
         event.kind == FrameKind::ProjectEvent
@@ -5101,7 +5112,11 @@ async fn expect_watched_write(
         .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
         .await
         .unwrap();
+    eprintln!(
+        "PROJECT WATCH WAIT end=invalidation begin=read-current fixture_entry={relative_path}"
+    );
     let after = expect_project_file_contents(client, "read invalidated file").await;
+    eprintln!("PROJECT WATCH WAIT end=read-current fixture_entry={relative_path}");
     assert_eq!(after.contents.as_deref(), Some(contents));
     assert!(after.version > before.version);
     eprintln!("PROJECT WATCH EVIDENCE: observed_file_invalidated=true contents_current=true");
@@ -5175,7 +5190,38 @@ async fn project_watcher_prunes_ignored_build_trees() {
         "second\n",
     )
     .await;
+    let mut rename_diagnostics = Vec::new();
+    for relative in ["fresh", "fresh/deep", "moved", "moved/deep"] {
+        for point in [
+            server::ScanPoint::WatcherDispatch,
+            server::ScanPoint::WatcherReconcile,
+            server::ScanPoint::WatcherProcessed,
+            server::ScanPoint::WatcherRegistered,
+            server::ScanPoint::WatcherUnregistered,
+        ] {
+            rename_diagnostics.push(fixture.on_project_scan(
+                repo.path().join(relative),
+                point,
+                move || {
+                    eprintln!("PROJECT WATCH RENAME fixture_entry={relative} point={point:?}");
+                },
+            ));
+        }
+    }
+    // A listing is an independent filesystem snapshot, not watch readiness.
+    // Complete the native rename without holding the worker during child creation.
+    let (renamed, renamed_rx) = watch_completion(
+        &fixture,
+        &repo.path().join("moved"),
+        server::ScanPoint::WatcherRenameProcessed,
+    );
+    eprintln!("PROJECT WATCH PHASE begin=rename-syscall");
     fs::rename(repo.path().join("fresh"), repo.path().join("moved")).unwrap();
+    eprintln!("PROJECT WATCH PHASE end=rename-syscall");
+    eprintln!("PROJECT WATCH WAIT begin=automatic-rename-completion");
+    renamed_rx.await.unwrap();
+    drop(renamed);
+    eprintln!("PROJECT WATCH WAIT end=automatic-rename-completion");
     expect_watched_listing(&mut fixture.client, "moved/deep/new.rs", true).await;
     let unopened_child = repo.path().join("moved/deep/created-without-read.rs");
     let (automatic, automatic_rx) = watch_completion(
@@ -5183,8 +5229,11 @@ async fn project_watcher_prunes_ignored_build_trees() {
         &unopened_child,
         server::ScanPoint::WatcherDispatch,
     );
+    eprintln!("PROJECT WATCH PHASE begin=automatic-unopened-write");
     write_file(&unopened_child, "automatic renamed-directory watch\n");
+    eprintln!("PROJECT WATCH WAIT begin=automatic-native-dispatch");
     automatic_rx.await.unwrap();
+    eprintln!("PROJECT WATCH WAIT end=automatic-native-dispatch");
     expect_watched_listing(
         &mut fixture.client,
         "moved/deep/created-without-read.rs",

@@ -10,7 +10,10 @@ use crate::actions::spawn_new_chat;
 use crate::components::inflight_tray::InflightTray;
 use crate::components::session_settings::SessionSettingsBar;
 use crate::send::send_frame;
-use crate::state::{ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, PendingTeamMember};
+use crate::state::{
+    ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, DefaultSendAction,
+    PendingTeamMember,
+};
 
 use protocol::{
     AgentOrigin, BackendKind, BackendSetupStatus, FrameKind, ImageData, InterruptPayload,
@@ -590,6 +593,42 @@ enum RunningSendAction {
     Steer,
 }
 
+fn submit_default_chat_input(
+    state: &AppState,
+    composer: &ComposerHandle,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_team_member: Signal<Option<PendingTeamMember>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+    running: bool,
+) {
+    let Some(action) = state.default_send_action.get_untracked() else {
+        return;
+    };
+    match (running, action) {
+        (true, DefaultSendAction::CancelAndSend) => send_running_chat_input(
+            state,
+            composer,
+            agent_ref,
+            pending_images,
+            RunningSendAction::CancelAndSend,
+        ),
+        (true, DefaultSendAction::Steer) => send_running_chat_input(
+            state,
+            composer,
+            agent_ref,
+            pending_images,
+            RunningSendAction::Steer,
+        ),
+        _ => submit_chat_input(
+            state,
+            composer,
+            agent_ref,
+            pending_team_member,
+            pending_images,
+        ),
+    }
+}
+
 fn send_running_chat_input(
     state: &AppState,
     composer: &ComposerHandle,
@@ -1046,6 +1085,11 @@ pub fn ChatInput(
                 .unwrap_or(false)
         })
     };
+    let default_send_action = state.default_send_action;
+    let default_send_label = move || match default_send_action.get() {
+        Some(action) => action.label(),
+        None => "Choose send action",
+    };
     let is_steer = Memo::new(move |_| ui_mode.get().2);
 
     // The dropdown holds items only in specific states (see state matrix):
@@ -1185,6 +1229,9 @@ pub fn ChatInput(
     let on_keydown_composer = composer.clone();
     let on_keydown_images = pending_images;
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        if ev.is_composing() || ev.key_code() == 229 {
+            return;
+        }
         if slash_open.get_untracked() {
             let count = slash_matches.get_untracked().len().max(1);
             let plain = !ev.shift_key() && !ev.meta_key() && !ev.ctrl_key() && !ev.alt_key();
@@ -1270,12 +1317,13 @@ pub fn ChatInput(
             ev.prevent_default();
             if submit_on_enter_mode() {
                 menu_open.set(false);
-                submit_chat_input(
+                submit_default_chat_input(
                     &on_keydown_state,
                     &on_keydown_composer,
                     agent_ref,
                     pending_team_member,
                     on_keydown_images,
+                    is_steer.get_untracked(),
                 );
             }
         }
@@ -1297,12 +1345,13 @@ pub fn ChatInput(
             primary_interrupt_stored.with_value(|state| interrupt_target_turn(state, agent_ref));
         } else {
             primary_submit_stored.with_value(|(state, composer)| {
-                submit_chat_input(
+                submit_default_chat_input(
                     state,
                     composer,
                     agent_ref,
                     pending_team_member,
                     primary_submit_images,
+                    is_steer_now,
                 )
             });
         }
@@ -1345,6 +1394,12 @@ pub fn ChatInput(
             }
         });
     });
+    let on_menu_queue = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(|(state, composer)| {
+            submit_chat_input(state, composer, agent_ref, pending_team_member, menu_images)
+        });
+    };
     let on_menu_cancel_send = move |_| {
         menu_open.set(false);
         menu_state.with_value(|(state, composer)| {
@@ -1844,6 +1899,10 @@ pub fn ChatInput(
                 </div>
             </Show>
 
+            <Show when=move || default_send_action.get().is_none()>
+                <p class="chat-input-error" role="alert">"Could not load default send action. Enable local storage and choose Default send action in Settings → Composer. Explicit send actions remain available."</p>
+            </Show>
+
             // Queued messages render in the In-flight tray (above this
             // composer, alongside the running background work they are
             // queued behind) — not here. The composer owns only draft
@@ -1965,7 +2024,7 @@ pub fn ChatInput(
                             if mode.1 && !is_steer_now && !readonly {
                                 interrupt_in_flight.get()
                             } else {
-                                !can_send()
+                                !can_send() || default_send_action.get().is_none() || (is_steer_now && default_send_action.get() == Some(DefaultSendAction::CancelAndSend) && interrupt_in_flight.get())
                             }
                         }
                         on:click=on_click_primary
@@ -1979,7 +2038,9 @@ pub fn ChatInput(
                                 if mode.1 && !is_steer_now && !readonly {
                                     "Cancel current turn"
                                 } else if is_steer_now && !readonly {
-                                    "Queue message"
+                                    default_send_label()
+                                } else if default_send_action.get().is_none() {
+                                    "Choose send action"
                                 } else {
                                     "Send message"
                                 }
@@ -1999,7 +2060,15 @@ pub fn ChatInput(
                                     "Cancel current turn"
                                 }
                             }
-                            else if is_steer_now && !readonly { "Queue message (Enter)" }
+                            else if is_steer_now && !readonly {
+                                match default_send_action.get() {
+                                    Some(DefaultSendAction::CancelAndSend) => "Cancel + send (Enter)",
+                                    Some(DefaultSendAction::Queue) => "Queue message (Enter)",
+                                    Some(DefaultSendAction::Steer) => "Steer (Enter)",
+                                    None => "Choose Default send action in Settings → Composer",
+                                }
+                            }
+                            else if default_send_action.get().is_none() { "Choose Default send action in Settings → Composer" }
                             else { "Send message (Enter)" }
                         }
                     >
@@ -2013,7 +2082,8 @@ pub fn ChatInput(
                             if mode.1 && !is_steer_now && !readonly {
                                 if interrupt_in_flight.get() { "Cancelling\u{2026}" } else { "Cancel" }
                             }
-                            else if is_steer_now && !readonly { "Queue" }
+                            else if is_steer_now && !readonly { default_send_label() }
+                            else if default_send_action.get().is_none() { "Choose send action" }
                             else { "Send" }
                         }}</span>
                     </button>
@@ -2059,7 +2129,13 @@ pub fn ChatInput(
                                     <span class="chat-send-menu-label">"Send as goal"</span>
                                 </button>
                             </Show>
-                            <Show when=move || can_interrupt() && is_steer.get()>
+                            <Show when=move || can_interrupt() && is_steer.get() && default_send_action.get() != Some(DefaultSendAction::Queue)>
+                                <button type="button" class="chat-send-menu-item" role="menuitem"
+                                    data-test="chat-send-menu-queue" title="Queue message" on:click=on_menu_queue>
+                                    <span class="chat-send-menu-label">"Queue"</span>
+                                </button>
+                            </Show>
+                            <Show when=move || can_interrupt() && is_steer.get() && default_send_action.get() != Some(DefaultSendAction::CancelAndSend)>
                                 <button
                                     type="button"
                                     class="chat-send-menu-item"
@@ -2075,7 +2151,7 @@ pub fn ChatInput(
                                     </span>
                                 </button>
                             </Show>
-                            <Show when=move || can_interrupt() && is_steer.get()>
+                            <Show when=move || can_interrupt() && is_steer.get() && default_send_action.get() != Some(DefaultSendAction::Steer)>
                                 <button
                                     type="button"
                                     class="chat-send-menu-item"
@@ -3458,9 +3534,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Cancel".
+    // Primary "Cancel + send" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Cancel".
     #[wasm_bindgen_test]
-    async fn thinking_input_no_session_queue_primary_steer_cancel_menu() {
+    async fn thinking_input_no_session_cancel_send_primary_queue_steer_menu() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -3473,10 +3549,13 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(
             p.text_content().unwrap_or_default().trim(),
-            "Queue",
-            "primary must be Queue when thinking with draft"
+            "Cancel + send",
+            "primary must be Cancel + send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+        assert!(
+            !p.has_attribute("disabled"),
+            "Cancel + send must be enabled"
+        );
 
         let c = caret(&container);
         assert!(!c.has_attribute("disabled"), "caret must be enabled");
@@ -3486,18 +3565,18 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec![
                 "Attach image".to_owned(),
-                "Cancel + send".to_owned(),
+                "Queue".to_owned(),
                 "Steer".to_owned(),
                 "Cancel".to_owned()
             ],
-            "thinking+input menu offers attachment, Cancel + send, Steer, Cancel"
+            "thinking+input menu offers attachment, Queue, Steer, Cancel"
         );
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Fork + send", "Cancel".
+    // Primary "Cancel + send" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
-    async fn thinking_input_with_session_queue_primary_full_menu() {
+    async fn thinking_input_with_session_cancel_send_primary_full_menu() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -3510,17 +3589,20 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(
             p.text_content().unwrap_or_default().trim(),
-            "Queue",
-            "primary must be Queue when thinking with draft"
+            "Cancel + send",
+            "primary must be Cancel + send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+        assert!(
+            !p.has_attribute("disabled"),
+            "Cancel + send must be enabled"
+        );
 
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
             vec![
                 "Attach image".to_owned(),
-                "Cancel + send".to_owned(),
+                "Queue".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
                 "Cancel".to_owned(),
@@ -4002,7 +4084,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            // thinking+input+session → primary=Queue, menu=Cancel + send/Steer/Fork + send/Cancel
+            // thinking+input+session → primary=Cancel + send, menu=Queue/Steer/Fork + send/Cancel
             configure(&state, true, true, "redirect");
             provide_context(state);
             view! { <ChatInput /> }
@@ -4012,8 +4094,8 @@ mod wasm_tests {
         open_menu(&container).await;
         let items = menu_item_texts(&container);
         assert!(
-            !items.iter().any(|t| t == "Queue"),
-            "Queue (primary label) must not appear as a menu item: {items:?}"
+            !items.iter().any(|t| t == "Cancel + send"),
+            "Cancel + send (primary label) must not appear as a menu item: {items:?}"
         );
         assert!(
             !items.iter().any(|t| t == "Send"),
@@ -4317,7 +4399,361 @@ mod wasm_tests {
     /// server-owned steering contract on its own menu item and Alt chord.
     #[wasm_bindgen_test]
     async fn cancel_send_and_steer_have_distinct_delivery_paths() {
+        let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        let saved = storage.get_item("tyde-default-send-action").unwrap();
+        storage.remove_item("tyde-default-send-action").unwrap();
+        for failure in ["invalid", "read"] {
+            storage
+                .set_item("tyde-default-send-action", "invalid")
+                .unwrap();
+            if failure == "read" {
+                js_sys::eval(r#"window.__composer_get_item = Storage.prototype.getItem;
+                    Storage.prototype.getItem = function(key) {
+                        if (key === "tyde-default-send-action") throw new Error("injected storage read failure");
+                        return window.__composer_get_item.call(this, key);
+                    };"#).unwrap();
+            }
+            let unresolved = AppState::new();
+            crate::components::settings_panel::restore_appearance(&unresolved);
+            if failure == "read" {
+                js_sys::eval("Storage.prototype.getItem = window.__composer_get_item; delete window.__composer_get_item;").unwrap();
+            }
+            configure(&unresolved, false, true, "unresolved preference");
+            let mount_unresolved = unresolved.clone();
+            let error_container = make_container();
+            let error_handle = mount_to(error_container.clone(), move || {
+                provide_context(mount_unresolved.clone());
+                view! {
+                    <crate::components::settings_panel::ComposerSettings />
+                    <ChatInput />
+                }
+            });
+            next_tick().await;
+            assert!(
+                error_container
+                    .text_content()
+                    .unwrap()
+                    .contains("could not be loaded")
+            );
+            assert!(primary(&error_container).has_attribute("disabled"));
+            assert_eq!(
+                primary(&error_container).text_content().unwrap().trim(),
+                "Choose send action"
+            );
+            let calls = stub_send_recording();
+            dispatch_keydown(&textarea(&error_container), "Enter", false, false);
+            primary(&error_container)
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                0,
+                "unresolved preferences must not cancel or send"
+            );
+            open_menu(&error_container).await;
+            query(&error_container, "[data-test='chat-send-menu-queue']")
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            next_tick().await;
+            assert_eq!(calls.length(), 1, "explicit Queue remains available");
+            let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+            assert_human_payload(&envelope, protocol::HumanInputAction::Send);
+            let select: web_sys::HtmlSelectElement =
+                query(&error_container, "#default-send-action")
+                    .unwrap()
+                    .dyn_into()
+                    .unwrap();
+            js_sys::eval(r#"window.__composer_set_item = Storage.prototype.setItem;
+                Storage.prototype.setItem = function(key, value) {
+                    if (key === "tyde-default-send-action") throw new Error("injected storage write failure");
+                    return window.__composer_set_item.call(this, key, value);
+                };"#).unwrap();
+            select.set_value("queue");
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            js_sys::eval("Storage.prototype.setItem = window.__composer_set_item; delete window.__composer_set_item;").unwrap();
+            unresolved
+                .composer_untracked()
+                .text
+                .set("failed save draft".into());
+            next_tick().await;
+            assert_eq!(
+                select.value(),
+                "",
+                "failed save must retain the unresolved selection"
+            );
+            assert!(primary(&error_container).has_attribute("disabled"));
+            dispatch_keydown(&textarea(&error_container), "Enter", false, false);
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                1,
+                "failed preference save must not enable default sending"
+            );
+            select.set_value("cancel_and_send");
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            unresolved
+                .composer_untracked()
+                .text
+                .set("corrected preference".into());
+            next_tick().await;
+            assert!(
+                query(&error_container, "[role='alert']").is_none(),
+                "choosing an action clears the restoration error"
+            );
+            assert!(!primary(&error_container).has_attribute("disabled"));
+            primary(&error_container)
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                3,
+                "explicit correction re-enables default Cancel + send"
+            );
+            drop(error_handle);
+            error_container.remove();
+            storage.remove_item("tyde-default-send-action").unwrap();
+        }
+
+        let defaults = AppState::new();
+        crate::components::settings_panel::restore_appearance(&defaults);
+        configure(&defaults, false, true, "default redirect");
+        let mount_defaults = defaults.clone();
+        let defaults_container = make_container();
+        let defaults_handle = mount_to(defaults_container.clone(), move || {
+            provide_context(mount_defaults.clone());
+            view! {
+                <crate::components::settings_panel::ComposerSettings />
+                <ChatInput />
+            }
+        });
+        next_tick().await;
+        assert_eq!(
+            primary(&defaults_container).text_content().unwrap().trim(),
+            "Cancel + send"
+        );
+        let default_select: web_sys::HtmlSelectElement =
+            query(&defaults_container, "#default-send-action")
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+        js_sys::eval(r#"window.__composer_set_item = Storage.prototype.setItem;
+            Storage.prototype.setItem = function(key, value) {
+                if (key === "tyde-default-send-action") throw new Error("injected storage write failure");
+                return window.__composer_set_item.call(this, key, value);
+            };"#).unwrap();
+        default_select.set_value("queue");
+        default_select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        js_sys::eval("Storage.prototype.setItem = window.__composer_set_item; delete window.__composer_set_item;").unwrap();
+        next_tick().await;
+        assert_eq!(
+            default_select.value(),
+            "cancel_and_send",
+            "failed save must display the action Enter will use"
+        );
+        assert!(
+            storage
+                .get_item("tyde-default-send-action")
+                .unwrap()
+                .is_none(),
+            "failed save must not persist the attempted choice"
+        );
+        let calls = stub_send_recording();
+        let field = textarea(&defaults_container);
+        let shift = web_sys::KeyboardEventInit::new();
+        shift.set_key("Enter");
+        shift.set_shift_key(true);
+        shift.set_bubbles(true);
+        shift.set_cancelable(true);
+        let shift =
+            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &shift).unwrap();
+        field.dispatch_event(&shift).unwrap();
+        assert!(
+            !shift.default_prevented(),
+            "Shift+Enter must retain the newline default"
+        );
+        let composing = web_sys::KeyboardEventInit::new();
+        composing.set_key("Enter");
+        composing.set_is_composing(true);
+        composing.set_bubbles(true);
+        composing.set_cancelable(true);
+        let event =
+            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &composing)
+                .unwrap();
+        field.dispatch_event(&event).unwrap();
+        assert!(
+            !event.default_prevented(),
+            "IME Enter must remain with the editor"
+        );
+        next_tick().await;
+        assert_eq!(calls.length(), 0, "Shift+Enter and IME do not send");
+        dispatch_keydown(&field, "Enter", false, false);
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(calls.length(), 2, "default Enter interrupts then sends");
+        let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+        let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["kind"], "interrupt");
+        let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
+        let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            assert_human_payload(&envelope, protocol::HumanInputAction::Send)["message"],
+            "default redirect"
+        );
+
+        let select: web_sys::HtmlSelectElement = query(&defaults_container, "#default-send-action")
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        for value in ["cancel_and_send", "steer", "queue"] {
+            select.set_value(value);
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            // A fresh client state follows the same startup restore path.
+            let restored = AppState::new();
+            crate::components::settings_panel::restore_appearance(&restored);
+            configure(&restored, false, true, "saved choice");
+            let restored_mount = restored.clone();
+            let restored_container = make_container();
+            let restored_handle = mount_to(restored_container.clone(), move || {
+                provide_context(restored_mount.clone());
+                view! { <ChatInput /> }
+            });
+            next_tick().await;
+            assert_eq!(
+                primary(&restored_container).text_content().unwrap().trim(),
+                match value {
+                    "cancel_and_send" => "Cancel + send",
+                    "steer" => "Steer",
+                    _ => "Queue",
+                }
+            );
+            let calls = stub_send_recording();
+            if value == "cancel_and_send" {
+                primary(&restored_container)
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+            } else {
+                dispatch_keydown(&textarea(&restored_container), "Enter", false, false);
+            }
+            next_tick().await;
+            next_tick().await;
+            let default_frames = if value == "cancel_and_send" { 2 } else { 1 };
+            assert_eq!(calls.length(), default_frames);
+            if value == "cancel_and_send" {
+                let args: JsonValue =
+                    serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+                let envelope: JsonValue =
+                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    envelope["kind"], "interrupt",
+                    "primary click cancels before sending"
+                );
+            }
+            let args: JsonValue =
+                serde_json::from_str(&calls.get(default_frames - 1).as_string().unwrap()).unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+            assert_human_payload(
+                &envelope,
+                if value == "steer" {
+                    protocol::HumanInputAction::Steer
+                } else {
+                    protocol::HumanInputAction::Send
+                },
+            );
+            restored
+                .composer_untracked()
+                .text
+                .set("one message override".into());
+            next_tick().await;
+            open_menu(&restored_container).await;
+            query(
+                &restored_container,
+                if value == "cancel_and_send" {
+                    "[data-test='chat-send-menu-queue']"
+                } else {
+                    "[data-test='chat-send-menu-cancel-send']"
+                },
+            )
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+            next_tick().await;
+            next_tick().await;
+            let override_frames = if value == "cancel_and_send" { 1 } else { 2 };
+            assert_eq!(calls.length(), default_frames + override_frames);
+            let args: JsonValue = serde_json::from_str(
+                &calls
+                    .get(default_frames + override_frames - 1)
+                    .as_string()
+                    .unwrap(),
+            )
+            .unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+            assert_human_payload(&envelope, protocol::HumanInputAction::Send);
+            assert_eq!(
+                storage
+                    .get_item("tyde-default-send-action")
+                    .unwrap()
+                    .as_deref(),
+                Some(value),
+                "override must not change the preference"
+            );
+            restored
+                .agent_turn_active
+                .set(std::collections::HashMap::new());
+            restored.composer_untracked().text.set("idle send".into());
+            next_tick().await;
+            assert_eq!(
+                primary(&restored_container).text_content().unwrap().trim(),
+                "Send"
+            );
+            dispatch_keydown(&textarea(&restored_container), "Enter", false, false);
+            next_tick().await;
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                default_frames + override_frames + 1,
+                "idle Enter is ordinary send"
+            );
+            let args: JsonValue =
+                serde_json::from_str(&calls.get(calls.length() - 1).as_string().unwrap()).unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+            assert_human_payload(&envelope, protocol::HumanInputAction::Send);
+            drop(restored_handle);
+            restored_container.remove();
+        }
+        drop(defaults_handle);
+        defaults_container.remove();
+        match saved {
+            Some(value) => storage
+                .set_item("tyde-default-send-action", &value)
+                .unwrap(),
+            None => storage.remove_item("tyde-default-send-action").unwrap(),
+        }
+
         let state = AppState::new();
+        state
+            .default_send_action
+            .set(Some(DefaultSendAction::Queue));
         configure(&state, false, true, "use the other parser");
         let mount_state = state.clone();
         let container = make_container();
@@ -4554,6 +4990,9 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state
+                .default_send_action
+                .set(Some(DefaultSendAction::Queue));
             // thinking + session + input → Cancel + send, Steer, Fork + send, Cancel.
             configure(&state, true, true, "redirect");
             provide_context(state);
