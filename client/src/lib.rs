@@ -419,6 +419,13 @@ impl Connection {
             .await
     }
 
+    pub async fn heartbeat(
+        &mut self,
+        payload: protocol::HeartbeatPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::Heartbeat, &payload).await
+    }
+
     pub async fn list_sessions(&mut self, payload: ListSessionsPayload) -> Result<(), FrameError> {
         let host_stream = self.host_stream();
         let seq = self
@@ -1616,6 +1623,14 @@ impl Connection {
                 }
                 FrameKind::AgentError => {
                     let _: AgentErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::HeartbeatAck => {
+                    let _: protocol::HeartbeatPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::ProjectOperation => {
+                    let _: protocol::ProjectOperationPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::CommandError => {

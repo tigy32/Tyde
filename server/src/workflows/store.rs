@@ -60,8 +60,11 @@ impl WorkflowRunStore {
     }
 
     pub(crate) fn upsert(&mut self, run: WorkflowRunSnapshot) -> Result<(), String> {
-        self.runs.insert(run.id.clone(), run);
-        self.save_current()
+        let mut runs = self.runs.clone();
+        runs.insert(run.id.clone(), run);
+        save(&self.path, &runs)?;
+        self.runs = runs;
+        Ok(())
     }
 
     pub(crate) fn delete_for_project(
@@ -77,10 +80,12 @@ impl WorkflowRunStore {
         if deleted.is_empty() {
             return Ok(deleted);
         }
+        let mut runs = self.runs.clone();
         for id in &deleted {
-            self.runs.remove(id);
+            runs.remove(id);
         }
-        self.save_current()?;
+        save(&self.path, &runs)?;
+        self.runs = runs;
         deleted.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(deleted)
     }
@@ -172,4 +177,89 @@ fn save(path: &Path, runs: &HashMap<WorkflowRunId, WorkflowRunSnapshot>) -> Resu
             path.display()
         )
     })
+}
+
+type WorkflowRunCall = Box<
+    dyn FnOnce(&mut WorkflowRunStore, &tokio::sync::watch::Sender<Vec<WorkflowRunSnapshot>>) + Send,
+>;
+
+enum WorkflowRunCommand {
+    Call(WorkflowRunCall),
+    Stop(tokio::sync::oneshot::Sender<()>),
+}
+
+pub(crate) struct WorkflowRunHandle {
+    calls: tokio::sync::mpsc::UnboundedSender<WorkflowRunCommand>,
+    snapshot: tokio::sync::watch::Receiver<Vec<WorkflowRunSnapshot>>,
+}
+
+impl WorkflowRunHandle {
+    pub(crate) fn spawn(mut store: WorkflowRunStore) -> Result<Self, String> {
+        let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel::<WorkflowRunCommand>();
+        let (snapshot, current) = tokio::sync::watch::channel(store.list());
+        std::thread::Builder::new()
+            .name("tyde-workflow-runs".into())
+            .spawn(move || {
+                while let Some(command) = inbox.blocking_recv() {
+                    match command {
+                        WorkflowRunCommand::Call(call) => call(&mut store, &snapshot),
+                        WorkflowRunCommand::Stop(reply) => {
+                            let _ = reply.send(());
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("start workflow-run owner: {error}"))?;
+        Ok(Self {
+            calls,
+            snapshot: current,
+        })
+    }
+
+    pub(crate) fn list(&self) -> Vec<WorkflowRunSnapshot> {
+        self.snapshot.borrow().clone()
+    }
+
+    pub(crate) fn get(&self, id: &WorkflowRunId) -> Option<WorkflowRunSnapshot> {
+        self.snapshot
+            .borrow()
+            .iter()
+            .find(|run| &run.id == id)
+            .cloned()
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.calls
+            .send(WorkflowRunCommand::Stop(reply))
+            .map_err(|_| "storage owner already stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "storage owner stopped before acknowledgement".to_owned())
+    }
+
+    pub(crate) async fn call<T, F>(&self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut WorkflowRunStore) -> Result<T, String> + Send + 'static,
+    {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let queued = std::time::Instant::now();
+        let span = tracing::Span::current();
+        self.calls
+            .send(WorkflowRunCommand::Call(Box::new(move |store, snapshot| {
+                let scope = span.enter();
+                let started = std::time::Instant::now();
+                let result = operation(store);
+                tracing::info!(target: "tyde::project_operation", stage = "workflow_runs", queue_ms = started.duration_since(queued).as_millis(), elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "serialized cleanup store operation completed");
+                snapshot.send_replace(store.list());
+                let _ = reply.send(result);
+                drop(scope);
+            })))
+            .map_err(|_| "workflow-run owner stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "workflow-run owner stopped".to_owned())?
+    }
 }

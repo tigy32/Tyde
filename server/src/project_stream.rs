@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{Event, EventKind};
@@ -24,13 +23,12 @@ use protocol::{
     ReviewSummary, StreamPath,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 
 use crate::review::state::ReviewCommand;
 use crate::review::{ProjectReviews, RegistryCommand, ReviewRegistryHandle};
-use crate::store::project::ProjectStore;
 use crate::stream::Stream;
 
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -125,13 +123,13 @@ pub(crate) struct ProjectDiffRequestKey {
 }
 
 pub(crate) struct ProjectStreamSubscription {
-    pub task: JoinHandle<()>,
+    pub task: JoinHandle<Result<(), String>>,
     pub handle: ProjectStreamHandle,
 }
 
 impl Drop for ProjectStreamSubscription {
     fn drop(&mut self) {
-        self.task.abort();
+        self.handle.shutdown();
     }
 }
 
@@ -181,12 +179,57 @@ struct ProjectSubscriber {
     file_delivery: ProjectFileDelivery,
 }
 
+struct PendingProjectSubscriber {
+    host_path: StreamPath,
+    subscriber: ProjectSubscriber,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+fn publish_subscriber(
+    pending: PendingProjectSubscriber,
+    project: &Project,
+    snapshot: &mut ProjectSnapshotState,
+    reviews: Vec<ReviewSummary>,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    warnings: [(&str, &Option<String>); 3],
+) {
+    let result = emit_snapshot_to_stream(
+        &pending.subscriber.stream,
+        project,
+        snapshot,
+        reviews,
+        pending.subscriber.file_delivery,
+    );
+    if result.is_ok() {
+        for (operation, warning) in warnings {
+            if let Some(message) = warning {
+                emit_project_command_error(
+                    &pending.subscriber.stream,
+                    FrameKind::ProjectFileList,
+                    operation,
+                    message.clone(),
+                    false,
+                );
+            }
+        }
+        subscribers.insert(pending.host_path, pending.subscriber);
+    } else {
+        subscribers.remove(&pending.host_path);
+        snapshot
+            .diff_context_modes
+            .retain(|(subscriber, _), _| subscriber != &pending.host_path);
+    }
+    let _ = pending.reply.send(result);
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectStreamHandle {
     tx: mpsc::UnboundedSender<ProjectStreamCommand>,
+    catalog: watch::Sender<protocol::ProjectCatalogRecord>,
 }
 
 enum ProjectStreamCommand {
+    Shutdown,
     ReviewRegistry(RegistryCommand),
     EmitReviewListChanged,
     AddSubscriber {
@@ -268,6 +311,23 @@ impl PendingProjectUpdate {
 }
 
 impl ProjectStreamHandle {
+    pub(crate) fn shutdown(&self) {
+        let _ = self.tx.send(ProjectStreamCommand::Shutdown);
+    }
+
+    pub(crate) fn adopt_catalog(&self, generation: u64, project: Project) {
+        self.catalog.send_if_modified(|record| {
+            if generation <= record.generation {
+                return false;
+            }
+            *record = protocol::ProjectCatalogRecord {
+                generation,
+                project,
+            };
+            true
+        });
+    }
+
     pub(crate) fn route_review_registry(&self, command: RegistryCommand) -> Result<(), String> {
         self.tx
             .send(ProjectStreamCommand::ReviewRegistry(command))
@@ -408,7 +468,7 @@ impl ProjectStreamHandle {
 
 pub(crate) fn spawn_project_subscription(
     shared_watcher: SharedProjectWatcher,
-    project_store: Arc<Mutex<ProjectStore>>,
+    generation: u64,
     project: Project,
     review_registry: ReviewRegistryHandle,
     force_watch_limit: bool,
@@ -416,7 +476,15 @@ pub(crate) fn spawn_project_subscription(
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (review_tx, review_rx) = mpsc::unbounded_channel();
-    let handle = ProjectStreamHandle { tx: command_tx };
+    let initial_catalog = protocol::ProjectCatalogRecord {
+        generation,
+        project: project.clone(),
+    };
+    let (catalog, catalog_rx) = watch::channel(initial_catalog.clone());
+    let handle = ProjectStreamHandle {
+        tx: command_tx,
+        catalog,
+    };
     review_registry.register_project(project.id.clone(), handle.clone())?;
     let snapshot = ProjectSnapshotState {
         file_entries: BTreeMap::new(),
@@ -427,9 +495,9 @@ pub(crate) fn spawn_project_subscription(
     let task = spawn_project_task(async move {
         run_project_subscription(
             shared_watcher,
-            project_store,
+            catalog_rx,
             project.id.clone(),
-            project,
+            initial_catalog,
             snapshot,
             None,
             Vec::new(),
@@ -441,14 +509,14 @@ pub(crate) fn spawn_project_subscription(
             review_tx,
             review_rx,
         )
-        .await;
+        .await
     })?;
     Ok(ProjectStreamSubscription { task, handle })
 }
 
-fn spawn_project_task(
-    future: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Result<JoinHandle<()>, String> {
+pub(crate) fn spawn_project_task<T: Send + 'static>(
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<JoinHandle<T>, String> {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         return Ok(runtime.spawn(future));
     }
@@ -468,8 +536,9 @@ fn spawn_project_task(
             };
             let (done_tx, done_rx) = oneshot::channel();
             let task = runtime.spawn(async move {
-                future.await;
+                let result = future.await;
                 let _ = done_tx.send(());
+                result
             });
             if task_tx.send(Ok(task)).is_err() {
                 return;
@@ -511,21 +580,6 @@ fn start_project_watcher(
     watcher_ready_rx
 }
 
-async fn load_subscription_project(
-    project_store: &Arc<Mutex<ProjectStore>>,
-    project_id: &ProjectId,
-) -> Result<Project, String> {
-    let projects = project_store
-        .lock()
-        .await
-        .list()
-        .map_err(|error| error.to_string())?;
-    projects
-        .into_iter()
-        .find(|project| &project.id == project_id)
-        .ok_or_else(|| format!("project {} disappeared while stream was active", project_id))
-}
-
 fn create_project_watcher(
     shared_watcher: SharedProjectWatcher,
     roots: &[ProjectRootPath],
@@ -548,7 +602,7 @@ fn create_project_watcher(
 }
 
 /// Roots the watcher can register: unavailable roots are listed with their
-/// status instead, and picked up again by `ensure_watched_roots` once they
+/// status instead, and picked up again by watcher initialization once they
 /// reappear.
 fn watchable_roots(project: &Project) -> Vec<ProjectRootPath> {
     project
@@ -593,9 +647,9 @@ fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String
 #[allow(clippy::too_many_arguments)]
 async fn run_project_subscription(
     shared_watcher: SharedProjectWatcher,
-    project_store: Arc<Mutex<ProjectStore>>,
+    mut catalog: watch::Receiver<protocol::ProjectCatalogRecord>,
     project_id: ProjectId,
-    mut project: Project,
+    initial_catalog: protocol::ProjectCatalogRecord,
     mut snapshot: ProjectSnapshotState,
     mut watcher: Option<ProjectWatcher>,
     mut watched_roots: Vec<ProjectRootPath>,
@@ -606,12 +660,29 @@ async fn run_project_subscription(
     review_registry: ReviewRegistryHandle,
     review_tx: mpsc::UnboundedSender<(protocol::ReviewId, ReviewCommand)>,
     mut review_rx: mpsc::UnboundedReceiver<(protocol::ReviewId, ReviewCommand)>,
-) {
+) -> Result<(), String> {
+    let mut project = initial_catalog.project;
+    let mut catalog_generation = initial_catalog.generation;
+    #[cfg(feature = "test-support")]
+    if let Err(error) = background_project_read(&project, "actor startup", |project| {
+        for root in project.root_paths() {
+            scan_test_support::run(
+                Path::new(&root.0),
+                scan_test_support::ScanPoint::ActorStarting,
+            );
+        }
+        Ok(())
+    })
+    .await
+    {
+        tracing::error!(%error, "project startup barrier failed");
+        return Err(error);
+    }
     let mut reviews = match ProjectReviews::load(&project, review_registry, review_tx).await {
         Ok(reviews) => reviews,
         Err(error) => {
             tracing::error!(%project_id, %error, "failed to load project review state");
-            return;
+            return Err(error);
         }
     };
     let mut snapshot_initialized = false;
@@ -646,6 +717,10 @@ async fn run_project_subscription(
     let mut pending_git = PendingGitRefresh::default();
     let mut diff_request_generation = 0_u64;
     let mut git_tasks = JoinSet::new();
+    let mut file_tasks = JoinSet::new();
+    let mut initialization_tasks = JoinSet::new();
+    let mut pending_subscribers = Vec::new();
+    let mut pending_files = PendingFileRefresh::default();
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
     let mut git_poll = interval_at(
         Instant::now() + GIT_STATUS_POLL_INTERVAL,
@@ -654,99 +729,98 @@ async fn run_project_subscription(
     git_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        let record = catalog.borrow_and_update().clone();
+        if record.generation > catalog_generation {
+            catalog_generation = record.generation;
+            let roots_changed = project.root_paths() != record.project.root_paths();
+            project = record.project;
+            if roots_changed {
+                snapshot_initialized = false;
+                snapshot
+                    .file_entries
+                    .retain(|root, _| project.root_paths().contains(root));
+                snapshot
+                    .diff_context_modes
+                    .retain(|(_, key), _| project.root_paths().contains(&key.root));
+                observed_files.retain(|path| project.root_paths().contains(&path.root));
+                watcher = None;
+                watcher_initializing = false;
+                watcher_retry = Instant::now();
+                pending_files.request(true);
+                pending_git.request(true, true);
+                file_versions.retain(|path, _| project.root_paths().contains(&path.root));
+                pending_file_version_changes
+                    .retain(|path, _| project.root_paths().contains(&path.root));
+                tracing::info!(target: "tyde::project_operation", generation = catalog_generation, root_count = project.root_paths().len(), stage = "metadata_adopt", "project authorization adopted before derived refresh");
+            }
+        }
+        if !pending_subscribers.is_empty() && initialization_tasks.is_empty() {
+            let record = catalog.borrow().clone();
+            initialization_tasks.spawn(async move {
+                let initial =
+                    background_project_read(&record.project, "initialize", initialize_snapshot)
+                        .await;
+                (record.generation, initial)
+            });
+        }
+        if pending_files.requested && file_tasks.is_empty() {
+            let request = std::mem::take(&mut pending_files);
+            let project = project.clone();
+            let generation = catalog_generation;
+            file_tasks.spawn(async move {
+                let result = background_project_read(&project, "files", scan_raw_entries).await;
+                CompletedFileRefresh {
+                    generation,
+                    request,
+                    result,
+                }
+            });
+        }
         if reviews.take_changed() || emit_reviews {
             emit_reviews = false;
             let payload = ProjectEventPayload::ReviewListChanged {
                 reviews: reviews.summaries(),
             };
-            if let Err(error) =
-                fan_out_payload(&mut subscribers, FrameKind::ProjectEvent, &payload).await
+            if let Err(error) = fan_out_payload(&mut subscribers, FrameKind::ProjectEvent, &payload)
             {
                 tracing::warn!(%project_id, %error, "failed to emit project review summaries");
             }
         }
         tokio::select! {
+            biased;
+            changed = catalog.changed() => { if changed.is_err() { break; } }
             Some((review_id, command)) = review_rx.recv() => {
                 reviews.handle_command(&project, review_id, command).await;
             }
             maybe_command = command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    return;
+                    break;
                 };
+                let command_project = catalog.borrow().project.clone();
                 match command {
+                    ProjectStreamCommand::Shutdown => break,
                     ProjectStreamCommand::ReviewRegistry(command) => {
-                        reviews.handle_registry(&project, command).await;
+                        reviews.handle_registry(&command_project, command).await;
                     }
                     ProjectStreamCommand::EmitReviewListChanged => { emit_reviews = true; }
                     ProjectStreamCommand::AddSubscriber { host_path, stream, file_delivery, reply } => {
-                        if !snapshot_initialized {
-                            match background_project_read(&project, "initialize", initialize_snapshot).await {
-                                Ok(initial) => { snapshot = initial; snapshot_initialized = true; }
-                                Err(error) => { let _ = reply.send(Err(error)); continue; }
-                            }
-                        }
-                        use std::collections::hash_map::Entry;
-                        match subscribers.entry(host_path.clone()) {
-                            Entry::Occupied(mut e) => {
-                                e.insert(ProjectSubscriber { stream, file_delivery });
-                                let _ = reply.send(Ok(()));
-                                continue;
-                            }
-                            Entry::Vacant(e) => {
-                                e.insert(ProjectSubscriber { stream: stream.clone(), file_delivery });
-                            }
-                        }
-                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, reviews.summaries(), file_delivery).await;
-                        if result.is_err() {
-                            subscribers.remove(&host_path);
-                            snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
+                        let pending = PendingProjectSubscriber { host_path, subscriber: ProjectSubscriber { stream, file_delivery }, reply };
+                        let current = catalog.borrow();
+                        if snapshot_initialized && current.generation == catalog_generation {
+                            publish_subscriber(pending, &current.project, &mut snapshot, reviews.summaries(), &mut subscribers,
+                                [("project_watch", &watcher_warning), ("project_watch", &file_warning), ("project_git_status", &git_warning)]);
                         } else {
-                            for (operation, warning) in [
-                                ("project_watch", &watcher_warning),
-                                ("project_watch", &file_warning),
-                                ("project_git_status", &git_warning),
-                            ] {
-                                if let Some(message) = warning {
-                                    emit_project_command_error(
-                                        &stream,
-                                        FrameKind::ProjectFileList,
-                                        operation,
-                                        message.clone(),
-                                        false,
-                                    ).await;
-                                }
-                            }
+                            pending_subscribers.push(pending);
                         }
-                        let _ = reply.send(result);
                     }
                     ProjectStreamCommand::RemoveSubscriber { host_path } => {
+                        pending_subscribers.retain(|pending| pending.host_path != host_path);
                         subscribers.remove(&host_path);
                         snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
                     }
                     ProjectStreamCommand::Refresh { reply } => {
-                        let result = refresh_project_files(
-                            &project_store,
-                            &project_id,
-                            &mut project,
-                            &mut snapshot,
-                            watcher.as_mut(),
-                            &mut watched_roots,
-                            watch_tx.clone(),
-                            &mut subscribers,
-                            true,
-                        ).await;
-                        match result {
-                            Ok(()) => {
-                                pending_git.request(true, true);
-                                pending_git.replies.push(reply);
-                            }
-                            Err(error) => {
-                                pending_update.merge(PendingProjectUpdate { files: true, git: true });
-                                debounce_active = true;
-                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
-                                let _ = reply.send(Err(error));
-                            }
-                        }
+                        pending_files.request(true);
+                        pending_files.replies.push(reply);
                     }
                     ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
                         diff_request_generation += 1;
@@ -760,7 +834,7 @@ async fn run_project_subscription(
                         let resource_mode = status.resource_mode;
                         if update_code_intel_provider_status(
                             &mut snapshot.code_intel_overview,
-                            &project,
+                            &command_project,
                             root.clone(),
                             status,
                         ) && let Err(error) = fan_out_payload(
@@ -768,7 +842,6 @@ async fn run_project_subscription(
                             FrameKind::CodeIntelOverview,
                             &snapshot.code_intel_overview,
                         )
-                        .await
                         {
                             tracing::error!(
                                 project_id = %project_id,
@@ -794,7 +867,7 @@ async fn run_project_subscription(
                         // arbitrarily high while the client's rendered version
                         // — set from this reply — stayed behind, and every
                         // code-intel query would be rejected as stale.
-                        let result = read_file(&project, payload).map(|mut contents| {
+                        let result = read_file(&command_project, payload).map(|mut contents| {
                             contents.version = file_versions
                                 .get(&contents.path)
                                 .copied()
@@ -811,18 +884,18 @@ async fn run_project_subscription(
                         let _ = reply.send(result);
                     }
                     ProjectStreamCommand::CurrentFileVersion { path, reply } => {
-                        let result = current_file_version(&project, &path, &file_versions);
+                        let result = current_file_version(&command_project, &path, &file_versions);
                         let _ = reply.send(result);
                     }
                     ProjectStreamCommand::ValidatePath { path, reply } => {
-                        let _ = reply.send(validate_project_path(&project, &path));
+                        let _ = reply.send(validate_project_path(&command_project, &path));
                     }
                     ProjectStreamCommand::RegisterFileVersionListenerAndCurrentVersion {
                         path,
                         listener,
                         reply,
                     } => {
-                        if validate_project_path(&project, &path).is_ok() {
+                        if validate_project_path(&command_project, &path).is_ok() {
                             observed_files.insert(path.clone());
                             if let Some(watcher) = watcher.as_mut()
                                 && let Err(error) = watcher.observe(&path).await {
@@ -830,7 +903,7 @@ async fn run_project_subscription(
                             }
                         }
                         let result = register_file_version_listener_and_current_version(
-                            &project,
+                            &command_project,
                             path,
                             &file_versions,
                             &mut file_version_listeners,
@@ -953,27 +1026,7 @@ async fn run_project_subscription(
                 debounce_active = false;
                 let refresh = pending_update.take();
                 let full = watcher.is_none();
-                if (refresh.files || full)
-                    && let Err(error) = refresh_project_files(
-                        &project_store,
-                        &project_id,
-                        &mut project,
-                        &mut snapshot,
-                        watcher.as_mut(),
-                        &mut watched_roots,
-                        watch_tx.clone(),
-                        &mut subscribers,
-                        full,
-                    ).await {
-                        warn_project_retry(&project_id, &mut subscribers, "project_watch", error, &mut file_warning).await;
-                        pending_update.merge(refresh);
-                        debounce_active = true;
-                        debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
-                        continue;
-                }
-                if file_warning.take().is_some() {
-                    tracing::info!(%project_id, "project file refresh recovered");
-                }
+                if refresh.files || full { pending_files.request(full); }
                 if refresh.git || full {
                     pending_git.request(full, refresh.files || full);
                 }
@@ -1014,46 +1067,93 @@ async fn run_project_subscription(
             } else {
                 next_git_refresh
             }), if pending_git.requested && git_tasks.is_empty() => {
-                let metadata_result = async {
-                    let latest_project = load_subscription_project(&project_store, &project_id).await?;
-                    if let Some(watcher) = watcher.as_mut()
-                        && ensure_watched_roots(watchable_roots(&latest_project), watcher, &mut watched_roots, watch_tx.clone()).await?
-                    {
-                        // A root became (un)available; its listing status changed too.
-                        pending_update.merge(PendingProjectUpdate { files: true, git: false });
-                        if !debounce_active {
-                            debounce_active = true;
-                            debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
-                        }
-                    }
-                    project = latest_project;
-                    if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
-                        fan_out_payload(&mut subscribers, FrameKind::CodeIntelOverview, &snapshot.code_intel_overview).await?;
-                    }
-                    Ok::<(), String>(())
-                }.await;
-                if let Err(error) = metadata_result {
-                    for reply in std::mem::take(&mut pending_git.replies) {
-                        let _ = reply.send(Err(error.clone()));
-                    }
-                    pending_git = PendingGitRefresh::default();
-                    git_poll.reset();
-                    warn_project_retry(&project_id, &mut subscribers, "project_git_status", error, &mut git_warning).await;
-                    continue;
-                }
                 let request = std::mem::take(&mut pending_git);
                 tracing::debug!(%project_id, full = request.full, refresh_diffs = request.refresh_diffs,
                     waiting_replies = request.replies.len(), "starting background project Git refresh");
                 let project = project.clone();
                 let previous_status = snapshot.git_status.clone();
                 let remembered = snapshot.diff_context_modes.clone();
+                let generation = catalog_generation;
                 git_tasks.spawn(async move {
                     let refresh_diffs = request.refresh_diffs;
                     let result = background_project_read(&project, "git refresh", move |project| {
                         read_git_refresh(project, previous_status, remembered, refresh_diffs)
                     }).await;
-                    CompletedGitRefresh { project, request, result }
+                    CompletedGitRefresh { generation, project, request, result }
                 });
+            }
+            completed = initialization_tasks.join_next(), if !initialization_tasks.is_empty() => {
+                let (generation, result) = match completed {
+                    Some(Ok(completed)) => completed,
+                    Some(Err(error)) => (catalog_generation, Err(format!("project bootstrap worker failed: {error}"))),
+                    None => continue,
+                };
+                let current = catalog.borrow();
+                if generation != current.generation { continue; }
+                match result {
+                    Ok(initial) => {
+                        snapshot = initial;
+                        snapshot_initialized = true;
+                        for pending in pending_subscribers.drain(..) {
+                            publish_subscriber(pending, &current.project, &mut snapshot, reviews.summaries(), &mut subscribers,
+                                [("project_watch", &watcher_warning), ("project_watch", &file_warning), ("project_git_status", &git_warning)]);
+                        }
+                    }
+                    Err(error) => {
+                        for pending in pending_subscribers.drain(..) { let _ = pending.reply.send(Err(error.clone())); }
+                    }
+                }
+            }
+            completed = file_tasks.join_next(), if !file_tasks.is_empty() => {
+                let completed = match completed {
+                    Some(Ok(completed)) => completed,
+                    Some(Err(error)) => {
+                        warn_project_retry(&project_id, &mut subscribers, "project_files", error.to_string(), &mut file_warning).await;
+                        continue;
+                    }
+                    None => continue,
+                };
+                if completed.generation != catalog_generation {
+                    pending_files.request(completed.request.full);
+                    pending_files.replies.extend(completed.request.replies);
+                    continue;
+                }
+                match completed.result {
+                    Ok(entries) => {
+                        let publication = {
+                            let current = catalog.borrow();
+                            if completed.generation != current.generation {
+                                pending_files.request(completed.request.full);
+                                pending_files.replies.extend(completed.request.replies);
+                                continue;
+                            }
+                            let changed = snapshot.file_entries != entries;
+                            snapshot.file_entries = entries;
+                            (|| -> Result<(), String> {
+                                if changed || completed.request.full {
+                                    let payload = full_file_list_from_raw(&current.project, &snapshot.file_entries);
+                                    fan_out_payload(&mut subscribers, FrameKind::ProjectFileList, &payload)?;
+                                }
+                                if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, current.project.root_paths()) {
+                                    fan_out_payload(&mut subscribers, FrameKind::CodeIntelOverview, &snapshot.code_intel_overview)?;
+                                }
+                                Ok(())
+                            })()
+                        };
+                        if let Err(error) = publication {
+                            warn_project_retry(&project_id, &mut subscribers, "project_files", error, &mut file_warning).await;
+                        } else if file_warning.take().is_some() { tracing::info!(%project_id, "project file refresh recovered"); }
+                        pending_git.request(completed.request.full, true);
+                        pending_git.replies.extend(completed.request.replies);
+                    }
+                    Err(error) => {
+                        for reply in completed.request.replies { let _ = reply.send(Err(error.clone())); }
+                        warn_project_retry(&project_id, &mut subscribers, "project_files", error, &mut file_warning).await;
+                        pending_update.merge(PendingProjectUpdate { files: true, git: true });
+                        debounce_active = true;
+                        debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
+                    }
+                }
             }
             completed = git_tasks.join_next(), if !git_tasks.is_empty() => {
                 next_git_refresh = Instant::now() + PROJECT_GIT_REFRESH_SPACING;
@@ -1066,21 +1166,30 @@ async fn run_project_subscription(
                         continue;
                     }
                 };
-                if completed.project.root_paths() != project.root_paths() {
+                if completed.generation != catalog_generation || completed.project.root_paths() != project.root_paths() {
                     tracing::debug!(%project_id, "discarding Git refresh for obsolete project roots");
                     pending_git.request(true, true);
                     pending_git.replies.append(&mut completed.request.replies);
                     continue;
                 }
                 let result = match completed.result {
-                    Ok(refresh) => apply_git_refresh(
+                    Ok(refresh) => {
+                        if refresh.watchable_roots != watched_roots {
+                            watcher = None;
+                            watcher_initializing = false;
+                            watcher_retry = Instant::now();
+                            pending_files.request(true);
+                        }
+                        apply_git_refresh(
+                        &catalog,
                         &mut snapshot,
                         &mut subscribers,
                         &mut reviews,
-                        &project,
+                        protocol::ProjectCatalogRecord { generation: completed.generation, project: project.clone() },
                         refresh,
                         completed.request.full,
-                    ).await,
+                    ).await
+                    },
                     Err(error) => Err(error),
                 };
                 let explicit_refresh = !completed.request.replies.is_empty();
@@ -1100,46 +1209,54 @@ async fn run_project_subscription(
             }
         }
     }
+    // Aborting these async wrappers would detach their running blocking reads.
+    // Retirement stops publication and joins all owned reads before deletion.
+    tracing::info!(target: "tyde::project_operation", stage = "cleanup",
+        git_reads = git_tasks.len(), file_reads = file_tasks.len(),
+        bootstrap_reads = initialization_tasks.len(), "settling owned project reads");
+    drop(watcher);
+    let (git, files, initialization) = tokio::join!(
+        settle_project_reads(&mut git_tasks),
+        settle_project_reads(&mut file_tasks),
+        settle_project_reads(&mut initialization_tasks),
+    );
+    git?;
+    files?;
+    initialization?;
+    tracing::info!(target: "tyde::project_operation", stage = "cleanup", "owned project reads settled");
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn refresh_project_files(
-    project_store: &Arc<Mutex<ProjectStore>>,
-    project_id: &ProjectId,
-    project: &mut Project,
-    snapshot: &mut ProjectSnapshotState,
-    watcher: Option<&mut ProjectWatcher>,
-    watched_roots: &mut Vec<ProjectRootPath>,
-    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+async fn settle_project_reads<T: 'static>(tasks: &mut JoinSet<T>) -> Result<(), String> {
+    let mut failed = false;
+    while let Some(result) = tasks.join_next().await {
+        failed |= result.is_err();
+    }
+    if failed {
+        Err("project read worker stopped unexpectedly during cleanup".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PendingFileRefresh {
+    requested: bool,
     full: bool,
-) -> Result<(), String> {
-    let latest_project = load_subscription_project(project_store, project_id).await?;
-    if let Some(watcher) = watcher {
-        ensure_watched_roots(
-            watchable_roots(&latest_project),
-            watcher,
-            watched_roots,
-            watch_tx,
-        )
-        .await?;
+    replies: Vec<oneshot::Sender<Result<(), String>>>,
+}
+
+impl PendingFileRefresh {
+    fn request(&mut self, full: bool) {
+        self.requested = true;
+        self.full |= full;
     }
-    *project = latest_project;
-    let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
-    if full || snapshot.file_entries != current_raw {
-        snapshot.file_entries = current_raw;
-        let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
-        fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
-    }
-    if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
-        fan_out_payload(
-            subscribers,
-            FrameKind::CodeIntelOverview,
-            &snapshot.code_intel_overview,
-        )
-        .await?;
-    }
-    Ok(())
+}
+
+struct CompletedFileRefresh {
+    generation: u64,
+    request: PendingFileRefresh,
+    result: Result<BTreeMap<ProjectRootPath, RootScan>, String>,
 }
 
 #[derive(Default)]
@@ -1159,12 +1276,14 @@ impl PendingGitRefresh {
 }
 
 struct CompletedGitRefresh {
+    generation: u64,
     project: Project,
     request: PendingGitRefresh,
     result: Result<GitRefresh, String>,
 }
 
 struct GitRefresh {
+    watchable_roots: Vec<ProjectRootPath>,
     status: ProjectGitStatusPayload,
     serialized_status: Value,
     diffs: Vec<RefreshedProjectDiff>,
@@ -1200,6 +1319,7 @@ fn read_git_refresh(
         Vec::new()
     };
     Ok(GitRefresh {
+        watchable_roots: watchable_roots(project),
         status,
         serialized_status,
         diffs,
@@ -1207,19 +1327,36 @@ fn read_git_refresh(
 }
 
 async fn apply_git_refresh(
+    catalog: &watch::Receiver<protocol::ProjectCatalogRecord>,
     snapshot: &mut ProjectSnapshotState,
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     reviews: &mut ProjectReviews,
-    project: &Project,
+    record: protocol::ProjectCatalogRecord,
     refresh: GitRefresh,
     full: bool,
 ) -> Result<(), String> {
-    if full || snapshot.git_status.as_ref() != Some(&refresh.serialized_status) {
-        snapshot.git_status = Some(refresh.serialized_status);
-        fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &refresh.status).await?;
+    let project = &record.project;
+    let generation = record.generation;
+    let status_changed = {
+        let current = catalog.borrow();
+        if current.generation != generation {
+            return Ok(());
+        }
+        let changed = full || snapshot.git_status.as_ref() != Some(&refresh.serialized_status);
+        if changed {
+            snapshot.git_status = Some(refresh.serialized_status);
+            fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &refresh.status)?;
+        }
+        changed
+    };
+    if status_changed {
         reset_reviews_for_clean_unstaged_roots(reviews, project, &refresh.status).await;
     }
     for diff in refresh.diffs {
+        let current = catalog.borrow();
+        if current.generation != generation {
+            return Ok(());
+        }
         if snapshot
             .diff_context_modes
             .get(&(diff.host_path.clone(), diff.key))
@@ -1232,55 +1369,18 @@ async fn apply_git_refresh(
         };
         match diff.result {
             Ok(payload) => {
-                let _ = send_payload(&subscriber.stream, FrameKind::ProjectGitDiff, &payload).await;
+                let _ = send_payload(&subscriber.stream, FrameKind::ProjectGitDiff, &payload);
             }
-            Err(error) => {
-                emit_project_command_error(
-                    &subscriber.stream,
-                    FrameKind::ProjectReadDiff,
-                    "project_read_diff",
-                    error,
-                    false,
-                )
-                .await
-            }
+            Err(error) => emit_project_command_error(
+                &subscriber.stream,
+                FrameKind::ProjectReadDiff,
+                "project_read_diff",
+                error,
+                false,
+            ),
         }
     }
     Ok(())
-}
-
-/// Re-registers the watcher when the watchable roots changed; returns whether
-/// it did.
-async fn ensure_watched_roots(
-    roots: Vec<ProjectRootPath>,
-    watcher: &mut ProjectWatcher,
-    watched_roots: &mut Vec<ProjectRootPath>,
-    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-) -> Result<bool, String> {
-    if *watched_roots == roots {
-        return Ok(false);
-    }
-
-    let shared_watcher = watcher.shared.clone();
-    let observed = watcher.observed.clone();
-    let replacement_roots = roots.clone();
-    let mut replacement = tokio::task::spawn_blocking(move || {
-        create_project_watcher(shared_watcher, &replacement_roots, watch_tx, false)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.message)?;
-    for path in observed {
-        if roots.contains(&path.root) {
-            replacement
-                .observe(&path)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    *watcher = replacement;
-    *watched_roots = roots;
-    Ok(true)
 }
 
 fn initial_code_intel_overview(roots: Vec<ProjectRootPath>) -> CodeIntelOverviewPayload {
@@ -1778,7 +1878,7 @@ fn serialize_git_status(git_status: &ProjectGitStatusPayload) -> Result<Value, S
         .map_err(|error| format!("failed to serialize project git status: {error}"))
 }
 
-async fn emit_snapshot_to_stream(
+fn emit_snapshot_to_stream(
     stream: &Stream,
     project: &Project,
     snapshot: &ProjectSnapshotState,
@@ -1805,7 +1905,7 @@ async fn emit_snapshot_to_stream(
         git_status,
         review_summaries,
     };
-    send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap).await?;
+    send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap)?;
     if !file_delivery.wants_frame(FrameKind::CodeIntelOverview) {
         return Ok(());
     }
@@ -1814,21 +1914,20 @@ async fn emit_snapshot_to_stream(
         FrameKind::CodeIntelOverview,
         &snapshot.code_intel_overview,
     )
-    .await
 }
 
-async fn fan_out_payload<T: serde::Serialize>(
+fn fan_out_payload<T: serde::Serialize>(
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("failed to serialize {kind} payload: {error}"))?;
-    fan_out_value(subscribers, kind, payload).await;
+    fan_out_value(subscribers, kind, payload);
     Ok(())
 }
 
-async fn fan_out_value(
+fn fan_out_value(
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     kind: FrameKind,
     payload: Value,
@@ -1919,7 +2018,7 @@ fn diff_scope_sort_key(scope: ProjectDiffScope) -> u8 {
     }
 }
 
-async fn send_payload<T: serde::Serialize>(
+fn send_payload<T: serde::Serialize>(
     stream: &Stream,
     kind: FrameKind,
     payload: &T,
@@ -1972,12 +2071,11 @@ async fn emit_project_stream_warning(
             operation,
             message.clone(),
             false,
-        )
-        .await;
+        );
     }
 }
 
-async fn emit_project_command_error(
+fn emit_project_command_error(
     stream: &Stream,
     request_kind: FrameKind,
     operation: &str,
@@ -3532,6 +3630,7 @@ pub mod scan_test_support {
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub enum ScanPoint {
+        ActorStarting,
         Metadata,
         ReadDirectory,
         WatcherInitialize,
@@ -3546,6 +3645,12 @@ pub mod scan_test_support {
         WatcherUnwatchFailed,
         WatcherDispatch,
         WatcherKernelRescan,
+        WatcherRescanFinished,
+        WatcherInvalidated,
+        WatcherRegistered,
+        WatcherUnregistered,
+        DevFrontendProbe,
+        PreferencesPinsApplied,
     }
 
     type ScanKey = (PathBuf, ScanPoint);
@@ -3678,6 +3783,9 @@ fn collect_raw_entries(
 }
 
 fn validate_root(project: &Project, root: &ProjectRootPath) -> Result<(), String> {
+    if project.is_removing_workbench() {
+        return Err("Workbench removal is in progress".to_owned());
+    }
     if project
         .root_paths()
         .into_iter()

@@ -147,6 +147,7 @@ pub enum HostEvent {
     SessionSummaryCountUpdated(SessionSummaryCountUpdatedPayload),
     CommandError(CommandErrorPayload),
     ProjectNotify(ProjectNotifyPayload),
+    ProjectOperation(protocol::ProjectOperationPayload),
     CustomAgentNotify(CustomAgentNotifyPayload),
     SteeringNotify(SteeringNotifyPayload),
     SelfImprovementNotify(protocol::SelfImprovementState),
@@ -1082,6 +1083,14 @@ async fn handle_host_envelope(
             let _ = host_tx
                 .send(HostEvent::SessionSummaryCountUpdated(payload))
                 .await;
+            true
+        }
+        FrameKind::ProjectOperation => {
+            let payload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::ProjectOperation(payload)).await;
             true
         }
         FrameKind::ProjectNotify => {

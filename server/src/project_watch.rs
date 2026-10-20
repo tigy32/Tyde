@@ -379,7 +379,6 @@ impl Drop for WatchLease {
 
 pub(crate) struct ProjectWatcher {
     tx: sync::Sender<Command>,
-    pub(crate) shared: SharedProjectWatcher,
     pub(crate) observed: HashSet<ProjectPath>,
 }
 
@@ -478,7 +477,6 @@ impl ProjectWatcher {
             .map_err(notify::Error::io)?;
         Ok(Self {
             tx,
-            shared,
             observed: HashSet::new(),
         })
     }
@@ -560,6 +558,11 @@ impl WatchState {
                     return Err(error);
                 }
                 self.registered.insert(path.to_owned());
+                #[cfg(feature = "test-support")]
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherRegistered,
+                );
             }
         }
         Ok(())
@@ -703,6 +706,11 @@ impl WatchState {
                 return Err(error);
             }
             self.registered.remove(path);
+            #[cfg(feature = "test-support")]
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherUnregistered,
+            );
         }
         tracing::debug!(
             directories = desired.len(),
@@ -902,6 +910,30 @@ impl WatchState {
         }
         relevant.sort();
         relevant.dedup();
+        tracing::debug!(
+            event_kind = ?event.kind,
+            input_paths = event.paths.len(),
+            relevant_paths = relevant.len(),
+            observed_files = self.explicit.len(),
+            reconcile,
+            lost_events = event.need_rescan(),
+            "classified project filesystem event"
+        );
+        #[cfg(feature = "test-support")]
+        if event.need_rescan() {
+            for path in &relevant {
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherInvalidated,
+                );
+            }
+            for root in &self.roots {
+                crate::project_stream::scan_test_support::run(
+                    root,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherRescanFinished,
+                );
+            }
+        }
         #[cfg(feature = "test-support")]
         for path in &event.paths {
             crate::project_stream::scan_test_support::run(

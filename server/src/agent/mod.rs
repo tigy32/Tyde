@@ -861,7 +861,7 @@ impl Drop for AgentProjectMoveGuard {
 
 pub(crate) struct ScheduledProjectMove {
     pub project_id: Option<protocol::ProjectId>,
-    pub lifecycle: Arc<crate::host::lifecycle::LifecycleHandle>,
+    pub project_store: Arc<crate::host::ProjectCatalogHandle>,
     pub guard: AgentProjectMoveGuard,
 }
 
@@ -4962,8 +4962,9 @@ pub(crate) fn spawn_agent_actor(
                 && project_entry_execution.is_none()
                 && let Some(movement) = scheduled_project_move.as_ref()
             {
-                match movement.lifecycle.enter_scheduled_project(
+                match movement.project_store.enter_scheduled_project(
                     current_start.agent_id.clone(),
+                    current_start.project_id.clone(),
                     movement.project_id.clone(),
                     current_start.workspace_roots.clone(),
                 ) {

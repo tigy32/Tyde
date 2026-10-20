@@ -970,6 +970,42 @@ fn command_error_context(envelope: &Envelope) -> Option<protocol::CommandErrorCo
             .map(|payload| protocol::CommandErrorContext::WorkbenchRemove {
                 project_id: payload.id,
             }),
+        FrameKind::ProjectCreate => envelope
+            .parse_payload::<protocol::ProjectCreatePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::Create(payload),
+            }),
+        FrameKind::ProjectDelete => envelope
+            .parse_payload::<protocol::ProjectDeletePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::Delete(payload),
+            }),
+        FrameKind::ProjectAddRoot => envelope
+            .parse_payload::<protocol::ProjectAddRootPayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::AddRoot(payload),
+            }),
+        FrameKind::ProjectDeleteRoot => envelope
+            .parse_payload::<protocol::ProjectDeleteRootPayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::DeleteRoot(payload),
+            }),
+        FrameKind::ProjectRename => envelope
+            .parse_payload::<protocol::ProjectRenamePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::Rename(payload),
+            }),
+        FrameKind::ProjectReorder => envelope
+            .parse_payload::<protocol::ProjectReorderPayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectMutation {
+                mutation: protocol::ProjectMutation::Reorder(payload),
+            }),
         _ => None,
     }
 }

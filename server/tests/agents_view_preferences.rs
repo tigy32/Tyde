@@ -3,7 +3,7 @@ mod fixture;
 use settings_model::HostBootstrapPayload;
 use std::time::Duration;
 
-use fixture::{Fixture, next_frame_matching_on};
+use fixture::{Fixture, next_frame_matching_on, send_host_payload, single_host_stream};
 use protocol::{
     AgentAnnotationTarget, AgentClosedPayload, AgentGroupAssignment, AgentGroupId, AgentGroupMode,
     AgentGroupsUpdate, AgentId, AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate,
@@ -74,41 +74,6 @@ async fn send_set_agent_pins(client: &mut client::Connection, update: AgentPinsU
 async fn send_set_agent_groups(client: &mut client::Connection, update: AgentGroupsUpdate) {
     let payload = SetAgentGroupsPayload { update };
     send_host_payload(client, FrameKind::SetAgentGroups, &payload).await;
-}
-
-async fn send_host_payload<T: serde::Serialize>(
-    client: &mut client::Connection,
-    kind: FrameKind,
-    payload: &T,
-) {
-    let host_stream = single_host_stream(client);
-    let seq = client
-        .outgoing_seq
-        .get(&host_stream)
-        .copied()
-        .expect("missing host stream sequence counter");
-    let envelope = Envelope::from_payload(host_stream.clone(), kind, seq, payload)
-        .expect("serialize host payload");
-    client.outgoing_seq.insert(host_stream, seq + 1);
-    write_envelope(&mut client.writer, &envelope)
-        .await
-        .expect("write host payload");
-}
-
-fn single_host_stream(client: &client::Connection) -> StreamPath {
-    let mut host_streams = client
-        .outgoing_seq
-        .keys()
-        .filter(|stream| stream.0.starts_with("/host/"));
-    let host_stream = host_streams
-        .next()
-        .cloned()
-        .expect("client should have a host stream");
-    assert!(
-        host_streams.next().is_none(),
-        "client should have exactly one host stream"
-    );
-    host_stream
 }
 
 fn built_in_id(id: BuiltInSmartViewId) -> SmartViewId {
@@ -1167,12 +1132,20 @@ async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_a
 #[tokio::test]
 async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_targets() {
     let mut fixture = Fixture::new().await;
+    let (publication, published) = fixture
+        .host_for_test()
+        .install_next_agent_session_publication_test_gate()
+        .await;
     let agent =
         spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "pin me").await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
     let session_id = start.session_id.expect("agent start session id");
     let session_target = local_session_target(session_id.clone());
     let transient_target = local_transient_target(agent.agent_id.clone());
+    publication.wait_until_entered().await;
+    eprintln!(
+        "PINS EVIDENCE: AgentStart received; session publication held after canonical promotion"
+    );
 
     send_set_agent_pins(
         &mut fixture.client,
@@ -1187,6 +1160,14 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
     .await;
     assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
 
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    fixture
+        .host_for_test()
+        .hold_preferences_owner_for_test(entered, held)
+        .await
+        .unwrap();
+    reached.await.unwrap();
     send_set_agent_pins(
         &mut fixture.client,
         AgentPinsUpdate::Pin {
@@ -1194,9 +1175,31 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "pin duplicate transient").await;
+    publication.release_one();
+    published.await.expect("session binding fanout completed");
+    let notify = expect_preferences_notify(
+        &mut fixture.client,
+        "session binding while duplicate pin held",
+    )
+    .await;
+    eprintln!(
+        "PINS EVIDENCE: next pinned snapshot came from session binding while duplicate mutation remained held"
+    );
     assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
 
+    let (applied, committed) = tokio::sync::oneshot::channel();
+    let applied_hook = fixture.on_project_scan(
+        fixture
+            .session_store_path()
+            .with_file_name("agents_view_preferences.json"),
+        server::ScanPoint::PreferencesPinsApplied,
+        move || {
+            let _ = applied.send(());
+        },
+    );
+    release.send(()).unwrap();
+    committed.await.expect("duplicate pin persisted");
+    drop(applied_hook);
     let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     assert_eq!(
         fresh_bootstrap
@@ -1207,6 +1210,14 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
         vec![session_target.clone()]
     );
 
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    fixture
+        .host_for_test()
+        .hold_preferences_owner_for_test(entered, held)
+        .await
+        .unwrap();
+    reached.await.unwrap();
     send_set_agent_pins(
         &mut fixture.client,
         AgentPinsUpdate::Unpin {
@@ -1214,8 +1225,52 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "unpin transient").await;
-    assert!(notify.snapshot.pins.pinned.is_empty());
+    // Notifications are full current state, not command replies. The explicitly
+    // held unpin cannot have produced this already queued duplicate-Pin frame.
+    let notify =
+        expect_preferences_notify(&mut fixture.client, "queued duplicate pin before unpin").await;
+    assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
+    eprintln!(
+        "PINS EVIDENCE: next snapshot after Unpin was the earlier duplicate Pin; unpin storage still held"
+    );
+    release.send(()).unwrap();
+    fixture
+        .client
+        .heartbeat(protocol::HeartbeatPayload {
+            client_sent_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    let mut settled = None;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "unpin settled before same-stream heartbeat",
+        |env| {
+            assert_ne!(env.kind, FrameKind::CommandError, "unpin must succeed");
+            if env.kind == FrameKind::AgentsViewPreferencesNotify {
+                settled = Some(
+                    env.parse_payload::<AgentsViewPreferencesNotifyPayload>()
+                        .unwrap(),
+                );
+            }
+            env.kind == FrameKind::HeartbeatAck
+        },
+    )
+    .await;
+    let settled = settled.expect("unpin published before heartbeat");
+    assert!(settled.snapshot.pins.pinned.is_empty());
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        fresh_bootstrap
+            .agents_view_preferences
+            .expect("persisted unpin bootstrap")
+            .pins
+            .pinned
+            .is_empty()
+    );
+    eprintln!(
+        "PINS EVIDENCE: canonical transient unpin published empty and fresh persisted bootstrap empty; earlier queued snapshot remained pinned"
+    );
 }
 
 #[tokio::test]

@@ -715,8 +715,6 @@ impl HostHandle {
             (Arc::clone(&state.project_store), state.use_mock_backend)
         };
         let project = project_store
-            .lock()
-            .await
             .get(&constraints.project_id)
             .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Swarm project does not exist"))?;
         match constraints.workspace_policy {
@@ -1354,7 +1352,7 @@ impl HostHandle {
             emit_swarm_events_locked(&mut state, pages, Some(requester));
             fan_out_swarm_events_locked(&mut state, shared);
             if let Some(events) = legacy_events {
-                fan_out_team_registry_events(&mut state, events).await;
+                fan_out_team_registry_events(&mut state, events);
             }
         }
         if let Some(id) = pause_id {
@@ -1671,13 +1669,9 @@ impl HostHandle {
             },
             None => {
                 let store = Arc::clone(&self.state.lock().await.project_store);
-                let project = store
-                    .lock()
-                    .await
-                    .get(&batch.constraints.project_id)
-                    .ok_or_else(|| {
-                        fail(SwarmErrorCode::NotFound, "Swarm project no longer exists")
-                    })?;
+                let project = store.get(&batch.constraints.project_id).ok_or_else(|| {
+                    fail(SwarmErrorCode::NotFound, "Swarm project no longer exists")
+                })?;
                 SpawnAgentParams::New {
                     workspace_roots: project
                         .root_paths()

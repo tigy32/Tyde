@@ -265,3 +265,8 @@ pub use types::{
     DotsAgentInput, DotsAwaitAgentsInput, DotsEmptyInput, DotsHostRegistrationPayload,
     DotsMessageInput, DotsRelayFrame, DotsSpawnAgentInput,
 };
+
+pub use types::{
+    ProjectCatalogRecord, ProjectMutation, ProjectOperationPayload, ProjectOperationStage,
+    ProjectOperationState, ProjectOperationWarning,
+};

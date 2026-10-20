@@ -35,6 +35,12 @@ pub async fn wait_until_ready(child: &mut AsyncGroupChild, port: u16) -> Result<
                 }
                 Err(error) => return Err(format!("frontend connection failed: {error}")),
             };
+            let local = stream
+                .local_addr()
+                .map_err(|error| format!("frontend readiness local endpoint failed: {error}"))?;
+            let peer = stream
+                .peer_addr()
+                .map_err(|error| format!("frontend readiness peer endpoint failed: {error}"))?;
             let mut stream = BufReader::new(stream);
             stream
                 .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -47,9 +53,17 @@ pub async fn wait_until_ready(child: &mut AsyncGroupChild, port: u16) -> Result<
                 .await
                 .map_err(|error| format!("frontend readiness response failed: {error}"))?;
             if !matches!(status.split_whitespace().nth(1), Some("200")) {
-                return Err(
-                    "frontend initial build did not serve its index successfully".to_owned(),
-                );
+                let http_status = status
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<u16>().ok());
+                let http_response = status.starts_with("HTTP/");
+                let request_echo = status.starts_with("GET / HTTP/");
+                return Err(format!(
+                    "frontend initial build did not serve its index successfully: local={local} peer={peer} self_connected={} http_response={http_response} http_status={http_status:?} request_echo={request_echo} status_bytes={}",
+                    local == peer,
+                    status.len(),
+                ));
             }
             return Ok(());
         }

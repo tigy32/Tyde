@@ -276,8 +276,10 @@ because the parent was emitted at subscription time.
 
 ## 5. Server-side ownership
 
-A workbench is a project, so the existing project actor / store / fanout
-absorbs it. There is no new actor. There is no new store.
+A workbench is a project. The shared project catalog actor owns its record,
+mutation reservations, and ordering alongside standalone projects. The same
+project-stream actor watches its roots; there is no workbench-specific actor
+or separate persisted catalog.
 
 ### 5.1 Worktree path computation
 
@@ -406,24 +408,24 @@ If all `git worktree add` succeed, the server calls
 rollback (`git worktree remove --force` and `git branch -D` for every created
 worktree) and surface the storage error.
 
-### 5.5 Concurrent create serialization
+### 5.5 Concurrent mutation admission
 
-`WorkbenchCreate` against the same parent is serialized in the host handler
-via a per-parent mutex. Two concurrent requests for branch `foo` against the
-same parent never both pass the "branch does not exist" preflight; the loser
-sees `CommandErrorCode::Conflict`.
+The catalog actor reserves the standalone parent family and proposed root
+paths before admitting `WorkbenchCreate`. Conflicting mutations or bindings
+are rejected immediately with `CommandErrorCode::Conflict`, not queued behind
+Git or filesystem work. Independent families may run workers concurrently;
+only durable catalog commits serialize. Rename, reorder, spawn, terminal
+creation, and live/scheduled project moves use that same ownership boundary.
 
-(Concurrent create against *different* parents is fine — the mutex is keyed on
-parent id.)
+### 5.6 Shared catalog and project streams
 
-### 5.6 No new actor
-
-A "workbench actor" would have to coordinate with the project actor that
-already manages `/project/<id>` for the workbench's roots. Workbench filesystem
-state and git status are exactly what the project actor already watches. The
-only additional cross-actor work is "spawn the project actor on create, abort
-it on remove," which the existing project lifecycle already does for
-standalone projects.
+Connection handlers await admission only. Owned workers perform Git, cleanup,
+and persistence; the actor continues accepting commands while they run. MCP
+handlers may await the final result without blocking the catalog or host.
+After persistence, full generation-stamped project records update project
+actors one-way before catalog fanout. Authorization uses that record before
+watcher/scanning completion, and obsolete scan results cannot publish removed
+roots. See `06-projects.md` for typed resource lifecycle and replay semantics.
 
 ---
 
@@ -544,13 +546,16 @@ Successful flow:
 1. Validate the target and parent relationship. Validate clean roots unless
    `force` is true.
 2. Close associated agents and terminals.
-3. Run `git worktree remove <worktree_root>` for every root, adding `--force`
+3. Stop project readers/watchers, then run
+   `git worktree remove <worktree_root>` for every root, adding `--force`
    only for the explicit forced path.
-4. Delete or detach every persisted project reference in the cascade above.
-5. Call `ProjectStore::delete_workbench`.
-6. Abort the project actor and drop its stream.
-7. Fan out the state-deletion notifications and
-   `ProjectNotify::Delete { project }`.
+4. Delete or detach every required persisted project reference in the cascade
+   above, including reviews. A cleanup error blocks catalog deletion.
+5. Persist `ProjectStore::delete_workbench` through the catalog owner.
+6. Fan out state-deletion notifications and `ProjectNotify::Delete { project }`.
+7. Report known post-commit publication/workflow failures as committed
+   warnings. Later watcher/scanning failures remain project-owned errors and
+   state, not a catalog rollback or failed mutation.
 
 `ProjectNotify::Delete` is only emitted after both git removal and store
 deletion succeed. If git removal succeeds but store delete fails, surface
@@ -779,8 +784,8 @@ feature/foo  →  <parent>--feature-foo
 
 ### 9.12 Concurrent `WorkbenchCreate` against the same parent
 
-Serialized via per-parent mutex (§5.5). One request wins, the other receives
-`CommandErrorCode::Conflict` from the "branch does not exist" preflight.
+The catalog reservation admits one request and immediately rejects the
+conflicting request with `CommandErrorCode::Conflict` (§5.5).
 
 ### 9.13 Project stream startup fails after successful create
 

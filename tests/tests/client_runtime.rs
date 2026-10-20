@@ -743,6 +743,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::AgentMoveResult(_)
                 | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
+                | HostEvent::ProjectOperation(_)
                 | HostEvent::NewTerminal(_)
                 | HostEvent::SessionSchemas(_)
                 | HostEvent::LaunchProfileCatalogNotify(_)

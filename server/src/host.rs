@@ -1,5 +1,11 @@
 #[path = "project_lifecycle.rs"]
 pub(crate) mod lifecycle;
+#[path = "project_catalog.rs"]
+mod project_catalog;
+pub(crate) use project_catalog::ProjectCatalogHandle;
+
+use crate::store::agents_view_preferences::AgentsViewPreferencesHandle;
+use crate::workflows::store::WorkflowRunHandle;
 #[path = "tychat_host.rs"]
 mod tychat;
 use crate::swarm_registry::SwarmRegistryHandle;
@@ -53,13 +59,13 @@ use protocol::{
     ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathPayload, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchCompletePayload,
-    ProjectSearchFileResult, ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    RequestedCompactionAvailability, RequestedCompactionRoute, ReviewActionPayload,
-    ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
-    SendMessagePayload, SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
+    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
+    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
+    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
+    SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
     SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
     SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
     SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
@@ -238,6 +244,7 @@ struct HostSubscriber {
     agent_replay: AgentReplayMode,
     session_list_replay: SessionListReplayMode,
     session_list_snapshot: Option<SessionListSnapshot>,
+    session_list_read_generation: u64,
     // HostBootstrap is a point-in-time list; ListSessions opts into updates.
     session_summary_updates_subscribed: bool,
     new_agent_fanouts_in_flight: u32,
@@ -761,7 +768,7 @@ pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
     pub team_registry: TeamRegistryHandle,
-    pub project_store: Arc<Mutex<ProjectStore>>,
+    pub project_store: Arc<ProjectCatalogHandle>,
     pub settings_store: Arc<HostSettingsStore>,
     #[cfg(feature = "test-support")]
     settings_lifecycle_test_gate: Option<(String, Arc<SpawnOperationTestGateInner>)>,
@@ -769,7 +776,7 @@ pub(crate) struct HostState {
     settings_queued_test_gate: Option<(String, Arc<SpawnOperationTestGateInner>)>,
     #[cfg(feature = "test-support")]
     learning_projection_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
-    pub agents_view_preferences_store: Option<Arc<Mutex<AgentsViewPreferencesStore>>>,
+    pub agents_view_preferences_store: Option<Arc<AgentsViewPreferencesHandle>>,
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub custom_agent_store: Arc<Mutex<CustomAgentStore>>,
@@ -822,7 +829,7 @@ pub(crate) struct HostState {
     pub workflow_watcher: WorkflowWatcherHandle,
     pub workflow_catalog: WorkflowCatalog,
     pub workflow_locations: Vec<WorkflowCatalogLocation>,
-    pub workflow_run_store: WorkflowRunStore,
+    pub workflow_run_store: Arc<WorkflowRunHandle>,
     pub mobile_access: MobileAccessHandle,
     session_schemas: HashMap<DiscoveryKey, SessionSchemaResolution>,
     discovered_launch_profiles: HashMap<BackendKind, Vec<LaunchProfileEntry>>,
@@ -863,13 +870,18 @@ pub(crate) struct HostState {
     swarm_startup_test_gates: crate::agent::SwarmStartupTestGates,
     #[cfg(feature = "test-support")]
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    session_list_publication_test_gate:
+        Option<(Arc<SpawnOperationTestGateInner>, oneshot::Sender<()>)>,
+    #[cfg(feature = "test-support")]
+    agent_session_publication_test_gate:
+        Option<(Arc<SpawnOperationTestGateInner>, oneshot::Sender<()>)>,
     agent_restoration_failures: Vec<protocol::AgentRestorationFailure>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     project_watcher: crate::project_watch::SharedProjectWatcher,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
-    project_lifecycles: HashMap<Option<ProjectId>, Weak<lifecycle::LifecycleHandle>>,
     /// Per-project "active search id". Each project-wide search stores its
     /// `search_id` here before spawning its walk; the walk polls this atomic
     /// and aborts as soon as the value no longer matches (a superseding search
@@ -879,11 +891,6 @@ pub(crate) struct HostState {
     /// to the owning root's `CodeIntelService` actor (lazily spawned). Holds no
     /// provider state itself. See `server/src/code_intel/`.
     code_intel_routers: HashMap<ProjectId, CodeIntelRouter>,
-    /// Workbench projects currently being removed. Removal validates
-    /// blockers against a snapshot and then runs slow git subprocesses
-    /// outside the state lock; agent spawns and terminal creation check
-    /// this set so they cannot race into a half-removed workbench.
-    removing_projects: HashSet<ProjectId>,
     #[cfg(feature = "test-support")]
     agent_name_test_gate: Option<Arc<AgentNameTestGateInner>>,
     /// Host-scoped mock launch reservations
@@ -992,6 +999,7 @@ fn spawn_settings_apply_actor(
 }
 
 pub struct HostHandle {
+    pub(crate) project_catalog: Arc<ProjectCatalogHandle>,
     pub(crate) config: crate::self_improvement::ConfigHandle,
     restart: Arc<RestartShutdown>,
     state: Arc<Mutex<HostState>>,
@@ -1209,7 +1217,9 @@ impl SpawnOperationTerminalClaim {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct WeakHostHandle {
+    project_catalog: Weak<ProjectCatalogHandle>,
     config: crate::self_improvement::ConfigHandle,
     restart: Weak<RestartShutdown>,
     state: Weak<Mutex<HostState>>,
@@ -1224,6 +1234,7 @@ impl WeakHostHandle {
     pub(crate) fn downgrade(host: &HostHandle) -> Self {
         Self {
             config: host.config.clone(),
+            project_catalog: Arc::downgrade(&host.project_catalog),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
@@ -1236,6 +1247,7 @@ impl WeakHostHandle {
 
     pub(crate) fn upgrade(&self) -> Option<HostHandle> {
         Some(HostHandle {
+            project_catalog: self.project_catalog.upgrade()?,
             config: self.config.clone(),
             restart: self.restart.upgrade()?,
             state: self.state.upgrade()?,
@@ -1252,6 +1264,7 @@ impl WeakHostHandle {
 impl Clone for HostHandle {
     fn clone(&self) -> Self {
         Self {
+            project_catalog: self.project_catalog.clone(),
             config: self.config.clone(),
             restart: Arc::clone(&self.restart),
             state: Arc::clone(&self.state),
@@ -1268,6 +1281,7 @@ impl Clone for HostHandle {
 impl Drop for HostHandle {
     fn drop(&mut self) {
         if let Some(owner) = self.spawn_operation_owner.as_ref() {
+            self.project_catalog.stop();
             self.config.stop();
             owner.begin_shutdown();
         }
@@ -2428,6 +2442,28 @@ impl HostHandle {
     }
 
     #[cfg(feature = "test-support")]
+    pub async fn install_next_session_list_publication_test_gate(
+        &self,
+    ) -> (InstalledSpawnOperationTestGate, oneshot::Receiver<()>) {
+        let gate = new_spawn_operation_test_gate();
+        let (finished, completion) = oneshot::channel();
+        self.state.lock().await.session_list_publication_test_gate =
+            Some((gate.shared(), finished));
+        (gate, completion)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn install_next_agent_session_publication_test_gate(
+        &self,
+    ) -> (InstalledSpawnOperationTestGate, oneshot::Receiver<()>) {
+        let gate = new_spawn_operation_test_gate();
+        let (finished, completion) = oneshot::channel();
+        self.state.lock().await.agent_session_publication_test_gate =
+            Some((gate.shared(), finished));
+        (gate, completion)
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn install_restart_stop_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         *self
@@ -2967,6 +3003,7 @@ impl HostHandle {
                 agent_replay,
                 session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
                 session_list_snapshot: None,
+                session_list_read_generation: 0,
                 session_summary_updates_subscribed: false,
                 new_agent_fanouts_in_flight: 0,
                 held_fanout_frames: Vec::new(),
@@ -3106,8 +3143,6 @@ impl HostHandle {
 
         let projects = state
             .project_store
-            .lock()
-            .await
             .list()
             .unwrap_or_else(|err| panic!("failed to list projects for host registration: {err}"));
         let project_ids = projects
@@ -3224,8 +3259,8 @@ impl HostHandle {
         let workflow_locations = state.workflow_locations.clone();
         let agents_view_preferences = match state.agents_view_preferences_store.as_ref() {
             Some(store) => {
-                let mut snapshot = store.lock().await.snapshot();
-                complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
+                let mut snapshot = store.snapshot();
+                complete_agents_view_preferences_snapshot(&state, &mut snapshot);
                 Some(snapshot)
             }
             None => None,
@@ -3497,11 +3532,40 @@ impl HostHandle {
             }
         }
         for (kind, payload) in pending_frames {
+            if kind == FrameKind::ProjectOperation {
+                match serde_json::from_value::<protocol::ProjectOperationPayload>(payload.clone()) {
+                    Ok(operation)
+                        if matches!(
+                            operation.state,
+                            protocol::ProjectOperationState::Admitted
+                                | protocol::ProjectOperationState::Running { .. }
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "invalid queued catalog progress");
+                        state.mobile_access.unregister_subscriber(host_path.clone());
+                        state.host_streams.remove(&host_path);
+                        state.agent_visibility.remove_host_stream(&host_path);
+                        return Vec::new();
+                    }
+                }
+            }
             if bootstrap_stream.send_value(kind, payload).is_err() {
                 state.mobile_access.unregister_subscriber(host_path.clone());
                 state.host_streams.remove(&host_path);
                 state.agent_visibility.remove_host_stream(&host_path);
                 return Vec::new();
+            }
+        }
+        for operation in self.project_catalog.operations() {
+            match serde_json::to_value(operation) {
+                Ok(payload) => {
+                    let _ = bootstrap_stream.send_value(FrameKind::ProjectOperation, payload);
+                }
+                Err(error) => tracing::error!(%error, "cannot replay catalog operation"),
             }
         }
         state
@@ -3510,7 +3574,7 @@ impl HostHandle {
 
         for project_id in project_ids {
             if let Err(error) =
-                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
+                subscribe_host_to_project(&mut state, &host_path, project_id.clone())
             {
                 tracing::warn!(
                     host_stream = %host_path,
@@ -3655,43 +3719,6 @@ impl HostHandle {
         }
     }
 
-    async fn project_lifecycle(
-        &self,
-        parent_project_id: Option<&ProjectId>,
-    ) -> Arc<lifecycle::LifecycleHandle> {
-        let mut state = self.state.lock().await;
-        state
-            .project_lifecycles
-            .retain(|_, actor| actor.strong_count() > 0);
-        if let Some(actor) = state
-            .project_lifecycles
-            .get(&parent_project_id.cloned())
-            .and_then(Weak::upgrade)
-        {
-            return actor;
-        }
-        let actor = lifecycle::LifecycleHandle::spawn(self.clone());
-        state
-            .project_lifecycles
-            .insert(parent_project_id.cloned(), Arc::downgrade(&actor));
-        actor
-    }
-
-    async fn project_lifecycle_for_project(
-        &self,
-        project_id: &ProjectId,
-    ) -> Result<Arc<lifecycle::LifecycleHandle>, String> {
-        let store = self.state.lock().await.project_store.clone();
-        let parent_id = {
-            let store = store.lock().await;
-            let project = store
-                .get(project_id)
-                .ok_or_else(|| format!("missing project {project_id}"))?;
-            project.parent_project_id().cloned().unwrap_or(project.id)
-        };
-        Ok(self.project_lifecycle(Some(&parent_id)).await)
-    }
-
     fn schedule_generated_agent_name(
         &self,
         agent_handle: AgentHandle,
@@ -3707,8 +3734,10 @@ impl HostHandle {
             .await;
             match result {
                 Ok(name) if !name.trim().is_empty() => {
-                    if agent_handle.apply_generated_name(Ok(name)).await == Some(true) {
-                        host.fan_out_session_lists().await;
+                    if agent_handle.apply_generated_name(Ok(name)).await == Some(true)
+                        && let Err(error) = host.fan_out_session_lists().await
+                    {
+                        tracing::error!(code = ?error.code(), "generated-name session publication failed; typed error emitted");
                     }
                 }
                 Ok(_) => {
@@ -3810,6 +3839,7 @@ impl HostHandle {
             start
         });
         if start {
+            self.project_catalog.stop();
             self.restart.stopped.cancel();
             if let Some(owner) = self.spawn_operations.owner.upgrade() {
                 owner.begin_shutdown();
@@ -3911,6 +3941,22 @@ impl HostHandle {
                     );
                     tychat.bridge.abort().await;
                     tychat.release_process_lock().await;
+                    host.project_catalog.shutdown().await;
+                    let (preferences, workflows) = {
+                        let state = host.state.lock().await;
+                        (
+                            state.agents_view_preferences_store.clone(),
+                            state.workflow_run_store.clone(),
+                        )
+                    };
+                    if let Some(preferences) = preferences
+                        && let Err(error) = preferences.shutdown().await
+                    {
+                        tracing::error!(%error, "preferences owner shutdown failed");
+                    }
+                    if let Err(error) = workflows.shutdown().await {
+                        tracing::error!(%error, "workflow-run owner shutdown failed");
+                    }
                     host.config.wait_stopped().await;
                 } else {
                     tracing::error!("host restart stopped without committing required accounting");
@@ -4474,7 +4520,11 @@ impl HostHandle {
                     (
                         agent_handle,
                         start,
-                        state.agent_sessions.get(&agent_id).cloned(),
+                        state
+                            .agent_sessions
+                            .get(&agent_id)
+                            .or_else(|| state.pending_agent_sessions.get(&agent_id))
+                            .cloned(),
                         state.registry.agent_access_mode(&agent_id),
                         Arc::clone(&state.session_store),
                         state.team_registry.clone(),
@@ -4858,7 +4908,7 @@ impl HostHandle {
             {
                 Ok(events) => {
                     let mut state = self.state.lock().await;
-                    fan_out_team_registry_events(&mut state, events).await;
+                    fan_out_team_registry_events(&mut state, events);
                 }
                 Err(error) => {
                     if let Err(error) = self.close_agent(&new_agent_id).await {
@@ -4899,7 +4949,7 @@ impl HostHandle {
                 {
                     Ok(events) => {
                         let mut state = self.state.lock().await;
-                        fan_out_team_registry_events(&mut state, events).await;
+                        fan_out_team_registry_events(&mut state, events);
                     }
                     Err(rollback_error) => {
                         tracing::error!(
@@ -5015,6 +5065,20 @@ impl HostHandle {
             restoration,
             mut review_startup_admission,
         } = context;
+        let project_binding = if let Some(project_id) = payload
+            .project_id
+            .as_ref()
+            .filter(|id| self.project_catalog.get(id).is_some())
+        {
+            Some(
+                self.project_catalog
+                    .reserve_bindings(vec![project_id.clone()])
+                    .await
+                    .map_err(|error| AppError::conflict("spawn_agent", error))?,
+            )
+        } else {
+            None
+        };
         let review_startup_deferred = review_startup_admission.is_some();
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -5148,7 +5212,7 @@ impl HostHandle {
                 state.agent_control_mcp.clone(),
                 state.config_mcp.clone(),
                 state.capacity_tx.clone(),
-                state.removing_projects.clone(),
+                state.project_store.clone(),
                 payload.parent_agent_id.as_ref().map(|agent_id| {
                     if let Some(session_id) = state.agent_sessions.get(agent_id).cloned() {
                         Ok(session_id)
@@ -5252,7 +5316,7 @@ impl HostHandle {
                     .await?;
                 let (project_id, missing_project_failure) = match payload.project_id.clone() {
                     Some(project_id) => {
-                        if removing_projects.contains(&project_id) {
+                        if removing_projects.is_removing(&project_id) {
                             (
                                 None,
                                 Some(format!(
@@ -5260,7 +5324,7 @@ impl HostHandle {
                                     project_id
                                 )),
                             )
-                        } else if project_store.lock().await.get(&project_id).is_some() {
+                        } else if project_store.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             (
@@ -5547,13 +5611,13 @@ impl HostHandle {
                 let requested_project_id = payload.project_id.or(record.project_id.clone());
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
-                        if removing_projects.contains(&project_id) {
+                        if removing_projects.is_removing(&project_id) {
                             let warning = format!(
                                 "workbench {} is being removed; resuming without a project",
                                 project_id
                             );
                             (None, Some(warning))
-                        } else if project_store.lock().await.get(&project_id).is_some() {
+                        } else if project_store.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             let warning = format!(
@@ -5835,13 +5899,13 @@ impl HostHandle {
                 let requested_project_id = record.project_id.clone();
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
-                        if removing_projects.contains(&project_id) {
+                        if removing_projects.is_removing(&project_id) {
                             let warning = format!(
                                 "workbench {} is being removed; forking without a project",
                                 project_id
                             );
                             (None, Some(warning))
-                        } else if project_store.lock().await.get(&project_id).is_some() {
+                        } else if project_store.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             let warning = format!(
@@ -6227,6 +6291,16 @@ impl HostHandle {
             }
             None => (None, None),
         };
+        let resolved_project_binding = if let Some(project_id) = request.project_id.as_ref() {
+            Some(
+                self.project_catalog
+                    .reserve_bindings(vec![project_id.clone()])
+                    .await
+                    .map_err(|error| AppError::conflict("spawn_agent", error))?,
+            )
+        } else {
+            None
+        };
         let diagnose_side_question_fanout = request.fork_from_session_id.is_some();
         tracing::info!(
             backend_kind = ?request.backend_kind,
@@ -6424,13 +6498,13 @@ impl HostHandle {
                 })
                 .flatten();
             let execution_project = match request.project_id.as_ref() {
-                Some(id) => state.project_store.lock().await.get(id),
+                Some(id) => state.project_store.get(id),
                 None => None,
             };
             if let Some(project) = &execution_project {
                 crate::workbench::validate_backend(project, request.backend_kind)?;
             }
-            let spawned = tyde_process_env::launch::project_scope(execution_project, async {
+            let spawned = tyde_process_env::launch::project_scope_sync(execution_project, || {
                 state.registry.spawn(
                     request,
                     &agent_control_mcp,
@@ -6454,8 +6528,7 @@ impl HostHandle {
                         backend_storage,
                     },
                 )
-            })
-            .await;
+            });
             if let Some(message) = human_prompt {
                 let input = protocol::AcceptedHumanInput {
                     id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
@@ -6536,6 +6609,8 @@ impl HostHandle {
             )
         };
 
+        drop(resolved_project_binding);
+        drop(project_binding);
         let agent_id = start.agent_id.clone();
         if let Err(error) = swarm_startup_admission {
             // Close cannot await an actor still blocked on this sender.
@@ -6731,7 +6806,7 @@ impl HostHandle {
         }
         {
             let mut state = self.state.lock().await;
-            fan_out_current_agents_view_preferences(&mut state).await;
+            fan_out_current_agents_view_preferences(&mut state);
         }
 
         if let Some(project_id) = start.project_id.clone()
@@ -6936,6 +7011,17 @@ impl HostHandle {
     }
 
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AppResult<AgentId> {
+        let project_binding = if let Some(project_id) = request.project_id.as_ref() {
+            Some(
+                self.project_catalog
+                    .reserve_bindings(vec![project_id.clone()])
+                    .await
+                    .map_err(|error| AppError::conflict("spawn_agent", error))?,
+            )
+        } else {
+            None
+        };
+
         if let Some(session) = request
             .resume_session_id
             .as_ref()
@@ -7014,13 +7100,13 @@ impl HostHandle {
             }
             let tychat = state.tychat.clone();
             let execution_project = match request.project_id.as_ref() {
-                Some(id) => state.project_store.lock().await.get(id),
+                Some(id) => state.project_store.get(id),
                 None => None,
             };
             if let Some(project) = &execution_project {
                 crate::workbench::validate_backend(project, request.backend_kind)?;
             }
-            let spawned = tyde_process_env::launch::project_scope(execution_project, async {
+            let spawned = tyde_process_env::launch::project_scope_sync(execution_project, || {
                 state.registry.spawn(
                     request,
                     &agent_control_mcp,
@@ -7044,8 +7130,7 @@ impl HostHandle {
                         backend_storage,
                     },
                 )
-            })
-            .await;
+            });
             self.register_restart_handle(&spawned.handle);
             (
                 spawned.start,
@@ -7056,6 +7141,7 @@ impl HostHandle {
             )
         };
 
+        drop(project_binding);
         let agent_id = start.agent_id.clone();
         let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
@@ -7199,57 +7285,42 @@ impl HostHandle {
         Ok(agent_id)
     }
 
+    pub(crate) async fn admit_project_mutation(
+        &self,
+        mutation: protocol::ProjectMutation,
+        output: Stream,
+    ) -> AppResult<()> {
+        drop(
+            self.project_catalog
+                .admit(mutation, None, Some(output))
+                .await?,
+        );
+        Ok(())
+    }
+
+    async fn complete_project_mutation(
+        &self,
+        mutation: protocol::ProjectMutation,
+        base: Option<BaseRevision>,
+    ) -> AppResult<project_catalog::CatalogResult> {
+        self.project_catalog
+            .admit(mutation, base, None)
+            .await?
+            .await
+            .map_err(|_| AppError::conflict("project_operation", "project worker stopped"))?
+    }
+
     pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<Project> {
-        const OPERATION: &str = "project_create";
-        let mut state = self.state.lock().await;
-        let project = {
-            let mut project_store = state.project_store.lock().await;
-            project_store
-                .create(payload.name, payload.roots)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        let project_id = project.id.clone();
-        fan_out_project_notify(
-            &mut state,
-            ProjectNotifyPayload::Upsert {
-                project: project.clone(),
-            },
-        )
-        .await;
-        if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "failed to start project actor after project creation"
-            );
+        match self
+            .complete_project_mutation(protocol::ProjectMutation::Create(payload), None)
+            .await?
+        {
+            project_catalog::CatalogResult::Project(project) => Ok(project),
+            _ => Err(AppError::protocol(
+                "project_create",
+                "unexpected catalog result",
+            )),
         }
-        let host_paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
-        for host_path in host_paths {
-            if let Err(error) =
-                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to subscribe host to project stream after project creation"
-                );
-            }
-            if let Err(error) =
-                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to emit initial review list after project creation"
-                );
-            }
-        }
-        drop(state);
-        self.update_workflow_watcher_targets_and_reload("project_create")
-            .await?;
-        Ok(project)
     }
 
     pub(crate) async fn move_agent(
@@ -7286,30 +7357,6 @@ impl HostHandle {
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
     ) -> Result<AgentStartPayload, String> {
-        let scope_id = match project_id {
-            Some(id) => Some(id.clone()),
-            None => self.agent_project_id(agent_id).await,
-        };
-        if let Some(scope_id) = scope_id {
-            let actor = self.project_lifecycle_for_project(&scope_id).await?;
-            actor
-                .request(|reply| lifecycle::Command::Move {
-                    agent_id: agent_id.clone(),
-                    project_id: project_id.cloned(),
-                    reply,
-                })
-                .await?
-        } else {
-            self.move_agent_to_project_serialized(agent_id, project_id)
-                .await
-        }
-    }
-
-    async fn move_agent_to_project_serialized(
-        &self,
-        agent_id: &AgentId,
-        project_id: Option<&ProjectId>,
-    ) -> Result<AgentStartPayload, String> {
         if self
             .is_swarm_agent(agent_id)
             .await
@@ -7317,27 +7364,32 @@ impl HostHandle {
         {
             return Err("Swarm member scope cannot be moved independently".into());
         }
-        let (handle, project) = {
-            let state = self.state.lock().await;
-            let handle = state
-                .registry
-                .agent_handle(agent_id)
-                .ok_or("This agent is no longer running")?;
-            let project = match project_id {
-                Some(id) => Some(
-                    state
-                        .project_store
-                        .lock()
-                        .await
-                        .get(id)
-                        .ok_or("Destination project no longer exists")?,
-                ),
-                None => None,
-            };
-            (handle, project)
-        };
+        let handle = self
+            .state
+            .lock()
+            .await
+            .registry
+            .agent_handle(agent_id)
+            .ok_or("This agent is no longer running")?;
+        let mut projects = handle
+            .snapshot()
+            .project_id
+            .filter(|id| self.project_catalog.get(id).is_some())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(id) = project_id {
+            projects.push(id.clone());
+        }
+        let _binding = self.project_catalog.reserve_bindings(projects).await?;
         let start = handle.snapshot();
-        self.validate_native_project_move(start.project_id.as_ref(), project.as_ref())
+        let destination = project_id
+            .map(|id| {
+                self.project_catalog
+                    .get(id)
+                    .ok_or("Destination project no longer exists")
+            })
+            .transpose()?;
+        self.validate_native_project_move(start.project_id.as_ref(), destination.as_ref())
             .await?;
         if start.origin == AgentOrigin::Tychat {
             return Err("The Tychat agent belongs to the host, not a project".into());
@@ -7411,7 +7463,6 @@ impl HostHandle {
         destination: Option<&Project>,
     ) -> Result<(), String> {
         let store = self.state.lock().await.project_store.clone();
-        let store = store.lock().await;
         let source = match source_id {
             Some(id) => Some(
                 store
@@ -7436,51 +7487,23 @@ impl HostHandle {
         agent_id: &AgentId,
         project_id: Option<&ProjectId>,
     ) -> Result<(), String> {
-        let source_id = self.agent_project_id(agent_id).await;
-        let actor = match project_id.or(source_id.as_ref()) {
-            Some(id) => self.project_lifecycle_for_project(id).await?,
-            None => self.project_lifecycle(None).await,
-        };
-        actor
-            .request(|reply| lifecycle::Command::ScheduleMove {
-                agent_id: agent_id.clone(),
-                project_id: project_id.cloned(),
-                lifecycle: actor.clone(),
-                reply,
-            })
-            .await?
-    }
-
-    async fn schedule_agent_project_move_serialized(
-        &self,
-        agent_id: &AgentId,
-        project_id: Option<&ProjectId>,
-        lifecycle: Arc<lifecycle::LifecycleHandle>,
-    ) -> Result<(), String> {
         let handle = self.validate_agent_project_entry(agent_id).await?;
-        let current_id = handle.snapshot().project_id;
         let project_store = self.state.lock().await.project_store.clone();
-        let destination = match project_id {
-            Some(id) => {
-                let project = project_store
-                    .lock()
-                    .await
-                    .get(id)
-                    .ok_or_else(|| "Destination project no longer exists".to_owned())?;
-                if project.is_removing_workbench() {
-                    return Err("Destination workbench is being removed".to_owned());
-                }
-                crate::backend::validate_local_workspace_roots(
-                    project
-                        .root_paths()
-                        .into_iter()
-                        .map(|root| root.0)
-                        .collect(),
-                )?;
-                Some(project)
-            }
-            None => None,
-        };
+        let current_id = handle.snapshot().project_id;
+        if let Some(id) = project_id {
+            let store = &project_store;
+            let destination = store
+                .get(id)
+                .ok_or_else(|| "Destination project no longer exists".to_owned())?;
+            crate::backend::validate_local_workspace_roots(
+                destination
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect(),
+            )?;
+        }
+        let destination = project_id.and_then(|id| project_store.get(id));
         self.validate_native_project_move(current_id.as_ref(), destination.as_ref())
             .await?;
         tracing::info!(
@@ -7503,237 +7526,43 @@ impl HostHandle {
         handle
             .schedule_project_move(crate::agent::ScheduledProjectMove {
                 project_id: project_id.cloned(),
-                lifecycle,
+                project_store,
                 guard: move_guard,
             })
             .await
     }
 
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
-        const OPERATION: &str = "project_rename";
-        let mut state = self.state.lock().await;
-        let project = {
-            let mut project_store = state.project_store.lock().await;
-            project_store
-                .rename(&payload.id, payload.name)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        fan_out_current_agents_view_preferences(&mut state).await;
-        Ok(())
-    }
-
-    pub(crate) async fn reorder_projects(&self, payload: ProjectReorderPayload) -> AppResult<()> {
-        const OPERATION: &str = "project_reorder";
-        let mut state = self.state.lock().await;
-        let projects = {
-            let mut project_store = state.project_store.lock().await;
-            project_store
-                .reorder(payload.scope, payload.project_ids)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        for project in projects {
-            fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        }
-        Ok(())
+        self.complete_project_mutation(protocol::ProjectMutation::Rename(payload), None)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn add_project_root(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
-        let actor = self
-            .project_lifecycle_for_project(&payload.id)
+        self.complete_project_mutation(protocol::ProjectMutation::AddRoot(payload), None)
             .await
-            .map_err(|error| AppError::not_found("project_add_root", error))?;
-        actor
-            .request(|reply| lifecycle::Command::AddRoot { payload, reply })
-            .await
-            .map_err(|error| AppError::internal("project_add_root", anyhow!(error)))?
-    }
-
-    async fn add_project_root_serialized(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
-        const OPERATION: &str = "project_add_root";
-        let mut state = self.state.lock().await;
-        let project = {
-            let mut project_store = state.project_store.lock().await;
-            project_store
-                .add_root(&payload.id, payload.root)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        let project_id = project.id.clone();
-        let roots = project.root_paths();
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
-            router.retain_roots(&roots);
-        }
-        let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to start project actor after adding project root"
-                );
-                None
-            }
-        };
-        drop(state);
-        if let Some(handle) = handle
-            && let Err(error) = handle.refresh().await
-        {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "failed to refresh project actor after adding project root"
-            );
-        }
-        self.update_workflow_watcher_targets_and_reload("project_add_root")
-            .await?;
-        Ok(())
+            .map(|_| ())
     }
 
     pub(crate) async fn delete_project_root(
         &self,
         payload: ProjectDeleteRootPayload,
     ) -> AppResult<()> {
-        let actor = self
-            .project_lifecycle_for_project(&payload.id)
+        self.complete_project_mutation(protocol::ProjectMutation::DeleteRoot(payload), None)
             .await
-            .map_err(|error| AppError::not_found("project_delete_root", error))?;
-        actor
-            .request(|reply| lifecycle::Command::DeleteRoot { payload, reply })
-            .await
-            .map_err(|error| AppError::internal("project_delete_root", anyhow!(error)))?
-    }
-
-    async fn delete_project_root_serialized(
-        &self,
-        payload: ProjectDeleteRootPayload,
-    ) -> AppResult<()> {
-        const OPERATION: &str = "project_delete_root";
-        let mut state = self.state.lock().await;
-        let project = {
-            let mut project_store = state.project_store.lock().await;
-            project_store
-                .delete_root(&payload.id, &payload.root)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        let project_id = project.id.clone();
-        let roots = project.root_paths();
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
-            router.retain_roots(&roots);
-        }
-        let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to start project actor after deleting project root"
-                );
-                None
-            }
-        };
-        drop(state);
-        if let Some(handle) = handle
-            && let Err(error) = handle.refresh().await
-        {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "failed to refresh project actor after deleting project root"
-            );
-        }
-        self.update_workflow_watcher_targets_and_reload("project_delete_root")
-            .await?;
-        Ok(())
+            .map(|_| ())
     }
 
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
-        let actor = self.project_lifecycle(Some(&payload.id)).await;
-        actor
-            .request(|reply| lifecycle::Command::DeleteProject { payload, reply })
+        self.complete_project_mutation(protocol::ProjectMutation::Delete(payload), None)
             .await
-            .map_err(|error| AppError::internal("project_delete", anyhow!(error)))?
+            .map(|_| ())
     }
 
-    async fn delete_project_serialized(&self, payload: ProjectDeletePayload) -> AppResult<()> {
-        const OPERATION: &str = "project_delete";
-        let mut state = self.state.lock().await;
-        {
-            let project_store = state.project_store.lock().await;
-            let Some(project) = project_store.get(&payload.id) else {
-                return Err(AppError::not_found(
-                    OPERATION,
-                    format!("cannot delete missing project {}", payload.id),
-                ));
-            };
-            if project.is_workbench() {
-                return Err(AppError::invalid(
-                    OPERATION,
-                    format!(
-                        "cannot delete workbench project {} with ProjectDelete; use WorkbenchRemove",
-                        payload.id
-                    ),
-                ));
-            }
-            if let Some(child) = project_store.list_children(&payload.id).first() {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!(
-                        "cannot delete project {} while referenced by workbench {}",
-                        payload.id, child
-                    ),
-                ));
-            }
-        }
-        let deleted_steering_ids = self
-            .delete_learning_project_rules(&payload.id)
+    pub(crate) async fn remove_workbench(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
+        self.complete_project_mutation(protocol::ProjectMutation::RemoveWorkbench(payload), None)
             .await
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let detached_session_ids = state
-            .session_store
-            .detach_project(&payload.id)
-            .await
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let team_events = state
-            .team_registry
-            .remove_project_refs(payload.id.clone(), HashSet::new())
-            .await
-            .map_err(|error| team_registry_error(OPERATION, error))?;
-        let project = {
-            let project_store = state.project_store.clone();
-            let mut project_store = project_store.lock().await;
-            // Finish stopping readers while their project still exists;
-            // deletion must not race a background metadata refresh.
-            if let Some(mut subscription) = state.project_streams.remove(&payload.id) {
-                subscription.task.abort();
-                if let Err(error) = (&mut subscription.task).await
-                    && !error.is_cancelled()
-                {
-                    return Err(AppError::internal(OPERATION, anyhow!(error)));
-                }
-            }
-            project_store
-                .delete(&payload.id)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-        cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
-        if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
-            router.shutdown_all();
-        }
-        for id in deleted_steering_ids {
-            fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
-        }
-        fan_out_team_registry_events(&mut state, team_events).await;
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
-        fan_out_current_agents_view_preferences(&mut state).await;
-        if !detached_session_ids.is_empty() {
-            fan_out_session_lists(&mut state).await;
-        }
-        drop(state);
-        self.update_workflow_watcher_targets_and_reload("project_delete")
-            .await?;
-        Ok(())
+            .map(|_| ())
     }
 
     pub(crate) async fn create_workbench(
@@ -7741,215 +7570,16 @@ impl HostHandle {
         payload: WorkbenchCreatePayload,
         base: Option<BaseRevision>,
     ) -> AppResult<CreatedWorkbench> {
-        let actor = self
-            .project_lifecycle(Some(&payload.parent_project_id))
-            .await;
-        actor
-            .request(|reply| lifecycle::Command::Create {
-                payload,
-                base,
-                reply,
-            })
-            .await
-            .map_err(|error| AppError::internal("workbench_create", anyhow!(error)))?
-    }
-
-    async fn create_workbench_serialized(
-        &self,
-        payload: WorkbenchCreatePayload,
-        base: Option<BaseRevision>,
-    ) -> AppResult<CreatedWorkbench> {
-        const OPERATION: &str = "workbench_create";
-
-        let project_store = {
-            let state = self.state.lock().await;
-            Arc::clone(&state.project_store)
-        };
-
-        let parent = {
-            let project_store = project_store.lock().await;
-            project_store
-                .get(&payload.parent_project_id)
-                .ok_or_else(|| {
-                    AppError::not_found(
-                        OPERATION,
-                        format!("project {} not found", payload.parent_project_id),
-                    )
-                })?
-        };
-
-        let ProjectSource::Standalone {
-            roots: parent_roots,
-        } = &parent.source
-        else {
-            return Err(AppError::invalid(
-                OPERATION,
-                format!(
-                    "cannot create workbench for non-standalone parent project {}",
-                    parent.id
-                ),
-            ));
-        };
-
-        if parent_roots.is_empty() {
-            return Err(AppError::internal_message(
-                OPERATION,
-                format!("standalone parent project {} has no roots", parent.id),
-                anyhow!("standalone parent project has no roots"),
-            ));
+        match self
+            .complete_project_mutation(protocol::ProjectMutation::CreateWorkbench(payload), base)
+            .await?
+        {
+            project_catalog::CatalogResult::Workbench(workbench) => Ok(workbench),
+            _ => Err(AppError::protocol(
+                "workbench_create",
+                "unexpected catalog result",
+            )),
         }
-
-        let settings_store = self.state.lock().await.settings_store.clone();
-        let engine = settings_store
-            .get()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .workbenches
-            .engine;
-        if engine == protocol::WorkbenchEngine::Bubblewrap && parent_roots.len() != 1 {
-            return Err(AppError::invalid(
-                OPERATION,
-                "Bubblewrap workbenches require exactly one project root",
-            )
-            .with_workbench_reason(protocol::WorkbenchUnsupportedReason::UnsupportedRoots));
-        }
-        let environment_directory = match engine {
-            protocol::WorkbenchEngine::Native => None,
-            protocol::WorkbenchEngine::Bubblewrap => {
-                Some(project_store.lock().await.environment_directory()?)
-            }
-        };
-
-        let branch = payload.branch.clone();
-        let roots = compute_workbench_roots(parent_roots, &branch)?;
-        preflight_workbench_create(&project_store, &parent, &branch, &roots).await?;
-
-        let mut resolved_roots = Vec::with_capacity(roots.len());
-        for root in &roots {
-            resolved_roots.push(CreatedWorkbenchRoot {
-                root: root.clone(),
-                base_commit: git_resolve_base_commit(&root.parent_root, base.as_ref()).await?,
-                parent_root_dirty: !git_status_porcelain(&root.parent_root)
-                    .await
-                    .map_err(|error| {
-                        AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                    })?
-                    .is_empty(),
-            });
-        }
-
-        let mut created = Vec::<WorkbenchRoot>::new();
-        for resolved in &resolved_roots {
-            let root = &resolved.root;
-            if let Err(error) = git_worktree_add(
-                &root.parent_root,
-                &root.worktree_root,
-                &branch,
-                &resolved.base_commit,
-            )
-            .await
-            {
-                let rollback_message = rollback_created_worktrees(&created, &branch).await;
-                let message = append_rollback_message(error, rollback_message);
-                return Err(AppError::internal_message(
-                    OPERATION,
-                    message.clone(),
-                    anyhow!(message),
-                ));
-            }
-            created.push(root.clone());
-        }
-
-        let environment = match environment_directory.as_ref() {
-            None => protocol::WorkbenchEnvironment::Native,
-            Some(directory) => {
-                match crate::workbench::prepare(Path::new(&roots[0].worktree_root.0), directory)
-                    .await
-                {
-                    Ok(environment) => environment,
-                    Err(mut error) => {
-                        let environment_cleanup = rollback_workbench_environment(directory).await;
-                        let git_cleanup = rollback_created_worktrees(&created, &branch).await;
-                        error.message = append_rollback_message(
-                            append_rollback_message(error.message, environment_cleanup),
-                            git_cleanup,
-                        );
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        let registered = project_store.lock().await.create_workbench(
-            payload.parent_project_id.clone(),
-            payload.name,
-            payload.branch,
-            roots,
-            environment.clone(),
-        );
-        let project = match registered {
-            Ok(project) => project,
-            Err(error) => {
-                let environment_cleanup = crate::workbench::finish(&environment)
-                    .await
-                    .err()
-                    .map(|error| format!("Environment rollback failed: {error}"));
-                let git_cleanup = rollback_created_worktrees(&created, &branch).await;
-                let message = append_rollback_message(
-                    append_rollback_message(error.to_string(), environment_cleanup),
-                    git_cleanup,
-                );
-                return Err(project_store_error(OPERATION, error.with_message(message)));
-            }
-        };
-
-        let project_id = project.id.clone();
-        let mut state = self.state.lock().await;
-        fan_out_project_notify(
-            &mut state,
-            ProjectNotifyPayload::Upsert {
-                project: project.clone(),
-            },
-        )
-        .await;
-        // The workbench record and worktrees already exist and the Upsert
-        // has fanned out, so a project-actor failure here must not fail
-        // the request (mirrors create_project): warn and return success.
-        if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "failed to start project actor after workbench creation"
-            );
-        }
-        let host_paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
-        for host_path in host_paths {
-            if let Err(error) =
-                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to subscribe host to workbench project stream after creation"
-                );
-            }
-            if let Err(error) =
-                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to emit initial review list after workbench creation"
-                );
-            }
-        }
-        drop(state);
-        self.update_workflow_watcher_targets_and_reload("workbench_create")
-            .await?;
-        Ok(CreatedWorkbench {
-            project,
-            roots: resolved_roots,
-        })
     }
 
     pub(crate) async fn selected_workbench_engine(
@@ -7960,112 +7590,131 @@ impl HostHandle {
     }
 
     pub(crate) async fn list_projects(&self) -> Result<Vec<Project>, String> {
-        let state = self.state.lock().await;
-        state.project_store.lock().await.list().map_err(Into::into)
+        self.project_catalog.list().map_err(Into::into)
     }
-
     pub(crate) async fn project_id_for_agent(&self, agent_id: &AgentId) -> Option<ProjectId> {
         self.agent_project_id(agent_id).await
     }
 
-    pub(crate) async fn remove_workbench(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
-        let actor = self
-            .project_lifecycle_for_project(&payload.id)
-            .await
-            .map_err(|error| AppError::not_found("workbench_remove", error))?;
-        actor
-            .request(|reply| lifecycle::Command::Remove { payload, reply })
-            .await
-            .map_err(|error| AppError::internal("workbench_remove", anyhow!(error)))?
-    }
-
-    async fn remove_workbench_serialized(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
-        const OPERATION: &str = "workbench_remove";
-        let project_store = {
-            let state = self.state.lock().await;
-            Arc::clone(&state.project_store)
-        };
-
-        let project = load_project(&project_store, &payload.id, OPERATION).await?;
-        let ProjectSource::GitWorkbench { roots, .. } = &project.source else {
-            return Err(AppError::invalid(
-                OPERATION,
-                format!(
-                    "cannot remove non-workbench project {} as workbench",
-                    payload.id
-                ),
-            ));
-        };
-
-        // Mark the workbench as being removed before validating blockers
-        // so agent spawns and terminal creation reject it while the slow
-        // git subprocesses below run outside the host state lock. The
-        // marker survives failed Bubblewrap teardown once Removing is persisted;
-        // restarting the host must not reopen a partially removed environment.
-        {
+    async fn stop_project_services(&self, project_id: &ProjectId) -> AppResult<()> {
+        let subscription = {
             let mut state = self.state.lock().await;
-            if !state.removing_projects.insert(payload.id.clone())
-                && !project.is_removing_workbench()
-            {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!("workbench {} is already being removed", payload.id),
-                ));
+            if let Some(mut router) = state.code_intel_routers.remove(project_id) {
+                router.shutdown_all();
             }
-        }
-        wait_for_workbench_remove_test_hook(self).await;
-        let result = self
-            .remove_workbench_marked(&payload, &project, roots, &project_store)
-            .await;
-        let still_removing = project_store
-            .lock()
-            .await
-            .get(&payload.id)
-            .is_some_and(|project| project.is_removing_workbench());
-        if !still_removing {
-            self.state
-                .lock()
+            state.project_streams.remove(project_id)
+        };
+        if let Some(mut subscription) = subscription {
+            subscription.handle.shutdown();
+            (&mut subscription.task)
                 .await
-                .removing_projects
-                .remove(&payload.id);
+                .map_err(|error| AppError::internal("project_cleanup", anyhow!(error)))?
+                .map_err(|error| AppError::internal("project_cleanup", anyhow!(error)))?;
         }
-        result
-    }
-
-    async fn persist_workbench_removal_phase(
-        &self,
-        project_store: &Arc<Mutex<ProjectStore>>,
-        id: &ProjectId,
-        phase: protocol::WorkbenchRemovalPhase,
-    ) -> AppResult<()> {
-        let project = project_store
-            .lock()
-            .await
-            .set_workbench_lifecycle(
-                id,
-                protocol::WorkbenchEnvironmentLifecycle::Removing { phase },
-            )
-            .map_err(|error| project_store_error("workbench_remove", error))?;
-        let mut state = self.state.lock().await;
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         Ok(())
     }
 
-    async fn remove_workbench_marked(
+    async fn prepare_project_delete(
+        &self,
+        project_id: &ProjectId,
+        workbench: bool,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_cleanup";
+        let started = std::time::Instant::now();
+        self.stop_project_services(project_id).await?;
+        let (sessions, annotations, teams, reviews, workflows) = {
+            let state = self.state.lock().await;
+            (
+                state.session_store.clone(),
+                state.agents_view_preferences_store.clone(),
+                state.team_registry.clone(),
+                state.review_registry.clone(),
+                state.workflow_run_store.clone(),
+            )
+        };
+        let deleted_steering_ids = self
+            .delete_learning_project_rules(project_id)
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let session_ids = sessions
+            .list()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .into_iter()
+            .filter(|record| record.project_id.as_ref() == Some(project_id))
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        let session_count = session_ids.len();
+        let deleted_session_ids = if workbench {
+            session_ids.iter().cloned().collect()
+        } else {
+            HashSet::new()
+        };
+        if workbench && let Some(store) = annotations {
+            let id = project_id.clone();
+            let annotation_sessions = session_ids.clone();
+            store
+                .call(move |store| {
+                    for session_id in annotation_sessions {
+                        store.remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id)?;
+                    }
+                    store.remove_project(HostFilterId(LOCAL_HOST_ID.to_owned()), id)
+                })
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+        let team_events = teams
+            .remove_project_refs(project_id.clone(), deleted_session_ids)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        if workbench {
+            let id = project_id.clone();
+            workflows
+                .call(move |store| store.delete_for_project(&id))
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+        let removed = reviews
+            .delete_for_project(project_id.clone())
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        if workbench {
+            for session_id in session_ids {
+                self.delete_session(session_id).await?;
+            }
+        } else {
+            sessions
+                .detach_project(project_id)
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+        tracing::info!(target: "tyde::project_operation", stage = "cleanup", workbench, session_count, review_count = removed.len(), steering_count = deleted_steering_ids.len(), elapsed_ms = started.elapsed().as_millis(), "required project cleanup completed before catalog delete");
+        let mut state = self.state.lock().await;
+        for id in deleted_steering_ids {
+            fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id });
+        }
+        fan_out_team_registry_events(&mut state, team_events);
+        state
+            .terminal_streams
+            .retain(|_, terminal| terminal.project_id() != Some(project_id));
+        Ok(())
+    }
+
+    async fn prepare_workbench_remove(
         &self,
         payload: &WorkbenchRemovePayload,
         project: &Project,
-        roots: &[WorkbenchRoot],
-        project_store: &Arc<Mutex<ProjectStore>>,
+        catalog: &ProjectCatalogHandle,
+        stream: &StreamPath,
     ) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
-        self.validate_workbench_remove_roots(project, payload.force)
-            .await?;
-
-        let ProjectSource::GitWorkbench { environment, .. } = &project.source else {
+        let ProjectSource::GitWorkbench {
+            roots, environment, ..
+        } = &project.source
+        else {
             return Err(AppError::invalid(
                 OPERATION,
-                "Expected a workbench environment",
+                "cannot remove non-workbench project as workbench",
             ));
         };
         let removal_phase = match environment {
@@ -8073,12 +7722,13 @@ impl HostHandle {
             protocol::WorkbenchEnvironment::Bubblewrap { lifecycle, .. } => {
                 let phase = match lifecycle {
                     protocol::WorkbenchEnvironmentLifecycle::Active => {
-                        self.persist_workbench_removal_phase(
-                            project_store,
-                            &project.id,
-                            protocol::WorkbenchRemovalPhase::SealArtifacts,
-                        )
-                        .await?;
+                        catalog
+                            .persist_removal_phase(
+                                stream,
+                                payload,
+                                protocol::WorkbenchRemovalPhase::SealArtifacts,
+                            )
+                            .await?;
                         protocol::WorkbenchRemovalPhase::SealArtifacts
                     }
                     protocol::WorkbenchEnvironmentLifecycle::Removing { phase } => *phase,
@@ -8086,15 +7736,14 @@ impl HostHandle {
                 Some(phase)
             }
         };
-
-        let (agent_ids, terminals) = {
+        let (agents, terminals) = {
             let state = self.state.lock().await;
-            let agent_ids = state
+            let agents = state
                 .registry
                 .agent_ids()
                 .into_iter()
-                .filter(|agent_id| {
-                    state.registry.agent_handle(agent_id).is_some_and(|agent| {
+                .filter(|id| {
+                    state.registry.agent_handle(id).is_some_and(|agent| {
                         let start = agent.snapshot();
                         start.project_id.as_ref() == Some(&project.id)
                             || (start.project_id.is_none()
@@ -8112,160 +7761,143 @@ impl HostHandle {
                 .filter(|terminal| terminal.project_id() == Some(&project.id))
                 .cloned()
                 .collect::<Vec<_>>();
-            (agent_ids, terminals)
+            (agents, terminals)
         };
-        for agent_id in agent_ids {
+        for agent_id in agents {
             self.close_agent(&agent_id).await?;
         }
         for terminal in terminals {
             terminal.close().await;
             terminal.wait_for_exit().await;
         }
-
         if matches!(
             environment,
             protocol::WorkbenchEnvironment::Bubblewrap { .. }
         ) {
-            let debug_mcp = self.state.lock().await.debug_mcp.clone();
-            debug_mcp
+            let debug = self.state.lock().await.debug_mcp.clone();
+            debug
                 .stop_workbench(&payload.id)
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         }
-
-        let subscription = {
-            let mut state = self.state.lock().await;
-            if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
-                router.shutdown_all();
-            }
-            state.project_streams.remove(&payload.id)
-        };
-        if let Some(mut subscription) = subscription {
-            subscription.task.abort();
-            if let Err(error) = (&mut subscription.task).await
-                && !error.is_cancelled()
-            {
-                return Err(AppError::internal(OPERATION, anyhow!(error)));
-            }
-        }
+        self.stop_project_services(&payload.id).await?;
         if removal_phase != Some(protocol::WorkbenchRemovalPhase::RemoveResources) {
             crate::workbench::seal(project, payload.force).await?;
             if removal_phase.is_some() {
-                self.persist_workbench_removal_phase(
-                    project_store,
-                    &project.id,
-                    protocol::WorkbenchRemovalPhase::RemoveResources,
-                )
-                .await?;
+                catalog
+                    .persist_removal_phase(
+                        stream,
+                        payload,
+                        protocol::WorkbenchRemovalPhase::RemoveResources,
+                    )
+                    .await?;
             }
         }
-
+        let started = std::time::Instant::now();
         for root in roots {
-            let has_git_metadata =
-                tokio::fs::try_exists(Path::new(&root.worktree_root.0).join(".git"))
-                    .await
-                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            if has_git_metadata {
-                git_worktree_remove(&root.parent_root, &root.worktree_root, payload.force)
-                    .await
-                    .map_err(|error| {
-                        AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                    })?;
-            } else {
-                // A leftover directory without .git may contain recovered work.
-                // Preserve it while removing the stale workbench registration.
-                tracing::warn!(
-                    project_id = %project.id,
-                    worktree_root = %root.worktree_root,
-                    "worktree Git metadata missing during workbench removal; preserving residual files and pruning git worktree bookkeeping"
-                );
-                if let Err(error) = git_worktree_prune(&root.parent_root).await {
-                    tracing::warn!(
-                        project_id = %project.id,
-                        parent_root = %root.parent_root,
-                        error = %error,
-                        "failed to prune git worktrees for root with missing Git metadata"
-                    );
-                }
-            }
-        }
-
-        crate::workbench::finish(environment).await?;
-
-        let (deleted_session_ids, annotations_store) = {
-            let state = self.state.lock().await;
-            let deleted_session_ids = state
-                .session_store
-                .delete_for_project(&payload.id)
+            let metadata = tokio::fs::try_exists(Path::new(&root.worktree_root.0).join(".git"))
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            (
-                deleted_session_ids,
-                state.agents_view_preferences_store.clone(),
-            )
-        };
-        if let Some(store) = annotations_store {
-            let mut store = store.lock().await;
-            for session_id in &deleted_session_ids {
-                store
-                    .remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id.clone())
+            if metadata {
+                git_worktree_remove(&root.parent_root, &root.worktree_root, payload.force)
+                    .await
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            } else {
+                tracing::warn!(target: "tyde::project_operation", stage = "filesystem", "worktree metadata missing; preserving residual files and pruning Git registration");
+                git_worktree_prune(&root.parent_root)
+                    .await
                     .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             }
-            store
-                .remove_project(HostFilterId(LOCAL_HOST_ID.to_owned()), payload.id.clone())
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         }
+        tracing::info!(target: "tyde::project_operation", stage = "filesystem", root_count = roots.len(), elapsed_ms = started.elapsed().as_millis(), "worktree filesystem removal completed");
+        crate::workbench::finish(environment).await?;
+        self.prepare_project_delete(&payload.id, true).await
+    }
 
-        let mut state = self.state.lock().await;
-        let deleted_steering_ids = self
-            .delete_learning_project_rules(&payload.id)
-            .await
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let deleted_sessions = !deleted_session_ids.is_empty();
-        let deleted_session_ids = deleted_session_ids.into_iter().collect();
-        let team_events = state
-            .team_registry
-            .remove_project_refs(payload.id.clone(), deleted_session_ids)
-            .await
-            .map_err(|error| team_registry_error(OPERATION, error))?;
-        state
-            .workflow_run_store
-            .delete_for_project(&payload.id)
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let deleted = {
-            let mut project_store = project_store.lock().await;
-            project_store
-                .delete_workbench(&payload.id)
-                .map_err(|error| project_store_error(OPERATION, error))?
-        };
-
-        cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
-        if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
-            router.shutdown_all();
+    async fn publish_project_catalog(
+        &self,
+        stream: StreamPath,
+        generation: u64,
+        mutation: protocol::ProjectMutation,
+        changes: Vec<ProjectNotifyPayload>,
+        final_commit: bool,
+    ) -> Vec<protocol::ProjectOperationWarning> {
+        let queued = std::time::Instant::now();
+        let operation_stream = stream.clone();
+        let mut warnings = Vec::new();
+        let deleted = changes
+            .iter()
+            .any(|change| matches!(change, ProjectNotifyPayload::Delete { .. }));
+        {
+            let mut state = self.state.lock().await;
+            let queue_ms = queued.elapsed().as_millis();
+            let record_count = changes.len();
+            for change in &changes {
+                if let ProjectNotifyPayload::Upsert { project } = change {
+                    if project.is_removing_workbench() {
+                        if let Some(subscription) = state.project_streams.get(&project.id) {
+                            subscription
+                                .handle
+                                .adopt_catalog(generation, project.clone());
+                        }
+                        continue;
+                    }
+                    match ensure_project_actor(&mut state, project.id.clone()) {
+                        Ok(handle) => {
+                            handle.adopt_catalog(generation, project.clone());
+                            if let Some(router) = state.code_intel_routers.get_mut(&project.id) {
+                                router.retain_roots(&project.root_paths());
+                            }
+                        }
+                        Err(error) => warnings.push(protocol::ProjectOperationWarning {
+                            stage: protocol::ProjectOperationStage::Fanout,
+                            message: error,
+                        }),
+                    }
+                    let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
+                    for path in paths {
+                        if let Err(error) =
+                            subscribe_host_to_project(&mut state, &path, project.id.clone())
+                        {
+                            warnings.push(protocol::ProjectOperationWarning {
+                                stage: protocol::ProjectOperationStage::Fanout,
+                                message: error,
+                            });
+                        }
+                    }
+                    if let Err(error) =
+                        emit_review_list_changed_for_project(&mut state, project.id.clone())
+                    {
+                        warnings.push(protocol::ProjectOperationWarning {
+                            stage: protocol::ProjectOperationStage::Fanout,
+                            message: error,
+                        });
+                    }
+                }
+            }
+            if final_commit {
+                self.project_catalog.published(stream);
+            }
+            for change in changes {
+                fan_out_project_notify(&mut state, change);
+            }
+            if matches!(
+                mutation,
+                protocol::ProjectMutation::Rename(_)
+                    | protocol::ProjectMutation::Delete(_)
+                    | protocol::ProjectMutation::RemoveWorkbench(_)
+            ) {
+                fan_out_current_agents_view_preferences(&mut state);
+            }
+            tracing::info!(target: "tyde::project_operation", stage = "fanout", operation_stream = %operation_stream, generation, record_count, subscriber_count = state.host_streams.len(), queue_ms, elapsed_ms = queued.elapsed().as_millis(), "durable catalog records published");
         }
-        if let Some(subscription) = state.project_streams.remove(&payload.id) {
-            subscription.task.abort();
+        if deleted && let Err(error) = self.fan_out_session_lists().await {
+            warnings.push(protocol::ProjectOperationWarning {
+                stage: protocol::ProjectOperationStage::Fanout,
+                message: error.to_string(),
+            });
         }
-        state
-            .terminal_streams
-            .retain(|_, terminal| terminal.project_id() != Some(&payload.id));
-        for id in deleted_steering_ids {
-            fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
-        }
-        fan_out_team_registry_events(&mut state, team_events).await;
-        fan_out_project_notify(
-            &mut state,
-            ProjectNotifyPayload::Delete { project: deleted },
-        )
-        .await;
-        fan_out_current_agents_view_preferences(&mut state).await;
-        if deleted_sessions {
-            fan_out_session_lists(&mut state).await;
-        }
-        drop(state);
-        self.update_workflow_watcher_targets_and_reload("workbench_remove")
-            .await?;
-        Ok(())
+        warnings
     }
 
     async fn validate_workbench_remove_roots(
@@ -8295,7 +7927,6 @@ impl HostHandle {
         };
 
         let parent = {
-            let project_store = project_store.lock().await;
             project_store.get(parent_project_id).ok_or_else(|| {
                 AppError::internal_message(
                     OPERATION,
@@ -8511,7 +8142,8 @@ impl HostHandle {
         const OPERATION: &str = "steering_upsert";
         let mut state = self.state.lock().await;
         if let SteeringScope::Project(project_id) = &payload.steering.scope
-            && !project_exists(&state.project_store, project_id, OPERATION).await?
+            && (state.project_store.is_removing(project_id)
+                || !project_exists(&state.project_store, project_id, OPERATION)?)
         {
             return Err(AppError::not_found(
                 OPERATION,
@@ -8526,7 +8158,7 @@ impl HostHandle {
             .steering(payload.steering)
             .await
             .map_err(|error| steering_store_error(OPERATION, error))?;
-        fan_out_steering_notify(&mut state, SteeringNotifyPayload::Upsert { steering }).await;
+        fan_out_steering_notify(&mut state, SteeringNotifyPayload::Upsert { steering });
         Ok(())
     }
 
@@ -8538,7 +8170,7 @@ impl HostHandle {
             .delete_steering(payload.id)
             .await
             .map_err(|error| steering_store_error(OPERATION, error))?;
-        fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
+        fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id });
         Ok(())
     }
 
@@ -9065,7 +8697,7 @@ impl HostHandle {
         &self,
         agent_id: &AgentId,
     ) -> Result<SessionId, String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut changes = self.subscribe_agent_status_changes().await;
         loop {
             let (session_id, status_handle) = {
                 let state = self.state.lock().await;
@@ -9077,20 +8709,18 @@ impl HostHandle {
             if let Some(session_id) = session_id {
                 return Ok(session_id);
             }
-            if let Some(status_handle) = status_handle {
-                let status = status_handle.snapshot().await;
-                if status.terminated {
-                    return Err(status.last_error.unwrap_or_else(|| {
-                        format!("agent {agent_id} terminated before session binding")
-                    }));
-                }
+            let status_handle =
+                status_handle.ok_or("agent was removed before session publication")?;
+            let status = status_handle.snapshot().await;
+            if status.terminated {
+                return Err(status
+                    .last_error
+                    .unwrap_or_else(|| "agent terminated before session publication".into()));
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for team member agent {agent_id} session binding"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            changes
+                .changed()
+                .await
+                .map_err(|_| "agent session publication owner stopped".to_owned())?;
         }
     }
 
@@ -9123,7 +8753,6 @@ impl HostHandle {
             return Err(format!("team member {} has no project_ids", member.id));
         }
         let project_store = { Arc::clone(&self.state.lock().await.project_store) };
-        let project_store = project_store.lock().await;
         let mut roots = Vec::new();
         let mut seen = HashSet::new();
         for project_id in &member.project_ids {
@@ -9179,7 +8808,7 @@ impl HostHandle {
             .rename_team(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9192,7 +8821,7 @@ impl HostHandle {
             .delete_team(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9205,7 +8834,7 @@ impl HostHandle {
             .set_manager(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9251,7 +8880,7 @@ impl HostHandle {
             .delete_member(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9263,7 +8892,7 @@ impl HostHandle {
             .reset_store()
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9315,7 +8944,7 @@ impl HostHandle {
             .shuffle_member_suggestion(payload)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
@@ -9384,13 +9013,13 @@ impl HostHandle {
         let events = mutate(registry, refs)
             .await
             .map_err(|error| team_registry_error(operation, error))?;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
         Ok(())
     }
 
     async fn fan_out_team_registry_events(&self, events: TeamRegistryEvents) {
         let mut state = self.state.lock().await;
-        fan_out_team_registry_events(&mut state, events).await;
+        fan_out_team_registry_events(&mut state, events);
     }
 
     pub(crate) async fn list_sessions(
@@ -9532,18 +9161,20 @@ impl HostHandle {
                 deletion.drop_guard(),
             )
         };
+        if let Some(store) = annotations_store {
+            let session_id = session_id.clone();
+            store
+                .call(move |store| {
+                    store.remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id)
+                })
+                .await
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+        }
         session_store
             .delete(&session_id)
             .await
             .map_err(|error| session_store_error(OPERATION, error))?;
-        if let Some(store) = annotations_store {
-            store
-                .lock()
-                .await
-                .remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id.clone())
-                .map_err(|error| AppError::invalid(OPERATION, error))?;
-        }
-        self.fan_out_session_lists().await;
+
         let mut state = self.state.lock().await;
         for snapshot in state
             .closed_agent_usage_snapshots
@@ -9552,16 +9183,102 @@ impl HostHandle {
         {
             snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
         }
-        fan_out_current_agents_view_preferences(&mut state).await;
+        fan_out_current_agents_view_preferences(&mut state);
         drop(state);
         self.fan_out_task_token_usages().await;
+        self.fan_out_session_lists().await.map_err(|error| AppError::internal(OPERATION,
+            anyhow!("Saved session deletion committed; session-list publication failed. Do not repeat the deletion: {error}")))?;
         drop(deletion_guard);
         Ok(())
     }
 
-    pub(crate) async fn fan_out_session_lists(&self) {
-        let mut state = self.state.lock().await;
-        fan_out_session_lists(&mut state).await;
+    pub(crate) async fn fan_out_session_lists(&self) -> AppResult<()> {
+        const OPERATION: &str = "session_list_publish";
+        let (store, storage, readers) = {
+            let mut state = self.state.lock().await;
+            let readers = state
+                .host_streams
+                .iter_mut()
+                .map(|(path, subscriber)| {
+                    subscriber.session_list_read_generation += 1;
+                    (path.clone(), subscriber.session_list_read_generation)
+                })
+                .collect::<Vec<_>>();
+            (
+                state.session_store.clone(),
+                state.backend_storage.clone(),
+                readers,
+            )
+        };
+        #[cfg(feature = "test-support")]
+        let gate = self
+            .state
+            .lock()
+            .await
+            .session_list_publication_test_gate
+            .take();
+        let result = store
+            .summaries_for_scope_with_backend_storage(SessionListScope::AllSessions, &storage)
+            .await;
+        #[cfg(feature = "test-support")]
+        if let Some((gate, _)) = &gate {
+            wait_for_spawn_operation_test_gate_inner(gate).await;
+        }
+        let result = match result {
+            Ok(sessions) => {
+                publish_session_lists(&mut *self.state.lock().await, sessions, readers);
+                Ok(())
+            }
+            Err(error) => {
+                let error = AppError::internal(
+                    OPERATION,
+                    anyhow!("Cannot publish current saved sessions: {error}"),
+                );
+                let mut state = self.state.lock().await;
+                for subscriber in state.host_streams.values_mut() {
+                    let payload =
+                        error.to_payload(subscriber.stream.path().clone(), FrameKind::ListSessions);
+                    let value = serde_json::to_value(payload)
+                        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                    let _ = emit_or_queue_host_frame(subscriber, FrameKind::CommandError, value);
+                }
+                Err(error)
+            }
+        };
+        #[cfg(feature = "test-support")]
+        if let Some((_, finished)) = gate {
+            let _ = finished.send(());
+        }
+        result
+    }
+
+    async fn publish_agent_background_work(&self, agent_id: &AgentId) {
+        let handles = {
+            let state = self.state.lock().await;
+            state.registry.agent_status_handle(agent_id).map(|own| {
+                let children = state
+                    .registry
+                    .agent_ids()
+                    .iter()
+                    .filter(|child| {
+                        state.registry.parent_agent_id(child).as_ref() == Some(agent_id)
+                    })
+                    .filter_map(|child| state.registry.agent_status_handle(child))
+                    .collect::<Vec<_>>();
+                (own, children)
+            })
+        };
+        let mut has_background_work = false;
+        if let Some((own, children)) = handles {
+            let status = own.snapshot().await;
+            if !status.terminated {
+                has_background_work = status.has_background_work;
+                for child in children {
+                    has_background_work |= child.snapshot().await.is_active();
+                }
+            }
+        }
+        publish_agent_background_work(&mut *self.state.lock().await, agent_id, has_background_work);
     }
 
     pub(crate) async fn fan_out_task_token_usages(&self) {
@@ -9578,7 +9295,7 @@ impl HostHandle {
         .await;
         attach_learning_accounting(&mut payloads, self.config.usage().await);
         let mut state = self.state.lock().await;
-        fan_out_task_token_usages(&mut state, payloads).await;
+        fan_out_task_token_usages(&mut state, payloads);
     }
 
     pub(crate) async fn backend_native_settings_write(
@@ -10316,22 +10033,27 @@ impl HostHandle {
         payload: SetAgentsViewPreferencesPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "set_agents_view_preferences";
-        let mut state = self.state.lock().await;
-        let Some(store) = state.agents_view_preferences_store.clone() else {
-            return Err(AppError::invalid(
-                OPERATION,
-                "agents view preferences are owned by the primary local host",
-            ));
+        let response = {
+            let state = self.state.lock().await;
+            let store = state.agents_view_preferences_store.clone().ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    "agents view preferences are owned by the primary local host",
+                )
+            })?;
+
+            let update = Self::canonicalize_agents_view_preferences_update(&state, payload.update)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            store
+                .enqueue(move |store| store.apply(update))
+                .map_err(|error| AppError::invalid(OPERATION, error))?
         };
-        let update = Self::canonicalize_agents_view_preferences_update(&state, payload.update)
-            .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let mut snapshot = store
-            .lock()
+        response
             .await
-            .apply(update)
+            .map_err(|_| AppError::internal(OPERATION, anyhow!("preferences owner stopped")))?
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
-        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state);
         Ok(())
     }
 
@@ -10340,86 +10062,132 @@ impl HostHandle {
         payload: SetAgentsSmartViewsPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "set_agents_smart_views";
-        let mut state = self.state.lock().await;
-        let Some(store) = state.agents_view_preferences_store.clone() else {
-            return Err(AppError::invalid(
-                OPERATION,
-                "agents view preferences are owned by the primary local host",
-            ));
+        let response = {
+            let state = self.state.lock().await;
+            let store = state.agents_view_preferences_store.clone().ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    "agents view preferences are owned by the primary local host",
+                )
+            })?;
+
+            let update = Ok::<_, String>(payload.update)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            store
+                .enqueue(move |store| store.apply_smart_views(update))
+                .map_err(|error| AppError::invalid(OPERATION, error))?
         };
-        let mut snapshot = store
-            .lock()
+        response
             .await
-            .apply_smart_views(payload.update)
+            .map_err(|_| AppError::internal(OPERATION, anyhow!("preferences owner stopped")))?
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
-        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state);
         Ok(())
     }
 
     pub(crate) async fn set_agent_tags(&self, payload: SetAgentTagsPayload) -> AppResult<()> {
         const OPERATION: &str = "set_agent_tags";
-        let mut state = self.state.lock().await;
-        let Some(store) = state.agents_view_preferences_store.clone() else {
-            return Err(AppError::invalid(
-                OPERATION,
-                "agents view preferences are owned by the primary local host",
-            ));
+        let response = {
+            let state = self.state.lock().await;
+            let store = state.agents_view_preferences_store.clone().ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    "agents view preferences are owned by the primary local host",
+                )
+            })?;
+            let resolver = AnnotationTargetResolver::new(&state);
+            let update = canonicalize_agent_tags_update(payload.update, &resolver)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            store
+                .enqueue(move |store| {
+                    store.apply_tags(update, |target| resolver.canonicalize(target))
+                })
+                .map_err(|error| AppError::invalid(OPERATION, error))?
         };
-        let resolver = AnnotationTargetResolver::new(&state);
-        let update = canonicalize_agent_tags_update(payload.update, &resolver)
-            .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let mut snapshot = store
-            .lock()
+        response
             .await
-            .apply_tags(update, |target| resolver.canonicalize(target))
+            .map_err(|_| AppError::internal(OPERATION, anyhow!("preferences owner stopped")))?
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
-        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state);
         Ok(())
     }
 
     pub(crate) async fn set_agent_pins(&self, payload: SetAgentPinsPayload) -> AppResult<()> {
         const OPERATION: &str = "set_agent_pins";
-        let mut state = self.state.lock().await;
-        let Some(store) = state.agents_view_preferences_store.clone() else {
-            return Err(AppError::invalid(
-                OPERATION,
-                "agents view preferences are owned by the primary local host",
-            ));
+        let response = {
+            let state = self.state.lock().await;
+            let store = state.agents_view_preferences_store.clone().ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    "agents view preferences are owned by the primary local host",
+                )
+            })?;
+            let (unpin, transient) = match &payload.update {
+                AgentPinsUpdate::Pin { target } => (
+                    false,
+                    matches!(target, AgentAnnotationTarget::TransientAgent { .. }),
+                ),
+                AgentPinsUpdate::Unpin { target } => (
+                    true,
+                    matches!(target, AgentAnnotationTarget::TransientAgent { .. }),
+                ),
+            };
+            let resolver = AnnotationTargetResolver::new(&state);
+            let update = canonicalize_agent_pins_update(payload.update, &resolver)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            let canonical_session = match &update {
+                AgentPinsUpdate::Pin { target } | AgentPinsUpdate::Unpin { target } => {
+                    matches!(target, AgentAnnotationTarget::Session { .. })
+                }
+            };
+            tracing::debug!(
+                unpin,
+                requested_transient = transient,
+                canonical_session,
+                "enqueue canonical pin mutation"
+            );
+            store
+                .enqueue(move |store| {
+                    store.apply_pins(update, |target| resolver.canonicalize(target))
+                })
+                .map_err(|error| AppError::invalid(OPERATION, error))?
         };
-        let resolver = AnnotationTargetResolver::new(&state);
-        let update = canonicalize_agent_pins_update(payload.update, &resolver)
-            .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let mut snapshot = store
-            .lock()
+        response
             .await
-            .apply_pins(update, |target| resolver.canonicalize(target))
+            .map_err(|_| AppError::internal(OPERATION, anyhow!("preferences owner stopped")))?
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
-        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state);
         Ok(())
     }
 
     pub(crate) async fn set_agent_groups(&self, payload: SetAgentGroupsPayload) -> AppResult<()> {
         const OPERATION: &str = "set_agent_groups";
-        let mut state = self.state.lock().await;
-        let Some(store) = state.agents_view_preferences_store.clone() else {
-            return Err(AppError::invalid(
-                OPERATION,
-                "agents view preferences are owned by the primary local host",
-            ));
+        let response = {
+            let state = self.state.lock().await;
+            let store = state.agents_view_preferences_store.clone().ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    "agents view preferences are owned by the primary local host",
+                )
+            })?;
+            let resolver = AnnotationTargetResolver::new(&state);
+            let update = canonicalize_agent_groups_update(payload.update, &resolver)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            store
+                .enqueue(move |store| {
+                    store.apply_groups(update, |target| resolver.canonicalize(target))
+                })
+                .map_err(|error| AppError::invalid(OPERATION, error))?
         };
-        let resolver = AnnotationTargetResolver::new(&state);
-        let update = canonicalize_agent_groups_update(payload.update, &resolver)
-            .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let mut snapshot = store
-            .lock()
+        response
             .await
-            .apply_groups(update, |target| resolver.canonicalize(target))
+            .map_err(|_| AppError::internal(OPERATION, anyhow!("preferences owner stopped")))?
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
-        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state);
         Ok(())
     }
 
@@ -10443,7 +10211,11 @@ impl HostHandle {
     ) -> Result<Vec<AgentOrderKey>, String> {
         let mut live_sessions = HashMap::<AgentId, Option<SessionId>>::new();
         for agent_id in state.registry.agent_ids() {
-            let session_id = state.agent_sessions.get(&agent_id).cloned();
+            let session_id = state
+                .agent_sessions
+                .get(&agent_id)
+                .or_else(|| state.pending_agent_sessions.get(&agent_id))
+                .cloned();
             live_sessions.insert(agent_id, session_id);
         }
 
@@ -10988,6 +10760,15 @@ impl HostHandle {
         host_output_stream: &Stream,
         payload: TerminalCreatePayload,
     ) -> AppResult<Option<TerminalHandle>> {
+        let _project_binding = match &payload.target {
+            TerminalLaunchTarget::Project { project_id, .. } => Some(
+                self.project_catalog
+                    .reserve_bindings(vec![project_id.clone()])
+                    .await
+                    .map_err(|error| AppError::conflict("terminal_create", error))?,
+            ),
+            _ => None,
+        };
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
@@ -11007,7 +10788,7 @@ impl HostHandle {
         let launch_project_id = launch.project_id.clone();
         if let Some(project_id) = launch_project_id.as_ref() {
             let state = self.state.lock().await;
-            if state.removing_projects.contains(project_id) {
+            if state.project_store.is_removing(project_id) {
                 return Err(AppError::conflict(
                     OPERATION,
                     format!(
@@ -11026,13 +10807,8 @@ impl HostHandle {
 
         {
             let mut state = self.state.lock().await;
-            // Re-check under the same lock that guards `terminal_streams`:
-            // workbench removal inserts into `removing_projects` before it
-            // validates blockers, so either this terminal is registered in
-            // time for the blocker check to see it, or the removal marker
-            // is visible here and the terminal is rejected.
             if let Some(project_id) = launch_project_id.as_ref()
-                && state.removing_projects.contains(project_id)
+                && state.project_store.is_removing(project_id)
             {
                 drop(state);
                 terminal.close().await;
@@ -11487,7 +11263,6 @@ impl HostHandle {
     ) -> AppResult<bool> {
         let (
             close_targets,
-            host_streams,
             session_store,
             closing_sessions_by_agent,
             backend_storage,
@@ -11506,23 +11281,6 @@ impl HostHandle {
                 return Ok(false);
             }
             let close_preparations = close_targets.iter().map(|(_, handle)| handle.prepare_close().ok_or_else(|| AppError::conflict("close_agent", "A descendant is already closing; finish that close before closing this subtree"))).collect::<AppResult<Vec<_>>>()?;
-            let visible_host_streams = recorded_visibility_only
-                .then(|| state.agent_visibility.visible_host_streams(agent_id));
-            let host_streams = state
-                .host_streams
-                .iter()
-                .filter(|(path, _)| match &visible_host_streams {
-                    Some(visible) => visible.contains(*path),
-                    None => true,
-                })
-                .map(|(path, subscriber)| {
-                    (
-                        path.clone(),
-                        subscriber.stream.clone(),
-                        subscriber.bootstrapped,
-                    )
-                })
-                .collect::<Vec<_>>();
             let closing_sessions_by_agent = close_targets
                 .iter()
                 .filter_map(|(agent_id, handle)| {
@@ -11537,7 +11295,6 @@ impl HostHandle {
                 .collect::<HashMap<_, _>>();
             (
                 close_targets,
-                host_streams,
                 Arc::clone(&state.session_store),
                 closing_sessions_by_agent,
                 state.backend_storage.clone(),
@@ -11558,15 +11315,6 @@ impl HostHandle {
             .iter()
             .map(|(agent_id, _)| agent_id.clone())
             .collect::<Vec<_>>();
-        let bootstrapping_paths = host_streams
-            .iter()
-            .filter_map(|(path, _, bootstrapped)| (!*bootstrapped).then_some(path.clone()))
-            .collect::<Vec<_>>();
-        let mut live_streams = host_streams
-            .into_iter()
-            .filter_map(|(path, stream, bootstrapped)| bootstrapped.then_some((path, stream)))
-            .collect::<Vec<_>>();
-        let mut dead_paths = Vec::new();
         self.withdraw_unowned_restoration_markers(
             &closing_session_ids,
             &session_store,
@@ -11647,150 +11395,138 @@ impl HostHandle {
             )
             .await?;
         }
+        let mut cleanup_events = Vec::new();
+        for closed_agent_id in &close_ids {
+            let (parent, remove_annotations, annotations, teams, swarms) = {
+                let state = self.state.lock().await;
+                let snapshot_session = state
+                    .registry
+                    .agent_handle(closed_agent_id)
+                    .and_then(|agent| agent.snapshot().session_id);
+                let remove_annotations = state.pending_agent_sessions.contains_key(closed_agent_id)
+                    || state
+                        .agent_sessions
+                        .get(closed_agent_id)
+                        .cloned()
+                        .or(snapshot_session)
+                        .is_none();
+                (
+                    state.registry.parent_agent_id(closed_agent_id),
+                    remove_annotations,
+                    state.agents_view_preferences_store.clone(),
+                    state.team_registry.clone(),
+                    state.swarm_registry.clone(),
+                )
+            };
+            let session = closing_sessions_by_agent.get(closed_agent_id).cloned();
+            let member = close_targets
+                .iter()
+                .find(|(id, _)| id == closed_agent_id)
+                .is_some_and(|(_, handle)| handle.snapshot().swarm_membership.is_some());
+            let swarm_events = if member {
+                swarms
+                    .status(
+                        closed_agent_id.clone(),
+                        AgentControlStatus::Idle,
+                        session,
+                        true,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| AppError::internal("close_agent", anyhow!(error.message)))?
+            } else {
+                Vec::new()
+            };
+            if remove_annotations && let Some(store) = annotations {
+                let agent = closed_agent_id.clone();
+                store
+                    .call(move |store| {
+                        store.remove_transient_agent(HostFilterId(LOCAL_HOST_ID.to_owned()), agent)
+                    })
+                    .await
+                    .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+            }
+            let team_events = teams
+                .clear_binding_by_agent(closed_agent_id.clone())
+                .await
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+            cleanup_events.push((closed_agent_id.clone(), parent, swarm_events, team_events));
+        }
+        self.fan_out_session_lists().await?;
         for preparation in close_preparations {
             preparation.commit();
         }
-        if let Some((stream, completed)) = completed_compaction {
-            send_agent_compact_notify(&stream, completed);
-        }
-        for (target_agent_id, _) in close_targets {
-            let payload = AgentClosedPayload {
-                agent_id: target_agent_id,
-            };
-            if !bootstrapping_paths.is_empty() {
-                let payload_value = serde_json::to_value(&payload)
-                    .expect("failed to serialize AgentClosed payload for host stream fanout");
-                let mut state = self.state.lock().await;
-                for path in &bootstrapping_paths {
-                    let Some(subscriber) = state.host_streams.get_mut(path) else {
-                        continue;
-                    };
-                    if emit_or_queue_host_frame(
-                        subscriber,
-                        FrameKind::AgentClosed,
-                        payload_value.clone(),
-                    )
-                    .is_err()
+        let mut parents = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            if let Some((stream, completed)) = completed_compaction {
+                send_agent_compact_notify(&stream, completed);
+            }
+            let mut dead_paths = Vec::new();
+            for (closed_agent_id, parent, swarm_events, team_events) in cleanup_events {
+                let visible = recorded_visibility_only.then(|| {
+                    state
+                        .agent_visibility
+                        .visible_host_streams(&closed_agent_id)
+                });
+                let payload = serde_json::to_value(AgentClosedPayload {
+                    agent_id: closed_agent_id.clone(),
+                })
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+                for (path, subscriber) in &mut state.host_streams {
+                    if visible.as_ref().is_none_or(|paths| paths.contains(path))
+                        && emit_or_queue_host_frame(
+                            subscriber,
+                            FrameKind::AgentClosed,
+                            payload.clone(),
+                        )
+                        .is_err()
                     {
                         dead_paths.push(path.clone());
                     }
                 }
-            }
-            let mut failed_paths = Vec::new();
-            for (path, stream) in &live_streams {
-                if emit_agent_closed_for_stream(&payload, stream)
-                    .await
-                    .is_err()
-                {
-                    failed_paths.push(path.clone());
+                let removed = state.registry.remove_agent(&closed_agent_id).is_some();
+                tracing::debug!(
+                    removed,
+                    registry_agent_count = state.registry.agent_ids().len(),
+                    "canonical close registry transition"
+                );
+                state.agent_visibility.remove_agent(&closed_agent_id);
+                state.spawn_publication_claims.remove(&closed_agent_id);
+                state.agent_sessions.remove(&closed_agent_id);
+                state.pending_agent_sessions.remove(&closed_agent_id);
+                state
+                    .pending_session_summary_count_updates
+                    .remove(&closed_agent_id);
+                state.agent_activity_summaries.remove(&closed_agent_id);
+                for subscriber in state.host_streams.values_mut() {
+                    forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
+                    subscriber.last_task_token_usages.clear();
+                }
+                swarms::fan_out_swarm_events_locked(&mut state, swarm_events);
+                fan_out_team_registry_events(&mut state, team_events);
+                if let Some(parent) = parent {
+                    parents.push(parent);
                 }
             }
-            if !failed_paths.is_empty() {
-                live_streams.retain(|(path, _)| !failed_paths.contains(path));
-                dead_paths.extend(failed_paths);
+            for path in dead_paths {
+                state.host_streams.remove(&path);
+                state.agent_visibility.remove_host_stream(&path);
             }
         }
-
-        dead_paths.sort_by(|left, right| left.0.cmp(&right.0));
-        dead_paths.dedup();
-
-        let mut state = self.state.lock().await;
-        for path in dead_paths {
-            state.host_streams.remove(&path);
-            state.agent_visibility.remove_host_stream(&path);
-        }
-
         self.restart
             .agents
             .lock()
             .expect("restart handles mutex poisoned")
             .retain(|handle| !close_ids.contains(&handle.snapshot().agent_id));
-        for closed_agent_id in close_ids {
-            let session = closing_sessions_by_agent.get(&closed_agent_id).cloned();
-            let parent = state.registry.parent_agent_id(&closed_agent_id);
-            let removed = state.registry.remove_agent(&closed_agent_id);
-            #[cfg(feature = "test-support")]
-            tracing::warn!(
-                registry_agent_count = state.registry.agent_ids().len(),
-                removed = removed.is_some(),
-                "Swarm retirement diagnostic: registry removed before canonical close publication"
-            );
-            match state
-                .swarm_registry
-                .status(
-                    closed_agent_id.clone(),
-                    AgentControlStatus::Idle,
-                    session,
-                    true,
-                    None,
-                )
-                .await
-            {
-                Ok(events) => swarms::fan_out_swarm_events_locked(&mut state, events),
-                Err(error) => {
-                    tracing::error!(code = ?error.code, "Closed swarm member could not be persisted")
-                }
-            }
-            if let Some(parent) = parent {
-                fan_out_agent_background_work(&mut state, &parent).await;
-            }
-            state.agent_visibility.remove_agent(&closed_agent_id);
-            state.spawn_publication_claims.remove(&closed_agent_id);
-            if removed.is_none() {
-                tracing::debug!(
-                    agent_id = %closed_agent_id,
-                    "agent was already removed before close cleanup completed"
-                );
-                continue;
-            }
-
-            let removed_session_id = state.agent_sessions.remove(&closed_agent_id);
-            let removed_pending_session_id = state.pending_agent_sessions.remove(&closed_agent_id);
-            state
-                .pending_session_summary_count_updates
-                .remove(&closed_agent_id);
-            state.agent_activity_summaries.remove(&closed_agent_id);
-            for subscriber in state.host_streams.values_mut() {
-                forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
-                subscriber.last_task_token_usages.clear();
-            }
-            let snapshot_session_id = removed
-                .as_ref()
-                .and_then(|agent| agent.snapshot().session_id);
-            if (removed_pending_session_id.is_some()
-                || removed_session_id.or(snapshot_session_id).is_none())
-                && let Some(store) = state.agents_view_preferences_store.clone()
-                && let Err(error) = store.lock().await.remove_transient_agent(
-                    HostFilterId(LOCAL_HOST_ID.to_owned()),
-                    closed_agent_id.clone(),
-                )
-            {
-                tracing::warn!(
-                    agent_id = %closed_agent_id,
-                    error = %error,
-                    "failed to remove transient agent annotations during close cleanup"
-                );
-            }
-            match state
-                .team_registry
-                .clear_binding_by_agent(closed_agent_id.clone())
-                .await
-            {
-                Ok(events) => fan_out_team_registry_events(&mut state, events).await,
-                Err(error) => {
-                    tracing::warn!(
-                        agent_id = %closed_agent_id,
-                        error = %error,
-                        "failed to clear team binding while closing agent"
-                    );
-                }
-            }
+        for parent in parents {
+            self.publish_agent_background_work(&parent).await;
         }
-        fan_out_session_lists(&mut state).await;
-        fan_out_current_agents_view_preferences(&mut state).await;
-        drop(state);
+        {
+            let mut state = self.state.lock().await;
+            fan_out_current_agents_view_preferences(&mut state);
+        }
         self.fan_out_task_token_usages().await;
-
         Ok(true)
     }
 
@@ -12572,35 +12308,16 @@ impl HostHandle {
         {
             payload.project_id = Some(project_id);
         }
-        if let Some(project_id) = payload.project_id.as_ref() {
-            let actor = self.project_lifecycle_for_project(project_id).await?;
-            notify_workbench_spawn_waiting_test_hook(self);
-            return actor
-                .request(|reply| lifecycle::Command::Spawn {
-                    payload: Box::new(payload),
-                    caller_agent_id: caller_agent_id.cloned(),
-                    input_origin,
-                    workflow,
-                    reply,
-                })
-                .await?;
-        }
-        self.spawn_agent_from_agent_control_serialized(
-            payload,
-            caller_agent_id,
-            input_origin,
-            workflow,
-        )
-        .await
-    }
-
-    async fn spawn_agent_from_agent_control_serialized(
-        &self,
-        mut payload: SpawnAgentPayload,
-        caller_agent_id: Option<&AgentId>,
-        input_origin: protocol::MessageOrigin,
-        workflow: Option<AgentWorkflowMetadata>,
-    ) -> Result<AgentId, String> {
+        notify_workbench_spawn_waiting_test_hook(self);
+        let _project_binding = if let Some(project_id) = payload.project_id.as_ref() {
+            Some(
+                self.project_catalog
+                    .reserve_bindings(vec![project_id.clone()])
+                    .await?,
+            )
+        } else {
+            None
+        };
         let requested_roots = match &payload.params {
             SpawnAgentParams::New {
                 workspace_roots, ..
@@ -12678,15 +12395,13 @@ impl HostHandle {
             return Ok(requested.to_vec());
         };
         let state = self.state.lock().await;
-        if state.removing_projects.contains(project_id) {
+        if state.project_store.is_removing(project_id) {
             return Err(format!(
                 "cannot spawn agent in workbench {project_id} because it is being removed"
             ));
         }
         let project = state
             .project_store
-            .lock()
-            .await
             .list()?
             .into_iter()
             .find(|project| &project.id == project_id)
@@ -12755,6 +12470,35 @@ impl HostHandle {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn hold_preferences_owner_for_test(
+        &self,
+        entered: oneshot::Sender<()>,
+        held: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), String> {
+        let store = self
+            .state
+            .lock()
+            .await
+            .agents_view_preferences_store
+            .clone()
+            .ok_or("preferences owner is unavailable")?;
+        drop(store.enqueue(move |_| {
+            entered
+                .send(())
+                .map_err(|_| "preferences barrier observer closed".to_owned())?;
+            held.recv()
+                .map_err(|_| "preferences barrier was cancelled".to_owned())
+        })?);
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn stop_workflow_watcher_for_test(&self) -> Result<(), String> {
+        let watcher = self.state.lock().await.workflow_watcher.clone();
+        watcher.stop_for_test().await
+    }
+
     pub(crate) async fn refresh_workflows(&self) -> AppResult<()> {
         self.reload_workflows_and_notify("workflow_refresh").await
     }
@@ -12768,15 +12512,26 @@ impl HostHandle {
         reason: &'static str,
         extra_diagnostic: Option<WorkflowDiagnostic>,
     ) -> AppResult<()> {
+        let generation = self.project_catalog.generation();
+        let projects = self
+            .project_catalog
+            .list()
+            .map_err(|error| project_store_error(reason, error))?;
+        let project_count = projects.len();
+        let queued = std::time::Instant::now();
+        let (catalog, locations) = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let mut catalog = WorkflowCatalog::discover(&projects);
+            if let Some(diagnostic) = extra_diagnostic { catalog.push_diagnostic(diagnostic); }
+            let locations = workflow_catalog_locations(&projects);
+            tracing::info!(target: "tyde::project_operation", stage = "workflow", generation, project_count, queue_ms = started.duration_since(queued).as_millis(), elapsed_ms = started.elapsed().as_millis(), "workflow discovery completed outside host ownership");
+            (catalog, locations)
+        }).await.map_err(|error| AppError::internal(reason, anyhow!(error)))?;
         let mut state = self.state.lock().await;
-        let projects = state.project_store.lock().await.list().map_err(|error| {
-            AppError::internal_message(reason, error.to_string(), anyhow!(error.to_string()))
-        })?;
-        let mut catalog = WorkflowCatalog::discover(&projects);
-        if let Some(diagnostic) = extra_diagnostic {
-            catalog.push_diagnostic(diagnostic);
+        if state.project_store.generation() != generation {
+            tracing::info!(target: "tyde::project_operation", stage = "workflow", generation, "discarding superseded workflow discovery");
+            return Ok(());
         }
-        let locations = workflow_catalog_locations(&projects);
         let payload = WorkflowNotifyPayload {
             summaries: catalog.summaries(),
             diagnostics: catalog.diagnostics(),
@@ -12784,28 +12539,22 @@ impl HostHandle {
         };
         state.workflow_catalog = catalog;
         state.workflow_locations = locations;
-        fan_out_workflow_notify(&mut state, payload).await;
+        fan_out_workflow_notify(&mut state, payload);
         Ok(())
     }
 
     async fn update_workflow_watcher_targets(&self) -> AppResult<()> {
-        let (watcher, targets) = {
-            let state = self.state.lock().await;
-            let projects = state.project_store.lock().await.list().map_err(|error| {
-                AppError::internal_message(
-                    "workflow_watch_targets",
-                    error.to_string(),
-                    anyhow!(error.to_string()),
-                )
-            })?;
-            (
-                state.workflow_watcher.clone(),
-                workflow_watch_dirs(&projects),
-            )
-        };
-        watcher.set_targets(targets).await.map_err(|error| {
-            AppError::internal_message("workflow_watch_targets", error.clone(), anyhow!(error))
-        })
+        let generation = self.project_catalog.generation();
+        let projects = self
+            .project_catalog
+            .list()
+            .map_err(|error| project_store_error("workflow_watch_targets", error))?;
+        let targets = workflow_watch_dirs(&projects);
+        let watcher = self.state.lock().await.workflow_watcher.clone();
+        watcher
+            .set_targets(generation, targets)
+            .await
+            .map_err(|error| AppError::internal("workflow_watch_targets", anyhow!(error)))
     }
 
     async fn update_workflow_watcher_targets_and_reload(
@@ -12821,7 +12570,7 @@ impl HostHandle {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<WorkflowTargetsResponse, String> {
         let state = self.state.lock().await;
-        let projects = state.project_store.lock().await.list()?;
+        let projects = state.project_store.list()?;
         let mut target_projects = Vec::new();
         match caller_agent_id {
             Some(agent_id) => {
@@ -12952,7 +12701,7 @@ impl HostHandle {
 
     async fn fresh_workflow_catalog_for_save(&self) -> Result<WorkflowCatalog, String> {
         let state = self.state.lock().await;
-        let projects = state.project_store.lock().await.list()?;
+        let projects = state.project_store.list()?;
         Ok(WorkflowCatalog::discover(&projects))
     }
 
@@ -12966,8 +12715,6 @@ impl HostHandle {
                 let state = self.state.lock().await;
                 let project = state
                     .project_store
-                    .lock()
-                    .await
                     .get(project_id)
                     .ok_or_else(|| format!("unknown project_id {project_id}"))?;
                 if !project
@@ -12993,6 +12740,16 @@ impl HostHandle {
 
     pub(crate) async fn trigger_workflow(&self, payload: TriggerWorkflowPayload) -> AppResult<()> {
         const OPERATION: &str = "trigger_workflow";
+        let _project_binding = match payload.project_id.as_ref() {
+            Some(id) => Some(
+                self.project_catalog
+                    .reserve_bindings(vec![id.clone()])
+                    .await
+                    .map_err(|error| AppError::conflict(OPERATION, error))?,
+            ),
+            None => None,
+        };
+
         let workflow_id = payload.workflow_id;
         let project_id = payload.project_id;
         let (definition, workspace_roots, workflow_mcp, settings, use_mock_backend) = {
@@ -13004,14 +12761,9 @@ impl HostHandle {
                     AppError::not_found(OPERATION, format!("unknown workflow {workflow_id}"))
                 })?;
             let workspace_roots = if let Some(project_id) = project_id.as_ref() {
-                let project = state
-                    .project_store
-                    .lock()
-                    .await
-                    .get(project_id)
-                    .ok_or_else(|| {
-                        AppError::not_found(OPERATION, format!("unknown project {project_id}"))
-                    })?;
+                let project = state.project_store.get(project_id).ok_or_else(|| {
+                    AppError::not_found(OPERATION, format!("unknown project {project_id}"))
+                })?;
                 project
                     .root_paths()
                     .into_iter()
@@ -13059,14 +12811,14 @@ impl HostHandle {
             completed_at_ms: None,
         };
         {
+            let store = self.state.lock().await.workflow_run_store.clone();
+            let saved = run.clone();
+            store
+                .call(move |store| store.upsert(saved))
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             let mut state = self.state.lock().await;
-            state
-                .workflow_run_store
-                .upsert(run.clone())
-                .map_err(|error| {
-                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                })?;
-            fan_out_workflow_run_notify(&mut state, run).await;
+            fan_out_workflow_run_notify(&mut state, run);
         }
 
         let prompt = crate::workflows::runner::build_coordinator_prompt(
@@ -13350,7 +13102,7 @@ impl HostHandle {
         update: F,
     ) -> Result<WorkflowRunSnapshot, String>
     where
-        F: FnOnce(&mut WorkflowRunSnapshot),
+        F: FnOnce(&mut WorkflowRunSnapshot) + Send + 'static,
     {
         self.workflow_update_run_inner(run_id, false, update).await
     }
@@ -13361,7 +13113,7 @@ impl HostHandle {
         update: F,
     ) -> Result<WorkflowRunSnapshot, String>
     where
-        F: FnOnce(&mut WorkflowRunSnapshot),
+        F: FnOnce(&mut WorkflowRunSnapshot) + Send + 'static,
     {
         self.workflow_update_run_inner(run_id, true, update).await
     }
@@ -13373,22 +13125,29 @@ impl HostHandle {
         update: F,
     ) -> Result<WorkflowRunSnapshot, String>
     where
-        F: FnOnce(&mut WorkflowRunSnapshot),
+        F: FnOnce(&mut WorkflowRunSnapshot) + Send + 'static,
     {
+        let store = self.state.lock().await.workflow_run_store.clone();
+        let run = store
+            .call(move |store| {
+                let mut run = store
+                    .get(&run_id)
+                    .ok_or_else(|| format!("unknown workflow run {run_id}"))?;
+                if !allow_terminal_update && is_workflow_terminal(run.status) {
+                    return Err(format!(
+                        "workflow run {run_id} is already {}",
+                        workflow_status_label(run.status)
+                    ));
+                }
+                update(&mut run);
+                store.upsert(run.clone())?;
+                Ok(run)
+            })
+            .await?;
         let mut state = self.state.lock().await;
-        let mut run = state
-            .workflow_run_store
-            .get(&run_id)
-            .ok_or_else(|| format!("unknown workflow run {run_id}"))?;
-        if !allow_terminal_update && is_workflow_terminal(run.status) {
-            return Err(format!(
-                "workflow run {run_id} is already {}",
-                workflow_status_label(run.status)
-            ));
+        if let Some(current) = state.workflow_run_store.get(&run.id) {
+            fan_out_workflow_run_notify(&mut state, current);
         }
-        update(&mut run);
-        state.workflow_run_store.upsert(run.clone())?;
-        fan_out_workflow_run_notify(&mut state, run.clone()).await;
         Ok(run)
     }
 
@@ -13473,7 +13232,7 @@ impl HostHandle {
         run_id: WorkflowRunId,
         message: &'static str,
     ) -> Result<(), String> {
-        self.workflow_update_run_allow_terminal(run_id, |run| {
+        self.workflow_update_run_allow_terminal(run_id, move |run| {
             if run.status != WorkflowRunSnapshotStatus::Running {
                 return;
             }
@@ -13640,6 +13399,13 @@ impl HostHandle {
     ) -> Result<(), String> {
         // Pending bindings exist only after actual backend startup succeeds.
         // Visible terminal cards retain history, not a running accounting owner.
+        #[cfg(feature = "test-support")]
+        let publication_gate = self
+            .state
+            .lock()
+            .await
+            .agent_session_publication_test_gate
+            .take();
         let (store, owners) = {
             let state = self.state.lock().await;
             let owners = state
@@ -13674,7 +13440,7 @@ impl HostHandle {
             }
             self.fan_out_task_token_usages().await;
         }
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
         let Some(pending_session_id) = state.pending_agent_sessions.get(&agent_id) else {
             return Err(format!(
                 "missing pending session binding for agent {agent_id} during publication"
@@ -13691,28 +13457,57 @@ impl HostHandle {
             ));
         }
 
+        let promotion = state
+            .agents_view_preferences_store
+            .as_ref()
+            .map(|store| {
+                let agent = agent_id.clone();
+                let session = session_id.clone();
+                store.enqueue(move |store| {
+                    store.promote_transient_agent(
+                        HostFilterId(LOCAL_HOST_ID.to_owned()),
+                        agent,
+                        session,
+                    )
+                })
+            })
+            .transpose()?;
+        drop(state);
+        if let Some(promotion) = promotion {
+            promotion
+                .await
+                .map_err(|_| "preferences owner stopped during session promotion".to_owned())??;
+        }
+        #[cfg(feature = "test-support")]
+        if let Some((gate, _)) = &publication_gate {
+            wait_for_spawn_operation_test_gate_inner(gate).await;
+        }
+        let mut state = self.state.lock().await;
+        if state.pending_agent_sessions.get(&agent_id) != Some(&session_id)
+            || state.registry.agent_handle(&agent_id).is_none()
+        {
+            return Err(
+                "agent session publication was withdrawn during annotation persistence".into(),
+            );
+        }
         state.pending_agent_sessions.remove(&agent_id);
         state
             .agent_sessions
             .insert(agent_id.clone(), session_id.clone());
-        if let Some(store) = state.agents_view_preferences_store.clone()
-            && let Err(error) = store.lock().await.promote_transient_agent(
-                HostFilterId(LOCAL_HOST_ID.to_owned()),
-                agent_id.clone(),
-                session_id.clone(),
-            )
-        {
-            state.agent_sessions.remove(&agent_id);
-            state
-                .pending_agent_sessions
-                .insert(agent_id.clone(), session_id.clone());
-            return Err(format!(
-                "failed to promote agent annotations for agent {agent_id} session {session_id}: {error}"
-            ));
-        }
-        fan_out_current_agents_view_preferences(&mut state).await;
+        state.registry.notify_session_binding_changed();
+        tracing::debug!(
+            trigger = "session_binding",
+            "publishing current annotation snapshot"
+        );
+        fan_out_current_agents_view_preferences(&mut state);
         drop(state);
-        self.fan_out_session_lists().await;
+        #[cfg(feature = "test-support")]
+        if let Some((_, finished)) = publication_gate {
+            let _ = finished.send(());
+        }
+        self.fan_out_session_lists()
+            .await
+            .map_err(|error| error.to_string())?;
         self.deliver_submitted_reviews_for_session(session_id).await;
         Ok(())
     }
@@ -13755,20 +13550,25 @@ impl HostHandle {
             "unpublished agent actor cleanup completed"
         );
         if removed_pending {
-            let mut state = self.state.lock().await;
-            if let Some(store) = state.agents_view_preferences_store.clone()
-                && let Err(error) = store.lock().await.remove_transient_agent(
-                    HostFilterId(LOCAL_HOST_ID.to_owned()),
-                    agent_id.clone(),
-                )
-            {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    error = %error,
-                    "failed to remove unpublished agent annotations during cleanup"
-                );
+            let store = self
+                .state
+                .lock()
+                .await
+                .agents_view_preferences_store
+                .clone();
+            if let Some(store) = store {
+                let agent = agent_id.clone();
+                if let Err(error) = store
+                    .call(move |store| {
+                        store.remove_transient_agent(HostFilterId(LOCAL_HOST_ID.to_owned()), agent)
+                    })
+                    .await
+                {
+                    tracing::error!(%error, "failed to remove unpublished agent annotations during cleanup");
+                }
             }
-            fan_out_current_agents_view_preferences(&mut state).await;
+            let mut state = self.state.lock().await;
+            fan_out_current_agents_view_preferences(&mut state);
         }
     }
 
@@ -14098,9 +13898,11 @@ impl HostHandle {
         }
         {
             let mut state = self.state.lock().await;
-            fan_out_current_agents_view_preferences(&mut state).await;
+            fan_out_current_agents_view_preferences(&mut state);
         }
-        self.fan_out_session_lists().await;
+        self.fan_out_session_lists()
+            .await
+            .map_err(|error| error.to_string())?;
         let naming_handle = agent_handle.clone();
         tokio::spawn(async move {
             while let Some(name) = name_update_rx.recv().await {
@@ -14181,7 +13983,7 @@ impl HostHandle {
             HostBrowseInitial::ProjectRoots { project_id } => {
                 let project = {
                     let state = self.state.lock().await;
-                    let project_store = state.project_store.lock().await;
+                    let project_store = &state.project_store;
                     project_store.get(&project_id)
                 };
                 project
@@ -14255,7 +14057,6 @@ impl HostHandle {
                     )
                 })?;
             let handle = ensure_project_actor(&mut state, project_id.clone())
-                .await
                 .map_err(|error| project_command_error(operation, error))?;
             let readiness = match state
                 .host_streams
@@ -14508,17 +14309,11 @@ impl HostHandle {
         operation: &'static str,
     ) -> AppResult<()> {
         let mut state = self.state.lock().await;
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .ok_or_else(|| {
-                AppError::not_found(operation, format!("project {} not found", project_id))
-            })?;
+        let project = state.project_store.get(&project_id).ok_or_else(|| {
+            AppError::not_found(operation, format!("project {} not found", project_id))
+        })?;
         let roots = project.root_paths();
         let handle = ensure_project_actor(&mut state, project_id.clone())
-            .await
             .map_err(|error| project_command_error(operation, error))?;
         let code_intel_settings = state
             .settings_store
@@ -15426,14 +15221,9 @@ impl HostHandle {
             config_mcp,
         ) = {
             let state = self.state.lock().await;
-            let project = state
-                .project_store
-                .lock()
-                .await
-                .get(&project_id)
-                .ok_or_else(|| {
-                    format!("cannot spawn review target in missing project {project_id}")
-                })?;
+            let project = state.project_store.get(&project_id).ok_or_else(|| {
+                format!("cannot spawn review target in missing project {project_id}")
+            })?;
             (
                 project,
                 Arc::clone(&state.settings_store),
@@ -16294,13 +16084,11 @@ impl HostHandle {
 }
 
 async fn load_project(
-    project_store: &Arc<Mutex<ProjectStore>>,
+    project_store: &Arc<ProjectCatalogHandle>,
     project_id: &ProjectId,
     operation: &'static str,
 ) -> AppResult<Project> {
     let projects = project_store
-        .lock()
-        .await
         .list()
         .map_err(|error| project_store_error(operation, error))?;
     projects
@@ -16458,7 +16246,7 @@ fn sanitize_branch_for_path(branch: &str) -> String {
 }
 
 async fn preflight_workbench_create(
-    project_store: &Arc<Mutex<ProjectStore>>,
+    project_store: &ProjectCatalogHandle,
     parent: &Project,
     branch: &GitBranchName,
     roots: &[WorkbenchRoot],
@@ -16520,8 +16308,6 @@ async fn preflight_workbench_create(
     }
 
     let records = project_store
-        .lock()
-        .await
         .list()
         .map_err(|error| project_store_error(OPERATION, error))?;
     for root in roots {
@@ -16794,26 +16580,6 @@ async fn git_worktree_prune(parent_root: &ProjectRootPath) -> Result<(), String>
     ))
 }
 
-async fn cleanup_reviews_for_deleted_project(
-    review_registry: &ReviewRegistryHandle,
-    project_id: &ProjectId,
-) {
-    match review_registry.delete_for_project(project_id.clone()).await {
-        Ok(removed) if removed.is_empty() => {}
-        Ok(removed) => tracing::info!(
-            project_id = %project_id,
-            review_count = removed.len(),
-            review_ids = ?removed,
-            "deleted persisted reviews referencing removed project"
-        ),
-        Err(error) => tracing::warn!(
-            project_id = %project_id,
-            error = %error,
-            "failed to delete persisted reviews referencing removed project"
-        ),
-    }
-}
-
 fn append_rollback_message(error: String, rollback_message: Option<String>) -> String {
     match rollback_message {
         Some(rollback_message) => format!("{error}; rollback failures: {rollback_message}"),
@@ -16822,20 +16588,19 @@ fn append_rollback_message(error: String, rollback_message: Option<String>) -> S
 }
 
 async fn run_git(root: &ProjectRootPath, args: &[&str]) -> Result<std::process::Output, String> {
-    crate::process_env::command("git")?
+    let command = args
+        .first()
+        .ok_or_else(|| "Git requires a subcommand".to_owned())?;
+    let started = std::time::Instant::now();
+    tracing::info!(target: "tyde::project_operation", stage = "git", command, argument_count = args.len(), "Git worker started");
+    let output = crate::process_env::command("git")?
         .arg("-C")
         .arg(&root.0)
         .args(args)
         .output()
-        .await
-        .map_err(|error| {
-            format!(
-                "failed to run git -C {} {}: {}",
-                root,
-                args.join(" "),
-                error
-            )
-        })
+        .await;
+    tracing::info!(target: "tyde::project_operation", stage = "git", command, success = output.as_ref().is_ok_and(|output| output.status.success()), elapsed_ms = started.elapsed().as_millis(), "Git worker completed");
+    output.map_err(|error| format!("failed to run Git command {command}: {error}"))
 }
 
 fn git_output_message(output: &std::process::Output) -> String {
@@ -16854,14 +16619,12 @@ fn git_output_message(output: &std::process::Output) -> String {
     )
 }
 
-async fn project_exists(
-    project_store: &Arc<Mutex<ProjectStore>>,
+fn project_exists(
+    project_store: &Arc<ProjectCatalogHandle>,
     project_id: &ProjectId,
     operation: &'static str,
 ) -> AppResult<bool> {
     let projects = project_store
-        .lock()
-        .await
         .list()
         .map_err(|error| project_store_error(operation, error))?;
     Ok(projects
@@ -17251,15 +17014,12 @@ fn spawn_host_inner(
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
     let initial_projects = project_store.list()?;
-    let removing_projects = initial_projects
-        .iter()
-        .filter(|project| project.is_removing_workbench())
-        .map(|project| project.id.clone())
-        .collect();
     let workflow_catalog = WorkflowCatalog::discover(&initial_projects);
     let workflow_locations = workflow_catalog_locations(&initial_projects);
     let workflow_watch_targets = workflow_watch_dirs(&initial_projects);
-    let workflow_run_store = WorkflowRunStore::load(paths.workflow_runs)?;
+    let workflow_run_store = Arc::new(WorkflowRunHandle::spawn(WorkflowRunStore::load(
+        paths.workflow_runs,
+    )?)?);
     let review_routes = session_store.initialize_reviews(&paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let agents_view_preferences_store = runtime_config
@@ -17312,7 +17072,7 @@ fn spawn_host_inner(
     );
     let (swarm_dispatch_tx, swarm_dispatch_rx) = mpsc::channel(1);
     let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs);
-    let project_store = Arc::new(Mutex::new(project_store));
+    let (project_store, project_catalog_actor) = ProjectCatalogHandle::new(project_store);
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
     let steering_store = SteeringStore::load(paths.steering)?;
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
@@ -17347,7 +17107,7 @@ fn spawn_host_inner(
     for project in &initial_projects {
         let subscription = spawn_project_subscription(
             project_watcher.clone(),
-            Arc::clone(&project_store),
+            project_store.generation(),
             project.clone(),
             review_registry.clone(),
             {
@@ -17427,6 +17187,7 @@ fn spawn_host_inner(
     )?;
     let (settings_apply_tx, settings_apply_rx) = mpsc::unbounded_channel();
     let host = HostHandle {
+        project_catalog: project_store.clone(),
         config,
         restart: Arc::new(RestartShutdown {
             stopped,
@@ -17447,7 +17208,7 @@ fn spawn_host_inner(
             supervisor_compaction_tx,
             review_registry,
             team_registry: TeamRegistryHandle::spawn(team_store),
-            project_store,
+            project_store: project_store.clone(),
             settings_store,
             #[cfg(feature = "test-support")]
             settings_lifecycle_test_gate: None,
@@ -17456,7 +17217,9 @@ fn spawn_host_inner(
             #[cfg(feature = "test-support")]
             learning_projection_test_gate: None,
             agents_view_preferences_store: agents_view_preferences_store
-                .map(|store| Arc::new(Mutex::new(store))),
+                .map(AgentsViewPreferencesHandle::spawn)
+                .transpose()?
+                .map(Arc::new),
             session_store,
             transcript_store,
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
@@ -17555,16 +17318,18 @@ fn spawn_host_inner(
             swarm_startup_test_gates: Default::default(),
             #[cfg(feature = "test-support")]
             restore_marker_withdraw_test_gate: None,
+            #[cfg(feature = "test-support")]
+            session_list_publication_test_gate: None,
+            #[cfg(feature = "test-support")]
+            agent_session_publication_test_gate: None,
             agent_restoration_failures: Vec::new(),
             host_streams: HashMap::new(),
             project_streams,
             project_watcher,
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
-            project_lifecycles: HashMap::new(),
             project_search_ids: HashMap::new(),
             code_intel_routers: HashMap::new(),
-            removing_projects,
             #[cfg(feature = "test-support")]
             agent_name_test_gate: None,
             #[cfg(feature = "test-support")]
@@ -17581,11 +17346,12 @@ fn spawn_host_inner(
     };
 
     debug_host_binding.bind_host(&host)?;
-
+    project_catalog_actor.start(WeakHostHandle::downgrade(&host))?;
     spawn_settings_apply_actor(WeakHostHandle::downgrade(&host), settings_apply_rx);
     let spawn_operation_worker = spawn_host_spawn_operation_task(
         WeakHostHandle {
             config: host.config.clone(),
+            project_catalog: Arc::downgrade(&host.project_catalog),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
@@ -17623,6 +17389,7 @@ fn spawn_host_inner(
     spawn_agent_turn_state_fanout_task(
         WeakHostHandle {
             config: host.config.clone(),
+            project_catalog: Arc::downgrade(&host.project_catalog),
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
@@ -20065,7 +19832,11 @@ impl AnnotationTargetResolver {
                 .registry
                 .agent_handle(&agent_id)
                 .map(|agent| agent.snapshot());
-            let session_id = state.agent_sessions.get(&agent_id).cloned();
+            let session_id = state
+                .agent_sessions
+                .get(&agent_id)
+                .or_else(|| state.pending_agent_sessions.get(&agent_id))
+                .cloned();
             if let Some(session_id) = session_id.clone() {
                 agent_by_session.insert(session_id, agent_id.clone());
             }
@@ -20316,28 +20087,23 @@ fn canonicalize_agent_groups_update(
     }
 }
 
-async fn complete_agents_view_preferences_snapshot(
+fn complete_agents_view_preferences_snapshot(
     state: &HostState,
     snapshot: &mut AgentsViewPreferencesSnapshot,
 ) {
-    let system_tags = compute_system_tags_snapshot(state).await;
+    let system_tags = compute_system_tags_snapshot(state);
     snapshot.tags.system = system_tags.system;
     snapshot.tags.system_assignments = system_tags.system_assignments;
 }
 
-async fn compute_system_tags_snapshot(state: &HostState) -> AgentTagsSnapshot {
-    let projects = state
-        .project_store
-        .lock()
-        .await
-        .list()
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                error = %error,
-                "failed to list projects while computing system agent tags"
-            );
-            Vec::new()
-        });
+fn compute_system_tags_snapshot(state: &HostState) -> AgentTagsSnapshot {
+    let projects = state.project_store.list().unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "failed to list projects while computing system agent tags"
+        );
+        Vec::new()
+    });
     let project_names = projects
         .into_iter()
         .map(|project| (project.id, project.name))
@@ -20757,6 +20523,7 @@ fn replace_session_list_snapshot(
     limit: Option<u32>,
     operation: &'static str,
 ) -> AppResult<(Vec<SessionSummary>, SessionListPageInfo)> {
+    subscriber.session_list_read_generation += 1;
     let generation = subscriber
         .session_list_snapshot
         .as_ref()
@@ -20888,23 +20655,20 @@ fn page_session_summaries(
     ))
 }
 
-async fn fan_out_session_lists(state: &mut HostState) {
-    let sessions = state
-        .session_store
-        .summaries_for_scope_with_backend_storage(
-            SessionListScope::AllSessions,
-            &state.backend_storage,
-        )
-        .await
-        .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
-
-    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+fn publish_session_lists(
+    state: &mut HostState,
+    sessions: Vec<SessionSummary>,
+    readers: Vec<(StreamPath, u64)>,
+) {
     let mut dead_paths = Vec::new();
 
-    for path in paths {
+    for (path, generation) in readers {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
+        if subscriber.session_list_read_generation != generation {
+            continue;
+        }
         let scope = subscriber
             .session_list_snapshot
             .as_ref()
@@ -21121,7 +20885,7 @@ fn apply_session_summary_count_update(
     true
 }
 
-async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsagePayload>) {
+fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsagePayload>) {
     if payloads.is_empty() {
         return;
     }
@@ -21143,10 +20907,7 @@ async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskToke
             {
                 continue;
             }
-            if emit_task_token_usage_for_subscriber(payload, subscriber)
-                .await
-                .is_err()
-            {
+            if emit_task_token_usage_for_subscriber(payload, subscriber).is_err() {
                 dead_paths.push(path.clone());
                 break;
             }
@@ -21670,7 +21431,7 @@ fn extend_task_token_usage_reasons(
     }
 }
 
-async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPayload) {
+fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21681,10 +21442,7 @@ async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPay
         if let ProjectNotifyPayload::Delete { project } = &payload {
             subscriber.project_readiness.remove(&project.id);
         }
-        if emit_project_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_project_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21715,7 +21473,7 @@ async fn fan_out_custom_agent_notify(state: &mut HostState, payload: CustomAgent
     }
 }
 
-async fn fan_out_steering_notify(state: &mut HostState, payload: SteeringNotifyPayload) {
+fn fan_out_steering_notify(state: &mut HostState, payload: SteeringNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21723,10 +21481,7 @@ async fn fan_out_steering_notify(state: &mut HostState, payload: SteeringNotifyP
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_steering_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_steering_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21778,7 +21533,7 @@ async fn fan_out_mcp_server_notify(state: &mut HostState, payload: McpServerNoti
     }
 }
 
-async fn fan_out_workflow_notify(state: &mut HostState, payload: WorkflowNotifyPayload) {
+fn fan_out_workflow_notify(state: &mut HostState, payload: WorkflowNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21786,10 +21541,7 @@ async fn fan_out_workflow_notify(state: &mut HostState, payload: WorkflowNotifyP
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_workflow_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_workflow_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21799,7 +21551,7 @@ async fn fan_out_workflow_notify(state: &mut HostState, payload: WorkflowNotifyP
     }
 }
 
-async fn fan_out_workflow_run_notify(state: &mut HostState, run: WorkflowRunSnapshot) {
+fn fan_out_workflow_run_notify(state: &mut HostState, run: WorkflowRunSnapshot) {
     let payload = WorkflowRunNotifyPayload { run };
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -21808,10 +21560,7 @@ async fn fan_out_workflow_run_notify(state: &mut HostState, run: WorkflowRunSnap
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_workflow_run_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_workflow_run_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21821,28 +21570,28 @@ async fn fan_out_workflow_run_notify(state: &mut HostState, run: WorkflowRunSnap
     }
 }
 
-async fn fan_out_team_registry_events(state: &mut HostState, events: TeamRegistryEvents) {
+fn fan_out_team_registry_events(state: &mut HostState, events: TeamRegistryEvents) {
     for payload in events.team_notifies {
-        fan_out_team_notify(state, payload).await;
+        fan_out_team_notify(state, payload);
     }
     for payload in events.member_notifies {
-        fan_out_team_member_notify(state, payload).await;
+        fan_out_team_member_notify(state, payload);
     }
     for payload in events.binding_notifies {
-        fan_out_team_member_binding_notify(state, payload).await;
+        fan_out_team_member_binding_notify(state, payload);
     }
     for payload in events.draft_notifies {
-        fan_out_team_draft_notify(state, payload).await;
+        fan_out_team_draft_notify(state, payload);
     }
     for payload in events.shuffle_suggestion_notifies {
-        fan_out_team_member_shuffle_suggestion(state, payload).await;
+        fan_out_team_member_shuffle_suggestion(state, payload);
     }
     for payload in events.store_status_notifies {
-        fan_out_teams_store_status_notify(state, payload).await;
+        fan_out_teams_store_status_notify(state, payload);
     }
 }
 
-async fn fan_out_teams_store_status_notify(
+fn fan_out_teams_store_status_notify(
     state: &mut HostState,
     payload: protocol::TeamsStoreStatusNotifyPayload,
 ) {
@@ -21853,10 +21602,7 @@ async fn fan_out_teams_store_status_notify(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_teams_store_status_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_teams_store_status_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21866,7 +21612,7 @@ async fn fan_out_teams_store_status_notify(
     }
 }
 
-async fn fan_out_team_member_shuffle_suggestion(
+fn fan_out_team_member_shuffle_suggestion(
     state: &mut HostState,
     payload: TeamMemberShuffleSuggestionNotifyPayload,
 ) {
@@ -21877,10 +21623,7 @@ async fn fan_out_team_member_shuffle_suggestion(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_team_member_shuffle_suggestion_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_team_member_shuffle_suggestion_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21890,7 +21633,7 @@ async fn fan_out_team_member_shuffle_suggestion(
     }
 }
 
-async fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) {
+fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21898,10 +21641,7 @@ async fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) 
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_team_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_team_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21911,7 +21651,7 @@ async fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) 
     }
 }
 
-async fn fan_out_team_member_notify(state: &mut HostState, payload: TeamMemberNotifyPayload) {
+fn fan_out_team_member_notify(state: &mut HostState, payload: TeamMemberNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21919,10 +21659,7 @@ async fn fan_out_team_member_notify(state: &mut HostState, payload: TeamMemberNo
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_team_member_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_team_member_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21932,7 +21669,7 @@ async fn fan_out_team_member_notify(state: &mut HostState, payload: TeamMemberNo
     }
 }
 
-async fn fan_out_team_member_binding_notify(
+fn fan_out_team_member_binding_notify(
     state: &mut HostState,
     payload: TeamMemberBindingNotifyPayload,
 ) {
@@ -21943,10 +21680,7 @@ async fn fan_out_team_member_binding_notify(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_team_member_binding_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_team_member_binding_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21956,7 +21690,7 @@ async fn fan_out_team_member_binding_notify(
     }
 }
 
-async fn fan_out_team_draft_notify(state: &mut HostState, payload: TeamDraftNotifyPayload) {
+fn fan_out_team_draft_notify(state: &mut HostState, payload: TeamDraftNotifyPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -21964,10 +21698,7 @@ async fn fan_out_team_draft_notify(state: &mut HostState, payload: TeamDraftNoti
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_team_draft_notify_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_team_draft_notify_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -21992,11 +21723,10 @@ async fn agent_team_validation_refs(
         .collect::<HashSet<_>>();
     let project_ids = state
         .project_store
-        .lock()
-        .await
         .list()
         .map_err(|error| AppError::internal(operation, anyhow!(error)))?
         .into_iter()
+        .filter(|project| !state.project_store.is_removing(&project.id))
         .map(|project| project.id)
         .collect::<HashSet<_>>();
     let enabled_backend_kinds = state
@@ -22022,10 +21752,13 @@ fn project_stream_path(project_id: &ProjectId) -> StreamPath {
     StreamPath(format!("/project/{}", project_id.0))
 }
 
-async fn ensure_project_actor(
+fn ensure_project_actor(
     state: &mut HostState,
     project_id: ProjectId,
 ) -> Result<ProjectStreamHandle, String> {
+    if state.project_store.is_removing(&project_id) {
+        return Err("project is being removed".into());
+    }
     if let Some(subscription) = state.project_streams.get(&project_id)
         && !subscription.task.is_finished()
     {
@@ -22039,20 +21772,16 @@ async fn ensure_project_actor(
         router.shutdown_all();
     }
 
-    if let Some(subscription) = state.project_streams.remove(&project_id) {
-        subscription.task.abort();
-    }
+    state.project_streams.remove(&project_id);
 
-    let project = state
+    let record = state
         .project_store
-        .lock()
-        .await
-        .get(&project_id)
+        .record(&project_id)
         .ok_or_else(|| format!("unknown project {project_id}"))?;
     let subscription = spawn_project_subscription(
         state.project_watcher.clone(),
-        Arc::clone(&state.project_store),
-        project,
+        record.generation,
+        record.project,
         state.review_registry.clone(),
         state.force_project_watch_limit,
     )?;
@@ -22061,7 +21790,7 @@ async fn ensure_project_actor(
     Ok(handle)
 }
 
-async fn subscribe_host_to_project(
+fn subscribe_host_to_project(
     state: &mut HostState,
     host_path: &StreamPath,
     project_id: ProjectId,
@@ -22069,11 +21798,14 @@ async fn subscribe_host_to_project(
     let Some(subscriber) = state.host_streams.get(host_path) else {
         return Ok(());
     };
+    if subscriber.project_readiness.contains_key(&project_id) {
+        return Ok(());
+    }
     let project_output_stream = subscriber
         .stream
         .with_path(project_stream_path(&project_id));
     let project_files = subscriber.project_files;
-    let handle = ensure_project_actor(state, project_id.clone()).await?;
+    let handle = ensure_project_actor(state, project_id.clone())?;
     let response =
         handle.begin_add_subscriber(host_path.clone(), project_output_stream, project_files)?;
     // The observer polls a stored clone; registration must not await it.
@@ -22116,11 +21848,11 @@ fn track_project_subscription(
     readiness
 }
 
-async fn emit_review_list_changed_for_project(
+fn emit_review_list_changed_for_project(
     state: &mut HostState,
     project_id: ProjectId,
 ) -> Result<(), String> {
-    let handle = ensure_project_actor(state, project_id).await?;
+    let handle = ensure_project_actor(state, project_id)?;
     handle.emit_review_list_changed()
 }
 
@@ -22220,8 +21952,6 @@ async fn fan_out_host_settings(
 async fn sync_code_intel_router_roots(state: &mut HostState) -> Result<(), String> {
     let projects = state
         .project_store
-        .lock()
-        .await
         .list()
         .map_err(|error| error.to_string())?;
     let roots_by_project = projects
@@ -22357,6 +22087,14 @@ async fn agent_activity(state: &HostState, agent_id: &AgentId) -> AgentActivity 
 
 async fn fan_out_agent_background_work(state: &mut HostState, agent_id: &AgentId) {
     let has_background_work = state.registry.has_background_work(agent_id).await;
+    publish_agent_background_work(state, agent_id, has_background_work);
+}
+
+fn publish_agent_background_work(
+    state: &mut HostState,
+    agent_id: &AgentId,
+    has_background_work: bool,
+) {
     let payload = serde_json::to_value(protocol::AgentBackgroundWorkNotifyPayload {
         agent_id: agent_id.clone(),
         has_background_work,
@@ -22445,10 +22183,7 @@ async fn fan_out_agent_activity_summary(
     }
 }
 
-async fn fan_out_agents_view_preferences(
-    state: &mut HostState,
-    snapshot: AgentsViewPreferencesSnapshot,
-) {
+fn fan_out_agents_view_preferences(state: &mut HostState, snapshot: AgentsViewPreferencesSnapshot) {
     let payload = AgentsViewPreferencesNotifyPayload { snapshot };
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -22457,10 +22192,7 @@ async fn fan_out_agents_view_preferences(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_agents_view_preferences_for_subscriber(&payload, subscriber)
-            .await
-            .is_err()
-        {
+        if emit_agents_view_preferences_for_subscriber(&payload, subscriber).is_err() {
             dead_paths.push(path);
         }
     }
@@ -22470,13 +22202,13 @@ async fn fan_out_agents_view_preferences(
     }
 }
 
-async fn fan_out_current_agents_view_preferences(state: &mut HostState) {
+fn fan_out_current_agents_view_preferences(state: &mut HostState) {
     let Some(store) = state.agents_view_preferences_store.clone() else {
         return;
     };
-    let mut snapshot = store.lock().await.snapshot();
-    complete_agents_view_preferences_snapshot(state, &mut snapshot).await;
-    fan_out_agents_view_preferences(state, snapshot).await;
+    let mut snapshot = store.snapshot();
+    complete_agents_view_preferences_snapshot(state, &mut snapshot);
+    fan_out_agents_view_preferences(state, snapshot);
 }
 
 async fn fan_out_session_schemas(state: &mut HostState, force_emit: bool) {
@@ -23026,7 +22758,7 @@ fn team_member_context_compaction_result_from_terminal(
     }
 }
 
-async fn emit_team_notify_for_subscriber(
+fn emit_team_notify_for_subscriber(
     payload: &TeamNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23035,7 +22767,7 @@ async fn emit_team_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TeamNotify, payload)
 }
 
-async fn emit_teams_store_status_notify_for_subscriber(
+fn emit_teams_store_status_notify_for_subscriber(
     payload: &protocol::TeamsStoreStatusNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23044,7 +22776,7 @@ async fn emit_teams_store_status_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TeamsStoreStatusNotify, payload)
 }
 
-async fn emit_team_member_notify_for_subscriber(
+fn emit_team_member_notify_for_subscriber(
     payload: &TeamMemberNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23053,7 +22785,7 @@ async fn emit_team_member_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TeamMemberNotify, payload)
 }
 
-async fn emit_team_member_binding_notify_for_subscriber(
+fn emit_team_member_binding_notify_for_subscriber(
     payload: &TeamMemberBindingNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23062,7 +22794,7 @@ async fn emit_team_member_binding_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TeamMemberBindingNotify, payload)
 }
 
-async fn emit_team_draft_notify_for_subscriber(
+fn emit_team_draft_notify_for_subscriber(
     payload: &TeamDraftNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23071,7 +22803,7 @@ async fn emit_team_draft_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TeamDraftNotify, payload)
 }
 
-async fn emit_team_member_shuffle_suggestion_for_subscriber(
+fn emit_team_member_shuffle_suggestion_for_subscriber(
     payload: &TeamMemberShuffleSuggestionNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23085,7 +22817,7 @@ async fn emit_team_member_shuffle_suggestion_for_subscriber(
     )
 }
 
-async fn emit_project_notify_for_subscriber(
+fn emit_project_notify_for_subscriber(
     payload: &ProjectNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23103,7 +22835,7 @@ async fn emit_custom_agent_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::CustomAgentNotify, payload)
 }
 
-async fn emit_steering_notify_for_subscriber(
+fn emit_steering_notify_for_subscriber(
     payload: &SteeringNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23130,7 +22862,7 @@ async fn emit_mcp_server_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::McpServerNotify, payload)
 }
 
-async fn emit_workflow_notify_for_subscriber(
+fn emit_workflow_notify_for_subscriber(
     payload: &WorkflowNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23139,7 +22871,7 @@ async fn emit_workflow_notify_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::WorkflowNotify, payload)
 }
 
-async fn emit_workflow_run_notify_for_subscriber(
+fn emit_workflow_run_notify_for_subscriber(
     payload: &WorkflowRunNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23234,7 +22966,7 @@ async fn emit_agent_activity_summary_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::AgentActivitySummary, payload)
 }
 
-async fn emit_task_token_usage_for_subscriber(
+fn emit_task_token_usage_for_subscriber(
     payload: &TaskTokenUsagePayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23243,7 +22975,7 @@ async fn emit_task_token_usage_for_subscriber(
     emit_or_queue_host_frame(subscriber, FrameKind::TaskTokenUsage, payload)
 }
 
-async fn emit_agents_view_preferences_for_subscriber(
+fn emit_agents_view_preferences_for_subscriber(
     payload: &AgentsViewPreferencesNotifyPayload,
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
@@ -23259,15 +22991,6 @@ async fn emit_backend_setup_for_subscriber(
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize BackendSetup payload for host stream fanout");
     emit_or_queue_host_frame(subscriber, FrameKind::BackendSetup, payload)
-}
-
-async fn emit_agent_closed_for_stream(
-    payload: &AgentClosedPayload,
-    stream: &Stream,
-) -> Result<(), StreamClosed> {
-    let payload = serde_json::to_value(payload)
-        .expect("failed to serialize AgentClosed payload for host stream fanout");
-    stream.send_value(FrameKind::AgentClosed, payload)
 }
 
 async fn emit_session_schemas_for_subscriber(
@@ -23979,7 +23702,7 @@ impl HostHandle {
 }
 
 async fn resolve_terminal_launch(
-    project_store: &Arc<Mutex<ProjectStore>>,
+    project_store: &Arc<ProjectCatalogHandle>,
     payload: TerminalCreatePayload,
 ) -> AppResult<TerminalLaunchInfo> {
     const OPERATION: &str = "terminal_create";
@@ -24224,8 +23947,7 @@ fn spawn_learning_projection(
                                 fan_out_steering_notify(
                                     &mut state,
                                     SteeringNotifyPayload::Delete { id: old.id.clone() },
-                                )
-                                .await;
+                                );
                             }
                         }
                         for steering in &current {
@@ -24235,8 +23957,7 @@ fn spawn_learning_projection(
                                     SteeringNotifyPayload::Upsert {
                                         steering: steering.clone(),
                                     },
-                                )
-                                .await;
+                                );
                             }
                         }
                         previous_steering = current;

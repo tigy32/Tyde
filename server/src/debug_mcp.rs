@@ -947,6 +947,19 @@ async fn build_instance(
             tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
         ];
 
+        #[cfg(feature = "test-support")]
+        {
+            let root = project_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::project_stream::scan_test_support::run(
+                    &root,
+                    crate::project_stream::scan_test_support::ScanPoint::DevFrontendProbe,
+                );
+            })
+            .await
+            .map_err(|error| format!("DEV frontend probe observer failed: {error}"))?;
+        }
+
         let readiness = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err("DEV startup cancelled".to_owned()),

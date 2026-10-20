@@ -154,3 +154,42 @@ filter = "all()"
 platform = 'cfg(target_os = "macos")'
 list-wrapper = "macos-test-binary"
 run-wrapper = "macos-test-binary"
+
+# Retain causal evidence: independent protocol work finishes before held I/O is released.
+[[profile.default.overrides]]
+filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure)'
+success-output = "final"
+
+# Retain state/event evidence for the returned watcher flow.
+[[profile.default.overrides]]
+filter = 'binary_id(server::projects) & test(project_watcher_prunes_ignored_build_trees)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::projects) & test(project_watcher_prunes_ignored_build_trees)'
+success-output = "final"
+retries = 0
+
+# Retain payload-free frontend producer/scenario event ordering.
+[[profile.default.overrides]]
+filter = 'binary_id(server::dev_instances) & test(dev_instance_claude_writes_stay_out_of_parent_claude_home)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::dev_instances) & test(dev_instance_claude_writes_stay_out_of_parent_claude_home)'
+success-output = "final"
+retries = 0
+
+# Retain state/event evidence for the returned pin-publication flow.
+[[profile.default.overrides]]
+filter = 'binary_id(server::agents_view_preferences) & test(agents_view_preferences_agent_pins_canonicalize_and_persist_session_targets)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::agents_view_preferences) & test(agents_view_preferences_agent_pins_canonicalize_and_persist_session_targets)'
+success-output = "final"
+retries = 0

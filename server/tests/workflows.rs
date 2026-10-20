@@ -73,22 +73,33 @@ async fn create_project(client: &mut client::Connection, root: &str) -> Project 
         .await
         .expect("project_create failed");
     let mut created = None;
-    next_frame_matching_on(client, "project create", |env| {
-        if env.kind != FrameKind::ProjectNotify {
-            return false;
-        }
-        match env
-            .parse_payload::<ProjectNotifyPayload>()
-            .expect("ProjectNotify")
-        {
-            ProjectNotifyPayload::Upsert { project } => {
-                created = Some(project);
-                true
+    let mut committed = false;
+    next_frame_matching_on(client, "project create settled", |env| {
+        match env.kind {
+            FrameKind::ProjectNotify => {
+                if let ProjectNotifyPayload::Upsert { project } = env.parse_payload().unwrap()
+                    && project.root_paths().iter().any(|path| path.0 == root) {
+                    created = Some(project);
+                }
             }
-            ProjectNotifyPayload::Delete { .. } => false,
+            FrameKind::ProjectOperation => {
+                let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+                if matches!(operation.mutation, protocol::ProjectMutation::Create(payload) if payload.roots.iter().any(|path| path.0 == root)) {
+                    match operation.state {
+                        protocol::ProjectOperationState::Committed { warnings } => {
+                            assert!(warnings.is_empty(), "project setup must settle without warnings");
+                            committed = true;
+                        }
+                        protocol::ProjectOperationState::Failed { .. } => panic!("project setup failed"),
+                        _ => {}
+                    }
+                }
+            }
+            FrameKind::CommandError => panic!("project setup command rejected"),
+            _ => {}
         }
-    })
-    .await;
+        created.is_some() && committed
+    }).await;
     created.expect("project upsert")
 }
 

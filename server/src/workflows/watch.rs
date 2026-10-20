@@ -27,7 +27,10 @@ pub(crate) struct WorkflowWatcherHandle {
 }
 
 enum WorkflowWatcherCommand {
+    #[cfg(feature = "test-support")]
+    Stop(oneshot::Sender<()>),
     SetTargets {
+        generation: u64,
         targets: Vec<PathBuf>,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -62,10 +65,30 @@ impl Drop for WorkflowWatcher {
 }
 
 impl WorkflowWatcherHandle {
-    pub(crate) async fn set_targets(&self, targets: Vec<PathBuf>) -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn stop_for_test(&self) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(WorkflowWatcherCommand::SetTargets { targets, reply })
+            .send(WorkflowWatcherCommand::Stop(reply))
+            .await
+            .map_err(|_| "workflow watcher already stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "workflow watcher stop acknowledgement lost".to_owned())
+    }
+
+    pub(crate) async fn set_targets(
+        &self,
+        generation: u64,
+        targets: Vec<PathBuf>,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(WorkflowWatcherCommand::SetTargets {
+                generation,
+                targets,
+                reply,
+            })
             .await
             .map_err(|_| "workflow watcher stopped".to_owned())?;
         response
@@ -118,6 +141,7 @@ async fn run_workflow_watcher(
     signal_tx: mpsc::Sender<WorkflowCatalogSignal>,
     watch_overflow: Arc<AtomicBool>,
 ) {
+    let mut generation = 0;
     let mut targets = normalize_targets(initial_targets);
     let mut missing_targets = BTreeSet::new();
     let mut watcher = rebuild_watcher(
@@ -142,7 +166,15 @@ async fn run_workflow_watcher(
                     return;
                 };
                 match command {
-                    WorkflowWatcherCommand::SetTargets { targets: new_targets, reply } => {
+                    #[cfg(feature = "test-support")]
+                    WorkflowWatcherCommand::Stop(reply) => {
+                        command_rx.close();
+                        let _ = reply.send(());
+                        return;
+                    }
+                    WorkflowWatcherCommand::SetTargets { generation: next_generation, targets: new_targets, reply } => {
+                        if next_generation < generation { let _ = reply.send(Ok(())); continue; }
+                        generation = next_generation;
                         let new_targets = normalize_targets(new_targets);
                         let missing_target_now_exists = missing_targets
                             .iter()

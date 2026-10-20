@@ -252,7 +252,11 @@ pub(crate) async fn route_client_envelope(
                 let payload: ProjectCreatePayload = parse_payload(&envelope, "project_create")?;
                 ensure_non_empty("project_create", "name", payload.name.as_str())?;
                 validate_project_roots(&payload.roots)?;
-                host.create_project(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::Create(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::AgentMove => {
                 let payload: protocol::types::AgentMovePayload =
@@ -263,30 +267,50 @@ pub(crate) async fn route_client_envelope(
                 let payload: ProjectRenamePayload = parse_payload(&envelope, "project_rename")?;
                 ensure_non_empty("project_rename", "id", payload.id.0.as_str())?;
                 ensure_non_empty("project_rename", "name", payload.name.as_str())?;
-                host.rename_project(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::Rename(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::ProjectReorder => {
                 let payload: ProjectReorderPayload = parse_payload(&envelope, "project_reorder")?;
                 validate_project_reorder(&payload)?;
-                host.reorder_projects(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::Reorder(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::ProjectAddRoot => {
                 let payload: ProjectAddRootPayload = parse_payload(&envelope, "project_add_root")?;
                 ensure_non_empty("project_add_root", "id", payload.id.0.as_str())?;
                 ensure_non_empty("project_add_root", "root", payload.root.0.as_str())?;
-                host.add_project_root(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::AddRoot(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::ProjectDeleteRoot => {
                 let payload: ProjectDeleteRootPayload =
                     parse_payload(&envelope, "project_delete_root")?;
                 ensure_non_empty("project_delete_root", "id", payload.id.0.as_str())?;
                 ensure_non_empty("project_delete_root", "root", payload.root.0.as_str())?;
-                host.delete_project_root(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::DeleteRoot(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::ProjectDelete => {
                 let payload: ProjectDeletePayload = parse_payload(&envelope, "project_delete")?;
                 ensure_non_empty("project_delete", "id", payload.id.0.as_str())?;
-                host.delete_project(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::Delete(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::WorkbenchCreate => {
                 let payload: WorkbenchCreatePayload = parse_payload(&envelope, "workbench_create")?;
@@ -297,12 +321,20 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 ensure_non_empty("workbench_create", "branch", payload.branch.0.as_str())?;
                 ensure_non_empty("workbench_create", "name", payload.name.as_str())?;
-                host.create_workbench(payload, None).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::CreateWorkbench(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::WorkbenchRemove => {
                 let payload: WorkbenchRemovePayload = parse_payload(&envelope, "workbench_remove")?;
                 ensure_non_empty("workbench_remove", "id", payload.id.0.as_str())?;
-                host.remove_workbench(payload).await?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::RemoveWorkbench(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
             }
             FrameKind::CustomAgentUpsert => {
                 let payload: CustomAgentUpsertPayload =
@@ -781,7 +813,7 @@ pub(crate) async fn route_client_envelope(
 
                 match host.agent_handle(&agent_id).await {
                     Some(agent) => match agent.set_name(payload.name).await {
-                        Some(true) => host.fan_out_session_lists().await,
+                        Some(true) => host.fan_out_session_lists().await?,
                         Some(false) => {}
                         None => {
                             let stream = host_output_stream.with_path(stream_path);

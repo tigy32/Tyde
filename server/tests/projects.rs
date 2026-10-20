@@ -452,24 +452,98 @@ fn init_git_repo(name: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
 #[tokio::test]
 async fn create_project_emits_upsert() {
     let mut fixture = Fixture::new().await;
-
+    let primary = init_git_repo("startup-primary", &[("README.md", "primary")]);
+    let obsolete = init_git_repo("startup-obsolete", &[("obsolete.txt", "obsolete")]);
+    let (reached, arrived) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let _hook = fixture.on_project_scan(
+        primary.path().to_path_buf(),
+        server::ScanPoint::ActorStarting,
+        move || {
+            reached.send(()).unwrap();
+            held.recv().unwrap();
+        },
+    );
+    let project = create_project(
+        &mut fixture.client,
+        "Tyde",
+        vec![
+            primary.path().to_string_lossy().into_owned(),
+            obsolete.path().to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    assert!(!project.id.0.is_empty());
+    assert_eq!(project.name, "Tyde");
+    arrived.await.unwrap();
     fixture
         .client
-        .project_create(ProjectCreatePayload {
-            name: "Tyde".to_owned(),
-            roots: vec![ProjectRootPath("/tmp/tyde".to_owned())],
+        .project_delete_root(ProjectDeleteRootPayload {
+            id: project.id.clone(),
+            root: project.root_paths()[1].clone(),
         })
         .await
-        .expect("project_create failed");
-
-    match expect_project_notify(&mut fixture.client, "project create").await {
-        ProjectNotifyPayload::Upsert { project } => {
-            assert!(!project.id.0.is_empty());
-            assert_eq!(project.name, "Tyde");
-            assert_eq!(project_roots(&project), vec!["/tmp/tyde".to_owned()]);
+        .unwrap();
+    match expect_project_notify(&mut fixture.client, "metadata adoption during held startup").await
+    {
+        ProjectNotifyPayload::Upsert { project: updated } => {
+            assert_eq!(updated.root_paths(), vec![project.root_paths()[0].clone()])
         }
-        other => panic!("expected upsert project notification, got {other:?}"),
+        _ => panic!("expected current full catalog record"),
     }
+    release.send(()).unwrap();
+    let bootstrap =
+        expect_project_bootstrap(&mut fixture.client, "latest roots after startup adoption").await;
+    assert_eq!(
+        bootstrap.project.root_paths(),
+        vec![project.root_paths()[0].clone()]
+    );
+    fs::write(primary.path().join("startup-settled.txt"), "settled").unwrap();
+    fixture
+        .client
+        .project_stage_file(
+            &project.id,
+            ProjectStageFilePayload {
+                path: ProjectPath {
+                    root: project.root_paths()[0].clone(),
+                    relative_path: "startup-settled.txt".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let status = next_frame_matching_on(
+        &mut fixture.client,
+        "settled Git refresh after startup root adoption",
+        |env| {
+            env.kind == FrameKind::ProjectGitStatus
+                && env
+                    .parse_payload::<ProjectGitStatusPayload>()
+                    .unwrap()
+                    .roots
+                    .iter()
+                    .any(|root| {
+                        root.files.iter().any(|file| {
+                            file.relative_path == "startup-settled.txt" && file.staged.is_some()
+                        })
+                    })
+        },
+    )
+    .await
+    .parse_payload::<ProjectGitStatusPayload>()
+    .unwrap();
+    assert_eq!(
+        status
+            .roots
+            .iter()
+            .map(|root| root.root.clone())
+            .collect::<Vec<_>>(),
+        vec![project.root_paths()[0].clone()],
+        "a startup-time record must not stamp obsolete roots with the new generation"
+    );
+    eprintln!(
+        "PROJECT ROOT EVIDENCE: catalog changed during held actor startup; completed real Git refresh contains only current authorized roots"
+    );
 }
 
 #[tokio::test]
@@ -787,6 +861,157 @@ async fn add_root_emits_updated_upsert() {
         }
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+    let initial = tempfile::tempdir().unwrap();
+    let added = tempfile::tempdir().unwrap();
+    fs::write(initial.path().join("original.txt"), "original root").unwrap();
+    fs::write(added.path().join("added.txt"), "added root").unwrap();
+    let project = create_project(
+        &mut fixture.client,
+        "Authoritative roots",
+        vec![initial.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "root authority initial bootstrap",
+        |env| {
+            env.kind == FrameKind::ProjectBootstrap
+                && env
+                    .parse_payload::<ProjectBootstrapPayload>()
+                    .is_ok_and(|bootstrap| bootstrap.project.id == project.id)
+        },
+    )
+    .await;
+    let mut observer = fixture.connect().await;
+    next_frame_matching_on(
+        &mut observer,
+        "root authority observer subscription settled",
+        |env| {
+            env.kind == FrameKind::ProjectBootstrap
+                && env
+                    .parse_payload::<ProjectBootstrapPayload>()
+                    .is_ok_and(|bootstrap| bootstrap.project.id == project.id)
+        },
+    )
+    .await;
+    let added_root = ProjectRootPath(added.path().to_string_lossy().into_owned());
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let scan_hook = fixture.on_project_scan(
+        added.path().to_owned(),
+        server::ScanPoint::ReadDirectory,
+        move || {
+            let _ = entered.send(());
+            let _ = held.recv();
+        },
+    );
+    fixture
+        .client
+        .project_add_root(ProjectAddRootPayload {
+            id: project.id.clone(),
+            root: added_root.clone(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut observer, "added root catalog publication", |env| {
+        env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Upsert { project: updated } if updated.id == project.id && updated.root_paths().contains(&added_root))
+    }).await;
+    reached.await.unwrap();
+    eprintln!("PROJECT ROOT EVIDENCE: real added-root scan held after catalog Upsert");
+    observer
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: added_root.clone(),
+                    relative_path: "added.txt".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let read =
+        expect_project_file_contents(&mut observer, "added-root authorization while scan held")
+            .await;
+    assert_eq!(read.contents.as_deref(), Some("added root"));
+    eprintln!("PROJECT ROOT EVIDENCE: added-root read completed before scan release");
+    fixture
+        .client
+        .project_delete_root(ProjectDeleteRootPayload {
+            id: project.id.clone(),
+            root: added_root.clone(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut observer, "removed root catalog publication", |env| {
+        env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Upsert { project: updated } if updated.id == project.id && !updated.root_paths().contains(&added_root))
+    }).await;
+    observer
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: added_root.clone(),
+                    relative_path: "added.txt".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let denied = expect_project_command_error(
+        &mut observer,
+        "removed-root authorization while obsolete scan held",
+    )
+    .await;
+    assert_eq!(denied.operation, "project_read_file");
+    assert!(denied.message.contains("does not belong"));
+    observer
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: project.root_paths()[0].clone(),
+                    relative_path: "original.txt".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let read =
+        expect_project_file_contents(&mut observer, "retained-root read while obsolete scan held")
+            .await;
+    assert_eq!(read.contents.as_deref(), Some("original root"));
+    assert!(
+        added.path().join("added.txt").is_file(),
+        "root removal must not remove files"
+    );
+    eprintln!(
+        "PROJECT ROOT EVIDENCE: removed-root rejection and retained-root read completed before obsolete scan release"
+    );
+    release.send(()).unwrap();
+    drop(scan_hook);
+    next_frame_matching_on(
+        &mut observer,
+        "latest root generation after obsolete scan completion",
+        |env| {
+            if env.kind != FrameKind::ProjectFileList
+                || env.stream != StreamPath(format!("/project/{}", project.id))
+            {
+                return false;
+            }
+            let listing = env.parse_payload::<ProjectFileListPayload>().unwrap();
+            assert!(
+                listing.roots.iter().all(|root| root.root != added_root),
+                "obsolete scan restored removed root membership"
+            );
+            listing.roots.len() == 1
+                && listing.roots[0]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.relative_path == "original.txt")
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4817,6 +5042,71 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
     }
 }
 
+fn watch_completion(
+    fixture: &Fixture,
+    path: &Path,
+    point: server::ScanPoint,
+) -> (
+    server::InstalledScanHook,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let hook = fixture.on_project_scan(path.to_owned(), point, move || {
+        let _ = tx.send(());
+    });
+    (hook, rx)
+}
+
+async fn expect_watched_listing(client: &mut client::Connection, path: &str, present: bool) {
+    next_frame_matching_on(
+        client,
+        "watcher listing reflects filesystem state",
+        |event| {
+            assert_ne!(event.kind, FrameKind::CommandError);
+            event.kind == FrameKind::ProjectFileList && {
+                let listing = event.parse_payload::<ProjectFileListPayload>().unwrap();
+                !listing.incremental
+                    && listing.roots.iter().any(|root| {
+                        root.entries.iter().any(|entry| entry.relative_path == path) == present
+                    })
+            }
+        },
+    )
+    .await;
+}
+
+async fn expect_watched_write(
+    client: &mut client::Connection,
+    project: &Project,
+    relative_path: &str,
+    contents: &str,
+) {
+    let path = ProjectPath {
+        root: ProjectRootPath(project_root(project, 0)),
+        relative_path: relative_path.to_owned(),
+    };
+    let absolute = Path::new(&path.root.0).join(relative_path);
+    client
+        .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+        .await
+        .unwrap();
+    let before = expect_project_file_contents(client, "observe file before watched write").await;
+    fs::write(&absolute, contents).unwrap();
+    next_frame_matching_on(client, "watched file invalidation", |event| {
+        assert_ne!(event.kind, FrameKind::CommandError);
+        event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path == path && file.version > before.version))
+    }).await;
+    client
+        .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+        .await
+        .unwrap();
+    let after = expect_project_file_contents(client, "read invalidated file").await;
+    assert_eq!(after.contents.as_deref(), Some(contents));
+    assert!(after.version > before.version);
+    eprintln!("PROJECT WATCH EVIDENCE: observed_file_invalidated=true contents_current=true");
+}
+
 #[tokio::test]
 async fn project_watcher_prunes_ignored_build_trees() {
     let mut fixture = Fixture::new().await;
@@ -4836,21 +5126,21 @@ async fn project_watcher_prunes_ignored_build_trees() {
         &repo.path().join("target/debug/.fingerprint/cache"),
         "artifact",
     );
-    let project = create_project_with_real_roots(
+    write_file(&repo.path().join("pruned/deep/new.rs"), "unopened\n");
+    let (ready, ready_rx) =
+        watch_completion(&fixture, repo.path(), server::ScanPoint::WatcherReady);
+    let project = create_project(
         &mut fixture.client,
         "Ignored watches",
         vec![repo.path().to_string_lossy().into_owned()],
     )
     .await;
 
+    expect_project_bootstrap(&mut fixture.client, "watcher flow bootstrap").await;
+    ready_rx.await.unwrap();
+    drop(ready);
     #[cfg(target_os = "linux")]
     {
-        (async {
-            while !directory_has_inotify_watch(&repo.path().join("src")) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
         for directory in [
             "target",
             "target/debug",
@@ -4867,141 +5157,272 @@ async fn project_watcher_prunes_ignored_build_trees() {
             "Git object storage must not consume OS watches"
         );
     }
-    fixture
-        .client
-        .project_read_file(
-            &project.id,
-            ProjectReadFilePayload {
-                path: ProjectPath {
-                    root: ProjectRootPath(project_root(&project, 0)),
-                    relative_path: "src/main.rs".to_owned(),
-                },
-            },
-        )
-        .await
-        .expect("read source");
-    expect_project_file_contents(&mut fixture.client, "source contents").await;
-    let source = repo.path().join("src/main.rs");
-    fs::write(&source, "source update\n").expect("edit source");
-    expect_watched_change(&mut fixture.client, "src/main.rs").await;
+
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
+        "src/main.rs",
+        "source update\n",
+    )
+    .await;
 
     write_file(&repo.path().join("fresh/deep/new.rs"), "new\n");
-    expect_watched_change(&mut fixture.client, "fresh/deep/new.rs").await;
-    fs::write(repo.path().join("fresh/deep/new.rs"), "second\n").unwrap();
-    expect_watched_change(&mut fixture.client, "fresh/deep/new.rs").await;
-    fs::rename(repo.path().join("fresh"), repo.path().join("moved")).unwrap();
-    expect_watched_change_at_phase(&mut fixture.client, "moved/deep/new.rs", "directory rename")
-        .await;
-    fs::write(repo.path().join("moved/deep/new.rs"), "after move\n").unwrap();
-    expect_watched_change_at_phase(
+    expect_watched_listing(&mut fixture.client, "fresh/deep/new.rs", true).await;
+    expect_watched_write(
         &mut fixture.client,
+        &project,
+        "fresh/deep/new.rs",
+        "second\n",
+    )
+    .await;
+    fs::rename(repo.path().join("fresh"), repo.path().join("moved")).unwrap();
+    expect_watched_listing(&mut fixture.client, "moved/deep/new.rs", true).await;
+    let unopened_child = repo.path().join("moved/deep/created-without-read.rs");
+    let (automatic, automatic_rx) = watch_completion(
+        &fixture,
+        &unopened_child,
+        server::ScanPoint::WatcherDispatch,
+    );
+    write_file(&unopened_child, "automatic renamed-directory watch\n");
+    automatic_rx.await.unwrap();
+    expect_watched_listing(
+        &mut fixture.client,
+        "moved/deep/created-without-read.rs",
+        true,
+    )
+    .await;
+    drop(automatic);
+    eprintln!(
+        "PROJECT WATCH EVIDENCE: automatic renamed-directory native event and listing completed before any new-path read"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let moved_path = ProjectPath {
+            root: ProjectRootPath(project_root(&project, 0)),
+            relative_path: "moved/deep/new.rs".to_owned(),
+        };
+        let moved_file = repo.path().join("moved/deep/new.rs");
+        // A dropped native event cannot identify an unopened file. The returned
+        // read registers observation before a version-invalidation assertion;
+        // unopened trees below retain their separate listing/pruning contract.
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: moved_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let before = expect_project_file_contents(
+            &mut fixture.client,
+            "observe renamed file before queue loss",
+        )
+        .await;
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let paused = fixture.on_project_scan(
+            repo.path().to_owned(),
+            server::ScanPoint::WatcherProcess,
+            move || {
+                let _ = paused_tx.send(());
+                release_rx.recv().expect("release rename catch-up worker");
+            },
+        );
+        fs::write(repo.path().join("src/main.rs"), "hold after rename\n").unwrap();
+        paused_rx.await.unwrap();
+        let invalidated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalidated_copy = invalidated.clone();
+        let target = fixture.on_project_scan(
+            moved_file.clone(),
+            server::ScanPoint::WatcherInvalidated,
+            move || {
+                invalidated_copy.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        let unopened_invalidated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unopened_copy = unopened_invalidated.clone();
+        let unopened = fixture.on_project_scan(
+            repo.path().join("pruned/deep/new.rs"),
+            server::ScanPoint::WatcherInvalidated,
+            move || {
+                unopened_copy.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        let (rescanned, rescanned_rx) = watch_completion(
+            &fixture,
+            repo.path(),
+            server::ScanPoint::WatcherRescanFinished,
+        );
+        let (dropped, dropped_rx) =
+            watch_completion(&fixture, &moved_file, server::ScanPoint::WatcherDropped);
+        // More distinct native events than the 128-entry queue, with its worker
+        // held. Alternating paths avoids kernel coalescing without a file storm.
+        for index in 0..129 {
+            fs::write(
+                repo.path().join(format!("src/queue-{}.rs", index % 2)),
+                "queue pressure\n",
+            )
+            .unwrap();
+        }
+        fs::write(&moved_file, "after move\n").unwrap();
+        dropped_rx.await.unwrap();
+        eprintln!(
+            "PROJECT WATCH EVIDENCE: renamed-file native event explicitly dropped while worker held; target observation completed before write"
+        );
+        release_tx.send(()).unwrap();
+        rescanned_rx.await.unwrap();
+        eprintln!(
+            "PROJECT WATCH EVIDENCE: catch-up finished observed_target_invalidated={} unopened_target_invalidated={}",
+            invalidated.load(std::sync::atomic::Ordering::SeqCst),
+            unopened_invalidated.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        drop((paused, dropped, target, unopened, rescanned));
+        next_frame_matching_on(&mut fixture.client, "observed renamed-file version after explicit queue loss", |event| {
+        assert_ne!(event.kind, FrameKind::CommandError);
+        event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path == moved_path && file.version > before.version))
+    }).await;
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: moved_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let after = expect_project_file_contents(
+            &mut fixture.client,
+            "renamed-file contents after explicit queue loss",
+        )
+        .await;
+        assert_eq!(after.contents.as_deref(), Some("after move\n"));
+        assert!(after.version > before.version);
+    }
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
         "moved/deep/new.rs",
-        "write after directory rename",
+        "native watch restored\n",
     )
     .await;
 
     write_file(&repo.path().join("shape"), "was a file\n");
-    expect_watched_change(&mut fixture.client, "shape").await;
+    expect_watched_listing(&mut fixture.client, "shape", true).await;
     fs::remove_file(repo.path().join("shape")).unwrap();
     write_file(&repo.path().join("shape/nested.rs"), "now a directory\n");
-    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
-    fs::write(
-        repo.path().join("shape/nested.rs"),
+    expect_watched_listing(&mut fixture.client, "shape/nested.rs", true).await;
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
+        "shape/nested.rs",
         "directory contents changed\n",
     )
-    .unwrap();
-    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    .await;
     fs::remove_dir_all(repo.path().join("shape")).unwrap();
-    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    expect_watched_listing(&mut fixture.client, "shape/nested.rs", false).await;
     write_file(
         &repo.path().join("shape/nested.rs"),
         "recreated directory\n",
     );
-    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
-    fs::write(
-        repo.path().join("shape/nested.rs"),
+    expect_watched_listing(&mut fixture.client, "shape/nested.rs", true).await;
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
+        "shape/nested.rs",
         "recreated contents changed\n",
     )
-    .unwrap();
-    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    .await;
 
     write_file(
         &repo.path().join(".settings/editor.toml"),
         "enabled = true\n",
     );
-    expect_watched_change(&mut fixture.client, ".settings/editor.toml").await;
-    fs::write(repo.path().join("tracked/keep.rs"), "tracked update\n").unwrap();
-    expect_watched_change(&mut fixture.client, "tracked/keep.rs").await;
-
-    fs::write(
-        repo.path().join(".gitignore"),
-        "/target/\n/tracked/\n/moved/\n",
-    )
-    .unwrap();
-    expect_watched_change(&mut fixture.client, ".gitignore").await;
-    #[cfg(target_os = "linux")]
-    assert!(
-        !directory_has_inotify_watch(&repo.path().join("moved/deep")),
-        "new ignore rules must release directory watches"
-    );
-    fs::write(repo.path().join("moved/deep/new.rs"), "ignored update\n").unwrap();
-    fs::write(
-        repo.path().join("target/debug/.fingerprint/cache"),
-        "new artifact",
-    )
-    .unwrap();
-    assert_no_watched_changes(
+    expect_watched_listing(&mut fixture.client, ".settings/editor.toml", true).await;
+    expect_watched_write(
         &mut fixture.client,
-        &["moved/deep/new.rs", "target/debug/.fingerprint/cache"],
+        &project,
+        "tracked/keep.rs",
+        "tracked update\n",
     )
     .await;
 
-    fs::write(repo.path().join(".gitignore"), "/target/\n/tracked/\n").unwrap();
-    expect_watched_change(&mut fixture.client, ".gitignore").await;
-    fs::write(repo.path().join("moved/deep/new.rs"), "visible again\n").unwrap();
-    expect_watched_change_at_phase(
-        &mut fixture.client,
-        "moved/deep/new.rs",
-        "write after root ignore removed",
-    )
-    .await;
+    let pruned = repo.path().join("pruned/deep");
+    for (control, ignored) in [
+        (
+            repo.path().join(".gitignore"),
+            "/target/\n/tracked/\n/pruned/\n",
+        ),
+        (repo.path().join("pruned/.gitignore"), "deep/\n"),
+        (repo.path().join(".git/info/exclude"), "pruned/\n"),
+    ] {
+        let (removed, removed_rx) =
+            watch_completion(&fixture, &pruned, server::ScanPoint::WatcherUnregistered);
+        fs::write(&control, ignored).unwrap();
+        removed_rx.await.unwrap();
+        // Pruning itself invalidates entries removed from the watch inventory.
+        // Consume that transition before asserting absence for later writes.
+        expect_watched_change_at_phase(
+            &mut fixture.client,
+            "pruned/deep/new.rs",
+            "ignore policy adopted",
+        )
+        .await;
+        #[cfg(target_os = "linux")]
+        assert!(
+            !directory_has_inotify_watch(&pruned),
+            "ignore rules must release unopened subtree watches"
+        );
+        fs::write(pruned.join("new.rs"), "ignored update\n").unwrap();
+        fs::write(
+            repo.path().join("target/debug/.fingerprint/cache"),
+            "new artifact",
+        )
+        .unwrap();
+        assert_no_watched_changes(
+            &mut fixture.client,
+            &["pruned/deep/new.rs", "target/debug/.fingerprint/cache"],
+        )
+        .await;
 
-    write_file(&repo.path().join("moved/.gitignore"), "deep/\n");
-    expect_watched_change(&mut fixture.client, "moved/.gitignore").await;
-    #[cfg(target_os = "linux")]
-    assert!(
-        !directory_has_inotify_watch(&repo.path().join("moved/deep")),
-        "nested ignore rules must prune existing watches"
-    );
-    fs::remove_file(repo.path().join("moved/.gitignore")).unwrap();
-    expect_watched_change(&mut fixture.client, "moved/.gitignore").await;
-    fs::write(
-        repo.path().join("moved/deep/new.rs"),
-        "nested rule removed\n",
-    )
-    .unwrap();
-    expect_watched_change_at_phase(
-        &mut fixture.client,
-        "moved/deep/new.rs",
-        "write after nested ignore removed",
-    )
-    .await;
-
-    fs::write(repo.path().join(".git/info/exclude"), "moved/\n").unwrap();
-    #[cfg(target_os = "linux")]
-    (async {
-        while directory_has_inotify_watch(&repo.path().join("moved/deep")) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let (restored, restored_rx) =
+            watch_completion(&fixture, &pruned, server::ScanPoint::WatcherRegistered);
+        if control == repo.path().join(".gitignore") {
+            fs::write(&control, "/target/\n/tracked/\n").unwrap();
+        } else {
+            fs::remove_file(&control).unwrap();
         }
-    })
-    .await;
-    fs::write(repo.path().join(".git/info/exclude"), "").unwrap();
-    expect_watched_change_at_phase(
-        &mut fixture.client,
-        "moved/deep/new.rs",
-        "repository exclusion removed",
-    )
-    .await;
+        restored_rx.await.unwrap();
+        expect_watched_change_at_phase(
+            &mut fixture.client,
+            "pruned/deep/new.rs",
+            "ignore policy removed",
+        )
+        .await;
+        #[cfg(target_os = "linux")]
+        assert!(
+            directory_has_inotify_watch(&pruned),
+            "restored unopened subtree must regain its native watch"
+        );
+        write_file(&pruned.join("created-after-restore.rs"), "watch restored\n");
+        expect_watched_listing(
+            &mut fixture.client,
+            "pruned/deep/created-after-restore.rs",
+            true,
+        )
+        .await;
+        fs::remove_file(pruned.join("created-after-restore.rs")).unwrap();
+        expect_watched_listing(
+            &mut fixture.client,
+            "pruned/deep/created-after-restore.rs",
+            false,
+        )
+        .await;
+        drop((removed, restored));
+    }
 
     fixture
         .client

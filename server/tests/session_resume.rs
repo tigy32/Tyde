@@ -5297,6 +5297,10 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
         r#"{"records":{"saved":{"id":"saved","backend_kind":"claude","workspace_roots":["/tmp/test"],"created_at_ms":1,"updated_at_ms":1}}}"#,
         r#"{"version":2,"records":{}}"#,
     ).await;
+    let (old_read, old_read_finished) = fixture
+        .host_for_test()
+        .install_next_session_list_publication_test_gate()
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -5333,6 +5337,7 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
         "mock backend response to: hello",
     )
     .await;
+    old_read.wait_until_entered().await;
     // The writer is a host-level deletion, not a command on the live agent:
     // bootstrap also asks live actors for usage, independently of session I/O.
     let mut deleting_client = fixture.connect().await;
@@ -5371,11 +5376,47 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list committed deletion");
-    let list = wait_for_session_list(&mut deleting_client, "list after commit").await;
+    // Annotation promotion can publish a pre-deletion list after the held
+    // transaction starts. Observe the committed state, not that queued list.
+    let list = fixture::next_frame_matching_on(&mut deleting_client, "list after commit", |env| {
+        env.kind == FrameKind::SessionList
+            && env
+                .parse_payload::<SessionListPayload>()
+                .unwrap()
+                .sessions
+                .iter()
+                .all(|record| record.id.0 != "saved")
+    })
+    .await
+    .parse_payload::<SessionListPayload>()
+    .unwrap();
     assert_eq!(list.sessions.len(), 1);
     assert!(
         list.sessions[0].id == session,
         "only the unrelated session remains"
+    );
+    let published =
+        wait_for_session_list(&mut fixture.client, "new list before releasing older read").await;
+    assert_eq!(published.sessions.len(), 1);
+    assert_eq!(published.sessions[0].id, session);
+    old_read.release_one();
+    old_read_finished.await.expect("older read completion");
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .unwrap();
+    // SessionList shares one FIFO output lane. Any obsolete publication is
+    // ahead of this fresh command's list once the older worker has completed.
+    let after_old_read = wait_for_session_list(
+        &mut fixture.client,
+        "older read must not resurrect deleted row",
+    )
+    .await;
+    let older_read_was_discarded =
+        after_old_read.sessions.len() == 1 && after_old_read.sessions[0].id == session;
+    eprintln!(
+        "SESSION PUBLICATION EVIDENCE: older real read completed after newer deletion; obsolete_rows_discarded={older_read_was_discarded}"
     );
     fixture.restart_host().await;
     fixture
@@ -5388,6 +5429,84 @@ async fn session_reads_remain_responsive_during_uncommitted_write() {
     assert!(
         list.sessions[0].id == session,
         "restart must not resurrect a deleted session from legacy JSON"
+    );
+
+    let mut damaged = Fixture::new_with_store_files(
+        r#"{"records":{"delete-me":{"id":"delete-me","backend_kind":"claude","workspace_roots":["/tmp/test"],"created_at_ms":1,"updated_at_ms":1},"keep-me":{"id":"keep-me","backend_kind":"claude","workspace_roots":["/tmp/test"],"created_at_ms":1,"updated_at_ms":1}}}"#,
+        r#"{"version":2,"records":{}}"#,
+    ).await;
+    let database =
+        server::store::session::SessionStore::database_path(&damaged.session_store_path());
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let saved: String = connection
+        .query_row(
+            "SELECT record FROM sessions WHERE id='keep-me'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET record='invalid record' WHERE id='keep-me'",
+            [],
+        )
+        .unwrap();
+    damaged
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: SessionId("delete-me".into()),
+        })
+        .await
+        .unwrap();
+    damaged
+        .client
+        .heartbeat(protocol::HeartbeatPayload {
+            client_sent_at_ms: 101,
+        })
+        .await
+        .unwrap();
+    let mut publication_error = false;
+    let mut committed_error = false;
+    let mut heartbeat = false;
+    fixture::next_frame_matching_on(
+        &mut damaged.client,
+        "failed session publication is explicit",
+        |env| {
+            if env.kind == FrameKind::HeartbeatAck {
+                heartbeat = true;
+            }
+            if env.kind == FrameKind::CommandError {
+                let error: protocol::CommandErrorPayload = env.parse_payload().unwrap();
+                assert_eq!(error.code, protocol::CommandErrorCode::Internal);
+                publication_error |= error.request_kind == FrameKind::ListSessions;
+                committed_error |= error.request_kind == FrameKind::DeleteSession
+                    && error.message.contains("deletion committed");
+            }
+            heartbeat
+        },
+    )
+    .await;
+    connection
+        .execute("UPDATE sessions SET record=?1 WHERE id='keep-me'", [&saved])
+        .unwrap();
+    damaged
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .unwrap();
+    let repaired = wait_for_session_list(
+        &mut damaged.client,
+        "committed deletion remains visible after publication repair",
+    )
+    .await;
+    assert_eq!(repaired.sessions.len(), 1);
+    assert!(repaired.sessions[0].id.0 == "keep-me");
+    eprintln!(
+        "SESSION PUBLICATION EVIDENCE: real SQLite decoding failure; publication_error={publication_error}, committed_error={committed_error}, connection_heartbeat={heartbeat}"
+    );
+    assert!(
+        older_read_was_discarded && publication_error && committed_error,
+        "session publication must reject obsolete rows and expose actual read failure: obsolete_rows_discarded={older_read_was_discarded}, publication_error={publication_error}, committed_error={committed_error}"
     );
 }
 
@@ -8012,6 +8131,7 @@ async fn close_and_expect_no_recovery(
         .expect("close the agent");
     fixture
         .next_frame_matching("AgentClosed", |env| {
+            assert_ne!(env.kind, FrameKind::CommandError, "canonical close must not reject a non-swarm agent because the swarm owner has stopped");
             env.kind == FrameKind::AgentClosed
                 && env
                     .parse_payload::<protocol::AgentClosedPayload>()
@@ -9437,6 +9557,11 @@ async fn close_during_startup_with_deferred_restart_is_not_restored() {
         .expect("close the starting agent");
     fixture
         .next_frame_matching("AgentClosed for the starting agent", |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::CommandError,
+                "explicit close must remain available during deferred restart"
+            );
             env.kind == FrameKind::AgentClosed
                 && env
                     .parse_payload::<protocol::AgentClosedPayload>()

@@ -56,22 +56,38 @@ exit 3
 "#;
 
 const FAKE_NODE: &str = r#"#!/usr/bin/python3
-import http.server,os,socket,sys
+import http.server,json,os,pathlib,socket,sys
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
 assert sys.argv[1].endswith('/tools/trunk-command.mjs')
 assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv
 if sys.argv[1].startswith('/mnt/tyde-workspace/'):
  assert os.getcwd()=='/mnt/tyde-workspace'
  assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE']
 port=int(sys.argv[sys.argv.index('--port')+1])
-control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
-control.sendall(b'B')
-assert control.recv(1)==b'R'
+proof=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.frontend')
+def record(phase):
+    proof.write_text(json.dumps({'phase':phase,'port':port,'pid':os.getpid()}))
+    print(f'DEV FRONTEND phase={phase} port={port}',flush=True)
+record('launched')
+ready=False
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        global ready
+        if not ready:
+            assert self.client_address[1]!=port
+            record('request-held')
+            control.sendall(b'Q'+self.client_address[1].to_bytes(2,'big'))
+            assert control.recv(1)==b'R'
+            ready=True
         self.send_response(200);self.end_headers();self.wfile.write(b'<html>fixture</html>')
+        record('response-served')
     def log_message(self,*args):pass
-http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
+server=http.server.HTTPServer(('127.0.0.1',port),Handler)
+record('bound')
+control.sendall(b'B'+port.to_bytes(2,'big'))
+record('awaiting-request')
+server.serve_forever()
 "#;
 
 // Nextest isolates each test in its own process, so the process environment
@@ -213,7 +229,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DevScenario {
     NativeExit,
     #[cfg(target_os = "linux")]
@@ -253,6 +269,11 @@ async fn start_dev_instance_expecting_exit(
     desktop_marker: &Path,
     scenario: DevScenario,
 ) -> String {
+    eprintln!("DEV READINESS scenario={scenario:?} phase=starting");
+    let producer_proof = desktop_marker.with_extension("frontend");
+    if producer_proof.exists() {
+        std::fs::remove_file(&producer_proof).expect("remove completed producer proof");
+    }
     let control_listener =
         tokio::net::UnixListener::bind(control_path).expect("bind frontend readiness gate");
     // Let the server retain its ephemeral listener: reserving then releasing a
@@ -419,6 +440,19 @@ async fn start_dev_instance_expecting_exit(
         fixture.host_for_test().debug_mcp_url_for_test().await,
     );
     let service = ().serve(transport).await.expect("connect to debug MCP");
+    let (release_probe, held_probe) = std::sync::mpsc::channel();
+    let (probe_entered_tx, probe_entered) = tokio::sync::oneshot::channel();
+    let probe_root =
+        std::fs::canonicalize(&repo_root).expect("canonical DEV source for probe observer");
+    eprintln!(
+        "DEV READINESS scenario={scenario:?} source_canonicalized={}",
+        probe_root != repo_root
+    );
+    let probe_gate =
+        fixture.on_project_scan(probe_root, server::ScanPoint::DevFrontendProbe, move || {
+            let _ = probe_entered_tx.send(());
+            let _ = held_probe.recv();
+        });
     let mut start = Box::pin(
         service.call_tool(CallToolRequestParams {
             meta: None,
@@ -438,7 +472,11 @@ async fn start_dev_instance_expecting_exit(
                 }).collect::<Vec<_>>(),
                 Err(error) => vec![error.to_string()],
             };
-            panic!("zxcv DEV start settled before frontend readiness gate: {details:?}");
+            let producer = match std::fs::read_to_string(&producer_proof) {
+                Ok(value) => value,
+                Err(error) => format!("producer_proof_unavailable={:?}", error.kind()),
+            };
+            panic!("DEV READINESS scenario={scenario:?} settled before frontend gate: producer={producer} details={details:?}");
         },
         connected = control_listener.accept() => connected.expect("frontend entered actual readiness gate"),
     };
@@ -449,6 +487,39 @@ async fn start_dev_instance_expecting_exit(
     assert!(
         !desktop_marker.exists(),
         "desktop started before frontend was ready"
+    );
+    let port = control.read_u16().await.expect("owned frontend endpoint");
+    probe_entered
+        .await
+        .expect("real canonical probe is held before connecting");
+    eprintln!("DEV READINESS scenario={scenario:?} phase=canonical-probe-held producer_bound=true");
+    // The old producer announced B with no listener, letting a competing
+    // endpoint (or self-connect) answer before the intended readiness gate.
+    // B now attests a bound child; release only the real probe, not HTTP200.
+    let ownership = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+    assert!(
+        matches!(ownership, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
+        "frontend gate must retain its actual bound endpoint"
+    );
+    release_probe
+        .send(())
+        .expect("release actual canonical frontend probe");
+    drop(probe_gate);
+    assert_eq!(
+        control
+            .read_u8()
+            .await
+            .expect("owned frontend HTTP request"),
+        b'Q'
+    );
+    let peer_port = control.read_u16().await.expect("actual probe endpoint");
+    assert_ne!(peer_port, port, "readiness must not be a TCP self-connect");
+    assert!(
+        !desktop_marker.exists(),
+        "desktop started before the held HTTP readiness response"
+    );
+    eprintln!(
+        "DEV READINESS scenario={scenario:?} phase=owned-http-request local=127.0.0.1:{port} peer=127.0.0.1:{peer_port} self_connected=false awaiting_http200=true"
     );
     let mut desktop_control = None;
     if !scenario.holds_frontend() {
@@ -465,6 +536,7 @@ async fn start_dev_instance_expecting_exit(
             desktop_control = Some(connected);
         }
     }
+    eprintln!("DEV READINESS scenario={scenario:?} phase=awaiting-terminal-result");
     let result = if scenario.removes_pending() {
         let project = workbench.as_ref().expect("owned Bubblewrap workbench");
         fixture
@@ -563,5 +635,6 @@ async fn start_dev_instance_expecting_exit(
         next_frame_matching_on(&mut fixture.client, "DEV workbench removed", |e| e.kind==protocol::FrameKind::ProjectNotify && matches!(e.parse_payload::<protocol::ProjectNotifyPayload>().unwrap(),protocol::ProjectNotifyPayload::Delete { project: p } if p.id==project.id)).await;
         assert!(!repo_root.exists());
     }
+    eprintln!("DEV READINESS scenario={scenario:?} phase=terminal-cleanup-joined");
     error
 }

@@ -713,6 +713,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SessionList
         | FrameKind::SessionSummaryCountUpdated
         | FrameKind::ProjectNotify
+        | FrameKind::ProjectOperation
         | FrameKind::CustomAgentNotify
         | FrameKind::SteeringNotify
         | FrameKind::SkillNotify

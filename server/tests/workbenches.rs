@@ -114,29 +114,6 @@ async fn expect_command_error(
         .expect("failed to parse CommandErrorPayload")
 }
 
-async fn wait_for_command_error(
-    client: &mut client::Connection,
-    context: &str,
-    duration: Duration,
-) -> Option<CommandErrorPayload> {
-    let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
-        let env = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed while waiting for {context}"),
-            Ok(Err(err)) => panic!("next_event failed while waiting for {context}: {err:?}"),
-            Err(_) => return None,
-        };
-        if env.kind == FrameKind::CommandError {
-            return Some(
-                env.parse_payload()
-                    .expect("failed to parse CommandErrorPayload"),
-            );
-        }
-    }
-}
-
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -418,6 +395,19 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
         "feature/login"
     );
 
+    let first = fixture.spawn("same connection chat", "initial").await;
+    fixture.finish_turn(&first).await;
+    let second = fixture.spawn("second connection chat", "initial").await;
+    fixture.finish_turn(&second).await;
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    let second_stream = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == second.new_agent.agent_id)
+        .unwrap()
+        .instance_stream
+        .clone();
+    let hook = fixture.install_workbench_remove_test_hook();
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -426,11 +416,188 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
         })
         .await
         .expect("workbench_remove write failed");
+    hook.wait_until_reached().await;
+    eprintln!("PROJECT MUTATION EVIDENCE: removal held before Git/cleanup; release is closed");
+    fixture
+        .mock(&second)
+        .await
+        .enqueue(MockTurn::text("second client completed while held"))
+        .await;
+    observer
+        .send_message(&second_stream, "independent chat".into())
+        .await
+        .unwrap();
+    fixture::next_logical_frame_matching_on(&mut observer, "second-client chat while removal held", |env| {
+        env.stream == second_stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<protocol::ChatEvent>().unwrap(), protocol::ChatEvent::StreamEnd(end) if end.message.content == "second client completed while held")
+    }).await;
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: second client chat completed; same-connection heartbeat is next while release remains closed"
+    );
+    fixture
+        .client
+        .heartbeat(protocol::HeartbeatPayload {
+            client_sent_at_ms: 7,
+        })
+        .await
+        .unwrap();
+    let heartbeat = expect_kind(
+        &mut fixture.client,
+        FrameKind::HeartbeatAck,
+        "same-connection heartbeat while removal held",
+    )
+    .await;
+    assert_eq!(
+        heartbeat
+            .parse_payload::<protocol::HeartbeatPayload>()
+            .unwrap()
+            .client_sent_at_ms,
+        7
+    );
+    fixture
+        .client
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "same-connection command while removal held",
+    )
+    .await;
+    fixture
+        .client
+        .project_read_file(
+            &parent.id,
+            protocol::ProjectReadFilePayload {
+                path: protocol::ProjectPath {
+                    root: parent.root_paths()[0].clone(),
+                    relative_path: "README.md".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let read = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectFileContents,
+        "same-connection read while removal held",
+    )
+    .await
+    .parse_payload::<protocol::ProjectFileContentsPayload>()
+    .unwrap();
+    assert_eq!(read.contents.as_deref(), Some("# round-trip\n"));
+    fixture
+        .mock(&first)
+        .await
+        .enqueue(MockTurn::text("same client completed while held"))
+        .await;
+    fixture
+        .client
+        .send_message(&first.stream, "same-connection chat".into())
+        .await
+        .unwrap();
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "same-connection chat while removal held", |env| {
+        env.stream == first.stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<protocol::ChatEvent>().unwrap(), protocol::ChatEvent::StreamEnd(end) if end.message.content == "same client completed while held")
+    }).await;
+    assert!(
+        expected_path.is_dir(),
+        "held operation must still be unfinished"
+    );
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: both chats, same-connection heartbeat/command/read completed before release"
+    );
+    observer
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("conflicting-operation".into()),
+            name: "conflicting operation".into(),
+        })
+        .await
+        .unwrap();
+    let conflict = expect_command_error(&mut observer, "held catalog family conflict").await;
+    assert_eq!(conflict.code, CommandErrorCode::Conflict);
+    assert!(
+        matches!(conflict.context, Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, .. }) if parent_project_id == parent.id)
+    );
+
+    let (mut reconnect, _) = fixture.connect_with_bootstrap().await;
+    let replay = next_frame_matching_on(&mut reconnect, "current operation replay", |env| {
+        env.kind == FrameKind::ProjectOperation && matches!(env.parse_payload::<protocol::ProjectOperationPayload>().unwrap().mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == workbench.id)
+    }).await.parse_payload::<protocol::ProjectOperationPayload>().unwrap();
+    assert_eq!(replay.host_id.0, protocol::LOCAL_HOST_ID);
+    assert!(matches!(
+        replay.state,
+        protocol::ProjectOperationState::Admitted | protocol::ProjectOperationState::Running { .. }
+    ));
+    let (mut reconnect_again, _) = fixture.connect_with_bootstrap().await;
+    let second_replay = next_frame_matching_on(
+        &mut reconnect_again,
+        "same current operation on reconnect",
+        |env| {
+            env.kind == FrameKind::ProjectOperation
+                && env
+                    .parse_payload::<protocol::ProjectOperationPayload>()
+                    .unwrap()
+                    .stream
+                    == replay.stream
+        },
+    )
+    .await
+    .parse_payload::<protocol::ProjectOperationPayload>()
+    .unwrap();
+    assert!(matches!(
+        second_replay.state,
+        protocol::ProjectOperationState::Admitted | protocol::ProjectOperationState::Running { .. }
+    ));
+    drop(reconnect_again);
+    fixture.client = reconnect;
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: conflicting admission rejected; reconnect replays current operation; submitting connection disconnected before release"
+    );
+    hook.resume();
     match expect_project_notify(&mut fixture.client, "workbench remove").await {
         ProjectNotifyPayload::Delete { project } => assert_eq!(project, workbench),
         other => panic!("expected workbench delete, got {other:?}"),
     }
     assert!(!expected_path.exists());
+    let terminal =
+        next_frame_matching_on(&mut fixture.client, "committed resource operation", |env| {
+            env.kind == FrameKind::ProjectOperation
+                && matches!(env.parse_payload::<protocol::ProjectOperationPayload>().unwrap(), protocol::ProjectOperationPayload { stream, state: protocol::ProjectOperationState::Committed { .. } | protocol::ProjectOperationState::Failed { .. }, .. } if stream == replay.stream)
+        })
+        .await
+        .parse_payload::<protocol::ProjectOperationPayload>()
+        .unwrap();
+    assert!(
+        matches!(terminal.state, protocol::ProjectOperationState::Committed { warnings } if warnings.is_empty())
+    );
+    let (mut settled, _) = fixture.connect_with_bootstrap().await;
+    settled
+        .heartbeat(protocol::HeartbeatPayload {
+            client_sent_at_ms: 9,
+        })
+        .await
+        .unwrap();
+    loop {
+        let env = settled
+            .next_event()
+            .await
+            .unwrap()
+            .expect("settled bootstrap connection");
+        if env.kind == FrameKind::ProjectOperation {
+            let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+            assert_ne!(
+                operation.stream, replay.stream,
+                "bootstrap must not replay terminal history"
+            );
+        }
+        if env.kind == FrameKind::HeartbeatAck {
+            break;
+        }
+    }
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: release completed real Git removal and typed commit; settled bootstrap contains no terminal history"
+    );
 }
 
 #[tokio::test]
@@ -534,7 +701,38 @@ async fn workbench_remove_rejects_dirty_worktree_unless_forced() {
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "dirty worktree remove").await;
+    let mut failed = None;
+    let mut error = None;
+    while failed.is_none() || error.is_none() {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .unwrap()
+            .expect("dirty removal outcome");
+        if env.kind == FrameKind::ProjectOperation {
+            let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+            if matches!(&operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == workbench.id)
+                && matches!(
+                    operation.state,
+                    protocol::ProjectOperationState::Failed { .. }
+                )
+            {
+                failed = Some(operation);
+            }
+        } else if env.kind == FrameKind::CommandError {
+            error = Some(env.parse_payload::<CommandErrorPayload>().unwrap());
+        }
+    }
+    assert!(matches!(
+        failed.unwrap().state,
+        protocol::ProjectOperationState::Failed {
+            code: CommandErrorCode::Conflict,
+            cleanup_may_be_partial: false,
+            ..
+        }
+    ));
+    let error = error.unwrap();
     assert!(
         matches!(&error.context, Some(protocol::CommandErrorContext::WorkbenchRemove { project_id }) if project_id == &workbench.id)
     );
@@ -663,18 +861,9 @@ async fn workbench_create_serializes_same_parent_same_branch() {
     write_b.expect("client B workbench_create write failed");
 
     let error = tokio::select! {
-        error = wait_for_command_error(
-            &mut client_a,
-            "client A concurrent workbench_create",
-            Duration::from_secs(30),
-        ) => error,
-        error = wait_for_command_error(
-            &mut client_b,
-            "client B concurrent workbench_create",
-            Duration::from_secs(30),
-        ) => error,
-    }
-    .expect("one concurrent workbench_create should fail");
+        error = expect_kind(&mut client_a, FrameKind::CommandError, "client A concurrent workbench conflict") => error,
+        error = expect_kind(&mut client_b, FrameKind::CommandError, "client B concurrent workbench conflict") => error,
+    }.parse_payload::<CommandErrorPayload>().unwrap();
     let created =
         match expect_project_notify(&mut fixture.client, "concurrent workbench create").await {
             ProjectNotifyPayload::Upsert { project } => project,
@@ -683,9 +872,7 @@ async fn workbench_create_serializes_same_parent_same_branch() {
     assert_eq!(error.operation, "workbench_create");
     assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(
-        error.message.contains("already exists"),
-        "unexpected error message: {}",
-        error.message
+        matches!(error.context, Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, branch }) if parent_project_id == parent.id && branch.0 == "serialized-create")
     );
     assert_eq!(created.parent_project_id(), Some(&parent.id));
     assert!(expected_worktree_path(repo.path(), "serialized-create").is_dir());
@@ -997,6 +1184,10 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     .await;
     hold_gate.wait_until_entered().await;
     drop(reservation);
+    let close_gate = fixture
+        .host_for_test()
+        .install_restore_marker_withdraw_test_gate()
+        .await;
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -1005,6 +1196,15 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         })
         .await
         .expect("workbench_remove write failed");
+    close_gate.wait_until_entered().await;
+    let (mut late_observer, late_bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        late_bootstrap
+            .agents
+            .iter()
+            .any(|agent| agent.agent_id == live_agent.agent_id)
+    );
+    drop(close_gate);
     // The close command cannot reach a backend parked behind this gate.
     drop(hold_gate);
     let _ = expect_kind(
@@ -1023,6 +1223,23 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     .expect("parse agent workbench delete");
     assert!(
         matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == agent_workbench.id)
+    );
+    let mut observed_close = false;
+    next_frame_matching_on(&mut late_observer, "late subscriber sees completed workbench cleanup", |env| {
+        if env.kind == FrameKind::AgentClosed {
+            observed_close |= env.parse_payload::<protocol::AgentClosedPayload>().unwrap().agent_id == live_agent.agent_id;
+        }
+        env.kind == FrameKind::ProjectOperation && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
+            matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == agent_workbench.id)
+                && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
+        })
+    }).await;
+    assert!(
+        observed_close,
+        "a client bootstrapped during required close cleanup must receive AgentClosed before deletion completes"
+    );
+    eprintln!(
+        "CLOSE PUBLICATION EVIDENCE: client bootstrapped during held close received AgentClosed before workbench completion"
     );
     assert!(
         !fixture.agent_ids().await.contains(&live_agent.agent_id),
@@ -1131,6 +1348,91 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         "session agent closed",
     )
     .await;
+    fixture::send_host_payload(
+        &mut fixture.client,
+        FrameKind::SetAgentsViewPreferences,
+        &protocol::SetAgentsViewPreferencesPayload {
+            update: protocol::AgentsViewPreferencesUpdate::SetSortMode {
+                sort_mode: protocol::AgentSortMode::NameAsc,
+            },
+        },
+    )
+    .await;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "annotation persistence fence after close",
+        |env| {
+            env.kind == FrameKind::AgentsViewPreferencesNotify
+                && env
+                    .parse_payload::<protocol::AgentsViewPreferencesNotifyPayload>()
+                    .unwrap()
+                    .snapshot
+                    .preferences
+                    .sort_mode
+                    == protocol::AgentSortMode::NameAsc
+        },
+    )
+    .await;
+    let annotation_path = fixture.store_dir().join("agents_view_preferences.json");
+    let saved_annotations = fs::read(&annotation_path).unwrap();
+    fs::write(&annotation_path, "invalid annotation storage").unwrap();
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: session_workbench.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    let mut terminal = None;
+    let mut failure = None;
+    while terminal.is_none() || failure.is_none() {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .unwrap()
+            .expect("required cleanup failure");
+        if env.kind == FrameKind::ProjectOperation {
+            let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+            if matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == session_workbench.id)
+            {
+                match operation.state {
+                    protocol::ProjectOperationState::Committed { .. } => {
+                        panic!("corrupt required annotation storage must block catalog Delete")
+                    }
+                    protocol::ProjectOperationState::Failed {
+                        cleanup_may_be_partial,
+                        ..
+                    } => {
+                        assert!(cleanup_may_be_partial);
+                        terminal = Some(());
+                    }
+                    _ => {}
+                }
+            }
+        } else if env.kind == FrameKind::CommandError {
+            failure = Some(env.parse_payload::<CommandErrorPayload>().unwrap());
+        }
+    }
+    let (_, incomplete) = fixture.connect_with_bootstrap().await;
+    assert!(
+        incomplete
+            .projects
+            .iter()
+            .any(|project| project.id == session_workbench.id)
+    );
+    assert!(
+        incomplete
+            .sessions
+            .iter()
+            .any(|session| session.project_id.as_ref() == Some(&session_workbench.id)),
+        "dependent cleanup must not consume session identities before it can complete"
+    );
+    fs::write(&annotation_path, saved_annotations).unwrap();
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: corrupt required annotations reject deletion; catalog and session identities remain for explicit repair/retry"
+    );
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -1614,6 +1916,69 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
             .filter(|project| project["branch"] == "feature/mcp-default")
             .count(),
         1
+    );
+    fixture
+        .host_for_test()
+        .stop_workflow_watcher_for_test()
+        .await
+        .unwrap();
+    let (is_error, body) = call_agent_control(&fixture, &orchestrator.agent_id, "tyde_create_workbench", json!({"parent_project_id": parent.id.0, "branch": "workflow-publication-error", "action": "create_only"})).await;
+    assert!(
+        is_error && body.contains("Catalog committed"),
+        "MCP must distinguish a durable commit from failed derived work"
+    );
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let committed = bootstrap.projects.into_iter().find(|project| matches!(&project.source, ProjectSource::GitWorkbench { branch, .. } if branch.0 == "workflow-publication-error")).expect("durably committed workbench must remain authoritative");
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: committed.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    let mut deleted = false;
+    let mut warning = false;
+    let mut reported = false;
+    while !deleted || !warning || !reported {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .unwrap()
+            .expect("post-commit deletion outcome");
+        match env.kind {
+            FrameKind::ProjectNotify => {
+                deleted |= matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project } if project.id == committed.id);
+            }
+            FrameKind::ProjectOperation => {
+                let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+                if matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == committed.id)
+                {
+                    match operation.state {
+                        protocol::ProjectOperationState::Committed { warnings } => {
+                            assert!(warnings.iter().any(|warning| warning.stage
+                                == protocol::ProjectOperationStage::Workflow));
+                            warning = true;
+                        }
+                        protocol::ProjectOperationState::Failed { .. } => panic!(
+                            "derived failure must not turn durable deletion into failed mutation"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().unwrap();
+                reported |= error.message.contains("Catalog committed")
+                    && matches!(error.context, Some(protocol::CommandErrorContext::ProjectMutationCommitted { mutation: protocol::ProjectMutation::RemoveWorkbench(payload), warnings }) if payload.id == committed.id && warnings.iter().any(|warning| warning.stage == protocol::ProjectOperationStage::Workflow));
+            }
+            _ => {}
+        }
+    }
+    assert!(!expected_worktree_path(repo.path(), "workflow-publication-error").exists());
+    eprintln!(
+        "PROJECT MUTATION EVIDENCE: stopped real workflow owner reports explicit post-commit MCP/connection errors; catalog create/delete remain authoritative"
     );
 }
 
@@ -2211,7 +2576,7 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         .to_owned();
     let url = fixture.agent_control_http_url().await;
     let project_id = workbench.id.0.clone();
-    let mut spawn_task = tokio::spawn(async move {
+    let spawn_task = tokio::spawn(async move {
         call_agent_control_request(
             url,
             Some(bearer),
@@ -2224,29 +2589,15 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         )
         .await
     });
-    tokio::select! {
-        _ = hook.wait_until_spawn_waiting() => {}
-        early = &mut spawn_task => {
-            hook.resume();
-            let (is_error, body) = early.expect("early MCP spawn task join");
-            panic!(
-                "remove/spawn phase: authenticated MCP call returned before the production spawn barrier; error={is_error}, result_bytes={}",
-                body.len()
-            );
-        }
-        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-            hook.resume();
-            panic!("remove/spawn phase: MCP invocation did not reach the production spawn admission barrier");
-        }
-    }
+    hook.wait_until_spawn_waiting().await;
+    let (is_error, body) = spawn_task.await.expect("spawn task join");
+    assert!(is_error, "spawn must reject while removal is still held");
+    assert!(
+        body.contains("being removed"),
+        "admission must report the held removal conflict"
+    );
     hook.resume();
 
-    let (is_error, body) = spawn_task.await.expect("spawn task join");
-    assert!(is_error, "remove and spawn both succeeded: {body}");
-    assert!(
-        body.contains("missing project") || body.contains("being removed"),
-        "spawn returned a success-shaped failure: {body}"
-    );
     let ProjectNotifyPayload::Delete { project } =
         expect_project_notify(&mut fixture.client, "concurrent remove winner").await
     else {

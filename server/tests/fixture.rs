@@ -45,6 +45,7 @@ pub fn is_builtin_team_custom_agent_notify(env: &Envelope) -> bool {
 /// form of the same set (plus built-in-team `CustomAgentNotify` upserts).
 #[allow(dead_code)]
 pub const ROUTINE_CONTROL_PLANE_KINDS: &[FrameKind] = &[
+    FrameKind::ProjectOperation,
     FrameKind::SessionSettings,
     FrameKind::QueuedMessages,
     FrameKind::SessionSchemas,
@@ -2082,4 +2083,42 @@ impl Drop for ExhaustedFileDescriptors {
             0
         );
     }
+}
+
+// The protocol fixture is compiled independently for every integration binary.
+#[allow(dead_code)]
+pub async fn send_host_payload<T: serde::Serialize>(
+    client: &mut client::Connection,
+    kind: FrameKind,
+    payload: &T,
+) {
+    let host_stream = single_host_stream(client);
+    let seq = client
+        .outgoing_seq
+        .get(&host_stream)
+        .copied()
+        .expect("missing host stream sequence counter");
+    let envelope = Envelope::from_payload(host_stream.clone(), kind, seq, payload)
+        .expect("serialize host payload");
+    client.outgoing_seq.insert(host_stream, seq + 1);
+    protocol::write_envelope(&mut client.writer, &envelope)
+        .await
+        .expect("write host payload");
+}
+
+#[allow(dead_code)]
+pub fn single_host_stream(client: &client::Connection) -> StreamPath {
+    let mut host_streams = client
+        .outgoing_seq
+        .keys()
+        .filter(|stream| stream.0.starts_with("/host/"));
+    let host_stream = host_streams
+        .next()
+        .cloned()
+        .expect("client should have a host stream");
+    assert!(
+        host_streams.next().is_none(),
+        "client should have exactly one host stream"
+    );
+    host_stream
 }

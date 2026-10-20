@@ -1961,6 +1961,15 @@ async fn builtin_compaction_remains_available_without_native_support() {
 #[tokio::test]
 async fn replacement_compaction_reports_required_close_failure() {
     let mut fixture = Fixture::new().await;
+    eprintln!("CLOSE PUBLICATION EVIDENCE: replacement flow started");
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    fixture
+        .host_for_test()
+        .hold_preferences_owner_for_test(entered, held)
+        .await
+        .unwrap();
+    reached.await.unwrap();
     let success = fixture
         .spawn_scripted(
             "replacement success ordering",
@@ -1977,6 +1986,26 @@ async fn replacement_compaction_reports_required_close_failure() {
         .compact_agent(&success.stream, protocol::AgentCompactPayload::default())
         .await
         .expect("request successful replacement");
+    eprintln!(
+        "CLOSE PUBLICATION EVIDENCE: initial turn idle observed while annotation persistence remains held"
+    );
+    let admission = fixture
+        .next_frame_matching("compaction with pending durable session binding", |env| {
+            env.kind == FrameKind::AgentCompactNotify
+                && env
+                    .parse_payload::<protocol::AgentCompactNotifyPayload>()
+                    .is_ok_and(|notice| notice.old_agent_id == success.new_agent.agent_id)
+        })
+        .await
+        .parse_payload::<protocol::AgentCompactNotifyPayload>()
+        .unwrap();
+    assert_eq!(
+        admission.status,
+        protocol::AgentCompactStatus::Started,
+        "a backend-started session must remain usable during annotation promotion; rejected_as_missing_session={}",
+        admission.message.as_deref() == Some("agent has no session to compact")
+    );
+    release.send(()).unwrap();
     let mut advertised_replacement = false;
     fixture.next_frame_matching("successful replacement completion before close", |event| {
         if event.kind == FrameKind::NewAgent {
@@ -1984,6 +2013,10 @@ async fn replacement_compaction_reports_required_close_failure() {
         }
         if event.kind == FrameKind::AgentClosed && event.parse_payload::<AgentClosedPayload>().is_ok_and(|closed| closed.agent_id == success.new_agent.agent_id) {
             panic!("required accounting must commit before Completed, but Completed must precede AgentClosed");
+        }
+        if event.kind == FrameKind::AgentCompactNotify {
+            let notice: protocol::AgentCompactNotifyPayload = event.parse_payload().unwrap();
+            if notice.old_agent_id == success.new_agent.agent_id { assert_ne!(notice.status, protocol::AgentCompactStatus::Failed, "unexpected replacement failure: replacement_present={}, saved_session_present={}", notice.new_agent_id.is_some(), notice.new_session_id.is_some()); }
         }
         let completed = event.kind == FrameKind::AgentCompactNotify && event.parse_payload::<protocol::AgentCompactNotifyPayload>().is_ok_and(|notice| notice.old_agent_id == success.new_agent.agent_id && notice.status == protocol::AgentCompactStatus::Completed);
         if completed { assert!(advertised_replacement, "replacement must be advertised before completion"); }
@@ -1997,6 +2030,9 @@ async fn replacement_compaction_reports_required_close_failure() {
                     .is_ok_and(|closed| closed.agent_id == success.new_agent.agent_id)
         })
         .await;
+    eprintln!(
+        "CLOSE PUBLICATION EVIDENCE: successful replacement Completed then AgentClosed observed"
+    );
     let agent = fixture
         .spawn_scripted(
             "replacement close failure",

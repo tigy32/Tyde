@@ -103,7 +103,7 @@ impl From<ProjectStoreError> for String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProjectStore {
     path: PathBuf,
     records: HashMap<String, Project>,

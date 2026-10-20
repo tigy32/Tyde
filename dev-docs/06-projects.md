@@ -320,3 +320,92 @@ roots. An unreconciled provider is closed before accepting further input.
 Persist roots only after provider acknowledgement. A transport failure or mismatched reply
 can leave the provider state uncertain; it is not proof of rollback, and must
 be reconciled before continuing the conversation.
+
+## Nonblocking catalog operations
+
+One catalog actor owns project/workbench records, order, mutation reservations,
+and binding admission. It publishes immutable committed records for readers;
+there is no parallel `ProjectStore` or parent mutex writer. Connection commands
+for create/delete, add/delete root, workbench create/remove, rename and reorder
+wait for admission only. Resource conflicts are explicit errors. MCP can await
+completion within its own handler. Independent mutations may execute Git and
+filesystem workers concurrently; catalog persistence is serialized against
+the latest committed record set.
+
+`ProjectOperationPayload` is the server-emitted resource lifecycle. Its
+server-owned stream identifies the admitted operation, not a client request.
+It includes host ownership, the canonical `ProjectMutation`, and typed
+admitted/running/committed/failed state. Running stages identify queue, Git,
+filesystem, persistence, cleanup, fanout, or workflow work. Failure identifies
+whether destructive cleanup may already be partial. A durable catalog commit
+remains committed if subsequent derived publication/workflow work fails;
+those failures are explicit warnings. Legacy scoped `CommandError` events
+remain available for admission and pre-commit failures. A post-commit derived
+failure also reports an explicit error to the submitting connection and MCP
+completion caller, clearly stating that the catalog committed and the mutation
+must not be repeated. Its `ProjectMutationCommitted` context and resource
+`Committed { warnings }` event preserve that distinction; the durable record
+is not rolled back.
+
+Bootstrap replays only CURRENT in-flight operations using the same events.
+Disconnect does not cancel owned work. There is no terminal-operation history,
+automatic resend, deduplication, exactly-once promise, or crash journal. After
+restart the persisted catalog is authoritative; partially completed external
+work may require explicit repair.
+
+The catalog sends generation-stamped full records one-way to project actors.
+Root authorization and root-scoped metadata are adopted before watcher/scanning
+publication. Slow scans execute outside actor turns, and an older generation
+cannot publish files or Git state for a removed root. No catalog/project actor
+request/reply cycle is needed.
+
+Deletion completes required cleanup before persisting and publishing Delete.
+The shared canonical agent-close path snapshots/transitions host state briefly
+and performs asynchronous close, cleanup, and persistence outside its guard.
+Preferences and workflow-run stores have single persistence owners; readers use
+owner-published state and writers enqueue atomic operations without waiting
+under `HostState`. Review, session, annotation, team, steering, terminal, and
+workflow cleanup errors propagate rather than pretending deletion succeeded.
+Scoped traces retain sanitized phase, queue, count, and completion evidence;
+they do not record conversation contents or credentials.
+
+Required close cleanup settles before its in-memory removal and current-client
+fanout, retaining Usage's accounting-before-Completed-before-Closed ordering.
+Workbench session cleanup reuses canonical session-deletion ownership and
+navigation updates; dependent references are cleaned before session identities
+are consumed. Corrupt required annotation storage is an explicit cleanup
+failure, not an empty store. Repair and an explicit retry can finish partial
+cleanup without a journal. Known post-commit publication/workflow errors are
+committed warnings; later watcher/scan failures remain project-owned typed
+errors and state, never a catalog rollback.
+
+Shared session-list fanout reads storage outside host ownership. Each subscriber
+owns read generations so a superseded read cannot replace its newer list or
+bootstrap. Real read failures produce typed errors, not an empty or stale-list
+success; session deletion preserves its committed fact when derived publication
+fails. Required list publication settles before canonical close success.
+
+Bubblewrap engine selection, preparation and owned resource cleanup use the
+same catalog admission and worker path as Native. Its existing durable Removing
+phases are intermediate catalog records, not a successful Delete: the reservation
+remains held until required cleanup and the final deletion commit. Failed teardown
+retains that persisted phase for an explicit retry. Scheduled entry uses catalog
+binding reservations and owned settlement/retirement work, not a second per-parent
+catalog writer. Native remains the default; Bubblewrap eligibility and live-move
+restrictions are unchanged.
+
+Watcher queue-loss catch-up invalidates file versions for files a client has
+actually read; it cannot reconstruct which unopened files changed. Unopened
+entries converge through full file listings. Protocol flows must observe a
+file before asserting its version invalidation, and wait on watcher
+registration/removal completion before checking OS watch ownership. This keeps
+rename and ignore-policy checks valid even when unrelated native events fill
+the bounded queue.
+
+Preferences notifications are full-state events, not mutation acknowledgements.
+AgentStart and session-binding publication are separate events: the latter may
+publish the same pins while a Pin/Unpin command is pending. Protocol flows must
+assert the settled snapshot after same-stream command completion rather than
+pairing each command with the next notification. Canonical transient targets
+resolve through actual pending/public session bindings; persisted unpin state
+must agree with a fresh bootstrap.

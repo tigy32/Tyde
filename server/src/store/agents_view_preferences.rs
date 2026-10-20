@@ -220,12 +220,23 @@ impl AgentsViewPreferencesStore {
         F: FnMut(AgentAnnotationTarget) -> Result<Option<AgentAnnotationTarget>, String>,
     {
         let mut state = self.read_current_state_or_default();
+        let pins_before = state.pins.pinned.len();
         apply_pins_update(&mut state, update)?;
         canonicalize_annotation_targets(&mut state, canonicalize_target)?;
         let state = validate_state(state)?;
         Self::save(&self.path, &state)?;
         self.set_state(state);
         self.load_error = None;
+        tracing::debug!(
+            pins_before,
+            pins_after = self.pins.pinned.len(),
+            "persisted canonical pin mutation"
+        );
+        #[cfg(feature = "test-support")]
+        crate::project_stream::scan_test_support::run(
+            &self.path,
+            crate::project_stream::scan_test_support::ScanPoint::PreferencesPinsApplied,
+        );
         Ok(self.snapshot())
     }
 
@@ -295,7 +306,7 @@ impl AgentsViewPreferencesStore {
         host_id: HostFilterId,
         project_id: ProjectId,
     ) -> Result<bool, String> {
-        let mut state = self.read_current_state_or_default();
+        let mut state = self.read_current_state_for_cleanup()?;
         let mut changed = false;
         state.preferences.filters.project_ids.retain(|filter| {
             let keep = filter.host_id != host_id || filter.project_id != project_id;
@@ -324,7 +335,7 @@ impl AgentsViewPreferencesStore {
         from: AgentAnnotationTarget,
         to: Option<AgentAnnotationTarget>,
     ) -> Result<bool, String> {
-        let mut state = self.read_current_state_or_default();
+        let mut state = self.read_current_state_for_cleanup()?;
         let changed = replace_annotation_target_in_state(&mut state, &from, to.as_ref());
         if !changed {
             return Ok(false);
@@ -334,6 +345,14 @@ impl AgentsViewPreferencesStore {
         self.set_state(state);
         self.load_error = None;
         Ok(true)
+    }
+
+    fn read_current_state_for_cleanup(&mut self) -> Result<StoreState, String> {
+        Self::read_from_disk(&self.path).map_err(|error| {
+            let message = error.message.clone();
+            self.load_error = Some(error);
+            message
+        })
     }
 
     fn read_current_state_or_default(&mut self) -> StoreState {
@@ -1794,4 +1813,95 @@ fn ensure_non_empty(field: &str, value: &str) -> Result<(), String> {
         return Err(format!("{field} must not be empty"));
     }
     Ok(())
+}
+
+type PreferencesCall = Box<
+    dyn FnOnce(
+            &mut AgentsViewPreferencesStore,
+            &tokio::sync::watch::Sender<AgentsViewPreferencesSnapshot>,
+        ) + Send,
+>;
+
+enum PreferencesCommand {
+    Call(PreferencesCall),
+    Stop(tokio::sync::oneshot::Sender<()>),
+}
+
+pub(crate) struct AgentsViewPreferencesHandle {
+    calls: tokio::sync::mpsc::UnboundedSender<PreferencesCommand>,
+    snapshot: tokio::sync::watch::Receiver<AgentsViewPreferencesSnapshot>,
+}
+
+impl AgentsViewPreferencesHandle {
+    pub(crate) fn spawn(mut store: AgentsViewPreferencesStore) -> Result<Self, String> {
+        let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel::<PreferencesCommand>();
+        let (snapshot, current) = tokio::sync::watch::channel(store.snapshot());
+        std::thread::Builder::new()
+            .name("tyde-preferences".into())
+            .spawn(move || {
+                while let Some(command) = inbox.blocking_recv() {
+                    match command {
+                        PreferencesCommand::Call(call) => call(&mut store, &snapshot),
+                        PreferencesCommand::Stop(reply) => {
+                            let _ = reply.send(());
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("start preferences owner: {error}"))?;
+        Ok(Self {
+            calls,
+            snapshot: current,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> AgentsViewPreferencesSnapshot {
+        self.snapshot.borrow().clone()
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.calls
+            .send(PreferencesCommand::Stop(reply))
+            .map_err(|_| "storage owner already stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "storage owner stopped before acknowledgement".to_owned())
+    }
+
+    pub(crate) fn enqueue<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<T, String>>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut AgentsViewPreferencesStore) -> Result<T, String> + Send + 'static,
+    {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let queued = std::time::Instant::now();
+        let span = tracing::Span::current();
+        self.calls
+            .send(PreferencesCommand::Call(Box::new(move |store, snapshot| {
+                let scope = span.enter();
+                let started = std::time::Instant::now();
+                let result = operation(store);
+                tracing::info!(target: "tyde::project_operation", stage = "preferences", queue_ms = started.duration_since(queued).as_millis(), elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "serialized cleanup store operation completed");
+                snapshot.send_replace(store.snapshot());
+                let _ = reply.send(result);
+                drop(scope);
+            })))
+            .map_err(|_| "preferences owner stopped".to_owned())?;
+        Ok(response)
+    }
+
+    pub(crate) async fn call<T, F>(&self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut AgentsViewPreferencesStore) -> Result<T, String> + Send + 'static,
+    {
+        self.enqueue(operation)?
+            .await
+            .map_err(|_| "preferences owner stopped".to_owned())?
+    }
 }

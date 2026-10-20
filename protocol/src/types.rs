@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 86;
+pub const PROTOCOL_VERSION: u32 = 87;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1059,6 +1059,7 @@ pub enum FrameKind {
     ProjectDelete,
     WorkbenchCreate,
     WorkbenchRemove,
+    ProjectOperation,
     CustomAgentUpsert,
     CustomAgentDelete,
     SteeringUpsert,
@@ -1285,6 +1286,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectDelete => f.write_str("project_delete"),
             Self::WorkbenchCreate => f.write_str("workbench_create"),
             Self::WorkbenchRemove => f.write_str("workbench_remove"),
+            Self::ProjectOperation => f.write_str("project_operation"),
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
             Self::HumanInput => f.write_str("human_input"),
@@ -6065,6 +6067,68 @@ pub enum ProjectNotifyPayload {
     Delete { project: Project },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCatalogRecord {
+    pub generation: u64,
+    pub project: Project,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum ProjectMutation {
+    Create(ProjectCreatePayload),
+    Delete(ProjectDeletePayload),
+    AddRoot(ProjectAddRootPayload),
+    DeleteRoot(ProjectDeleteRootPayload),
+    CreateWorkbench(WorkbenchCreatePayload),
+    RemoveWorkbench(WorkbenchRemovePayload),
+    Rename(ProjectRenamePayload),
+    Reorder(ProjectReorderPayload),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectOperationStage {
+    Queue,
+    Git,
+    Filesystem,
+    Persistence,
+    Cleanup,
+    Fanout,
+    Workflow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectOperationWarning {
+    pub stage: ProjectOperationStage,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectOperationState {
+    Admitted,
+    Running {
+        stage: ProjectOperationStage,
+    },
+    Committed {
+        warnings: Vec<ProjectOperationWarning>,
+    },
+    Failed {
+        code: CommandErrorCode,
+        message: String,
+        cleanup_may_be_partial: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectOperationPayload {
+    pub host_id: HostFilterId,
+    pub stream: StreamPath,
+    pub mutation: ProjectMutation,
+    pub state: ProjectOperationState,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkbenchCreateAction {
@@ -8446,6 +8510,13 @@ pub enum CommandErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandErrorContext {
+    ProjectMutation {
+        mutation: ProjectMutation,
+    },
+    ProjectMutationCommitted {
+        mutation: ProjectMutation,
+        warnings: Vec<ProjectOperationWarning>,
+    },
     ProjectFile {
         path: ProjectPath,
     },

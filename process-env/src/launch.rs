@@ -24,6 +24,13 @@ pub async fn project_scope<F: std::future::Future>(
     WORKBENCH_PROJECT.scope(project, Box::pin(future)).await
 }
 
+pub fn project_scope_sync<T>(
+    project: Option<protocol::Project>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    WORKBENCH_PROJECT.sync_scope(project, operation)
+}
+
 pub fn current_project() -> Option<protocol::Project> {
     WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten()
 }

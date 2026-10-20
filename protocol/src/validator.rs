@@ -679,6 +679,9 @@ impl ProtocolValidator {
             FrameKind::CommandError => {
                 parse_host_payload::<CommandErrorPayload>(self, envelope, "CommandError")
             }
+            FrameKind::ProjectOperation => {
+                parse_host_payload::<crate::ProjectOperationPayload>(self, envelope, "ProjectOperation")
+            }
             FrameKind::ProjectNotify => {
                 parse_host_payload::<ProjectNotifyPayload>(self, envelope, "ProjectNotify")
             }
