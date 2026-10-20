@@ -394,6 +394,7 @@ pub async fn confirm_dialog(title: &str, message: &str) -> bool {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 pub async fn message_dialog(title: &str, message: &str) {
     #[derive(Serialize)]
     struct Args<'a> {

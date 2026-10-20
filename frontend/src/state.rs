@@ -15,11 +15,11 @@ use protocol::{
     CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
     CompactionObservationId, CompactionOperationId, ContextCompactionNotifyPayload,
     ContextCompactionStatus, ContextCompactionTimelineEvent, CustomAgent, CustomAgentId,
-    DiffContextMode, GitBranchName, HistoryPageRequestId, HostAbsPath, HostBrowseEntry,
-    HostBrowseErrorPayload, HostPlatform, LaunchProfileCatalog, LaunchProfileId, McpServerConfig,
-    McpServerId, MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload,
-    Project, ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload,
-    ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    DiffContextMode, HistoryPageRequestId, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
+    HostPlatform, LaunchProfileCatalog, LaunchProfileId, McpServerConfig, McpServerId,
+    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
+    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
+    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
     ProjectSearchFileResult, QueuedMessageEntry, RequestedCompactionAvailability, Review,
     ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
     SessionSettingsSchema, SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId,
@@ -3512,51 +3512,13 @@ pub struct ActiveTerminalRef {
     pub terminal_id: TerminalId,
 }
 
-/// In-flight `WorkbenchCreate` request awaiting the matching `ProjectNotify::
-/// Upsert`. The dispatcher correlates by `(host_id, parent_project_id, branch)`
-/// — see §3.3 of `dev-docs/18-workbenches.md` — and on a match switches the
-/// active project to the new workbench id, then removes the entry. A
-/// `CommandError` matches the host, parent, and branch from typed resource
-/// context. The create modal consumes the matching error inline. Entries
-/// expire after [`PENDING_WORKBENCH_CREATE_TTL_MS`] so an orphaned request
-/// cannot trigger a spurious active-project switch much later.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingWorkbenchCreate {
-    pub host_id: String,
-    pub parent_project_id: ProjectId,
-    pub branch: GitBranchName,
-    /// Wall-clock ms (`Date.now()`) when the request was sent. See
-    /// [`PendingWorkbenchCreate::is_stale`].
-    pub requested_at_ms: u64,
-    /// Error message from a `CommandError` for `WorkbenchCreate` on this
-    /// host. `None` while the create is still in flight.
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingWorkbenchRemove {
-    pub host_id: String,
-    pub project_id: ProjectId,
-    pub project_name: String,
-    pub force: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkbenchRemovePrompt {
     pub host_id: String,
+    pub operation_stream: StreamPath,
     pub project_id: ProjectId,
     pub project_name: String,
     pub message: String,
-}
-
-/// How long an in-flight workbench create stays correlatable. Past this the
-/// entry is purged on the next touch of `pending_workbench_creates`.
-pub const PENDING_WORKBENCH_CREATE_TTL_MS: u64 = 5 * 60 * 1000;
-
-impl PendingWorkbenchCreate {
-    pub fn is_stale(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.requested_at_ms) > PENDING_WORKBENCH_CREATE_TTL_MS
-    }
 }
 
 /// Current wall-clock in ms. Zero on non-wasm builds (native logic tests
@@ -4220,14 +4182,8 @@ pub struct AppState {
     /// disable the Start button so the user can't double-fire while
     /// the server is preparing the offer.
     pub mobile_pairing_start_pending: RwSignal<HashSet<String>>,
-    /// In-flight `WorkbenchCreate` requests. The dispatcher uses these to
-    /// correlate the resulting `ProjectNotify::Upsert` and switch the active
-    /// project to the freshly-created workbench. See `PendingWorkbenchCreate`.
-    pub pending_workbench_creates: RwSignal<Vec<PendingWorkbenchCreate>>,
-    /// In-flight workbench removals. A host-scoped `CommandError` is paired
-    /// with the oldest entry for that host so the failure can be shown next
-    /// to the destructive action instead of disappearing into header status.
-    pub pending_workbench_removes: RwSignal<Vec<PendingWorkbenchRemove>>,
+    pub project_operations:
+        RwSignal<HashMap<(String, StreamPath), protocol::ProjectOperationPayload>>,
     pub workbench_remove_prompt: RwSignal<Option<WorkbenchRemovePrompt>>,
     /// Managed remote hosts for which the Phase 2 safety net has already fired
     /// its one forced upgrade-and-reconnect after a `Reject{IncompatibleProtocol}`.
@@ -4510,8 +4466,7 @@ impl AppState {
             mobile_access_state: RwSignal::new(HashMap::new()),
             mobile_pairing_offer: RwSignal::new(HashMap::new()),
             mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
-            pending_workbench_creates: RwSignal::new(Vec::new()),
-            pending_workbench_removes: RwSignal::new(Vec::new()),
+            project_operations: RwSignal::new(HashMap::new()),
             workbench_remove_prompt: RwSignal::new(None),
             upgrade_attempted: RwSignal::new(HashSet::new()),
         }
@@ -6809,10 +6764,19 @@ impl AppState {
             .update(|pending| pending.retain(|(id, _)| !review_ids.contains(id)));
         self.review_create_pending
             .update(|pending| pending.retain(|(host, _), _| host != host_id));
-        self.pending_workbench_creates
-            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
-        self.pending_workbench_removes
-            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        self.project_operations.update(|operations| {
+            operations.retain(|(host, _), operation| {
+                if host != host_id { return true; }
+                if matches!(operation.state, protocol::ProjectOperationState::Admitted | protocol::ProjectOperationState::Running { .. }) {
+                    crate::notices::report_error(
+                        crate::notices::NoticeScope::ProjectOperations(host_id.to_owned()),
+                        format!("Host {host_id} disconnected during a project operation. Completion is unknown; check the catalog after reconnecting before trying again."),
+                    );
+                    return false;
+                }
+                true
+            });
+        });
         // Bootstrap replaces server snapshots. Keep view identity and drafts;
         // only cursors and in-flight requests belong to the lost connection.
         self.host_streams.update(|streams| {
@@ -7242,10 +7206,19 @@ impl AppState {
             .update(|terminals| terminals.retain(|terminal| terminal.host_id != host_id));
         self.project_view_memory
             .update(|map| map.retain(|key, _| key.host_id != host_id));
-        self.pending_workbench_creates
-            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
-        self.pending_workbench_removes
-            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        self.project_operations.update(|operations| {
+            operations.retain(|(host, _), operation| {
+                if host != host_id { return true; }
+                if matches!(operation.state, protocol::ProjectOperationState::Admitted | protocol::ProjectOperationState::Running { .. }) {
+                    crate::notices::report_error(
+                        crate::notices::NoticeScope::ProjectOperations(host_id.to_owned()),
+                        format!("Host {host_id} disconnected during a project operation. Completion is unknown; check the catalog after reconnecting before trying again."),
+                    );
+                    return false;
+                }
+                true
+            });
+        });
         self.workbench_remove_prompt.update(|prompt| {
             if prompt
                 .as_ref()

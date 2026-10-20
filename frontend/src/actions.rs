@@ -4,8 +4,8 @@ use wasm_bindgen_futures::spawn_local;
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AppState, ComposerHandle, FileResourceKey, OpenTarget,
-    PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination, PendingWorkbenchCreate,
-    PendingWorkbenchRemove, SidebarTab, TabContent, TabId, sort_project_infos,
+    PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination, SidebarTab, TabContent,
+    TabId, sort_project_infos,
 };
 
 use protocol::{
@@ -1420,41 +1420,22 @@ pub fn delete_project_root(
     project_id: ProjectId,
     root: ProjectRootPath,
 ) {
-    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-        log::error!("delete_project_root: host stream missing for {host_id}");
-        return;
-    };
-    let payload = ProjectDeleteRootPayload {
-        id: project_id,
-        root,
-    };
-    spawn_local(async move {
-        if let Err(error) = send_frame(
-            &host_id,
-            host_stream,
-            FrameKind::ProjectDeleteRoot,
-            &payload,
-        )
-        .await
-        {
-            log::error!("failed to send ProjectDeleteRoot: {error}");
-        }
-    });
+    submit_project_mutation(
+        state,
+        host_id,
+        protocol::ProjectMutation::DeleteRoot(ProjectDeleteRootPayload {
+            id: project_id,
+            root,
+        }),
+    );
 }
 
 pub fn delete_project(state: &AppState, host_id: String, project_id: ProjectId) {
-    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-        log::error!("delete_project: host stream missing for {host_id}");
-        return;
-    };
-    let payload = ProjectDeletePayload { id: project_id };
-    spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, host_stream, FrameKind::ProjectDelete, &payload).await
-        {
-            log::error!("failed to send ProjectDelete: {error}");
-        }
-    });
+    submit_project_mutation(
+        state,
+        host_id,
+        protocol::ProjectMutation::Delete(ProjectDeletePayload { id: project_id }),
+    );
 }
 
 pub fn reorder_projects(
@@ -1590,108 +1571,120 @@ pub fn create_workbench(
         log::error!("create_workbench: branch must not be empty");
         return;
     }
-    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-        log::error!("create_workbench: host stream missing for {host_id}");
-        return;
-    };
-    let branch_name = GitBranchName(trimmed.clone());
-    // Record the pending create so dispatch can correlate the resulting
-    // `ProjectNotify::Upsert` (per §3.3) and switch active to the new
-    // workbench. Purge stale entries while we're here so an old orphaned
-    // create can never trigger a spurious switch.
-    let now = crate::state::now_ms();
-    state.pending_workbench_creates.update(|pending| {
-        pending.retain(|entry| !entry.is_stale(now));
-        pending.push(PendingWorkbenchCreate {
-            host_id: host_id.clone(),
-            parent_project_id: parent_project_id.clone(),
-            branch: branch_name.clone(),
-            requested_at_ms: now,
-            error: None,
-        });
-    });
-    let payload = WorkbenchCreatePayload {
-        parent_project_id: parent_project_id.clone(),
-        branch: branch_name.clone(),
-        name: trimmed,
-    };
-    let state = state.clone();
-    spawn_local(async move {
-        if let Err(error) = crate::send::send_frame_unreported(
-            &host_id,
-            host_stream,
-            FrameKind::WorkbenchCreate,
-            &payload,
-        )
-        .await
-        {
-            log::error!("failed to send WorkbenchCreate: {error}");
-            // The request never reached the host: drop the pending entry so
-            // it can't match a later Upsert and cause a spurious
-            // active-project switch. The create modal notices the entry
-            // vanishing (without a matching workbench appearing) and shows a
-            // generic failure.
-            state.pending_workbench_creates.update(|pending| {
-                if let Some(idx) = pending.iter().position(|entry| {
-                    entry.host_id == host_id
-                        && entry.parent_project_id == parent_project_id
-                        && entry.branch == branch_name
-                        && entry.error.is_none()
-                }) {
-                    pending.remove(idx);
-                }
-            });
-        }
-    });
+    submit_project_mutation(
+        state,
+        host_id,
+        protocol::ProjectMutation::CreateWorkbench(WorkbenchCreatePayload {
+            parent_project_id,
+            branch: GitBranchName(trimmed.clone()),
+            name: trimmed,
+        }),
+    );
 }
 
-pub fn remove_workbench(
+pub fn remove_workbench(state: &AppState, host_id: String, workbench_id: ProjectId, force: bool) {
+    submit_project_mutation(
+        state,
+        host_id,
+        protocol::ProjectMutation::RemoveWorkbench(WorkbenchRemovePayload {
+            id: workbench_id,
+            force,
+        }),
+    );
+}
+
+pub fn submit_project_mutation(
     state: &AppState,
     host_id: String,
-    workbench_id: ProjectId,
-    workbench_name: String,
-    force: bool,
+    mutation: protocol::ProjectMutation,
 ) {
-    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-        log::error!("remove_workbench: host stream missing for {host_id}");
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        crate::notices::report_project_send_failure(
+            state,
+            host_id,
+            mutation,
+            "Host is not connected.",
+        );
         return;
-    };
-    let pending = PendingWorkbenchRemove {
-        host_id: host_id.clone(),
-        project_id: workbench_id.clone(),
-        project_name: workbench_name,
-        force,
-    };
-    state.pending_workbench_removes.update(|entries| {
-        entries.retain(|entry| {
-            entry.host_id != pending.host_id || entry.project_id != pending.project_id
-        });
-        entries.push(pending);
-    });
-    let payload = WorkbenchRemovePayload {
-        id: workbench_id.clone(),
-        force,
     };
     let state = state.clone();
     spawn_local(async move {
-        if let Err(error) = crate::send::send_frame_unreported(
-            &host_id,
-            host_stream,
-            FrameKind::WorkbenchRemove,
-            &payload,
-        )
-        .await
-        {
-            log::error!("failed to send WorkbenchRemove: {error}");
-            state.pending_workbench_removes.update(|entries| {
-                entries
-                    .retain(|entry| entry.host_id != host_id || entry.project_id != workbench_id);
-            });
-            crate::bridge::message_dialog(
-                "Workbench could not be removed",
-                &format!("The removal request could not be sent: {error}"),
-            )
-            .await;
+        let result = match &mutation {
+            protocol::ProjectMutation::Create(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectCreate,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::Delete(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectDelete,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::AddRoot(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectAddRoot,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::DeleteRoot(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectDeleteRoot,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::CreateWorkbench(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::WorkbenchCreate,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::RemoveWorkbench(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::WorkbenchRemove,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::Rename(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectRename,
+                    payload,
+                )
+                .await
+            }
+            protocol::ProjectMutation::Reorder(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::ProjectReorder,
+                    payload,
+                )
+                .await
+            }
+        };
+        if let Err(error) = result {
+            crate::notices::report_project_send_failure(&state, host_id, mutation, &error);
         }
     });
 }

@@ -165,9 +165,10 @@ There is **no** `WorkbenchNotify`. There is **no** `WorkbenchRename`. There is
 **no** per-operation `/workbench/<uuid>` stream.
 
 Workbench upserts and deletes flow through `ProjectNotify::{Upsert, Delete}`.
-Renames reuse `ProjectRename` (metadata only — see §6.4). Operation success
-is observable as the resulting `ProjectNotify` event; failures are
-`CommandError` on the host stream.
+Renames reuse `ProjectRename` (metadata only — see §6.4). Catalog changes
+arrive as `ProjectNotify`; operation lifecycle arrives as `ProjectOperation`
+on the host stream. Its server-owned `stream` identifies each admitted
+mutation, including attempts with identical inputs.
 
 ### 3.2 Input payloads
 
@@ -204,10 +205,19 @@ Both are sent on the host stream, matching the existing
 - `CommandError { request_kind: WorkbenchRemove, code, message, fatal: false }`
   on failure.
 
-The requesting client correlates "my create" by `(parent_project_id, branch)` —
-the next `ProjectNotify::Upsert` whose source is `GitWorkbench` and whose
-`(parent_project_id, branch)` matches the request is the one to switch to. No
-request IDs are needed; the matching happens against typed protocol data.
+The UI renders `ProjectOperation` admitted/running/committed/failed state
+independently of catalog events and transport send completion. Bootstrap
+replays CURRENT in-flight operations, not settled history. It does not match
+branches against catalog updates or auto-navigate when creation completes.
+
+Submitting the workbench form closes it immediately. Compact nonmodal notices
+identify the host, target and current stage. Pending controls are scoped to the
+project family; other navigation and chat remain usable. Failures retain the
+typed input for deliberate retry. Potentially partial cleanup requires inspection;
+removal offers an explicit confirmation before force. A committed warning is
+not a failed creation and never offers Retry. Disconnect means completion is
+unknown, not cancellation or permission to resend. See `06-projects.md` for
+the catalog ownership and restart boundary.
 
 ### 3.4 Existing payloads update to typed roots
 

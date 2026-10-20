@@ -687,62 +687,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // `ReviewEvent::Snapshot`, neither of which fires for
                 // a rejected request.
                 clear_review_pending_on_error(state, host_id, &payload);
-                if matches!(payload.request_kind, FrameKind::WorkbenchCreate) {
-                    let now = crate::state::now_ms();
-                    state.pending_workbench_creates.update(|pending| {
-                        pending.retain(|p| !p.is_stale(now));
-                        if let Some(entry) = pending
-                            .iter_mut()
-                            .find(|p| p.host_id == host_id && p.error.is_none() && matches!(&payload.context,
-                                Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, branch })
-                                if &p.parent_project_id == parent_project_id && &p.branch == branch))
-                        {
-                            entry.error = Some(payload.message.clone());
-                        }
-                    });
-                }
-                if matches!(payload.request_kind, FrameKind::WorkbenchRemove) {
-                    let mut removal = None;
-                    state.pending_workbench_removes.update(|pending| {
-                        if let Some(index) =
-                            pending.iter().position(|entry| entry.host_id == host_id && matches!(&payload.context,
-                                Some(protocol::CommandErrorContext::WorkbenchRemove { project_id }) if &entry.project_id == project_id))
-                        {
-                            removal = Some(pending.remove(index));
-                        }
-                    });
-                    let message = payload.message.clone();
-                    let dirty = matches!(payload.code, protocol::CommandErrorCode::Conflict)
-                        && message.contains("worktree roots are dirty");
-                    if let Some(removal) = removal {
-                        if dirty && !removal.force {
-                            state.workbench_remove_prompt.set(Some(
-                                crate::state::WorkbenchRemovePrompt {
-                                    host_id: removal.host_id,
-                                    project_id: removal.project_id,
-                                    project_name: removal.project_name,
-                                    message,
-                                },
-                            ));
-                        } else {
-                            wasm_bindgen_futures::spawn_local(async move {
-                                crate::bridge::message_dialog(
-                                    "Workbench could not be removed",
-                                    &message,
-                                )
-                                .await;
-                            });
-                        }
-                    } else {
-                        wasm_bindgen_futures::spawn_local(async move {
-                            crate::bridge::message_dialog(
-                                "Workbench could not be removed",
-                                &message,
-                            )
-                            .await;
-                        });
-                    }
-                }
                 if payload.request_kind == FrameKind::ProjectReadFile
                     && let Some(protocol::CommandErrorContext::ProjectFile { path }) =
                         &payload.context
@@ -1832,41 +1776,37 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::ProjectOperation => {
+            match envelope.parse_payload::<protocol::ProjectOperationPayload>() {
+                Ok(payload) => {
+                    log::debug!(
+                        "project operation event host={host_id} terminal={}",
+                        matches!(
+                            payload.state,
+                            protocol::ProjectOperationState::Committed { .. }
+                                | protocol::ProjectOperationState::Failed { .. }
+                        )
+                    );
+                    state.project_operations.update(|operations| {
+                    let key = (host_id.to_owned(), payload.stream.clone());
+                    if matches!(&payload.state, protocol::ProjectOperationState::Committed { warnings } if warnings.is_empty()) {
+                        operations.remove(&key);
+                    } else {
+                        operations.insert(key, payload);
+                    }
+                });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_operation payload: {error}"),
+                ),
+            }
+        }
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
-                // Correlate with any in-flight WorkbenchCreate before mutating
-                // state. §3.3 says the matching upsert is the one to switch
-                // to; identify it by (parent_project_id, branch) and then
-                // drop the pending entry so a future failure doesn't try to
-                // clear it.
-                let workbench_match = match &project.source {
-                    protocol::ProjectSource::GitWorkbench {
-                        parent_project_id,
-                        branch,
-                        ..
-                    } => {
-                        let mut matched = None;
-                        let now = crate::state::now_ms();
-                        state.pending_workbench_creates.update(|pending| {
-                            // Stale or already-failed entries must not steal
-                            // this upsert: only a live in-flight create gets
-                            // the auto-switch.
-                            pending.retain(|p| !p.is_stale(now));
-                            if let Some(idx) = pending.iter().position(|p| {
-                                p.host_id == host_id
-                                    && &p.parent_project_id == parent_project_id
-                                    && &p.branch == branch
-                                    && p.error.is_none()
-                            }) {
-                                pending.remove(idx);
-                                matched = Some(project.id.clone());
-                            }
-                        });
-                        matched
-                    }
-                    protocol::ProjectSource::Standalone { .. } => None,
-                };
-
                 state.projects.update(|projects| {
                     if let Some(existing) = projects
                         .iter_mut()
@@ -1881,13 +1821,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                     sort_project_infos(projects);
                 });
-
-                if let Some(new_id) = workbench_match {
-                    state.switch_active_project(Some(crate::state::ActiveProjectRef {
-                        host_id: host_id.to_string(),
-                        project_id: new_id,
-                    }));
-                }
             }
             Ok(ProjectNotifyPayload::Delete { project }) => {
                 handle_project_delete(state, host_id, &project);
@@ -4277,19 +4210,6 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
 /// view-memory entry. Forget runs **after** the active switch so
 /// `switch_active_project`'s outgoing-project snapshot can't reinsert it.
 pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &protocol::Project) {
-    let mut completed_remove = false;
-    state.pending_workbench_removes.update(|pending| {
-        pending.retain(|entry| {
-            let keep = entry.host_id != host_id || entry.project_id != project.id;
-            completed_remove |= !keep;
-            keep
-        });
-    });
-    if completed_remove {
-        state.command_errors_by_host.update(|errors| {
-            errors.remove(host_id);
-        });
-    }
     state.workbench_remove_prompt.update(|prompt| {
         if prompt
             .as_ref()
@@ -9291,51 +9211,6 @@ mod wasm_tests {
             !after.contains("newer activity"),
             "the provisional staleness marker is obsolete and must not render, got: {after}"
         );
-    }
-
-    #[wasm_bindgen_test]
-    fn dirty_workbench_error_opens_visible_removal_prompt() {
-        reset_inbound_state_for_host("host-a");
-        let state = AppState::new();
-        state.pending_workbench_removes.update(|pending| {
-            pending.push(crate::state::PendingWorkbenchRemove {
-                host_id: "host-a".to_owned(),
-                project_id: ProjectId("workbench-a".to_owned()),
-                project_name: "Dirty workbench".to_owned(),
-                force: false,
-            });
-        });
-        let message = "cannot remove workbench because worktree roots are dirty:\n/tmp/wb:\n?? implementation.md";
-        let envelope = Envelope::from_payload(
-            StreamPath("/host/local".to_owned()),
-            FrameKind::CommandError,
-            0,
-            &CommandErrorPayload {
-                workbench_reason: None,
-                context: Some(protocol::CommandErrorContext::WorkbenchRemove {
-                    project_id: ProjectId("workbench-a".to_owned()),
-                }),
-                request_id: None,
-                stream: StreamPath("/host/local".to_owned()),
-                request_kind: FrameKind::WorkbenchRemove,
-                operation: "workbench_remove".to_owned(),
-                code: protocol::CommandErrorCode::Conflict,
-                message: message.to_owned(),
-                fatal: false,
-            },
-        )
-        .expect("command error envelope");
-
-        dispatch_envelope(&state, "host-a", envelope);
-
-        let prompt = state
-            .workbench_remove_prompt
-            .get_untracked()
-            .expect("dirty removal prompt");
-        assert_eq!(prompt.project_id.0, "workbench-a");
-        assert_eq!(prompt.project_name, "Dirty workbench");
-        assert!(prompt.message.contains("?? implementation.md"));
-        assert!(state.pending_workbench_removes.get_untracked().is_empty());
     }
 
     /// The refresh gate is released by an arriving first page. A rejected

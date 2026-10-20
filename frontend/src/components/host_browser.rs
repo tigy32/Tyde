@@ -396,17 +396,8 @@ fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String
 #[component]
 pub fn HostBrowser() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let dialog_open = state.browse_dialog;
 
     view! {
-        <Show when=move || dialog_open.get().is_none() && crate::notices::has_notice(&crate::notices::NoticeScope::Browser)>
-            <div class="browser-backdrop">
-                <div class="browser-modal" role="dialog" aria-label="Folder browser">
-                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
-                    <button type="button" on:click=move |_| crate::notices::clear_scope(&crate::notices::NoticeScope::Browser)>"Close"</button>
-                </div>
-            </div>
-        </Show>
         {move || {
             state.browse_dialog.with(|dialog| {
                 dialog.as_ref().map(|d| {
@@ -525,7 +516,11 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let current_path_for_confirm = current_path.clone();
     let dialog_purpose = dialog.purpose.clone();
     let host_id_for_confirm = host_id_signal.clone();
+    let loading_for_confirm = loading.clone();
     let on_confirm = move |_| {
+        if loading_for_confirm.get_untracked() {
+            return;
+        }
         let Some(path) = current_path_for_confirm.get_untracked() else {
             crate::notices::report_error(
                 crate::notices::NoticeScope::Browser,
@@ -542,60 +537,26 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     .unwrap_or(&path.0)
                     .to_owned();
                 let host_id = host_id_for_confirm.get_untracked();
-                let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
-                    log::error!("cannot create project without a connected dialog host");
-                    crate::notices::report_error(
-                        crate::notices::NoticeScope::Browser,
-                        format!(
-                            "Tyde cannot create the project because host “{host_id}” is not connected."
-                        ),
-                    );
-                    return;
-                };
-                spawn_local(async move {
-                    if let Err(error) = send_frame(
-                        &host_id,
-                        host_stream,
-                        FrameKind::ProjectCreate,
-                        &ProjectCreatePayload {
-                            name,
-                            roots: vec![protocol::ProjectRootPath(path.0)],
-                        },
-                    )
-                    .await
-                    {
-                        log::error!("failed to send ProjectCreate: {error}");
-                    }
-                });
+                crate::actions::submit_project_mutation(
+                    &state_for_confirm,
+                    host_id,
+                    protocol::ProjectMutation::Create(ProjectCreatePayload {
+                        name,
+                        roots: vec![protocol::ProjectRootPath(path.0)],
+                    }),
+                );
                 close_dialog(&state_for_confirm);
             }
             BrowsePurpose::AddRoot { project_id } => {
                 let host_id = host_id_for_confirm.get_untracked();
-                let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
-                    log::error!("cannot add root without a connected dialog host");
-                    crate::notices::report_error(
-                        crate::notices::NoticeScope::Browser,
-                        format!(
-                            "Tyde cannot add the folder because host “{host_id}” is not connected."
-                        ),
-                    );
-                    return;
-                };
-                spawn_local(async move {
-                    if let Err(error) = send_frame(
-                        &host_id,
-                        host_stream,
-                        FrameKind::ProjectAddRoot,
-                        &ProjectAddRootPayload {
-                            id: project_id,
-                            root: protocol::ProjectRootPath(path.0),
-                        },
-                    )
-                    .await
-                    {
-                        log::error!("failed to send ProjectAddRoot: {error}");
-                    }
-                });
+                crate::actions::submit_project_mutation(
+                    &state_for_confirm,
+                    host_id,
+                    protocol::ProjectMutation::AddRoot(ProjectAddRootPayload {
+                        id: project_id,
+                        root: protocol::ProjectRootPath(path.0),
+                    }),
+                );
                 close_dialog(&state_for_confirm);
             }
         }
@@ -815,7 +776,8 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
 
     let can_confirm = {
         let current_path = current_path.clone();
-        move || current_path.get().is_some()
+        let loading = loading.clone();
+        move || current_path.get().is_some() && !loading.get()
     };
 
     let confirm_label = match &dialog.purpose {

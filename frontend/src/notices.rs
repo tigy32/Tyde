@@ -15,6 +15,7 @@ pub enum NoticeScope {
     Terminal(String, StreamPath),
     Terminals,
     Browser,
+    ProjectOperations(String),
     Workflows(String),
 }
 
@@ -24,13 +25,14 @@ pub enum NoticeSeverity {
     Warning,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct Notice {
     id: u64,
     scope: NoticeScope,
     operation: Option<FrameKind>,
     severity: NoticeSeverity,
     message: String,
+    retry: Option<protocol::ProjectMutation>,
 }
 
 thread_local! {
@@ -62,6 +64,32 @@ fn report(
     severity: NoticeSeverity,
     message: String,
 ) {
+    report_with_retry(scope, operation, severity, message, None);
+}
+
+pub fn report_project_send_failure(
+    state: &AppState,
+    host: String,
+    mutation: protocol::ProjectMutation,
+    error: &str,
+) {
+    let label = mutation_label(state, &host, &mutation);
+    report_with_retry(
+        NoticeScope::ProjectOperations(host),
+        None,
+        NoticeSeverity::Error,
+        format!("{label} could not be sent: {error}"),
+        Some(mutation),
+    );
+}
+
+fn report_with_retry(
+    scope: NoticeScope,
+    operation: Option<FrameKind>,
+    severity: NoticeSeverity,
+    message: String,
+    retry: Option<protocol::ProjectMutation>,
+) {
     log::debug!(
         "error presentation scope={scope:?} operation={operation:?} warning={}: {message}",
         severity == NoticeSeverity::Warning
@@ -73,13 +101,19 @@ fn report(
     });
     NOTICES.with(|notices| {
         notices.update(|notices| {
-            notices.retain(|notice| notice.scope != scope || notice.operation != operation);
+            notices.retain(|notice| {
+                notice.scope != scope
+                    || notice.operation != operation
+                    || notice.retry.is_some()
+                    || retry.is_some()
+            });
             notices.push(Notice {
                 id,
                 scope,
                 operation,
                 severity,
                 message,
+                retry,
             });
         })
     });
@@ -99,7 +133,8 @@ pub fn clear_request(scope: &NoticeScope, operation: FrameKind) {
     NOTICES.with(|notices| {
         notices.update(|notices| {
             notices.retain(|notice| {
-                &notice.scope != scope
+                matches!(notice.scope, NoticeScope::ProjectOperations(_))
+                    || &notice.scope != scope
                     || (notice.operation.is_some() && notice.operation != Some(operation))
             })
         })
@@ -171,11 +206,17 @@ pub fn request_scope(host: &str, stream: &StreamPath, kind: FrameKind) -> Option
         FrameKind::ListSessions | FrameKind::DeleteSession => {
             Some(NoticeScope::Sessions(host.to_owned()))
         }
-        FrameKind::HostBrowseStart
-        | FrameKind::HostBrowseList
-        | FrameKind::HostBrowseClose
-        | FrameKind::ProjectCreate
-        | FrameKind::ProjectAddRoot => Some(NoticeScope::Browser),
+        FrameKind::HostBrowseStart | FrameKind::HostBrowseList | FrameKind::HostBrowseClose => {
+            Some(NoticeScope::Browser)
+        }
+        FrameKind::ProjectCreate
+        | FrameKind::ProjectAddRoot
+        | FrameKind::ProjectDeleteRoot
+        | FrameKind::ProjectDelete
+        | FrameKind::WorkbenchCreate
+        | FrameKind::WorkbenchRemove
+        | FrameKind::ProjectRename
+        | FrameKind::ProjectReorder => Some(NoticeScope::ProjectOperations(host.to_owned())),
         FrameKind::TerminalCreate => Some(NoticeScope::Terminals),
         FrameKind::WorkflowRefresh | FrameKind::TriggerWorkflow | FrameKind::CancelWorkflow => {
             Some(NoticeScope::Workflows(host.to_owned()))
@@ -193,28 +234,10 @@ pub fn report_command_error(state: &AppState, host: &str, error: &CommandErrorPa
                 .diff_expand_request_ids
                 .with_untracked(|requests| requests.values().any(|pending| pending == id))
     });
-    let inline_workbench = match &error.context {
-        Some(protocol::CommandErrorContext::WorkbenchCreate {
-            parent_project_id,
-            branch,
-        }) => state.pending_workbench_creates.with_untracked(|pending| {
-            pending.iter().any(|entry| {
-                entry.host_id == host
-                    && !entry.is_stale(crate::state::now_ms())
-                    && &entry.parent_project_id == parent_project_id
-                    && &entry.branch == branch
-            })
-        }),
-        _ => false,
-    };
     if inline_diff
-        || inline_workbench
         || matches!(
             error.request_kind,
-            FrameKind::WorkbenchRemove
-                | FrameKind::WorkflowRefresh
-                | FrameKind::TriggerWorkflow
-                | FrameKind::CancelWorkflow
+            FrameKind::WorkflowRefresh | FrameKind::TriggerWorkflow | FrameKind::CancelWorkflow
         )
     {
         log::debug!(
@@ -223,15 +246,21 @@ pub fn report_command_error(state: &AppState, host: &str, error: &CommandErrorPa
         );
         return;
     }
-    let scope = match &error.context {
-        Some(protocol::CommandErrorContext::WorkbenchCreate {
-            parent_project_id, ..
-        }) => Some(NoticeScope::Project(
-            host.to_owned(),
-            parent_project_id.clone(),
-        )),
-        _ => request_scope(host, &error.stream, error.request_kind),
-    };
+    if matches!(
+        error.context,
+        Some(protocol::CommandErrorContext::ProjectMutationCommitted { .. })
+    ) {
+        return;
+    }
+    // The terminal operation and its compatibility command error carry the same
+    // diagnostic. Deduplicate presentation only; never settle state from an error.
+    let duplicate = matches!(error.request_kind, FrameKind::ProjectCreate | FrameKind::ProjectDelete | FrameKind::ProjectAddRoot | FrameKind::ProjectDeleteRoot | FrameKind::WorkbenchCreate | FrameKind::WorkbenchRemove | FrameKind::ProjectRename | FrameKind::ProjectReorder) && state.project_operations.with_untracked(|operations| operations.iter().any(|((owner, _), operation)| {
+        owner == host && matches!(&operation.state, protocol::ProjectOperationState::Failed { message, .. } if message == &error.message)
+    }));
+    if duplicate {
+        return;
+    }
+    let scope = request_scope(host, &error.stream, error.request_kind);
     if let Some(scope) = scope {
         // ProjectFileList is a server-push kind, not a failed user command. A
         // non-fatal error on that kind reports degraded subscription health.
@@ -289,7 +318,8 @@ pub fn InlineNotices(
     #[prop(optional)] include_operation: Option<FrameKind>,
 ) -> impl IntoView {
     let notices = NOTICES.with(Clone::clone);
-    let visible = Memo::new(move |_| {
+    let state = expect_context::<AppState>();
+    let visible = Signal::derive(move || {
         let scopes = scopes.get();
         notices.with(|notices| {
             notices
@@ -308,6 +338,15 @@ pub fn InlineNotices(
             <div class=if notice.severity == NoticeSeverity::Warning { "inline-notice warning" } else { "inline-notice error" }
                 role=if notice.severity == NoticeSeverity::Warning { "status" } else { "alert" }>
                 <span>{notice.message}</span>
+                {notice.retry.clone().map(|mutation| {
+                    let state = state.clone();
+                    let scope = notice.scope.clone();
+                    view! { <button type="button" on:click=move |_| {
+                        let NoticeScope::ProjectOperations(host) = &scope else { return; };
+                        NOTICES.with(|notices| notices.update(|notices| notices.retain(|current| current.id != notice.id)));
+                        crate::actions::submit_project_mutation(&state, host.clone(), mutation.clone());
+                    }>"Retry"</button> }
+                })}
                 <button type="button" aria-label="Dismiss notice" on:click=move |_| {
                     NOTICES.with(|notices| notices.update(|notices| notices.retain(|current| current.id != notice.id)));
                 }>"×"</button>
@@ -327,5 +366,177 @@ pub fn ActionError(error: ArcRwSignal<Option<String>>) -> impl IntoView {
                 <button type="button" aria-label="Dismiss notice" on:click={let error = error.clone(); move |_| error.set(None)}>"×"</button>
             </div>
         </Show>
+    }
+}
+
+pub fn project_mutation_pending(state: &AppState, host: &str, project: &ProjectId) -> bool {
+    let family = |id: &ProjectId| {
+        state.projects.with(|projects| {
+            projects
+                .iter()
+                .find(|entry| entry.host_id == host && &entry.project.id == id)
+                .and_then(|entry| entry.project.parent_project_id().cloned())
+                .unwrap_or_else(|| id.clone())
+        })
+    };
+    let target = family(project);
+    state.project_operations.with(|operations| {
+        operations.iter().any(|((owner, _), operation)| {
+            owner == host
+                && matches!(
+                    operation.state,
+                    protocol::ProjectOperationState::Admitted
+                        | protocol::ProjectOperationState::Running { .. }
+                )
+                && mutation_project(&operation.mutation).is_some_and(|id| family(id) == target)
+        })
+    })
+}
+
+fn mutation_project(mutation: &protocol::ProjectMutation) -> Option<&ProjectId> {
+    use protocol::ProjectMutation;
+    match mutation {
+        ProjectMutation::Create(_) | ProjectMutation::Reorder(_) => None,
+        ProjectMutation::Delete(payload) => Some(&payload.id),
+        ProjectMutation::AddRoot(payload) => Some(&payload.id),
+        ProjectMutation::DeleteRoot(payload) => Some(&payload.id),
+        ProjectMutation::CreateWorkbench(payload) => Some(&payload.parent_project_id),
+        ProjectMutation::RemoveWorkbench(payload) => Some(&payload.id),
+        ProjectMutation::Rename(payload) => Some(&payload.id),
+    }
+}
+
+pub(crate) fn project_label(state: &AppState, host: &str, id: &ProjectId) -> String {
+    state.projects.with(|projects| {
+        match projects
+            .iter()
+            .find(|entry| entry.host_id == host && &entry.project.id == id)
+        {
+            Some(entry) => entry.project.name.clone(),
+            None => format!("project {id} (not in catalog)"),
+        }
+    })
+}
+
+pub(crate) fn mutation_label(
+    state: &AppState,
+    host: &str,
+    mutation: &protocol::ProjectMutation,
+) -> String {
+    use protocol::ProjectMutation;
+    match mutation {
+        ProjectMutation::Create(payload) => format!("Create project {}", payload.name),
+        ProjectMutation::Delete(payload) => {
+            format!("Delete {}", project_label(state, host, &payload.id))
+        }
+        ProjectMutation::AddRoot(payload) => format!(
+            "Add {} to {}",
+            payload.root,
+            project_label(state, host, &payload.id)
+        ),
+        ProjectMutation::DeleteRoot(payload) => format!(
+            "Remove {} from {}",
+            payload.root,
+            project_label(state, host, &payload.id)
+        ),
+        ProjectMutation::CreateWorkbench(payload) => format!(
+            "Create workbench {} in {}",
+            payload.branch,
+            project_label(state, host, &payload.parent_project_id)
+        ),
+        ProjectMutation::RemoveWorkbench(payload) => format!(
+            "Remove workbench {}",
+            project_label(state, host, &payload.id)
+        ),
+        ProjectMutation::Rename(payload) => format!("Rename project to {}", payload.name),
+        ProjectMutation::Reorder(_) => "Reorder projects".to_owned(),
+    }
+}
+
+#[component]
+pub fn ProjectOperationNotices() -> impl IntoView {
+    use protocol::{ProjectOperationStage, ProjectOperationState};
+    let state = expect_context::<AppState>();
+    let operations = state.project_operations;
+    let hosts = state.configured_hosts;
+    let remove_prompt = state.workbench_remove_prompt;
+    let browser = state.browse_dialog;
+    let scopes = move || {
+        let mut scopes = Vec::new();
+        if browser.with(|dialog| dialog.is_none()) {
+            scopes.push(NoticeScope::Browser);
+        }
+        scopes.extend(
+            hosts
+                .get()
+                .into_iter()
+                .map(|host| NoticeScope::ProjectOperations(host.id)),
+        );
+        scopes
+    };
+    view! {
+        <div class="project-operation-notices">
+            <InlineNotices scopes=Signal::derive(scopes) />
+            <For each=move || {
+                let mut keys = operations.with(|operations| operations.iter().filter(|(_, operation)| !matches!(&operation.state, ProjectOperationState::Committed { warnings } if warnings.is_empty())).map(|(key, _)| key.clone()).collect::<Vec<_>>());
+                keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
+                keys
+            } key=|key| key.clone() let:key>
+                {
+                    let state = state.clone();
+                    // Operation identity is server-owned; a keyed row reads the current payload.
+                    let current = Signal::derive({ let key = key.clone(); move || operations.with(|operations| operations.get(&key).cloned()) });
+                    let label = { let host = key.0.clone(); let state = state.clone(); move || current.get().map(|operation| {
+                        let host_label = hosts.with(|hosts| hosts.iter().find(|entry| entry.id == host).map(|entry| entry.label.clone()));
+                        format!("{} · {}", host_label.unwrap_or_else(|| host.clone()), mutation_label(&state, &host, &operation.mutation))
+                    }) };
+                    let detail = move || current.get().map(|operation| match operation.state {
+                        ProjectOperationState::Admitted => "Queued".to_owned(),
+                        ProjectOperationState::Running { stage } => match stage {
+                            ProjectOperationStage::Queue => "Queued",
+                            ProjectOperationStage::Git => "Working in Git…",
+                            ProjectOperationStage::Filesystem => "Updating files…",
+                            ProjectOperationStage::Persistence => "Saving…",
+                            ProjectOperationStage::Cleanup => "Cleaning up…",
+                            ProjectOperationStage::Fanout => "Updating project views…",
+                            ProjectOperationStage::Workflow => "Updating workflows…",
+                        }.to_owned(),
+                        ProjectOperationState::Committed { warnings } => format!("Saved, with warnings: {}. Do not repeat this operation.", warnings.iter().map(|warning| warning.message.as_str()).collect::<Vec<_>>().join("; ")),
+                        ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } => if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },
+                    });
+                    let settled = move || current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Committed { .. } | ProjectOperationState::Failed { .. }));
+                    let state_for_retry = state.clone();
+                    let host_for_retry = key.0.clone();
+                    let key_for_retry = key.clone();
+                    let retry = move |_| {
+                        let Some(operation) = current.get_untracked() else { return; };
+                        let ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } = operation.state else { return; };
+                        if let protocol::ProjectMutation::RemoveWorkbench(payload) = &operation.mutation {
+                            state_for_retry.workbench_remove_prompt.set(Some(crate::state::WorkbenchRemovePrompt {
+                                host_id: host_for_retry.clone(), project_id: payload.id.clone(),
+                                operation_stream: operation.stream,
+                                project_name: project_label(&state_for_retry, &host_for_retry, &payload.id),
+                                message: if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },
+                            }));
+                        } else {
+                            crate::actions::submit_project_mutation(&state_for_retry, host_for_retry.clone(), operation.mutation);
+                            operations.update(|operations| { operations.remove(&key_for_retry); });
+                        }
+                    };
+                    view! {
+                        <div class=move || if current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Failed { .. })) { "inline-notice error" } else if current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Committed { .. })) { "inline-notice warning" } else { "inline-notice" } role="status">
+                            <span><strong>{label}</strong>{" — "}{detail}</span>
+                            <Show when=move || current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Failed { cleanup_may_be_partial: false, .. }) || (matches!(operation.state, ProjectOperationState::Failed { .. }) && matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(_))))>
+                                <button type="button" on:click=retry.clone()>{move || if current.get().is_some_and(|operation| matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(_))) { "Review removal…" } else { "Retry" }}</button>
+                            </Show>
+                            <Show when=settled>
+                                <button type="button" aria-label="Dismiss project operation" on:click={let key = key.clone(); move |_| operations.update(|operations| { operations.remove(&key); })}>"×"</button>
+                            </Show>
+                        </div>
+                    }
+                }
+            </For>
+            {move || remove_prompt.get().map(|prompt| view! { <crate::components::project_rail::WorkbenchRemoveModal prompt /> })}
+        </div>
     }
 }

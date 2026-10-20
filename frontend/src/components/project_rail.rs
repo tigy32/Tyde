@@ -64,7 +64,6 @@ pub fn ProjectRail() -> impl IntoView {
     let editing_project = RwSignal::new(None::<EditingKey>);
     let context_menu = RwSignal::new(None::<RailContextMenu>);
     let workbench_prompt = RwSignal::new(None::<WorkbenchCreatePrompt>);
-    let state_for_remove_prompt = state.clone();
 
     let state_for_home = state.clone();
     let go_home = move |_| {
@@ -234,9 +233,7 @@ pub fn ProjectRail() -> impl IntoView {
             {move || workbench_prompt.get().map(|prompt| view! {
                 <WorkbenchCreateModal prompt=prompt workbench_prompt=workbench_prompt />
             })}
-            {move || state_for_remove_prompt.workbench_remove_prompt.get().map(|prompt| view! {
-                <WorkbenchRemoveModal prompt=prompt />
-            })}
+
         </nav>
     }
 }
@@ -747,6 +744,14 @@ fn ProjectContextMenuItems(
         })
     };
 
+    let busy = {
+        let state = state.clone();
+        let project = project.clone();
+        Memo::new(move |_| {
+            crate::notices::project_mutation_pending(&state, &project.host_id, &project.project_id)
+        })
+    };
+
     let is_workbench = move || {
         project_signal
             .get()
@@ -867,22 +872,22 @@ fn ProjectContextMenuItems(
             if !crate::bridge::confirm_dialog("Remove workbench", &message).await {
                 return;
             }
-            remove_workbench(&state, host_id, workbench_id, workbench_name, false);
+            remove_workbench(&state, host_id, workbench_id, false);
         });
     };
 
     view! {
         <>
             <button class="context-menu-item" on:click=on_edit>"Edit project…"</button>
-            <button class="context-menu-item" on:click=on_rename>"Rename"</button>
+            <button class="context-menu-item" disabled=move || busy.get() on:click=on_rename>"Rename"</button>
             {move || (!is_workbench()).then(|| view! {
-                <button class="context-menu-item" on:click=on_new_workbench.clone()>
+                <button class="context-menu-item" disabled=move || busy.get() on:click=on_new_workbench.clone()>
                     "New Workbench"
                 </button>
                 <button
                     class="context-menu-item"
                     on:click=on_delete.clone()
-                    disabled=move || has_workbench_children.get()
+                    disabled=move || has_workbench_children.get() || busy.get()
                     title=move || if has_workbench_children.get() {
                         "Remove its workbenches first"
                     } else {
@@ -896,7 +901,7 @@ fn ProjectContextMenuItems(
                 })}
             })}
             {move || is_workbench().then(|| view! {
-                <button class="context-menu-item" on:click=on_remove_workbench.clone()>
+                <button class="context-menu-item" disabled=move || busy.get() on:click=on_remove_workbench.clone()>
                     "Remove Workbench"
                 </button>
             })}
@@ -904,35 +909,6 @@ fn ProjectContextMenuItems(
     }
 }
 
-/// Submission record the New Workbench modal holds while a create is in
-/// flight. `preexisting_ids` snapshots the workbench ids that already matched
-/// `(host, parent, branch)` at submit time so success is detected only by a
-/// *new* matching workbench appearing — a pre-existing same-branch workbench
-/// must not close the modal as a false success.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SubmittedWorkbenchCreate {
-    branch: protocol::GitBranchName,
-    preexisting_ids: Vec<protocol::ProjectId>,
-}
-
-/// New Workbench modal. State machine:
-///
-/// - **Editing** (`submitted == None`): inputs enabled; `error` (if set)
-///   shows the previous attempt's failure inline so the user can correct the
-///   branch name and retry.
-/// - **Pending** (`submitted == Some`): entered on submit, after
-///   `create_workbench` pushed its `PendingWorkbenchCreate` entry. Inputs and
-///   submit are disabled and a "Creating workbench…" status is shown. A
-///   watcher effect resolves the phase:
-///   - success — a new workbench matching `(host, parent, branch)` lands in
-///     `state.projects` (the dispatcher auto-switches to it) → close;
-///   - reported failure — our pending entry carries the `CommandError`
-///     message → consume the entry, show the message, back to Editing;
-///   - silent failure — the pending entry vanished without a workbench
-///     appearing (send failure, host disconnect cleanup) → generic error,
-///     back to Editing.
-/// - Cancel / Escape / backdrop always close, withdrawing any in-flight
-///   pending entry so a late success can't yank the active project later.
 #[component]
 fn WorkbenchCreateModal(
     prompt: WorkbenchCreatePrompt,
@@ -940,9 +916,6 @@ fn WorkbenchCreateModal(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let branch = RwSignal::new(String::new());
-    let submitted = RwSignal::new(None::<SubmittedWorkbenchCreate>);
-    let error: RwSignal<Option<String>> = RwSignal::new(None);
-    let pending = move || submitted.get().is_some();
     let input_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |_| {
         if let Some(el) = input_ref.get() {
@@ -950,145 +923,33 @@ fn WorkbenchCreateModal(
         }
     });
 
-    let close = {
-        let state = state.clone();
-        let host_id = prompt.host_id.clone();
-        let parent_project_id = prompt.parent_project_id.clone();
-        move || {
-            if let Some(sub) = submitted.get_untracked() {
-                state.pending_workbench_creates.update(|pending| {
-                    pending.retain(|entry| {
-                        !(entry.host_id == host_id
-                            && entry.parent_project_id == parent_project_id
-                            && entry.branch == sub.branch)
-                    });
-                });
-            }
-            workbench_prompt.set(None);
-        }
-    };
+    let close = move || workbench_prompt.set(None);
 
-    // Watch for the outcome of an in-flight create. Reads nothing while
-    // Editing (early return keeps the tracked sources minimal).
-    {
-        let state = state.clone();
-        let host_id = prompt.host_id.clone();
-        let parent_project_id = prompt.parent_project_id.clone();
-        Effect::new(move |_| {
-            let Some(sub) = submitted.get() else {
-                return;
-            };
-            let success = state.projects.get().iter().any(|info| {
-                info.host_id == host_id
-                    && !sub.preexisting_ids.contains(&info.project.id)
-                    && match &info.project.source {
-                        ProjectSource::GitWorkbench {
-                            parent_project_id: parent,
-                            branch,
-                            ..
-                        } => parent == &parent_project_id && branch == &sub.branch,
-                        ProjectSource::Standalone { .. } => false,
-                    }
-            });
-            if success {
-                workbench_prompt.set(None);
-                return;
-            }
-            let entry = state
-                .pending_workbench_creates
-                .get()
-                .into_iter()
-                .find(|entry| {
-                    entry.host_id == host_id
-                        && entry.parent_project_id == parent_project_id
-                        && entry.branch == sub.branch
-                });
-            let failure = match entry {
-                Some(entry) => {
-                    let Some(message) = entry.error else {
-                        // Still in flight.
-                        return;
-                    };
-                    // Consume the errored entry — it exists solely so this
-                    // modal can surface the failure.
-                    state.pending_workbench_creates.update(|pending| {
-                        pending.retain(|entry| {
-                            !(entry.host_id == host_id
-                                && entry.parent_project_id == parent_project_id
-                                && entry.branch == sub.branch
-                                && entry.error.is_some())
-                        });
-                    });
-                    message
-                }
-                // Entry vanished without a workbench appearing: the send
-                // failed (actions removed it) or the host disconnected.
-                None => {
-                    "The request could not be completed. Check the host connection and try again."
-                        .to_owned()
-                }
-            };
-            error.set(Some(failure));
-            submitted.set(None);
-            if let Some(el) = input_ref.get_untracked() {
-                let _ = el.focus();
-            }
-        });
-    }
-
-    let close_for_backdrop = close.clone();
+    let close_for_backdrop = close;
     let on_backdrop_click = move |_| close_for_backdrop();
 
-    let close_for_cancel = close.clone();
+    let close_for_cancel = close;
     let on_cancel = move |_| close_for_cancel();
 
     let state_for_submit = state.clone();
     let prompt_for_submit = prompt.clone();
     let submit = move || {
-        if submitted.get_untracked().is_some() {
-            return;
-        }
         let value = branch.get_untracked().trim().to_owned();
         if value.is_empty() {
             return;
         }
-        let branch_name = protocol::GitBranchName(value.clone());
-        let preexisting_ids = state_for_submit
-            .projects
-            .get_untracked()
-            .into_iter()
-            .filter(|info| {
-                info.host_id == prompt_for_submit.host_id
-                    && match &info.project.source {
-                        ProjectSource::GitWorkbench {
-                            parent_project_id,
-                            branch,
-                            ..
-                        } => {
-                            parent_project_id == &prompt_for_submit.parent_project_id
-                                && branch == &branch_name
-                        }
-                        ProjectSource::Standalone { .. } => false,
-                    }
-            })
-            .map(|info| info.project.id)
-            .collect();
-        error.set(None);
         create_workbench(
             &state_for_submit,
             prompt_for_submit.host_id.clone(),
             prompt_for_submit.parent_project_id.clone(),
             value,
         );
-        submitted.set(Some(SubmittedWorkbenchCreate {
-            branch: branch_name,
-            preexisting_ids,
-        }));
+        workbench_prompt.set(None);
     };
     let submit_for_keydown = submit.clone();
     let submit_for_button = submit;
 
-    let close_for_keydown = close.clone();
+    let close_for_keydown = close;
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
         ev.stop_propagation();
         match ev.key().as_str() {
@@ -1128,26 +989,19 @@ fn WorkbenchCreateModal(
                         spellcheck="false"
                         autocapitalize="none"
                         autocomplete="off"
-                        disabled=pending
                         prop:value=move || branch.get()
                         on:input=move |ev| branch.set(event_target_value(&ev))
                         on:keydown=on_keydown
                     />
-                    {move || error.get().map(|message| view! {
-                        <div class="modal-error">{message}</div>
-                    })}
-                    {move || pending().then(|| view! {
-                        <div class="modal-status">"Creating workbench…"</div>
-                    })}
                 </div>
                 <div class="modal-actions">
                     <button class="modal-button" on:click=on_cancel>"Cancel"</button>
                     <button
                         class="modal-button primary"
                         on:click=move |_| submit_for_button()
-                        disabled=move || pending() || branch.get().trim().is_empty()
+                        disabled=move || branch.get().trim().is_empty()
                     >
-                        {move || if pending() { "Creating…" } else { "Create Workbench" }}
+                        "Create Workbench"
                     </button>
                 </div>
             </div>
@@ -1156,7 +1010,7 @@ fn WorkbenchCreateModal(
 }
 
 #[component]
-fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
+pub(crate) fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
     let state = expect_context::<AppState>();
     let close = {
         let state = state.clone();
@@ -1180,11 +1034,16 @@ fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
     let force_prompt = prompt.clone();
     let on_force = move |_| {
         state_for_force.workbench_remove_prompt.set(None);
+        state_for_force.project_operations.update(|operations| {
+            operations.remove(&(
+                force_prompt.host_id.clone(),
+                force_prompt.operation_stream.clone(),
+            ));
+        });
         remove_workbench(
             &state_for_force,
             force_prompt.host_id.clone(),
             force_prompt.project_id.clone(),
-            force_prompt.project_name.clone(),
             true,
         );
     };
@@ -1214,7 +1073,7 @@ fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
                 on:click=|event: web_sys::MouseEvent| event.stop_propagation()
             >
                 <div id="workbench-remove-title" class="modal-title">
-                    "Workbench has uncommitted files"
+                    "Review workbench removal"
                 </div>
                 <div class="modal-body">
                     <div class="modal-error">{prompt.message}</div>
@@ -1326,6 +1185,13 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
         let project = project.clone();
         Memo::new(move |_| state.can_manage_project_roots(&project.host_id, &project.project_id))
     };
+    let busy = {
+        let state = state.clone();
+        let project = project.clone();
+        Memo::new(move |_| {
+            crate::notices::project_mutation_pending(&state, &project.host_id, &project.project_id)
+        })
+    };
     let save_state = state.clone();
     let save_project = project.clone();
     let save = move |_| {
@@ -1386,7 +1252,7 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                     <div class="project-editor-name-row">
                         <input id="project-editor-name" class="modal-input" node_ref=input prop:value=move || name.get()
                             on:input=move |ev| name.set(event_target_value(&ev)) />
-                        <button class="modal-button" disabled=move || name.get().trim().is_empty() || info.with(|info| info.as_ref().is_none_or(|info| info.project.name == name.get().trim())) on:click=save>"Save name"</button>
+                        <button class="modal-button" disabled=move || busy.get() || name.get().trim().is_empty() || info.with(|info| info.as_ref().is_none_or(|info| info.project.name == name.get().trim())) on:click=save>"Save name"</button>
                     </div>
                     <h3>"Source roots"</h3>
                     <p class="project-roots-help">"Removing a source root disconnects it from this project. Files stay on disk."</p>
@@ -1408,7 +1274,7 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                                 <div class="project-editor-root">
                                     <span>{root_label.clone()}<span class="project-root-error" role="status">{status}</span></span>
                                     <button class="modal-button" aria-label=format!("Remove source root {root_label}")
-                                        disabled=move || !can_edit_roots.get() || count <= 1
+                                        disabled=move || busy.get() || !can_edit_roots.get() || count <= 1
                                         title=move || if count <= 1 { "A project must keep at least one source root" } else { "Remove root from project; keep files" }
                                         on:click=move |_| crate::actions::delete_project_root(&remove_state, remove_project.host_id.clone(), remove_project.project_id.clone(), root.clone())
                                     >"Remove"</button>
@@ -1416,7 +1282,7 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                             }
                         }).collect_view()
                     })}
-                    <button class="modal-button" disabled=move || !can_edit_roots.get()
+                    <button class="modal-button" disabled=move || busy.get() || !can_edit_roots.get()
                         on:click=move |_| crate::components::host_browser::open_add_root_browser_for(&add_state, add_project.clone())>"Add source root…"</button>
                     <Show when=move || !can_edit_roots.get()>
                         <p>"Roots are managed by workbench creation while this project is a workbench or has workbenches."</p>
@@ -1740,58 +1606,588 @@ mod wasm_tests {
         );
     }
 
+    fn button(container: &HtmlElement, text: &str) -> HtmlElement {
+        let buttons = container.query_selector_all("button").unwrap();
+        (0..buttons.length())
+            .filter_map(|index| buttons.item(index))
+            .filter_map(|node| node.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().unwrap_or_default().trim() == text)
+            .expect("visible action")
+    }
+
+    fn operation_event(
+        state: &AppState,
+        seq: u64,
+        stream: &str,
+        mutation: protocol::ProjectMutation,
+        status: protocol::ProjectOperationState,
+    ) {
+        crate::dispatch::dispatch_envelope(
+            state,
+            "host-a",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/a".to_owned()),
+                protocol::FrameKind::ProjectOperation,
+                seq,
+                &protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".to_owned()),
+                    stream: protocol::StreamPath(stream.to_owned()),
+                    mutation,
+                    state: status,
+                },
+            )
+            .unwrap(),
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn adding_a_workbench_reactively_appears_in_nested_list() {
+        use protocol::{ProjectMutation, ProjectOperationStage, ProjectOperationState};
+        install_send_stub();
+        // Hold bridge admission independently of the server's operation events.
+        js_sys::eval(
+            r#"
+            window.__normal_project_invoke = window.__TAURI__.core.invoke;
+            window.__create_entered = new Promise(resolve => window.__create_enter = resolve);
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                if (cmd === 'send_host_line' && JSON.parse(args.line).kind === 'workbench_create') {
+                    window.__create_enter();
+                    return new Promise(resolve => window.__release_create = resolve);
+                }
+                return window.__normal_project_invoke(cmd, args);
+            };
+        "#,
+        )
+        .unwrap();
         let container = make_container();
-        let state_signal = leptos::prelude::StoredValue::new(None::<AppState>);
+        let state = make_state_with_fixture();
+        crate::dispatch::clear_host_seqs("host-a");
+        state.host_streams.update(|streams| {
+            streams.insert(
+                "host-a".to_owned(),
+                protocol::StreamPath("/host/a".to_owned()),
+            );
+        });
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "host-a".to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        let mount_state = state.clone();
+        let prompt = RwSignal::new(Some(WorkbenchCreatePrompt {
+            host_id: "host-a".to_owned(),
+            parent_project_id: ProjectId("p-tyde".to_owned()),
+            parent_name: "Tyde2".to_owned(),
+        }));
+        let composer = crate::state::ComposerHandle::default();
         let _handle = mount_to(container.clone(), move || {
-            let state = make_state_with_fixture();
-            state_signal.set_value(Some(state.clone()));
-            provide_context(state);
-            view! { <ProjectRail /> }
+            provide_context(mount_state.clone());
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <crate::components::header::Header /><ProjectRail />
+                <crate::components::chat_input::ChatInput composer=composer.clone() />
+                <ProjectEditor /><crate::components::host_browser::HostBrowser />
+                {move || prompt.get().map(|value| view! { <WorkbenchCreateModal prompt=value workbench_prompt=prompt /> })}
+            }
         });
-
         next_tick().await;
-
-        let labels_before = workbench_labels(&container);
-        assert_eq!(
-            labels_before.len(),
-            2,
-            "fixture should start with two workbenches, got: {labels_before:?}"
+        let input = container
+            .query_selector(".workbench-create-modal input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value("experiment");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        button(&container, "Create Workbench").click();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(
+            &js_sys::eval("window.__create_entered").unwrap(),
+        ))
+        .await
+        .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-create-modal")
+                .unwrap()
+                .is_none(),
+            "submission must close before bridge admission completes"
         );
-
-        // Append a new workbench under p-tyde — the rail should pick it up
-        // through its reactive derivation rather than a manual refresh.
-        let state = state_signal
-            .get_value()
-            .expect("state should be captured by the mount closure");
-        state.projects.update(|projects| {
-            projects.push(ProjectInfo {
-                host_id: "host-a".to_owned(),
-                project: workbench(
-                    "wb-new",
-                    "experiment",
-                    2,
-                    "p-tyde",
-                    "experiment",
-                    "/tmp/tyde2",
-                    "/tmp/tyde2--experiment",
-                ),
-            });
-            sort_project_infos(projects);
-        });
-
-        next_tick().await;
-
-        let labels_after = workbench_labels(&container);
         assert_eq!(
-            labels_after.len(),
+            workbench_labels(&container).len(),
+            2,
+            "no optimistic workbench row"
+        );
+        let orphan = container
+            .query_selector("[title='OrphanProj']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        orphan.click();
+        let textarea = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        textarea.set_value("Unrelated chat draft");
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let mutation = ProjectMutation::CreateWorkbench(protocol::WorkbenchCreatePayload {
+            parent_project_id: ProjectId("p-tyde".to_owned()),
+            branch: GitBranchName("experiment".to_owned()),
+            name: "experiment".to_owned(),
+        });
+        operation_event(
+            &state,
+            0,
+            "/project-operation/create",
+            mutation.clone(),
+            ProjectOperationState::Admitted,
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Create workbench experiment in Tyde2")
+        );
+        assert!(container.text_content().unwrap().contains("Queued"));
+        js_sys::eval("window.__release_create(); window.__TAURI__.core.invoke = window.__normal_project_invoke;").unwrap();
+        next_tick().await;
+        assert_eq!(
+            workbench_labels(&container).len(),
+            2,
+            "transport completion is not domain completion"
+        );
+        operation_event(
+            &state,
+            1,
+            "/project-operation/create",
+            mutation.clone(),
+            ProjectOperationState::Running {
+                stage: ProjectOperationStage::Git,
+            },
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Working in Git"));
+        assert!(
+            textarea.value() == "Unrelated chat draft",
+            "unrelated draft must remain unchanged"
+        );
+        let project = workbench(
+            "wb-new",
+            "experiment",
+            2,
+            "p-tyde",
+            "experiment",
+            "/tmp/tyde2",
+            "/tmp/tyde2--experiment",
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-a",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/a".to_owned()),
+                protocol::FrameKind::ProjectNotify,
+                2,
+                &protocol::ProjectNotifyPayload::Upsert { project },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(workbench_labels(&container).contains(&"experiment".to_owned()));
+        assert_eq!(
+            state.active_project.get_untracked().unwrap().project_id.0,
+            "p-orphan",
+            "late create must never steal navigation"
+        );
+        operation_event(
+            &state,
             3,
-            "expected three workbenches after add, got: {labels_after:?}"
+            "/project-operation/create",
+            mutation.clone(),
+            ProjectOperationState::Committed {
+                warnings: vec![protocol::ProjectOperationWarning {
+                    stage: ProjectOperationStage::Workflow,
+                    message: "Workflow discovery unavailable".to_owned(),
+                }],
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Saved, with warnings")
         );
         assert!(
-            labels_after.contains(&"experiment".to_owned()),
-            "expected 'experiment' workbench to appear, got: {labels_after:?}"
+            container
+                .text_content()
+                .unwrap()
+                .contains("Do not repeat this operation")
+        );
+        assert!(
+            container
+                .query_selector(".workbench-create-modal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            textarea.value() == "Unrelated chat draft",
+            "unrelated draft must remain unchanged"
+        );
+        // A different attempt has its own server identity; the older result cannot settle it.
+        operation_event(
+            &state,
+            4,
+            "/project-operation/another",
+            mutation.clone(),
+            ProjectOperationState::Admitted,
+        );
+        operation_event(
+            &state,
+            5,
+            "/project-operation/create",
+            mutation.clone(),
+            ProjectOperationState::Committed { warnings: vec![] },
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Queued"));
+        state.prepare_host_refresh("host-a");
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Completion is unknown")
+        );
+        // An empty bootstrap removes p-orphan and disables Save because its
+        // record is missing, not because another project's mutation is pending.
+        let catalog = state.projects.with_untracked(|projects| {
+            projects
+                .iter()
+                .filter(|entry| entry.host_id == "host-a")
+                .map(|entry| entry.project.clone())
+                .collect()
+        });
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, "host-a", |bootstrap| {
+            bootstrap.projects = catalog;
+        });
+        operation_event(
+            &state,
+            0,
+            "/project-operation/another",
+            mutation.clone(),
+            ProjectOperationState::Running {
+                stage: ProjectOperationStage::Persistence,
+            },
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Saving"));
+        assert!(
+            container
+                .query_selector("[title='OrphanProj']")
+                .unwrap()
+                .is_some(),
+            "replayed catalog must keep the unrelated project available"
+        );
+        operation_event(
+            &state,
+            1,
+            "/project-operation/another",
+            mutation,
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Conflict,
+                message: "Branch already exists".to_owned(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Branch already exists")
+        );
+        assert!(
+            container
+                .query_selector(".workbench-create-modal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            textarea.value() == "Unrelated chat draft",
+            "unrelated draft must remain unchanged"
+        );
+        let orphan_project = ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("p-orphan".to_owned()),
+        };
+        state.project_editor.set(Some(orphan_project));
+        next_tick().await;
+        let name = container
+            .query_selector("#project-editor-name")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        name.set_value("Edited orphan");
+        name.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            !button(&container, "Save name").has_attribute("disabled"),
+            "another project's failure does not block this editor"
+        );
+        let root_mutation = ProjectMutation::AddRoot(protocol::ProjectAddRootPayload {
+            id: ProjectId("p-orphan".to_owned()),
+            root: ProjectRootPath("/tmp/added".to_owned()),
+        });
+        operation_event(
+            &state,
+            2,
+            "/project-operation/root",
+            root_mutation.clone(),
+            ProjectOperationState::Running {
+                stage: ProjectOperationStage::Persistence,
+            },
+        );
+        next_tick().await;
+        assert!(button(&container, "Save name").has_attribute("disabled"));
+        assert!(button(&container, "Add source root…").has_attribute("disabled"));
+        let roots = container
+            .query_selector_all(".project-editor-root")
+            .unwrap();
+        assert_eq!(
+            roots.length(),
+            1,
+            "no root may be inserted before the server catalog changes"
+        );
+        assert!(
+            roots
+                .item(0)
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("/tmp/orphan")
+        );
+        button(&container, "Done").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Edit project']")
+                .unwrap()
+                .is_none(),
+            "editor remains dismissible while mutation is held"
+        );
+        operation_event(
+            &state,
+            3,
+            "/project-operation/root",
+            root_mutation,
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Internal,
+                message: "Could not save added root".to_owned(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Could not save added root")
+        );
+        assert!(
+            container
+                .query_selector("[aria-label='Folder browser']")
+                .unwrap()
+                .is_none(),
+            "late add-root error cannot reopen a browser"
+        );
+        let mutations = [
+            (
+                ProjectMutation::Create(protocol::ProjectCreatePayload {
+                    name: "New project".to_owned(),
+                    roots: vec![ProjectRootPath("/tmp/new".to_owned())],
+                }),
+                "Create project New project",
+            ),
+            (
+                ProjectMutation::DeleteRoot(protocol::ProjectDeleteRootPayload {
+                    id: ProjectId("p-orphan".to_owned()),
+                    root: ProjectRootPath("/tmp/orphan".to_owned()),
+                }),
+                "Remove /tmp/orphan from OrphanProj",
+            ),
+            (
+                ProjectMutation::Delete(protocol::ProjectDeletePayload {
+                    id: ProjectId("p-orphan".to_owned()),
+                }),
+                "Delete OrphanProj",
+            ),
+        ];
+        for (index, (mutation, label)) in mutations.into_iter().enumerate() {
+            let seq = 4 + index as u64 * 2;
+            operation_event(
+                &state,
+                seq,
+                &format!("/project-operation/other-{index}"),
+                mutation.clone(),
+                ProjectOperationState::Admitted,
+            );
+            next_tick().await;
+            assert!(container.text_content().unwrap().contains(label));
+            assert!(
+                container
+                    .query_selector("[title='OrphanProj']")
+                    .unwrap()
+                    .is_some(),
+                "catalog cannot disappear before server Delete"
+            );
+            operation_event(
+                &state,
+                seq + 1,
+                &format!("/project-operation/other-{index}"),
+                mutation,
+                ProjectOperationState::Committed { warnings: vec![] },
+            );
+            next_tick().await;
+        }
+        // A closed form retains its actual unsent input on the error affordance.
+        js_sys::eval("window.__TAURI__.core.invoke = (cmd,args) => cmd === 'send_host_line' && JSON.parse(args.line).kind === 'workbench_create' ? Promise.reject('Connection closed') : window.__normal_project_invoke(cmd,args);").unwrap();
+        state.host_streams.update(|streams| {
+            streams.insert(
+                "host-a".to_owned(),
+                protocol::StreamPath("/host/a".to_owned()),
+            );
+        });
+        prompt.set(Some(WorkbenchCreatePrompt {
+            host_id: "host-a".to_owned(),
+            parent_project_id: ProjectId("p-tyde".to_owned()),
+            parent_name: "Tyde2".to_owned(),
+        }));
+        next_tick().await;
+        let input = container
+            .query_selector(".workbench-create-modal input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value("recover-submitted-branch");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        button(&container, "Create Workbench").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-create-modal")
+                .unwrap()
+                .is_none()
+        );
+        js_sys::eval("window.__TAURI__.core.invoke = window.__normal_project_invoke;").unwrap();
+        crate::actions::delete_project(
+            &state,
+            "host-a".to_owned(),
+            ProjectId("p-orphan".to_owned()),
+        );
+        next_tick().await;
+        let errors = container
+            .query_selector_all(".project-operation-notices .inline-notice.error")
+            .unwrap();
+        let unsent = (0..errors.length())
+            .filter_map(|index| errors.item(index))
+            .find(|node| {
+                node.text_content()
+                    .unwrap()
+                    .contains("recover-submitted-branch could not be sent")
+                    || node
+                        .text_content()
+                        .unwrap()
+                        .contains("recover-submitted-branch in Tyde2 could not be sent")
+            })
+            .expect("recoverable unsent branch")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        js_sys::eval("window.__TAURI__.core.invoke = window.__normal_project_invoke;").unwrap();
+        button(&unsent, "Retry").click();
+        next_tick().await;
+        assert!(js_sys::eval(r#"window.__test_send_calls.some(([cmd,args]) => cmd === 'send_host_line' && JSON.parse(JSON.parse(args).line).kind === 'workbench_create' && JSON.parse(JSON.parse(args).line).payload.branch === 'recover-submitted-branch')"#).unwrap().as_bool().unwrap());
+        // A long error cannot take navigation/chat out of the viewport.
+        operation_event(
+            &state,
+            10,
+            "/project-operation/long",
+            ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
+                id: ProjectId("wb-feat".to_owned()),
+                force: false,
+            }),
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Internal,
+                message: "untracked file diagnostic ".repeat(1000),
+                cleanup_may_be_partial: true,
+            },
+        );
+        next_tick().await;
+        let notices = container
+            .query_selector(".project-operation-notices")
+            .unwrap()
+            .unwrap();
+        let viewport = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(notices.get_bounding_client_rect().height() <= viewport * 0.2 + 1.0);
+        assert!(
+            notices.scroll_height() > notices.client_height(),
+            "complete errors remain reachable by scrolling"
+        );
+        button(&container, "Review removal…").click();
+        next_tick().await;
+        let modal = container
+            .query_selector(".workbench-remove-modal")
+            .unwrap()
+            .unwrap();
+        assert!(
+            modal
+                .text_content()
+                .unwrap()
+                .contains("Cleanup may be incomplete")
+        );
+        let cancel = button(&container, "Cancel");
+        assert!(
+            cancel.get_bounding_client_rect().bottom() <= viewport,
+            "long diagnostics must leave confirmation controls reachable"
+        );
+        cancel.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Cleanup may be incomplete"),
+            "cancelling review must retain partial-cleanup guidance"
+        );
+        assert!(
+            textarea.value() == "Unrelated chat draft",
+            "unrelated draft must remain unchanged"
         );
     }
 
@@ -1870,38 +2266,31 @@ mod wasm_tests {
             });
             crate::dispatch::clear_host_seqs("host-a");
             crate::components::header::reset_user_notice_for_tests();
-            state.pending_workbench_removes.update(|pending| {
-                for (id, name) in [("wb-fix", "bugfix-x"), ("wb-feat", "feature-login")] {
-                    pending.push(crate::state::PendingWorkbenchRemove {
-                        host_id: "host-a".to_owned(),
-                        project_id: ProjectId(id.to_owned()),
-                        project_name: name.to_owned(),
-                        force: false,
-                    });
-                }
-            });
-            crate::dispatch::dispatch_envelope(
+            operation_event(
                 &state,
-                "host-a",
-                protocol::Envelope::from_payload(
-                    protocol::StreamPath("/host/a".to_owned()),
-                    protocol::FrameKind::CommandError,
-                    0,
-                    &protocol::CommandErrorPayload {
-                        workbench_reason: None,
-                        context: Some(protocol::CommandErrorContext::WorkbenchRemove {
-                            project_id: ProjectId("wb-feat".to_owned()),
-                        }),
-                        request_id: None,
-                        stream: protocol::StreamPath("/host/a".to_owned()),
-                        request_kind: protocol::FrameKind::WorkbenchRemove,
-                        operation: "workbench_remove".to_owned(),
-                        code: protocol::CommandErrorCode::Conflict,
-                        message: "worktree roots are dirty:\n?? implementation.md".to_owned(),
-                        fatal: false,
-                    },
-                )
-                .unwrap(),
+                0,
+                "/project-operation/remove-other",
+                protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
+                    id: ProjectId("wb-fix".to_owned()),
+                    force: false,
+                }),
+                protocol::ProjectOperationState::Running {
+                    stage: protocol::ProjectOperationStage::Cleanup,
+                },
+            );
+            operation_event(
+                &state,
+                1,
+                "/project-operation/remove",
+                protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
+                    id: ProjectId("wb-feat".to_owned()),
+                    force: false,
+                }),
+                protocol::ProjectOperationState::Failed {
+                    code: protocol::CommandErrorCode::Conflict,
+                    message: "worktree roots are dirty:\n?? implementation.md".to_owned(),
+                    cleanup_may_be_partial: false,
+                },
             );
             state_signal.set_value(Some(state.clone()));
             provide_context(state);
@@ -1909,6 +2298,21 @@ mod wasm_tests {
         });
         next_tick().await;
 
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none(),
+            "remote failure must not open a modal"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("?? implementation.md")
+        );
+        button(&container, "Review removal…").click();
+        next_tick().await;
         let modal = container
             .query_selector(".workbench-remove-modal")
             .unwrap()
@@ -1931,8 +2335,6 @@ mod wasm_tests {
                 .is_none(),
             "the removal dialog already owns this error"
         );
-        assert!(state_signal.get_value().unwrap().pending_workbench_removes.with_untracked(|pending|
-            pending.len() == 1 && pending[0].project_id.0 == "wb-fix"));
         let buttons = modal.query_selector_all("button").unwrap();
         let labels = (0..buttons.length())
             .filter_map(|index| buttons.item(index)?.text_content())
@@ -1940,12 +2342,41 @@ mod wasm_tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["Open Workbench", "Cancel", "Delete Anyway"]);
 
-        buttons
-            .item(2)
-            .expect("Delete Anyway button")
-            .dyn_into::<HtmlElement>()
-            .expect("button element")
-            .click();
+        button(&container, "Cancel").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("?? implementation.md"),
+            "cancel must retain the failure and its recovery action"
+        );
+        button(&container, "Review removal…").click();
+        next_tick().await;
+        button(&container, "Open Workbench").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("?? implementation.md"),
+            "inspection must not dismiss the error"
+        );
+        button(&container, "Review removal…").click();
+        next_tick().await;
+        button(&container, "Delete Anyway").click();
         next_tick().await;
         next_tick().await;
         assert!(
@@ -1970,15 +2401,9 @@ mod wasm_tests {
         .as_bool()
         .unwrap_or(false);
         assert!(forced, "Delete Anyway must send force=true");
-        let state = state_signal
-            .get_value()
-            .expect("state should be captured by the mount closure");
         assert!(
-            state
-                .pending_workbench_removes
-                .get_untracked()
-                .iter()
-                .any(|entry| entry.project_id.0 == "wb-feat" && entry.force)
+            container.text_content().unwrap().contains("Cleaning up"),
+            "other removal remains in flight"
         );
     }
 

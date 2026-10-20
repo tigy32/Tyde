@@ -14170,6 +14170,11 @@ pre.tool-error-pre {
     white-space: pre-wrap;
 }
 
+.workbench-remove-modal .modal-error {
+    max-height: 30vh;
+    overflow-y: auto;
+}
+
 .workbench-remove-modal .modal-warning {
     color: var(--text-primary);
     font-size: 0.846rem;
@@ -16259,6 +16264,8 @@ pre.tool-error-pre {
 .review-round-member p { margin: 6px 0; overflow-wrap: anywhere; }
 .review-round-finding { border-left: 2px solid var(--border-primary); padding-left: 10px; margin-top: 12px; }
 .review-round-finding small { color: var(--accent-link); }
+
+.project-operation-notices { flex: 0 0 auto; max-height: 20vh; overflow-y: auto; }
 
 .inline-notice { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; margin: 6px; border: 1px solid currentColor; border-radius: 4px; font-size: 12px; overflow-wrap: anywhere; }
 .inline-notice.error { color: var(--color-error, #e57560); }
