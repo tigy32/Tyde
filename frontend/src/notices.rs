@@ -455,7 +455,7 @@ pub(crate) fn mutation_label(
 
 #[component]
 pub fn ProjectOperationNotices() -> impl IntoView {
-    use protocol::{ProjectOperationStage, ProjectOperationState};
+    use protocol::ProjectOperationState;
     let state = expect_context::<AppState>();
     let operations = state.project_operations;
     let hosts = state.configured_hosts;
@@ -478,7 +478,19 @@ pub fn ProjectOperationNotices() -> impl IntoView {
         <div class="project-operation-notices">
             <InlineNotices scopes=Signal::derive(scopes) />
             <For each=move || {
-                let mut keys = operations.with(|operations| operations.iter().filter(|(_, operation)| !matches!(&operation.state, ProjectOperationState::Committed { warnings } if warnings.is_empty())).map(|(key, _)| key.clone()).collect::<Vec<_>>());
+                let mut keys = operations.with(|operations| {
+                    operations
+                        .iter()
+                        .filter(|(_, operation)| {
+                            matches!(&operation.state, ProjectOperationState::Failed { .. })
+                                || matches!(
+                                    &operation.state,
+                                    ProjectOperationState::Committed { warnings } if !warnings.is_empty()
+                                )
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>()
+                });
                 keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
                 keys
             } key=|key| key.clone() let:key>
@@ -491,16 +503,7 @@ pub fn ProjectOperationNotices() -> impl IntoView {
                         format!("{} · {}", host_label.unwrap_or_else(|| host.clone()), mutation_label(&state, &host, &operation.mutation))
                     }) };
                     let detail = move || current.get().map(|operation| match operation.state {
-                        ProjectOperationState::Admitted => "Queued".to_owned(),
-                        ProjectOperationState::Running { stage } => match stage {
-                            ProjectOperationStage::Queue => "Queued",
-                            ProjectOperationStage::Git => "Working in Git…",
-                            ProjectOperationStage::Filesystem => "Updating files…",
-                            ProjectOperationStage::Persistence => "Saving…",
-                            ProjectOperationStage::Cleanup => "Cleaning up…",
-                            ProjectOperationStage::Fanout => "Updating project views…",
-                            ProjectOperationStage::Workflow => "Updating workflows…",
-                        }.to_owned(),
+                        ProjectOperationState::Admitted | ProjectOperationState::Running { .. } => String::new(),
                         ProjectOperationState::Committed { warnings } => format!("Saved, with warnings: {}. Do not repeat this operation.", warnings.iter().map(|warning| warning.message.as_str()).collect::<Vec<_>>().join("; ")),
                         ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } => if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },
                     });
@@ -538,5 +541,221 @@ pub fn ProjectOperationNotices() -> impl IntoView {
             </For>
             {move || remove_prompt.get().map(|prompt| view! { <crate::components::project_rail::WorkbenchRemoveModal prompt /> })}
         </div>
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use protocol::ProjectOperationState;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_operation_notices_quiets_routine_progress_and_renders_failures() {
+        let container = make_container();
+        let state = AppState::new();
+        let mount_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ProjectOperationNotices /> }
+        });
+        next_tick().await;
+
+        let notices_el = container
+            .query_selector(".project-operation-notices")
+            .unwrap()
+            .expect("notices container");
+        assert_eq!(
+            notices_el.client_height(),
+            0,
+            "empty notices container has 0 height"
+        );
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none()
+        );
+
+        let host = "host-a".to_owned();
+        let stream = StreamPath("/project-operation/wb-test".to_owned());
+        let mutation =
+            protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
+                id: ProjectId("wb-test".to_owned()),
+                force: false,
+            });
+
+        // 1. Routine in-flight operations (Admitted, Running) must NOT render global notice
+        state.project_operations.update(|ops| {
+            ops.insert(
+                (host.clone(), stream.clone()),
+                protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".to_owned()),
+                    stream: stream.clone(),
+                    mutation: mutation.clone(),
+                    state: ProjectOperationState::Admitted,
+                },
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            notices_el.client_height(),
+            0,
+            "Admitted operation leaves notices quiet"
+        );
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none()
+        );
+
+        state.project_operations.update(|ops| {
+            ops.insert(
+                (host.clone(), stream.clone()),
+                protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".to_owned()),
+                    stream: stream.clone(),
+                    mutation: mutation.clone(),
+                    state: ProjectOperationState::Running {
+                        stage: protocol::ProjectOperationStage::Cleanup,
+                    },
+                },
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            notices_el.client_height(),
+            0,
+            "Running stage leaves notices quiet"
+        );
+        assert!(!container.text_content().unwrap().contains("Cleaning up"));
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none()
+        );
+
+        // 2. Clean committed operation leaves notices quiet
+        state.project_operations.update(|ops| {
+            ops.remove(&(host.clone(), stream.clone()));
+        });
+        next_tick().await;
+        assert_eq!(notices_el.client_height(), 0);
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none()
+        );
+
+        // 3. Committed with warnings renders warning notice
+        state.project_operations.update(|ops| {
+            ops.insert(
+                (host.clone(), stream.clone()),
+                protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".to_owned()),
+                    stream: stream.clone(),
+                    mutation: mutation.clone(),
+                    state: ProjectOperationState::Committed {
+                        warnings: vec![protocol::ProjectOperationWarning {
+                            stage: protocol::ProjectOperationStage::Git,
+                            message: "Branch lock could not be cleared immediately".to_owned(),
+                        }],
+                    },
+                },
+            );
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Saved, with warnings")
+        );
+        assert!(
+            container
+                .query_selector(".inline-notice.warning")
+                .unwrap()
+                .is_some()
+        );
+
+        // Dismiss warning
+        let dismiss_btn = container
+            .query_selector("button[aria-label='Dismiss project operation']")
+            .unwrap()
+            .expect("dismiss button")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        dismiss_btn.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(notices_el.client_height(), 0);
+
+        // 4. Failed operation renders error notice with review/retry affordance
+        state.project_operations.update(|ops| {
+            ops.insert(
+                (host.clone(), stream.clone()),
+                protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".to_owned()),
+                    stream: stream.clone(),
+                    mutation: mutation.clone(),
+                    state: ProjectOperationState::Failed {
+                        code: protocol::CommandErrorCode::Conflict,
+                        message: "Worktree roots are dirty".to_owned(),
+                        cleanup_may_be_partial: false,
+                    },
+                },
+            );
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Worktree roots are dirty")
+        );
+        let error_notice = container
+            .query_selector(".inline-notice.error")
+            .unwrap()
+            .expect("error notice");
+        let review_btn = error_notice
+            .query_selector("button")
+            .unwrap()
+            .expect("review button")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            review_btn.text_content().as_deref().map(str::trim),
+            Some("Review removal…")
+        );
     }
 }

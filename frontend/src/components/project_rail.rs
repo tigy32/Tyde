@@ -1753,12 +1753,19 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
                 .contains("Create workbench experiment in Tyde2")
         );
-        assert!(container.text_content().unwrap().contains("Queued"));
+        assert!(!container.text_content().unwrap().contains("Queued"));
+        assert!(
+            container
+                .query_selector(".project-operation-notices .inline-notice")
+                .unwrap()
+                .is_none(),
+            "routine in-flight progress must not render global notice"
+        );
         js_sys::eval("window.__release_create(); window.__TAURI__.core.invoke = window.__normal_project_invoke;").unwrap();
         next_tick().await;
         assert_eq!(
@@ -1776,7 +1783,17 @@ mod wasm_tests {
             },
         );
         next_tick().await;
-        assert!(container.text_content().unwrap().contains("Working in Git"));
+        assert!(
+            !container.text_content().unwrap().contains("Working in Git"),
+            "routine running stage keeps global notices quiet"
+        );
+        assert!(
+            container
+                .query_selector(".project-operation-notices .inline-notice")
+                .unwrap()
+                .is_none(),
+            "routine running stage keeps global notices quiet"
+        );
         assert!(
             textarea.value() == "Unrelated chat draft",
             "unrelated draft must remain unchanged"
@@ -1859,7 +1876,10 @@ mod wasm_tests {
             ProjectOperationState::Committed { warnings: vec![] },
         );
         next_tick().await;
-        assert!(container.text_content().unwrap().contains("Queued"));
+        assert!(
+            !container.text_content().unwrap().contains("Queued"),
+            "routine in-flight admission must not appear in global notices"
+        );
         state.prepare_host_refresh("host-a");
         next_tick().await;
         assert!(
@@ -1890,7 +1910,10 @@ mod wasm_tests {
             },
         );
         next_tick().await;
-        assert!(container.text_content().unwrap().contains("Saving"));
+        assert!(
+            !container.text_content().unwrap().contains("Saving"),
+            "routine saving stage must not appear in global notices"
+        );
         assert!(
             container
                 .query_selector("[title='OrphanProj']")
@@ -2044,7 +2067,10 @@ mod wasm_tests {
                 ProjectOperationState::Admitted,
             );
             next_tick().await;
-            assert!(container.text_content().unwrap().contains(label));
+            assert!(
+                !container.text_content().unwrap().contains(label),
+                "routine in-flight mutation must not appear in global notices"
+            );
             assert!(
                 container
                     .query_selector("[title='OrphanProj']")
@@ -2402,8 +2428,72 @@ mod wasm_tests {
         .unwrap_or(false);
         assert!(forced, "Delete Anyway must send force=true");
         assert!(
-            container.text_content().unwrap().contains("Cleaning up"),
-            "other removal remains in flight"
+            !container.text_content().unwrap().contains("Cleaning up"),
+            "routine operation progress must not appear in global header notices"
+        );
+        assert!(
+            container
+                .query_selector(".project-operation-notices .inline-notice")
+                .unwrap()
+                .is_none(),
+            "routine in-flight operations must not render global notice banner"
+        );
+        let notices_el = container
+            .query_selector(".project-operation-notices")
+            .unwrap()
+            .expect("project operation notices container");
+        assert_eq!(
+            notices_el.client_height(),
+            0,
+            "no empty container height or layout shift when nothing real visible"
+        );
+
+        // Verify that the other in-flight removal (wb-fix / bugfix-x) is deterministically
+        // reflected in the user-visible UI via disabled pending actions on the workbench.
+        let buttons = container
+            .query_selector_all(".project-rail button[title]")
+            .unwrap();
+        let fix_button = (0..buttons.length())
+            .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.get_attribute("title").as_deref() == Some("bugfix-x"))
+            .expect("bugfix-x workbench button");
+        let event_options = web_sys::MouseEventInit::new();
+        event_options.set_cancelable(true);
+        event_options.set_bubbles(true);
+        let event =
+            web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &event_options)
+                .unwrap();
+        fix_button.dispatch_event(&event).unwrap();
+        next_tick().await;
+
+        let menu_buttons = container
+            .query_selector_all(".context-menu button")
+            .unwrap();
+        let remove_btn = (0..menu_buttons.length())
+            .filter_map(|i| {
+                menu_buttons
+                    .item(i)?
+                    .dyn_into::<web_sys::HtmlButtonElement>()
+                    .ok()
+            })
+            .find(|b| b.text_content().as_deref().map(str::trim) == Some("Remove Workbench"))
+            .expect("Remove Workbench menu button");
+        assert!(
+            remove_btn.disabled(),
+            "Remove Workbench action must be disabled while removal is in flight"
+        );
+        let rename_btn = (0..menu_buttons.length())
+            .filter_map(|i| {
+                menu_buttons
+                    .item(i)?
+                    .dyn_into::<web_sys::HtmlButtonElement>()
+                    .ok()
+            })
+            .find(|b| b.text_content().as_deref().map(str::trim) == Some("Rename"))
+            .expect("Rename menu button");
+        assert!(
+            rename_btn.disabled(),
+            "Rename action must be disabled while removal is in flight"
         );
     }
 
