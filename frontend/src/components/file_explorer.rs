@@ -793,7 +793,7 @@ fn node_matches_filter(node: &TreeNode, filter: &str, show_hidden: bool) -> bool
 mod wasm_tests {
     use super::*;
     use crate::state::ActiveProjectRef;
-    use crate::wasm_test_support::Mounted;
+    use crate::wasm_test_support::{Mounted, ScopedRoot};
     use leptos::mount::mount_to;
     use protocol::{
         CodeIntelLanguageId, CodeIntelOverviewHeadline, CodeIntelOverviewPayload,
@@ -808,26 +808,15 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn make_container() -> HtmlElement {
+    fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
-        // One document is shared by every test in the binary. A container left
-        // behind keeps its rows — and their hover/focus state — in the page for
-        // whatever runs next, so each fixture disposes the last one and owns the
-        // page it asserts about.
-        let stale = document
-            .query_selector_all("[data-test-container]")
-            .unwrap();
-        for index in 0..stale.length() {
-            if let Some(node) = stale.item(index)
-                && let Some(parent) = node.parent_node()
-            {
-                let _ = parent.remove_child(&node);
-            }
-        }
         let container = document.create_element("div").unwrap();
         container.set_attribute("data-test-container", "1").unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(
+            container.dyn_into::<HtmlElement>().unwrap(),
+            "file-explorer",
+        )
     }
 
     async fn next_tick() {
@@ -1052,7 +1041,21 @@ mod wasm_tests {
     /// An ordinary click opens in the focused pane and never splits.
     #[wasm_bindgen_test]
     async fn clicking_a_file_row_opens_it_in_the_focused_pane() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let peer = document.create_element("div").unwrap();
+        peer.set_attribute("data-test-container", "1").unwrap();
+        document.body().unwrap().append_child(&peer).unwrap();
+        let peer = ScopedRoot::new(peer.dyn_into::<HtmlElement>().unwrap(), "explorer-peer");
         let container = make_container();
+        console_log!(
+            "Explorer fixture creation: peer_connected={}, current_connected={}",
+            peer.is_connected(),
+            container.is_connected()
+        );
+        assert!(
+            peer.is_connected(),
+            "a fixture must not delete another owner's root"
+        );
         let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
         next_tick().await;
 
@@ -1085,6 +1088,30 @@ mod wasm_tests {
                 .center_zone
                 .with_untracked(|center_zone| center_zone.is_split()),
             "an ordinary open never creates a split"
+        );
+
+        // The retained gate counted this abandoned parent in CenterZone, whose
+        // panic then left a fixed overlay covering every diff pointer fixture.
+        let previous_root = (*container).clone();
+        drop(state);
+        drop(container);
+        console_log!(
+            "Explorer fixture teardown: previous_connected={}, previous_children={}, peer_connected={}",
+            previous_root.is_connected(),
+            previous_root.has_child_nodes(),
+            peer.is_connected()
+        );
+        assert!(
+            !previous_root.is_connected(),
+            "the fixture removes its own parent"
+        );
+        assert!(
+            !previous_root.has_child_nodes(),
+            "the mounted view is disposed"
+        );
+        assert!(
+            peer.is_connected(),
+            "teardown must preserve another owner's root"
         );
     }
 

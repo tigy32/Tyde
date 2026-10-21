@@ -228,6 +228,12 @@ pub(crate) struct ProjectStreamHandle {
     catalog: watch::Sender<protocol::ProjectCatalogRecord>,
 }
 
+impl ProjectStreamHandle {
+    pub(crate) fn execution_project(&self) -> Project {
+        self.catalog.borrow().project.clone()
+    }
+}
+
 enum ProjectStreamCommand {
     Shutdown,
     ReviewRegistry(RegistryCommand),
@@ -3857,7 +3863,7 @@ fn strip_trailing_line_suffix(path: &str) -> &str {
 }
 
 fn project_path_from_absolute(project: &Project, absolute_path: &str) -> Option<ProjectPath> {
-    let host_path = project.host_path_for_runtime(absolute_path)?;
+    let host_path = project.host_path_for_runtime(absolute_path).ok()?;
     let absolute = Path::new(&host_path);
     if !absolute.is_absolute() {
         return None;

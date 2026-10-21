@@ -31,6 +31,8 @@ pub(crate) trait CodeIntelProvider: Send {
     /// dropping the external handle is not a reliable shutdown signal.
     fn shutdown(&mut self);
 
+    fn take_shutdown_task(&mut self) -> Option<tokio::task::JoinHandle<()>>;
+
     /// Replace the language-server configuration for this provider and restart
     /// discovery/spawn for any already-subscribed files.
     fn reconfigure(&mut self, config: LanguageServerConfig);

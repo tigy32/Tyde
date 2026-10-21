@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    BackendKind, Project, ProjectSource, WorkbenchAvailability, WorkbenchEnvironment,
-    WorkbenchSupport, WorkbenchUnsupportedReason,
+    Project, ProjectSource, WorkbenchAvailability, WorkbenchEnvironment, WorkbenchSupport,
+    WorkbenchUnsupportedReason,
 };
 use serde::Deserialize;
 use tyde_process_env::launch::{AsyncCommandGroup, ProcessStdio};
@@ -40,7 +40,7 @@ fn engine_command(
         .map_err(|error| AppError::internal("workbench_environment", error))?;
     std::io::Write::write_all(&mut helper, RUNNER.as_bytes())
         .map_err(|error| AppError::internal("workbench_environment", error))?;
-    let mut command = tyde_process_env::command("python3")
+    let mut command = tyde_process_env::launch::host_command("python3")
         .map_err(|reason| AppError::invalid("workbench_environment", reason))?;
     command
         .arg(helper.path())
@@ -294,33 +294,72 @@ pub(crate) async fn finish(environment: &WorkbenchEnvironment) -> AppResult<()> 
     Ok(())
 }
 
-pub(crate) fn validate_backend(project: &Project, kind: BackendKind) -> AppResult<()> {
+pub(crate) fn validate_execution(project: &Project) -> AppResult<()> {
+    project
+        .execution_root_mapping()
+        .map(|_| ())
+        .map_err(|message| {
+            AppError::invalid("spawn_agent", message)
+                .with_workbench_reason(WorkbenchUnsupportedReason::UnsupportedRoots)
+        })?;
     if project.is_removing_workbench() {
         return Err(AppError::conflict(
             "spawn_agent",
             "Workbench removal is in progress",
         ));
     }
+    Ok(())
+}
+
+pub(crate) async fn prepare_backend_execution(
+    launch: Option<&protocol::AcpAgentSpec>,
+) -> Result<(), String> {
+    use tyde_process_env::launch::{current_project, set_execution_environment};
+    let Some(project) = current_project() else {
+        return Ok(());
+    };
+    project.execution_root_mapping().map(|_| ())?;
     let ProjectSource::GitWorkbench {
-        environment: WorkbenchEnvironment::Bubblewrap { .. },
+        environment:
+            WorkbenchEnvironment::Bubblewrap {
+                manifest_path,
+                logical_root,
+                ..
+            },
         roots,
         ..
     } = &project.source
     else {
         return Ok(());
     };
-    if roots.len() != 1 {
-        return Err(AppError::invalid(
-            "spawn_agent",
-            "Bubblewrap requires one authoritative root",
-        ));
+    let [root] = roots.as_slice() else {
+        return Err("Execution workspace requires one authoritative source root".to_owned());
+    };
+    let mut environment = invoke::<tyde_process_env::launch::ExecutionEnvironment>(
+        "environment",
+        &[
+            Path::new(&manifest_path.0),
+            Path::new(&root.worktree_root.0),
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if environment.values.get("TYDE_WORKBENCH_ROOT") != Some(&logical_root.0) {
+        return Err("Execution workspace root differs from its canonical runner".to_owned());
     }
-    if !crate::backend::capabilities_for_backend_kind(kind)
-        .contains(tyde_agent_adapter::BackendCapability::BubblewrapWorkbench)
-    {
-        return Err(AppError::invalid("spawn_agent", "This backend has not established Bubblewrap runtime compatibility; select a Native workbench").with_workbench_reason(WorkbenchUnsupportedReason::UnsupportedBackend));
+    if let Some(launch) = launch {
+        if launch
+            .env
+            .get("TYDE_WORKBENCH_ROOT")
+            .is_some_and(|root| root != &logical_root.0)
+        {
+            return Err(
+                "Launch environment cannot replace the execution workspace root".to_owned(),
+            );
+        }
+        environment.values.extend(launch.env.clone());
     }
-    Ok(())
+    set_execution_environment(environment)
 }
 
 pub(crate) fn bubblewrap_environment(project: &Project) -> Option<&WorkbenchEnvironment> {

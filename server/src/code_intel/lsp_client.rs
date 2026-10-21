@@ -22,15 +22,13 @@
 //! messages in. No `Arc<Mutex<HashMap>>` for the request map.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, ProcessOwner, spawn};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::lsp_codec::{LspDecoder, encode};
@@ -40,7 +38,6 @@ use super::lsp_codec::{LspDecoder, encode};
 /// task alive indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZE_REQUEST_TIMEOUT: Duration = REQUEST_TIMEOUT;
-const SERVER_EXIT_WAIT: Duration = Duration::from_millis(250);
 const STDERR_CAPTURE_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,10 +141,10 @@ pub(crate) struct LspServerExit {
     pub stderr: Option<String>,
 }
 
+#[derive(Clone)]
 struct LspProcessDiagnostics {
-    child: Arc<Mutex<Option<AsyncGroupChild>>>,
-    stderr: Arc<Mutex<StderrCapture>>,
-    stderr_task: Mutex<Option<JoinHandle<()>>>,
+    owner: ProcessOwner,
+    completed: watch::Receiver<Option<LspServerExit>>,
 }
 
 #[derive(Default)]
@@ -308,34 +305,29 @@ impl Drop for LspPendingRequest {
 
 pub(crate) struct LspClient {
     cmd_tx: mpsc::UnboundedSender<LspCommand>,
-    /// The owned child slot, shared with the reaper. `None` for the in-memory
-    /// (`from_io`) constructor used in tests.
-    child: Option<Arc<Mutex<Option<AsyncGroupChild>>>>,
+    process: LspProcessDiagnostics,
     reader_task: JoinHandle<()>,
     actor_task: JoinHandle<()>,
 }
 
 impl LspClient {
     /// Spawn `binary args…` as a grouped child in `cwd`, wiring its stdio into
-    /// an LSP client. `env_path` overrides the child's `PATH` (so rust-analyzer
-    /// can find `cargo`/`rustc` — pass `process_env::resolved_child_process_path()`).
+    /// an LSP client using the workspace's canonical execution environment.
     pub(crate) async fn spawn(
         binary: &Path,
         args: &[String],
         cwd: &Path,
-        env_path: Option<&OsStr>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<LspEvent>), String> {
+        crate::workbench::prepare_backend_execution(None).await?;
         let mut cmd = crate::backend::subprocess::command(binary)?;
         cmd.args(args)
             .current_dir(cwd)
             .stdin(crate::backend::subprocess::ProcessStdio::Piped)
             .stdout(crate::backend::subprocess::ProcessStdio::Piped)
             .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-        if let Some(path) = env_path {
-            cmd.env("PATH", path);
-        }
-        let mut child = cmd
-            .group_spawn()
+        let owner = ProcessOwner::child();
+        let mut child = owner
+            .scope(cmd.group_spawn())
             .await
             .map_err(|e| format!("failed to spawn language server {binary:?}: {e}"))?;
 
@@ -343,11 +335,8 @@ impl LspClient {
         let stdout = child.take_stdout().ok_or("failed to capture stdout")?;
         let stderr = child.take_stderr().ok_or("failed to capture stderr")?;
 
-        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
-        let stderr_capture_for_task = stderr_capture.clone();
-        // Drain stderr to the log and retain the tail so a crashed server's
-        // real failure reason can be surfaced in the typed error payload.
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = spawn(async move {
+            let mut captured = StderrCapture::default();
             let mut stderr = stderr;
             let mut chunk = [0u8; 4096];
             loop {
@@ -359,53 +348,45 @@ impl LspClient {
                             "language server stderr: {}",
                             String::from_utf8_lossy(&chunk[..n]).trim_end()
                         );
-                        stderr_capture_for_task.lock().await.push_bytes(&chunk[..n]);
+                        captured.push_bytes(&chunk[..n]);
                     }
                     Err(error) => {
-                        tracing::debug!(%error, "language server stderr read error");
+                        tracing::warn!(%error, "language server stderr read failed");
                         break;
                     }
                 }
             }
+            captured.captured()
         });
-
-        let child_slot = Arc::new(Mutex::new(Some(child)));
-        let process = LspProcessDiagnostics {
-            child: child_slot.clone(),
-            stderr: stderr_capture,
-            stderr_task: Mutex::new(Some(stderr_task)),
-        };
-        let (client, notifications) =
-            Self::from_io_inner(stdin, stdout, Some(child_slot), Some(process));
-        Ok((client, notifications))
-    }
-
-    fn from_io_inner<W, R>(
-        writer: W,
-        reader: R,
-        child: Option<Arc<Mutex<Option<AsyncGroupChild>>>>,
-        process: Option<LspProcessDiagnostics>,
-    ) -> (Self, mpsc::UnboundedReceiver<LspEvent>)
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-    {
+        let (completed_tx, completed) = watch::channel(None);
+        spawn(async move {
+            let exit_status = match child.wait().await {
+                Ok(status) => Some(status.to_string()),
+                Err(error) => Some(format!("failed to join language server: {error}")),
+            };
+            let stderr = match stderr_task.await {
+                Ok(stderr) => stderr,
+                Err(error) => Some(format!("failed to join language server stderr: {error}")),
+            };
+            completed_tx.send_replace(Some(LspServerExit {
+                exit_status,
+                stderr,
+            }));
+        });
+        let process = LspProcessDiagnostics { owner, completed };
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<LspCommand>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<LspEvent>();
-
-        let reader_cmd_tx = cmd_tx.clone();
-        let reader_task = tokio::spawn(read_loop(reader, reader_cmd_tx, event_tx.clone()));
-        let actor_task = tokio::spawn(actor_loop(writer, cmd_rx, event_tx, process));
-
-        (
+        let reader_task = spawn(read_loop(stdout, cmd_tx.clone(), event_tx.clone()));
+        let actor_task = spawn(actor_loop(stdin, cmd_rx, event_tx, Some(process.clone())));
+        Ok((
             Self {
                 cmd_tx,
-                child,
+                process,
                 reader_task,
                 actor_task,
             },
             event_rx,
-        )
+        ))
     }
 
     /// Send a request and await its correlated response.
@@ -437,46 +418,22 @@ impl LspClient {
     /// Disabling code intelligence must release Cargo locks, including those
     /// held by descendants, without waiting for a busy server's LSP response.
     pub(crate) async fn terminate(self) {
-        if let Some(child) = &self.child {
-            let mut guard = child.lock().await;
-            if let Some(mut process) = guard.take() {
-                let _ = process.start_kill();
-                let _ = process.wait().await;
-            }
-        }
+        self.process.owner.kill_all();
+        collect_server_exit(Some(&self.process)).await;
     }
 
-    /// Graceful LSP teardown: `shutdown` request (bounded), `exit`
-    /// notification, then kill+reap the process group. Bounded everywhere so a
-    /// wedged server can never hang teardown.
     pub(crate) async fn shutdown(self) {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(60),
-            self.request("shutdown", Value::Null),
-        )
-        .await;
+        let _ = self.request("shutdown", Value::Null).await;
         let _ = self.notify("exit", Value::Null);
-        if let Some(child) = &self.child {
-            let mut guard = child.lock().await;
-            if let Some(mut c) = guard.take() {
-                match tokio::time::timeout(Duration::from_secs(60), c.wait()).await {
-                    Ok(_) => {}
-                    Err(_) => {
-                        let _ = c.kill().await;
-                    }
-                }
-            }
-        }
-        // Drop aborts the reader/actor tasks; the child slot is already empty.
+        wait_server_exit(&self.process).await;
     }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        self.process.owner.kill_all();
         self.reader_task.abort();
         self.actor_task.abort();
-        // Aborted owners drop their canonical child leases; native cleanup
-        // does not depend on a runtime or acquiring this client's async slot.
     }
 }
 
@@ -651,47 +608,28 @@ async fn fail_after_write_error(
 }
 
 async fn collect_server_exit(process: Option<&LspProcessDiagnostics>) -> LspServerExit {
-    let Some(process) = process else {
-        return LspServerExit::default();
-    };
-
-    let exit_status = collect_exit_status(process).await;
-    await_stderr_task(process).await;
-    let stderr = process.stderr.lock().await.captured();
-    LspServerExit {
-        exit_status,
-        stderr,
-    }
-}
-
-async fn collect_exit_status(process: &LspProcessDiagnostics) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + SERVER_EXIT_WAIT;
-    loop {
-        let status = {
-            let mut guard = process.child.lock().await;
-            match guard.as_mut() {
-                Some(child) => child.try_wait(),
-                None => return None,
-            }
-        };
-        match status {
-            Ok(Some(status)) => return Some(status.to_string()),
-            Ok(None) if tokio::time::Instant::now() >= deadline => return None,
-            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-            Err(error) => return Some(format!("failed to query process status: {error}")),
+    match process {
+        Some(process) => {
+            process.owner.kill_all();
+            wait_server_exit(process).await
         }
+        None => LspServerExit::default(),
     }
 }
 
-async fn await_stderr_task(process: &LspProcessDiagnostics) {
-    let Some(mut task) = process.stderr_task.lock().await.take() else {
-        return;
-    };
-    tokio::select! {
-        _ = &mut task => {}
-        _ = tokio::time::sleep(SERVER_EXIT_WAIT) => {
-            task.abort();
-            let _ = task.await;
+async fn wait_server_exit(process: &LspProcessDiagnostics) -> LspServerExit {
+    let mut completed = process.completed.clone();
+    loop {
+        if let Some(exit) = completed.borrow_and_update().clone() {
+            return exit;
+        }
+        if completed.changed().await.is_err() {
+            return LspServerExit {
+                exit_status: Some(
+                    "Language server owner stopped without a completion event".to_owned(),
+                ),
+                stderr: None,
+            };
         }
     }
 }

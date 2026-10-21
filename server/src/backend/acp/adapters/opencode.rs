@@ -37,7 +37,8 @@ impl OpenCodeAdapter {
     }
 
     fn config_content(&self) -> Result<String, String> {
-        let mut config = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+        let mut config = match tyde_process_env::launch::environment_var("OPENCODE_CONFIG_CONTENT")
+        {
             Ok(raw) if !raw.trim().is_empty() => serde_json::from_str::<Value>(&raw)
                 .map_err(|error| format!("invalid OPENCODE_CONFIG_CONTENT: {error}"))?,
             _ => json!({}),

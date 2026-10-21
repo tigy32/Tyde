@@ -57,7 +57,6 @@ use super::lsp_client::{LspClient, LspError, LspEvent, LspRequester, LspServerEx
 use super::lsp_position::LineIndex;
 use super::provider::CodeIntelProvider;
 use super::{absolute_path, emit};
-use crate::process_env;
 use crate::stream::Stream;
 
 /// Cap on bounded provider restart attempts after an unexpected child exit
@@ -232,6 +231,7 @@ pub(crate) struct LspProvider {
     /// Cached for the trait's `provider_id()` (e.g. `"rust-analyzer"`,
     /// `"pyright"`) without round-tripping the actor.
     provider_id: CodeIntelProviderId,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LspProvider {
@@ -246,8 +246,12 @@ impl LspProvider {
         // The actor keeps a clone of its own sender so the crash/restart path can
         // schedule a delayed `Restart` onto itself (spec §M7).
         let actor = RaActor::new(config, root, resource_mode, tx.clone(), provider_status_tx);
-        tokio::spawn(actor.run(rx));
-        Self { tx, provider_id }
+        let task = crate::backend::subprocess::spawn(actor.run(rx));
+        Self {
+            tx,
+            provider_id,
+            task: Some(task),
+        }
     }
 }
 
@@ -258,6 +262,10 @@ impl CodeIntelProvider for LspProvider {
 
     fn shutdown(&mut self) {
         let _ = self.tx.send(RaCommand::Shutdown);
+    }
+
+    fn take_shutdown_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.task.take()
     }
 
     fn reconfigure(&mut self, config: LanguageServerConfig) {
@@ -962,7 +970,7 @@ impl RaActor {
         let tx = self.self_tx.clone();
         // Detached so the actor loop keeps serving other commands during the
         // backoff (non-blocking, per "Actors Over Locks").
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             tokio::time::sleep(delay).await;
             let _ = tx.send(RaCommand::Restart);
         });
@@ -1034,7 +1042,7 @@ impl RaActor {
             output,
             active: Arc::clone(&self.references_active),
         };
-        tokio::spawn(job.run());
+        crate::backend::subprocess::spawn(job.run());
     }
 
     /// On-demand go-to-definition. Issues `textDocument/definition` at the
@@ -1078,7 +1086,7 @@ impl RaActor {
             };
         let root = self.root.clone();
         let active = Arc::clone(&self.navigate_active);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let index = LineIndex::new(&text);
             let (line, character) = index.byte_to_position(payload.offset);
             let params = json!({
@@ -1186,7 +1194,7 @@ impl RaActor {
                 }
             };
         let active = Arc::clone(&self.hover_active);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let index = LineIndex::new(&text);
             let (line, character) = index.byte_to_position(payload.offset);
             let params = json!({
@@ -1320,11 +1328,22 @@ impl RaActor {
         }
         self.set_phase(Phase::Starting, None);
 
+        if let Err(error) = crate::workbench::prepare_backend_execution(None).await {
+            self.set_phase(Phase::Failed, Some(error.clone()));
+            return Err(StartFailure {
+                code: CodeIntelErrorCode::ProviderUnavailable,
+                message: error,
+                hint: None,
+                exit_status: None,
+                stderr: None,
+            });
+        }
+
         let discover = self.config.discover;
         let configured_path = self.config.configured_path.clone();
         let cwd = PathBuf::from(&self.root.0);
         let discover_cwd = cwd.clone();
-        let discovery = match tokio::task::spawn_blocking(move || {
+        let discovery = match crate::backend::subprocess::spawn_blocking(move || {
             discover(&discover_cwd, configured_path.as_ref())
         })
         .await
@@ -1361,8 +1380,7 @@ impl RaActor {
             }
         };
 
-        let env_path = process_env::resolved_child_process_path();
-        let (client, notifications) = match LspClient::spawn(&binary, &args, &cwd, env_path).await {
+        let (client, notifications) = match LspClient::spawn(&binary, &args, &cwd).await {
             Ok(pair) => pair,
             Err(error) => {
                 self.set_phase(Phase::Failed, Some(error.clone()));
@@ -1719,7 +1737,7 @@ impl RaActor {
                 _cancel_tx: cancel_tx,
             },
         );
-        tokio::spawn(job.run());
+        crate::backend::subprocess::spawn(job.run());
     }
 
     fn handle_event(&mut self, event: LspEvent) {
@@ -2567,11 +2585,11 @@ impl ModelJob {
                 let root = self.root.clone();
                 let uri = self.uri.clone();
                 let (line, character) = positions[idx];
-                tasks.spawn(async move {
+                tasks.spawn(crate::backend::subprocess::inherit_execution(async move {
                     let targets =
                         resolve_definition(&requester, &root, &uri, line, character).await;
                     (idx, targets)
-                });
+                }));
             }
             if tasks.is_empty() && queue.is_empty() {
                 break;
@@ -3104,13 +3122,22 @@ fn build_reference_lines(
 /// `publishDiagnostics`. `None` if the path isn't absolute (`from_file_path`
 /// requires it; project roots always are).
 fn file_uri(path: &Path) -> Option<String> {
-    Url::from_file_path(path).ok().map(|url| url.to_string())
+    Url::from_file_path(
+        tyde_process_env::launch::WorkspacePath::host(path)
+            .ok()?
+            .in_execution(),
+    )
+    .ok()
+    .map(|url| url.to_string())
 }
 
 /// Decode a `file://` URI back to a filesystem path for diagnostic matching.
 /// `None` for a non-file or unparseable URI.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    Url::parse(uri).ok()?.to_file_path().ok()
+    let path = Url::parse(uri).ok()?.to_file_path().ok()?;
+    tyde_process_env::launch::WorkspacePath::execution(path)
+        .ok()
+        .map(|path| path.on_host().to_path_buf())
 }
 
 /// Extract a 0–100 work amount from a `$/progress` value, mapping `percentage`

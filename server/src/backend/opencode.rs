@@ -69,9 +69,9 @@ pub(crate) async fn export_session(
         .group_spawn()
         .await
         .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
-    let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+    let output = child
+        .wait_with_output()
         .await
-        .map_err(|error| format!("OpenCode export timed out: {error}"))?
         .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
     if !output.status.success() {
         return Err(format!("OpenCode export failed: {}", output.status));
@@ -89,6 +89,11 @@ pub(crate) async fn relocate_workspace_session(
     previous: &str,
     destination: &str,
 ) -> Result<(), String> {
+    let previous = tyde_process_env::launch::WorkspacePath::host(previous)?.execution_string()?;
+    let destination =
+        tyde_process_env::launch::WorkspacePath::host(destination)?.execution_string()?;
+    let previous = previous.as_str();
+    let destination = destination.as_str();
     let before = export_session(program, session_id, previous).await?;
     if before
         .pointer("/info/id")
@@ -274,7 +279,7 @@ impl crate::backend::Backend for OpencodeBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
@@ -298,7 +303,7 @@ impl crate::backend::Backend for OpencodeBackend {
         })
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -312,7 +317,7 @@ impl crate::backend::Backend for OpencodeBackend {
         Ok((Self(backend), events))
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -326,7 +331,7 @@ impl crate::backend::Backend for OpencodeBackend {
         Ok((Self(backend), events))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         _workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
         _from_session_id: SessionId,
@@ -337,7 +342,7 @@ impl crate::backend::Backend for OpencodeBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<crate::backend::BackendSession>, String> {
         list_sessions(context).await

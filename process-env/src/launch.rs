@@ -1,3 +1,5 @@
+mod execution;
+pub use execution::{ExecutionContext, ExecutionRoute};
 pub mod pty;
 
 use crate as process_env;
@@ -15,20 +17,28 @@ use tokio_util::sync::CancellationToken;
 tokio::task_local! {
     static PROCESS_OWNER: ProcessOwner;
     static WORKBENCH_PROJECT: Option<protocol::Project>;
+    static EXECUTION_ENVIRONMENT: Arc<std::sync::OnceLock<Arc<ExecutionEnvironment>>>;
 }
 
 pub async fn project_scope<F: std::future::Future>(
     project: Option<protocol::Project>,
     future: F,
 ) -> F::Output {
-    WORKBENCH_PROJECT.scope(project, Box::pin(future)).await
+    EXECUTION_ENVIRONMENT
+        .scope(
+            Arc::default(),
+            WORKBENCH_PROJECT.scope(project, Box::pin(future)),
+        )
+        .await
 }
 
 pub fn project_scope_sync<T>(
     project: Option<protocol::Project>,
     operation: impl FnOnce() -> T,
 ) -> T {
-    WORKBENCH_PROJECT.sync_scope(project, operation)
+    EXECUTION_ENVIRONMENT.sync_scope(Arc::default(), || {
+        WORKBENCH_PROJECT.sync_scope(project, operation)
+    })
 }
 
 pub fn current_project() -> Option<protocol::Project> {
@@ -52,29 +62,105 @@ pub fn require_nested_namespaces() -> Result<(), String> {
     Ok(())
 }
 
-pub fn runtime_path(path: &std::path::Path) -> std::path::PathBuf {
-    WORKBENCH_PROJECT
-        .try_with(|project| {
-            let Some(project) = project else {
-                return path.to_path_buf();
-            };
-            let protocol::ProjectSource::GitWorkbench {
-                roots,
-                environment: protocol::WorkbenchEnvironment::Bubblewrap { logical_root, .. },
-                ..
-            } = &project.source
-            else {
-                return path.to_path_buf();
-            };
-            match roots
-                .first()
-                .and_then(|root| path.strip_prefix(&root.worktree_root.0).ok())
-            {
-                Some(relative) => std::path::Path::new(&logical_root.0).join(relative),
-                None => path.to_path_buf(),
-            }
+#[derive(Clone, Debug)]
+pub struct WorkspacePath {
+    host: std::path::PathBuf,
+    execution: std::path::PathBuf,
+}
+
+impl WorkspacePath {
+    pub fn host(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let host = path.as_ref().to_path_buf();
+        let project = current_project();
+        let execution = match &project {
+            Some(project) => match project.execution_root_mapping()? {
+                Some((host_root, execution_root)) => match host.strip_prefix(&host_root.0) {
+                    // Joining an empty suffix adds a separator, changing native
+                    // project indexes and violating canonical workspace APIs.
+                    Ok(relative) if relative.as_os_str().is_empty() => {
+                        std::path::PathBuf::from(&execution_root.0)
+                    }
+                    Ok(relative) => std::path::Path::new(&execution_root.0).join(relative),
+                    Err(_) => host.clone(),
+                },
+                None => host.clone(),
+            },
+            None => host.clone(),
+        };
+        Ok(Self { host, execution })
+    }
+
+    pub fn execution(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let execution = path.as_ref().to_path_buf();
+        let project = current_project();
+        let host = match &project {
+            Some(project) => std::path::PathBuf::from(project.host_path_for_runtime(
+                execution.to_str().ok_or("Execution path must be UTF-8")?,
+            )?),
+            None => execution.clone(),
+        };
+        Ok(Self { host, execution })
+    }
+
+    pub fn on_host(&self) -> &std::path::Path {
+        &self.host
+    }
+
+    pub fn in_execution(&self) -> &std::path::Path {
+        &self.execution
+    }
+
+    pub fn execution_string(&self) -> Result<String, String> {
+        self.execution
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "Execution path must be UTF-8".to_owned())
+    }
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+pub struct ExecutionEnvironment {
+    pub values: std::collections::BTreeMap<String, String>,
+    pub configuration_identity: String,
+    pub runner_identity: String,
+}
+
+pub fn set_execution_environment(values: ExecutionEnvironment) -> Result<(), String> {
+    EXECUTION_ENVIRONMENT
+        .try_with(|environment| match environment.set(Arc::new(values)) {
+            Ok(()) => Ok(()),
+            Err(values) if environment.get() == Some(&values) => Ok(()),
+            Err(_) => Err("Execution environment changed during the workspace lifetime".to_owned()),
         })
-        .unwrap_or_else(|_| path.to_path_buf())
+        .map_err(|_| "Execution environment has no workspace owner".to_owned())?
+}
+
+pub fn environment_var(key: &str) -> Result<String, std::env::VarError> {
+    EXECUTION_ENVIRONMENT
+        .try_with(|environment| {
+            environment.get().map(|environment| {
+                environment
+                    .values
+                    .get(key)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| std::env::var(key))
+}
+
+pub fn environment_var_os(key: &str) -> Option<std::ffi::OsString> {
+    EXECUTION_ENVIRONMENT
+        .try_with(|environment| {
+            environment
+                .get()
+                .map(|environment| environment.values.get(key).map(std::ffi::OsString::from))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| std::env::var_os(key))
 }
 
 type SharedProcess = Arc<std::sync::Mutex<OwnedProcess>>;
@@ -297,13 +383,59 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    tokio::spawn(inherit_execution(future))
+}
+
+pub fn spawn_blocking<F, T>(operation: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
+    let project = current_project();
+    let environment = EXECUTION_ENVIRONMENT
+        .try_with(Arc::clone)
+        .unwrap_or_default();
+    #[cfg(all(feature = "test-support", target_os = "linux"))]
+    let probe = test_support::CURRENT_PROBE.try_with(Clone::clone).ok();
+    tokio::task::spawn_blocking(move || {
+        let operation = || {
+            EXECUTION_ENVIRONMENT.sync_scope(environment, || {
+                WORKBENCH_PROJECT.sync_scope(project, operation)
+            })
+        };
+        let operation = || match owner {
+            Some(owner) => PROCESS_OWNER.sync_scope(owner, operation),
+            None => operation(),
+        };
+        #[cfg(all(feature = "test-support", target_os = "linux"))]
+        {
+            match probe {
+                Some(probe) => test_support::CURRENT_PROBE.sync_scope(probe, operation),
+                None => operation(),
+            }
+        }
+        #[cfg(not(all(feature = "test-support", target_os = "linux")))]
+        operation()
+    })
+}
+
+pub fn inherit_execution<F>(future: F) -> impl std::future::Future<Output = F::Output> + Send
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let future = Box::pin(future);
     let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
     let workbench = WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten();
+    let environment = EXECUTION_ENVIRONMENT
+        .try_with(Arc::clone)
+        .unwrap_or_default();
     #[cfg(all(feature = "test-support", target_os = "linux"))]
     let probe = test_support::CURRENT_PROBE.try_with(Clone::clone).ok();
-    tokio::spawn(async move {
-        let future = project_scope(workbench, future);
+    async move {
+        let future =
+            EXECUTION_ENVIRONMENT.scope(environment, WORKBENCH_PROJECT.scope(workbench, future));
         #[cfg(all(feature = "test-support", target_os = "linux"))]
         let future = async move {
             match probe {
@@ -315,13 +447,16 @@ where
             Some(owner) => owner.scope(future).await,
             None => future.await,
         }
-    })
+    }
 }
 
 pub struct AsyncGroupChild {
     process: SharedProcess,
     cleanup: Option<oneshot::Sender<()>>,
     exit: tokio::sync::watch::Receiver<ProcessExit>,
+    execution: Option<ExecutionContext>,
+    #[cfg(target_os = "linux")]
+    execution_plan: Option<Arc<std::fs::File>>,
 }
 
 impl std::fmt::Debug for AsyncGroupChild {
@@ -435,6 +570,8 @@ impl Drop for AsyncGroupChild {
         if let Some(cleanup) = self.cleanup.take() {
             let _ = cleanup.send(());
         }
+        #[cfg(target_os = "linux")]
+        drop(self.execution_plan.take());
     }
 }
 
@@ -488,13 +625,42 @@ pub struct GroupCommand {
     session: SessionMode,
     independent: Option<IndependentProcess>,
     workbench: Option<protocol::Project>,
+    prepared_environment: Option<Arc<ExecutionEnvironment>>,
+    capture_execution: bool,
+    #[cfg(target_os = "linux")]
+    active_execution: Option<ExecutionContext>,
+    #[cfg(target_os = "linux")]
+    execution_plan: Option<Arc<std::fs::File>>,
     #[cfg(all(feature = "test-support", target_os = "linux"))]
     probe: Option<test_support::Probe>,
 }
 
+pub fn process_path() -> Result<std::ffi::OsString, String> {
+    match EXECUTION_ENVIRONMENT
+        .try_with(|environment| environment.get().cloned())
+        .ok()
+        .flatten()
+    {
+        Some(environment) => environment
+            .values
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .ok_or_else(|| "Execution environment is missing PATH".to_owned()),
+        None => process_env::initialize_process_env().map(std::ffi::OsString::from),
+    }
+}
+
+pub fn host_command(program: impl AsRef<std::ffi::OsStr>) -> Result<GroupCommand, String> {
+    let mut command = raw_command(program);
+    command
+        .on_host()
+        .env("PATH", process_env::initialize_process_env()?);
+    Ok(command)
+}
+
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Result<GroupCommand, String> {
     let mut command = raw_command(program);
-    command.env("PATH", process_env::initialize_process_env()?);
+    command.env("PATH", process_path()?);
     Ok(command)
 }
 
@@ -508,6 +674,15 @@ pub(crate) fn raw_command(program: impl AsRef<std::ffi::OsStr>) -> GroupCommand 
         session: SessionMode::Group,
         independent: None,
         workbench: WORKBENCH_PROJECT.try_with(Clone::clone).ok().flatten(),
+        capture_execution: false,
+        #[cfg(target_os = "linux")]
+        active_execution: None,
+        #[cfg(target_os = "linux")]
+        execution_plan: None,
+        prepared_environment: EXECUTION_ENVIRONMENT
+            .try_with(|environment| environment.get().cloned())
+            .ok()
+            .flatten(),
         #[cfg(all(feature = "test-support", target_os = "linux"))]
         probe: test_support::current_probe(),
     }
@@ -515,11 +690,27 @@ pub(crate) fn raw_command(program: impl AsRef<std::ffi::OsStr>) -> GroupCommand 
 
 impl GroupCommand {
     pub fn in_project(&mut self, project: protocol::Project) -> &mut Self {
+        if self.workbench.as_ref() != Some(&project) {
+            self.prepared_environment = None;
+        }
         self.workbench = Some(project);
         self
     }
 
-    fn wrap_workbench(mut self) -> std::io::Result<Self> {
+    pub(crate) fn on_host(&mut self) -> &mut Self {
+        self.workbench = None;
+        self.prepared_environment = None;
+        self
+    }
+
+    fn wrap_workbench(
+        mut self,
+        #[cfg(target_os = "linux")] setup: Option<&execution::Setup>,
+    ) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(execution) = self.active_execution.clone() {
+            return execution.wrap(self);
+        }
         let Some(project) = self.workbench.take() else {
             return Ok(self);
         };
@@ -536,6 +727,10 @@ impl GroupCommand {
         else {
             return Ok(self);
         };
+        project
+            .execution_root_mapping()
+            .map(|_| ())
+            .map_err(std::io::Error::other)?;
         if !cfg!(target_os = "linux") || roots.len() != 1 {
             return Err(std::io::Error::other(
                 "Bubblewrap requires Linux and one authoritative source root",
@@ -544,6 +739,9 @@ impl GroupCommand {
         let root = std::path::Path::new(&roots[0].worktree_root.0);
         let cwd = match &self.cwd {
             Some(cwd) => match cwd.strip_prefix(root) {
+                Ok(relative) if relative.as_os_str().is_empty() => {
+                    std::path::PathBuf::from(&logical_root.0)
+                }
                 Ok(relative) => std::path::Path::new(&logical_root.0).join(relative),
                 Err(_) => cwd.clone(),
             },
@@ -553,20 +751,59 @@ impl GroupCommand {
         // runner's inner --chdir may use the stable logical mount.
         self.cwd = Some(root.to_path_buf());
         let helper = std::path::Path::new(&manifest_path.0).with_file_name("runner.py");
+        let prepared = self.prepared_environment.take();
+        if let Some(environment) = &prepared {
+            let mut base = std::env::vars_os()
+                .map(|(key, _)| (key, None))
+                .collect::<Vec<_>>();
+            base.extend(
+                environment
+                    .values
+                    .iter()
+                    .map(|(key, value)| (key.into(), Some(value.into()))),
+            );
+            base.append(&mut self.env);
+            self.env = base;
+        }
         let mut args = vec![
             helper.into_os_string(),
-            "launch".into(),
+            match &prepared {
+                Some(_) if self.capture_execution => "launch_prepared_context",
+                None if self.capture_execution => "launch_context",
+                Some(_) => "launch_prepared",
+                None => "launch",
+            }
+            .into(),
             manifest_path.0.as_str().into(),
             root.as_os_str().to_owned(),
             cwd.into_os_string(),
             self.program,
         ];
+        if let Some(environment) = prepared {
+            args.insert(5, environment.configuration_identity.as_str().into());
+            args.insert(6, environment.runner_identity.as_str().into());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(setup) = setup {
+            args.insert(5, setup.address().into_os_string());
+        }
         args.append(&mut self.args);
-        self.program = process_env::find_executable_in_path("python3")
+        self.program = process_env::find_host_executable_in_path("python3")
             .ok_or_else(|| std::io::Error::other("Bubblewrap runtime requires host Python 3"))?
             .into_os_string();
         self.args = args;
         Ok(self)
+    }
+
+    pub async fn group_spawn_with_execution(
+        mut self,
+    ) -> std::io::Result<(AsyncGroupChild, ExecutionContext)> {
+        self.capture_execution = true;
+        let child = self.group_spawn().await?;
+        let execution = child.execution.clone().ok_or_else(|| {
+            std::io::Error::other("Native launch did not provide its execution context")
+        })?;
+        Ok((child, execution))
     }
 
     #[cfg(unix)]
@@ -683,7 +920,36 @@ async fn launch(
     spec: GroupCommand,
     #[cfg(unix)] admission: Option<DeferredPlan>,
 ) -> std::io::Result<AsyncGroupChild> {
+    #[cfg(target_os = "linux")]
+    let setup = if spec.capture_execution && spec.active_execution.is_none() {
+        match spec.workbench.as_ref().map(|project| &project.source) {
+            Some(protocol::ProjectSource::GitWorkbench {
+                environment: protocol::WorkbenchEnvironment::Bubblewrap { manifest_path, .. },
+                ..
+            }) => {
+                let python =
+                    process_env::find_host_executable_in_path("python3").ok_or_else(|| {
+                        std::io::Error::other("Execution context requires host Python 3")
+                    })?;
+                Some(execution::Setup::new(
+                    std::path::Path::new(&manifest_path.0),
+                    python,
+                )?)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let captured = spec.capture_execution;
+    #[cfg(target_os = "linux")]
+    let active = spec.active_execution.clone();
+    #[cfg(target_os = "linux")]
+    let spec = spec.wrap_workbench(setup.as_ref())?;
+    #[cfg(not(target_os = "linux"))]
     let spec = spec.wrap_workbench()?;
+    #[cfg(target_os = "linux")]
+    let execution_plan = spec.execution_plan.clone();
     let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
     let launch = Arc::new(PendingLaunch {
         ticket: NEXT_LAUNCH_TICKET.fetch_add(1, Ordering::Relaxed),
@@ -718,6 +984,8 @@ async fn launch(
             };
             // PDEATHSIG follows this thread, which also drives the child's pipes.
             runtime.block_on(async move {
+                #[cfg(target_os = "linux")]
+                let execution_resources = (spec.active_execution.clone(), spec.execution_plan.clone());
                 if worker_launch.cancellation.is_cancelled() { let _ = reply_tx.send(Err(cancelled_launch_error())); return; }
                 worker_launch.trace(LaunchPhase::SpawnStarted);
                 #[cfg(unix)]
@@ -747,7 +1015,7 @@ async fn launch(
                 }));
                 let native_guard = NativeProcessGuard(Arc::clone(&process));
                 let registered = match &worker_owner { Some(owner) => owner.register_child(&process), None => true };
-                let child = AsyncGroupChild { process, cleanup: Some(release), exit };
+                let child = AsyncGroupChild { process, cleanup: Some(release), exit, execution: None, #[cfg(target_os = "linux")] execution_plan: None };
                 let result = if !registered || worker_launch.cancellation.is_cancelled() {
                     Err(cancelled_launch_error())
                 } else {
@@ -783,7 +1051,8 @@ async fn launch(
                         }
                     }
                 }
-
+                #[cfg(target_os = "linux")]
+                drop(execution_resources);
             });
         })?;
     let mut commit_pending = true;
@@ -812,7 +1081,31 @@ async fn launch(
     if !accepted || launch.cancellation.is_cancelled() {
         return Err(cancelled_launch_error());
     }
-    result
+    let mut child = result?;
+    #[cfg(target_os = "linux")]
+    {
+        child.execution_plan = execution_plan;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let execution = match (setup, active) {
+            (Some(setup), None) => Some(setup.receive(&mut child).await?),
+            (None, Some(execution)) => Some(execution),
+            (None, None) if captured => Some(ExecutionContext::default()),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(std::io::Error::other(
+                    "Native launch has conflicting execution owners",
+                ));
+            }
+        };
+        child.execution = execution;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if captured {
+        child.execution = Some(ExecutionContext::default());
+    }
+    Ok(child)
 }
 /// Blocking callers use the same native launch/ownership engine, never std spawn.
 pub struct BlockingChild {

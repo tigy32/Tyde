@@ -2685,6 +2685,13 @@ pub(crate) async fn do_spawn_agent(
     if input.prompt.trim().is_empty() {
         return Err("prompt must not be empty".to_string());
     }
+    let workspace_caller = match &message_origin {
+        protocol::MessageOrigin::Agent { agent_id, .. } => agent_id.as_ref(),
+        _ => request_agent_id.as_ref(),
+    };
+    for root in &mut input.workspace_roots {
+        *root = host.host_path_for_agent(workspace_caller, root).await?;
+    }
 
     let host_settings = host.read_settings().await?;
     let launch_profile_id = input

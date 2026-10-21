@@ -67,7 +67,9 @@ fn link_workspace_session(
 ) -> Result<std::path::PathBuf, String> {
     uuid::Uuid::parse_str(session_id)
         .map_err(|error| format!("Invalid Grok session identity: {error}"))?;
-    let sessions = crate::paths::home_dir()?.join(".grok").join("sessions");
+    let sessions = crate::paths::execution_home_dir()?
+        .join(".grok")
+        .join("sessions");
     let encode = |root: &str| -> String {
         root.bytes()
             .map(|byte| {
@@ -120,6 +122,11 @@ pub(crate) async fn relocate_workspace_session(
     previous: &str,
     destination: &str,
 ) -> Result<(), String> {
+    let previous = tyde_process_env::launch::WorkspacePath::host(previous)?.execution_string()?;
+    let destination =
+        tyde_process_env::launch::WorkspacePath::host(destination)?.execution_string()?;
+    let previous = previous.as_str();
+    let destination = destination.as_str();
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
         let mut temporary =
             tempfile::NamedTempFile::new_in(path.parent().ok_or("Invalid native metadata path")?)
@@ -206,6 +213,7 @@ pub(crate) async fn list_sessions(
         .workspace_roots
         .first()
         .ok_or_else(|| "Grok session discovery requires a workspace root".to_owned())?;
+    let execution_root = tyde_process_env::launch::WorkspacePath::host(root)?.execution_string()?;
     let output = crate::process_env::command(context.program.as_deref().unwrap_or("grok"))?
         .current_dir(root)
         .args(["sessions", "list", "--limit", "1000"])
@@ -235,7 +243,7 @@ pub(crate) async fn list_sessions(
             Some(BackendSession {
                 id: SessionId(id.to_owned()),
                 backend_kind: BackendKind::Grok,
-                workspace_roots: vec![root.clone()],
+                workspace_roots: vec![execution_root.clone()],
                 title: (!title.is_empty() && title != "(no summary)").then_some(title),
                 token_count: None,
                 created_at_ms: None,
@@ -337,7 +345,7 @@ impl crate::backend::Backend for GrokBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
@@ -374,7 +382,7 @@ impl crate::backend::Backend for GrokBackend {
         })
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -388,7 +396,7 @@ impl crate::backend::Backend for GrokBackend {
         Ok((Self(backend), events))
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -402,7 +410,7 @@ impl crate::backend::Backend for GrokBackend {
         Ok((Self(backend), events))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         _workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
         _from_session_id: SessionId,
@@ -413,7 +421,7 @@ impl crate::backend::Backend for GrokBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<crate::backend::BackendSession>, String> {
         list_sessions(context).await

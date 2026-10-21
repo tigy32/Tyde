@@ -18,5 +18,6 @@ pub use tyde_process_env::launch::exec_helper_entry;
 #[cfg(all(feature = "test-support", target_os = "linux"))]
 pub use tyde_process_env::launch::test_support;
 pub(crate) use tyde_process_env::launch::{
-    AsyncCommandGroup, AsyncGroupChild, GroupCommand, ProcessOwner, ProcessStdio, command, spawn,
+    AsyncCommandGroup, AsyncGroupChild, GroupCommand, ProcessOwner, ProcessStdio, command,
+    inherit_execution, spawn, spawn_blocking,
 };

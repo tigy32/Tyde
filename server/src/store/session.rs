@@ -1282,7 +1282,7 @@ pub struct SessionStoreHandle {
 }
 
 impl SessionStoreHandle {
-    pub(crate) fn new(store: SessionStore) -> Self {
+    pub fn new(store: SessionStore) -> Self {
         Self {
             store: Arc::new(store),
             readers: Arc::new(tokio::sync::Semaphore::new(4)),

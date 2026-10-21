@@ -4,6 +4,10 @@ pub fn home_dir() -> Result<PathBuf, String> {
     home_dir_from_env(|name| std::env::var(name).ok())
 }
 
+pub(crate) fn execution_home_dir() -> Result<PathBuf, String> {
+    home_dir_from_env(|name| tyde_process_env::launch::environment_var(name).ok())
+}
+
 fn home_dir_from_env<F>(mut env: F) -> Result<PathBuf, String>
 where
     F: FnMut(&str) -> Option<String>,

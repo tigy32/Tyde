@@ -746,7 +746,10 @@ impl CodexSkillCatalogError {
     fn relates_to(&self, name: &str, expected_skill_md: Option<&Path>) -> bool {
         self.name.as_deref() == Some(name)
             || self.locator.as_deref().is_some_and(|locator| {
-                expected_skill_md.is_some_and(|expected| Path::new(locator) == expected)
+                expected_skill_md.is_some_and(|expected| {
+                    process_env::launch::WorkspacePath::execution(locator)
+                        .is_ok_and(|path| path.on_host() == expected)
+                })
             })
     }
 }
@@ -837,7 +840,8 @@ fn codex_listed_filesystem_skill_md(skill: &CodexListedSkill) -> Result<Option<P
     if !path.is_absolute() {
         return Ok(None);
     }
-    let skill_md = std::fs::canonicalize(path).map_err(|err| {
+    let host_path = process_env::launch::WorkspacePath::execution(path)?;
+    let skill_md = std::fs::canonicalize(host_path.on_host()).map_err(|err| {
         format!(
             "Failed to inspect native Codex skill '{}' at {}: {err}",
             skill.name,
@@ -1433,7 +1437,7 @@ async fn configure_codex_native_skills(
     let mut diagnostics = codex_skill_catalog_diagnostics("baseline", &baseline.errors);
     let selected = selected_skills.to_vec();
     let projection_root = projection.path().to_path_buf();
-    let preparation = tokio::task::spawn_blocking(move || {
+    let preparation = crate::backend::subprocess::spawn_blocking(move || {
         prepare_codex_skills_blocking(selected, baseline, projection_root, selection)
     })
     .await
@@ -1462,7 +1466,7 @@ async fn configure_codex_native_skills(
         }
         let prepared_for_verification = prepared.clone();
         let catalog_for_verification = final_catalog.clone();
-        let verdicts = tokio::task::spawn_blocking(move || {
+        let verdicts = crate::backend::subprocess::spawn_blocking(move || {
             verify_codex_prepared_skills_blocking(
                 &prepared_for_verification,
                 &catalog_for_verification,
@@ -1529,7 +1533,7 @@ async fn configure_codex_native_skills(
                     .then_some(prepared.ordinal)
             })
             .collect::<Vec<_>>();
-        tokio::task::spawn_blocking(move || {
+        crate::backend::subprocess::spawn_blocking(move || {
             for ordinal in failed_wrappers {
                 discard_codex_skill_wrapper(&projection_root, ordinal)?;
             }
@@ -1922,6 +1926,7 @@ impl CodexSession {
                 }
             }
         };
+        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let skill_setup = if let Some(projection) = skill_projection.as_ref() {
             match configure_codex_native_skills(
                 &rpc,
@@ -1950,10 +1955,7 @@ impl CodexSession {
         let mut skill_setup = skill_setup;
         skill_setup.diagnostics.splice(0..0, skill_notices);
 
-        let cwd = process_env::launch::runtime_path(Path::new(&cwd))
-            .to_string_lossy()
-            .into_owned();
-        let runtime_roots = codex_runtime_workspace_roots(workspace_roots, &cwd);
+        let runtime_roots = codex_runtime_workspace_roots(workspace_roots, &cwd)?;
         tracing::info!(
             ?runtime_roots,
             "Starting Codex with ordered workspace roots"
@@ -2179,6 +2181,7 @@ impl CodexSession {
                 }
             }
         };
+        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let skill_setup = if let Some(projection) = skill_projection.as_ref() {
             match configure_codex_native_skills(
                 &rpc,
@@ -2221,7 +2224,7 @@ impl CodexSession {
             "persistExtendedHistory": false
         });
         fork_params["runtimeWorkspaceRoots"] =
-            json!(codex_runtime_workspace_roots(workspace_roots, &cwd));
+            json!(codex_runtime_workspace_roots(workspace_roots, &cwd)?);
 
         if access_mode == BackendAccessMode::EnforcedReadOnly {
             match codex_restricted_thread_config(
@@ -5269,17 +5272,19 @@ impl CodexInner {
             .ok_or(super::WorkspaceRelocationError::Busy)?;
         tracing::info!(?roots, "Changing Codex workspace roots");
         tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native thread/settings/update dispatch");
+        let execution_roots = super::execution_workspace_roots(&roots)
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let updated = self
             .rpc
             .request(
                 "thread/settings/update",
-                json!({"threadId": thread_id, "cwd": roots[0]}),
+                json!({"threadId": thread_id, "cwd": execution_roots[0]}),
             )
             .await;
         // Loaded thread/resume ignores root overrides. The native settings
         // setter accepts cwd; runtime roots are applied on each next turn.
         tracing::info!(target: "tyde_project_entry_diagnostic", accepted = updated.is_ok(), "Codex native thread/settings/update result");
-        relocation.finish(updated.is_ok().then(|| roots.clone()));
+        relocation.finish(updated.is_ok().then_some(execution_roots));
         updated.map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
         tracing::info!(
             ?roots,
@@ -21127,18 +21132,18 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
     crate::backend::tyde_owned_no_root_cwd("codex")
 }
 
-fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<String> {
+fn codex_runtime_workspace_roots(
+    workspace_roots: &[String],
+    cwd: &str,
+) -> Result<Vec<String>, String> {
     let mut roots = workspace_roots
         .iter()
         .filter_map(|root| {
             let trimmed = root.trim();
-            (!trimmed.is_empty() && !trimmed.starts_with("ssh://")).then(|| {
-                process_env::launch::runtime_path(Path::new(trimmed))
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            (!trimmed.is_empty() && !trimmed.starts_with("ssh://"))
+                .then(|| process_env::launch::WorkspacePath::host(trimmed)?.execution_string())
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
 
     if roots.is_empty() {
         if workspace_roots.iter().any(|root| !root.trim().is_empty()) {
@@ -21148,7 +21153,7 @@ fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<S
         roots.insert(0, cwd.to_string());
     }
 
-    roots
+    Ok(roots)
 }
 
 async fn codex_user_input_items(
@@ -21646,8 +21651,10 @@ impl CodexNativeTraceOwner {
             while let Some(command) = inbox.recv().await {
                 // Transfer the only cursor into an I/O job; filesystem work
                 // never runs on the adapter's synchronous state owner.
-                match tokio::task::spawn_blocking(move || run_codex_native_trace_io(trace, command))
-                    .await
+                match crate::backend::subprocess::spawn_blocking(move || {
+                    run_codex_native_trace_io(trace, command)
+                })
+                .await
                 {
                     Ok(next) => trace = next,
                     Err(error) => {
@@ -23739,9 +23746,6 @@ impl CodexRpc {
             for arg in codex_app_server_args(access_mode, execution_mode, &config_overrides) {
                 cmd.arg(arg);
             }
-            if let Some(path) = process_env::resolved_child_process_path() {
-                cmd.env("PATH", path);
-            }
             if let Some(root) = rollout_trace_root.as_ref() {
                 cmd.env("CODEX_ROLLOUT_TRACE_ROOT", root.path());
             }
@@ -25722,7 +25726,7 @@ impl Backend for CodexBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         Ok(crate::backend::BackendDiscovery {
@@ -25747,7 +25751,6 @@ impl Backend for CodexBackend {
 
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
-            tyde_agent_adapter::BackendCapability::BubblewrapWorkbench,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
@@ -25815,7 +25818,7 @@ impl Backend for CodexBackend {
         codex_session_settings_schema(Vec::new())
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -25823,7 +25826,7 @@ impl Backend for CodexBackend {
         Self::start_session(workspace_roots, config, initial_input).await
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
@@ -26012,7 +26015,7 @@ impl Backend for CodexBackend {
         ))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         from_session_id: protocol::SessionId,
@@ -26298,7 +26301,7 @@ impl Backend for CodexBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
@@ -26319,6 +26322,7 @@ impl Backend for CodexBackend {
         .map_err(|_| "Codex session discovery timed out".to_owned())
         .and_then(|result| result);
         let listed = codex_probe_result_with_cleanup(listed, rpc.terminate().await)?;
+        let execution_roots = super::execution_workspace_roots(&context.workspace_roots)?;
         Ok(listed
             .iter()
             .filter_map(|metadata| {
@@ -26329,7 +26333,7 @@ impl Backend for CodexBackend {
                     || session
                         .workspace_roots
                         .iter()
-                        .any(|root| context.workspace_roots.contains(root))
+                        .any(|root| execution_roots.contains(root))
             })
             .collect())
     }

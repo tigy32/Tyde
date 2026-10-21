@@ -225,9 +225,6 @@ async fn raw_model_catalog() -> Result<serde_json::Map<String, Value>, String> {
     }
     let mut command = codex_command()?;
     command.arg("debug").arg("models");
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     let output = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, command.output())
         .await
         .map_err(|_| "`codex debug models` timed out".to_owned())?

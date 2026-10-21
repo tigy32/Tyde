@@ -192,8 +192,8 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
 
     /// Client capabilities advertised in `initialize`.
     ///
-    /// The default declares filesystem read/write and terminal support, which
-    /// [`super::AcpBridge`] implements for every agent. The generic backend
+    /// The default declares filesystem read/write and terminal support for
+    /// local agents. The generic backend disables these for SSH agents and
     /// supplies `protocolVersion` and `clientInfo`; an adapter must not set
     /// them.
     fn client_capabilities(&self) -> Value {

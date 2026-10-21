@@ -72,11 +72,24 @@ enum CodeIntelCommand {
 #[derive(Clone)]
 struct CodeIntelServiceHandle {
     tx: mpsc::UnboundedSender<CodeIntelCommand>,
+    completed: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
 }
 
 impl CodeIntelServiceHandle {
     fn shutdown(&self) {
         let _ = self.tx.send(CodeIntelCommand::Shutdown);
+    }
+
+    async fn join(mut self) -> Result<(), String> {
+        loop {
+            if let Some(result) = self.completed.borrow_and_update().clone() {
+                return result;
+            }
+            self.completed
+                .changed()
+                .await
+                .map_err(|_| "Code intelligence stopped without completing teardown".to_owned())?;
+        }
     }
 }
 
@@ -110,53 +123,63 @@ impl CodeIntelService {
         project_handle: ProjectStreamHandle,
         resource_mode: CodeIntelResourceMode,
         code_intel_settings: CodeIntelSettings,
+        owner: tyde_process_env::launch::ProcessOwner,
     ) -> CodeIntelServiceHandle {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (version_tx, version_rx) = mpsc::unbounded_channel();
         let (provider_status_tx, provider_status_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut service = CodeIntelService {
-                root,
-                providers: HashMap::new(),
-                project_handle,
-                version_listener_tx: version_tx,
-                provider_status_tx,
-                version_listener_registered: false,
-                subscriptions: HashSet::new(),
-                resource_mode,
-                code_intel_settings,
-            };
-            let mut version_rx = Some(version_rx);
-            let mut provider_status_rx = Some(provider_status_rx);
-            loop {
-                tokio::select! {
-                    command = rx.recv() => {
-                        match command {
-                            Some(CodeIntelCommand::Shutdown) => break,
-                            Some(command) => service.handle(command).await,
-                            None => break, // all handles dropped
+        let (completed_tx, completed) = tokio::sync::watch::channel(None);
+        let project = project_handle.execution_project();
+        crate::backend::subprocess::spawn(async move {
+            tyde_process_env::launch::project_scope(
+                Some(project),
+                owner.scope(async move {
+                    let mut service = CodeIntelService {
+                        root,
+                        providers: HashMap::new(),
+                        project_handle,
+                        version_listener_tx: version_tx,
+                        provider_status_tx,
+                        version_listener_registered: false,
+                        subscriptions: HashSet::new(),
+                        resource_mode,
+                        code_intel_settings,
+                    };
+                    let mut version_rx = Some(version_rx);
+                    let mut provider_status_rx = Some(provider_status_rx);
+                    loop {
+                        tokio::select! {
+                            command = rx.recv() => {
+                                match command {
+                                    Some(CodeIntelCommand::Shutdown) => break,
+                                    Some(command) => service.handle(command).await,
+                                    None => break, // all handles dropped
+                                }
+                            }
+                            change = recv_version_change(&mut version_rx) => {
+                                match change {
+                                    Some(change) => service.handle_version_change(change),
+                                    // The project-stream actor dropped its listener
+                                    // sender (the project subscription ended). Stop
+                                    // polling the dead channel; keep serving commands.
+                                    None => version_rx = None,
+                                }
+                            }
+                            status = recv_provider_status(&mut provider_status_rx) => {
+                                match status {
+                                    Some(status) => service.handle_provider_status(status),
+                                    None => provider_status_rx = None,
+                                }
+                            }
                         }
                     }
-                    change = recv_version_change(&mut version_rx) => {
-                        match change {
-                            Some(change) => service.handle_version_change(change),
-                            // The project-stream actor dropped its listener
-                            // sender (the project subscription ended). Stop
-                            // polling the dead channel; keep serving commands.
-                            None => version_rx = None,
-                        }
-                    }
-                    status = recv_provider_status(&mut provider_status_rx) => {
-                        match status {
-                            Some(status) => service.handle_provider_status(status),
-                            None => provider_status_rx = None,
-                        }
-                    }
-                }
-            }
-            service.shutdown_providers();
+                    let result = service.shutdown_providers().await;
+                    completed_tx.send_replace(Some(result));
+                }),
+            )
+            .await;
         });
-        CodeIntelServiceHandle { tx }
+        CodeIntelServiceHandle { tx, completed }
     }
 
     async fn subscribe_version(
@@ -260,12 +283,30 @@ impl CodeIntelService {
         }
     }
 
-    fn shutdown_providers(&mut self) {
+    async fn shutdown_providers(&mut self) -> Result<(), String> {
+        let mut tasks = Vec::new();
         for provider in self.providers.values_mut() {
             provider.shutdown();
+            if let Some(task) = provider.take_shutdown_task() {
+                tasks.push(task);
+            }
         }
         self.providers.clear();
         self.subscriptions.clear();
+        let mut failures = Vec::new();
+        for task in tasks {
+            if let Err(error) = task.await {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Code intelligence teardown failed: {}",
+                failures.join("; ")
+            ))
+        }
     }
 
     async fn handle(&mut self, command: CodeIntelCommand) {
@@ -468,6 +509,7 @@ async fn recv_provider_status(
 /// register for version-change notifications (§M4) — it is still plumbing, not
 /// provider state.
 pub(crate) struct CodeIntelRouter {
+    owner: tyde_process_env::launch::ProcessOwner,
     services: HashMap<ProjectRootPath, CodeIntelServiceHandle>,
     project_handle: ProjectStreamHandle,
     /// The host's resource mode (spec §M6), captured once via the
@@ -484,6 +526,7 @@ impl CodeIntelRouter {
         code_intel_settings: CodeIntelSettings,
     ) -> Self {
         Self {
+            owner: tyde_process_env::launch::ProcessOwner::default(),
             services: HashMap::new(),
             project_handle,
             resource_mode: host_resource_mode(),
@@ -495,12 +538,14 @@ impl CodeIntelRouter {
         let project_handle = self.project_handle.clone();
         let resource_mode = self.resource_mode;
         let code_intel_settings = self.code_intel_settings.clone();
+        let owner = self.owner.clone();
         self.services.entry(root.clone()).or_insert_with(|| {
             CodeIntelService::spawn(
                 root.clone(),
                 project_handle,
                 resource_mode,
                 code_intel_settings,
+                owner,
             )
         })
     }
@@ -533,8 +578,32 @@ impl CodeIntelRouter {
     }
 
     pub(crate) fn shutdown_all(&mut self) {
+        self.owner.kill_all();
         for (_, handle) in self.services.drain() {
             handle.shutdown();
+        }
+    }
+
+    pub(crate) async fn shutdown_and_join(mut self) -> Result<(), String> {
+        self.owner.kill_all();
+        let services = self
+            .services
+            .drain()
+            .map(|(_, service)| service)
+            .collect::<Vec<_>>();
+        for service in &services {
+            service.shutdown();
+        }
+        let mut failures = Vec::new();
+        for service in services {
+            if let Err(error) = service.join().await {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
         }
     }
 

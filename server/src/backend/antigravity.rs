@@ -43,7 +43,6 @@ use crate::backend::{
     backend_fork_unsupported_message, render_combined_spawn_instructions,
     resolve_settings as resolve_backend_settings,
 };
-use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 
 const ANTIGRAVITY_AGENT_NAME: &str = "antigravity";
@@ -260,13 +259,15 @@ fn prepare_antigravity_tool_policy(
 }
 
 impl AgyLaunch {
-    fn native_roots(&self) -> Vec<String> {
-        std::iter::once(self.primary_root.clone())
-            .chain(self.extra_roots.iter().cloned())
-            .collect()
+    fn native_roots(&self) -> Result<Vec<String>, String> {
+        super::execution_workspace_roots(
+            &std::iter::once(self.primary_root.clone())
+                .chain(self.extra_roots.iter().cloned())
+                .collect::<Vec<_>>(),
+        )
     }
 
-    fn args(&self, conversation_id: Option<&str>) -> Vec<String> {
+    fn args(&self, conversation_id: Option<&str>) -> Result<Vec<String>, String> {
         let mut args = vec![
             "--print-timeout".to_string(),
             ANTIGRAVITY_PRINT_TIMEOUT.to_string(),
@@ -289,12 +290,15 @@ impl AgyLaunch {
             args.push(format!("--conversation={conversation_id}"));
         }
         args.push("--add-dir".to_string());
-        args.push(self.primary_root.clone());
+        args.push(
+            tyde_process_env::launch::WorkspacePath::host(&self.primary_root)?
+                .execution_string()?,
+        );
         for root in &self.extra_roots {
             args.push("--add-dir".to_string());
-            args.push(root.clone());
+            args.push(tyde_process_env::launch::WorkspacePath::host(root)?.execution_string()?);
         }
-        args
+        Ok(args)
     }
 }
 
@@ -322,10 +326,7 @@ impl AgyProcess {
             return Err("Antigravity cannot enforce read-only workspace access".into());
         }
         let mut command = crate::backend::subprocess::command("agy")?;
-        command.args(launch.args(resume));
-        if let Some(path) = process_env::resolved_child_process_path() {
-            command.env("PATH", path);
-        }
+        command.args(launch.args(resume)?);
         if let Some((name, value)) = launch.bridge_env.as_ref() {
             command.env(name, value);
         }
@@ -1406,6 +1407,14 @@ impl Supervisor {
             self.inner.emitter.backend_error(&err);
             return false;
         }
+        let message = match super::workspace_prompt(message, Some(&self.launch.workspace_roots)) {
+            Ok(message) => message,
+            Err(error) => {
+                self.inner.emitter.backend_error(&error);
+                self.inner.emitter.typing_status_changed(false);
+                return false;
+            }
+        };
         self.turn_counter += 1;
         let model = {
             let mut state = self.inner.state.lock().await;
@@ -1422,7 +1431,6 @@ impl Supervisor {
             self.inner.emitter.user_message(user_message, None, origin);
         }
         self.inner.emitter.typing_status_changed(true);
-        let message = super::workspace_prompt(message, Some(&self.launch.workspace_roots));
         if let Err(err) = process.send_turn(&message).await {
             self.inner.emitter.backend_error(&err);
             self.inner.emitter.typing_status_changed(false);
@@ -1561,10 +1569,13 @@ impl Supervisor {
                         let emitter = Arc::clone(&self.inner.emitter);
                         let tool_id = tool_id.clone();
                         let name = name.clone();
-                        self.native_children.spawn(async move {
-                            relay_antigravity_child(brain_dir, id, tool_id, name, child, emitter)
+                        self.native_children
+                            .spawn(crate::backend::subprocess::inherit_execution(async move {
+                                relay_antigravity_child(
+                                    brain_dir, id, tool_id, name, child, emitter,
+                                )
                                 .await;
-                        });
+                            }));
                     }
                     Err(error) => self
                         .inner
@@ -1698,10 +1709,14 @@ impl Supervisor {
         tracing::info!(session_id = %self.session_id, ?roots, "Changing Antigravity workspace roots");
         // The resumed native trajectory, not CLI --add-dir, owns tool workspaces.
         process.terminate().await;
-        let replacement_roots = launch.native_roots();
+        let replacement_roots = launch
+            .native_roots()
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
         let metadata = relocate_antigravity_metadata(
             &self.conversation_db,
-            &self.launch.primary_root,
+            &tyde_process_env::launch::WorkspacePath::host(&self.launch.primary_root)
+                .and_then(|path| path.execution_string())
+                .map_err(super::WorkspaceRelocationError::Rejected)?,
             &replacement_roots,
         );
         let result = match &metadata {
@@ -1825,14 +1840,13 @@ fn tool_execution_result(
             stderr: String::new(),
         },
         ToolRequestType::ReadFiles { file_paths } => ToolExecutionResult::ReadFiles {
-            // `agy` summarises a read as "4 lines, 17 bytes" and reports the
-            // size nowhere else, so the size is measured rather than parsed out
-            // of a sentence whose wording is not a contract.
+            // Native read output does not report a structured size. Host
+            // metadata is neither the private runtime nor the file as read.
             files: file_paths
                 .iter()
                 .map(|path| protocol::FileInfo {
                     path: path.clone(),
-                    bytes: Some(fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)),
+                    bytes: None,
                 })
                 .collect(),
         },
@@ -1882,9 +1896,6 @@ async fn run_antigravity_cli_command(
     process.args(["--output-format", "stream-json", "-p", command]);
     if let Some(model) = model {
         process.args(["--model", model]);
-    }
-    if let Some(path) = process_env::resolved_child_process_path() {
-        process.env("PATH", path);
     }
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
@@ -1993,9 +2004,6 @@ async fn read_antigravity_capacity() -> Result<CapacityReport, CapacityUnavailab
     let mut command = crate::backend::subprocess::command("agy")
         .map_err(|_| CapacityUnavailableReason::SourceUnreachable)?;
     command.args(["--output-format", "stream-json", "-p", "/usage"]);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     command
         .stdin(crate::backend::subprocess::ProcessStdio::Null)
         .stdout(crate::backend::subprocess::ProcessStdio::Piped)
@@ -2755,7 +2763,7 @@ impl Backend for AntigravityBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         let program = context.program.as_deref().unwrap_or("agy");
@@ -2795,7 +2803,7 @@ impl Backend for AntigravityBackend {
         }
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -2813,7 +2821,7 @@ impl Backend for AntigravityBackend {
         .await
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -2832,7 +2840,7 @@ impl Backend for AntigravityBackend {
         .await
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         _workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
         _from_session_id: SessionId,
@@ -2843,7 +2851,7 @@ impl Backend for AntigravityBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         _context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let conversations_dir = resolve_antigravity_conversations_dir(None)?;
@@ -3035,7 +3043,7 @@ impl AntigravityBackend {
         let resume_metadata = if let Some(id) = resume.as_ref() {
             let path = antigravity_conversation_db_path(id, conversations_dir);
             let stored = antigravity_session_workspace_roots(&path)?;
-            let native_roots = launch.native_roots();
+            let native_roots = launch.native_roots()?;
             if stored != native_roots {
                 let previous = stored
                     .first()
@@ -3322,7 +3330,7 @@ pub(crate) fn resolve_antigravity_conversations_dir(
 ) -> Result<PathBuf, String> {
     match configured_dir {
         Some(path) => Ok(path.to_path_buf()),
-        None => Ok(crate::paths::home_dir()?
+        None => Ok(crate::paths::execution_home_dir()?
             .join(".gemini")
             .join("antigravity-cli")
             .join("conversations")),
@@ -3608,7 +3616,7 @@ fn merge_antigravity_bridge_entry(
 }
 
 fn antigravity_mcp_config_path() -> Result<PathBuf, String> {
-    Ok(crate::paths::home_dir()?
+    Ok(crate::paths::execution_home_dir()?
         .join(".gemini")
         .join("config")
         .join("mcp_config.json"))
@@ -3639,7 +3647,7 @@ impl AntigravityMcpConfigLock {
     /// and parking a runtime worker stalls every task scheduled on it.
     async fn acquire(path: &Path) -> Result<Self, String> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::acquire_blocking(&path))
+        crate::backend::subprocess::spawn_blocking(move || Self::acquire_blocking(&path))
             .await
             .map_err(|err| format!("Antigravity MCP config lock task failed: {err}"))?
     }

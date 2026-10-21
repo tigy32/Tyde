@@ -182,7 +182,6 @@ fn probe_rust_analyzer(path: &Path, workspace_root: &Path) -> Result<(), ProbeFa
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_child_path(&mut command);
     match run_bounded(command, PROBE_TIMEOUT) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(ProbeFailure {
@@ -213,7 +212,6 @@ fn rustup_which_rust_analyzer(workspace_root: &Path) -> Option<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_child_path(&mut command);
     let output = run_bounded(command, PROBE_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
@@ -224,12 +222,6 @@ fn rustup_which_rust_analyzer(workspace_root: &Path) -> Option<PathBuf> {
     }
     let path = PathBuf::from(path);
     path.is_file().then_some(path)
-}
-
-fn apply_child_path(command: &mut Command) {
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
 }
 
 fn run_bounded(mut command: Command, timeout: Duration) -> Result<std::process::Output, String> {

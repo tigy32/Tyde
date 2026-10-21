@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     sync::{Notify, mpsc, oneshot, watch},
@@ -98,7 +99,7 @@ impl Connection {
         let stop = Arc::new(Notify::new());
         let stop_task = stop.clone();
         let (reaped_tx, reaped) = watch::channel(None);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut stdin = stdin;
             let mut output = BufReader::new(stdout);
             let mut errors = BufReader::new(stderr).lines();
@@ -273,10 +274,23 @@ impl Connection {
         method: &'static str,
         params: Value,
     ) -> Result<T, String> {
-        let result = self
-            .request(method, params)
-            .await
-            .map_err(|error| format!("{method}: {error}"))?;
+        let result = self.request(method, params).await.map_err(|error| {
+            tracing::warn!(
+                method,
+                code = error.code,
+                message_identity = %format!("{:x}", Sha256::digest(error.message.as_bytes())),
+                message_bytes = error.message.len(),
+                mentions_workspace = error.message.contains("workspace"),
+                mentions_command_id = error.message.contains("commandId"),
+                mentions_model = error.message.contains("model"),
+                mentions_mcp = error.message.contains("mcp"),
+                data_fields = ?error.data.as_object().map(|data| data.keys().filter(|key| {
+                    matches!(key.as_str(), "kind" | "reason" | "path" | "issues" | "errors")
+                }).collect::<Vec<_>>()),
+                "Muse native RPC rejected a typed operation"
+            );
+            format!("{method}: {error}")
+        })?;
         serde_json::from_value(result)
             .map_err(|error| format!("Invalid Muse {method} result: {error}"))
     }

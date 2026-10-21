@@ -31,7 +31,15 @@ pub fn resolved_child_process_path() -> Option<&'static OsStr> {
     initialize_process_env().ok()
 }
 
+pub fn find_host_executable_in_path(binary: &str) -> Option<PathBuf> {
+    find_executable_on_path(binary, initialize_process_env().ok()?, false)
+}
+
 pub fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
+    find_executable_on_path(binary, &launch::process_path().ok()?, true)
+}
+
+fn find_executable_on_path(binary: &str, path: &OsStr, execution: bool) -> Option<PathBuf> {
     let trimmed = binary.trim();
     if trimmed.is_empty() {
         return None;
@@ -39,13 +47,37 @@ pub fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
 
     let explicit_path = Path::new(trimmed);
     if explicit_path.components().count() > 1 {
-        return explicit_path.exists().then(|| explicit_path.to_path_buf());
+        let host = if execution {
+            launch::WorkspacePath::execution(explicit_path)
+                .ok()?
+                .on_host()
+                .to_path_buf()
+        } else {
+            explicit_path.to_path_buf()
+        };
+        return host.exists().then(|| explicit_path.to_path_buf());
     }
 
-    let resolved_path = resolved_child_process_path()?;
-    for dir in std::env::split_paths(resolved_path) {
-        if let Some(candidate) = find_matching_executable_in_dir(&dir, trimmed) {
-            return Some(candidate);
+    for dir in std::env::split_paths(path) {
+        let host_dir = if execution {
+            launch::WorkspacePath::execution(&dir)
+                .ok()?
+                .on_host()
+                .to_path_buf()
+        } else {
+            dir
+        };
+        if let Some(candidate) = find_matching_executable_in_dir(&host_dir, trimmed) {
+            return if execution {
+                Some(
+                    launch::WorkspacePath::host(candidate)
+                        .ok()?
+                        .in_execution()
+                        .to_path_buf(),
+                )
+            } else {
+                Some(candidate)
+            };
         }
     }
     None
@@ -99,6 +131,7 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) -> Result<(), String> {
     );
     let mut command = launch::raw_command(&shell);
     command
+        .on_host()
         .arg("-ilc")
         .arg(&script)
         .new_session()

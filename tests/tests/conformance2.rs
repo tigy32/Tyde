@@ -177,7 +177,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch"
+                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -14860,13 +14860,10 @@ async fn collect_owned_background_turn<B: Backend>(host: &mut Harness<B>, prompt
     }
 }
 
-conformance2_scenario!(
-    real_bubblewrap_workbench,
-    [BackendCapability::BubblewrapWorkbench]
-);
+conformance2_scenario!(real_bubblewrap_workbench, []);
 
 async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
-    let project = host.prepare_bubblewrap().await;
+    let (project, peer_project) = host.prepare_bubblewrap().await;
     let protocol::ProjectSource::GitWorkbench { environment, .. } = &project.source else {
         panic!("engine fixture must be a workbench");
     };
@@ -14874,84 +14871,646 @@ async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
         matches!(
             environment,
             protocol::WorkbenchEnvironment::Bubblewrap {
-                initialization: protocol::WorkbenchInitialization::Cold,
+                initialization: protocol::WorkbenchInitialization::Snapshot { .. },
                 ..
             }
         ),
-        "an unbuilt fixture must not claim a snapshot"
+        "consumers must use actual sealed CoW artifacts"
     );
+    let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+    std::fs::create_dir_all(&probe_dir).expect("create startup MCP probe directory");
+    let probe_script = probe_dir.join("probe.py");
+    let journal = probe_dir.join("calls.jsonl");
+    let source = mcp_probe_script()
+        .replace("import json, sys, time", "import json, os, sys, time")
+        .replace(
+            "json.dumps(arguments, sort_keys=True)",
+            "json.dumps(dict(arguments, runtime_namespace=os.readlink('/proc/self/ns/mnt'), source_read=Path('/mnt/tyde-workspace/README.txt').read_text()), sort_keys=True)",
+        );
+    std::fs::write(&probe_script, source).expect("write real startup MCP probe server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            probe_script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let host_root = host.workspace().to_string_lossy().into_owned();
+    let parent = host.bubblewrap_parent().to_path_buf();
+    let peer = host.bubblewrap_peer().to_path_buf();
     let host_namespace = std::fs::read_link("/proc/self/ns/mnt")
         .expect("host mount namespace")
         .to_string_lossy()
         .into_owned();
+    let primary_owner = unique_payload();
+    let peer_owner = unique_payload();
+    let session_directory = tempfile::tempdir().expect("canonical session store directory");
+    let session_store = std::sync::Arc::new(server::store::session::SessionStoreHandle::new(
+        server::store::session::SessionStore::load(session_directory.path().join("sessions.json"))
+            .expect("open real canonical session store"),
+    ));
     let script = format!(
         r#"import json, os, pathlib, subprocess
 root = pathlib.Path('/mnt/tyde-workspace')
 source = root / 'README.txt'
-output = root / 'build-output'
-output.mkdir()
-clone = output / 'private-copy.txt'
+clone = root / 'build-output/private-copy.txt'
+peer = pathlib.Path({peer:?})
 before = source.read_text()
-subprocess.run(['cp', '--reflink=always', str(source), str(clone)], check=True)
-private_inode = source.stat().st_ino != clone.stat().st_ino
+with open('/dev/null', 'r+b', buffering=0) as device:
+    sample = b'native device probe'
+    devices = device.write(sample) == len(sample) and device.read(1) == b''
+seeded = clone.read_text() == before and (peer / 'build-output/private-copy.txt').read_text() == before
+metadata = clone.stat()
+build = subprocess.run(['python3', 'build.py'], check=True, capture_output=True, text=True)
+warm = json.loads(build.stdout)['reused'] and clone.stat().st_ino == metadata.st_ino and clone.stat().st_mtime_ns == metadata.st_mtime_ns
+private_inode = clone.stat().st_ino != (peer / 'build-output/private-copy.txt').stat().st_ino
 clone.write_text('private build artifact\n')
+source.write_text('private source edit\n')
 (root / 'boundary.txt').write_text('created\n')
-print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private_inode and source.read_text() == before, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+(root / 'session-owner.txt').write_text({primary_owner:?})
+print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'warm': warm, 'devices': devices, 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': seeded and private_inode and (peer / 'build-output/private-copy.txt').read_text() == before, 'source': (peer / 'README.txt').read_text() == before and pathlib.Path({parent:?}, 'README.txt').read_text() == before, 'alias': root.samefile({host_root:?}), 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
 "#
     );
     let prompt = format!(
-        "Use a real shell tool in /mnt/tyde-workspace to execute this exact Python 3 script. \
-         Do not substitute an explanation or change the checks. Then briefly confirm completion.\n\
+        "Use your real shell tool with the default workspace cwd to execute this exact Python 3 script. \
+         Do not change directory or substitute an explanation. Briefly confirm completion.\n\
          python3 - <<'TYDE_BOUNDARY_PY'\n{script}TYDE_BOUNDARY_PY"
     );
-    tyde_process_env::launch::project_scope(Some(project), async {
+    let primary_agent = tyde_process_env::launch::project_scope(Some(project.clone()), async {
         let agent = spawn_agent(host, &prompt).await;
         let first = collect_turn(host, &agent, &prompt).await;
         report_bubblewrap_usage("created", &first);
-        assert_bubblewrap_process_output(&first, "created", &["cwd", "namespace", "cow", "generic"]);
-        assert!(std::fs::read_to_string(host.workspace().join("boundary.txt"))
-            .expect("provider-created host file") == "created\n", "provider must write the real host workbench");
-        assert!(std::fs::read_to_string(host.workspace().join("README.txt"))
-            .expect("unchanged source") == "tyde conformance workspace", "private CoW edit must preserve source");
-        let followup = "Use a real shell tool to run exactly:\npython3 - <<'TYDE_BOUNDARY_PY'\nimport json, pathlib\np = pathlib.Path('/mnt/tyde-workspace/boundary.txt')\nassert p.read_text() == 'created\\n'\np.write_text('edited\\n')\nprint(json.dumps({'boundary': 'edited', 'readback': p.read_text() == 'edited\\n'}))\nTYDE_BOUNDARY_PY\nThen briefly confirm completion.";
-        let second = ask(host, &agent, followup).await;
-        report_bubblewrap_usage("edited", &second);
-        assert_bubblewrap_process_output(&second, "edited", &["readback"]);
-        assert!(std::fs::read_to_string(host.workspace().join("boundary.txt"))
-            .expect("provider-edited host file") == "edited\n", "next turn must edit the same host file");
-        assert_universal_contract(&[first, second]);
+        assert_bubblewrap_process_output(
+            &first,
+            "created",
+            &[
+                "cwd",
+                "warm",
+                "devices",
+                "namespace",
+                "cow",
+                "source",
+                "alias",
+                "generic",
+            ],
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.workspace().join("boundary.txt"))
+                .expect("provider-created host file"),
+            "created\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.workspace().join("README.txt")).expect("private source"),
+            "private source edit\n"
+        );
+        let followup = bubblewrap_followup_prompt(
+            host.backend(),
+            "created",
+            "edited",
+            "runtime-created",
+            "runtime-edited",
+            &host_namespace,
+        );
+        let second = ask(host, &agent, &followup).await;
+        assert_bubblewrap_native_file_io(
+            &second,
+            "created",
+            "edited",
+            "runtime-created",
+            "runtime-edited",
+        );
+        assert!(
+            mcp_journal(&journal).is_empty(),
+            "native file I/O must not substitute the MCP probe"
+        );
+        let payload = unique_payload();
+        let before = mcp_journal(&journal).len();
+        let mcp_prompt = mcp_probe_prompt(host.backend(), &payload);
+        let mcp = ask(host, &agent, mcp_prompt).await;
+        assert_mcp_calls_reached_the_server(&mcp, &journal, before, &[&payload]);
+        assert_mcp_results_came_back(&mcp, &[&payload]);
+        let served = mcp_journal(&journal);
+        let call = served
+            .last()
+            .expect("startup MCP call must reach its server");
+        assert!(
+            call.get("runtime_namespace")
+                .and_then(Value::as_str)
+                .is_some_and(|namespace| namespace != host_namespace),
+            "the actual MCP server must execute inside the workbench namespace"
+        );
+        assert!(
+            call.get("source_read").and_then(Value::as_str) == Some("private source edit\n"),
+            "startup MCP must read the same private source through the stable execution path"
+        );
+        assert_universal_contract(&[first, second, mcp]);
         let shutdown = close_agent(host, &agent).await;
         assert_no_error_message("Bubblewrap shutdown", &shutdown);
+        record_bubblewrap_session(
+            &session_store,
+            host.backend(),
+            &agent,
+            vec![host_root.clone()],
+        )
+        .await;
+        agent
+    })
+    .await;
+    let peer_root = peer.to_string_lossy().into_owned();
+    let peer_prompt = format!(
+        r#"Use your real shell tool at the default workspace cwd to execute exactly this Python script, without changing directory:
+python3 - <<'TYDE_PEER_PY'
+import json, os, pathlib
+root = pathlib.Path('/mnt/tyde-workspace')
+assert (root / 'README.txt').read_text() == 'tyde conformance workspace'
+assert (root / 'build-output/private-copy.txt').read_text() == 'tyde conformance workspace'
+assert not (root / 'boundary.txt').exists()
+(root / 'session-owner.txt').write_text({peer_owner:?})
+print(json.dumps({{'boundary': 'peer-created', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'owner': (root / 'session-owner.txt').read_text() == {peer_owner:?}}}))
+TYDE_PEER_PY
+Briefly confirm completion."#
+    );
+    let peer_agent = tyde_process_env::launch::project_scope(Some(peer_project.clone()), async {
+        let agent = spawn_agent_at_roots(host, vec![peer_root.clone()], &peer_prompt).await;
+        let turn = collect_turn(host, &agent, &peer_prompt).await;
+        assert_bubblewrap_process_output(&turn, "peer-created", &["cwd", "namespace", "owner"]);
+        assert_universal_contract(&[turn]);
+        assert_no_error_message("Bubblewrap peer shutdown", &close_agent(host, &agent).await);
+        record_bubblewrap_session(
+            &session_store,
+            host.backend(),
+            &agent,
+            vec![peer_root.clone()],
+        )
+        .await;
+        agent
+    })
+    .await;
+    assert!(
+        primary_agent.session_id != peer_agent.session_id,
+        "workbenches require distinct acknowledged native sessions"
+    );
+    tyde_process_env::launch::project_scope(Some(project), async {
+        assert_bubblewrap_session_ownership::<B>(
+            &session_store,
+            &host_root,
+            &primary_agent,
+            &peer_root,
+            &peer_agent,
+        )
+        .await;
+        let resumed = resume_agent(host, &primary_agent.session_id).await;
+        assert_bubblewrap_replayed_owner(&resumed, &primary_owner, &peer_owner);
+        let resume_prompt = bubblewrap_followup_prompt(
+            host.backend(),
+            "edited",
+            "resumed",
+            "runtime-created",
+            "runtime-resumed",
+            &host_namespace,
+        );
+        let calls_before = mcp_journal(&journal).len();
+        let readback = ask(host, &resumed, &resume_prompt).await;
+        assert_bubblewrap_native_file_io(
+            &readback,
+            "edited",
+            "resumed",
+            "runtime-created",
+            "runtime-resumed",
+        );
+        assert_eq!(
+            mcp_journal(&journal).len(),
+            calls_before,
+            "resumed native file I/O must not substitute MCP"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.workspace().join("boundary.txt"))
+                .expect("native file edits must reach the same host workbench"),
+            "resumed\n"
+        );
+        assert_universal_contract(&[readback]);
+        assert_no_error_message(
+            "Bubblewrap resumed shutdown",
+            &close_agent(host, &resumed).await,
+        );
+    })
+    .await;
+    tyde_process_env::launch::project_scope(Some(peer_project), async {
+        assert_bubblewrap_session_ownership::<B>(&session_store, &peer_root, &peer_agent, &host_root, &primary_agent).await;
+        let resumed = resume_agent_at_roots(host, vec![peer_root.clone()], &peer_agent.session_id).await;
+        assert_bubblewrap_replayed_owner(&resumed, &peer_owner, &primary_owner);
+        let prompt = format!(
+            r#"Use your real shell tool at the default workspace cwd to execute exactly:
+python3 - <<'TYDE_PEER_PY'
+import json, os, pathlib
+root = pathlib.Path('/mnt/tyde-workspace')
+assert not (root / 'boundary.txt').exists()
+assert (root / 'README.txt').read_text() == 'tyde conformance workspace'
+assert (root / 'build-output/private-copy.txt').read_text() == 'tyde conformance workspace'
+print(json.dumps({{'boundary': 'peer-resumed', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'owner': (root / 'session-owner.txt').read_text() == {peer_owner:?}}}))
+TYDE_PEER_PY
+Briefly confirm completion."#
+        );
+        let turn = ask(host, &resumed, &prompt).await;
+        assert_bubblewrap_process_output(&turn, "peer-resumed", &["cwd", "namespace", "owner"]);
+        assert_universal_contract(&[turn]);
+        assert_no_error_message("Bubblewrap peer resumed shutdown", &close_agent(host, &resumed).await);
     }).await;
+    assert!(
+        std::fs::read_to_string(Path::new(&host_root).join("session-owner.txt"))
+            .expect("primary owner file")
+            == primary_owner,
+        "peer execution must not replace primary state"
+    );
+    assert!(
+        std::fs::read_to_string(peer.join("session-owner.txt")).expect("peer owner file")
+            == peer_owner,
+        "primary execution must not replace peer state"
+    );
+    assert!(
+        !parent.join("session-owner.txt").exists(),
+        "neither session may write parent state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.join("README.txt")).expect("independent peer source"),
+        "tyde conformance workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.join("build-output/private-copy.txt"))
+            .expect("independent peer artifacts"),
+        "tyde conformance workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(parent.join("README.txt")).expect("unchanged parent source"),
+        "tyde conformance workspace"
+    );
+    assert!(
+        !parent.join("boundary.txt").exists() && !peer.join("boundary.txt").exists(),
+        "provider writes must stay in their workspace"
+    );
 }
 
-fn assert_bubblewrap_process_output(turn: &Turn, phase: &str, checks: &[&str]) {
-    let observed = turn.tool_completions().any(|completion| {
-        let ToolExecutionOutcome::Succeeded {
-            result:
-                ToolExecutionResult::RunCommand {
-                    exit_code: 0,
-                    stdout,
-                    ..
-                },
-        } = &completion.outcome
-        else {
-            return false;
-        };
-        stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .any(|output| {
-                output["boundary"].as_str() == Some(phase)
-                    && checks
-                        .iter()
-                        .all(|key| output[*key].as_bool() == Some(true))
-            })
-    });
-    assert!(
-        observed,
-        "real successful command output must establish every boundary check"
+async fn record_bubblewrap_session(
+    store: &server::store::session::SessionStoreHandle,
+    backend_kind: BackendKind,
+    agent: &Agent,
+    workspace_roots: Vec<String>,
+) {
+    store
+        .upsert_backend_session(
+            &server::backend::BackendSession {
+                id: agent.session_id.clone(),
+                backend_kind,
+                workspace_roots,
+                title: None,
+                token_count: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+                resumable: true,
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("persist acknowledged native identity with canonical host ownership");
+}
+
+async fn assert_bubblewrap_session_ownership<B: Backend>(
+    store: &std::sync::Arc<server::store::session::SessionStoreHandle>,
+    root: &str,
+    agent: &Agent,
+    peer_root: &str,
+    peer: &Agent,
+) {
+    let sessions = B::list_sessions(&server::backend::BackendProbeContext {
+        workspace_roots: vec![root.to_owned()],
+        session_store: Some(store.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("list real native sessions with canonical ownership");
+    eprintln!(
+        "BUBBLEWRAP_CATALOG {}",
+        serde_json::json!({
+            "entries": sessions.len(),
+            "caller_matches": sessions.iter().filter(|session| session.id == agent.session_id).count(),
+            "peer_matches": sessions.iter().filter(|session| session.id == peer.session_id).count(),
+            "known_host_owners": sessions.iter().filter(|session| session.workspace_roots == [root] || session.workspace_roots == [peer_root]).count()
+        })
     );
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.id == agent.session_id)
+            .count(),
+        1,
+        "catalog must retain its acknowledged native session exactly once"
+    );
+    for session in sessions {
+        let expected = if session.id == agent.session_id {
+            Some(root)
+        } else if session.id == peer.session_id {
+            Some(peer_root)
+        } else {
+            None
+        };
+        if let Some(expected) = expected {
+            assert!(
+                session.backend_kind == B::session_settings_schema().backend_kind
+                    && session.workspace_roots == [expected],
+                "catalog must preserve native identity and canonical host ownership, never caller-inferred ownership"
+            );
+        } else {
+            assert!(
+                !session
+                    .workspace_roots
+                    .iter()
+                    .any(|owner| owner == peer_root || owner == root),
+                "unowned native entries must not acquire a caller's host ownership"
+            );
+        }
+    }
+}
+
+fn assert_bubblewrap_replayed_owner(agent: &Agent, owner: &str, peer_owner: &str) {
+    let user_history = agent
+        .replayed_history
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) => {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        user_history.iter().any(|message| message.contains(owner)),
+        "resume must replay its own native session history"
+    );
+    assert!(
+        !user_history
+            .iter()
+            .any(|message| message.contains(peer_owner)),
+        "resume must not import the peer native session history"
+    );
+}
+
+fn bubblewrap_followup_prompt(
+    backend: BackendKind,
+    before: &str,
+    after: &str,
+    runtime_before: &str,
+    runtime_after: &str,
+    host_namespace: &str,
+) -> String {
+    let (read_instructions, readback_output) = match backend {
+        BackendKind::Codex => (
+            "Return the complete contents of each file in the native tool output, including every random proof line. A native read-only command is valid when that is how your backend exposes file reading; print the complete contents to stdout and retain that output in the tool result. Do not read io-proofs.json, substitute your own explanation, or call MCP for this file-I/O task.",
+            " Return its complete contents in the native tool output as well.",
+        ),
+        _ => (
+            "A native read-only command is valid when that is how your backend exposes file reading. Do not read io-proofs.json, omit file contents from tool output, substitute your own explanation, or call MCP for this file-I/O task.",
+            "",
+        ),
+    };
+    format!(
+        r#"First use your real shell tool in the default workspace cwd to run exactly:
+python3 - <<'TYDE_RUNTIME_START_PY'
+import json, pathlib, secrets
+runtime = pathlib.Path('/mnt/tyde-runtime')
+assert pathlib.Path('boundary.txt').read_text() == {before:?} + '\n'
+assert (runtime / 'private/runtime-boundary.txt').read_text() == {runtime_before:?} + '\n'
+proofs = {{name: 'TYDE_IO_' + secrets.token_hex(24) for name in ['workspace', 'runtime']}}
+pathlib.Path('boundary.txt').write_text({before:?} + '\n' + proofs['workspace'] + '\n')
+(runtime / 'private/runtime-boundary.txt').write_text({runtime_before:?} + '\n' + proofs['runtime'] + '\n')
+(runtime / 'private/io-proofs.json').write_text(json.dumps(proofs))
+metadata = runtime.stat()
+identity = [metadata.st_dev, metadata.st_ino]
+(runtime / 'private/runtime-identity.json').write_text(json.dumps(identity))
+print(json.dumps({{'boundary': {after:?} + '-runtime-start', 'runtime_instance': identity}}))
+TYDE_RUNTIME_START_PY
+Use your native file-reading facilities to read the complete contents of boundary.txt, /mnt/tyde-runtime/private/runtime-identity.json and /mnt/tyde-runtime/private/runtime-boundary.txt. {read_instructions}
+Then use your native file-editing or patch tool, with a separate call for each file, to replace only the line {before:?} in boundary.txt with {after:?}, and only the line {runtime_before:?} in /mnt/tyde-runtime/private/runtime-boundary.txt with {runtime_after:?}. Retain the random proof lines and all terminating newlines. Do not substitute shell writes for the native edits. Use your native reading facility again to read the complete contents of /mnt/tyde-runtime/private/runtime-boundary.txt after its edit.{readback_output}
+After all reads and edits complete, use your real shell tool in the default workspace cwd to run exactly:
+python3 - <<'TYDE_BOUNDARY_PY'
+import hashlib, json, os, pathlib
+p = pathlib.Path('boundary.txt')
+runtime = pathlib.Path('/mnt/tyde-runtime')
+proofs = json.loads((runtime / 'private/io-proofs.json').read_text())
+assert p.read_text() == {after:?} + '\n' + proofs['workspace'] + '\n'
+assert (runtime / 'private/runtime-boundary.txt').read_text() == {runtime_after:?} + '\n' + proofs['runtime'] + '\n'
+metadata = runtime.stat()
+identity = [metadata.st_dev, metadata.st_ino]
+assert json.loads((runtime / 'private/runtime-identity.json').read_text()) == identity
+assert pathlib.Path('README.txt').read_text() == 'private source edit\n'
+assert pathlib.Path('build-output/private-copy.txt').read_text() == 'private build artifact\n'
+p.write_text({after:?} + '\n')
+(runtime / 'private/runtime-boundary.txt').write_text({runtime_after:?} + '\n')
+print(json.dumps({{'boundary': {after:?}, 'readback': True, 'runtime_readback': True, 'runtime_instance': identity, 'proof_hashes': {{name: hashlib.sha256(value.encode()).hexdigest() for name, value in proofs.items()}}, 'cwd': os.getcwd() == '/mnt/tyde-workspace', 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}}}))
+TYDE_BOUNDARY_PY
+Briefly confirm completion."#
+    )
+}
+
+enum BubblewrapReadEvidence<'a> {
+    Contents { hash: &'a str, phase: &'a str },
+    RuntimeIdentity(&'a Value),
+}
+
+// Real Codex command reads and Hermes read_file do not emit ReadFiles.
+// Typed read acknowledgements retain paths, not contents; other native
+// results must return an unpredictable file proof. Neither the prompt nor
+// the final shell attestation reveals its value.
+fn bubblewrap_read_route(
+    request: &protocol::ToolRequest,
+    completion: &protocol::ToolExecutionCompletedData,
+    name: &str,
+    evidence: &BubblewrapReadEvidence<'_>,
+) -> Option<&'static str> {
+    use sha2::{Digest, Sha256};
+    let ToolExecutionOutcome::Succeeded { result } = &completion.outcome else {
+        return None;
+    };
+    if matches!(&request.tool_type, ToolRequestType::ReadFiles { file_paths }
+        if file_paths.iter().any(|path| Path::new(path).file_name().is_some_and(|filename| filename == name)))
+    {
+        return Some("typed_native_read");
+    }
+    let (text, route) = match (&request.tool_type, result) {
+        (
+            ToolRequestType::RunCommand { .. },
+            ToolExecutionResult::RunCommand {
+                stdout,
+                exit_code: 0,
+                ..
+            },
+        ) => (stdout.clone(), "native_command_output"),
+        (ToolRequestType::Other { .. }, ToolExecutionResult::Other { result }) => (
+            serde_json::to_string(result).expect("serialize retained native output"),
+            "untyped_native_output",
+        ),
+        _ => return None,
+    };
+    let observed = match evidence {
+        BubblewrapReadEvidence::Contents { hash, phase } => {
+            text.contains(*phase)
+                && text.split("TYDE_IO_").skip(1).any(|tail| {
+                    let Some(value) = tail
+                        .get(..48)
+                        .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    else {
+                        return false;
+                    };
+                    let proof = format!("TYDE_IO_{value}");
+                    format!("{:x}", Sha256::digest(proof.as_bytes())) == *hash
+                })
+        }
+        BubblewrapReadEvidence::RuntimeIdentity(identity) => {
+            let compact = serde_json::to_string(identity).expect("serialize runtime identity");
+            text.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .contains(&compact)
+        }
+    };
+    observed.then_some(route)
+}
+
+fn assert_bubblewrap_native_file_io(
+    turn: &Turn,
+    before: &str,
+    phase: &str,
+    runtime_before: &str,
+    runtime_after: &str,
+) {
+    let (start, initial) = bubblewrap_command_proof(turn, &format!("{phase}-runtime-start"), &[]);
+    let (end, final_output) = bubblewrap_command_proof(
+        turn,
+        phase,
+        &["readback", "runtime_readback", "cwd", "namespace"],
+    );
+    assert!(
+        initial["runtime_instance"]
+            .as_array()
+            .is_some_and(|identity| { identity.len() == 2 && identity.iter().all(Value::is_u64) })
+            && initial["runtime_instance"] == final_output["runtime_instance"],
+        "native file callbacks and commands must share one live runtime within each turn"
+    );
+    let completions = turn
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            ChatEvent::ToolExecutionCompleted(completion) if start < index && index < end => {
+                Some((index, completion))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut routes = BTreeSet::new();
+    for (name, key, previous, next) in [
+        ("boundary.txt", "workspace", before, phase),
+        (
+            "runtime-boundary.txt",
+            "runtime",
+            runtime_before,
+            runtime_after,
+        ),
+    ] {
+        let edit = completions.iter().find_map(|(index, completion)| {
+            (matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. })
+                && turn.tool_requests().any(|request| request.tool_call_id == completion.tool_call_id
+                    && matches!(&request.tool_type, ToolRequestType::ModifyFile { file_path, .. }
+                        if Path::new(file_path).file_name().is_some_and(|filename| filename == name))))
+                .then_some(*index)
+        }).expect("native edits must complete against both the workspace and private runtime");
+        let hash = final_output["proof_hashes"][key]
+            .as_str()
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .expect("actual final command must attest an unpredictable file proof");
+        for (after_edit, expected) in [(false, previous), (true, next)] {
+            if after_edit && name == "boundary.txt" {
+                continue;
+            }
+            let observed = completions.iter().filter(|(index, _)| {
+                if after_edit { *index > edit } else { *index < edit }
+            }).find_map(|(_, completion)| {
+                turn.tool_requests().filter(|request| request.tool_call_id == completion.tool_call_id)
+                    .find_map(|request| bubblewrap_read_route(request, completion, name,
+                        &BubblewrapReadEvidence::Contents { hash, phase: expected }))
+            }).expect("successful native reads must prove original contents and post-edit runtime readback");
+            routes.insert(observed);
+        }
+    }
+    let identity = completions
+        .iter()
+        .find_map(|(_, completion)| {
+            turn.tool_requests()
+                .filter(|request| request.tool_call_id == completion.tool_call_id)
+                .find_map(|request| {
+                    bubblewrap_read_route(
+                        request,
+                        completion,
+                        "runtime-identity.json",
+                        &BubblewrapReadEvidence::RuntimeIdentity(&initial["runtime_instance"]),
+                    )
+                })
+        })
+        .expect("native reads must observe the caller's actual runtime identity");
+    routes.insert(identity);
+    eprintln!(
+        "BUBBLEWRAP_FILE_IO {}",
+        serde_json::json!({
+            "phase": phase,
+            "read_routes": routes,
+            "workspace_edit": true,
+            "runtime_edit": true,
+            "runtime_readback": true,
+            "same_runtime": true
+        })
+    );
+}
+
+fn assert_bubblewrap_process_output(turn: &Turn, phase: &str, checks: &[&str]) -> Value {
+    bubblewrap_command_proof(turn, phase, checks).1
+}
+
+fn bubblewrap_command_proof(turn: &Turn, phase: &str, checks: &[&str]) -> (usize, Value) {
+    turn.events()
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| {
+            let ChatEvent::ToolExecutionCompleted(completion) = event else {
+                return None;
+            };
+            let ToolExecutionOutcome::Succeeded {
+                result:
+                    ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout,
+                        ..
+                    },
+            } = &completion.outcome
+            else {
+                return None;
+            };
+            stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|output| {
+                    output["boundary"].as_str() == Some(phase)
+                        && checks
+                            .iter()
+                            .all(|key| output[*key].as_bool() == Some(true))
+                })
+                .map(|output| (index, output))
+        })
+        .expect("real successful command output must establish every boundary check")
 }
 
 fn report_bubblewrap_usage(phase: &str, turn: &Turn) {

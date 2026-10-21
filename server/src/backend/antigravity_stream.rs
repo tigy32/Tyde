@@ -426,6 +426,21 @@ pub fn tool_request_type(tool_name: &str, args: &Value, enriched: bool) -> ToolR
         "view_file" => ToolRequestType::ReadFiles {
             file_paths: arg_str(args, "AbsolutePath").into_iter().collect(),
         },
+        "read_file" if arg_str(args, "Path").is_some() => ToolRequestType::ReadFiles {
+            file_paths: arg_str(args, "Path").into_iter().collect(),
+        },
+        "edit_file"
+            if enriched
+                && arg_str(args, "Path").is_some()
+                && arg_str(args, "Target").is_some()
+                && arg_str(args, "Replacement").is_some() =>
+        {
+            ToolRequestType::ModifyFile {
+                file_path: arg_str(args, "Path").unwrap_or_default(),
+                before: arg_str(args, "Target").unwrap_or_default(),
+                after: arg_str(args, "Replacement").unwrap_or_default(),
+            }
+        }
         "write_to_file" if enriched => ToolRequestType::ModifyFile {
             file_path: arg_str(args, "TargetFile").unwrap_or_default(),
             // agy has no "previous content" argument. A write that overwrites

@@ -638,7 +638,7 @@ impl Backend for MockBackend {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    async fn discover(
+    async fn discover_in_workspace(
         context: &super::BackendProbeContext,
     ) -> Result<super::BackendDiscovery, String> {
         context
@@ -669,7 +669,7 @@ impl Backend for MockBackend {
         empty_session_settings_schema(BackendKind::Claude)
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -677,7 +677,7 @@ impl Backend for MockBackend {
         Self::spawn_with_launch(workspace_roots, config, initial_input).await
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -685,7 +685,7 @@ impl Backend for MockBackend {
         Self::resume_with_launch(workspace_roots, config, session_id).await
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         from_session_id: SessionId,
@@ -699,7 +699,7 @@ impl Backend for MockBackend {
         Some(self.control.clone())
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         _context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let store = session_store()

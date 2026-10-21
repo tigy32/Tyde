@@ -1198,7 +1198,7 @@ fn WorkbenchesTab() -> impl IntoView {
         <div class="workbenches-settings">
             <h2 class="settings-panel-title">"Workbenches"</h2>
             <p class="settings-description">"Engine for new workbenches. Existing workbenches are unchanged."</p>
-            <p class="settings-description">"Bubblewrap: Linux only, new normal Codex sessions only. No transfers between engines."</p>
+            <p class="settings-description">"Bubblewrap: Linux only. Native backend authentication, tools and policies are preserved. No live transfers between engines."</p>
             {move || {
                 let Some(host_id) = display_state.selected_host_id.get() else {
                     return view! { <p class="settings-description">"Select a host to configure workbenches."</p> }.into_any();

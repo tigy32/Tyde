@@ -16,9 +16,24 @@ host tools or namespace policy requires a host restart to refresh that report.
 This is a performance environment, not a hostile-code sandbox. Each workbench
 mounts its real Git source at `/mnt/tyde-workspace`, with private writable files
 and artifacts. Host executables and native config/auth remain runtime references;
-HOME and credentials are never copied into snapshots. Backend security/tool
-policies are unchanged. New normal Codex agents currently declare compatibility;
-other backends and live cross-engine conversation moves remain unsupported.
+HOME and credentials are never copied into snapshots. Native filesystem
+permissions are preserved, including config/session paths outside HOME; the
+engine-owned cohort store is mounted read-only. Backend security/tool policies
+and host namespace policy are unchanged. All enabled backends use the same
+host/execution workspace boundary; no backend declares Bubblewrap compatibility.
+Native session IDs remain unchanged, while native workspace inputs use the
+stable execution path and Tyde keeps host-root project ownership. Native catalog
+IDs join to that canonical session ownership; an unowned native transcript keeps
+its reported execution path rather than being assigned to the caller's project.
+Listing shared execution paths without the canonical session store fails explicitly.
+Host-serviced native file and terminal requests carry their driver's live
+execution descriptor. They use that instance's namespace, runtime files and
+services, rather than launching another environment. Closing the instance
+invalidates the descriptor; it never retargets a new launch. Private runtime
+files initialize afresh on each native driver launch, including resume.
+Host-only controls reject parent traversal and engine-private paths instead
+of projecting them onto unrelated host files.
+Live cross-engine conversation moves remain unsupported.
 Modes requiring nested namespaces fail explicitly if host policy denies them.
 
 ## Optional project configuration
@@ -95,8 +110,11 @@ invalid/absent explicit bindings fail rather than guessing replacements.
 Service readiness is an explicit nonempty Unix-stream notification to its
 configured relative runtime socket, or a real process exit. Services run in the
 same mount namespace as commands. Unexpected service exit fails execution.
-Shutdown runs the configured stop command, or sends SIGTERM when that is the
-configured empty-stop policy, and joins the owned processes. Failure is surfaced;
+Commands with configured services wait for owned descendants while monitoring
+service failure. Ordinary commands without services terminate and join leftover
+descendants after their native leader exits. Shutdown runs the configured stop
+command, or sends SIGTERM when that is the configured empty-stop policy, and
+joins the owned processes. Failure is surfaced;
 Tyde never controls host/peer services.
 
 **External host services are not automatically namespace-compatible.** A daemon

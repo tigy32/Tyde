@@ -1225,7 +1225,11 @@ impl Backend for HermesBackend {
     ) -> crate::backend::NativeSettingsWriteOutcome {
         let result = async {
             let roots = if context.workspace_roots.is_empty() {
-                vec![crate::paths::home_dir()?.to_string_lossy().into_owned()]
+                vec![
+                    crate::paths::execution_home_dir()?
+                        .to_string_lossy()
+                        .into_owned(),
+                ]
             } else {
                 context.workspace_roots.clone()
             };
@@ -1248,7 +1252,7 @@ impl Backend for HermesBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         let probe =
@@ -1335,7 +1339,7 @@ impl Backend for HermesBackend {
         }
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -1447,7 +1451,7 @@ impl Backend for HermesBackend {
         ))
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -1583,7 +1587,7 @@ impl Backend for HermesBackend {
         ))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         _workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
         _from_session_id: SessionId,
@@ -1594,7 +1598,7 @@ impl Backend for HermesBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         _context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let profile = hermes_config::resolve_profile_ref(None)?;
@@ -3061,13 +3065,20 @@ impl HermesSessionActor {
     }
 
     async fn submit_prompt(&mut self, message: &str, attached_paths: &[String]) {
+        let message = match super::workspace_prompt(message, self.workspace_roots.as_deref()) {
+            Ok(message) => message,
+            Err(error) => {
+                self.emit_turn_failure(error);
+                return;
+            }
+        };
         match self
             .gateway
             .request(
                 "prompt.submit",
                 json!({
                     "session_id": self.live_session_id,
-                    "text": super::workspace_prompt(message, self.workspace_roots.as_deref()),
+                    "text": message,
                 }),
             )
             .await
@@ -5030,9 +5041,6 @@ async fn register_hermes_mcp_bridge(
     // startup dies on the MCP-bridge readiness timeout.
     command.envs(&target.env);
     command.env_remove(HERMES_TOOLSETS_ENV);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     if let Some(cwd) = target.cwd.as_deref() {
         command.current_dir(cwd);
     }
@@ -5111,9 +5119,6 @@ async fn register_hermes_skill_dir(
     // the default profile's `config.yaml` while the gateway reads another's.
     command.envs(&target.env);
     command.env_remove(HERMES_TOOLSETS_ENV);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     if let Some(cwd) = target.cwd.as_deref() {
         command.current_dir(cwd);
     }
@@ -5201,7 +5206,7 @@ fn expand_hermes_path(path: &str) -> PathBuf {
     let Some(rest) = path.strip_prefix('~') else {
         return PathBuf::from(path);
     };
-    let Ok(home) = crate::paths::home_dir() else {
+    let Ok(home) = crate::paths::execution_home_dir() else {
         return PathBuf::from(path);
     };
     match rest.strip_prefix('/') {
@@ -5216,7 +5221,7 @@ fn prepare_hermes_managed_toolsets(
     directory: &Path,
     selected_toolsets: &str,
 ) -> Result<(), String> {
-    let existing = std::env::var_os(HERMES_MANAGED_DIR_ENV)
+    let existing = tyde_process_env::launch::environment_var_os(HERMES_MANAGED_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
@@ -5276,20 +5281,20 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         .await;
     }
 
-    eprintln!(
-        "TYDE HERMES SPAWN ENV https_proxy={:?}",
-        std::env::var("HTTPS_PROXY")
+    tracing::debug!(
+        proxy_present = tyde_process_env::launch::environment_var("HTTPS_PROXY").is_ok(),
+        "Hermes native proxy environment"
     );
     let mut command = crate::backend::subprocess::command(&target.program)?;
     command.args(&target.args);
     command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
     command.envs(&target.env);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     if let Some(cwd) = target.cwd.as_deref() {
         command.current_dir(cwd);
-        command.env("TERMINAL_CWD", cwd);
+        command.env(
+            "TERMINAL_CWD",
+            tyde_process_env::launch::WorkspacePath::host(cwd)?.in_execution(),
+        );
     }
     // Tyde owns the interaction surface, so ordinary Hermes approval gates
     // would only interrupt work the user already authorized by starting the
@@ -7458,7 +7463,7 @@ fn hermes_mcp_bridge_descriptor(
                     .map(|value| value.trim())
                     .filter(|value| !value.is_empty())
                 {
-                    let token = std::env::var(variable).map_err(|_| {
+                    let token = tyde_process_env::launch::environment_var(variable).map_err(|_| {
                         format!(
                             "Hermes MCP server '{name}' requires bearer token environment variable '{variable}'"
                         )
@@ -7492,7 +7497,8 @@ fn build_session_create_params(
     settings: &SessionSettingsValues,
     history_instructions: Option<&str>,
 ) -> Result<Value, String> {
-    let cwd = session_cwd(workspace_roots)?;
+    let cwd = tyde_process_env::launch::WorkspacePath::host(session_cwd(workspace_roots)?)?
+        .execution_string()?;
     let mut params = json!({
         "cols": 80,
         "source": "tyde",
@@ -8240,7 +8246,7 @@ async fn resolve_gateway_spawn_target(
     let remote_roots = crate::remote::parse_remote_workspace_roots(workspace_roots)?;
     if let Some((host, roots)) = remote_roots {
         let args = vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()];
-        let program = std::env::var(HERMES_REMOTE_PYTHON_ENV)
+        let program = tyde_process_env::launch::environment_var(HERMES_REMOTE_PYTHON_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -8352,14 +8358,14 @@ pub(crate) fn hermes_executable_candidates() -> Vec<String> {
 }
 
 pub(crate) fn explicit_hermes_executable() -> Option<String> {
-    std::env::var(HERMES_EXECUTABLE_ENV)
+    tyde_process_env::launch::environment_var(HERMES_EXECUTABLE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn explicit_hermes_python() -> Option<String> {
-    std::env::var("HERMES_PYTHON")
+    tyde_process_env::launch::environment_var("HERMES_PYTHON")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -8649,7 +8655,7 @@ fn executable_target_from_token(token: &str, script_dir: Option<&Path>) -> Optio
 
 fn expand_known_shell_vars(token: &str) -> String {
     let mut expanded = token.to_string();
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = tyde_process_env::launch::environment_var("HOME") {
         expanded = expanded.replace("${HOME}", &home);
         expanded = expanded.replace("$HOME", &home);
     }
@@ -8727,9 +8733,6 @@ async fn run_hermes_version_command(
         .arg("--version")
         .stdout(crate::backend::subprocess::ProcessStdio::Piped)
         .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command_proc.env("PATH", path);
-    }
     let spawned = command_proc.group_spawn().await;
     let mut child = match spawned {
         Ok(child) => child,
@@ -8913,9 +8916,6 @@ pub(crate) async fn probe_hermes_python_gateway_import(
         .arg(script)
         .stdout(crate::backend::subprocess::ProcessStdio::Piped)
         .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command_proc.env("PATH", path);
-    }
     let mut child = command_proc.group_spawn().await.map_err(|err| {
         let code = if err.kind() == io::ErrorKind::NotFound {
             BackendSetupDiagnosticCode::CommandNotFound
@@ -9434,7 +9434,7 @@ fn timestamp_number_to_ms(value: f64) -> u64 {
 }
 
 fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
-    std::env::var(key)
+    tyde_process_env::launch::environment_var(key)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0)

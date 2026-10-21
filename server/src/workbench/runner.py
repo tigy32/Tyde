@@ -1,4 +1,5 @@
 """Opaque project snapshots and an owned Linux process environment."""
+import array
 import contextlib
 import ctypes
 import fcntl
@@ -12,10 +13,12 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import string
 import subprocess
 import sys
 import tempfile
+import termios
 import uuid
 
 SCHEMA = 2
@@ -31,6 +34,14 @@ class Failure(Exception):
 
 def fail(reason, message):
     raise Failure(reason, message)
+
+
+def runtime_diagnostic(phase, **details):
+    try:
+        print("Workbench runtime diagnostic: " + json.dumps(dict(phase=phase, **details), sort_keys=True), file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        # A caller dropping captured stderr must not prevent owned teardown.
+        pass
 
 
 def digest(value):
@@ -70,7 +81,7 @@ def probe():
     if sys.platform != "linux":
         result = unsupported("not_linux", "Bubblewrap workbenches require Linux")
         return {"bubblewrap": result, "nested_namespaces": result}
-    if not hasattr(os, "pidfd_open") or sys.version_info < (3, 9):
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal") or sys.version_info < (3, 9):
         result = unsupported("runtime_tool_missing", "Bubblewrap requires Python 3.9+ and Linux pidfd process completion events")
         return {"bubblewrap": result, "nested_namespaces": result}
     missing = next((name for name in ("bwrap", "cp", "git") if shutil.which(name) is None), None)
@@ -147,7 +158,7 @@ def validate_configuration(config):
             fail("runtime_configuration_invalid", "Snapshot reuse requires explicit toolchain/ABI/input provenance paths")
     for value in config["runtime_directories"] + list(config["runtime_files"]):
         path = relative_path(value)
-        if path.parts[0] in ("bin", "runner.py", "manifest.json"):
+        if path.parts[0] in ("bin", "runner.py", "manifest.json", "control.sock", "execution.sock"):
             fail("runtime_configuration_invalid", "Runtime files/directories overlap engine-owned resources")
     for binding in config["runtime_file_bindings"]:
         if binding["runtime_file"] not in config["runtime_files"]:
@@ -155,7 +166,7 @@ def validate_configuration(config):
     names, notifications = set(), set()
     for service in config["services"]:
         notification = relative_path(service["ready_notification"])
-        if notification.parts[0] in ("bin", "runner.py", "manifest.json") or str(notification) in config["runtime_files"]:
+        if notification.parts[0] in ("bin", "runner.py", "manifest.json", "control.sock", "execution.sock") or str(notification) in config["runtime_files"]:
             fail("runtime_configuration_invalid", "Service notification overlaps a runtime resource")
         if not service["command"] or not service["name"] or service["name"] in names or service["ready_notification"] in notifications:
             fail("runtime_configuration_invalid", "Services require unique names/notifications and a foreground command")
@@ -343,9 +354,7 @@ def owned_environment(manifest_path, expected_root=None):
 
 
 def runtime_binds(manifest, env):
-    home = Path.home()
-    paths = [home / ".codex", home / ".cache", home / ".config", home / ".local/share", home / ".local/state", Path("/tmp"), Path(manifest["common"]), Path(manifest["root"])]
-    paths += [Path(env[key]) for key in ("CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME") if key in env]
+    paths = []
     for value in manifest["configuration"]["writable_paths"]:
         path = Path(expand(value, env))
         if not path.exists():
@@ -355,17 +364,180 @@ def runtime_binds(manifest, env):
     for path in dict.fromkeys(paths):
         if not path.is_absolute():
             fail("runtime_configuration_invalid", "Writable runtime references must be absolute paths")
+        if any(path == engine or path in engine.parents for engine in map(Path, (LOGICAL_ROOT, RUNTIME, RECEIPTS))):
+            fail("runtime_configuration_invalid", "A writable runtime reference overlaps engine-owned mountpoints")
         if path.exists():
             args += ["--bind", str(path), str(path)]
-    args += ["--ro-bind", manifest["snapshot_root"], manifest["snapshot_root"]]
     return args
 
 
-def launch(manifest_path, expected_root, cwd, command):
+def private_mountpoints():
+    # Engine mountpoints must not create directories or symlinks on the host.
+    # Restore existing /mnt entries before applying narrower runtime overlays.
+    args = ["--tmpfs", "/mnt"]
+    reserved = {LOGICAL_ROOT, RUNTIME, RECEIPTS}
+    for path in sorted(Path("/mnt").iterdir()):
+        if str(path) in reserved:
+            fail("incompatible_environment", "An engine mountpoint conflicts with an existing host /mnt entry")
+        if path.is_symlink():
+            args += ["--symlink", os.readlink(path), str(path)]
+        else:
+            args += ["--dev-bind", str(path), str(path)]
+    return args
+
+
+def own_descendants():
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0):
+        fail("incompatible_environment", "Could not establish runtime descendant ownership")
+
+
+def guarded_launch(args, env, run, descriptor_path=None):
+    # The guardian survives the caller's process-group kill, retaining its lease
+    # until even orphaned/setsid native descendants have been killed and joined.
+    # The runtime takes controlling-terminal ownership after entering its own
+    # session; pipe-based providers never touch the host's controlling terminal.
+    if os.isatty(0):
+        previous_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            fcntl.ioctl(0, termios.TIOCNOTTY)
+        finally:
+            signal.signal(signal.SIGHUP, previous_hup)
+    control, guardian_control = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parentfd = os.pidfd_open(os.getpid())
+    guardian = os.fork()
+    if guardian == 0:
+        control.close()
+        result = None
+        listener = None
+        runtimefd = None
+        try:
+            os.setsid()
+            own_descendants()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            directoryfd = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                listener.bind("/proc/self/fd/%d/control.sock" % directoryfd)
+            finally:
+                os.close(directoryfd)
+            listener.listen(1)
+            pending_signals = []
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(signum, signal.SIG_IGN)
+            child = subprocess.Popen(args, env=env, start_new_session=True)
+            childfd = os.pidfd_open(child.pid)
+            try:
+                with selectors.DefaultSelector() as events:
+                    events.register(parentfd, selectors.EVENT_READ, "parent")
+                    events.register(guardian_control, selectors.EVENT_READ, "control")
+                    events.register(childfd, selectors.EVENT_READ, "child")
+                    events.register(listener, selectors.EVENT_READ, "runtime")
+                    while result is None:
+                        for key, _ in events.select():
+                            if key.data == "child":
+                                result = child.wait()
+                                break
+                            if key.data == "parent":
+                                result = -signal.SIGKILL
+                                break
+                            if key.data == "runtime":
+                                connection, _ = listener.accept()
+                                with connection:
+                                    peer = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                                    pid, _, _ = struct.unpack("3i", peer)
+                                    runtimefd = os.pidfd_open(pid)
+                                    connection.send(b"start")
+                                if descriptor_path is not None:
+                                    with socket.socket(socket.AF_UNIX) as descriptor:
+                                        descriptor.connect(descriptor_path)
+                                        value = os.fsencode(run)
+                                        descriptor.sendall(struct.pack("!Q", len(value)) + value)
+                                events.unregister(listener)
+                                listener.close()
+                                listener = None
+                                for signum in pending_signals:
+                                    signal.pidfd_send_signal(runtimefd, signum)
+                                pending_signals.clear()
+                                continue
+                            message = guardian_control.recv(64)
+                            if not message:
+                                result = -signal.SIGKILL
+                                break
+                            signum = int(message)
+                            if runtimefd is None:
+                                pending_signals.append(signum)
+                            else:
+                                try:
+                                    signal.pidfd_send_signal(runtimefd, signum)
+                                except ProcessLookupError:
+                                    pass
+            finally:
+                # Kill the wrapper group even if its leader exited first.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                os.close(childfd)
+        except Failure as error:
+            result = {"error": {"reason": error.reason, "message": error.message}}
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            result = {"error": {"reason": "incompatible_environment", "message": "Execution guardian failed at an OS boundary (" + type(error).__name__ + ", errno=" + str(getattr(error, "errno", None)) + ")"}}
+        finally:
+            try:
+                join_children(terminate=True)
+                shutil.rmtree(run)
+            except (Failure, OSError) as error:
+                result = {"error": {"reason": "incompatible_environment", "message": "Execution guardian could not finish owned teardown (" + type(error).__name__ + ")"}}
+            try:
+                guardian_control.send(json.dumps(result).encode())
+            except BrokenPipeError:
+                pass
+            guardian_control.close()
+            if listener is not None:
+                listener.close()
+            if runtimefd is not None:
+                os.close(runtimefd)
+            os.close(parentfd)
+            os._exit(0)
+    guardian_control.close()
+    os.close(parentfd)
+    previous = {}
+    def forward(signum, _frame):
+        try:
+            control.send(str(signum).encode())
+        except BrokenPipeError:
+            pass
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous[signum] = signal.signal(signum, forward)
+        message = control.recv(4096)
+        _, status = os.waitpid(guardian, 0)
+        if not message or status:
+            fail("incompatible_environment", "Execution guardian exited without a completion result")
+        result = json.loads(message)
+        if isinstance(result, dict):
+            fail(result["error"]["reason"], result["error"]["message"])
+        return result
+    finally:
+        control.close()
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def launch(manifest_path, expected_root, cwd, command, configuration_identity=None, runner_identity=None, descriptor_path=None):
     manifest_path = Path(manifest_path).resolve()
     manifest = owned_environment(manifest_path, expected_root)
     config = manifest["configuration"]
-    env = runtime_environment(config)
+    if configuration_identity is None:
+        env = runtime_environment(config)
+    else:
+        if runner_identity != digest(Path(__file__).read_bytes()):
+            fail("incompatible_environment", "The execution runner changed while its backend was active")
+        if configuration_identity != digest(json.dumps(config, sort_keys=True).encode()):
+            fail("runtime_configuration_invalid", "The execution configuration changed while its backend was active")
+        env = dict(os.environ)
+        env["PATH"] = RUNTIME + "/bin:" + env["PATH"]
+    env["PWD"] = cwd
     with admission(manifest_path):
         directory = manifest_path.parent
         with tempfile.TemporaryDirectory(prefix="run-", dir=directory / "runs") as run:
@@ -381,15 +553,17 @@ def launch(manifest_path, expected_root, cwd, command):
                 path = run / relative_path(name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(expand(contents, env))
-            args = [manifest["bwrap"], "--unshare-user", "--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]
+            args = [manifest["bwrap"], "--unshare-user", "--dev-bind", "/", "/"]
+            args += private_mountpoints()
             args += runtime_binds(manifest, env)
             for binding in config["runtime_file_bindings"]:
                 destination = Path(expand(binding["host_path"], env))
                 if not destination.is_absolute() or not destination.is_file():
                     fail("runtime_configuration_invalid", "A configured native runtime file binding is absent or not an absolute file")
                 args += ["--ro-bind", str(run / binding["runtime_file"]), str(destination)]
-            args += ["--tmpfs", "/mnt", "--bind", manifest["root"], LOGICAL_ROOT, "--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", manifest["python"], RUNTIME + "/runner.py", "inside", *command]
-            return subprocess.run(args, env=env).returncode
+            args += ["--ro-bind", manifest["snapshot_root"], manifest["snapshot_root"]]
+            args += ["--bind", manifest["root"], LOGICAL_ROOT, "--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", manifest["python"], RUNTIME + "/runner.py", "inside", *command]
+            return guarded_launch(args, env, run, descriptor_path)
 
 
 def join_children(excluded=(), services=(), terminate=False):
@@ -402,6 +576,7 @@ def join_children(excluded=(), services=(), terminate=False):
             while True:
                 children = Path("/proc/self/task/%d/children" % os.getpid()).read_text().split()
                 children = [int(pid) for pid in children if int(pid) not in excluded]
+                runtime_diagnostic("descendants_observed", count=len(children), terminate=terminate)
                 for pid in children:
                     if pid not in pending:
                         pidfd = os.pidfd_open(pid)
@@ -429,17 +604,191 @@ def join_children(excluded=(), services=(), terminate=False):
                 os.close(pidfd)
 
 
+def read_exact(connection, length):
+    value = bytearray()
+    while len(value) < length:
+        chunk = connection.recv(length - len(value))
+        if not chunk:
+            fail("incompatible_environment", "Execution connection closed during a request")
+        value.extend(chunk)
+    return bytes(value)
+
+
+def execute(endpoint, plan_path):
+    encoded = Path(plan_path).read_bytes()
+    if len(encoded) > 64 * 1024 * 1024:
+        fail("incompatible_environment", "Execution request exceeds its protocol limit")
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(endpoint)
+        descriptors = array.array("i", [0, 1, 2])
+        sent = connection.sendmsg([struct.pack("!Q", len(encoded))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+        if sent != 8:
+            fail("incompatible_environment", "Execution descriptor transfer was incomplete")
+        connection.sendall(encoded)
+        previous = {}
+        def forward(signum, _frame):
+            try:
+                connection.sendall((json.dumps({"signal": signum}) + "\n").encode())
+            except BrokenPipeError:
+                pass
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                previous[signum] = signal.signal(signum, forward)
+            result = json.loads(connection.makefile("rb").readline())
+            if "error" in result:
+                fail(result["error"]["reason"], result["error"]["message"])
+            return result["exit_code"]
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+
+
+def execution_request(connection):
+    own_descendants()
+    child = None
+    descriptors = array.array("i")
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_DFL)
+        header, ancillary, flags, _ = connection.recvmsg(8, socket.CMSG_SPACE(3 * descriptors.itemsize))
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptors.frombytes(data[:len(data) - len(data) % descriptors.itemsize])
+        if flags & socket.MSG_CTRUNC or len(descriptors) != 3:
+            fail("incompatible_environment", "Execution request requires exactly three stdio descriptors")
+        header += read_exact(connection, 8 - len(header))
+        length, = struct.unpack("!Q", header)
+        if length > 64 * 1024 * 1024:
+            fail("incompatible_environment", "Execution request exceeds its protocol limit")
+        plan = json.loads(read_exact(connection, length))
+        environment = dict(os.environb)
+        for key, value in plan["environment"]:
+            key = bytes(key)
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = bytes(value)
+        cwd = None if plan["cwd"] is None else bytes(plan["cwd"])
+        child = subprocess.Popen([bytes(value) for value in plan["command"]], cwd=cwd, env=environment,
+                                 stdin=descriptors[0], stdout=descriptors[1], stderr=descriptors[2], start_new_session=True)
+        for descriptor in descriptors:
+            os.close(descriptor)
+        descriptors = array.array("i")
+        childfd = os.pidfd_open(child.pid)
+        try:
+            with selectors.DefaultSelector() as events:
+                events.register(childfd, selectors.EVENT_READ, "child")
+                events.register(connection, selectors.EVENT_READ, "control")
+                buffer = bytearray()
+                settled = False
+                while not settled:
+                    for key, _ in events.select():
+                        if key.data == "child":
+                            settled = True
+                            break
+                        data = connection.recv(65536)
+                        if not data:
+                            settled = True
+                            break
+                        buffer.extend(data)
+                        while b"\n" in buffer:
+                            message, _, buffer = buffer.partition(b"\n")
+                            signum = json.loads(message)["signal"]
+                            if signum not in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                                fail("incompatible_environment", "Execution control signal is invalid")
+                            try:
+                                os.killpg(child.pid, signum)
+                            except ProcessLookupError:
+                                pass
+            result = child.poll()
+            if result is None:
+                result = -signal.SIGKILL
+        finally:
+            os.close(childfd)
+        response = {"exit_code": result}
+    except Failure as error:
+        response = {"error": {"reason": error.reason, "message": error.message}}
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        response = {"error": {"reason": "incompatible_environment", "message": "Active execution request failed at an OS boundary (" + type(error).__name__ + ", errno=" + str(getattr(error, "errno", None)) + ")"}}
+    finally:
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+        for descriptor in descriptors:
+            os.close(descriptor)
+        join_children(terminate=True)
+    try:
+        connection.sendall((json.dumps(response) + "\n").encode())
+    except BrokenPipeError:
+        pass
+    connection.close()
+
+
+def accept_execution(listener, requests, events):
+    connection, _ = listener.accept()
+    pid = os.fork()
+    if pid == 0:
+        listener.close()
+        for other, _ in requests.values():
+            other.close()
+        try:
+            execution_request(connection)
+        finally:
+            os._exit(0)
+    pidfd = os.pidfd_open(pid)
+    requests[pid] = (connection, pidfd)
+    events.register(pidfd, selectors.EVENT_READ, ("request", pid))
+
+
+def finish_execution(requests):
+    for connection, _ in requests.values():
+        connection.shutdown(socket.SHUT_RDWR)
+    with selectors.DefaultSelector() as events:
+        for pid, (_, pidfd) in requests.items():
+            events.register(pidfd, selectors.EVENT_READ, pid)
+        while requests:
+            for key, _ in events.select():
+                pid = key.data
+                os.waitpid(pid, 0)
+                connection, pidfd = requests.pop(pid)
+                events.unregister(pidfd)
+                os.close(pidfd)
+                connection.close()
+
+
 def inside(command):
-    # Bubblewrap owns namespace PID 1; adopt command/service descendants here
-    # so their completion and service failures remain part of our lifecycle.
-    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0):
-        fail("incompatible_environment", "Could not establish runtime descendant ownership")
+    own_descendants()
+    terminal = os.isatty(0)
+    if terminal:
+        if os.getsid(0) != os.getpid():
+            os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     manifest = load(RUNTIME + "/manifest.json")
     env = dict(os.environ)
     services = []
     child = None
     failed_cleanup = False
-    settled = False
+    requests = {}
+    executor = socket.socket(socket.AF_UNIX)
+    executor.bind(RUNTIME + "/execution.sock")
+    executor.listen()
+    def forward(signum, _frame):
+        if child is None:
+            fail("incompatible_environment", "Execution was cancelled before its native command started")
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, forward)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
+        control.connect(RUNTIME + "/control.sock")
+        if control.recv(16) != b"start":
+            fail("incompatible_environment", "Execution guardian did not admit the native command")
     try:
         for spec in manifest["configuration"]["services"]:
             listener = socket.socket(socket.AF_UNIX)
@@ -447,9 +796,10 @@ def inside(command):
             listener.listen(1)
             log = tempfile.TemporaryFile()
             service_env = dict(env, **{key: expand(value, env) for key, value in spec["environment"].items()})
-            process = subprocess.Popen([expand(value, env) for value in spec["command"]], env=service_env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            process = subprocess.Popen([expand(value, env) for value in spec["command"]], env=service_env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             pidfd = os.pidfd_open(process.pid)
             services.append((process, pidfd, spec, log))
+            runtime_diagnostic("service_started", pid=process.pid)
             try:
                 with selectors.DefaultSelector() as events:
                     events.register(listener, selectors.EVENT_READ, "ready")
@@ -465,28 +815,58 @@ def inside(command):
                     fail("runtime_service_failed", "A runtime service is outside its workbench mount namespace")
             finally:
                 listener.close()
-        child = subprocess.Popen(command, env=env)
+        child = subprocess.Popen(command, env=env, preexec_fn=os.setpgrp)
+        runtime_diagnostic("command_started", pid=child.pid, terminal=terminal)
+        if terminal:
+            os.tcsetpgrp(0, child.pid)
+            runtime_diagnostic("terminal_foreground", process_group=os.tcgetpgrp(0))
         childfd = os.pidfd_open(child.pid)
         try:
             with selectors.DefaultSelector() as events:
                 events.register(childfd, selectors.EVENT_READ, "child")
                 for _, pidfd, _, _ in services:
                     events.register(pidfd, selectors.EVENT_READ, "service")
-                if any(key.data == "service" for key, _ in events.select()):
-                    fail("runtime_service_failed", "An owned runtime service exited during command execution")
+                events.register(executor, selectors.EVENT_READ, "execution")
+                settled = False
+                while not settled:
+                    for key, _ in events.select():
+                        if key.data == "service":
+                            fail("runtime_service_failed", "An owned runtime service exited during command execution")
+                        if key.data == "child":
+                            settled = True
+                            break
+                        if key.data == "execution":
+                            accept_execution(executor, requests, events)
+                            continue
+                        _, pid = key.data
+                        os.waitpid(pid, 0)
+                        connection, pidfd = requests.pop(pid)
+                        events.unregister(pidfd)
+                        os.close(pidfd)
+                        connection.close()
+            executor.close()
+            finish_execution(requests)
             result = child.wait()
+            runtime_diagnostic("command_exited", exit_code=result)
             descendants = join_children(
                 {process.pid for process, _, _, _ in services},
                 [pidfd for _, pidfd, _, _ in services],
+                terminate=not services,
             )
-            settled = True
-            return result if result else next((code for code in descendants if code), 0)
+            return result if result or not services else next((code for code in descendants if code), 0)
         finally:
             os.close(childfd)
     finally:
-        if child is not None and child.poll() is None:
-            child.kill()
+        executor.close()
+        finish_execution(requests)
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             child.wait()
+        if terminal:
+            os.tcsetpgrp(0, os.getpgrp())
         for process, pidfd, spec, log in reversed(services):
             if process.poll() is not None:
                 failed_cleanup = True
@@ -503,7 +883,7 @@ def inside(command):
                 failed_cleanup = True
             os.close(pidfd)
             log.close()
-        join_children(terminate=not settled)
+        join_children(terminate=True)
         if failed_cleanup:
             fail("runtime_service_failed", "Owned runtime service shutdown failed; resources were joined")
 
@@ -529,7 +909,9 @@ def produce(command):
         before = source_inventory(root)
         inputs = input_identity(root, config, dict(os.environ))
         tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
+        runtime_diagnostic("producer_started")
         result = subprocess.run(command)
+        runtime_diagnostic("producer_command_exited", exit_code=result.returncode)
         descendants = join_children()
         if result.returncode or any(descendants):
             fail("incompatible_environment", "The explicit snapshot producer or one of its descendants failed")
@@ -538,6 +920,7 @@ def produce(command):
             fail("incompatible_environment", "Snapshot producer inputs changed during execution")
         receipt = {"schema": SCHEMA, "tree": tree, "inputs": inputs, "key": cohort_key(tree, inputs), "source": before, "artifacts": artifact_inventory(root, config), "producer": digest(json.dumps(command).encode())}
         save(receipt_path, receipt)
+        runtime_diagnostic("producer_completed")
     return 0
 
 
@@ -588,6 +971,36 @@ def main():
         return probe()
     if action == "prepare":
         return prepare(*arguments)
+    if action == "environment":
+        manifest_path, expected_root = arguments
+        with admission(manifest_path):
+            manifest = owned_environment(manifest_path, expected_root)
+            # Refresh the executable, not the stored paths, native identities,
+            # provenance or artifacts of already-created workbenches.
+            helper = Path(manifest_path).with_name("runner.py")
+            with tempfile.NamedTemporaryFile(dir=helper.parent, delete=False) as staged:
+                temporary = Path(staged.name)
+                staged.write(Path(__file__).read_bytes())
+            try:
+                os.replace(temporary, helper)
+            finally:
+                temporary.unlink(missing_ok=True)
+            values = runtime_environment(manifest["configuration"])
+            # Launch owns its private bin prefix; a command's explicit PATH
+            # remains an override of this same prepared environment.
+            values["PATH"] = values["PATH"].removeprefix(RUNTIME + "/bin:")
+            return {"values": values, "configuration_identity": digest(json.dumps(manifest["configuration"], sort_keys=True).encode()), "runner_identity": digest(Path(__file__).read_bytes())}
+    if action == "execute":
+        sys.exit(execute(*arguments))
+    if action == "launch_prepared_context":
+        manifest, expected_root, cwd, descriptor, configuration_identity, runner_identity, *command = arguments
+        sys.exit(launch(manifest, expected_root, cwd, command, configuration_identity, runner_identity, descriptor))
+    if action == "launch_context":
+        manifest, expected_root, cwd, descriptor, *command = arguments
+        sys.exit(launch(manifest, expected_root, cwd, command, descriptor_path=descriptor))
+    if action == "launch_prepared":
+        manifest, expected_root, cwd, configuration_identity, runner_identity, *command = arguments
+        sys.exit(launch(manifest, expected_root, cwd, command, configuration_identity, runner_identity))
     if action == "launch":
         manifest, expected_root, cwd, *command = arguments
         sys.exit(launch(manifest, expected_root, cwd, command))

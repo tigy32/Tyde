@@ -10,6 +10,7 @@ use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
@@ -42,7 +43,6 @@ use crate::backend::{
     AgentIdentity, CancelBackgroundTaskOutcome, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand,
     StartupMcpServer, StartupMcpTransport, normalize_mcp_call_tool_result,
 };
-use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
@@ -3586,12 +3586,13 @@ impl ClaudeInner {
             .state
             .with(move |state| {
                 if super::invokes_slash_command(state.slash_commands.as_ref(), &prompt) {
-                    prompt
+                    Ok(prompt)
                 } else {
                     super::workspace_prompt(&prompt, state.workspace_roots.as_deref())
                 }
             })
-            .await;
+            .await
+            .map_err(TurnStartError::Failed)?;
         let input_message = build_stream_json_user_message(&prompt, images);
         tracing::info!(turn_id, "writing Claude foreground prompt");
         // Waiter registration and the frame's place in stdin are one
@@ -5072,7 +5073,7 @@ impl ClaudeInner {
         config: ClaudeProcessSpawnConfig,
         process_generation: u64,
     ) -> Result<ClaudeProcessRuntime, String> {
-        let cli_args = build_claude_cli_args(&config);
+        let cli_args = build_claude_cli_args(&config)?;
         let mut child = if let Some(host) = config.ssh_host.as_deref() {
             let pinned_model = config.model.as_deref().and_then(normalize_nonempty);
             let model_env = pinned_model.as_deref().map_or_else(Vec::new, |model| {
@@ -5099,9 +5100,6 @@ impl ClaudeInner {
             let mut cmd = crate::backend::subprocess::command(program)?;
             for arg in &cli_args {
                 cmd.arg(arg);
-            }
-            if let Some(path) = process_env::resolved_child_process_path() {
-                cmd.env("PATH", path);
             }
             if let Some(model) = config.model.as_deref().and_then(normalize_nonempty) {
                 cmd.env("ANTHROPIC_MODEL", &model);
@@ -6796,7 +6794,7 @@ impl ClaudeInner {
 }
 
 fn claude_binary() -> String {
-    std::env::var(TYDE_CLAUDE_BIN_ENV)
+    tyde_process_env::launch::environment_var(TYDE_CLAUDE_BIN_ENV)
         .ok()
         .and_then(|value| normalize_nonempty(&value))
         .unwrap_or_else(|| "claude".to_string())
@@ -6822,12 +6820,8 @@ async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Resul
     // different configuration than the one that will run. Plugin resolution is
     // cwd-sensitive (project-scoped plugins) and config-sensitive
     // (`CLAUDE_CONFIG_DIR`), so the probe runs in the session's workspace and
-    // inherits the same environment, with only `PATH` overridden the same way
-    // `spawn_process` overrides it.
+    // inherits the same canonical execution environment as `spawn_process`.
     cmd.current_dir(workspace_root);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        cmd.env("PATH", path);
-    }
     let output = tokio::time::timeout(CLAUDE_INITIALIZE_TIMEOUT, cmd.output())
         .await
         .map_err(|_| {
@@ -6851,9 +6845,6 @@ async fn claude_supports_plugin_dir() -> Result<bool, String> {
     // A cancelled native launch is not a negative CLI capability to cache.
     let mut cmd = crate::backend::subprocess::command(claude_binary())?;
     cmd.arg("--help");
-    if let Some(path) = process_env::resolved_child_process_path() {
-        cmd.env("PATH", path);
-    }
     let output = cmd.output().await.map_err(|err| {
         tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
         format!("Failed to probe Claude CLI for --plugin-dir support: {err}")
@@ -6871,7 +6862,7 @@ async fn claude_supports_plugin_dir() -> Result<bool, String> {
     Ok(supported)
 }
 
-fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
+fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String>, String> {
     let enforced_read_only = config.access_mode == BackendAccessMode::EnforcedReadOnly;
     let effective_permission_mode = if enforced_read_only {
         "dontAsk"
@@ -6901,7 +6892,10 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
 
     if let Some(roots) = &config.workspace_roots {
         for root in &roots[1..] {
-            cli_args.extend(["--add-dir".to_owned(), root.clone()]);
+            cli_args.extend([
+                "--add-dir".to_owned(),
+                tyde_process_env::launch::WorkspacePath::host(root)?.execution_string()?,
+            ]);
         }
     }
     if config.ephemeral {
@@ -7046,7 +7040,7 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         cli_args.push(uuid::Uuid::new_v4().to_string());
     }
 
-    cli_args
+    Ok(cli_args)
 }
 
 fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {
@@ -7078,7 +7072,7 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
                     .as_deref()
                     .map(str::trim)
                     .filter(|variable| !variable.is_empty())
-                    && let Ok(token) = std::env::var(variable)
+                    && let Ok(token) = tyde_process_env::launch::environment_var(variable)
                 {
                     headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
                     headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
@@ -8919,7 +8913,10 @@ async fn relocate_claude_workspace(
     inner: &ClaudeInner,
     roots: &[String],
 ) -> Result<(), super::WorkspaceRelocationError> {
-    let cwd = &roots[0];
+    let host_cwd = &roots[0];
+    let cwd = tyde_process_env::launch::WorkspacePath::host(host_cwd)
+        .and_then(|path| path.execution_string())
+        .map_err(super::WorkspaceRelocationError::Rejected)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(roots = roots.len(), "Changing Claude workspace roots");
     let response = inner
@@ -8943,7 +8940,7 @@ async fn relocate_claude_workspace(
     );
     match response.get("status").and_then(Value::as_str) {
         Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
-            let workspace_root = cwd.clone();
+            let workspace_root = host_cwd.clone();
             inner
                 .state
                 .with(move |state| state.workspace_root = workspace_root)
@@ -8979,7 +8976,7 @@ async fn relocate_claude_workspace(
             json!({
                 "type": "control_request", "request_id": request_id,
                 "request": {"subtype": "apply_flag_settings", "settings": {
-                    "permissions": {"additionalDirectories": &roots[1..]}
+                    "permissions": {"additionalDirectories": super::execution_workspace_roots(&roots[1..]).map_err(super::WorkspaceRelocationError::Rejected)?}
                 }}
             }),
             CLAUDE_CONTROL_RESPONSE_TIMEOUT,
@@ -13675,7 +13672,12 @@ fn claude_modify_preview(tool_name: &str, arguments: &Value) -> Option<ClaudeMod
         "write" => {
             let after = claude_argument_string(arguments, &["content", "text", "new_content"])
                 .unwrap_or_default();
-            let before = std::fs::read_to_string(&file_path).unwrap_or_default();
+            let path = tyde_process_env::launch::WorkspacePath::execution(&file_path).ok()?;
+            let before = match std::fs::read_to_string(path.on_host()) {
+                Ok(before) => before,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(_) => return None,
+            };
             (before, after)
         }
         "multiedit" => parse_multiedit_preview(arguments)?,
@@ -13981,21 +13983,21 @@ fn claude_tool_execution_outcome(
 }
 
 fn claude_home_dir() -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("CLAUDE_CONFIG_DIR") {
+    if let Ok(explicit) = tyde_process_env::launch::environment_var("CLAUDE_CONFIG_DIR") {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
             return Ok(PathBuf::from(trimmed));
         }
     }
 
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = tyde_process_env::launch::environment_var("HOME") {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
             return Ok(PathBuf::from(trimmed).join(".claude"));
         }
     }
 
-    if let Ok(home) = std::env::var("USERPROFILE") {
+    if let Ok(home) = tyde_process_env::launch::environment_var("USERPROFILE") {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
             return Ok(PathBuf::from(trimmed).join(".claude"));
@@ -14038,11 +14040,19 @@ fn normalize_claude_workspace_root(workspace_root: &str) -> String {
 
 fn claude_workspace_sessions_dir(workspace_root: &str) -> Result<PathBuf, String> {
     let claude_home = claude_home_dir()?;
-    Ok(claude_home
+    let canonical = normalize_claude_workspace_root(workspace_root);
+    let execution =
+        tyde_process_env::launch::WorkspacePath::host(&canonical)?.execution_string()?;
+    let directory = claude_home
         .join("projects")
-        .join(encode_workspace_root(&normalize_claude_workspace_root(
-            workspace_root,
-        ))))
+        .join(encode_workspace_root(&execution));
+    tracing::info!(
+        canonical_changed = canonical != workspace_root,
+        execution_projected = execution != canonical,
+        index_identity = %format!("{:x}", Sha256::digest(directory.as_os_str().as_encoded_bytes())),
+        "Claude native project index resolved"
+    );
+    Ok(directory)
 }
 
 fn claude_session_file_path(workspace_root: &str, session_id: &str) -> Result<PathBuf, String> {
@@ -14052,9 +14062,17 @@ fn claude_session_file_path(workspace_root: &str, session_id: &str) -> Result<Pa
 
 async fn list_claude_sessions(workspace_root: &str) -> Result<Vec<Value>, String> {
     let sessions_dir = claude_workspace_sessions_dir(workspace_root)?;
+    let execution_root =
+        tyde_process_env::launch::WorkspacePath::host(workspace_root)?.execution_string()?;
     let mut rd = match tokio_fs::read_dir(&sessions_dir).await {
         Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                index_present = false,
+                "Claude native catalog directory inspected"
+            );
+            return Ok(Vec::new());
+        }
         Err(err) => {
             return Err(format!(
                 "Failed to read Claude sessions directory '{}': {err}",
@@ -14064,7 +14082,11 @@ async fn list_claude_sessions(workspace_root: &str) -> Result<Vec<Value>, String
     };
 
     let mut sessions = Vec::new();
-    while let Ok(Some(entry)) = rd.next_entry().await {
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to enumerate Claude native project index: {error}"))?
+    {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
@@ -14074,7 +14096,7 @@ async fn list_claude_sessions(workspace_root: &str) -> Result<Vec<Value>, String
         {
             continue;
         }
-        if let Some(metadata) = inspect_claude_session_file(&path, workspace_root).await? {
+        if let Some(metadata) = inspect_claude_session_file(&path, &execution_root).await? {
             sessions.push(metadata);
         }
     }
@@ -14084,6 +14106,11 @@ async fn list_claude_sessions(workspace_root: &str) -> Result<Vec<Value>, String
         let b_ts = b.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
+    tracing::info!(
+        index_present = true,
+        sessions = sessions.len(),
+        "Claude native catalog directory inspected"
+    );
 
     Ok(sessions)
 }
@@ -16284,9 +16311,6 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
         "stream-json",
         "--no-session-persistence",
     ]);
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
     command
         .stdin(crate::backend::subprocess::ProcessStdio::Piped)
         .stdout(crate::backend::subprocess::ProcessStdio::Piped)
@@ -16498,7 +16522,7 @@ impl Backend for ClaudeBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         let (session, events) = ClaudeSession::spawn_ephemeral(
@@ -16535,7 +16559,7 @@ impl Backend for ClaudeBackend {
         result
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -16543,7 +16567,7 @@ impl Backend for ClaudeBackend {
         Self::spawn_or_fork(workspace_roots, config, None, initial_input).await
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
@@ -16730,7 +16754,7 @@ impl Backend for ClaudeBackend {
         ))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         from_session_id: protocol::SessionId,
@@ -16746,7 +16770,7 @@ impl Backend for ClaudeBackend {
         .map_err(BackendStartupError::backend_failed)
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let mut sessions = Vec::new();

@@ -4062,6 +4062,10 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     use protocol::{WorkbenchAvailability, WorkbenchEngine, WorkbenchEnvironment};
 
     let mut fixture = Fixture::new().await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     assert_eq!(
         fixture.bootstrap.settings.workbenches.engine,
         WorkbenchEngine::Native
@@ -4181,6 +4185,84 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     assert_eq!(*initialization, protocol::WorkbenchInitialization::Cold);
     let manifest_path = PathBuf::from(&manifest_path.0);
     let root = project.root_paths()[0].clone();
+    let (caller, caller_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("execution-path-caller".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&project),
+                prompt: "workbench caller".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    assert!(
+        caller_start.session_id.is_some(),
+        "MCP caller must acknowledge its persisted session before spawning a child"
+    );
+    fixture.finish_turn(&caller).await;
+    let caller = caller.new_agent;
+    eprintln!("BUBBLEWRAP FLOW MCP caller durable-and-idle");
+    for (path, cause) in [
+        (
+            "/mnt/tyde-workspace/../boundary-outside",
+            "parent traversal",
+        ),
+        (
+            "/mnt/tyde-workspace/dir/../../boundary-outside",
+            "parent traversal",
+        ),
+        ("/mnt/tyde-runtime/private", "Engine-only"),
+        ("/mnt//tyde-runtime/private", "Engine-only"),
+        ("/mnt/tyde-producer-receipts", "Engine-only"),
+        ("/mnt", "Engine-only"),
+    ] {
+        let (is_error, body) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_spawn_agent",
+            json!({
+                "workspace_roots": [path],
+                "prompt": "must not register an execution-only host root",
+                "backend_kind": "codex"
+            }),
+        )
+        .await;
+        assert!(
+            is_error && body.contains(cause),
+            "MCP must reject unrepresentable host paths before spawning"
+        );
+    }
+    let (is_error, _) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "workspace_roots": ["/mnt//tyde-workspace/./"],
+            "prompt": "inherit the explicitly mapped host workspace",
+            "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(!is_error, "MCP must map an ordinary logical workspace root");
+    let child = expect_kind(&mut fixture.client, FrameKind::NewAgent, "mapped MCP child")
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("mapped MCP child payload");
+    assert_eq!(child.workspace_roots, vec![root.0.clone()]);
+    assert_eq!(child.project_id, Some(project.id.clone()));
+    assert!(
+        child.parent_agent_id.as_ref() == Some(&caller.agent_id),
+        "MCP child must preserve its authenticated caller as parent"
+    );
     let (_, replay) = fixture.connect_with_bootstrap().await;
     assert!(
         replay.projects.iter().any(|entry| entry == &project),
@@ -4229,13 +4311,16 @@ output = root / 'build-output'
 output.mkdir()
 clone = output / 'private-copy.txt'
 before = source.read_text()
+with open('/dev/null', 'r+b', buffering=0) as device:
+    sample = b'native device probe'
+    devices = device.write(sample) == len(sample) and device.read(1) == b''
 subprocess.run(['cp', '--reflink=always', str(source), str(clone)], check=True)
 independent = clone.stat().st_ino != source.stat().st_ino
 clone.write_text('private artifact\n')
 private = independent and source.read_text() == before
 source.write_text('edited in engine terminal\n')
 # Frame machine-readable output after Bash's bracketed-paste CSI plus bare CR.
-print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private, 'devices': devices, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
 "#
     );
     fixture
@@ -4275,7 +4360,7 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
             .find(|value| value["boundary"] == "complete")
         {
             assert!(
-                ["cwd", "namespace", "cow", "generic"]
+                ["cwd", "namespace", "cow", "devices", "generic"]
                     .iter()
                     .all(|key| evidence[*key].as_bool() == Some(true)),
                 "actual terminal output must establish every isolation boundary"
@@ -4447,6 +4532,10 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
                 .parse_payload::<protocol::TerminalOutputPayload>()
                 .unwrap()
                 .data,
+        );
+        assert!(
+            !produced.contains("\"error\": {\"reason\":"),
+            "explicit producer emitted a typed runtime failure before completion"
         );
         if produced
             .lines()
@@ -4679,14 +4768,18 @@ os._exit(0)
         )
         .await
         .expect("execute real command");
-    let (mut service, _) = service_listener
-        .accept()
-        .await
-        .expect("owned service control connection");
-    let (mut descendant, _) = descendant_listener
-        .accept()
-        .await
-        .expect("owned descendant control connection");
+    let (mut service, _) = tokio::select! {
+        accepted = service_listener.accept() => accepted.expect("owned service control connection"),
+        event = next_frame_matching_on(&mut fixture.client, "service startup outcome", |event| {
+            event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
+        }) => panic!("runtime exited before its required service connected: {:?}", event.kind),
+    };
+    let (mut descendant, _) = tokio::select! {
+        accepted = descendant_listener.accept() => accepted.expect("owned descendant control connection"),
+        event = next_frame_matching_on(&mut fixture.client, "descendant startup outcome", |event| {
+            event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
+        }) => panic!("runtime exited before its owned descendant connected: {:?}", event.kind),
+    };
     assert_eq!(
         descendant
             .read_u8()

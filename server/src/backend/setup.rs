@@ -582,7 +582,8 @@ async fn probe_candidates(candidates: &[String]) -> ProbeResult {
 }
 
 async fn probe_command(command: &str) -> Result<Option<String>, VersionCommandFailure> {
-    let child_path = process_env::resolved_child_process_path().map(std::ffi::OsStr::to_os_string);
+    let child_path =
+        Some(process_env::launch::process_path().map_err(VersionCommandFailure::Start)?);
     let output = run_version_command_with_child_path(command, child_path).await?;
     let version = output
         .stdout

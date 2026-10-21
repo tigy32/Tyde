@@ -182,6 +182,13 @@ pub async fn prepare_workbench_environment(
 }
 
 #[cfg(feature = "test-support")]
+pub async fn seal_workbench_environment(project: &protocol::Project) -> Result<(), String> {
+    workbench::seal(project, false)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
 pub async fn finish_workbench_environment(
     environment: &protocol::WorkbenchEnvironment,
     discard_artifacts: bool,

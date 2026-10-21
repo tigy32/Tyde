@@ -668,7 +668,9 @@ pub(crate) fn install_file_drop_navigation_guard() {
 fn resolve_chat_file_href(href: &str, project: &protocol::Project) -> Option<ProjectPath> {
     let project_roots = project.root_paths();
     let decoded = percent_decode_path(href).unwrap_or_else(|| href.to_owned());
-    let normalized = project.host_path_for_runtime(&normalize_file_reference(&decoded)?)?;
+    let normalized = project
+        .host_path_for_runtime(&normalize_file_reference(&decoded)?)
+        .ok()?;
 
     if let Some(path) = project_path_from_absolute(&normalized, &project_roots) {
         return Some(path);

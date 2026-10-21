@@ -5832,24 +5832,66 @@ impl Project {
         }
     }
 
-    pub fn host_path_for_runtime(&self, path: &str) -> Option<String> {
+    pub fn execution_root_mapping(
+        &self,
+    ) -> Result<Option<(&ProjectRootPath, &ProjectRootPath)>, &'static str> {
         let ProjectSource::GitWorkbench {
             roots,
             environment: WorkbenchEnvironment::Bubblewrap { logical_root, .. },
             ..
         } = &self.source
         else {
-            return Some(path.to_owned());
+            return Ok(None);
         };
         let [root] = roots.as_slice() else {
-            return None;
+            return Err("Execution workspace requires one authoritative root");
         };
-        match path.strip_prefix(&logical_root.0) {
-            Some("") => Some(root.worktree_root.0.clone()),
-            Some(suffix) if suffix.starts_with('/') => {
-                Some(format!("{}{}", root.worktree_root.0, suffix))
+        for path in [&root.worktree_root.0, &logical_root.0] {
+            if !path.starts_with('/')
+                || path[1..]
+                    .split('/')
+                    .any(|component| matches!(component, "" | "." | ".."))
+            {
+                return Err("Execution workspace roots must be canonical absolute Linux paths");
             }
-            Some(_) | None => Some(path.to_owned()),
+        }
+        Ok(Some((&root.worktree_root, logical_root)))
+    }
+
+    pub fn host_path_for_runtime(&self, path: &str) -> Result<String, &'static str> {
+        let Some((host_root, logical_root)) = self.execution_root_mapping()? else {
+            return Ok(path.to_owned());
+        };
+        if path.split('/').any(|component| component == "..") {
+            return Err("Execution path with parent traversal has no authoritative host mapping");
+        }
+        let absolute;
+        let path = if path.starts_with('/') {
+            absolute = format!(
+                "/{}",
+                path.split('/')
+                    .filter(|component| !matches!(*component, "" | "."))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+            absolute.as_str()
+        } else {
+            path
+        };
+        if path == "/mnt"
+            || ["/mnt/tyde-runtime", "/mnt/tyde-producer-receipts"]
+                .iter()
+                .any(|root| {
+                    path.strip_prefix(root)
+                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                })
+        {
+            return Err("Engine-only execution path has no host workspace mapping");
+        }
+        match path.strip_prefix(&logical_root.0) {
+            Some("") => Ok(host_root.0.clone()),
+            Some(suffix) if suffix.starts_with('/') => Ok(format!("{}{}", host_root.0, suffix)),
+            Some(_) | None => Ok(path.to_owned()),
         }
     }
 
@@ -5945,7 +5987,6 @@ pub enum WorkbenchUnsupportedReason {
     RuntimeConfigurationInvalid,
     RuntimeServiceFailed,
     NestedNamespacesDenied,
-    UnsupportedBackend,
     UnsupportedRoots,
     IncompatibleEnvironment,
 }

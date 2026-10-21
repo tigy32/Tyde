@@ -46,7 +46,7 @@ impl HermesProfileRef {
 /// The Hermes home root: `HERMES_HOME` when set in the server's environment,
 /// else `~/.hermes`.
 pub(crate) fn hermes_home_dir() -> Result<PathBuf, String> {
-    if let Some(home) = std::env::var(HERMES_HOME_ENV)
+    if let Some(home) = tyde_process_env::launch::environment_var(HERMES_HOME_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
@@ -59,7 +59,7 @@ pub(crate) fn hermes_home_dir() -> Result<PathBuf, String> {
     // the gateway actually loads.
     #[cfg(windows)]
     {
-        if let Some(local_app_data) = std::env::var("LOCALAPPDATA")
+        if let Some(local_app_data) = tyde_process_env::launch::environment_var("LOCALAPPDATA")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
@@ -67,13 +67,13 @@ pub(crate) fn hermes_home_dir() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(local_app_data).join("hermes"));
         }
         // Hermes's own fallback when LOCALAPPDATA is absent.
-        return Ok(crate::paths::home_dir()?
+        return Ok(crate::paths::execution_home_dir()?
             .join("AppData")
             .join("Local")
             .join("hermes"));
     }
     #[cfg(not(windows))]
-    Ok(crate::paths::home_dir()?.join(".hermes"))
+    Ok(crate::paths::execution_home_dir()?.join(".hermes"))
 }
 
 /// Hermes's own profile-name grammar (`hermes_cli/profiles.py`):

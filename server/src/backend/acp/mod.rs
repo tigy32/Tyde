@@ -27,7 +27,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
-use crate::process_env;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 
@@ -92,6 +91,7 @@ pub enum AcpInbound {
         id: Value,
         method: String,
         params: Value,
+        origin: AcpRequestOrigin,
     },
     Stderr(String),
     Closed {
@@ -100,6 +100,38 @@ pub enum AcpInbound {
     Barrier {
         ack: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone)]
+pub struct AcpRequestOrigin {
+    execution: AcpRequestExecution,
+    stdin: AcpStdinWriter,
+}
+
+#[derive(Clone)]
+enum AcpRequestExecution {
+    Local(tyde_process_env::launch::ExecutionContext),
+    Remote,
+}
+
+impl AcpRequestOrigin {
+    async fn respond(&self, id: Value, result: Value) -> Result<(), String> {
+        self.stdin
+            .write_line(format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0", "id":id, "result":result})
+            ))
+            .await
+    }
+
+    async fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), String> {
+        self.stdin
+            .write_line(format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message}})
+            ))
+            .await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,20 +416,24 @@ impl AcpBridge {
 
     pub async fn handle_server_request(
         &self,
+        origin: &AcpRequestOrigin,
         id: Value,
         method: &str,
         params: &Value,
     ) -> Result<bool, String> {
-        let result = match self.handle_builtin_request(method, params).await {
+        let result = match self
+            .handle_builtin_request(&origin.execution, method, params)
+            .await
+        {
             Ok(Some(result)) => result,
             Ok(None) => return Ok(false),
             Err(err) => {
-                self.respond_error(id, -32_000, &err).await?;
+                origin.respond_error(id, -32_000, &err).await?;
                 return Ok(true);
             }
         };
 
-        self.respond(id, result).await?;
+        origin.respond(id, result).await?;
         Ok(true)
     }
 
@@ -420,23 +456,63 @@ impl AcpBridge {
 
     async fn handle_builtin_request(
         &self,
+        execution: &AcpRequestExecution,
         method: &str,
         params: &Value,
     ) -> Result<Option<Value>, String> {
-        match method {
-            "fs/read_text_file" => self.handle_fs_read_text_file(params).await.map(Some),
-            "fs/write_text_file" => self.handle_fs_write_text_file(params).await.map(Some),
-            "terminal/create" => self.handle_terminal_create(params).await.map(Some),
-            "terminal/output" => self.handle_terminal_output(params).await.map(Some),
-            "terminal/wait_for_exit" => self.handle_terminal_wait_for_exit(params).await.map(Some),
-            "terminal/kill" => self.handle_terminal_kill(params).await.map(Some),
-            "terminal/release" => self.handle_terminal_release(params).await.map(Some),
-            "session/request_permission" => self.handle_request_permission(params).await.map(Some),
+        match (execution, method) {
+            (
+                AcpRequestExecution::Remote,
+                "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+                | "terminal/output"
+                | "terminal/wait_for_exit"
+                | "terminal/kill"
+                | "terminal/release",
+            ) => {
+                tracing::warn!(
+                    method,
+                    "Rejected unsupported remote ACP filesystem or terminal callback"
+                );
+                Err("Remote ACP filesystem and terminal callbacks are unsupported".to_owned())
+            }
+            (AcpRequestExecution::Local(execution), "fs/read_text_file") => self
+                .handle_fs_read_text_file(execution, params)
+                .await
+                .map(Some),
+            (AcpRequestExecution::Local(execution), "fs/write_text_file") => self
+                .handle_fs_write_text_file(execution, params)
+                .await
+                .map(Some),
+            (AcpRequestExecution::Local(execution), "terminal/create") => self
+                .handle_terminal_create(execution, params)
+                .await
+                .map(Some),
+            (AcpRequestExecution::Local(_), "terminal/output") => {
+                self.handle_terminal_output(params).await.map(Some)
+            }
+            (AcpRequestExecution::Local(_), "terminal/wait_for_exit") => {
+                self.handle_terminal_wait_for_exit(params).await.map(Some)
+            }
+            (AcpRequestExecution::Local(_), "terminal/kill") => {
+                self.handle_terminal_kill(params).await.map(Some)
+            }
+            (AcpRequestExecution::Local(_), "terminal/release") => {
+                self.handle_terminal_release(params).await.map(Some)
+            }
+            (_, "session/request_permission") => {
+                self.handle_request_permission(params).await.map(Some)
+            }
             _ => Ok(None),
         }
     }
 
-    async fn handle_fs_read_text_file(&self, params: &Value) -> Result<Value, String> {
+    async fn handle_fs_read_text_file(
+        &self,
+        execution: &tyde_process_env::launch::ExecutionContext,
+        params: &Value,
+    ) -> Result<Value, String> {
         let path = params
             .get("path")
             .and_then(Value::as_str)
@@ -459,9 +535,13 @@ impl AcpBridge {
             .unwrap_or(ACP_DEFAULT_FILE_LINE_LIMIT as u64)
             .max(1) as usize;
 
-        let raw_bytes = tokio::fs::read(path)
-            .await
-            .map_err(|err| format!("Failed to read file '{path}': {err}"))?;
+        let read = execution.read(Path::new(path)).await;
+        tracing::info!(
+            route = ?execution.route(),
+            success = read.is_ok(),
+            "ACP caller filesystem read completed"
+        );
+        let raw_bytes = read.map_err(|err| format!("Failed to read file '{path}': {err}"))?;
         let content = String::from_utf8_lossy(&raw_bytes).to_string();
 
         let lines = content.lines().collect::<Vec<_>>();
@@ -482,7 +562,11 @@ impl AcpBridge {
         }))
     }
 
-    async fn handle_fs_write_text_file(&self, params: &Value) -> Result<Value, String> {
+    async fn handle_fs_write_text_file(
+        &self,
+        execution: &tyde_process_env::launch::ExecutionContext,
+        params: &Value,
+    ) -> Result<Value, String> {
         let path = params
             .get("path")
             .and_then(Value::as_str)
@@ -499,20 +583,22 @@ impl AcpBridge {
             .and_then(Value::as_str)
             .ok_or("fs/write_text_file requires string 'content'")?;
 
-        if let Some(parent) = Path::new(path).parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|err| format!("Failed to create parent directory for '{path}': {err}"))?;
-        }
-
-        tokio::fs::write(path, content)
-            .await
-            .map_err(|err| format!("Failed to write file '{path}': {err}"))?;
+        let written = execution.write(Path::new(path), content.as_bytes()).await;
+        tracing::info!(
+            route = ?execution.route(),
+            success = written.is_ok(),
+            "ACP caller filesystem write completed"
+        );
+        written.map_err(|err| format!("Failed to write file '{path}': {err}"))?;
 
         Ok(Value::Null)
     }
 
-    async fn handle_terminal_create(&self, params: &Value) -> Result<Value, String> {
+    async fn handle_terminal_create(
+        &self,
+        execution: &tyde_process_env::launch::ExecutionContext,
+        params: &Value,
+    ) -> Result<Value, String> {
         let command = params
             .get("command")
             .and_then(Value::as_str)
@@ -579,7 +665,7 @@ impl AcpBridge {
             .unwrap_or(ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT)
             .max(1);
 
-        let mut cmd = crate::backend::subprocess::command(command)?;
+        let mut cmd = execution.command(command)?;
         cmd.args(&args)
             .stdin(crate::backend::subprocess::ProcessStdio::Null)
             .stdout(crate::backend::subprocess::ProcessStdio::Piped)
@@ -596,6 +682,7 @@ impl AcpBridge {
             .group_spawn()
             .await
             .map_err(|err| format!("Failed to spawn terminal command '{command}': {err}"))?;
+        tracing::info!(route = ?execution.route(), "ACP caller command launched");
 
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
@@ -1496,24 +1583,22 @@ impl AcpRpc {
         ),
         String,
     > {
-        let mut child = if let Some(host) = ssh_host {
-            crate::remote::spawn_remote_process(
+        let (mut child, execution) = if let Some(host) = ssh_host {
+            let child = crate::remote::spawn_remote_process(
                 host,
                 &spec.remote_args[0],
                 &spec.remote_args[1..],
                 spec.remote_cwd.as_deref(),
             )
             .await
-            .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
+            .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?;
+            (child, AcpRequestExecution::Remote)
         } else {
             let mut cmd = crate::backend::subprocess::command(&spec.local_program)?;
             cmd.args(&spec.local_args)
                 .stdin(crate::backend::subprocess::ProcessStdio::Piped)
                 .stdout(crate::backend::subprocess::ProcessStdio::Piped)
                 .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-            if let Some(path) = process_env::resolved_child_process_path() {
-                cmd.env("PATH", path);
-            }
             cmd.envs(spec.local_env);
             if let Some(path) = spec
                 .local_cwd
@@ -1523,15 +1608,22 @@ impl AcpRpc {
             {
                 cmd.current_dir(path);
             }
-            cmd.group_spawn()
+            let (child, execution) = cmd
+                .group_spawn_with_execution()
                 .await
-                .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
+                .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?;
+            (child, AcpRequestExecution::Local(execution))
         };
 
         let stdin = child.take_stdin().ok_or("Failed to capture ACP stdin")?;
         let stdout = child.take_stdout().ok_or("Failed to capture ACP stdout")?;
         let stderr = child.take_stderr().ok_or("Failed to capture ACP stderr")?;
 
+        let input = AcpStdinWriter::spawn(stdin);
+        let request_origin = AcpRequestOrigin {
+            execution,
+            stdin: input.clone(),
+        };
         let child_ref = AcpChildOwner::spawn(child);
         let pending = PendingRpcMap::spawn(HashMap::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -1607,6 +1699,7 @@ impl AcpRpc {
                             id,
                             method: method.to_string(),
                             params,
+                            origin: request_origin.clone(),
                         });
                     } else {
                         let _ = stdout_inbound.send(AcpInbound::Notification {
@@ -1644,7 +1737,7 @@ impl AcpRpc {
 
         Ok((
             Self {
-                stdin: AcpStdinWriter::spawn(stdin),
+                stdin: input,
                 pending,
                 next_id: AtomicU64::new(1),
                 child: child_ref,

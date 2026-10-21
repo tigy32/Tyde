@@ -7,8 +7,6 @@
 //! no recognizable path becomes `Other` carrying its raw arguments, not a
 //! `ModifyFile` with an empty path.
 
-use std::path::Path;
-
 use serde_json::{Value, json};
 
 use super::AcpToolCallCompletion;
@@ -31,20 +29,6 @@ const EDIT_BEFORE_KEYS: &[&str] = &["oldStr", "old_str", "old_string", "oldStrin
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
-}
-
-/// Resolve a possibly-relative tool path against the workspace root.
-pub fn resolve_tool_file_path(file_path: &str, workspace_root: &str) -> String {
-    if file_path.is_empty() {
-        return String::new();
-    }
-    if Path::new(file_path).is_absolute() || workspace_root.is_empty() {
-        return file_path.to_string();
-    }
-    Path::new(workspace_root)
-        .join(file_path)
-        .to_string_lossy()
-        .to_string()
 }
 
 /// Collect the file paths an ACP `read` call refers to.
@@ -109,18 +93,10 @@ pub async fn default_map_tool_request(kind: &str, args: &Value, workspace_root: 
                 return other();
             };
             let after = first_str(args, EDIT_AFTER_KEYS).unwrap_or("").to_string();
-            let mut before = first_str(args, EDIT_BEFORE_KEYS).unwrap_or("").to_string();
-
-            // An agent that sends only the replacement text still produces a
-            // useful diff if we can read what is on disk right now.
-            let resolved = resolve_tool_file_path(file_path, workspace_root);
-            if before.is_empty()
-                && !resolved.is_empty()
-                && Path::new(&resolved).exists()
-                && let Ok(contents) = tokio::fs::read_to_string(&resolved).await
-            {
-                before = contents;
-            }
+            // Native execution can already have committed the edit. A host
+            // read cannot recover its previous contents or represent private
+            // runtime files; the native arguments own both sides of the card.
+            let before = first_str(args, EDIT_BEFORE_KEYS).unwrap_or("").to_string();
 
             json!({
                 "kind": "ModifyFile",

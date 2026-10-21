@@ -391,7 +391,7 @@ phases are intermediate catalog records, not a successful Delete: the reservatio
 remains held until required cleanup and the final deletion commit. Failed teardown
 retains that persisted phase for an explicit retry. Scheduled entry uses catalog
 binding reservations and owned settlement/retirement work, not a second per-parent
-catalog writer. Native remains the default; Bubblewrap eligibility and live-move
+catalog writer. Native remains the default; Bubblewrap prerequisites and live-move
 restrictions are unchanged.
 
 Watcher queue-loss catch-up invalidates file versions for files a client has

@@ -370,7 +370,7 @@ fn validate_http_mcp_configuration(
         .map(str::trim)
         .filter(|variable| !variable.is_empty())
     {
-        let token = std::env::var(variable).map_err(|error| {
+        let token = tyde_process_env::launch::environment_var(variable).map_err(|error| {
             format!(
                 "MCP server '{}' bearer token environment variable '{variable}' is unavailable: {error}",
                 server.name
@@ -440,15 +440,10 @@ pub struct BackendStorage {
 
 impl BackendStorage {
     pub fn new(overrides: HashMap<BackendKind, PathBuf>) -> Result<Self, String> {
-        let mut roots = HashMap::new();
         for kind in SUPPORTED_BACKENDS {
-            if let Some(root) =
-                resolve_storage_root(kind, overrides.get(&kind).map(PathBuf::as_path))?
-            {
-                roots.insert(kind, root);
-            }
+            resolve_storage_root(kind, overrides.get(&kind).map(PathBuf::as_path)).map(|_| ())?;
         }
-        Ok(Self { roots })
+        Ok(Self { roots: overrides })
     }
 
     pub(crate) fn root(&self, kind: BackendKind) -> Option<&std::path::Path> {
@@ -1107,6 +1102,8 @@ pub struct BackendProbeContext {
     pub workspace_roots: Vec<String>,
     pub launch: Option<protocol::AcpAgentSpec>,
     pub disabled_providers: HashMap<String, Vec<String>>,
+    /// Canonical host ownership for catalogs whose execution cwd is shared.
+    pub session_store: Option<Arc<crate::store::session::SessionStoreHandle>>,
 }
 
 impl BackendProbeContext {
@@ -1268,6 +1265,18 @@ pub trait Backend: Send + Sync + 'static {
     }
 
     fn discover(
+        context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = Result<BackendDiscovery, String>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            crate::workbench::prepare_backend_execution(context.launch.as_ref()).await?;
+            Self::discover_in_workspace(context).await
+        }
+    }
+
+    fn discover_in_workspace(
         context: &BackendProbeContext,
     ) -> impl std::future::Future<Output = Result<BackendDiscovery, String>> + Send
     where
@@ -1471,6 +1480,20 @@ pub trait Backend: Send + Sync + 'static {
         initial_input: SendMessagePayload,
     ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
     where
+        Self: Sized,
+    {
+        async move {
+            crate::workbench::prepare_backend_execution(config.acp_agent.as_ref()).await?;
+            Self::spawn_in_workspace(workspace_roots, config, initial_input).await
+        }
+    }
+
+    fn spawn_in_workspace(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: SendMessagePayload,
+    ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
+    where
         Self: Sized;
 
     /// Resume an existing backend session.
@@ -1489,6 +1512,20 @@ pub trait Backend: Send + Sync + 'static {
         session_id: SessionId,
     ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
     where
+        Self: Sized,
+    {
+        async move {
+            crate::workbench::prepare_backend_execution(config.acp_agent.as_ref()).await?;
+            Self::resume_in_workspace(workspace_roots, config, session_id).await
+        }
+    }
+
+    fn resume_in_workspace(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
+    where
         Self: Sized;
 
     /// Fork an existing backend-native session into a fresh independent
@@ -1500,10 +1537,68 @@ pub trait Backend: Send + Sync + 'static {
         initial_input: SendMessagePayload,
     ) -> impl std::future::Future<Output = Result<(Self, EventStream), BackendStartupError>> + Send
     where
+        Self: Sized,
+    {
+        async move {
+            crate::workbench::prepare_backend_execution(config.acp_agent.as_ref())
+                .await
+                .map_err(BackendStartupError::backend_failed)?;
+            Self::fork_in_workspace(workspace_roots, config, from_session_id, initial_input).await
+        }
+    }
+
+    fn fork_in_workspace(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: SessionId,
+        initial_input: SendMessagePayload,
+    ) -> impl std::future::Future<Output = Result<(Self, EventStream), BackendStartupError>> + Send
+    where
         Self: Sized;
 
     /// Enumerate resumable sessions known to this backend.
     fn list_sessions(
+        context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            let projected = match tyde_process_env::launch::current_project() {
+                Some(project) => project.execution_root_mapping()?.is_some(),
+                None => false,
+            };
+            if projected && context.session_store.is_none() {
+                return Err("Session listing requires canonical host ownership when execution paths are shared".to_owned());
+            }
+            crate::workbench::prepare_backend_execution(context.launch.as_ref()).await?;
+            let mut sessions = Self::list_sessions_in_workspace(context).await?;
+            let Some(store) = &context.session_store else {
+                return Ok(sessions);
+            };
+            let mut owners = HashMap::new();
+            for record in store.list().await? {
+                for binding in record.backend_bindings {
+                    let key = (binding.backend_kind, binding.provider_session_id);
+                    if let Some(roots) = owners.insert(key, record.workspace_roots.clone())
+                        && roots != record.workspace_roots
+                    {
+                        return Err(
+                            "Native session has conflicting canonical workspace owners".to_owned()
+                        );
+                    }
+                }
+            }
+            for session in &mut sessions {
+                if let Some(roots) = owners.get(&(session.backend_kind, session.id.clone())) {
+                    session.workspace_roots.clone_from(roots);
+                }
+            }
+            Ok(sessions)
+        }
+    }
+
+    fn list_sessions_in_workspace(
         context: &BackendProbeContext,
     ) -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
     where
@@ -1725,12 +1820,21 @@ pub(crate) fn session_workspace_roots(
 const WORKSPACE_CONTEXT_PREFIX: &str = "<tyde_workspace>\n";
 const WORKSPACE_CONTEXT_SUFFIX: &str = "\nThe JSON array above is the current ordered workspace root list. The first root is the default working directory; the other roots are additional project directories available to your tools by absolute path. This list replaces any workspace roots described in earlier turns. Follow applicable instructions in each directory when working there.\n</tyde_workspace>\n\n";
 
-pub(crate) fn workspace_prompt(message: &str, roots: Option<&[String]>) -> String {
+pub(crate) fn workspace_prompt(message: &str, roots: Option<&[String]>) -> Result<String, String> {
     let Some(roots) = roots else {
-        return message.to_owned();
+        return Ok(message.to_owned());
     };
-    let roots = serde_json::json!(roots);
-    format!("{WORKSPACE_CONTEXT_PREFIX}{roots}{WORKSPACE_CONTEXT_SUFFIX}{message}")
+    let roots = serde_json::json!(execution_workspace_roots(roots)?);
+    Ok(format!(
+        "{WORKSPACE_CONTEXT_PREFIX}{roots}{WORKSPACE_CONTEXT_SUFFIX}{message}"
+    ))
+}
+
+pub(crate) fn execution_workspace_roots(roots: &[String]) -> Result<Vec<String>, String> {
+    roots
+        .iter()
+        .map(|root| tyde_process_env::launch::WorkspacePath::host(root)?.execution_string())
+        .collect()
 }
 
 /// Whether `message` must reach the provider verbatim because it invokes one

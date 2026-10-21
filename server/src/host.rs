@@ -6507,7 +6507,7 @@ impl HostHandle {
                 None => None,
             };
             if let Some(project) = &execution_project {
-                crate::workbench::validate_backend(project, request.backend_kind)?;
+                crate::workbench::validate_execution(project)?;
             }
             let spawned = tyde_process_env::launch::project_scope_sync(execution_project, || {
                 state.registry.spawn(
@@ -7109,7 +7109,7 @@ impl HostHandle {
                 None => None,
             };
             if let Some(project) = &execution_project {
-                crate::workbench::validate_backend(project, request.backend_kind)?;
+                crate::workbench::validate_execution(project)?;
             }
             let spawned = tyde_process_env::launch::project_scope_sync(execution_project, || {
                 state.registry.spawn(
@@ -7601,14 +7601,42 @@ impl HostHandle {
         self.agent_project_id(agent_id).await
     }
 
-    async fn stop_project_services(&self, project_id: &ProjectId) -> AppResult<()> {
-        let subscription = {
-            let mut state = self.state.lock().await;
-            if let Some(mut router) = state.code_intel_routers.remove(project_id) {
-                router.shutdown_all();
-            }
-            state.project_streams.remove(project_id)
+    pub(crate) async fn host_path_for_agent(
+        &self,
+        agent_id: Option<&AgentId>,
+        path: &str,
+    ) -> Result<String, String> {
+        let Some(agent_id) = agent_id else {
+            return Ok(path.to_owned());
         };
+        let handle = self
+            .agent_handle(agent_id)
+            .await
+            .ok_or("Execution path caller is no longer registered")?;
+        let Some(project_id) = handle.snapshot().project_id else {
+            return Ok(path.to_owned());
+        };
+        let project = self
+            .project_catalog
+            .get(&project_id)
+            .ok_or("Execution path caller project no longer exists")?;
+        project.host_path_for_runtime(path).map_err(str::to_owned)
+    }
+
+    async fn stop_project_services(&self, project_id: &ProjectId) -> AppResult<()> {
+        let (router, subscription) = {
+            let mut state = self.state.lock().await;
+            (
+                state.code_intel_routers.remove(project_id),
+                state.project_streams.remove(project_id),
+            )
+        };
+        if let Some(router) = router {
+            router
+                .shutdown_and_join()
+                .await
+                .map_err(|error| AppError::internal("project_cleanup", anyhow!(error)))?;
+        }
         if let Some(mut subscription) = subscription {
             subscription.handle.shutdown();
             (&mut subscription.task)
@@ -10610,6 +10638,7 @@ impl HostHandle {
                         .and_then(|id| settings.launch_profiles.get(id))
                         .and_then(|profile| profile.acp.clone()),
                     disabled_providers: settings.hermes_disabled_providers.clone(),
+                    session_store: None,
                 };
                 let is_default_profile = custom_profile.is_none();
                 let result = match &root {

@@ -604,8 +604,19 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_create_project(
         &self,
-        Parameters(input): Parameters<CreateProjectToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        Parameters(mut input): Parameters<CreateProjectToolInput>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match self.host.config_mcp_caller(&parts).await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        for root in &mut input.roots {
+            *root = match self.host.host_path_for_agent(caller.as_ref(), root).await {
+                Ok(root) => root,
+                Err(error) => return Ok(err_text(error)),
+            };
+        }
         let payload = protocol::ProjectCreatePayload {
             name: input.name,
             roots: input
@@ -655,8 +666,21 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_add_project_root(
         &self,
-        Parameters(input): Parameters<ProjectRootToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        Parameters(mut input): Parameters<ProjectRootToolInput>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match self.host.config_mcp_caller(&parts).await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        input.root = match self
+            .host
+            .host_path_for_agent(caller.as_ref(), &input.root)
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => return Ok(err_text(error)),
+        };
         let id = protocol::ProjectId(input.project_id);
         let payload = protocol::ProjectAddRootPayload {
             id: id.clone(),
@@ -679,8 +703,21 @@ impl TydeConfigMcpServer {
     )]
     async fn tyde_config_remove_project_root(
         &self,
-        Parameters(input): Parameters<ProjectRootToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        Parameters(mut input): Parameters<ProjectRootToolInput>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match self.host.config_mcp_caller(&parts).await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        input.root = match self
+            .host
+            .host_path_for_agent(caller.as_ref(), &input.root)
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => return Ok(err_text(error)),
+        };
         let id = protocol::ProjectId(input.project_id);
         let payload = protocol::ProjectDeleteRootPayload {
             id: id.clone(),

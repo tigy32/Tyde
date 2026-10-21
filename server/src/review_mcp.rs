@@ -221,7 +221,7 @@ impl TydeReviewMcpServer {
     )]
     async fn read_review_git(
         &self,
-        Parameters(input): Parameters<ReviewerGitInput>,
+        Parameters(mut input): Parameters<ReviewerGitInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let (_, handle) = match self
@@ -236,6 +236,18 @@ impl TydeReviewMcpServer {
         }
         let roots = match handle.project_roots().await {
             Ok(roots) => roots,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let caller = match request_agent_id_from_parts(&parts) {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        input.root = match self
+            .host
+            .host_path_for_agent(caller.as_ref(), &input.root)
+            .await
+        {
+            Ok(root) => root,
             Err(error) => return Ok(err_text(error)),
         };
         if !roots.iter().any(|root| root.0 == input.root) {
@@ -317,7 +329,7 @@ impl TydeReviewMcpServer {
     )]
     async fn propose_review_comment(
         &self,
-        Parameters(input): Parameters<ProposeReviewCommentToolInput>,
+        Parameters(mut input): Parameters<ProposeReviewCommentToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let review_id_for_log = input.review_id.clone();
@@ -360,6 +372,14 @@ impl TydeReviewMcpServer {
             anchor_kind,
             "received review MCP proposal"
         );
+        input.location.root.0 = match self
+            .host
+            .host_path_for_agent(Some(&reviewer_agent_id), &input.location.root.0)
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => return Ok(err_text(error)),
+        };
         let review_id = input.review_id;
         let args = ProposeReviewCommentArgs {
             location: input.location,

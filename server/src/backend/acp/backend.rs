@@ -163,10 +163,15 @@ async fn await_kiro_stage<T>(
 /// ACP protocol version Tyde speaks.
 const ACP_CLIENT_PROTOCOL_VERSION: u32 = 1;
 
-fn acp_initialize_params(adapter: &dyn AcpAgentAdapter) -> Value {
+fn acp_initialize_params(adapter: &dyn AcpAgentAdapter, ssh_host: Option<&str>) -> Value {
+    let mut client_capabilities = adapter.client_capabilities();
+    if ssh_host.is_some() {
+        client_capabilities["fs"] = json!({"readTextFile": false, "writeTextFile": false});
+        client_capabilities["terminal"] = json!(false);
+    }
     json!({
         "protocolVersion": ACP_CLIENT_PROTOCOL_VERSION,
-        "clientCapabilities": adapter.client_capabilities(),
+        "clientCapabilities": client_capabilities,
         "clientInfo": {
             "name": "tyde",
             "title": "Tyde",
@@ -525,7 +530,10 @@ impl KiroSession {
         let initialize_response = await_kiro_stage(
             mode.probe_deadline,
             KiroSchemaProbeStage::Initialize,
-            bridge.request("initialize", acp_initialize_params(adapter.as_ref())),
+            bridge.request(
+                "initialize",
+                acp_initialize_params(adapter.as_ref(), mode.ssh_host.as_deref()),
+            ),
         )
         .await?;
         let mut capabilities = parse_capabilities(&initialize_response);
@@ -537,7 +545,7 @@ impl KiroSession {
 
         let session_result: Result<(String, Value), String> = async {
             let mut session_params = json!({
-                "cwd": roots.session_cwd,
+                "cwd": tyde_process_env::launch::WorkspacePath::host(&roots.session_cwd)?.execution_string()?,
                 "mcpServers": acp_mcp_servers_json(mode.startup_mcp_servers)
             });
             adapter.decorate_session_new(
@@ -836,9 +844,6 @@ pub(crate) async fn read_capacity_from_spec(
         command.args(&spec.local_args);
         if let Some(cwd) = spec.local_cwd.as_deref() {
             command.current_dir(cwd);
-        }
-        if let Some(path) = process_env::resolved_child_process_path() {
-            command.env("PATH", path);
         }
         command
             .stdin(crate::backend::subprocess::ProcessStdio::Null)
@@ -1316,7 +1321,10 @@ impl KiroInner {
                 .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let initialized = self
                 .bridge
-                .request("initialize", acp_initialize_params(self.adapter.as_ref()))
+                .request(
+                    "initialize",
+                    acp_initialize_params(self.adapter.as_ref(), None),
+                )
                 .await
                 .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let capabilities = parse_capabilities(&initialized);
@@ -1330,7 +1338,8 @@ impl KiroInner {
                 "session/load",
                 json!({
                     "sessionId": session_id,
-                    "cwd": cwd,
+                    "cwd": tyde_process_env::launch::WorkspacePath::host(cwd).and_then(|path| path.execution_string())
+                        .map_err(crate::backend::WorkspaceRelocationError::Rejected)?,
                     "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
                 }),
             )
@@ -1344,7 +1353,10 @@ impl KiroInner {
             .or_else(|| response.get("currentWorkingDirectory"))
             .or_else(|| response.pointer("/_meta/currentWorkingDirectory"))
             .and_then(Value::as_str)
-            && reported != cwd
+            && reported
+                != tyde_process_env::launch::WorkspacePath::host(cwd)
+                    .and_then(|path| path.execution_string())
+                    .map_err(crate::backend::WorkspaceRelocationError::Rejected)?
         {
             return Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(
                 format!(
@@ -1653,7 +1665,7 @@ impl KiroInner {
                             .with(|state| state.workspace_roots.clone())
                             .await
                             .as_deref(),
-                    )
+                    )?
                 };
                 let mut prompt_blocks = vec![json!({
                     "type": "text",
@@ -2009,7 +2021,10 @@ impl KiroInner {
         for page in 0..MAX_PAGES {
             let mut params = json!({});
             if !workspace_root.is_empty() {
-                params["cwd"] = Value::String(workspace_root.clone());
+                params["cwd"] = Value::String(
+                    tyde_process_env::launch::WorkspacePath::host(&workspace_root)?
+                        .execution_string()?,
+                );
             }
             if let Some(cursor) = &cursor {
                 params["cursor"] = Value::String(cursor.clone());
@@ -2165,7 +2180,7 @@ impl KiroInner {
                 "session/load",
                 json!({
                     "sessionId": session_id,
-                    "cwd": cwd,
+                    "cwd": tyde_process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?,
                     "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
                 }),
             )
@@ -2770,7 +2785,12 @@ std::ops::ControlFlow::Continue(())
             AcpInbound::Notification { method, params } => {
                 self.handle_notification(&method, &params).await;
             }
-            AcpInbound::ServerRequest { id, method, params } => {
+            AcpInbound::ServerRequest {
+                id,
+                method,
+                params,
+                origin,
+            } => {
                 if self.adapter.backend_kind() == protocol::BackendKind::Grok
                     && is_grok_exit_plan_mode_method(&method)
                 {
@@ -2787,18 +2807,18 @@ std::ops::ControlFlow::Continue(())
                 }
                 match self
                     .bridge
-                    .handle_server_request(id.clone(), &method, &params)
+                    .handle_server_request(&origin, id.clone(), &method, &params)
                     .await
                 {
                     Ok(true) => {}
                     Ok(false) => {
-                        let _ = self.bridge.respond(id, json!({ "ignored": true })).await;
+                        let _ = origin.respond(id, json!({ "ignored": true })).await;
                     }
                     Err(err) => {
                         self.emitter.subprocess_stderr(&format!(
                             "Failed to handle server request '{method}': {err}"
                         ));
-                        let _ = self.bridge.respond_error(id, -32_000, &err).await;
+                        let _ = origin.respond_error(id, -32_000, &err).await;
                     }
                 }
             }
@@ -3084,42 +3104,45 @@ std::ops::ControlFlow::Continue({
         self.emitter.tool_progress(&progress);
         let parent_emitter = Arc::clone(&self.emitter);
         self.state.apply(move |state| {
-            state.native_relay_tasks.spawn(async move {
-                let mut progress = progress;
-                while let Some(raw) = events_rx.recv().await {
-                    if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
-                        if let Some(data) = raw.get("data")
-                            && let Ok(usage) = serde_json::from_value(data.clone())
+            state
+                .native_relay_tasks
+                .spawn(crate::backend::subprocess::inherit_execution(async move {
+                    let mut progress = progress;
+                    while let Some(raw) = events_rx.recv().await {
+                        if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
                         {
-                            let _ = handle.model_usage_tx.send(usage);
-                        }
-                        continue;
-                    }
-                    if let Some(event) = map_kiro_value_to_chat_event(&raw) {
-                        if let protocol::ToolProgressUpdate::SubAgent(details) =
-                            &mut progress.update
-                        {
-                            match &event {
-                                protocol::ChatEvent::ToolRequest(request) => {
-                                    details.tool_calls += 1;
-                                    details.last_tool_name = Some(request.tool_name.clone());
-                                }
-                                protocol::ChatEvent::TypingStatusChanged(active) => {
-                                    details.completed = !active;
-                                    details.status = if *active {
-                                        protocol::SubAgentProgressStatus::Running
-                                    } else {
-                                        protocol::SubAgentProgressStatus::Completed
-                                    };
-                                }
-                                _ => {}
+                            if let Some(data) = raw.get("data")
+                                && let Ok(usage) = serde_json::from_value(data.clone())
+                            {
+                                let _ = handle.model_usage_tx.send(usage);
                             }
+                            continue;
                         }
-                        let _ = handle.event_tx.send(event);
-                        parent_emitter.tool_progress(&progress);
+                        if let Some(event) = map_kiro_value_to_chat_event(&raw) {
+                            if let protocol::ToolProgressUpdate::SubAgent(details) =
+                                &mut progress.update
+                            {
+                                match &event {
+                                    protocol::ChatEvent::ToolRequest(request) => {
+                                        details.tool_calls += 1;
+                                        details.last_tool_name = Some(request.tool_name.clone());
+                                    }
+                                    protocol::ChatEvent::TypingStatusChanged(active) => {
+                                        details.completed = !active;
+                                        details.status = if *active {
+                                            protocol::SubAgentProgressStatus::Running
+                                        } else {
+                                            protocol::SubAgentProgressStatus::Completed
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let _ = handle.event_tx.send(event);
+                            parent_emitter.tool_progress(&progress);
+                        }
                     }
-                }
-            });
+                }));
         });
         eprintln!("TYDE ACP NATIVE SESSION ROUTE registered=true");
         for (method, params) in pending {
@@ -5539,8 +5562,8 @@ fn kiro_plan_status_to_task_status(raw: &str) -> protocol::TaskStatus {
 }
 
 pub(crate) fn resolve_local_kiro_sessions_dir() -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
+    let home = tyde_process_env::launch::environment_var("HOME")
+        .or_else(|_| tyde_process_env::launch::environment_var("USERPROFILE"))
         .map_err(|_| "Could not determine home directory for Kiro sessions".to_string())?;
     Ok(std::path::PathBuf::from(home)
         .join(".kiro")
@@ -7642,7 +7665,7 @@ impl Backend for KiroBackend {
         true
     }
 
-    async fn discover(
+    async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<crate::backend::BackendDiscovery, String> {
         Ok(crate::backend::BackendDiscovery {
@@ -7742,7 +7765,7 @@ impl Backend for KiroBackend {
         self.command_handle.inner.begin_compaction(request).await
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
@@ -7927,7 +7950,7 @@ impl Backend for KiroBackend {
         ))
     }
 
-    async fn resume(
+    async fn resume_in_workspace(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
@@ -8105,7 +8128,7 @@ impl Backend for KiroBackend {
         ))
     }
 
-    async fn fork(
+    async fn fork_in_workspace(
         _workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
         _from_session_id: SessionId,
@@ -8116,7 +8139,7 @@ impl Backend for KiroBackend {
         ))
     }
 
-    async fn list_sessions(
+    async fn list_sessions_in_workspace(
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let adapter = context

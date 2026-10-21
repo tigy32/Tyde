@@ -68,7 +68,8 @@ impl MuseBackend {
             workspace_roots
         };
         let roots = super::validate_local_workspace_roots(roots)?;
-        let cwd = roots
+        let execution_roots = super::execution_workspace_roots(&roots)?;
+        let cwd = execution_roots
             .first()
             .ok_or("Muse requires a workspace root")?
             .clone();
@@ -113,6 +114,14 @@ impl MuseBackend {
             BackendAccessMode::EnforcedReadOnly => ":read-only",
             BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => ":unrestricted",
         };
+        tracing::info!(
+            host_roots = roots.len(),
+            execution_roots = execution_roots.len(),
+            cwd_projected = roots.first() != execution_roots.first(),
+            execution_scope_present = tyde_process_env::launch::current_project().is_some(),
+            startup_mcp_servers = config.startup_mcp_servers.len(),
+            "Muse native session workspace resolved"
+        );
         let mcp = mcp_config(&config.startup_mcp_servers)?;
         let command_id = command_id();
         let active_goal = match &source {
@@ -120,7 +129,7 @@ impl MuseBackend {
             Some(_) | None => false,
         };
         let mut opened: SessionResult = match &source {
-            None => connection.typed("session/start", json!({"commandId":command_id,"workspaceRoot":cwd,"workspaceRoots":roots,"modelId":model,"permissionProfile":profile,"config":mcp})).await?,
+            None => connection.typed("session/start", json!({"commandId":command_id,"workspaceRoot":cwd,"workspaceRoots":execution_roots,"modelId":model,"permissionProfile":profile,"config":mcp})).await?,
             Some(source) if fork => connection.typed("session/fork", json!({"commandId":command_id,"sessionId":source.0,"excludeItems":true})).await?,
             Some(source) if active_goal => {
                 // A resumed unfinished goal needs Muse's native idle wake.
@@ -211,7 +220,7 @@ impl MuseBackend {
             config,
         )?;
         actor.initialize(source.is_some() && !fork).await?;
-        let actor = tokio::spawn(actor.run(initial));
+        let actor = crate::backend::subprocess::spawn(actor.run(initial));
         Ok((
             Self {
                 session_id,
@@ -339,7 +348,9 @@ impl Backend for MuseBackend {
         validate_policy(policy, self::tools::admission_selection)
     }
 
-    async fn discover(context: &BackendProbeContext) -> Result<BackendDiscovery, String> {
+    async fn discover_in_workspace(
+        context: &BackendProbeContext,
+    ) -> Result<BackendDiscovery, String> {
         let program = context.program.as_deref().unwrap_or("muse");
         let (connection, _notifications, _host) = connect(
             program,
@@ -415,21 +426,21 @@ impl Backend for MuseBackend {
         })
     }
 
-    async fn spawn(
+    async fn spawn_in_workspace(
         roots: Vec<String>,
         config: BackendSpawnConfig,
         input: SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         Self::open(roots, config, None, Some(input), false).await
     }
-    async fn resume(
+    async fn resume_in_workspace(
         roots: Vec<String>,
         config: BackendSpawnConfig,
         id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         Self::open(roots, config, Some(id), None, false).await
     }
-    async fn fork(
+    async fn fork_in_workspace(
         roots: Vec<String>,
         config: BackendSpawnConfig,
         id: SessionId,
@@ -439,7 +450,9 @@ impl Backend for MuseBackend {
             .await
             .map_err(BackendStartupError::from)
     }
-    async fn list_sessions(context: &BackendProbeContext) -> Result<Vec<BackendSession>, String> {
+    async fn list_sessions_in_workspace(
+        context: &BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
@@ -457,6 +470,7 @@ impl Backend for MuseBackend {
             true,
         )
         .await?;
+        let execution_roots = super::execution_workspace_roots(&context.workspace_roots)?;
         let mut cursor = None::<String>;
         let mut sessions = Vec::new();
         loop {
@@ -470,7 +484,7 @@ impl Backend for MuseBackend {
                 if !context.workspace_roots.is_empty()
                     && roots
                         .first()
-                        .is_none_or(|root| !context.workspace_roots.contains(root))
+                        .is_none_or(|root| !execution_roots.contains(root))
                 {
                     continue;
                 }
@@ -704,7 +718,7 @@ fn mcp_config(servers: &[super::StartupMcpServer]) -> Result<Value, String> {
             super::StartupMcpTransport::Http{url,headers,bearer_token_env_var} => {
                 let mut headers = headers.clone();
                 if let Some(variable) = bearer_token_env_var {
-                    let token = std::env::var(variable)
+                    let token = tyde_process_env::launch::environment_var(variable)
                         .map_err(|_| "Muse MCP bearer-token environment variable is unavailable".to_owned())?;
                     headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
                     headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
@@ -947,9 +961,10 @@ async fn configured_mcp_selectors(config: &BackendSpawnConfig) -> Result<Vec<Str
             } => {
                 let mut headers = headers.clone();
                 if let Some(variable) = bearer_token_env_var {
-                    let token = std::env::var(variable).map_err(|_| {
-                        "Muse MCP bearer-token environment variable is unavailable".to_owned()
-                    })?;
+                    let token =
+                        tyde_process_env::launch::environment_var(variable).map_err(|_| {
+                            "Muse MCP bearer-token environment variable is unavailable".to_owned()
+                        })?;
                     headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
                     headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
                 }

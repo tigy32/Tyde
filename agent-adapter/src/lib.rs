@@ -83,7 +83,6 @@ macro_rules! exhaustive_capabilities {
 }
 
 exhaustive_capabilities! {
-    BubblewrapWorkbench,
     ListSessions,
     ResumeSession,
     SetWorkspaceRoots,

@@ -525,6 +525,7 @@ pub struct Harness<B: Backend> {
         protocol::WorkbenchEnvironment,
         std::path::PathBuf,
     )>,
+    bubblewrap_siblings: Vec<(protocol::WorkbenchEnvironment, std::path::PathBuf)>,
     pub config: BackendSpawnConfig,
     pub test_name: String,
     pub observer: std::sync::Arc<Observer>,
@@ -581,6 +582,7 @@ impl<B: Backend> Harness<B> {
             workspace,
             profile,
             workbench: None,
+            bubblewrap_siblings: Vec::new(),
             config,
             test_name: test_name.to_owned(),
             observer,
@@ -626,64 +628,153 @@ impl<B: Backend> Harness<B> {
         PROTOCOL_VIOLATIONS.with(|violations| violations.borrow().clone())
     }
 
-    pub async fn prepare_bubblewrap(&mut self) -> protocol::Project {
+    pub async fn prepare_bubblewrap(&mut self) -> (protocol::Project, protocol::Project) {
         assert!(self.backend.is_none(), "prepare before provider launch");
         std::fs::write(self.workspace().join(".gitignore"), "/build-output/\n")
             .expect("ignore private build output");
+        std::fs::create_dir(self.workspace().join(".tyde")).expect("project configuration");
+        std::fs::write(
+            self.workspace().join("build.py"),
+            r#"import hashlib, json, os
+from pathlib import Path
+
+assert os.getcwd() == '/mnt/tyde-workspace'
+source = Path('README.txt').read_bytes()
+identity = {'cwd': os.getcwd(), 'source': hashlib.sha256(source).hexdigest()}
+output = Path('build-output')
+fingerprint = output / 'fingerprint.json'
+artifact = output / 'private-copy.txt'
+reused = fingerprint.exists() and json.loads(fingerprint.read_text()) == identity and artifact.read_bytes() == source
+if not reused:
+    output.mkdir(exist_ok=True)
+    artifact.write_bytes(source)
+    fingerprint.write_text(json.dumps(identity))
+print(json.dumps({'reused': reused}))
+"#,
+        )
+        .expect("path-sensitive opaque build recipe");
+        let configuration = serde_json::json!({
+            "runtime_directories": ["private"],
+            "runtime_files": {"private/runtime-boundary.txt": "runtime-created\n"},
+            "snapshot": {
+                "producer": ["python3", "build.py"],
+                "include": ["build-output"],
+                "provenance_paths": ["/usr/bin/python3"],
+                "provenance_environment": []
+            }
+        });
+        std::fs::write(
+            self.workspace().join(".tyde/workbench.json"),
+            configuration.to_string(),
+        )
+        .expect("explicit language-agnostic snapshot configuration");
         init_workspace_repo(self.workspace());
         let directory = tempfile::tempdir().expect("environment parent");
-        let worktree = directory.path().join("worktree");
-        let status = std::process::Command::new("git")
-            .current_dir(self.workspace())
-            .args(["worktree", "add", "-q", "-b", "feature/bubblewrap"])
-            .arg(&worktree)
-            .status()
-            .expect("create conformance Git workbench");
+        let seed = prepare_bubblewrap_root(self.workspace.path(), directory.path(), "seed").await;
         assert!(
-            status.success(),
-            "create real Git workbench before engine preparation"
+            matches!(
+                workbench_environment(&seed),
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    initialization: protocol::WorkbenchInitialization::Cold,
+                    ..
+                }
+            ),
+            "the initial producer must not claim a preexisting snapshot"
         );
-        let environment =
-            server::prepare_workbench_environment(&worktree, &directory.path().join("environment"))
-                .await
-                .expect("real Bubblewrap engine must support the paid scenario");
-        let parent_root =
-            protocol::ProjectRootPath(self.workspace().to_string_lossy().into_owned());
-        let root = protocol::ProjectRootPath(worktree.to_string_lossy().into_owned());
-        let project = protocol::Project {
-            id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
-            name: "Bubblewrap conformance".to_owned(),
-            sort_order: 0,
-            source: protocol::ProjectSource::GitWorkbench {
-                parent_project_id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
-                branch: protocol::GitBranchName("feature/bubblewrap".to_owned()),
-                roots: vec![protocol::WorkbenchRoot {
-                    parent_root,
-                    worktree_root: root,
-                }],
-                environment: environment.clone(),
-            },
-        };
-        self.workbench = Some((directory, environment, worktree));
-        project
+        self.workbench = Some((
+            directory,
+            workbench_environment(&seed),
+            seed.root_paths()[0].0.clone().into(),
+        ));
+        let mut producer =
+            tyde_process_env::launch::command("/bin/sh").expect("generic producer command");
+        producer
+            .in_project(seed.clone())
+            .args(["-c", "/mnt/tyde-runtime/bin/tyde-workbench-produce"]);
+        let produced = producer
+            .output()
+            .await
+            .expect("explicit producer completion");
+        assert!(
+            produced.status.success(),
+            "stable-path producer failed: {}",
+            String::from_utf8_lossy(&produced.stderr)
+        );
+        server::seal_workbench_environment(&seed)
+            .await
+            .expect("seal actual producer artifacts");
+        let directory = &self.workbench.as_ref().expect("owned environment").0;
+        let primary =
+            prepare_bubblewrap_root(self.workspace.path(), directory.path(), "primary").await;
+        self.bubblewrap_siblings.push((
+            workbench_environment(&seed),
+            seed.root_paths()[0].0.clone().into(),
+        ));
+        let (_, environment, root) = self.workbench.as_mut().expect("owned environment");
+        *environment = workbench_environment(&primary);
+        *root = primary.root_paths()[0].0.clone().into();
+        let directory = &self.workbench.as_ref().expect("owned environment").0;
+        let peer = prepare_bubblewrap_root(self.workspace.path(), directory.path(), "peer").await;
+        assert!(
+            matches!(
+                workbench_environment(&peer),
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    initialization: protocol::WorkbenchInitialization::Snapshot { .. },
+                    ..
+                }
+            ),
+            "the peer must independently restore the sealed snapshot"
+        );
+        self.bubblewrap_siblings.push((
+            workbench_environment(&peer),
+            peer.root_paths()[0].0.clone().into(),
+        ));
+        (primary, peer)
+    }
+
+    pub fn bubblewrap_parent(&self) -> &Path {
+        self.workspace.path()
+    }
+
+    pub fn bubblewrap_peer(&self) -> &Path {
+        &self
+            .bubblewrap_siblings
+            .last()
+            .expect("second private workbench")
+            .1
     }
 
     pub async fn finish(&mut self) {
         self.shutdown().await;
         if let Some((directory, environment, worktree)) = self.workbench.take() {
-            server::finish_workbench_environment(&environment, true)
-                .await
-                .expect("remove real Bubblewrap environment after provider shutdown");
-            let status = std::process::Command::new("git")
-                .current_dir(self.workspace())
-                .args(["worktree", "remove", "--force"])
-                .arg(worktree)
-                .status()
-                .expect("remove conformance Git workbench");
-            assert!(
-                status.success(),
-                "remove real Git workbench after engine teardown"
-            );
+            self.bubblewrap_siblings.push((environment, worktree));
+            for (environment, worktree) in self.bubblewrap_siblings.drain(..) {
+                server::finish_workbench_environment(&environment, true)
+                    .await
+                    .expect("remove real Bubblewrap environment after provider shutdown");
+                let status = std::process::Command::new("git")
+                    .current_dir(self.workspace.path())
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&worktree)
+                    .status()
+                    .expect("remove conformance Git workbench");
+                assert!(
+                    status.success(),
+                    "remove real Git workbench after engine teardown"
+                );
+                if let protocol::WorkbenchEnvironment::Bubblewrap { manifest_path, .. } =
+                    environment
+                {
+                    assert!(
+                        !Path::new(&manifest_path.0)
+                            .parent()
+                            .expect("environment directory")
+                            .exists(),
+                        "owned runtime must be removed"
+                    );
+                }
+                assert!(!worktree.exists(), "owned worktree must be removed");
+            }
             drop(directory);
         }
         if let Some((service, task)) = self.control.take() {
@@ -734,10 +825,7 @@ impl<B: Backend> Harness<B> {
         let mut closing = Vec::new();
         if let Some(mut stream) = self.events.take() {
             loop {
-                match tokio::time::timeout(Duration::from_secs(30), stream.recv_backend())
-                    .await
-                    .expect("backend shutdown left its event stream open")
-                {
+                match stream.recv_backend().await {
                     Some(BackendEvent::Chat(event)) => closing.push(event),
                     Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_)) => {
                     }
@@ -749,6 +837,45 @@ impl<B: Backend> Harness<B> {
             }
         }
         closing
+    }
+}
+
+fn workbench_environment(project: &protocol::Project) -> protocol::WorkbenchEnvironment {
+    let protocol::ProjectSource::GitWorkbench { environment, .. } = &project.source else {
+        panic!("real fixture requires a workbench");
+    };
+    environment.clone()
+}
+
+async fn prepare_bubblewrap_root(parent: &Path, directory: &Path, name: &str) -> protocol::Project {
+    let root = directory.join(name);
+    let branch = format!("feature/bubblewrap-{name}");
+    let status = std::process::Command::new("git")
+        .current_dir(parent)
+        .args(["worktree", "add", "-q", "-b", &branch])
+        .arg(&root)
+        .status()
+        .expect("create conformance Git workbench");
+    assert!(status.success(), "create real Git workbench");
+    let environment = server::prepare_workbench_environment(
+        &root,
+        &directory.join(format!("environment-{name}")),
+    )
+    .await
+    .expect("real Bubblewrap prerequisites must be available");
+    protocol::Project {
+        id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
+        name: format!("Bubblewrap conformance {name}"),
+        sort_order: 0,
+        source: protocol::ProjectSource::GitWorkbench {
+            parent_project_id: protocol::ProjectId(uuid::Uuid::new_v4().to_string()),
+            branch: protocol::GitBranchName(branch),
+            roots: vec![protocol::WorkbenchRoot {
+                parent_root: protocol::ProjectRootPath(parent.to_string_lossy().into_owned()),
+                worktree_root: protocol::ProjectRootPath(root.to_string_lossy().into_owned()),
+            }],
+            environment,
+        },
     }
 }
 
