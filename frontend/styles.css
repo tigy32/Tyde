@@ -7010,6 +7010,29 @@ math merror {
     gap: var(--space-2);
 }
 
+.agents-panel .agent-card[data-agent-drop-kind="agent"] > .agent-card-top { cursor: grab; user-select: none; -webkit-user-select: none; }
+.agents-panel .agent-card[data-agent-drop-kind="agent"] > .agent-card-top button { cursor: pointer; }
+.agents-panel .agent-card-top input { cursor: text; user-select: text; -webkit-user-select: text; }
+.agents-panel[data-agent-dragging="true"],
+.agents-panel[data-agent-dragging="true"] * { cursor: grabbing; }
+.agent-card-grip { flex-shrink: 0; color: var(--text-tertiary); font-size: 16px; line-height: 1; }
+.agent-row-drag-preview {
+    position: fixed;
+    z-index: 10000;
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: min(240px, calc(100vw - 16px));
+    height: 32px;
+    padding: 5px 8px;
+    background: var(--surface-2);
+    color: var(--text-primary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 3px;
+    opacity: 1;
+}
+
 .agent-card-pin {
     display: inline-flex;
     align-items: center;

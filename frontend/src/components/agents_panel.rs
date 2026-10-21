@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use leptos::leptos_dom::helpers::{
+    AnimationFrameRequestHandle, request_animation_frame_with_handle,
+};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -578,21 +581,114 @@ struct SidebarAgentRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SidebarKeyboardTarget {
+enum SidebarDropTarget {
     Agent(SidebarAgentRef),
     Group(AgentGroupId),
     Ungroup,
 }
 
 #[derive(Clone)]
+struct AgentPointerDrag {
+    agent: SidebarAgentRef,
+    pointer_id: i32,
+    start: (i32, i32),
+    position: (i32, i32),
+    active: bool,
+    target: Option<SidebarDropTarget>,
+}
+
+fn pointer_drop_target(panel: &web_sys::Element, x: i32, y: i32) -> Option<SidebarDropTarget> {
+    let element = panel
+        .owner_document()?
+        .element_from_point(x as f32, y as f32)?;
+    if !panel.contains(Some(&element)) {
+        return None;
+    }
+    let target = element.closest("[data-agent-drop-kind]").ok()??;
+    match target.get_attribute("data-agent-drop-kind").as_deref() {
+        Some("agent") => Some(SidebarDropTarget::Agent(SidebarAgentRef {
+            host_id: target.get_attribute("data-agent-drop-host")?,
+            agent_id: AgentId(target.get_attribute("data-agent-drop-id")?),
+        })),
+        Some("group") => Some(SidebarDropTarget::Group(AgentGroupId(
+            target.get_attribute("data-group-id")?,
+        ))),
+        Some("ungroup") => Some(SidebarDropTarget::Ungroup),
+        _ => {
+            log::error!("invalid agent pointer drop target");
+            None
+        }
+    }
+}
+
+fn scroll_agent_pointer_drag(
+    panel_ref: NodeRef<leptos::html::Div>,
+    scroll_ref: NodeRef<leptos::html::Div>,
+    pointer_drag: RwSignal<Option<AgentPointerDrag>>,
+    frame: StoredValue<Option<AnimationFrameRequestHandle>>,
+    live_status: RwSignal<String>,
+) {
+    match request_animation_frame_with_handle(move || {
+        frame.set_value(None);
+        let Some(drag) = pointer_drag
+            .try_get_untracked()
+            .flatten()
+            .filter(|drag| drag.active)
+        else {
+            return;
+        };
+        let (Some(panel), Some(scrollport)) = (
+            panel_ref.try_get_untracked().flatten(),
+            scroll_ref.try_get_untracked().flatten(),
+        ) else {
+            return;
+        };
+        let rect = scrollport.get_bounding_client_rect();
+        let (x, y) = (f64::from(drag.position.0), f64::from(drag.position.1));
+        let shift =
+            if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
+                if y < rect.top() + 24.0 {
+                    -12
+                } else if y > rect.bottom() - 24.0 {
+                    12
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+        let before = scrollport.scroll_top();
+        scrollport.set_scroll_top(before + shift);
+        if scrollport.scroll_top() != before {
+            let target = pointer_drop_target(&panel, drag.position.0, drag.position.1);
+            pointer_drag.update(|current| {
+                if let Some(current) = current {
+                    current.target = target;
+                }
+            });
+        }
+        scroll_agent_pointer_drag(panel_ref, scroll_ref, pointer_drag, frame, live_status);
+    }) {
+        Ok(handle) => frame.set_value(Some(handle)),
+        Err(error) => {
+            log::error!("cannot schedule agent drag scrolling: {error:?}");
+            pointer_drag.set(None);
+            live_status
+                .set("Cannot move agent: browser animation frames are unavailable".to_owned());
+        }
+    }
+}
+
+#[derive(Clone)]
 struct AgentsPanelInteractions {
-    editing_agent: RwSignal<Option<protocol::AgentId>>,
+    editing_agent: RwSignal<Option<SidebarAgentRef>>,
     edit_value: RwSignal<String>,
     expanded_parents: RwSignal<HashSet<SidebarAgentRef>>,
     inactive_parents: RwSignal<HashSet<SidebarAgentRef>>,
-    dragged_agent: RwSignal<Option<SidebarAgentRef>>,
+    pointer_drag: RwSignal<Option<AgentPointerDrag>>,
+    suppress_pointer_click: RwSignal<bool>,
     keyboard_agent: RwSignal<Option<SidebarAgentRef>>,
-    keyboard_target: RwSignal<Option<SidebarKeyboardTarget>>,
+    keyboard_target: RwSignal<Option<SidebarDropTarget>>,
     pending_rename_group_name: RwSignal<Option<String>>,
     group_live_status: RwSignal<String>,
 }
@@ -1148,26 +1244,11 @@ fn focus_relative_drop_target(current: &web_sys::EventTarget, offset: i32) {
 
 fn render_ungroup_drop_target(
     state: AppState,
-    dragged_agent: RwSignal<Option<SidebarAgentRef>>,
     keyboard_agent: RwSignal<Option<SidebarAgentRef>>,
-    keyboard_target: RwSignal<Option<SidebarKeyboardTarget>>,
+    keyboard_target: RwSignal<Option<SidebarDropTarget>>,
     group_live_status: RwSignal<String>,
 ) -> impl IntoView {
-    let ungroup_drag_state = state.clone();
     let ungroup_keyboard_state = state;
-    let ungroup_on_dragover = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
-    };
-    let ungroup_on_drop = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
-        ev.stop_propagation();
-        drop_agent_on_ungroup(
-            &ungroup_drag_state,
-            dragged_agent.get_untracked(),
-            group_live_status,
-        );
-        dragged_agent.set(None);
-    };
     let ungroup_on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
         " " | "Enter" => {
             if let Some(agent) = keyboard_agent.get_untracked() {
@@ -1205,9 +1286,8 @@ fn render_ungroup_drop_target(
             data-agent-group-keyboard-target="true"
             aria-label="Ungroup selected agent"
             aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
-            on:focus=move |_| keyboard_target.set(Some(SidebarKeyboardTarget::Ungroup))
-            on:dragover=ungroup_on_dragover
-            on:drop=ungroup_on_drop
+            on:focus=move |_| keyboard_target.set(Some(SidebarDropTarget::Ungroup))
+            data-agent-drop-kind="ungroup"
             on:keydown=ungroup_on_keydown
         >
             "Ungroup"
@@ -1474,14 +1554,32 @@ pub fn AgentsPanel() -> impl IntoView {
     let inactive_parents = RwSignal::new(HashSet::new());
     // Editing state lives here so it survives agent list re-renders caused by
     // streaming / turn-active updates. Only one agent can be renamed at a time.
-    let editing_agent: RwSignal<Option<protocol::AgentId>> = RwSignal::new(None);
+    let editing_agent: RwSignal<Option<SidebarAgentRef>> = RwSignal::new(None);
     let edit_value: RwSignal<String> = RwSignal::new(String::new());
     let editing_group: RwSignal<Option<AgentGroupId>> = RwSignal::new(None);
     let group_edit_value: RwSignal<String> = RwSignal::new(String::new());
-    let dragged_agent: RwSignal<Option<SidebarAgentRef>> = RwSignal::new(None);
-    let drag_hover_group: RwSignal<Option<AgentGroupId>> = RwSignal::new(None);
+    let pointer_drag: RwSignal<Option<AgentPointerDrag>> = RwSignal::new(None);
+    let suppress_pointer_click = RwSignal::new(false);
+    let panel_ref = NodeRef::<leptos::html::Div>::new();
+    let scroll_ref = NodeRef::<leptos::html::Div>::new();
+    let scroll_frame = StoredValue::new(None::<AnimationFrameRequestHandle>);
+    let dragged_agent = Memo::new(move |_| {
+        pointer_drag.with(|drag| {
+            drag.as_ref()
+                .filter(|drag| drag.active)
+                .map(|drag| drag.agent.clone())
+        })
+    });
+    let drag_hover_group = Memo::new(move |_| {
+        pointer_drag.with(
+            |drag| match drag.as_ref().and_then(|drag| drag.target.as_ref()) {
+                Some(SidebarDropTarget::Group(group)) => Some(group.clone()),
+                _ => None,
+            },
+        )
+    });
     let keyboard_agent: RwSignal<Option<SidebarAgentRef>> = RwSignal::new(None);
-    let keyboard_target: RwSignal<Option<SidebarKeyboardTarget>> = RwSignal::new(None);
+    let keyboard_target: RwSignal<Option<SidebarDropTarget>> = RwSignal::new(None);
     let pending_rename_group_name: RwSignal<Option<String>> = RwSignal::new(None);
     let group_live_status: RwSignal<String> = RwSignal::new(String::new());
     let interactions = AgentsPanelInteractions {
@@ -1489,7 +1587,8 @@ pub fn AgentsPanel() -> impl IntoView {
         edit_value,
         expanded_parents,
         inactive_parents,
-        dragged_agent,
+        pointer_drag,
+        suppress_pointer_click,
         keyboard_agent,
         keyboard_target,
         pending_rename_group_name,
@@ -1648,6 +1747,113 @@ pub fn AgentsPanel() -> impl IntoView {
         projection
     });
 
+    Effect::new(move |_| {
+        let active = dragged_agent.get().is_some();
+        if let Some(frame) = scroll_frame.get_value() {
+            frame.cancel();
+            scroll_frame.set_value(None);
+        }
+        if active {
+            scroll_agent_pointer_drag(
+                panel_ref,
+                scroll_ref,
+                pointer_drag,
+                scroll_frame,
+                group_live_status,
+            );
+        }
+    });
+    let pointer_move = window_event_listener(leptos::ev::pointermove, move |ev| {
+        let Some(mut drag) = pointer_drag.get_untracked() else {
+            return;
+        };
+        if ev.pointer_id() != drag.pointer_id {
+            return;
+        }
+        if ev.buttons() & 1 == 0 {
+            pointer_drag.set(None);
+            return;
+        }
+        drag.position = (ev.client_x(), ev.client_y());
+        let dx = f64::from(drag.position.0) - f64::from(drag.start.0);
+        let dy = f64::from(drag.position.1) - f64::from(drag.start.1);
+        if !drag.active && dx * dx + dy * dy < 36.0 {
+            return;
+        }
+        ev.prevent_default();
+        drag.active = true;
+        suppress_pointer_click.set(true);
+        drag.target = panel_ref
+            .get_untracked()
+            .and_then(|panel| pointer_drop_target(&panel, ev.client_x(), ev.client_y()));
+        pointer_drag.set(Some(drag));
+    });
+    let pointer_drop_state = state.clone();
+    let pointer_up = window_event_listener(leptos::ev::pointerup, move |ev| {
+        let Some(drag) = pointer_drag.get_untracked() else {
+            return;
+        };
+        if ev.pointer_id() != drag.pointer_id || ev.button() != 0 {
+            return;
+        }
+        let target = panel_ref
+            .get_untracked()
+            .and_then(|panel| pointer_drop_target(&panel, ev.client_x(), ev.client_y()));
+        pointer_drag.set(None);
+        if !drag.active {
+            return;
+        }
+        ev.prevent_default();
+        match target {
+            Some(SidebarDropTarget::Agent(target)) => {
+                if let Some(target) = agent_for_ref(&pointer_drop_state, &target) {
+                    drop_agent_on_agent(
+                        &pointer_drop_state,
+                        Some(drag.agent),
+                        target,
+                        pending_rename_group_name,
+                        group_live_status,
+                    );
+                } else {
+                    group_live_status.set(
+                        "Destination agent is no longer available. Choose another destination."
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(SidebarDropTarget::Group(group)) => drop_agent_on_group(
+                &pointer_drop_state,
+                Some(drag.agent),
+                group,
+                group_live_status,
+            ),
+            Some(SidebarDropTarget::Ungroup) => {
+                drop_agent_on_ungroup(&pointer_drop_state, Some(drag.agent), group_live_status)
+            }
+            None => group_live_status.set("Move cancelled".to_owned()),
+        }
+    });
+    let pointer_cancel = window_event_listener(leptos::ev::pointercancel, move |ev| {
+        if pointer_drag.with_untracked(|drag| {
+            drag.as_ref()
+                .is_some_and(|drag| drag.pointer_id == ev.pointer_id())
+        }) {
+            pointer_drag.set(None);
+            group_live_status.set("Move cancelled".to_owned());
+        }
+    });
+    let pointer_blur = window_event_listener(leptos::ev::blur, move |_| pointer_drag.set(None));
+    on_cleanup(move || {
+        if let Some(frame) = scroll_frame.get_value() {
+            frame.cancel();
+        }
+        pointer_move.remove();
+        pointer_up.remove();
+        pointer_cancel.remove();
+        pointer_blur.remove();
+    });
+    let preview_state = state.clone();
+
     let on_search = move |ev: leptos::ev::Event| {
         let val = event_target_value(&ev);
         search.set(val);
@@ -1713,7 +1919,14 @@ pub fn AgentsPanel() -> impl IntoView {
     let toolbar_state = state.clone();
 
     view! {
-        <div class="panel agents-panel">
+        <div class="panel agents-panel" node_ref=panel_ref
+            data-agent-dragging=move || dragged_agent.get().is_some().to_string()
+            on:keydown:capture=move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Escape" && pointer_drag.get_untracked().is_some() {
+                    pointer_drag.set(None);
+                    group_live_status.set("Move cancelled".to_owned());
+                }
+            }>
             <div class="panel-search">
                 <input
                     type="text"
@@ -1779,7 +1992,7 @@ pub fn AgentsPanel() -> impl IntoView {
                 </div>
             </details>
             <AgentRestorationNotice />
-            <div class="panel-content">
+            <div class="panel-content" node_ref=scroll_ref>
                 {move || {
                     let projection = projection.get();
                     if projection.pinned.is_empty() && projection.hosts.is_empty() {
@@ -1796,7 +2009,6 @@ pub fn AgentsPanel() -> impl IntoView {
                             </section>
                         });
                         let hosts = projection.hosts.into_iter().map(|host| {
-                        let default_drop_state = state.clone();
                         let add_project_state = state.clone();
                         let add_project_host = host.key.clone();
                         let custom_groups = host.custom_groups;
@@ -1812,40 +2024,8 @@ pub fn AgentsPanel() -> impl IntoView {
                                             let folder_key = format!("group:{}", group_id.0);
                                             let member_count = custom_group.groups.iter().map(|group| group.member_count()).sum();
                                             let group_name = custom_group.group.name.clone();
-                                            let section_group_id = group_id.clone();
                                             let header_group_id = group_id.clone();
                                             let hover_class_group_id = group_id.clone();
-                                            let hover_enter_group_id = group_id.clone();
-                                            let hover_leave_group_id = group_id.clone();
-                                            let drop_state = state.clone();
-                                            let drop_dragged = dragged_agent;
-                                            let drop_status = group_live_status;
-                                            let hover_on_drop = drag_hover_group;
-                                            let on_group_dragenter = move |ev: web_sys::DragEvent| {
-                                                ev.prevent_default();
-                                                drag_hover_group.set(Some(hover_enter_group_id.clone()));
-                                            };
-                                            let on_group_dragleave = move |ev: web_sys::DragEvent| {
-                                                ev.prevent_default();
-                                                if drag_hover_group.with_untracked(|current| current.as_ref() == Some(&hover_leave_group_id)) {
-                                                    drag_hover_group.set(None);
-                                                }
-                                            };
-                                            let on_group_dragover = move |ev: web_sys::DragEvent| {
-                                                ev.prevent_default();
-                                            };
-                                            let on_group_drop = move |ev: web_sys::DragEvent| {
-                                                ev.prevent_default();
-                                                ev.stop_propagation();
-                                                drop_agent_on_group(
-                                                    &drop_state,
-                                                    drop_dragged.get_untracked(),
-                                                    section_group_id.clone(),
-                                                    drop_status,
-                                                );
-                                                drop_dragged.set(None);
-                                                hover_on_drop.set(None);
-                                            };
                                             let keyboard_state = state.clone();
                                             let keyboard_group_id = group_id.clone();
                                             let keyboard_status = group_live_status;
@@ -1914,14 +2094,11 @@ pub fn AgentsPanel() -> impl IntoView {
                                                             "agent-sidebar-custom-group"
                                                         }
                                                     }
+                                                    data-agent-drop-kind="group"
                                                     data-group-id=group_id_attr
-                                                    on:dragenter=on_group_dragenter
-                                                    on:dragleave=on_group_dragleave
-                                                    on:dragover=on_group_dragover
-                                                    on:drop=on_group_drop
                                                 >
                                                     <div
-                                                        class=move || if keyboard_target.get().as_ref() == Some(&SidebarKeyboardTarget::Group(header_class_group_id.clone())) {
+                                                        class=move || if keyboard_target.get().as_ref() == Some(&SidebarDropTarget::Group(header_class_group_id.clone())) {
                                                             "agent-sidebar-custom-group-header agent-group-keyboard-focus"
                                                         } else {
                                                             "agent-sidebar-custom-group-header"
@@ -1929,7 +2106,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                         tabindex="0"
                                                         data-agent-group-keyboard-target="true"
                                                         aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
-                                                        on:focus=move |_| keyboard_target.set(Some(SidebarKeyboardTarget::Group(header_focus_group_id.clone())))
+                                                        on:focus=move |_| keyboard_target.set(Some(SidebarDropTarget::Group(header_focus_group_id.clone())))
                                                         on:keydown=on_group_keydown
                                                     >
                                                         {move || {
@@ -2034,18 +2211,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                 </div>
                                 <div
                                     class="agent-sidebar-default-tree"
-                                    on:dragover=move |ev: web_sys::DragEvent| {
-                                        ev.prevent_default();
-                                    }
-                                    on:drop=move |ev: web_sys::DragEvent| {
-                                        ev.prevent_default();
-                                        drop_agent_on_ungroup(
-                                            &default_drop_state,
-                                            dragged_agent.get_untracked(),
-                                            group_live_status,
-                                        );
-                                        dragged_agent.set(None);
-                                    }
+                                    data-agent-drop-kind="ungroup"
                                 >
                                             {host.projects.into_iter().map(|project| {
                                                 let folder_key = format!("project:{}", project.key);
@@ -2085,7 +2251,6 @@ pub fn AgentsPanel() -> impl IntoView {
                                     if dragging_or_picking && has_custom_groups {
                                         render_ungroup_drop_target(
                                             ungroup_target_state.clone(),
-                                            dragged_agent,
                                             keyboard_agent,
                                             keyboard_target,
                                             group_live_status,
@@ -2099,6 +2264,18 @@ pub fn AgentsPanel() -> impl IntoView {
                     }
                 }}
             </div>
+            <leptos::portal::Portal>
+                {move || pointer_drag.get().filter(|drag| drag.active).and_then(|drag| {
+                    let agent = preview_state.agents.with(|agents| agents.iter().find(|agent| agent_ref(agent) == drag.agent).cloned())?;
+                    Some(view! {
+                        <div class="agent-row-drag-preview" aria-hidden="true"
+                            style=format!("left:clamp(8px, {}px, calc(100vw - 248px));top:clamp(8px, {}px, calc(100vh - 44px))", drag.position.0 + 14, drag.position.1 + 14)>
+                            <span class="agent-backend-glyph">{crate::components::launch_menu::backend_icon(agent.backend_kind)}</span>
+                            <span class="agent-card-name">{agent.name}</span>
+                        </div>
+                    })
+                })}
+            </leptos::portal::Portal>
             <Show when=move || launch_open.get()>
                 <leptos::portal::Portal><crate::components::launch_menu::LaunchChooser open_sig=launch_open project_context=launch_project /></leptos::portal::Portal>
             </Show>
@@ -2361,7 +2538,8 @@ fn agent_card(
     let editing_agent = interactions.editing_agent;
     let edit_value = interactions.edit_value;
     let expanded_parents = interactions.expanded_parents;
-    let dragged_agent = interactions.dragged_agent;
+    let pointer_drag = interactions.pointer_drag;
+    let suppress_pointer_click = interactions.suppress_pointer_click;
     let keyboard_agent = interactions.keyboard_agent;
     let keyboard_target = interactions.keyboard_target;
     let pending_rename_group_name = interactions.pending_rename_group_name;
@@ -2434,7 +2612,11 @@ fn agent_card(
 
     let click_state = state.clone();
     let click_agent = agent.clone();
-    let on_click = move |_: web_sys::MouseEvent| {
+    let on_click = move |ev: web_sys::MouseEvent| {
+        if ev.detail() > 0 && suppress_pointer_click.get_untracked() {
+            suppress_pointer_click.set(false);
+            return;
+        }
         // Switch to the agent's own project/host first, then open (and
         // activate) its chat tab; `active_agent` follows from the Memo over
         // `center_zone`. See `open_agent_chat` for the load-bearing ordering.
@@ -2452,39 +2634,35 @@ fn agent_card(
     };
 
     let drag_ref = agent_ref(&agent);
-    let drag_name = name.clone();
-    let on_dragstart = {
-        let drag_ref = drag_ref.clone();
-        let drag_name = drag_name.clone();
-        move |ev: web_sys::DragEvent| {
-            dragged_agent.set(Some(drag_ref.clone()));
-            group_live_status.set(format!("Moving {drag_name}"));
-            if let Some(data_transfer) = ev.data_transfer() {
-                data_transfer.set_effect_allowed("move");
-                let _ = data_transfer.set_data("text/plain", &drag_ref.agent_id.0);
-            }
+    let pointer_ref = drag_ref.clone();
+    let on_pointerdown = move |ev: web_sys::PointerEvent| {
+        suppress_pointer_click.set(false);
+        if ev.button() != 0 || !ev.is_primary() || ev.pointer_type() == "touch" {
+            return;
         }
-    };
-    let on_dragover_agent = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
-        ev.stop_propagation();
-    };
-    let drop_state = state.clone();
-    let drop_agent = agent.clone();
-    let on_drop_agent = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
-        ev.stop_propagation();
-        drop_agent_on_agent(
-            &drop_state,
-            dragged_agent.get_untracked(),
-            drop_agent.clone(),
-            pending_rename_group_name,
-            group_live_status,
-        );
-        dragged_agent.set(None);
-    };
-    let on_dragend = move |_: web_sys::DragEvent| {
-        dragged_agent.set(None);
+        let Some(target) = ev
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        if target
+            .closest("button, input, textarea, select, a, summary, .sidebar-card-details")
+            .ok()
+            .flatten()
+            .is_some()
+            || target.closest(".agent-card-top").ok().flatten().is_none()
+        {
+            return;
+        }
+        pointer_drag.set(Some(AgentPointerDrag {
+            agent: pointer_ref.clone(),
+            pointer_id: ev.pointer_id(),
+            start: (ev.client_x(), ev.client_y()),
+            position: (ev.client_x(), ev.client_y()),
+            active: false,
+            target: None,
+        }));
     };
 
     let move_handle_ref = drag_ref.clone();
@@ -2514,8 +2692,7 @@ fn agent_card(
                     }
                 } else {
                     keyboard_agent.set(Some(move_handle_ref.clone()));
-                    keyboard_target
-                        .set(Some(SidebarKeyboardTarget::Agent(move_handle_ref.clone())));
+                    keyboard_target.set(Some(SidebarDropTarget::Agent(move_handle_ref.clone())));
                     group_live_status.set(format!(
                         "Picked up {move_handle_name}. Move focus to a group, agent, or Ungroup and press Space or Enter."
                     ));
@@ -2539,7 +2716,7 @@ fn agent_card(
     };
     let move_focus_ref = drag_ref.clone();
     let on_move_handle_focus = move |_| {
-        keyboard_target.set(Some(SidebarKeyboardTarget::Agent(move_focus_ref.clone())));
+        keyboard_target.set(Some(SidebarDropTarget::Agent(move_focus_ref.clone())));
     };
     let move_click_name = name.clone();
     let class_drag_ref = drag_ref.clone();
@@ -2548,10 +2725,10 @@ fn agent_card(
 
     let input_ref = NodeRef::<leptos::html::Input>::new();
 
-    let agent_id_for_effect = agent_id.clone();
+    let edit_ref_for_effect = agent_ref(&agent);
     // Auto-focus and select-all when editing mode activates.
     Effect::new(move |_| {
-        if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_effect))
+        if editing_agent.with(|e| e.as_ref() == Some(&edit_ref_for_effect))
             && let Some(el) = input_ref.get()
         {
             let _ = el.focus();
@@ -2560,11 +2737,11 @@ fn agent_card(
     });
 
     let rename_name = name.clone();
-    let agent_id_for_rename = agent_id.clone();
+    let edit_ref_for_rename = agent_ref(&agent);
     let on_rename = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
         edit_value.set(rename_name.clone());
-        editing_agent.set(Some(agent_id_for_rename.clone()));
+        editing_agent.set(Some(edit_ref_for_rename.clone()));
     };
 
     let host_id_for_edit = agent.host_id.clone();
@@ -2693,7 +2870,7 @@ fn agent_card(
         move || state.compaction_errors.with(|m| m.get(&agent_id).cloned())
     };
 
-    let agent_id_for_editing_block = agent_id.clone();
+    let edit_ref_for_block = agent_ref(&agent);
     let card_anchor = NodeRef::<leptos::html::Div>::new();
     // The row is one line until the reader asks for more. Details and actions
     // live behind the chevron and behind right-click; neither appears on hover,
@@ -2713,7 +2890,7 @@ fn agent_card(
             group_live_status.set("Move cancelled".to_owned());
         } else {
             keyboard_agent.set(Some(menu_move_ref.clone()));
-            keyboard_target.set(Some(SidebarKeyboardTarget::Agent(menu_move_ref.clone())));
+            keyboard_target.set(Some(SidebarDropTarget::Agent(menu_move_ref.clone())));
             group_live_status.set(format!(
                 "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
                 menu_move_name
@@ -2768,7 +2945,7 @@ fn agent_card(
     view! {
         <div
             class=move || {
-                if keyboard_target.get().as_ref() == Some(&SidebarKeyboardTarget::Agent(class_drag_ref.clone())) {
+                if keyboard_target.get().as_ref() == Some(&SidebarDropTarget::Agent(class_drag_ref.clone())) {
                     "agent-card agent-group-keyboard-focus"
                 } else {
                     "agent-card"
@@ -2780,7 +2957,10 @@ fn agent_card(
             data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
-            draggable="true"
+            draggable="false"
+            data-agent-drop-kind="agent"
+            data-agent-drop-host=agent.host_id.clone()
+            data-agent-drop-id=agent.agent_id.0.clone()
             aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
             on:click=on_click
             on:contextmenu=move |ev: web_sys::MouseEvent| open_card_menu(card_menu, &ev)
@@ -2792,12 +2972,11 @@ fn agent_card(
                     on_keydown_card(ev);
                 }
             }
-            on:dragstart=on_dragstart
-            on:dragover=on_dragover_agent
-            on:drop=on_drop_agent
-            on:dragend=on_dragend
+            on:pointerdown=on_pointerdown
+            on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
         >
             <div class="agent-card-top">
+                <span class="agent-card-grip" aria-hidden="true" title="Drag agent to a group or onto another agent">"⠿"</span>
                 <button
                     type="button"
                     class="sidebar-card-expand"
@@ -2818,11 +2997,11 @@ fn agent_card(
 
                 <div class="agent-card-top-main">
                 {move || {
-                    if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_editing_block)) {
+                    if editing_agent.with(|e| e.as_ref() == Some(&edit_ref_for_block)) {
                         let host_id = host_id_for_edit.clone();
                         let stream = stream_for_edit.clone();
                         let compare = name.clone();
-                        let agent_id_for_blur = agent_id_for_editing_block.clone();
+                        let edit_ref_for_blur = edit_ref_for_block.clone();
                         let on_keydown = move |ev: web_sys::KeyboardEvent| {
                             ev.stop_propagation();
                             match ev.key().as_str() {
@@ -2856,7 +3035,7 @@ fn agent_card(
                             let compare = name.clone();
                             move |_: web_sys::FocusEvent| {
                                 // Guard against double-send when Enter already committed.
-                                if editing_agent.with_untracked(|e| e.as_ref() != Some(&agent_id_for_blur)) {
+                                if editing_agent.with_untracked(|e| e.as_ref() != Some(&edit_ref_for_blur)) {
                                     return;
                                 }
                                 let new_name = edit_value.get_untracked().trim().to_string();
@@ -3030,7 +3209,7 @@ fn agent_card(
                                 group_live_status.set("Move cancelled".to_owned());
                             } else {
                                 keyboard_agent.set(Some(click_drag_ref.clone()));
-                                keyboard_target.set(Some(SidebarKeyboardTarget::Agent(click_drag_ref.clone())));
+                                keyboard_target.set(Some(SidebarDropTarget::Agent(click_drag_ref.clone())));
                                 group_live_status.set(format!(
                                     "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
                                     move_click_name
@@ -3582,9 +3761,43 @@ mod wasm_tests {
         element.dispatch_event(&event).expect("dispatch event");
     }
 
-    fn dispatch_drag_event(element: &HtmlElement, event_name: &str) {
-        let event = web_sys::DragEvent::new(event_name).expect("drag event");
-        element.dispatch_event(&event).expect("dispatch drag event");
+    fn pointer_event(element: &web_sys::Element, name: &str, x: i32, y: i32) {
+        let init = web_sys::PointerEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_pointer_id(1);
+        init.set_pointer_type("mouse");
+        init.set_is_primary(true);
+        init.set_button(0);
+        init.set_buttons(if name == "pointerup" { 0 } else { 1 });
+        init.set_client_x(x);
+        init.set_client_y(y);
+        element
+            .dispatch_event(&web_sys::PointerEvent::new_with_event_init_dict(name, &init).unwrap())
+            .unwrap();
+    }
+
+    fn begin_agent_drag(card: &HtmlElement) {
+        let name = card.query_selector(".agent-card-name").unwrap().unwrap();
+        let rect = name.get_bounding_client_rect();
+        let x = rect.left() as i32 + 2;
+        let y = (rect.top() + rect.height() / 2.0) as i32;
+        pointer_event(&name, "pointerdown", x, y);
+        pointer_event(&name, "pointermove", x + 8, y);
+    }
+
+    fn finish_agent_drag(target: &HtmlElement) {
+        let rect = target.get_bounding_client_rect();
+        pointer_event(
+            target,
+            "pointerup",
+            (rect.left() + rect.width() / 2.0) as i32,
+            (rect.top() + rect.height() / 2.0) as i32,
+        );
+    }
+
+    fn cancel_agent_drag(card: &HtmlElement) {
+        pointer_event(card, "pointercancel", 0, 0);
     }
 
     /// A real right-click, at a real point in the viewport.
@@ -6612,7 +6825,7 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap();
-        dispatch_drag_event(&beta_card, "dragstart");
+        begin_agent_drag(&beta_card);
         next_tick().await;
         let group = container
             .query_selector("[data-group-id='review']")
@@ -6620,7 +6833,7 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap();
-        dispatch_drag_event(&group, "drop");
+        finish_agent_drag(&group);
         next_tick().await;
         assert_eq!(last_group_update_json(&calls)["kind"], "move_targets");
         assert!(state.active_agent.get_untracked().is_none());
@@ -7516,53 +7729,318 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn dragging_ungrouped_agent_onto_agent_sends_create_group() {
+    async fn agent_pointer_drag_keeps_one_row_and_exact_group_targets() {
         let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
         apply_group_snapshot(&state, AgentGroupsSnapshot::default());
-
-        let _handle = mount_panel(&container, state);
-        for _ in 0..4 {
-            next_tick().await;
-        }
+        state.agents_view_preferences.update(|snapshot| {
+            snapshot.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects
+        });
+        push_agent_with_scope(
+            &state,
+            "remote",
+            "parent-alpha",
+            "Other-host parent",
+            true,
+            Some("gamma"),
+            None,
+        );
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
         assert!(
             container
                 .query_selector(".agent-ungroup-drop-target")
                 .unwrap()
                 .is_none(),
-            "Ungroup target should stay hidden when there are no custom groups"
+            "Ungroup stays hidden when there are no custom groups"
+        );
+        let beta = agent_card_el(&container, "beta-agent");
+        let name = beta.query_selector(".agent-card-name").unwrap().unwrap();
+        let rect = name.get_bounding_client_rect();
+        let x = rect.left() as i32 + 2;
+        let y = (rect.top() + rect.height() / 2.0) as i32;
+        pointer_event(&name, "pointerdown", x, y);
+        pointer_event(&name, "pointermove", x + 3, y + 3);
+        next_tick().await;
+        let document = container.owner_document().unwrap();
+        assert!(
+            document
+                .query_selector(".agent-row-drag-preview")
+                .unwrap()
+                .is_none(),
+            "Small pointer motion is still an ordinary click"
+        );
+        pointer_event(&name, "pointerup", x + 3, y + 3);
+        name.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id.0,
+            "beta-agent"
+        );
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .all(|(kind, _, _)| kind != "set_agent_groups")
         );
 
-        let beta_card: HtmlElement = container
-            .query_selector("[data-agent-id='beta-agent'] .agent-card")
+        let parent = agent_card_el(&container, "parent-alpha");
+        expand_row(&container, "parent-alpha");
+        parent
+            .query_selector("[aria-label='Rename agent']")
             .unwrap()
-            .expect("beta card")
-            .dyn_into()
-            .unwrap();
-        let parent_card: HtmlElement = container
-            .query_selector("[data-agent-id='parent-alpha'] .agent-card")
             .unwrap()
-            .expect("parent card")
-            .dyn_into()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".agent-card-name-input")
+                .unwrap()
+                .length(),
+            1,
+            "Only the intended host's row enters inline editing"
+        );
+        let input = parent
+            .query_selector(".agent-card-name-input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
             .unwrap();
-        dispatch_drag_event(&beta_card, "dragstart");
-        dispatch_drag_event(&parent_card, "drop");
-        for _ in 0..4 {
-            next_tick().await;
-        }
+        assert_eq!(
+            document.active_element().unwrap(),
+            input.clone().dyn_into::<web_sys::Element>().unwrap()
+        );
+        dispatch_key(&input, "Escape");
+        next_tick().await;
+        begin_agent_drag(&parent);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".agent-ungroup-drop-target")
+                .unwrap()
+                .is_none(),
+            "A held drag cannot reveal Ungroup without custom groups"
+        );
+        let preview = document
+            .query_selector(".agent-row-drag-preview")
+            .unwrap()
+            .expect("one held preview");
+        assert_eq!(
+            document
+                .query_selector_all(".agent-row-drag-preview")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert_eq!(
+            preview.dyn_ref::<HtmlElement>().unwrap().inner_text(),
+            "Parent Alpha Agent"
+        );
+        let size = preview.get_bounding_client_rect();
+        assert!(
+            size.height() <= 36.0 && size.width() <= 242.0,
+            "Expanded metadata and child rows must not enter the preview"
+        );
+        let style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&preview)
+            .unwrap()
+            .unwrap();
+        assert_eq!(style.get_property_value("opacity").unwrap(), "1");
+        assert!(
+            !style
+                .get_property_value("background-color")
+                .unwrap()
+                .contains("rgba"),
+            "Preview background is opaque"
+        );
+        assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+        dispatch_key(&parent, "Escape");
+        next_tick().await;
+        assert!(
+            document
+                .query_selector(".agent-row-drag-preview")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id.0,
+            "beta-agent",
+            "Cancelling a move cannot open its source"
+        );
 
+        begin_agent_drag(&beta);
+        finish_agent_drag(&parent);
+        next_tick().await;
         let update = last_group_update_json(&calls);
         assert_eq!(update["kind"], "create_group");
-        assert_eq!(update["targets"].as_array().expect("targets").len(), 2);
-        assert!(
-            update["name"]
-                .as_str()
-                .expect("name")
-                .contains("Beta Agent"),
-            "new group should receive an automatic member-based name: {update:?}"
+        assert_eq!(
+            update["targets"],
+            serde_json::json!([local_target("beta-agent"), local_target("parent-alpha")])
         );
+        assert!(update["name"].as_str().unwrap().contains("Beta Agent"));
+        assert!(
+            document
+                .query_selector(".agent-row-drag-preview")
+                .unwrap()
+                .is_none()
+        );
+
+        let agents_before_removal = state.agents.get_untracked();
+        let command_count = recorded_frames(&calls)
+            .iter()
+            .filter(|(kind, _, _)| kind == "set_agent_groups")
+            .count();
+        begin_agent_drag(&beta);
+        state.agents.update(|agents| {
+            agents.retain(|agent| !(agent.host_id == "local" && agent.agent_id.0 == "parent-alpha"))
+        });
+        finish_agent_drag(&parent);
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Destination agent is no longer available. Choose another destination.")
+        );
+        assert_eq!(
+            recorded_frames(&calls)
+                .iter()
+                .filter(|(kind, _, _)| kind == "set_agent_groups")
+                .count(),
+            command_count
+        );
+        state.agents.set(agents_before_removal);
+        next_tick().await;
+
+        apply_group_snapshot(&state, assigned_group("review", "Review", &["beta-agent"]));
+        state.agents_view_preferences.update(|snapshot| {
+            snapshot.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects
+        });
+        next_tick().await;
+        let parent = agent_card_el(&container, "parent-alpha");
+        let group = container
+            .query_selector("[data-group-id='review']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        begin_agent_drag(&parent);
+        finish_agent_drag(&group);
+        next_tick().await;
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "move_targets");
+        assert_eq!(update["group_id"], "review");
+        assert_eq!(
+            update["targets"],
+            serde_json::json!([local_target("parent-alpha")])
+        );
+        assert!(
+            state
+                .agents
+                .with_untracked(|agents| agents.iter().any(|agent| agent.agent_id.0
+                    == "child-alpha"
+                    && agent
+                        .parent_agent_id
+                        .as_ref()
+                        .is_some_and(|id| id.0 == "parent-alpha"))),
+            "Moving the displayed parent leaves child lifecycle ownership intact"
+        );
+        for index in 0..12 {
+            push_agent_with_scope(
+                &state,
+                "local",
+                &format!("edge-{index}"),
+                &format!("Edge member {index}"),
+                true,
+                Some("alpha"),
+                None,
+            );
+        }
+        next_tick().await;
+        let scroll = container
+            .query_selector(".panel-content")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        scroll
+            .set_attribute("style", "flex:none;height:180px;overflow:auto")
+            .unwrap();
+        scroll.set_scroll_top(0);
+        let group = container
+            .query_selector("[data-group-id='review'] > .agent-sidebar-custom-group-header")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let viewport = scroll.get_bounding_client_rect();
+        assert!(
+            group.get_bounding_client_rect().top() > viewport.bottom(),
+            "The destination starts below the visible list"
+        );
+        js_sys::eval("window.__agentFrames = new Map(); window.__agentFrameId = 0; window.__agentOriginalRaf = window.requestAnimationFrame; window.__agentOriginalCancel = window.cancelAnimationFrame; window.requestAnimationFrame = callback => { const id = ++window.__agentFrameId; window.__agentFrames.set(id, callback); return id; }; window.cancelAnimationFrame = id => window.__agentFrames.delete(id); window.__agentTick = () => { const callbacks = [...window.__agentFrames.values()]; window.__agentFrames.clear(); callbacks.forEach(callback => callback(0)); };").unwrap();
+        struct FrameClock;
+        impl Drop for FrameClock {
+            fn drop(&mut self) {
+                js_sys::eval("window.requestAnimationFrame = window.__agentOriginalRaf; window.cancelAnimationFrame = window.__agentOriginalCancel; delete window.__agentFrames; delete window.__agentTick; delete window.__agentOriginalRaf; delete window.__agentOriginalCancel; delete window.__agentFrameId;").unwrap();
+            }
+        }
+        let clock = FrameClock;
+        let before_edge_commands = recorded_frames(&calls)
+            .iter()
+            .filter(|(kind, _, _)| kind == "set_agent_groups")
+            .count();
+        let parent = agent_card_el(&container, "parent-alpha");
+        begin_agent_drag(&parent);
+        pointer_event(
+            &parent,
+            "pointermove",
+            (viewport.right() - 8.0) as i32,
+            (viewport.bottom() - 2.0) as i32,
+        );
+        next_tick().await;
+        let mut visible = false;
+        for _ in 0..(scroll.scroll_height() / 12 + 2) {
+            js_sys::eval("window.__agentTick()").unwrap();
+            let rect = group.get_bounding_client_rect();
+            if rect.top() >= viewport.top() && rect.bottom() <= viewport.bottom() {
+                visible = true;
+                break;
+            }
+        }
+        assert!(
+            visible && scroll.scroll_top() > 0,
+            "Held edge scrolling reveals the destination without a wheel or real-time wait"
+        );
+        finish_agent_drag(&group);
+        next_tick().await;
+        assert_eq!(
+            recorded_frames(&calls)
+                .iter()
+                .filter(|(kind, _, _)| kind == "set_agent_groups")
+                .count(),
+            before_edge_commands + 1,
+            "The offscreen drop must submit a new command"
+        );
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "move_targets");
+        assert_eq!(update["group_id"], "review");
+        assert_eq!(
+            update["targets"],
+            serde_json::json!([local_target("parent-alpha")])
+        );
+        let settled_scroll = scroll.scroll_top();
+        js_sys::eval("window.__agentTick()").unwrap();
+        assert_eq!(
+            scroll.scroll_top(),
+            settled_scroll,
+            "Dropping cancels the scroll frame"
+        );
+        drop(clock);
     }
 
     #[wasm_bindgen_test]
@@ -7698,14 +8176,14 @@ mod wasm_tests {
         );
 
         // Case 2: an active mouse drag with groups present -> exactly 1 target.
-        // Drag a default-tree (ungrouped) agent so the card is draggable.
+        // Start a default-tree agent through its row body.
         let parent_card: HtmlElement = container
             .query_selector("[data-agent-id='parent-alpha'] .agent-card")
             .unwrap()
             .expect("parent card")
             .dyn_into()
             .unwrap();
-        dispatch_drag_event(&parent_card, "dragstart");
+        begin_agent_drag(&parent_card);
         for _ in 0..4 {
             next_tick().await;
         }
@@ -7716,7 +8194,7 @@ mod wasm_tests {
         );
 
         // Ending the drag tears the target back down.
-        dispatch_drag_event(&parent_card, "dragend");
+        cancel_agent_drag(&parent_card);
         for _ in 0..4 {
             next_tick().await;
         }

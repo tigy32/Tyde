@@ -195,7 +195,9 @@ async fn call_agent_control_request(
         None => config,
     };
     let transport = StreamableHttpClientTransport::from_config(config);
+    eprintln!("WORKBENCH MCP tool={name} phase=connecting");
     let service = ().serve(transport).await.expect("connect agent-control MCP");
+    eprintln!("WORKBENCH MCP tool={name} phase=awaiting-tool-result");
     let result = service
         .call_tool(CallToolRequestParams {
             meta: None,
@@ -205,11 +207,13 @@ async fn call_agent_control_request(
         })
         .await
         .expect("call agent-control tool");
+    eprintln!("WORKBENCH MCP tool={name} phase=tool-result-received");
     let RawContent::Text(text) = &result.content.first().expect("tool content").raw else {
         panic!("expected text tool result")
     };
     let response = (result.is_error.unwrap_or(false), text.text.clone());
     service.cancel().await.expect("cancel MCP client");
+    eprintln!("WORKBENCH MCP tool={name} phase=client-cancelled");
     response
 }
 
@@ -4243,6 +4247,7 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
             "MCP must reject unrepresentable host paths before spawning"
         );
     }
+    eprintln!("BUBBLEWRAP FLOW mapped-child MCP requested");
     let (is_error, _) = call_agent_control(
         &fixture,
         &caller.agent_id,
@@ -4255,6 +4260,7 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     )
     .await;
     assert!(!is_error, "MCP must map an ordinary logical workspace root");
+    eprintln!("BUBBLEWRAP FLOW mapped-child MCP returned; awaiting NewAgent");
     let child = expect_kind(&mut fixture.client, FrameKind::NewAgent, "mapped MCP child")
         .await
         .parse_payload::<NewAgentPayload>()
@@ -4265,11 +4271,13 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         child.parent_agent_id.as_ref() == Some(&caller.agent_id),
         "MCP child must preserve its authenticated caller as parent"
     );
+    eprintln!("BUBBLEWRAP FLOW mapped-child NewAgent received; awaiting host replay");
     let (_, replay) = fixture.connect_with_bootstrap().await;
     assert!(
         replay.projects.iter().any(|entry| entry == &project),
         "replay must carry the same typed environment and host root"
     );
+    eprintln!("BUBBLEWRAP FLOW host replay verified; requesting engine terminal");
     fixture
         .client
         .terminal_create(TerminalCreatePayload {
@@ -4283,22 +4291,38 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         })
         .await
         .expect("create real engine terminal");
-    let terminal = expect_kind(
-        &mut fixture.client,
+    eprintln!("BUBBLEWRAP FLOW engine terminal request sent; awaiting NewTerminal");
+    let terminal = next_frame_matching_on(&mut fixture.client, "engine terminal", |env| {
+        matches!(env.kind, FrameKind::NewTerminal | FrameKind::CommandError)
+    })
+    .await;
+    assert_eq!(
+        terminal.kind,
         FrameKind::NewTerminal,
-        "engine terminal",
-    )
-    .await
-    .parse_payload::<NewTerminalPayload>()
-    .unwrap();
-    let bootstrap = expect_kind(
-        &mut fixture.client,
+        "engine terminal creation must succeed"
+    );
+    let terminal = terminal.parse_payload::<NewTerminalPayload>().unwrap();
+    eprintln!("BUBBLEWRAP FLOW NewTerminal received; awaiting TerminalBootstrap");
+    let bootstrap =
+        next_frame_matching_on(&mut fixture.client, "engine terminal bootstrap", |env| {
+            env.stream == terminal.stream
+                && matches!(
+                    env.kind,
+                    FrameKind::TerminalBootstrap
+                        | FrameKind::TerminalError
+                        | FrameKind::TerminalExit
+                )
+        })
+        .await;
+    assert_eq!(
+        bootstrap.kind,
         FrameKind::TerminalBootstrap,
-        "engine terminal bootstrap",
-    )
-    .await
-    .parse_payload::<protocol::TerminalBootstrapPayload>()
-    .unwrap();
+        "engine terminal must bootstrap"
+    );
+    let bootstrap = bootstrap
+        .parse_payload::<protocol::TerminalBootstrapPayload>()
+        .unwrap();
+    eprintln!("BUBBLEWRAP FLOW TerminalBootstrap received");
     assert_eq!(bootstrap.start.project_id, Some(project.id.clone()));
     assert_eq!(bootstrap.start.root, Some(root.clone()));
     let host_namespace = fs::read_link("/proc/self/ns/mnt")
@@ -4330,11 +4354,12 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
         .terminal_send(
             &terminal.terminal_id,
             protocol::TerminalSendPayload {
-                data: format!("python3 - <<'TYDE_BOUNDARY_PY'\n{script}TYDE_BOUNDARY_PY\n"),
+                data: format!("python3 - <<'TYDE_BOUNDARY_PY'\n{script}TYDE_BOUNDARY_PY\nstatus=$?; printf '\\n{{\"boundary_command_finished\":%s}}\\n' \"$status\"\n"),
             },
         )
         .await
         .expect("run namespace boundary command");
+    eprintln!("BUBBLEWRAP FLOW boundary command sent; awaiting completion record");
     let mut output = String::new();
     loop {
         let event = next_frame_matching_on(&mut fixture.client, "engine command output", |env| {
@@ -4356,11 +4381,27 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
                 .unwrap()
                 .data,
         );
-        if let Some(evidence) = output
+        let records = output
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|value| value["boundary"] == "complete")
+            .collect::<Vec<_>>();
+        eprintln!(
+            "BUBBLEWRAP FLOW boundary output bytes={} parsed_records={}",
+            output.len(),
+            records.len()
+        );
+        if let Some(completed) = records
+            .iter()
+            .find(|record| record.get("boundary_command_finished").is_some())
         {
+            assert_eq!(
+                completed["boundary_command_finished"], 0,
+                "boundary command failed before producing its assertion record"
+            );
+            let evidence = records
+                .iter()
+                .find(|value| value["boundary"] == "complete")
+                .expect("completed boundary command must emit its assertion record");
             assert!(
                 ["cwd", "namespace", "cow", "devices", "generic"]
                     .iter()
@@ -4388,12 +4429,19 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
         })
         .await
         .expect("remove engine workbench and terminal");
-    next_frame_matching_on(&mut fixture.client, "engine removed", |env| {
-        env.kind == FrameKind::ProjectNotify
-            && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
-            ProjectNotifyPayload::Delete { project: deleted } if deleted.id == project.id)
+    eprintln!("BUBBLEWRAP FLOW boundary verified; awaiting engine removal");
+    let removed = next_frame_matching_on(&mut fixture.client, "engine removed", |env| {
+        env.kind == FrameKind::CommandError
+            || (env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                ProjectNotifyPayload::Delete { project: deleted } if deleted.id == project.id))
     })
     .await;
+    assert_eq!(
+        removed.kind,
+        FrameKind::ProjectNotify,
+        "engine removal must succeed"
+    );
     assert!(
         !Path::new(&root.0).exists(),
         "remove must finish host worktree cleanup"
@@ -4508,7 +4556,7 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
     )
     .await;
     fixture.client.terminal_send(&producer_terminal.terminal_id, protocol::TerminalSendPayload {
-        data: "PATH=\"$QA_PRODUCER_PATH\" /mnt/tyde-runtime/bin/tyde-workbench-produce && printf '\\n{\"producer_completed\":true}\\n'\n".to_owned(),
+        data: "PATH=\"$QA_PRODUCER_PATH\" /mnt/tyde-runtime/bin/tyde-workbench-produce; status=$?; printf '\\n{\"producer_completed\":%s}\\n' \"$status\"\n".to_owned(),
     }).await.expect("explicit generic producer request");
     eprintln!("BUBBLEWRAP FLOW explicit-producer requested");
     let mut produced = String::new();
@@ -4539,11 +4587,15 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
             !produced.contains("\"error\": {\"reason\":"),
             "explicit producer emitted a typed runtime failure before completion"
         );
-        if produced
+        if let Some(completed) = produced
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .any(|value| value["producer_completed"] == true)
+            .find(|value| value.get("producer_completed").is_some())
         {
+            assert_eq!(
+                completed["producer_completed"], 0,
+                "explicit producer must succeed"
+            );
             break;
         }
     }
@@ -4618,12 +4670,18 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
         })
         .await
         .expect("remove private consumer");
-    next_frame_matching_on(&mut fixture.client, "consumer removed", |env| {
-        env.kind == FrameKind::ProjectNotify
-            && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
-            ProjectNotifyPayload::Delete { project } if project.id == consumer_id)
+    let removed = next_frame_matching_on(&mut fixture.client, "consumer removed", |env| {
+        env.kind == FrameKind::CommandError
+            || (env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                ProjectNotifyPayload::Delete { project } if project.id == consumer_id))
     })
     .await;
+    assert_eq!(
+        removed.kind,
+        FrameKind::ProjectNotify,
+        "consumer removal must succeed"
+    );
     assert!(!consumer_root.exists());
 }
 
