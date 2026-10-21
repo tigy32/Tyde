@@ -16470,9 +16470,22 @@ mod wasm_tests {
     /// only visible as one field inside the Hosts tab.
     #[wasm_bindgen_test]
     async fn scope_bar_names_the_host_each_page_edits() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
         let container = make_container();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 1600px; height: 900px;",
+            )
+            .unwrap();
         let state = AppState::new();
         install_scope_bar_hosts(&state, crate::state::ConnectionStatus::Connected);
+        state.host_settings_by_host.update(|settings| {
+            settings.insert("host-a".to_owned(), settings_model::HostSettings::default());
+        });
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
@@ -16529,6 +16542,94 @@ mod wasm_tests {
             nav.contains("Host · dev2"),
             "the sidebar group holding host-scoped tabs must name the host: {nav:?}"
         );
+
+        click_tab(&container, "Review");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Review");
+        let workspace_width = container.client_width() as f64;
+        let layout = container
+            .query_selector(".settings-layout")
+            .unwrap()
+            .expect("settings navigation and content layout must render");
+        let content = container
+            .query_selector(".settings-content")
+            .unwrap()
+            .expect("the selected settings page must render");
+        assert!(
+            layout.get_bounding_client_rect().width() > workspace_width * 0.9,
+            "settings navigation and content should occupy the available workspace"
+        );
+        assert!(
+            content.get_bounding_client_rect().width() > workspace_width * 0.7,
+            "settings pages and Review columns should use the available workspace"
+        );
+        let columns = container
+            .query_selector_all(".review-configuration-columns > section")
+            .unwrap();
+        assert_eq!(
+            columns.length(),
+            2,
+            "Review must keep both configuration columns"
+        );
+        for index in 0..columns.length() {
+            assert!(
+                columns
+                    .item(index)
+                    .unwrap()
+                    .unchecked_into::<HtmlElement>()
+                    .get_bounding_client_rect()
+                    .width()
+                    > workspace_width * 0.3,
+                "both Review columns should expand to use the available workspace"
+            );
+        }
+
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 480px; height: 900px;",
+            )
+            .unwrap();
+        next_tick().await;
+        let narrow_width = container.client_width() as f64;
+        let narrow_content = container
+            .query_selector(".settings-content")
+            .unwrap()
+            .unwrap();
+        assert!(
+            narrow_content.get_bounding_client_rect().width() > narrow_width * 0.85,
+            "narrow settings content should remain within the responsive workspace"
+        );
+        assert!(
+            narrow_content.scroll_width() <= narrow_content.client_width(),
+            "narrow settings content should not overflow horizontally"
+        );
+        assert_eq!(
+            container
+                .query_selector(".settings-scope-bar select")
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<HtmlSelectElement>()
+                .value(),
+            "host-a",
+            "the host selector must remain available in the narrow layout"
+        );
+        click_tab(&container, "Appearance");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Appearance");
+        let close = container
+            .query_selector(".settings-close-btn")
+            .unwrap()
+            .expect("the settings close control must remain available");
+        close.unchecked_into::<HtmlElement>().click();
+        next_tick().await;
+        assert!(
+            !state.settings_open.get_untracked(),
+            "the close control must still close settings"
+        );
+        drop(_handle);
+        container.remove();
+        style.remove();
     }
 
     /// The scope bar states why a host-scoped page cannot be edited, and warns

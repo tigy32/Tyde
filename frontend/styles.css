@@ -9791,8 +9791,8 @@ math merror {
     min-height: 0;
     display: flex;
     gap: 32px;
-    max-width: 1100px;
-    margin: 0 auto;
+    max-width: none;
+    margin: 0;
 }
 
 /* --- Settings Scope Bar --- */
@@ -9946,7 +9946,7 @@ math merror {
     padding: 0 4px 16px;
     flex: 1;
     min-width: 0;
-    max-width: 720px;
+    max-width: none;
 }
 
 /* With both side panels open the centre zone can be under 600px wide; the
