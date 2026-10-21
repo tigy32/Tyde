@@ -2622,6 +2622,23 @@ mod wasm_tests {
             query(&container, "[data-testid='chat-thinking-ring']").is_none(),
             "waiting on the user is not thinking"
         );
+        state.agent_turn_active.update(|turns| {
+            turns.insert(AgentId(AGENT.to_owned()), true);
+        });
+        next_tick().await;
+        let notice = query(&container, "[data-testid='chat-awaiting-user']")
+            .expect("continuing machine work must keep the question notice mounted");
+        assert!(
+            notice
+                .text_content()
+                .unwrap_or_default()
+                .contains("Needs your answer"),
+            "continuing machine work must not hide the question notice"
+        );
+        state.agent_turn_active.update(|turns| {
+            turns.remove(&AgentId(AGENT.to_owned()));
+        });
+        next_tick().await;
         let primary_btn: HtmlElement = primary(&container).dyn_into().unwrap();
         assert_eq!(
             primary_btn.text_content().unwrap_or_default().trim(),

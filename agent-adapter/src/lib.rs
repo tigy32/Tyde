@@ -162,6 +162,9 @@ exhaustive_capabilities! {
     // Hermes background work and check on it, but a foreground command blocks
     // them, so "continuing a command is a second action" asserts nothing there.
     YieldsRunningCommands,
+    // Native JavaScript cells can yield to the model while their awaited
+    // tools remain foreground work, then be collected with a native wait.
+    YieldedCodeCells,
     // A foreground command that outlives its timeout is moved to the
     // background instead of killed, and the runtime starts a turn of its own
     // when it finishes. Measured on Claude Code 2.1.283: a Bash call with a

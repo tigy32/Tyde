@@ -4774,6 +4774,20 @@ struct CodexState {
 }
 
 impl CodexState {
+    fn settle_native_question_pause(&self, emitter: &TurnEmitter) {
+        let waiting_on_question = self.pending_request.as_ref().is_some_and(|request| {
+            matches!(request.kind, PendingRequestKind::UserInput { .. })
+                && emitter.has_pending_tool_request(&request.tool_call_id)
+        });
+        if waiting_on_question
+            && !self.awaiting_root_turn_start
+            && emitter.open_response().is_none()
+            && emitter.open_foreground_tool_ids().is_empty()
+        {
+            emitter.typing_status_changed(false);
+        }
+    }
+
     /// A root turn, admitted or running, that will settle typing itself.
     fn root_turn_owns_typing(&self) -> bool {
         self.active_turn_id.is_some()
@@ -8869,6 +8883,7 @@ impl CodexInner {
                     state.close_active_stream_when_tools_idle = false;
                     emitter.typing_status_changed(false);
                 }
+                state.settle_native_question_pause(&emitter);
                 emit_deferred_idle
             })
             .await;
@@ -11567,6 +11582,13 @@ impl CodexInner {
             }).count(),
             "Finalized Codex provider response boundary"
         );
+        self.state
+            .with(move |state| {
+                if !failed && thread_id == state.thread_id {
+                    state.settle_native_question_pause(&emitter);
+                }
+            })
+            .await;
         true
     }
 
@@ -16244,9 +16266,12 @@ let stream_key = stream_key.as_str();
                     },
                 )
                 .await;
-                self.finalize_strict_response(params, CodexResponseEnd::Completed)
+                // The native question can precede its provider response's
+                // usage. Only that response boundary may finalize the message.
+                let emitter = Arc::clone(&self.emitter);
+                self.state
+                    .with(move |state| state.settle_native_question_pause(&emitter))
                     .await;
-                self.emitter.typing_status_changed(false);
             }
             "mcpServer/elicitation/request" => {
                 let result = codex_mcp_elicitation_result(params);
@@ -25751,6 +25776,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
+            tyde_agent_adapter::BackendCapability::YieldedCodeCells,
             tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,
             tyde_agent_adapter::BackendCapability::NativeGoals,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,

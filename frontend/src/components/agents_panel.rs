@@ -7567,8 +7567,18 @@ mod wasm_tests {
                 "h-await",
                 agent_stream("a-await"),
                 FrameKind::AgentActivityChanged,
-                seq,
+                seq * 2,
                 &protocol::AgentActivityChangedPayload { activity },
+            );
+            dispatch_frame(
+                &state,
+                "h-await",
+                agent_stream("a-await"),
+                FrameKind::ChatEvent,
+                seq * 2 + 1,
+                &protocol::ChatEvent::TypingStatusChanged(
+                    activity != protocol::AgentActivity::Idle,
+                ),
             );
             next_tick().await;
             assert_eq!(status.get_attribute("title").as_deref(), Some(label));
@@ -7577,6 +7587,12 @@ mod wasm_tests {
                 text.contains(label),
                 "status must read {label}, got {text:?}"
             );
+            if activity == protocol::AgentActivity::AwaitingUser {
+                assert!(
+                    text.contains('?'),
+                    "human attention must outrank live typing"
+                );
+            }
             assert_eq!(
                 text.contains('\u{2713}'),
                 activity == protocol::AgentActivity::Idle,

@@ -152,6 +152,9 @@ macro_rules! conformance2_scenario {
                     Profile::new(&["gpt-5.6-sol"], &[("model", "gpt-5.6-sol"), ("reasoning_effort", "low")])
                 } else if stringify!($scenario) == "real_async_answer_completion_overlap" {
                     Profile::new(&["gpt-6-luna"], &[("model", "gpt-6-luna"), ("reasoning_effort", "low")])
+                } else if stringify!($scenario) == "real_question_during_yielded_cell" {
+                    let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-sol".to_owned());
+                    Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
                 } else if stringify!($scenario) == "real_generated_image_preserves_tool_ownership" {
                     // Luna missed the race; Astra reproduced the captured empty-reasoning interleaving.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
@@ -6916,6 +6919,232 @@ conformance2_scenario!(
     [BackendCapability::AsyncUserQuestionRequests]
 );
 
+async fn collect_yielded_question_until<B: Backend>(
+    host: &mut Harness<B>,
+    turn: &mut Turn,
+    hung_guard: tokio::time::Instant,
+    idle_allowed: bool,
+    stop: impl Fn(&ChatEvent) -> bool,
+) {
+    loop {
+        let event = host
+            .next_chat(hung_guard)
+            .await
+            .expect("yielded question exceeded its ten-minute hung guard");
+        assert!(
+            !matches!(&event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error)),
+            "yielded question emitted a backend error"
+        );
+        assert!(
+            !matches!(&event, ChatEvent::ToolExecutionCompleted(completion)
+                if !matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. })),
+            "foreground work was cancelled or failed while the question was answerable"
+        );
+        assert!(
+            idle_allowed || !matches!(event, ChatEvent::TypingStatusChanged(false)),
+            "question falsely declared idle while real foreground work was held open"
+        );
+        assert!(
+            host.protocol_violations().is_empty(),
+            "yielded question violated the backend event contract"
+        );
+        let finished = stop(&event);
+        turn.events.push(event);
+        if finished {
+            return;
+        }
+    }
+}
+
+async fn real_question_during_yielded_cell<B: Backend>(host: &mut Harness<B>) {
+    let profile = host.workspace().join("blocking_question_profile.py");
+    std::fs::write(
+        &profile,
+        include_str!("conformance2/blocking_question_profile.py"),
+    )
+    .expect("write native question profile and real gated MCP tool");
+    if std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_none() {
+        let status = tokio::process::Command::new("python3")
+            .arg(&profile)
+            .arg(std::env::current_exe().expect("conformance executable"))
+            .arg(&host.test_name)
+            .arg("yielded")
+            .status()
+            .await
+            .expect("run native yielded-cell profile");
+        assert!(
+            status.success(),
+            "native yielded-cell profile failed; see private run log"
+        );
+        return;
+    }
+    let gate_path = host.workspace().join("foreground.sock");
+    let gate = tokio::net::UnixListener::bind(&gate_path).expect("bind foreground gate");
+    install_mcp_server(
+        host,
+        "question_gate",
+        "python3",
+        vec![
+            profile.to_string_lossy().into_owned(),
+            "--held-tool".to_owned(),
+            gate_path.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    for answer_first in [true, false] {
+        let prompt = "Perform this exact native concurrency flow. First invoke functions.exec with \
+            this JavaScript: const pending = tools.mcp__question_gate__hold({}); \
+            await yield_control(); text(await pending); \
+            This explicitly yields while the real MCP tool remains pending. Do not await the \
+            cell or use functions.wait yet. After exec yields, your next direct tool call must \
+            be functions.request_user_input, which is listed in the direct tool inventory and \
+            enabled in Default mode. Do not use functions.request_user_input_async or any \
+            asynchronous question substitute. Do not call tools.request_user_input inside exec. \
+            Ask one question Which label? with options ALPHA and BETA using the native \
+            functions.request_user_input tool, then wait for my actual answer. Then collect \
+            the original cell using functions.wait and reply exactly with my selected label. \
+            Do not use shell, file, child-agent or other tools.";
+        assert!(matches!(
+            try_deliver_message(host, &agent, user_message(prompt), false).await,
+            server::backend::SendOutcome::Accepted
+        ));
+        let mut turn = host.turn(prompt);
+        let hung_guard = tokio::time::Instant::now() + Duration::from_secs(600);
+        collect_yielded_question_until(host, &mut turn, hung_guard, false, |event| {
+            matches!(event, ChatEvent::ToolRequest(request)
+                if matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. }))
+        })
+        .await;
+        let question = turn
+            .tool_requests()
+            .find(|request| matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. }))
+            .expect("native question")
+            .clone();
+        assert!(matches!(
+            question.tool_type,
+            ToolRequestType::AskUserQuestion {
+                mode: protocol::UserQuestionMode::Blocking,
+                ..
+            }
+        ));
+        let machine_ids = turn
+            .tool_requests()
+            .filter(|request| request.tool_call_id != question.tool_call_id)
+            .filter(|request| {
+                !turn
+                    .tool_completions()
+                    .any(|completion| completion.tool_call_id == request.tool_call_id)
+            })
+            .map(|request| request.tool_call_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            machine_ids.len(),
+            1,
+            "question must arrive with one real tool still open"
+        );
+        let (mut release, _) = tokio::time::timeout_at(hung_guard, gate.accept())
+            .await
+            .expect("held MCP tool never connected")
+            .expect("accept actual foreground tool");
+        if answer_first {
+            send_question_response(host, &question.tool_call_id, "ALPHA").await;
+            collect_yielded_question_until(host, &mut turn, hung_guard, false, |event| {
+                matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == question.tool_call_id)
+            })
+            .await;
+        }
+        use tokio::io::AsyncWriteExt;
+        release
+            .write_all(b"R")
+            .await
+            .expect("release real foreground tool");
+        // Native inference can finish before its response boundary is delivered.
+        // Observe the machine receipt, not a pre-answer StreamEnd or idle edge.
+        let machine_id = &machine_ids[0];
+        collect_yielded_question_until(host, &mut turn, hung_guard, true, |event| {
+            matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == *machine_id)
+        })
+        .await;
+        if !answer_first {
+            assert!(
+                !turn
+                    .tool_completions()
+                    .any(|completion| completion.tool_call_id == question.tool_call_id),
+                "machine completion must not retire the unanswered question"
+            );
+            send_question_response(host, &question.tool_call_id, "ALPHA").await;
+            collect_yielded_question_until(host, &mut turn, hung_guard, true, |event| {
+                matches!(event, ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == question.tool_call_id)
+            })
+            .await;
+        }
+        collect_yielded_question_until(host, &mut turn, hung_guard, true, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+        assert_eq!(
+            turn.tool_completions()
+                .filter(|completion| completion.tool_call_id == *machine_id)
+                .count(),
+            1,
+            "held foreground tool must succeed exactly once"
+        );
+        let question_messages = turn
+            .assistant_messages()
+            .filter(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == question.tool_call_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            question_messages.len(),
+            1,
+            "native question must retain exactly one owning response"
+        );
+        assert!(
+            question_messages[0]
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.request.known_usage())
+                .is_some_and(|usage| usage.total_tokens > 0),
+            "native question response must retain its actual reported request usage"
+        );
+        assert_eq!(
+            turn.tool_completions()
+                .filter(|completion| completion.tool_call_id == question.tool_call_id)
+                .count(),
+            1,
+            "native answer must complete exactly once"
+        );
+        assert!(
+            turn.final_text().contains("ALPHA"),
+            "native answer did not reach the model's final response"
+        );
+        assert_universal_contract(std::slice::from_ref(&turn));
+        eprintln!(
+            "Yielded native question: answer_first={answer_first} machine_success=true answer_delivered=true clean_idle=true question_usage_owned=true"
+        );
+    }
+    assert_clean_close(host, &agent).await;
+}
+conformance2_scenario!(
+    real_question_during_yielded_cell,
+    [
+        BackendCapability::YieldedCodeCells,
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::StartupMcpServers
+    ]
+);
+
 async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let question_prompt = if host.backend() == BackendKind::Codex
         && std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_some()
@@ -6943,19 +7172,7 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     }
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
-    assert_eq!(
-        asked
-            .events()
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::TypingStatusChanged(active) => Some(*active),
-                _ => None,
-            })
-            .next_back(),
-        Some(false),
-        "awaiting a user answer must stop live typing before the answer arrives"
-    );
-    assert_blocking_question_leaves_no_open_response(&asked);
+    assert_question_response_remains_replayable(&asked);
 
     // Answering with a label the provider actually offered, so this
     // tests the tool rather than the prompt.
@@ -6966,6 +7183,12 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let answered = answer_question(host, &agent, &asked, &choice).await;
     assert_question_answer_reached_the_model(&asked, &answered, &choice);
     assert_answer_has_no_user_echo(&answered);
+    let mut question_turn = host.turn(&question_prompt);
+    question_turn.events.extend(asked.events().iter().cloned());
+    question_turn
+        .events
+        .extend(answered.events().iter().cloned());
+    assert_one_message_per_provider_request(&question_turn);
 
     // Second question, abandoned rather than answered. Cancelling is
     // the user's escape hatch from an interactive tool, and it is the
@@ -8498,28 +8721,26 @@ fn assert_question_waits_for_an_answer(question: &Question) {
     );
 }
 
-/// A reattach rebuilds the transcript from durable events plus live state
-/// that only a visibly active turn keeps, and a turn waiting on a blocking
-/// question is not visibly active. A question left inside a still-open
-/// response is therefore dropped with that response on reload, and the
-/// agent waits on a card nobody can see.
-fn assert_blocking_question_leaves_no_open_response(question: &Question) {
+// Live responses survive reattach only while the typing authority is active.
+// A blocking RPC need not deliver its provider response boundary before answer.
+fn assert_question_response_remains_replayable(question: &Question) {
     let mut open_responses = 0usize;
+    let mut typing = None;
     for event in question.events() {
         match event {
             ChatEvent::StreamStart(_) => open_responses += 1,
             ChatEvent::StreamEnd(_) => open_responses = open_responses.saturating_sub(1),
+            ChatEvent::TypingStatusChanged(active) => typing = Some(*active),
             _ => {}
         }
     }
-    assert_eq!(
-        open_responses,
-        0,
-        "{}: the blocking question {:?} is waiting inside a response that never ended, so a \
-         reattach during the wait discards the question with the live response.",
-        question.label(),
-        question.tool_call_id()
+    assert!(
+        open_responses == 0 || typing == Some(true),
+        "an unanswered question must not be discarded with an inactive live response"
     );
+    if question.mode() == protocol::UserQuestionMode::NonBlocking {
+        assert_eq!(typing, Some(false), "nonblocking question must reach idle");
+    }
 }
 
 fn assert_question_answer_reached_the_model(question: &Question, answered: &Turn, choice: &str) {
