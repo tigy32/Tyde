@@ -2088,6 +2088,8 @@ pub enum AgentsSidebarProjectVisibility {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsSidebarPreferences {
     #[serde(default)]
+    pub hide_empty_projects: bool,
+    #[serde(default)]
     pub hide_inactive: bool,
     #[serde(default)]
     pub hide_sub_agents: bool,

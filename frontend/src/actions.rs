@@ -240,12 +240,19 @@ pub fn begin_new_chat_with_profile(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
 ) {
-    begin_profile_chat(
-        state,
-        profile,
-        custom_agent_id,
-        state.chat_context_host_id_untracked(),
-    );
+    let selection_host = state.chat_context_host_id_untracked();
+    let custom_agent_id = custom_agent_id.or_else(|| {
+        if state.active_project_ref_untracked().is_some() {
+            return None;
+        }
+        state.launch_profile_catalog.with_untracked(|catalogs| {
+            catalogs
+                .get(selection_host.as_ref()?)?
+                .home_custom_agent_id
+                .clone()
+        })
+    });
+    begin_profile_chat(state, profile, custom_agent_id, selection_host);
 }
 
 pub(crate) fn begin_new_chat_with_profile_in_project(
@@ -258,6 +265,25 @@ pub(crate) fn begin_new_chat_with_profile_in_project(
         state.switch_active_project(Some(project.clone()));
     }
     begin_profile_chat(state, profile, custom_agent_id, Some(project.host_id));
+}
+
+pub(crate) async fn begin_new_chat_with_profile_at_home(
+    state: &AppState,
+    profile: LaunchProfile,
+    custom_agent_id: Option<CustomAgentId>,
+    host_id: String,
+) -> Result<(), String> {
+    if state.selected_host_id.get_untracked().as_ref() != Some(&host_id) {
+        let store = crate::bridge::set_selected_host(crate::bridge::SetSelectedHostRequest {
+            host_id: Some(host_id.clone()),
+        })
+        .await?;
+        state.configured_hosts.set(store.hosts);
+        state.selected_host_id.set(store.selected_host_id);
+    }
+    state.switch_active_project(None);
+    begin_profile_chat(state, profile, custom_agent_id, Some(host_id));
+    Ok(())
 }
 
 fn begin_profile_chat(
@@ -273,17 +299,7 @@ fn begin_profile_chat(
     };
     let composer = state.composer_for(tab);
     composer.backend_override.set(Some(profile.backend_kind));
-    composer.custom_agent_id.set(custom_agent_id.or_else(|| {
-        if state.active_project_ref_untracked().is_some() {
-            return None;
-        }
-        state.launch_profile_catalog.with_untracked(|catalogs| {
-            catalogs
-                .get(selection_host.as_ref()?)?
-                .home_custom_agent_id
-                .clone()
-        })
-    }));
+    composer.custom_agent_id.set(custom_agent_id);
     composer.launch_profile_id.set(Some(profile.id));
     composer.selection_host.set(selection_host);
     // Show the profile's settings as the effective draft values, but mark them

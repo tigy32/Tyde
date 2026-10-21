@@ -745,6 +745,7 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
 async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() {
     let mut fixture = Fixture::new().await;
     let sidebar = AgentsSidebarPreferences {
+        hide_empty_projects: true,
         hide_inactive: true,
         hide_sub_agents: true,
         show_workbenches: true,

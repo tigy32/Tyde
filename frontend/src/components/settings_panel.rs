@@ -11453,8 +11453,19 @@ mod wasm_tests {
             text.contains("Settings → Bots"),
             "the unpaired tab says where the pairing code comes from"
         );
+        // The shared scope bar names "Launch profiles host", not a Tychat control.
+        let tychat = container
+            .query_selector(".settings-tychat")
+            .unwrap()
+            .expect("Tychat settings");
+        let tychat_text = tychat.text_content().unwrap();
         assert!(
-            !text.contains("Access mode") && !text.contains("Launch profile"),
+            !tychat_text.contains("Access mode")
+                && !tychat_text.contains("Launch profile")
+                && tychat
+                    .query_selector("#tychat-launch-profile")
+                    .unwrap()
+                    .is_none(),
             "the Tychat agent always runs unrestricted, and Hermes has no launch profiles here"
         );
         let agent = control(&container, "Agent");
@@ -16656,6 +16667,16 @@ mod wasm_tests {
     /// the Launch Profiles editor to render and persist typed settings.
     fn install_launch_profile_host(state: &AppState, profiles: Vec<HostLaunchProfileConfig>) {
         let host_id = "host-lp".to_owned();
+        // A connected host also arrives in the configured-host bootstrap;
+        // launch context must not resolve a host absent from that catalog.
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: host_id.clone(),
+                label: "Launch profiles host".to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: true,
+            }]);
         let profile_ids = profiles
             .iter()
             .map(|profile| profile.id.clone())
@@ -17135,11 +17156,18 @@ mod wasm_tests {
             choice.get_attribute("aria-pressed").as_deref(),
             Some("true")
         );
-        find_button_by_text(&chooser, "Create agent")
-            .unwrap()
-            .click();
+        let create = find_button_by_text(&chooser, "Create agent").unwrap();
+        assert!(
+            !create.has_attribute("disabled"),
+            "a ready profile on the configured host must be launchable"
+        );
+        create.click();
         next_tick().await;
         next_tick().await;
+        assert!(
+            !chooser.is_connected(),
+            "confirmation must close the chooser before rendering the draft"
+        );
         let toggle: HtmlElement = container
             .query_selector("button.session-settings-toggle")
             .unwrap()

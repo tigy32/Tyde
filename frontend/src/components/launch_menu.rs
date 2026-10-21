@@ -1,8 +1,8 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::actions::{begin_new_chat_with_profile, begin_new_chat_with_profile_in_project};
-use crate::state::{ActiveProjectRef, AppState, DEFAULT_CUSTOM_AGENT_ID};
+use crate::actions::{begin_new_chat_with_profile_at_home, begin_new_chat_with_profile_in_project};
+use crate::state::{ActiveProjectRef, AppState, ConnectionStatus, DEFAULT_CUSTOM_AGENT_ID};
 
 use protocol::{BackendKind, CustomAgent, CustomAgentId, LaunchProfileEntry, LaunchProfileKind};
 
@@ -137,49 +137,107 @@ pub fn LaunchChooser(
     #[prop(optional)] on_created: Option<Callback<()>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let chosen_project = project_context.and_then(|context| context.get_untracked());
-    let host = match project_context {
-        Some(_) => chosen_project
-            .as_ref()
-            .map(|project| project.host_id.clone()),
-        None => state.chat_context_host_id_untracked(),
+    let chosen_project = match project_context {
+        Some(context) => context.get_untracked(),
+        None => state.active_project_ref_untracked(),
     };
-    let context_label = chosen_project.as_ref().map(|target| {
-        let projects = state.projects;
-        let hosts = state.configured_hosts;
-        let target = target.clone();
-        move || {
-            let project = projects.with(|projects| {
-                projects
+    let host = chosen_project
+        .as_ref()
+        .map(|project| project.host_id.clone())
+        .or_else(|| state.chat_context_host_id_untracked());
+    let selection = RwSignal::new((host.clone(), chosen_project.clone()));
+    let selected_host = Memo::new(move |_| selection.get().0);
+    let project_choices_state = state.clone();
+    let project_choices = Memo::new(move |_| {
+        let hosts = project_choices_state.configured_hosts.get();
+        hosts
+            .iter()
+            .flat_map(|host| {
+                let host_label = if hosts
                     .iter()
-                    .find(|project| {
-                        project.host_id == target.host_id && project.project.id == target.project_id
-                    })
-                    .map(|project| project.project.name.clone())
-            });
-            let host = hosts.with(|hosts| {
-                hosts
-                    .iter()
-                    .find(|host| host.id == target.host_id)
-                    .map(|host| host.label.clone())
-            });
-            match (host, project) {
-                (Some(host), Some(project)) => format!("{host} · {project}"),
-                _ => "Project unavailable".to_owned(),
-            }
-        }
+                    .filter(|other| other.label == host.label)
+                    .count()
+                    > 1
+                {
+                    format!("{} ({})", host.label, host.id)
+                } else {
+                    host.label.clone()
+                };
+                let mut choices = vec![(
+                    Some(host.id.clone()),
+                    None,
+                    format!("No project / Home · {host_label}"),
+                )];
+                choices.extend(
+                    project_choices_state
+                        .projects
+                        .get()
+                        .into_iter()
+                        .filter(|project| project.host_id == host.id)
+                        .map(|project| {
+                            (
+                                Some(host.id.clone()),
+                                Some(ActiveProjectRef {
+                                    host_id: host.id.clone(),
+                                    project_id: project.project.id,
+                                }),
+                                format!("{} · {}", host_label, project.project.name),
+                            )
+                        }),
+                );
+                choices
+            })
+            .collect::<Vec<_>>()
+    });
+    let project_available = Memo::new(move |_| {
+        let selected = selection.get();
+        project_choices
+            .get()
+            .iter()
+            .any(|(host, project, _)| (host, project) == (&selected.0, &selected.1))
+    });
+    let context_label = Memo::new(move |_| {
+        let selected = selection.get();
+        project_choices
+            .get()
+            .into_iter()
+            .find(|(host, project, _)| (host, project) == (&selected.0, &selected.1))
+            .map(|(_, _, label)| label)
+            .unwrap_or_else(|| "Project unavailable".to_owned())
     });
     let entries_state = state.clone();
-    let entries_host = host.clone();
+    let entries_host = selected_host;
     let entries = Memo::new(move |_| {
         entries_state.launch_profile_catalog.with(|catalogs| {
             entries_host
+                .get()
                 .as_ref()
                 .and_then(|host| catalogs.get(host))
                 .map(|catalog| catalog.entries.clone())
-                .unwrap_or_default()
         })
     });
+    let catalog_connection_state = state.clone();
+    let missing_catalog_message = move || {
+        let status = selected_host.get().and_then(|host| {
+            catalog_connection_state
+                .connection_statuses
+                .with(|hosts| hosts.get(&host).cloned())
+        });
+        match status {
+            Some(ConnectionStatus::Connected) => {
+                "Waiting for this host's launch profiles.".to_owned()
+            }
+            Some(ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }) => {
+                "Connecting to this host to load launch profiles.".to_owned()
+            }
+            Some(ConnectionStatus::Error(message)) => {
+                format!("Launch profiles unavailable: {message}")
+            }
+            Some(ConnectionStatus::Disconnected) | None => {
+                "Connect to this host to load launch profiles.".to_owned()
+            }
+        }
+    };
     let initial_profile = state.launch_profile_catalog.with_untracked(|catalogs| {
         let catalog = catalogs.get(host.as_ref()?)?;
         if let Some(backend) = initial_backend {
@@ -200,22 +258,29 @@ pub fn LaunchChooser(
         })
     });
     let selected_profile = RwSignal::new(initial_profile);
-    let initial_agent =
-        if chosen_project.is_none() && state.active_project_ref_untracked().is_none() {
-            state.launch_profile_catalog.with_untracked(|catalogs| {
-                catalogs.get(host.as_ref()?)?.home_custom_agent_id.clone()
+    let role_override = RwSignal::new(None::<CustomAgentId>);
+    let role_state = state.clone();
+    let selected_agent = Memo::new(move |_| {
+        role_override.get().or_else(|| {
+            if selection.get().1.is_some() {
+                return None;
+            }
+            role_state.launch_profile_catalog.with(|catalogs| {
+                catalogs
+                    .get(selected_host.get().as_ref()?)?
+                    .home_custom_agent_id
+                    .clone()
             })
-        } else {
-            None
-        };
-    let selected_agent = RwSignal::new(initial_agent);
+        })
+    });
     let backend_query = RwSignal::new(String::new());
     let role_query = RwSignal::new(String::new());
     let agents_state = state.clone();
-    let agents_host = host.clone();
+    let agents_host = selected_host;
     let agents = Memo::new(move |_| {
         let mut agents: Vec<CustomAgent> = agents_state.custom_agents.with(|hosts| {
             agents_host
+                .get()
                 .as_ref()
                 .and_then(|host| hosts.get(host))
                 .map(|agents| agents.values().cloned().collect())
@@ -226,7 +291,7 @@ pub fn LaunchChooser(
     });
     let ready_profile = Memo::new(move |_| {
         let id = selected_profile.get()?;
-        entries.get().into_iter().find_map(|entry| match entry {
+        entries.get()?.into_iter().find_map(|entry| match entry {
             LaunchProfileEntry::Ready { profile } if profile.id == id => Some(profile),
             _ => None,
         })
@@ -255,31 +320,51 @@ pub fn LaunchChooser(
             .unwrap_or_else(|| "Use this host's default agent".to_owned())
     });
 
-    let context_state = state.clone();
-    let context_host = host.clone();
-    let context_project = chosen_project.clone();
-    let context_matches = Memo::new(move |_| match project_context {
-        Some(current) => current
-            .get()
-            .is_some_and(|project| Some(project) == context_project),
-        None => context_state.chat_context_host_id() == context_host,
-    });
+    let origin_state = state.clone();
+    let origin_host = origin_state.chat_context_host_id_untracked();
     Effect::new(move |_| {
-        if !context_matches.get() {
+        if origin_state.chat_context_host_id() != origin_host {
             open_sig.set(false);
         }
     });
 
+    let project_catalogs = state.launch_profile_catalog;
+    let change_project = move |ev: web_sys::Event| {
+        let selected: (Option<String>, Option<ActiveProjectRef>) =
+            match serde_json::from_str(&event_target_value(&ev)) {
+                Ok(selected) => selected,
+                Err(_) => {
+                    log::error!("invalid project picker selection encoding");
+                    return;
+                }
+            };
+        let target = project_choices
+            .get_untracked()
+            .into_iter()
+            .find(|(host, project, _)| (host, project) == (&selected.0, &selected.1));
+        if let Some((host, project, _)) = target {
+            if selection.get_untracked() == (host.clone(), project.clone()) {
+                return;
+            }
+            let profile = project_catalogs.with_untracked(|catalogs| {
+                catalogs.get(host.as_ref()?)?.default_profile_id.clone()
+            });
+            selection.set((host, project));
+            selected_profile.set(profile);
+            role_override.set(None);
+        }
+    };
+
     let create = Callback::new(move |()| {
         if !open_sig.get_untracked()
-            || !context_matches.get_untracked()
+            || !project_available.get_untracked()
             || !role_available.get_untracked()
         {
             return;
         }
         if let Some(profile) = ready_profile.get_untracked() {
             open_sig.set(false);
-            match chosen_project.clone() {
+            match selection.get_untracked().1 {
                 Some(project) => begin_new_chat_with_profile_in_project(
                     &state,
                     profile,
@@ -287,7 +372,25 @@ pub fn LaunchChooser(
                     project,
                 ),
                 None => {
-                    begin_new_chat_with_profile(&state, profile, selected_agent.get_untracked())
+                    if let Some(host) = selected_host.get_untracked() {
+                        let state = state.clone();
+                        let agent = selected_agent.get_untracked();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match begin_new_chat_with_profile_at_home(&state, profile, agent, host)
+                                .await
+                            {
+                                Ok(()) => {
+                                    if let Some(on_created) = on_created {
+                                        on_created.run(());
+                                    }
+                                }
+                                Err(error) => crate::components::header::report_user_error(
+                                    format!("Could not create agent: {error}"),
+                                ),
+                            }
+                        });
+                        return;
+                    }
                 }
             }
             if let Some(on_created) = on_created {
@@ -338,9 +441,9 @@ pub fn LaunchChooser(
                 let Some(dialog) = dialog_ref.get_untracked() else {
                     return;
                 };
-                let Ok(nodes) =
-                    dialog.query_selector_all("button:not([disabled]), input:not([disabled])")
-                else {
+                let Ok(nodes) = dialog.query_selector_all(
+                    "button:not([disabled]), input:not([disabled]), select:not([disabled])",
+                ) else {
                     return;
                 };
                 let (Some(first), Some(last)) = (
@@ -387,9 +490,20 @@ pub fn LaunchChooser(
             <div class="launch-chooser" role="dialog" aria-modal="true" aria-label="New agent"
                 node_ref=dialog_ref on:keydown=on_keydown>
                 <header class="launch-chooser-header">
-                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p>{context_label.map(|label| view! { <p class="launch-project-context">{label}</p> })}</div>
+                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
                     <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
                         on:click=move |_| open_sig.set(false)>"×"</button>
+                    <div class="launch-project-picker">
+                        <label for="launch-project-select">"Project"</label>
+                        <select id="launch-project-select" aria-label="Project" on:change=change_project>
+                            <Show when=move || !project_available.get()><option value="" selected=true disabled=true>"Project unavailable"</option></Show>
+                            {move || project_choices.get().into_iter().map(|(host, project, label)| {
+                                let target = (host, project);
+                                let value = serde_json::json!(target).to_string();
+                                view! { <option value=value selected=move || selection.get() == target>{label}</option> }
+                            }).collect_view()}
+                        </select>
+                    </div>
                 </header>
                 <div class="launch-chooser-body">
                     <section class="launch-backends" aria-label="Backend">
@@ -399,14 +513,19 @@ pub fn LaunchChooser(
                             on:input=move |ev| backend_query.set(event_target_value(&ev)) />
                         <div class="launch-backend-list" role="group" aria-label="Backend choices">
                             {move || {
+                                let Some(available) = entries.get() else {
+                                    let message = missing_catalog_message();
+                                    return view! { <p class="launch-empty" role="status">{message}</p> }.into_any();
+                                };
                                 let query = backend_query.get().trim().to_lowercase();
-                                let filtered: Vec<_> = entries.get().into_iter().filter(|entry| {
+                                let catalog_empty = available.is_empty();
+                                let filtered: Vec<_> = available.into_iter().filter(|entry| {
                                     let label = match entry { LaunchProfileEntry::Ready { profile } => &profile.label,
                                         LaunchProfileEntry::Unavailable { label, .. } => label };
                                     label.to_lowercase().contains(&query) || backend_label_for(entry.backend_kind()).to_lowercase().contains(&query)
                                 }).collect();
                                 if filtered.is_empty() {
-                                    return view! { <p class="launch-empty">{if entries.get().is_empty() {
+                                    return view! { <p class="launch-empty">{if catalog_empty {
                                         "No launch profiles available. Enable a backend in Settings → Backends."
                                     } else { "No backends match your search." }}</p> }.into_any();
                                 }
@@ -452,7 +571,7 @@ pub fn LaunchChooser(
                             <Show when=move || "default agent".contains(&role_query.get().trim().to_lowercase())
                                 || default_description.get().to_lowercase().contains(&role_query.get().trim().to_lowercase())>
                                 <button type="button" class="launch-role-choice" aria-pressed=move || selected_agent.get().is_none_or(|id| id.0 == DEFAULT_CUSTOM_AGENT_ID).to_string()
-                                    title=move || default_description.get() on:click=move |_| selected_agent.set(Some(CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned())))>
+                                    title=move || default_description.get() on:click=move |_| role_override.set(Some(CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned())))>
                                     <span class="launch-choice-text"><strong>"Default agent"</strong><small>{default_description}</small></span>
                                     <span class="launch-selection-mark" aria-hidden="true"></span>
                                 </button>
@@ -468,7 +587,7 @@ pub fn LaunchChooser(
                                         view! {
                                             <button type="button" class="launch-role-choice" title=title
                                                 aria-pressed=move || (selected_agent.get() == Some(pressed_id.clone())).to_string()
-                                                on:click=move |_| selected_agent.set(Some(id.clone()))>
+                                                on:click=move |_| role_override.set(Some(id.clone()))>
                                                 <span class="launch-choice-text"><strong>{agent.name}</strong><small>{agent.description}</small></span>
                                                 <span class="launch-selection-mark" aria-hidden="true"></span>
                                             </button>
@@ -489,11 +608,14 @@ pub fn LaunchChooser(
                         <small>"Ready to create"</small>
                         <strong>{move || ready_profile.get().map(|profile| format!("{} · {}", profile.label, role_name.get()))
                             .unwrap_or_else(|| "Choose an available backend".to_owned())}</strong>
+                        <small>{context_label}</small>
+                        <Show when=move || !project_available.get()><small>"The selected project is no longer available."</small></Show>
+                        <Show when=move || selected_profile.get().is_some() && ready_profile.get().is_none()><small>"The selected backend is no longer available."</small></Show>
                         <Show when=move || !role_available.get()><small>"The selected role is no longer available."</small></Show>
                     </div>
                     <div class="launch-footer-actions">
                         <div><button type="button" class="launch-cancel" on:click=move |_| open_sig.set(false)>"Cancel"</button>
-                            <button type="button" class="launch-create" disabled=move || ready_profile.get().is_none() || !role_available.get()
+                            <button type="button" class="launch-create" disabled=move || ready_profile.get().is_none() || !role_available.get() || !project_available.get()
                                 on:click=move |_| create.run(())>"Create agent"</button></div>
                         <small>"Enter in search to create · Esc to close"</small>
                     </div>
@@ -597,6 +719,16 @@ mod wasm_tests {
     }
 
     fn set_catalog(state: &AppState, host_id: &str, entries: Vec<LaunchProfileEntry>) {
+        state.configured_hosts.update(|hosts| {
+            if !hosts.iter().any(|host| host.id == host_id) {
+                hosts.push(crate::bridge::ConfiguredHost {
+                    id: host_id.to_owned(),
+                    label: host_id.to_owned(),
+                    transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                    auto_connect: true,
+                });
+            }
+        });
         state.selected_host_id.set(Some(host_id.to_owned()));
         state.connection_statuses.update(|hosts| {
             hosts.insert(
@@ -816,6 +948,282 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn project_picker_routes_catalogs_and_rejects_disappearing_selections() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("local-default", "Local Claude", BackendKind::Claude)],
+        );
+        set_catalog(
+            &state,
+            "remote",
+            vec![ready("remote-default", "Remote Codex", BackendKind::Codex)],
+        );
+        state.selected_host_id.set(Some("local".into()));
+        for host in ["local", "remote"] {
+            state.custom_agents.update(|hosts| {
+                let id = CustomAgentId(format!("{host}-role"));
+                hosts.entry(host.into()).or_default().insert(
+                    id.clone(),
+                    CustomAgent {
+                        id,
+                        name: format!("{host} role"),
+                        description: "Host-specific role".into(),
+                        instructions: None,
+                        skill_ids: vec![],
+                        mcp_server_ids: vec![],
+                        tool_policy: ToolPolicy::Unrestricted,
+                    },
+                );
+            });
+            state.projects.update(|projects| {
+                projects.push(crate::state::ProjectInfo {
+                    host_id: host.into(),
+                    project: protocol::Project {
+                        id: protocol::ProjectId("same-project-id".into()),
+                        name: "Shared name".into(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone { roots: vec![] },
+                    },
+                })
+            });
+            state.launch_profile_catalog.update(|catalogs| {
+                catalogs.get_mut(host).unwrap().default_profile_id =
+                    Some(LaunchProfileId(format!("{host}-default")));
+            });
+        }
+        state.configured_hosts.update(|hosts| {
+            hosts.push(crate::bridge::ConfiguredHost {
+                id: "unbootstrapped".into(),
+                label: "Offline host".into(),
+                transport: crate::bridge::HostTransportConfig::SshStdio {
+                    ssh_destination: "qa-unavailable.invalid".into(),
+                    lifecycle: crate::bridge::RemoteHostLifecycleConfig::Manual,
+                },
+                auto_connect: false,
+            });
+        });
+        let local = ActiveProjectRef {
+            host_id: "local".into(),
+            project_id: protocol::ProjectId("same-project-id".into()),
+        };
+        let remote = ActiveProjectRef {
+            host_id: "remote".into(),
+            project_id: protocol::ProjectId("same-project-id".into()),
+        };
+        state.active_project.set(Some(local.clone()));
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+        let picker = || {
+            container
+                .query_selector("select[aria-label='Project']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlSelectElement>()
+                .unwrap()
+        };
+        let choose = |host: &str, project: Option<ActiveProjectRef>| {
+            picker().set_value(&serde_json::json!((Some(host), project)).to_string());
+            picker()
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+        };
+        assert_eq!(
+            picker().value(),
+            serde_json::json!((Some("local"), Some(local.clone()))).to_string()
+        );
+        assert!(find_button_by_text(&container, "Local Claude").is_some());
+        choose("unbootstrapped", None);
+        next_tick().await;
+        assert!(visible_text(&container).contains("Connect to this host to load launch profiles."));
+        assert!(!visible_text(&container).contains("Enable a backend in Settings"));
+        assert!(
+            find_button_by_text(&container, "Create agent")
+                .unwrap()
+                .has_attribute("disabled")
+        );
+        assert_eq!(state.active_project.get_untracked(), Some(local.clone()));
+        state.connection_statuses.update(|hosts| {
+            hosts.insert("unbootstrapped".into(), ConnectionStatus::Connected);
+        });
+        next_tick().await;
+        assert!(visible_text(&container).contains("Waiting for this host's launch profiles."));
+        state.launch_profile_catalog.update(|hosts| {
+            hosts.insert(
+                "unbootstrapped".into(),
+                LaunchProfileCatalog {
+                    home_custom_agent_id: None,
+                    entries: vec![],
+                    default_profile_id: None,
+                    custom_profile_schemas: vec![],
+                },
+            );
+        });
+        next_tick().await;
+        assert!(visible_text(&container).contains("Enable a backend in Settings"));
+        assert!(!visible_text(&container).contains("Waiting for this host's launch profiles."));
+        let late_help = CustomAgentId("late-help".into());
+        state.custom_agents.update(|hosts| {
+            hosts.entry("unbootstrapped".into()).or_default().insert(
+                late_help.clone(),
+                CustomAgent {
+                    id: late_help.clone(),
+                    name: "Late Help".into(),
+                    description: "Home role delivered with the catalog".into(),
+                    instructions: None,
+                    skill_ids: vec![],
+                    mcp_server_ids: vec![],
+                    tool_policy: ToolPolicy::Unrestricted,
+                },
+            );
+        });
+        state.launch_profile_catalog.update(|hosts| {
+            let catalog = hosts.get_mut("unbootstrapped").unwrap();
+            catalog.home_custom_agent_id = Some(late_help);
+            catalog.entries = vec![ready("late-claude", "Late Claude", BackendKind::Claude)];
+        });
+        next_tick().await;
+        assert_eq!(
+            find_button_by_text(&container, "Late Help")
+                .unwrap()
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("true"),
+            "Home reflects the canonical role when its catalog arrives"
+        );
+        find_button_by_text(&container, "Late Claude")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(visible_text(&container).contains("Late Claude · Late Help"));
+        choose("remote", Some(remote.clone()));
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Remote Codex").is_some());
+        assert!(find_button_by_text(&container, "Local Claude").is_none());
+        assert!(find_button_by_text(&container, "remote role").is_some());
+        assert!(find_button_by_text(&container, "local role").is_none());
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(local.clone()),
+            "Picking is not navigation"
+        );
+        state
+            .projects
+            .update(|projects| projects.retain(|project| project.host_id != "remote"));
+        next_tick().await;
+        assert!(visible_text(&container).contains("The selected project is no longer available."));
+        assert!(
+            find_button_by_text(&container, "Create agent")
+                .unwrap()
+                .has_attribute("disabled")
+        );
+        assert!(
+            open.get_untracked(),
+            "Invalid selection stays visible, never silently switches to Home"
+        );
+        state.projects.update(|projects| {
+            projects.push(crate::state::ProjectInfo {
+                host_id: "remote".into(),
+                project: protocol::Project {
+                    id: remote.project_id.clone(),
+                    name: "Shared name".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone { roots: vec![] },
+                },
+            })
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(!open.get_untracked());
+        assert_eq!(state.active_project.get_untracked(), Some(remote));
+        assert_rendered_draft(&container, "Codex", "Auto").await;
+
+        open.set(true);
+        next_tick().await;
+        choose("local", Some(local));
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Local Claude").is_some());
+        state
+            .launch_profile_catalog
+            .update(|catalogs| catalogs.get_mut("local").unwrap().entries.clear());
+        next_tick().await;
+        assert!(visible_text(&container).contains("The selected backend is no longer available."));
+        assert!(
+            find_button_by_text(&container, "Create agent")
+                .unwrap()
+                .has_attribute("disabled")
+        );
+        struct RestoreInvoke(wasm_bindgen::JsValue);
+        impl Drop for RestoreInvoke {
+            fn drop(&mut self) {
+                let core = js_sys::eval("window.__TAURI__.core").unwrap();
+                js_sys::Reflect::set(&core, &"invoke".into(), &self.0).unwrap();
+            }
+        }
+        let _restore = RestoreInvoke(js_sys::eval("window.__TAURI__.core.invoke").unwrap());
+        let store = serde_json::json!({
+            "hosts": state.configured_hosts.get_untracked(), "selected_host_id": "remote",
+        });
+        js_sys::eval(&format!("window.__TAURI__.core.invoke = (cmd) => cmd === 'set_selected_host' ? new Promise(resolve => window.__finishHomeHost = () => resolve({store})) : Promise.resolve()")).unwrap();
+        choose("remote", None);
+        next_tick().await;
+        assert!(
+            picker()
+                .selected_options()
+                .item(0)
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("No project / Home")
+        );
+        assert!(find_button_by_text(&container, "Remote Codex").is_some());
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            js_sys::eval("typeof window.__finishHomeHost === 'function'")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "the explicit host handoff is held at its completion event"
+        );
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.get_mut("remote").unwrap().home_custom_agent_id =
+                Some(CustomAgentId("remote-role".into()));
+        });
+        js_sys::eval("window.__finishHomeHost(); delete window.__finishHomeHost").unwrap();
+        next_tick().await;
+        assert!(!open.get_untracked());
+        assert!(state.active_project.get_untracked().is_none());
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            None,
+            "the confirmed Default role must not change during the host handoff"
+        );
+        assert_eq!(
+            state.selected_host_id.get_untracked().as_deref(),
+            Some("remote")
+        );
+        state.drop_draft_bound_to_another_host();
+        assert_eq!(
+            state
+                .composer_untracked()
+                .selection_host
+                .get_untracked()
+                .as_deref(),
+            Some("remote")
+        );
+        assert_rendered_draft(&container, "Codex", "Auto").await;
+    }
+
     /// Selecting a ready profile sets the draft launch profile id, backend, and
     /// session settings straight from the server-provided profile — no id
     /// parsing — and closes the menu.
@@ -1019,14 +1427,15 @@ mod wasm_tests {
         }
     }
 
-    /// When the host has no launch profiles yet, the empty state guides the
+    /// When the host reports an empty catalog, the empty state guides the
     /// user to enable a backend rather than showing a dead end.
     #[wasm_bindgen_test]
     async fn empty_catalog_shows_actionable_copy() {
         let container = make_container();
         let state = AppState::new();
-        // Host selected but no catalog entries → empty state.
-        state.selected_host_id.set(Some("local".to_owned()));
+        // Without a received catalog, the DOM correctly asks to connect the host.
+        // This flow guards the distinct server-reported empty catalog guidance.
+        set_catalog(&state, "local", vec![]);
         let open = RwSignal::new(true);
         let _handle = mount_menu(&container, &state, open);
         next_tick().await;
@@ -1571,6 +1980,17 @@ mod wasm_tests {
             host_id: "local".to_owned(),
             project_id: protocol::ProjectId("approved-project".to_owned()),
         };
+        state.projects.update(|projects| {
+            projects.push(crate::state::ProjectInfo {
+                host_id: project.host_id.clone(),
+                project: protocol::Project {
+                    id: project.project_id.clone(),
+                    name: "Approved project".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone { roots: vec![] },
+                },
+            })
+        });
         state.switch_active_project(Some(project));
         open.set(true);
         next_tick().await;
@@ -1590,6 +2010,11 @@ mod wasm_tests {
             None,
             "Project launches retain the ordinary Default"
         );
+        assert!(
+            !open.get_untracked(),
+            "Project launch must actually create the draft"
+        );
+        assert_rendered_draft(&container, "Claude", "Auto").await;
         container.remove();
     }
 

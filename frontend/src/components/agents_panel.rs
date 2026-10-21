@@ -1537,18 +1537,7 @@ pub fn AgentsPanel() -> impl IntoView {
 
     let launch_target = RwSignal::new(None::<ActiveProjectRef>);
     let launch_open = RwSignal::new(false);
-    let launch_projects = state.projects;
-    let launch_project = Memo::new(move |_| {
-        let target = launch_target.get()?;
-        launch_projects.with(|projects| {
-            projects
-                .iter()
-                .any(|project| {
-                    project.host_id == target.host_id && project.project.id == target.project_id
-                })
-                .then_some(target)
-        })
-    });
+    let launch_project = Memo::new(move |_| launch_target.get());
     let launch = Callback::new(move |target| {
         launch_target.set(Some(target));
         launch_open.set(true);
@@ -1560,6 +1549,10 @@ pub fn AgentsPanel() -> impl IntoView {
         let projects = section_state.projects.get();
         let active = section_state.active_project.get();
         let show_other = current_filters.get().show_other_projects;
+        let hide_empty = section_state
+            .effective_agents_sidebar_preferences()
+            .hide_empty_projects;
+        let actual_agents = section_state.agents.get();
         let scoped_projects = projects
             .iter()
             .filter(|project| {
@@ -1579,14 +1572,64 @@ pub fn AgentsPanel() -> impl IntoView {
             })
             .cloned()
             .collect();
-        build_sidebar_projection(
+        let mut projection = build_sidebar_projection(
             filtered_agents.get(),
             filtered_swarms.get(),
             section_state.configured_hosts.get(),
             scoped_projects,
             snapshot.groups,
             snapshot.pins,
-        )
+        );
+        if hide_empty {
+            let actual_swarms = section_state.swarms.get();
+            let has_conversations = |target: &ActiveProjectRef| {
+                let agent_projects = actual_agents
+                    .iter()
+                    .filter_map(|agent| agent.project_id.as_ref().map(|id| (&agent.host_id, id)));
+                let swarm_projects = actual_swarms.iter().flat_map(|(host, swarms)| {
+                    swarms
+                        .values()
+                        .map(move |swarm| (host, &swarm.constraints.project_id))
+                });
+                agent_projects.chain(swarm_projects).any(|(host, project)| {
+                    if host != &target.host_id {
+                        return false;
+                    }
+                    let mut current = Some(project);
+                    for _ in 0..=projects.len() {
+                        let Some(id) = current else {
+                            return false;
+                        };
+                        if id == &target.project_id {
+                            return true;
+                        }
+                        current = projects
+                            .iter()
+                            .find(|project| {
+                                project.host_id == target.host_id && &project.project.id == id
+                            })
+                            .and_then(|project| project.project.parent_project_id());
+                    }
+                    false
+                })
+            };
+            for host in &mut projection.hosts {
+                host.projects
+                    .retain(|section| section.project.as_ref().is_none_or(has_conversations));
+                for section in &mut host.projects {
+                    section.workbenches.retain(|workbench| {
+                        has_conversations(&ActiveProjectRef {
+                            host_id: workbench.host_id.clone(),
+                            project_id: workbench.project.id.clone(),
+                        })
+                    });
+                }
+            }
+            projection
+                .hosts
+                .retain(|host| !host.projects.is_empty() || !host.custom_groups.is_empty());
+        }
+        projection
     });
 
     let on_search = move |ev: leptos::ev::Event| {
@@ -1639,6 +1682,20 @@ pub fn AgentsPanel() -> impl IntoView {
         }
     };
 
+    let empty_state = state.clone();
+    let hide_empty_projects = Memo::new(move |_| {
+        empty_state
+            .effective_agents_sidebar_preferences()
+            .hide_empty_projects
+    });
+    let toggle_empty_state = state.clone();
+    let toggle_empty = move |_| {
+        let mut sidebar = toggle_empty_state.effective_agents_sidebar_preferences();
+        sidebar.hide_empty_projects = !sidebar.hide_empty_projects;
+        persist_sidebar(&toggle_empty_state, sidebar);
+    };
+    let toolbar_state = state.clone();
+
     view! {
         <div class="panel agents-panel">
             <div class="panel-search">
@@ -1653,6 +1710,11 @@ pub fn AgentsPanel() -> impl IntoView {
                     autocapitalize="none"
                     autocomplete="off"
                 />
+                <button type="button" class="agents-new-button" title="New agent" aria-label="New agent"
+                    on:click=move |_| {
+                        launch_target.set(toolbar_state.active_project_ref_untracked());
+                        launch_open.set(true);
+                    }><span aria-hidden="true">"+"</span><span class="agents-new-label">"New agent"</span></button>
             </div>
             <details class="agents-filter-menu">
                 <summary aria-label="Filter agents" title="Filter agents">"▽"</summary>
@@ -1679,6 +1741,10 @@ pub fn AgentsPanel() -> impl IntoView {
                     <input type="checkbox" prop:checked=move || show_workbenches.get()
                         on:change=toggle_workbenches />
                     "Show workbenches"
+                </label>
+                <label class="agents-workbench-filter">
+                    <input type="checkbox" prop:checked=move || hide_empty_projects.get() on:change=toggle_empty />
+                    "Hide empty projects"
                 </label>
                 </div>
             </details>
@@ -4886,9 +4952,37 @@ mod wasm_tests {
                 .dyn_into::<HtmlElement>()
                 .unwrap()
         };
-        remote_new().click();
+        container
+            .query_selector("button[aria-label='New agent']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
         next_tick().await;
         let document = web_sys::window().unwrap().document().unwrap();
+        let picker = document
+            .query_selector("select[aria-label='Project']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        let selected: (Option<String>, Option<ActiveProjectRef>) =
+            serde_json::from_str(&picker.value()).unwrap();
+        assert_eq!(
+            selected.1, original_selection,
+            "Toolbar launch defaults to the active typed project"
+        );
+        document
+            .query_selector("[aria-label='Close agent chooser']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        remote_new().click();
+        next_tick().await;
         let dialog = || {
             document
                 .query_selector("[role='dialog'][aria-label='New agent']")
@@ -5147,6 +5241,108 @@ mod wasm_tests {
         confirmed.show_workbenches = false;
         state.apply_agents_view_snapshot("local", sidebar_snapshot(confirmed));
         next_tick().await;
+
+        let before_empty_filter = state.agents_view_preferences.get_untracked();
+        let mut filtered_preferences = before_empty_filter.clone();
+        filtered_preferences.sidebar.hide_empty_projects = true;
+        filtered_preferences.sidebar.hide_inactive = true;
+        filtered_preferences.sidebar.show_workbenches = true;
+        state.projects.update(|projects| {
+            let mut empty_workbench = projects
+                .iter()
+                .find(|project| {
+                    project.host_id == "local" && project.project.id.0 == "alpha-workbench"
+                })
+                .unwrap()
+                .clone();
+            empty_workbench.project.id = ProjectId("alpha-empty-workbench".into());
+            empty_workbench.project.name = "Empty workbench".into();
+            projects.push(empty_workbench);
+        });
+        filtered_preferences
+            .pins
+            .pinned
+            .push(local_target("workbench-agent"));
+        state.agents_view_preferences.set(filtered_preferences);
+        next_tick().await;
+        for host in ["local", "remote"] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-project-key='{host}:empty']"))
+                    .unwrap()
+                    .is_none(),
+                "Only truly empty projects disappear"
+            );
+        }
+        for key in [
+            "local:alpha",
+            "local:beta",
+            "remote:gamma",
+            "remote:alpha-workbench",
+        ] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-project-key='{key}']"))
+                    .unwrap()
+                    .is_some(),
+                "Idle, pinned and workbench agents count even when activity filters hide every row"
+            );
+        }
+        assert!(
+            container
+                .query_selector("[data-project-id='alpha-empty-workbench']")
+                .unwrap()
+                .is_none(),
+            "An empty workbench is hidden even when its parent contains agents"
+        );
+        assert!(
+            container
+                .query_selector("[data-project-id='alpha-workbench']")
+                .unwrap()
+                .is_some(),
+            "A populated idle workbench keeps its heading"
+        );
+        let search_input = container
+            .query_selector("input[placeholder='Filter agents...']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        search_input.set_value("no agent matches this search");
+        search_input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-project-key='local:alpha']")
+                .unwrap()
+                .is_some(),
+            "A project with only filtered-out workbench agents is not empty"
+        );
+        assert!(
+            container
+                .query_selector("[data-project-key='remote:gamma']")
+                .unwrap()
+                .is_some(),
+            "Search results cannot define actual catalog membership"
+        );
+        search_input.set_value("");
+        search_input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        state.projects.update(|projects| {
+            projects.retain(|project| project.project.id.0 != "alpha-empty-workbench")
+        });
+        state.agents_view_preferences.set(before_empty_filter);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-project-key='local:empty']")
+                .unwrap()
+                .is_some(),
+            "Empty projects return when the explicit option is cleared"
+        );
 
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
@@ -6888,6 +7084,85 @@ mod wasm_tests {
             );
             assert!(!text.contains("Normal Agent") && !text.contains("Remote Crew"));
         }
+
+        // Recovery retains swarm conversations but clears live agent handles.
+        state
+            .agents
+            .update(|agents| agents.retain(|agent| agent.agent_id.0 == "normal"));
+        state.swarms.update(|hosts| {
+            for swarms in hosts.values_mut() {
+                for swarm in swarms.values_mut() {
+                    swarm.lifecycle = SwarmLifecycle::Paused;
+                    for member in &mut swarm.members {
+                        member.state = SwarmMemberState::Dormant;
+                        member.session_id =
+                            Some(protocol::SessionId(format!("saved-{}", member.spec.id)));
+                        member.agent_id = None;
+                        member.runtime_status = None;
+                    }
+                }
+            }
+        });
+        state.active_project.set(None);
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects;
+        preferences.sidebar.hide_empty_projects = true;
+        state.agents_view_preferences.set(preferences);
+        next_tick().await;
+        let bamboo = container
+            .query_selector("[data-project-key='local:bamboo']")
+            .unwrap()
+            .expect("A saved swarm keeps its parent project even without live agents");
+        let saved_swarm = bamboo
+            .query_selector("[data-project-id='bamboo-bench'] [data-swarm-id='bamboo-swarm']")
+            .unwrap()
+            .expect("A saved swarm keeps its exact workbench conversation row");
+        let text = saved_swarm.text_content().unwrap();
+        assert!(
+            text.contains("Bamboo Crew") && text.contains("Paused") && text.contains("2 agents")
+        );
+        assert!(
+            container
+                .query_selector("[data-project-id='bamboo-sibling']")
+                .unwrap()
+                .is_none(),
+            "A genuinely empty sibling workbench is still hidden"
+        );
+        let search = container
+            .query_selector("input[placeholder='Filter agents...']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        search.set_value("no swarm matches this search");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-project-key='local:bamboo']")
+                .unwrap()
+                .is_some(),
+            "Filtering out a saved swarm does not make its project empty"
+        );
+        state.swarms.update(|hosts| {
+            hosts.get_mut("local").unwrap().clear();
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-project-key='local:bamboo']")
+                .unwrap()
+                .is_none(),
+            "Another host's same-ID swarm cannot keep an empty local project visible"
+        );
+        assert!(
+            container
+                .query_selector("[data-project-key='remote:bamboo-bench']")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[wasm_bindgen_test]

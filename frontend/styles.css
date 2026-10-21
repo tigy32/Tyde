@@ -600,6 +600,7 @@ details summary:focus:not(:focus-visible) {
 .launch-chooser h2 { margin: 0; font-size: 1.7rem; font-weight: 600; }
 .launch-chooser-header p { margin: 6px 0 0; color: var(--text-secondary); }
 .launch-chooser-close {
+    order: 1;
     background: transparent;
     border: none;
     color: var(--text-secondary);
@@ -609,6 +610,19 @@ details summary:focus:not(:focus-visible) {
     height: 32px;
     border-radius: 4px;
 }
+
+.launch-project-picker {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+    max-width: 360px;
+    gap: 7px;
+    margin-left: auto;
+}
+.launch-project-picker label { font-weight: 600; }
+.launch-project-picker select { width: 100%; min-width: 0; padding: 10px 12px; background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border-primary); border-radius: 5px; }
+.launch-project-picker select:focus-visible { outline: 2px solid var(--accent-link); outline-offset: 2px; }
 
 .launch-chooser-body {
     display: grid;
@@ -701,6 +715,8 @@ details summary:focus:not(:focus-visible) {
 .launch-chooser button:focus-visible, .launch-chooser input:focus-visible { outline: 2px solid var(--accent-link); outline-offset: 2px; }
 
 @media (max-width: 760px) {
+    .launch-chooser-header { flex-wrap: wrap; }
+    .launch-project-picker { order: 2; flex-basis: 100%; max-width: none; }
     .launch-chooser-body { grid-template-columns: minmax(180px, 35%) minmax(0, 1fr); }
     .launch-backends, .launch-roles { padding: 16px; }
     .launch-role-list { grid-template-columns: minmax(0, 1fr); }
@@ -17577,7 +17593,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .dock-tab-item { flex-shrink: 0; }
 .project-root-error { display: block; color: var(--error); }
 
-.agents-panel { position: relative; }
+.agents-panel { position: relative; container-type: inline-size; }
 .agents-panel > .panel-search { padding-right: 42px; }
 .agents-filter-menu { position: absolute; top: 8px; right: 8px; z-index: 3; }
 .agents-filter-menu summary { list-style: none; width: 28px; height: 28px; border: 1px solid var(--border-primary); border-radius: 4px; display: grid; place-items: center; color: var(--text-secondary); cursor: pointer; }
@@ -17765,3 +17781,11 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-sidebar-workbenches:empty { display: none; }
 .agent-sidebar-workbench { display: flex; align-items: center; gap: 3px; min-height: 26px; color: var(--text-secondary); font-size: 12px; }
 .agent-sidebar-workbench:hover .project-edit-pencil, .agent-sidebar-workbench:focus-within .project-edit-pencil { opacity: 1; }
+
+/* Project-aware agent discovery and launch controls. */
+.agents-panel > .panel-search { display: flex; align-items: center; gap: 8px; }
+.agents-panel > .panel-search .panel-search-input { min-width: 0; flex: 1; }
+.agents-new-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex-shrink: 0; height: 28px; padding: 0 9px; color: var(--text-primary); background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.agents-new-button > span:first-child { color: var(--accent-primary); font-size: 20px; }
+.agents-new-button:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+@container (max-width: 300px) { .agents-new-label { display: none; } }
