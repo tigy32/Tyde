@@ -390,6 +390,9 @@ pub struct HostRuntimeConfig {
     #[cfg(feature = "test-support")]
     pub dots_configuration_gate: Option<watch::Receiver<bool>>,
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
+    /// Transfer an already-bound fixture listener through the child's stdin.
+    #[cfg(all(feature = "test-support", unix))]
+    pub dev_frontend_listener: Option<Arc<std::net::TcpListener>>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -449,6 +452,8 @@ impl Default for HostRuntimeConfig {
             #[cfg(feature = "test-support")]
             dots_configuration_gate: None,
             debug_mcp_bind_addr: None,
+            #[cfg(all(feature = "test-support", unix))]
+            dev_frontend_listener: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
             workflow_mcp_bind_addr: None,
@@ -17123,7 +17128,7 @@ fn spawn_host_inner(
         )?;
         project_streams.insert(project.id.clone(), subscription);
     }
-    let debug_mcp = match crate::debug_mcp::start_server(runtime_config.debug_mcp_bind_addr) {
+    let debug_mcp = match crate::debug_mcp::start_server(&runtime_config) {
         Ok(handle) => handle,
         Err(err) if runtime_config.debug_mcp_bind_addr.is_none() => {
             tracing::warn!(

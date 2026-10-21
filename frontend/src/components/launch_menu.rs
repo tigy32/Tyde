@@ -46,55 +46,86 @@ fn backend_tag_for(
 }
 
 pub(super) fn backend_icon(kind: BackendKind) -> impl IntoView {
-    let mark = match kind {
-        BackendKind::Tycode => view! { <path d="m7 5-5 7 5 7m10-14 5 7-5 7m-3-16-4 18" /> }.into_any(),
-        BackendKind::Kiro => view! {
-            <path d="m12 2 9 5v10l-9 5-9-5V7z" />
-            <circle cx="12" cy="12" r="3" />
-            <circle cx="13" cy="11" r="0.8" fill="currentColor" />
-        }.into_any(),
-        BackendKind::Claude => view! {
-            <g stroke="#d97757" stroke-width="1.9">
-                <path d="M12 1v22M1 12h22M4.2 4.2l15.6 15.6M4.2 19.8 19.8 4.2M7.8 1.8l8.4 20.4M1.8 7.8l20.4 8.4M1.8 16.2l20.4-8.4M7.8 22.2l8.4-20.4" />
-            </g>
-        }.into_any(),
-        BackendKind::Codex => view! {
-            <g stroke-width="1.4">
-                {(0..6).map(|i| view! {
-                    <path transform=format!("rotate({} 12 12)", i * 60)
-                        d="M12 3c-3-3-8 0-7 4l1 6 6 3 5-3V7l-5-3-5 3v6" />
-                }).collect_view()}
-            </g>
-        }.into_any(),
-        BackendKind::Antigravity => view! {
-            <path d="m3 20 9-17 9 17" stroke="#a58cff" stroke-width="4" />
-            <path d="m12 3 4.5 8.5" stroke="#f39b88" stroke-width="4" />
-            <path d="m16.5 11.5 4.5 8.5" stroke="#69b8ff" stroke-width="4" />
-        }.into_any(),
-        BackendKind::Hermes => view! {
-            <path d="M2 3c4 7 13 2 20 14-7-7-14 0-19-8m1 3c5 7 12 1 18 8-7-3-11 2-16-4m3 3c4 4 8 1 12 3" />
-        }.into_any(),
-        BackendKind::Grok => view! {
-            <path d="M18 4a9 9 0 1 0 3 6M2 22 22 2m-5 1h5v5" />
-        }.into_any(),
-        BackendKind::Opencode => view! {
-            <rect x="2" y="2" width="20" height="20" rx="3" />
-            <path d="m6 7 4 5-4 5m7 0h5" />
-        }.into_any(),
-        BackendKind::Muse => {
-            // Bundle https://muse.ai/images/favicon/app-squiggle.svg unchanged;
-            // its embedded SVG keeps gradient IDs private and works offline.
-            let source = format!(
-                "data:image/svg+xml,{}",
-                String::from(js_sys::encode_uri_component(include_str!("../../muse.svg")))
-            );
-            view! { <image href=source width="24" height="24" /> }.into_any()
-        },
+    use base64::Engine;
+
+    let (light, dark, media_type, backing): (&[u8], Option<&[u8]>, &str, Option<&str>) = match kind
+    {
+        BackendKind::Tycode => (
+            include_bytes!("../../provider-icons/tycode.svg"),
+            None,
+            "image/svg+xml",
+            Some("white"),
+        ),
+        BackendKind::Kiro => (
+            include_bytes!("../../provider-icons/kiro.svg"),
+            None,
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Claude => (
+            include_bytes!("../../provider-icons/claude.svg"),
+            None,
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Codex => (
+            include_bytes!("../../provider-icons/openai-black.svg"),
+            Some(include_bytes!("../../provider-icons/openai-white.svg")),
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Antigravity => (
+            include_bytes!("../../provider-icons/antigravity.svg"),
+            None,
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Hermes => (
+            include_bytes!("../../provider-icons/hermes.svg"),
+            None,
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Grok => (
+            include_bytes!("../../provider-icons/grok.png"),
+            None,
+            "image/png",
+            Some("black"),
+        ),
+        BackendKind::Opencode => (
+            include_bytes!("../../provider-icons/opencode-light.svg"),
+            Some(include_bytes!("../../provider-icons/opencode-dark.svg")),
+            "image/svg+xml",
+            None,
+        ),
+        BackendKind::Muse => (
+            include_bytes!("../../muse.svg"),
+            None,
+            "image/svg+xml",
+            None,
+        ),
     };
+    let source = |bytes: &[u8]| {
+        format!(
+            "data:{media_type};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    let light_source = source(light);
+    let dark_source = dark.map(source);
+    let themed = dark_source.is_some();
     view! {
         <svg class="launch-backend-icon" width="24" height="24" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-            stroke-linejoin="round" aria-hidden="true" focusable="false">{mark}</svg>
+            fill="none" aria-hidden="true" focusable="false">
+            // Select supplied colorways, never filter or recolor vendor artwork.
+            <style>{".launch-backend-icon .provider-dark { display: none; } [data-theme=dark] .launch-backend-icon .provider-light { display: none; } [data-theme=dark] .launch-backend-icon .provider-dark { display: inline; }"}</style>
+            {backing.map(|color| view! { <rect width="24" height="24" rx="2" fill=color /> })}
+            <image class=if themed { "provider-light" } else { "" }
+                href=light_source width="24" height="24" preserveAspectRatio="xMidYMid meet" />
+            {dark_source.map(|source| view! {
+                <image class="provider-dark" href=source width="24" height="24" preserveAspectRatio="xMidYMid meet" />
+            })}
+        </svg>
     }
 }
 
@@ -1648,7 +1679,18 @@ mod wasm_tests {
             &state,
             "local",
             vec![
+                ready("tycode:default", "Tycode", BackendKind::Tycode),
+                ready("kiro:default", "Kiro", BackendKind::Kiro),
                 ready("claude:default", "Claude", BackendKind::Claude),
+                ready("codex:default", "Codex", BackendKind::Codex),
+                ready(
+                    "antigravity:default",
+                    "Antigravity",
+                    BackendKind::Antigravity,
+                ),
+                ready("hermes:default", "Hermes", BackendKind::Hermes),
+                ready("grok:default", "Grok", BackendKind::Grok),
+                ready("opencode:default", "OpenCode", BackendKind::Opencode),
                 ready("muse:default", "Muse", BackendKind::Muse),
                 ready_kind(
                     "muse:custom",
@@ -1671,6 +1713,187 @@ mod wasm_tests {
             rect.width() >= 20.0 && rect.height() >= 20.0,
             "backend identity has a visible icon"
         );
+        let root = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap();
+        let previous_theme = root.get_attribute("data-theme");
+        for theme in ["light", "dark"] {
+            root.set_attribute("data-theme", theme).unwrap();
+            for label in [
+                "Tycode",
+                "Kiro",
+                "Claude",
+                "Codex",
+                "Antigravity",
+                "Hermes",
+                "Grok",
+                "OpenCode",
+                "Muse",
+            ] {
+                let row = find_button_by_text(&container, label).unwrap();
+                let mark = row
+                    .query_selector("svg[aria-hidden=true]")
+                    .unwrap()
+                    .unwrap();
+                mark.set_attribute("style", "width:18px;height:18px")
+                    .unwrap();
+                let bounds = mark.get_bounding_client_rect();
+                assert_eq!((bounds.width(), bounds.height()), (18.0, 18.0));
+                let images = mark.query_selector_all("image").unwrap();
+                let mut visible = 0;
+                for index in 0..images.length() {
+                    let image = images
+                        .item(index)
+                        .unwrap()
+                        .dyn_into::<web_sys::Element>()
+                        .unwrap();
+                    let style = web_sys::window()
+                        .unwrap()
+                        .get_computed_style(&image)
+                        .unwrap()
+                        .unwrap();
+                    if style.get_property_value("display").unwrap() == "none" {
+                        continue;
+                    }
+                    visible += 1;
+                    let source = image.get_attribute("href").unwrap();
+                    assert!(
+                        source.starts_with("data:image/"),
+                        "{label} must render offline"
+                    );
+                    assert_eq!(
+                        image.get_attribute("preserveAspectRatio").as_deref(),
+                        Some("xMidYMid meet")
+                    );
+                    let painted_bounds = image.get_bounding_client_rect();
+                    assert_eq!(
+                        (painted_bounds.width(), painted_bounds.height()),
+                        (18.0, 18.0),
+                        "{label}'s mounted image must occupy its slot"
+                    );
+                    assert_eq!(style.get_property_value("visibility").unwrap(), "visible");
+                    assert!(
+                        style
+                            .get_property_value("opacity")
+                            .unwrap()
+                            .parse::<f64>()
+                            .unwrap()
+                            > 0.0
+                    );
+                    let snapshot = mark
+                        .clone_node_with_deep(true)
+                        .unwrap()
+                        .dyn_into::<web_sys::Element>()
+                        .unwrap();
+                    let snapshot_images = snapshot.query_selector_all("image").unwrap();
+                    for other in (0..snapshot_images.length()).rev() {
+                        if other != index {
+                            snapshot_images
+                                .item(other)
+                                .unwrap()
+                                .dyn_into::<web_sys::Element>()
+                                .unwrap()
+                                .remove();
+                        }
+                    }
+                    snapshot.query_selector("style").unwrap().unwrap().remove();
+                    let markup = snapshot.outer_html().replacen(
+                        "<svg ",
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" ",
+                        1,
+                    );
+                    let decoded = web_sys::HtmlImageElement::new().unwrap();
+                    decoded.set_src(&format!(
+                        "data:image/svg+xml,{}",
+                        String::from(js_sys::encode_uri_component(&markup))
+                    ));
+                    wasm_bindgen_futures::JsFuture::from(decoded.decode())
+                        .await
+                        .unwrap();
+                    let canvas = web_sys::window()
+                        .unwrap()
+                        .document()
+                        .unwrap()
+                        .create_element("canvas")
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlCanvasElement>()
+                        .unwrap();
+                    canvas.set_width(18);
+                    canvas.set_height(18);
+                    let context = canvas
+                        .get_context("2d")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+                        .unwrap();
+                    // Chrome decodes the SVG's 24px attributes as its natural
+                    // size despite its mounted 18px CSS size; retain that viewport.
+                    context
+                        .draw_image_with_html_image_element_and_dw_and_dh(
+                            &decoded,
+                            0.0,
+                            0.0,
+                            bounds.width(),
+                            bounds.height(),
+                        )
+                        .unwrap();
+                    let pixels = context
+                        .get_image_data(0.0, 0.0, 18.0, 18.0)
+                        .unwrap()
+                        .data()
+                        .0;
+                    assert!(
+                        pixels.chunks_exact(4).any(|pixel| pixel[3] > 200),
+                        "{label} must paint at 18px in {theme} mode"
+                    );
+                    if matches!(label, "Tycode" | "Grok") {
+                        assert!(
+                            pixels
+                                .chunks_exact(4)
+                                .any(|p| p[3] > 200 && p[..3].iter().all(|v| *v < 60))
+                                && pixels
+                                    .chunks_exact(4)
+                                    .any(|p| p[3] > 200 && p[..3].iter().all(|v| *v > 220)),
+                            "{label}'s mounted mark must contrast with its backing"
+                        );
+                    }
+                    if label == "OpenCode" {
+                        let expected = if theme == "light" {
+                            [33, 30, 30]
+                        } else {
+                            [241, 236, 236]
+                        };
+                        assert_eq!(
+                            &pixels[(9 * 18 + 2) * 4..(9 * 18 + 2) * 4 + 3],
+                            &expected,
+                            "use the supplied {theme} colorway, not a tint"
+                        );
+                        assert!(
+                            (0..18).all(|y| pixels[y * 18 * 4 + 3] == 0
+                                && pixels[(y * 18 + 17) * 4 + 3] == 0),
+                            "OpenCode's portrait mark must not stretch to fill the square slot"
+                        );
+                        assert!(
+                            pixels[(9 * 18 + 2) * 4 + 3] > 200
+                                && pixels[(9 * 18 + 15) * 4 + 3] > 200,
+                            "OpenCode retains its full centered width"
+                        );
+                    }
+                }
+                assert_eq!(
+                    visible, 1,
+                    "exactly one supplied {label} colorway in {theme}"
+                );
+                mark.remove_attribute("style").unwrap();
+            }
+        }
+        match previous_theme {
+            Some(theme) => root.set_attribute("data-theme", &theme).unwrap(),
+            None => root.remove_attribute("data-theme").unwrap(),
+        }
         for label in ["Muse", "Code helper"] {
             let row = find_button_by_text(&container, label).unwrap();
             let mark = row

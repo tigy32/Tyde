@@ -170,7 +170,12 @@ struct ClosingDevProject {
     error: Option<String>,
 }
 
-fn start_instance_registry(mut receiver: mpsc::UnboundedReceiver<InstanceCommand>) {
+fn start_instance_registry(
+    mut receiver: mpsc::UnboundedReceiver<InstanceCommand>,
+    #[cfg(all(feature = "test-support", unix))] mut frontend_listener: Option<
+        Arc<std::net::TcpListener>,
+    >,
+) {
     tokio::spawn(async move {
         let mut records = HashMap::<String, DevInstanceRecord>::new();
         let mut closed_projects = std::collections::HashSet::new();
@@ -266,6 +271,8 @@ fn start_instance_registry(mut receiver: mpsc::UnboundedReceiver<InstanceCommand
                                 input,
                                 execution_project.map(|project| *project),
                                 cancellation.clone(),
+                                #[cfg(all(feature = "test-support", unix))]
+                                frontend_listener.take(),
                             ));
                             pending.insert(
                                 task.id(),
@@ -741,8 +748,10 @@ struct HealthResponse {
     status: &'static str,
 }
 
-pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, String> {
-    let bind_addr = bind_addr.unwrap_or_else(|| {
+pub fn start_server(config: &crate::host::HostRuntimeConfig) -> Result<DebugMcpHandle, String> {
+    #[cfg(all(feature = "test-support", unix))]
+    let frontend_listener = config.dev_frontend_listener.clone();
+    let bind_addr = config.debug_mcp_bind_addr.unwrap_or_else(|| {
         DEFAULT_BIND_ADDR
             .parse()
             .expect("default loopback debug MCP bind addr must parse")
@@ -775,7 +784,11 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
                 .build()
                 .expect("failed to build debug MCP runtime");
             runtime.block_on(async move {
-                start_instance_registry(instance_commands);
+                start_instance_registry(
+                    instance_commands,
+                    #[cfg(all(feature = "test-support", unix))]
+                    frontend_listener,
+                );
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio debug MCP listener");
                 let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
@@ -857,6 +870,9 @@ async fn build_instance(
     input: StartInstanceToolInput,
     execution_project: Option<Project>,
     cancellation: CancellationToken,
+    #[cfg(all(feature = "test-support", unix))] frontend_listener: Option<
+        Arc<std::net::TcpListener>,
+    >,
 ) -> Result<(DevInstanceRecord, StartInstanceResult), DevStartFailure> {
     let logical_project_dir = match execution_project.as_ref().map(|project| &project.source) {
         Some(ProjectSource::GitWorkbench {
@@ -873,6 +889,15 @@ async fn build_instance(
         | None => project_dir.clone(),
     };
     let instance_id = Uuid::new_v4().simple().to_string();
+    #[cfg(all(feature = "test-support", unix))]
+    let frontend_port = match &frontend_listener {
+        Some(listener) => listener
+            .local_addr()
+            .map_err(|error| format!("failed to read fixture frontend endpoint: {error}"))?
+            .port(),
+        None => reserve_loopback_port()?,
+    };
+    #[cfg(not(all(feature = "test-support", unix)))]
     let frontend_port = reserve_loopback_port()?;
     let host_port = reserve_loopback_port()?;
     let ui_debug_port = reserve_loopback_port()?;
@@ -912,6 +937,15 @@ async fn build_instance(
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut frontend_command =
         devtools_protocol::frontend::command(&logical_project_dir, &store_dir, frontend_port)?;
+    #[cfg(all(feature = "test-support", unix))]
+    if let Some(listener) = frontend_listener {
+        let descriptor: std::os::fd::OwnedFd = listener
+            .try_clone()
+            .map_err(|error| format!("failed to transfer fixture frontend listener: {error}"))?
+            .into();
+        frontend_command.stdin(std::fs::File::from(descriptor));
+    }
+
     if let Some(project) = &execution_project {
         frontend_command.in_project(project.clone());
     }

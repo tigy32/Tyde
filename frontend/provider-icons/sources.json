@@ -1,0 +1,71 @@
+{
+  "retrieved": "2026-10-20",
+  "assets": [
+    {
+      "file": "openai-black.svg",
+      "source": "https://cdn.openai.com/brand/openai-logos.zip",
+      "archive_member": "OpenAI-logos/SVGs/OAI_OpenAI-Blossom_Black.svg",
+      "sha256": "75c1e9fffa5e8c437bec1d67197a73992bca45d166c6ff23215185dea8fae92a"
+    },
+    {
+      "file": "openai-white.svg",
+      "source": "https://cdn.openai.com/brand/openai-logos.zip",
+      "archive_member": "OpenAI-logos/SVGs/OAI_OpenAI-Blossom_White.svg",
+      "sha256": "01d158767c4eec0e47bd617e67759c33da0accd1438be1a8d29dfdb99ce87285"
+    },
+    {
+      "file": "claude.svg",
+      "source": "https://www-cdn.anthropic.com/ae59ca4ca194dac9c9dc3bc78c5829468cb0e8af.zip",
+      "archive_member": "Anthropic media resources/Anthropic logos/Claude logos/3 Claude Spark/SVG/Claude Spark - Clay.svg",
+      "sha256": "6d53db4be375e899c937c26cf16684a80d6e869b1928d72b37748bef2560e219"
+    },
+    {
+      "file": "kiro.svg",
+      "source": "https://kiro.dev/icon.svg",
+      "archive_member": null,
+      "sha256": "774cbc1c7ecec8c935a6091595583d7a92fc8289d6f1db3f071c0f50c61c369f"
+    },
+    {
+      "file": "antigravity.svg",
+      "source": "https://antigravity.google/assets/image/brand/antigravity-icon__full-color.svg",
+      "archive_member": null,
+      "sha256": "d775965ea1f8060538c15f758a3e22487317211fcb6051333b5e023f35aa726f"
+    },
+    {
+      "file": "hermes.svg",
+      "source": "https://raw.githubusercontent.com/NousResearch/hermes-agent/0b8dee00fafe975f10be40172322d0ccfabfa7f6/assets/icon-master.svg",
+      "archive_member": null,
+      "sha256": "6c4968c1a46f104559684826ed8061fad6052711ff0af9c6b36a6ce674536684"
+    },
+    {
+      "file": "opencode-light.svg",
+      "source": "https://raw.githubusercontent.com/anomalyco/opencode/5fa426f68d1dbf3c8aaa01557e357719f0577438/packages/console/app/src/asset/brand/opencode-logo-light.svg",
+      "archive_member": null,
+      "sha256": "b47a4fecc77599382e238868e74064bbe92307b0e253a32f0b1a026517a2d2a6"
+    },
+    {
+      "file": "opencode-dark.svg",
+      "source": "https://raw.githubusercontent.com/anomalyco/opencode/5fa426f68d1dbf3c8aaa01557e357719f0577438/packages/console/app/src/asset/brand/opencode-logo-dark.svg",
+      "archive_member": null,
+      "sha256": "5dd4abb4de60204510edf140bbe74b3580d07ebdda79fdb0081cd45acb53d44b"
+    },
+    {
+      "file": "grok.png",
+      "source": "https://raw.githubusercontent.com/xai-org/xai-cookbook/58b8d68bfc1ef8fff0a9c0561342e6d11d4b9571/examples/voice-agent-web/client/public/grok.png",
+      "archive_member": null,
+      "sha256": "359056ee8983cfa0ba7e72795078c7c0ddf6c5d7a1870401ab960ed4f9df9e53"
+    },
+    {
+      "file": "tycode.svg",
+      "source": "https://raw.githubusercontent.com/tigy32/Tycode/4766e3935f51d940883222e40bac941d4e02a9ae/tycode-vscode/tycode-icon.svg",
+      "archive_member": null,
+      "sha256": "2d59bb5fef95ec39b0c8de975f821f9ad04e35d5082535c19fd6a1478c51c4b0"
+    },
+    {
+      "file": "../muse.svg",
+      "source": "https://muse.ai/images/favicon/app-squiggle.svg",
+      "archive_member": null,
+      "sha256": "6373d89d274258a38432f3c3729cd716498b8ded849b174a7998683dcf4aaba5"
+    }
+  ]
+}

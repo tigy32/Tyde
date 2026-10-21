@@ -89,8 +89,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200);self.end_headers();self.wfile.write(b'<html>fixture</html>')
         record('response-served')
     def log_message(self,*args):pass
-record('binding',port)
-server=http.server.HTTPServer(('127.0.0.1',port),Handler)
+record('adopting-bound-listener',port)
+listener=socket.socket(fileno=0)
+assert listener.getsockname()==('127.0.0.1',port), 'inherited-frontend-endpoint'
+server=http.server.HTTPServer(('127.0.0.1',port),Handler,bind_and_activate=False)
+server.socket.close()
+server.socket=listener
+server.server_address=listener.getsockname()
+server.server_name='localhost'
+server.server_port=port
+server.server_activate()
 record('bound',port)
 control.sendall(b'B'+port.to_bytes(2,'big'))
 record('awaiting-request',port)
@@ -283,9 +291,13 @@ async fn start_dev_instance_expecting_exit(
     }
     let control_listener =
         tokio::net::UnixListener::bind(control_path).expect("bind frontend readiness gate");
-    // Let the server retain its ephemeral listener: reserving then releasing a
-    // port raced other tests and failed with AddressAlreadyInUse.
+    // Keep both endpoints bound; transfer frontend ownership to the child
+    // without the reserve-close-bind gap that caused AddressAlreadyInUse.
+    let frontend_listener = std::sync::Arc::new(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind owned fixture frontend"),
+    );
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        dev_frontend_listener: Some(frontend_listener),
         debug_mcp_bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         ..Default::default()
     })
@@ -535,6 +547,12 @@ async fn start_dev_instance_expecting_exit(
         matches!(ownership, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
         "frontend gate must retain its actual bound endpoint"
     );
+    // Bind the cleanup probe while the child owns its port, so the later
+    // release check cannot accidentally establish a TCP self-connection.
+    let cleanup_probe = tokio::net::TcpSocket::new_v4().expect("create endpoint release probe");
+    cleanup_probe
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("bind distinct cleanup probe endpoint");
     release_probe
         .send(())
         .expect("release actual canonical frontend probe");
@@ -644,6 +662,12 @@ async fn start_dev_instance_expecting_exit(
         0,
         "failed dev start must stop its owned frontend"
     );
+    let released = cleanup_probe
+        .connect((std::net::Ipv4Addr::LOCALHOST, port).into())
+        .await
+        .expect_err("joined startup cleanup must release the child's listener");
+    assert_eq!(released.kind(), std::io::ErrorKind::ConnectionRefused);
+    eprintln!("DEV READINESS scenario={scenario:?} phase=endpoint-released-after-cleanup");
     service.cancel().await.expect("cancel debug MCP client");
     assert_eq!(
         result.is_error,
