@@ -992,6 +992,15 @@ impl AgentActivityStatsTracker {
         self.stats.clone()
     }
 
+    fn task_usage_amount(&self, reported_usage: &TokenUsage) -> TaskTokenUsageAmount {
+        let mut amount = TaskTokenUsageAmount::from_token_usage(reported_usage);
+        amount.partial_fields =
+            crate::host::aggregate_task_token_usage(self.token_usage_by_source.values())
+                .usage
+                .partial_fields;
+        amount
+    }
+
     fn usage_snapshot(&self) -> (TaskTokenUsageScope, Option<String>) {
         if self.accounting_session_shared {
             return (
@@ -1023,9 +1032,27 @@ impl AgentActivityStatsTracker {
             .token_usage_total_only
             .filter(|total| *total >= self.stats.token_usage.total_tokens)
         {
+            let mut usage = if self
+                .token_usage_by_source
+                .values()
+                .any(|scope| scope.reported_usage().is_some())
+            {
+                self.task_usage_amount(&self.stats.token_usage)
+            } else {
+                TaskTokenUsageAmount::total_only(total_tokens)
+            };
+            if total_tokens > usage.total_tokens {
+                tracing::debug!(
+                    reported_total = total_tokens,
+                    split_total = usage.total_tokens,
+                    "Preserving task usage breakdown beneath aggregate-only observation"
+                );
+                usage.mark_reported_fields_partial();
+                usage.total_tokens = total_tokens;
+            }
             return (
                 TaskTokenUsageScope::Known {
-                    usage: Box::new(TaskTokenUsageAmount::total_only(total_tokens)),
+                    usage: Box::new(usage),
                 },
                 self.latest_model.clone(),
             );
@@ -1080,13 +1107,13 @@ impl AgentActivityStatsTracker {
             }
         } else if partial_seen || unavailable_count > 0 {
             TaskTokenUsageScope::Partial {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(reported_usage)),
+                usage: Box::new(self.task_usage_amount(reported_usage)),
                 unavailable_count,
                 reasons,
             }
         } else {
             TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(reported_usage)),
+                usage: Box::new(self.task_usage_amount(reported_usage)),
             }
         };
         (usage, self.latest_model.clone())

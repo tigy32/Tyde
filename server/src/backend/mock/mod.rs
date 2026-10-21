@@ -36,8 +36,8 @@ use emit::{MockEventSender, WeakMockEventSender};
 pub use control::{MockControl, MockRequest, MockViolation};
 pub use gate::MockGateHandle;
 pub use script::{
-    AbandonedResponse, MockCompactionFailure, MockLaunch, MockResumeReplay, MockScript, MockTurn,
-    RunningCommandShape,
+    AbandonedResponse, MockCompactionFailure, MockLaunch, MockNativeChildUsage, MockResumeReplay,
+    MockScript, MockTurn, RunningCommandShape,
 };
 
 #[cfg(any(test, feature = "test-support"))]

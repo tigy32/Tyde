@@ -4904,8 +4904,22 @@ pub struct TaskTokenUsageEntry {
     pub usage: TaskTokenUsageScope,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTokenUsageField {
+    Prompt,
+    Input,
+    Output,
+    CachedPrompt,
+    CacheCreationInput,
+    Reasoning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTokenUsageAmount {
+    /// Fields with a reported subtotal but incomplete component coverage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_fields: Vec<TaskTokenUsageField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     pub total_tokens: u64,
@@ -4924,6 +4938,7 @@ pub struct TaskTokenUsageAmount {
 impl TaskTokenUsageAmount {
     pub fn zero() -> Self {
         Self {
+            partial_fields: Vec::new(),
             prompt_tokens: Some(0),
             total_tokens: 0,
             input_tokens: Some(0),
@@ -4936,6 +4951,7 @@ impl TaskTokenUsageAmount {
 
     pub fn from_token_usage(usage: &TokenUsage) -> Self {
         Self {
+            partial_fields: Vec::new(),
             prompt_tokens: Some(usage.prompt_tokens()),
             total_tokens: usage.total_tokens,
             input_tokens: Some(usage.input_tokens),
@@ -4948,6 +4964,7 @@ impl TaskTokenUsageAmount {
 
     pub fn total_only(total_tokens: u64) -> Self {
         Self {
+            partial_fields: Vec::new(),
             prompt_tokens: None,
             total_tokens,
             input_tokens: None,
@@ -4959,24 +4976,60 @@ impl TaskTokenUsageAmount {
     }
 
     pub fn saturating_add(&mut self, other: &Self) {
-        add_optional_usage_amount(&mut self.prompt_tokens, other.prompt_tokens);
+        for field in &other.partial_fields {
+            if !self.partial_fields.contains(field) {
+                self.partial_fields.push(*field);
+            }
+        }
+        for (field, total, value) in [
+            (
+                TaskTokenUsageField::Prompt,
+                &mut self.prompt_tokens,
+                other.prompt_tokens,
+            ),
+            (
+                TaskTokenUsageField::Input,
+                &mut self.input_tokens,
+                other.input_tokens,
+            ),
+            (
+                TaskTokenUsageField::Output,
+                &mut self.output_tokens,
+                other.output_tokens,
+            ),
+            (
+                TaskTokenUsageField::CachedPrompt,
+                &mut self.cached_prompt_tokens,
+                other.cached_prompt_tokens,
+            ),
+            (
+                TaskTokenUsageField::CacheCreationInput,
+                &mut self.cache_creation_input_tokens,
+                other.cache_creation_input_tokens,
+            ),
+            (
+                TaskTokenUsageField::Reasoning,
+                &mut self.reasoning_tokens,
+                other.reasoning_tokens,
+            ),
+        ] {
+            if total.is_some() != value.is_some() && !self.partial_fields.contains(&field) {
+                self.partial_fields.push(field);
+            }
+            *total = match (*total, value) {
+                (Some(left), Some(right)) => Some(left.saturating_add(right)),
+                (left, right) => left.or(right),
+            };
+        }
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
-        add_optional_usage_amount(&mut self.input_tokens, other.input_tokens);
-        add_optional_usage_amount(&mut self.output_tokens, other.output_tokens);
-        add_optional_usage_amount(&mut self.cached_prompt_tokens, other.cached_prompt_tokens);
-        add_optional_usage_amount(
-            &mut self.cache_creation_input_tokens,
-            other.cache_creation_input_tokens,
-        );
-        add_optional_usage_amount(&mut self.reasoning_tokens, other.reasoning_tokens);
+        self.partial_fields.sort();
     }
-}
 
-fn add_optional_usage_amount(total: &mut Option<u64>, value: Option<u64>) {
-    *total = match (*total, value) {
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
-        _ => None,
-    };
+    pub fn mark_reported_fields_partial(&mut self) {
+        let mut total = Self::total_only(0);
+        total.saturating_add(self);
+        self.partial_fields = total.partial_fields;
+    }
 }
 
 impl Default for TaskTokenUsageAmount {

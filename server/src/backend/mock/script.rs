@@ -447,6 +447,7 @@ impl MockTurn {
             TextShape {
                 busy_native_child: Some(MockNativeChild {
                     registration_gate: None,
+                    usage: MockNativeChildUsage::Split,
                     emit_timing_tool: false,
                     name: child_name.into(),
                     prompt: child_prompt.into(),
@@ -617,6 +618,7 @@ impl MockTurn {
         let mut steps = held_steps(text.into());
         steps.push(MockStep::SpawnNativeChild(MockNativeChild {
             registration_gate: None,
+            usage: MockNativeChildUsage::Split,
             emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
@@ -1039,6 +1041,7 @@ impl MockTurn {
         gate: &MockGateHandle,
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            usage: MockNativeChildUsage::Split,
             registration_gate: Some(gate.gate()),
             emit_timing_tool: true,
             name: child_name.into(),
@@ -1055,6 +1058,7 @@ impl MockTurn {
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             registration_gate: None,
+            usage: MockNativeChildUsage::Split,
             emit_timing_tool: true,
             name: child_name.into(),
             prompt: child_prompt.into(),
@@ -1070,6 +1074,24 @@ impl MockTurn {
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             registration_gate: None,
+            usage: MockNativeChildUsage::Split,
+            emit_timing_tool: false,
+            name: child_name.into(),
+            prompt: child_prompt.into(),
+            grandchild: None,
+            lifecycle: MockChildLifecycle::CompleteAndRetain,
+        })])
+    }
+
+    pub fn with_native_child_usage(
+        self,
+        child_name: impl Into<String>,
+        child_prompt: impl Into<String>,
+        usage: MockNativeChildUsage,
+    ) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            usage,
             emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
@@ -1087,6 +1109,7 @@ impl MockTurn {
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             registration_gate: None,
+            usage: MockNativeChildUsage::Split,
             emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
@@ -1105,6 +1128,7 @@ impl MockTurn {
     ) -> Self {
         self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
             registration_gate: None,
+            usage: MockNativeChildUsage::Split,
             emit_timing_tool: false,
             name: child_name.into(),
             prompt: child_prompt.into(),
@@ -1457,10 +1481,19 @@ pub(super) struct MockPendingTool {
     pub(super) gate_after_completion: Option<MockGate>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum MockNativeChildUsage {
+    Split,
+    TotalOnly(u64),
+    SplitWithTotal(u64),
+    MixedOptionalWithEqualTotal,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MockNativeChild {
     pub(super) registration_gate: Option<MockGate>,
     pub(super) emit_timing_tool: bool,
+    pub(super) usage: MockNativeChildUsage,
     pub(super) name: String,
     pub(super) prompt: String,
     pub(super) lifecycle: MockChildLifecycle,

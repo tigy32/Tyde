@@ -2616,8 +2616,16 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         MOCK_TURN_TOKEN_TOTAL
     );
     assert_eq!(
-        payload.total.usage.cached_prompt_tokens, None,
-        "missing cache splits remain missing"
+        payload.total.usage.cached_prompt_tokens,
+        Some(801),
+        "root reports 1 cached token and child reports 800; the grandchild's missing cache breakdown must not erase them"
+    );
+    assert!(
+        payload
+            .total
+            .usage
+            .partial_fields
+            .contains(&protocol::TaskTokenUsageField::CachedPrompt)
     );
     assert_eq!(
         payload.total.usage.prompt_tokens,
@@ -3112,6 +3120,273 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
             .agent_count,
         1
     );
+
+    let before_mix = updated
+        .task_token_usages
+        .iter()
+        .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+        .expect("pre-mix authoritative usage")
+        .clone();
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    fixture
+        .mock_by_id(&restored_child.agent_id)
+        .await
+        .enqueue(
+            MockTurn::text("mixed component coverage")
+                .with_native_child_usage(
+                    "total-only child",
+                    "total only",
+                    server::backend::mock::MockNativeChildUsage::TotalOnly(47),
+                )
+                .with_native_child_usage(
+                    "partial-split child",
+                    "partial split",
+                    server::backend::mock::MockNativeChildUsage::SplitWithTotal(500),
+                )
+                .with_native_child_usage(
+                    "mixed-optional child",
+                    "mixed optional",
+                    server::backend::mock::MockNativeChildUsage::MixedOptionalWithEqualTotal,
+                ),
+        )
+        .await;
+    fixture
+        .client
+        .send_message(
+            &restored_child.instance_stream,
+            "mixed component coverage".to_owned(),
+        )
+        .await
+        .expect("start mixed reporting");
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &restored_child.instance_stream,
+        "mixed component coverage",
+    )
+    .await;
+    let expected_total = MOCK_TURN_TOKEN_TOTAL * 7 + 47 + 500 + 363;
+    for _ in 0..4 {
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "native component observation complete",
+            |env| {
+                env.stream != restored_child.instance_stream
+                    && env.kind == FrameKind::ChatEvent
+                    && env
+                        .parse_payload::<ChatEvent>()
+                        .is_ok_and(|event| matches!(event, ChatEvent::StreamEnd(_)))
+            },
+        )
+        .await;
+    }
+    let mixed = expect_task_token_usage_matching(
+        &mut observer,
+        &restored_agent.agent_id,
+        "split and total-only descendants",
+        |payload| {
+            payload.total.usage.total_tokens == expected_total && payload.breakdown.len() == 6
+        },
+    )
+    .await;
+    let (_, settled) = fixture.connect_with_bootstrap().await;
+    let mixed = settled
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == mixed.root_agent_id)
+        .expect("settled component accounting");
+    assert_known_task_status(&mixed.total.status);
+    assert_eq!(
+        mixed.total.usage.output_tokens,
+        before_mix
+            .total
+            .usage
+            .output_tokens
+            .map(|output| output + 340 + 80 + 88)
+    );
+    assert_eq!(
+        mixed.total.usage.cached_prompt_tokens,
+        before_mix
+            .total
+            .usage
+            .cached_prompt_tokens
+            .map(|cached| cached + 800)
+    );
+    assert_eq!(
+        mixed.total.usage.prompt_tokens,
+        before_mix
+            .total
+            .usage
+            .prompt_tokens
+            .map(|prompt| prompt + 2_100 + 250 + 275)
+    );
+    assert_eq!(
+        mixed.total.usage.input_tokens,
+        before_mix
+            .total
+            .usage
+            .input_tokens
+            .map(|input| input + 1_250 + 250 + 275)
+    );
+    assert_eq!(
+        mixed.total.usage.reasoning_tokens,
+        before_mix
+            .total
+            .usage
+            .reasoning_tokens
+            .map(|reasoning| reasoning + 120)
+    );
+    assert_eq!(
+        mixed.total.usage.cache_creation_input_tokens,
+        before_mix
+            .total
+            .usage
+            .cache_creation_input_tokens
+            .map(|created| created + 50)
+    );
+    for field in [
+        protocol::TaskTokenUsageField::Prompt,
+        protocol::TaskTokenUsageField::Input,
+        protocol::TaskTokenUsageField::Output,
+        protocol::TaskTokenUsageField::CachedPrompt,
+        protocol::TaskTokenUsageField::Reasoning,
+    ] {
+        assert!(
+            mixed.total.usage.partial_fields.contains(&field),
+            "reported components must carry incomplete coverage"
+        );
+    }
+    let total_only = mixed
+        .breakdown
+        .iter()
+        .find(|entry| entry.name == "total-only child")
+        .expect("total-only descendant");
+    let amount = total_only
+        .usage
+        .reported_usage()
+        .expect("authoritative combined total");
+    assert_eq!(amount.total_tokens, 47);
+    assert_eq!(amount.prompt_tokens, None);
+    assert_eq!(amount.output_tokens, None);
+    assert_eq!(amount.cached_prompt_tokens, None);
+    assert_eq!(amount.reasoning_tokens, None);
+    let partial_split = mixed
+        .breakdown
+        .iter()
+        .find(|entry| entry.name == "partial-split child")
+        .expect("partially split descendant");
+    let amount = partial_split
+        .usage
+        .reported_usage()
+        .expect("authoritative split subtotal");
+    assert_eq!(amount.total_tokens, 500);
+    assert_eq!(amount.prompt_tokens, Some(250));
+    assert_eq!(amount.output_tokens, Some(80));
+    assert!(
+        amount
+            .partial_fields
+            .contains(&protocol::TaskTokenUsageField::Output)
+    );
+    let mixed_optional = mixed
+        .breakdown
+        .iter()
+        .find(|entry| entry.name == "mixed-optional child")
+        .expect("mixed optional coverage descendant");
+    let amount = mixed_optional
+        .usage
+        .reported_usage()
+        .expect("equal combined total split");
+    assert_eq!(amount.total_tokens, 363);
+    assert_eq!(amount.prompt_tokens, Some(275));
+    assert_eq!(amount.output_tokens, Some(88));
+    assert_eq!(amount.cached_prompt_tokens, Some(0));
+    assert_eq!(amount.reasoning_tokens, Some(0));
+    assert_eq!(
+        amount.partial_fields,
+        vec![
+            protocol::TaskTokenUsageField::CachedPrompt,
+            protocol::TaskTokenUsageField::CacheCreationInput,
+            protocol::TaskTokenUsageField::Reasoning
+        ],
+        "equal total retains exact prompt/output but incomplete optional counters"
+    );
+    let claude = mixed
+        .backends
+        .iter()
+        .find(|group| group.backend_kind == BackendKind::Claude)
+        .expect("mixed Claude group");
+    assert!(claude.total.usage.prompt_tokens.is_some());
+    assert!(
+        claude
+            .total
+            .usage
+            .partial_fields
+            .contains(&protocol::TaskTokenUsageField::Prompt)
+    );
+    assert_eq!(
+        mixed
+            .backends
+            .iter()
+            .find(|group| group.backend_kind == BackendKind::Grok),
+        before_mix
+            .backends
+            .iter()
+            .find(|group| group.backend_kind == BackendKind::Grok),
+        "another provider's closed usage remains untouched"
+    );
+    let (mut replay_client, replay) = fixture.connect_with_bootstrap().await;
+    let replayed = replay
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored_agent.agent_id)
+        .expect("mixed usage reconnect");
+    assert_eq!(replayed.total, mixed.total);
+    for entry in [total_only, partial_split, mixed_optional] {
+        let agent = replay
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == entry.agent_id)
+            .expect("native live descriptor");
+        replay_client
+            .close_agent(&agent.instance_stream)
+            .await
+            .expect("close mixed native child");
+        let closed = expect_kind(
+            &mut replay_client,
+            FrameKind::AgentClosed,
+            "mixed child closed",
+        )
+        .await;
+        assert_eq!(
+            closed
+                .parse_payload::<AgentClosedPayload>()
+                .expect("closed payload")
+                .agent_id,
+            entry.agent_id
+        );
+    }
+    let (_, closed) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        closed
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == restored_agent.agent_id)
+            .expect("closed mixed rollup")
+            .total,
+        mixed.total
+    );
+    let session = mixed.root_session_id.clone().expect("mixed root session");
+    let restarted = fixture.relaunch_host_after_kill().await;
+    let restored = fixture
+        .restored_agents(&restarted, std::slice::from_ref(&session))
+        .await;
+    let (_, replay) = fixture.connect_with_bootstrap().await;
+    let replayed = replay
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&session].agent_id)
+        .expect("mixed usage restart");
+    assert_eq!(replayed.total.usage, mixed.total.usage);
+    assert_eq!(replayed.breakdown.len(), 6);
 }
 
 #[tokio::test]

@@ -21415,17 +21415,25 @@ pub(crate) fn aggregate_task_token_usage<'a>(
     for scope in usages {
         match scope {
             TaskTokenUsageScope::Known { usage: known } => {
+                if reported_count == 0 {
+                    usage = (**known).clone();
+                } else {
+                    usage.saturating_add(known);
+                }
                 reported_count = reported_count.saturating_add(1);
-                usage.saturating_add(known);
             }
             TaskTokenUsageScope::Partial {
                 usage: partial,
                 unavailable_count: partial_unavailable_count,
                 reasons: partial_reasons,
             } => {
+                if reported_count == 0 {
+                    usage = (**partial).clone();
+                } else {
+                    usage.saturating_add(partial);
+                }
                 reported_count = reported_count.saturating_add(1);
                 partial_seen = true;
-                usage.saturating_add(partial);
                 unavailable_count = unavailable_count.saturating_add(*partial_unavailable_count);
                 extend_task_token_usage_reasons(&mut reasons, partial_reasons);
             }
@@ -21451,6 +21459,14 @@ pub(crate) fn aggregate_task_token_usage<'a>(
     } else {
         TaskTokenUsageStatus::Known
     };
+    tracing::debug!(
+        reported_count,
+        unavailable_count,
+        partial_field_count = usage.partial_fields.len(),
+        prompt_reported = usage.prompt_tokens.is_some(),
+        output_reported = usage.output_tokens.is_some(),
+        "Task usage component coverage aggregated"
+    );
     TaskTokenUsageAggregate { usage, status }
 }
 

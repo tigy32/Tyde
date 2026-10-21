@@ -25,7 +25,7 @@ use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
 use super::script::{
     AbandonedResponse, MockAgentControlAwait, MockChildLifecycle, MockNativeChild,
-    RunningCommandShape,
+    MockNativeChildUsage, RunningCommandShape,
 };
 use super::{MOCK_MODEL, now_ms};
 
@@ -653,10 +653,20 @@ pub(super) async fn spawn_native_child(
         }
     };
 
+    let total = match child.usage {
+        MockNativeChildUsage::Split => None,
+        MockNativeChildUsage::TotalOnly(total) | MockNativeChildUsage::SplitWithTotal(total) => {
+            Some(total)
+        }
+        MockNativeChildUsage::MixedOptionalWithEqualTotal => Some(363),
+    };
+    if let Some(total) = total {
+        let _ = handle.total_usage_tx.send(total);
+    }
     match child.lifecycle {
         MockChildLifecycle::LiveUntilInterrupt => {
             if child.emit_timing_tool {
-                emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+                emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80, true);
                 let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {
                     tool_call_id: "native-running-timing".to_owned(),
                     tool_name: "run_command".to_owned(),
@@ -670,7 +680,28 @@ pub(super) async fn spawn_native_child(
             active_subagents.push(handle);
         }
         MockChildLifecycle::CompleteAndRetain => {
-            emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+            emit_native_child_turn(
+                &handle.event_tx,
+                &child.prompt,
+                250,
+                80,
+                !matches!(child.usage, MockNativeChildUsage::TotalOnly(_)),
+            );
+            if matches!(
+                child.usage,
+                MockNativeChildUsage::MixedOptionalWithEqualTotal
+            ) {
+                emit_native_child_turn_with_usage(
+                    &handle.event_tx,
+                    &child.prompt,
+                    Some(TokenUsage {
+                        input_tokens: 25,
+                        output_tokens: 8,
+                        total_tokens: 33,
+                        ..Default::default()
+                    }),
+                );
+            }
             if child.emit_timing_tool {
                 let _ = handle.event_tx.send(ChatEvent::ToolRequest(ToolRequest {
                     tool_call_id: "native-timing-fixture".to_owned(),
@@ -716,7 +747,13 @@ pub(super) async fn spawn_native_child(
                     )
                     .await
                     .unwrap_or_else(|_| panic!("mock native grandchild registration failed"));
-                emit_native_child_turn(&grandchild_handle.event_tx, &grandchild.prompt, 25, 8);
+                emit_native_child_turn(
+                    &grandchild_handle.event_tx,
+                    &grandchild.prompt,
+                    25,
+                    8,
+                    true,
+                );
                 let _ = handle.event_tx.send(native_child_link(
                     &grandchild_tool_id,
                     &grandchild_handle,
@@ -732,7 +769,13 @@ pub(super) async fn spawn_native_child(
             active_subagents.push(handle);
         }
         MockChildLifecycle::CompleteAndDrop => {
-            emit_native_child_turn(&handle.event_tx, &child.prompt, 250, 80);
+            emit_native_child_turn(
+                &handle.event_tx,
+                &child.prompt,
+                250,
+                80,
+                !matches!(child.usage, MockNativeChildUsage::TotalOnly(_)),
+            );
             // Dropping the handle closes event_tx, so the relay actor sees
             // events.recv() == None and must park instead of exiting.
             drop(handle);
@@ -819,6 +862,26 @@ fn emit_native_child_turn(
     prompt: &str,
     input_tokens: u64,
     output_tokens: u64,
+    report_split: bool,
+) {
+    emit_native_child_turn_with_usage(
+        event_tx,
+        prompt,
+        report_split.then_some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_prompt_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            reasoning_tokens: Some(0),
+        }),
+    );
+}
+
+fn emit_native_child_turn_with_usage(
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    prompt: &str,
+    usage: Option<TokenUsage>,
 ) {
     let message_id = Some(Uuid::new_v4().to_string());
     let response_text = format!("mock native child response to: {prompt}");
@@ -845,24 +908,8 @@ fn emit_native_child_turn(
             model_info: Some(ModelInfo {
                 model: MOCK_MODEL.to_owned(),
             }),
-            token_usage: Some(MessageTokenUsage::request_and_turn_known(
-                TokenUsage {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens: input_tokens + output_tokens,
-                    cached_prompt_tokens: Some(0),
-                    cache_creation_input_tokens: Some(0),
-                    reasoning_tokens: Some(0),
-                },
-                TokenUsage {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens: input_tokens + output_tokens,
-                    cached_prompt_tokens: Some(0),
-                    cache_creation_input_tokens: Some(0),
-                    reasoning_tokens: Some(0),
-                },
-            )),
+            token_usage: usage
+                .map(|usage| MessageTokenUsage::request_and_turn_known(usage.clone(), usage)),
             context_breakdown: None,
             images: None,
         },

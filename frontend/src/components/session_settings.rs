@@ -3,9 +3,10 @@ use wasm_bindgen::JsCast;
 
 use protocol::{
     BackendKind, ControlOption, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, TaskTokenUsageAmount, TaskTokenUsagePayload,
-    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
-    UNAVAILABLE_OPTION_SUFFIX, clear_invalid_dependent_select_values, options_including_current,
+    SessionSettingsSchema, SessionSettingsValues, TaskTokenUsageAmount, TaskTokenUsageField,
+    TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
+    TaskTokenUsageUnavailableReason, UNAVAILABLE_OPTION_SUFFIX,
+    clear_invalid_dependent_select_values, options_including_current,
 };
 
 use crate::components::chat_message::format_compact;
@@ -760,39 +761,79 @@ pub(super) fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReaso
 // Keep the footer's established arrow/subset presentation. Prompt totals
 // arrive already aggregated: missing cache breakdowns must not erase input
 // contributed by other backends or turn an unknown subset into zero.
+fn task_number(
+    amount: &TaskTokenUsageAmount,
+    field: TaskTokenUsageField,
+    value: Option<u64>,
+) -> String {
+    match value {
+        Some(value) if amount.partial_fields.contains(&field) => {
+            format!("≥{}", format_compact(value))
+        }
+        Some(value) => format_compact(value),
+        None => "—".to_owned(),
+    }
+}
+
 fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
-    let number = |value: Option<u64>| value.map(format_compact).unwrap_or_else(|| "—".to_owned());
     let input = match amount.cached_prompt_tokens {
-        Some(cached) if cached > 0 => format!(
-            "↑{} (cached {})",
-            number(amount.prompt_tokens),
-            format_compact(cached)
+        Some(cached)
+            if cached > 0
+                || amount
+                    .partial_fields
+                    .contains(&TaskTokenUsageField::CachedPrompt) =>
+        {
+            format!(
+                "↑{} (cached {})",
+                task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens),
+                task_number(amount, TaskTokenUsageField::CachedPrompt, Some(cached))
+            )
+        }
+        _ => format!(
+            "↑{}",
+            task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens)
         ),
-        _ => format!("↑{}", number(amount.prompt_tokens)),
     };
     let output = match amount.reasoning_tokens {
-        Some(reasoning) if reasoning > 0 => format!(
-            "↓{} (reasoning {})",
-            number(amount.output_tokens),
-            format_compact(reasoning)
+        Some(reasoning)
+            if reasoning > 0
+                || amount
+                    .partial_fields
+                    .contains(&TaskTokenUsageField::Reasoning) =>
+        {
+            format!(
+                "↓{} (reasoning {})",
+                task_number(amount, TaskTokenUsageField::Output, amount.output_tokens),
+                task_number(amount, TaskTokenUsageField::Reasoning, Some(reasoning))
+            )
+        }
+        _ => format!(
+            "↓{}",
+            task_number(amount, TaskTokenUsageField::Output, amount.output_tokens)
         ),
-        _ => format!("↓{}", number(amount.output_tokens)),
     };
     (input, Some(output))
 }
 
 fn task_detail_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
-    let number = |value: Option<u64>| value.map(format_compact).unwrap_or_else(|| "—".to_owned());
     (
         format!(
             "↑{} (cached {})",
-            number(amount.prompt_tokens),
-            number(amount.cached_prompt_tokens)
+            task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens),
+            task_number(
+                amount,
+                TaskTokenUsageField::CachedPrompt,
+                amount.cached_prompt_tokens
+            )
         ),
         Some(format!(
             "↓{} (reasoning {})",
-            number(amount.output_tokens),
-            number(amount.reasoning_tokens)
+            task_number(amount, TaskTokenUsageField::Output, amount.output_tokens),
+            task_number(
+                amount,
+                TaskTokenUsageField::Reasoning,
+                amount.reasoning_tokens
+            )
         )),
     )
 }
@@ -808,6 +849,7 @@ pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
                         <span class="token-stat token-stat-output">{text}</span>
                     })}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
+                    {(!usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial" title="≥ marks the reported subtotal; some contributing usage has no breakdown for that field">"partial breakdown"</span> })}
                 </span>
             }
             .into_any()
@@ -826,6 +868,7 @@ pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
                         <span class="token-stat token-stat-output">{text}</span>
                     })}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
+                    {(!usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial" title="≥ marks the reported subtotal; some contributing usage has no breakdown for that field">"partial breakdown"</span> })}
                     <span class="session-task-status session-task-status-partial">
                         {marker}
                     </span>
@@ -892,7 +935,7 @@ fn TaskUsageBadge(
         <span class="session-task-usage" node_ref=wrapper_ref>
             <button class="session-task-toggle" node_ref=toggle_ref aria-haspopup="dialog"
                 aria-expanded=move || open.get().to_string() aria-controls=move || popover_id.get()
-                title="Cumulative tokens across this task's requests and agents. The context panel shows the latest request's occupancy instead."
+                title="Cumulative tokens across this task's requests and agents. The context panel shows the latest request's occupancy instead. ≥ marks a reported subtotal with incomplete breakdown coverage."
                 on:click=move |_| open.update(|open| *open = !*open)>
                 <span class="session-task-scope">"Task"</span>
                 {move || rollup.get().map(|payload| match payload.total.status {
@@ -903,7 +946,7 @@ fn TaskUsageBadge(
                     }
                 })}
                 {move || rollup.get().and_then(|payload| (payload.breakdown.len() > 1).then(|| view! { <span class="session-task-including">{format!("including {} agents", payload.breakdown.len())}</span> }))}
-                {move || rollup.get().and_then(|payload| matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. }).then(|| view! { <span class="session-task-status session-task-status-partial">"partial"</span> }))}
+                {move || rollup.get().and_then(|payload| (matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. }) || !payload.total.usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial">"partial"</span> }))}
             </button>
             <Show when=move || open.get()>
                 <div id=move || popover_id.get()><TaskUsagePopup rollup=rollup binding=binding on_close=close /></div>
@@ -2076,6 +2119,7 @@ mod wasm_tests {
 
     fn known_amount(input: u64, output: u64) -> TaskTokenUsageAmount {
         TaskTokenUsageAmount {
+            partial_fields: Vec::new(),
             prompt_tokens: Some(input),
             total_tokens: input + output,
             input_tokens: Some(input),
@@ -2503,6 +2547,108 @@ mod wasm_tests {
                 .unwrap()
                 .contains("not per-task allocations")
         );
+        let mut mixed = partial_rollup("root", 2_000, 200);
+        let mut codex_amount = known_amount(2_000, 200);
+        codex_amount.input_tokens = Some(1_000);
+        codex_amount.cached_prompt_tokens = Some(1_000);
+        codex_amount.reasoning_tokens = Some(50);
+        let mut claude_amount = known_amount(1_000, 100);
+        claude_amount.input_tokens = Some(300);
+        claude_amount.cached_prompt_tokens = Some(700);
+        claude_amount.reasoning_tokens = Some(20);
+        let fields = vec![
+            TaskTokenUsageField::Prompt,
+            TaskTokenUsageField::Input,
+            TaskTokenUsageField::Output,
+            TaskTokenUsageField::CachedPrompt,
+            TaskTokenUsageField::Reasoning,
+        ];
+        let mut claude_subtotal = claude_amount.clone();
+        claude_subtotal.total_tokens += 47;
+        claude_subtotal.partial_fields = fields.clone();
+        let mut total = known_amount(3_000, 300);
+        total.total_tokens += 47;
+        total.input_tokens = Some(1_300);
+        total.cached_prompt_tokens = Some(1_700);
+        total.reasoning_tokens = Some(70);
+        total.partial_fields = fields;
+        mixed.total = TaskTokenUsageAggregate {
+            usage: total,
+            status: TaskTokenUsageStatus::Known,
+        };
+        mixed.backends = vec![
+            protocol::TaskBackendUsage {
+                backend_kind: BackendKind::Codex,
+                analyzer_batch_count: 0,
+                agent_count: 1,
+                reporting_agent_count: 1,
+                incomplete_agent_count: 0,
+                total: TaskTokenUsageAggregate {
+                    usage: codex_amount.clone(),
+                    status: TaskTokenUsageStatus::Known,
+                },
+            },
+            protocol::TaskBackendUsage {
+                backend_kind: BackendKind::Claude,
+                analyzer_batch_count: 0,
+                agent_count: 2,
+                reporting_agent_count: 2,
+                incomplete_agent_count: 0,
+                total: TaskTokenUsageAggregate {
+                    usage: claude_subtotal,
+                    status: TaskTokenUsageStatus::Known,
+                },
+            },
+        ];
+        mixed.breakdown[0].backend_kind = BackendKind::Codex;
+        mixed.breakdown[0].usage = TaskTokenUsageScope::Known {
+            usage: Box::new(codex_amount),
+        };
+        mixed.breakdown[1].usage = TaskTokenUsageScope::Known {
+            usage: Box::new(claude_amount),
+        };
+        mixed.breakdown[2].usage = TaskTokenUsageScope::Known {
+            usage: Box::new(TaskTokenUsageAmount::total_only(47)),
+        };
+        dispatch_task_usage(&state, "h-task-tree", 3, &mixed);
+        next_tick().await;
+        let text = query(&container, ".session-task-toggle")
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            text.contains("↑≥3.0K (cached ≥1.7K)")
+                && text.contains("↓≥300 (reasoning ≥70)")
+                && text.contains("partial"),
+            "known component subtotals stay visible with incomplete coverage"
+        );
+        let codex = query(&container, "article[aria-label=Codex]")
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            codex.contains("↑2.0K (cached 1.0K)")
+                && codex.contains("↓200 (reasoning 50)")
+                && !codex.contains("≥")
+        );
+        let claude = query(&container, "article[aria-label=Claude]")
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            claude.contains("↑≥1.0K (cached ≥700)")
+                && claude.contains("↓≥100 (reasoning ≥20)")
+                && claude.contains("partial breakdown")
+        );
+        expand_usage(&container, "Agents").await;
+        let rows = container.query_selector_all(".session-task-row").unwrap();
+        let total_only = rows.item(2).unwrap().text_content().unwrap();
+        assert!(
+            total_only.contains("↑— (cached —)")
+                && total_only.contains("↓— (reasoning —)")
+                && total_only.contains("Reported combined: 47"),
+            "unknown split components cannot become zero or borrow another agent's usage"
+        );
         let badge = query(&container, ".session-task-toggle").expect("badge still rendered");
         badge.click();
         for _ in 0..4 {
@@ -2558,6 +2704,7 @@ mod wasm_tests {
             reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
         };
         rollup.total.usage = TaskTokenUsageAmount {
+            partial_fields: Vec::new(),
             prompt_tokens: Some(86_000),
             total_tokens: 94_600,
             input_tokens: Some(86_000),
