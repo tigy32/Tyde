@@ -2092,6 +2092,8 @@ pub struct AgentsSidebarPreferences {
     #[serde(default)]
     pub hide_sub_agents: bool,
     #[serde(default)]
+    pub show_workbenches: bool,
+    #[serde(default)]
     pub project_visibility: AgentsSidebarProjectVisibility,
 }
 

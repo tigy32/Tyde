@@ -1265,8 +1265,11 @@ fn folder_toggle(
                 width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path d="m6 3 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
+            <svg class="agent-folder-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7h18" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+            </svg>
             <span class="agent-folder-label">{display_label}</span>
-            <span class="agent-folder-count" aria-hidden="true">{count}</span>
+            {(count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{count}</span> })}
         </button>
     }
 }
@@ -1426,6 +1429,13 @@ pub fn AgentsPanel() -> impl IntoView {
     let current_filters = Memo::new(move |_| {
         let sidebar = filters_state.effective_agents_sidebar_preferences();
         sidebar_to_panel_filters(&sidebar)
+    });
+
+    let workbench_filter_state = state.clone();
+    let show_workbenches = Memo::new(move |_| {
+        workbench_filter_state
+            .effective_agents_sidebar_preferences()
+            .show_workbenches
     });
 
     let filter_state = state.clone();
@@ -1620,6 +1630,15 @@ pub fn AgentsPanel() -> impl IntoView {
         }
     };
 
+    let toggle_workbenches = {
+        let state = state.clone();
+        move |_| {
+            let mut sidebar = state.effective_agents_sidebar_preferences();
+            sidebar.show_workbenches = !sidebar.show_workbenches;
+            persist_sidebar(&state, sidebar);
+        }
+    };
+
     view! {
         <div class="panel agents-panel">
             <div class="panel-search">
@@ -1656,6 +1675,11 @@ pub fn AgentsPanel() -> impl IntoView {
                 >
                     "Show other projects"
                 </button>
+                <label class="agents-workbench-filter">
+                    <input type="checkbox" prop:checked=move || show_workbenches.get()
+                        on:change=toggle_workbenches />
+                    "Show workbenches"
+                </label>
                 </div>
             </details>
             <AgentRestorationNotice />
@@ -1935,34 +1959,17 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
                                                 let edit_name = format!("Edit project {}", project.label);
                                                 view! {
-                                                    <section class="agent-sidebar-project-section" data-project-key=project.key>
+                                                    <section class="agent-sidebar-project-section" data-project-key=project.key.clone()>
                                                         <div class="agent-sidebar-project-header">
                                                             {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
-                                                            <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span>
+                                                            {(member_count > 0).then(|| view! { <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span> })}
                                                             {target.map(|target| view! {
+                                                                <ProjectNewAgent target=target.clone() label=project.label.clone() launch=launch />
                                                                 <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
-                                                                    on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"✎"</button>
-                                                                <ProjectNewAgent target=target label=project.label.clone() launch=launch />
+                                                                    on:click=move |_| editor.set(Some(target.clone()))>"⋯"</button>
                                                             })}
                                                         </div>
-                                                        {if project.workbenches.is_empty() { ().into_any() } else {
-                                                            let workbench_key = folder_key.clone();
-                                                            view! { <Show when=move || !collapsed_folders.with(|folders| folders.contains(&workbench_key))>
-                                                                <div class="agent-sidebar-workbenches">
-                                                                {project.workbenches.iter().map(|workbench| {
-                                                                    let target = ActiveProjectRef { host_id: workbench.host_id.clone(), project_id: workbench.project.id.clone() };
-                                                                    let label = workbench.project.name.clone();
-                                                                    let edit_label = format!("Edit project {label}");
-                                                                    view! { <div class="agent-sidebar-workbench" data-project-id=workbench.project.id.0.clone()>
-                                                                        <span title=label.clone()>"⑂ "{label.clone()}</span>
-                                                                        <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"✎"</button>
-                                                                        <ProjectNewAgent target=target label=label launch=launch />
-                                                                    </div> }
-                                                                }).collect_view()}
-                                                                </div>
-                                                            </Show> }.into_any()
-                                                        }}
-                                                        {folder_members(state.clone(), project.swarms, project.groups, interactions.clone(), collapsed_folders, folder_key)}
+                                                        {project_members(state.clone(), project.clone(), interactions.clone(), collapsed_folders, folder_key, show_workbenches, launch)}
                                                     </section>
                                                 }
                                             }).collect_view()}
@@ -2000,6 +2007,66 @@ pub fn AgentsPanel() -> impl IntoView {
                 <leptos::portal::Portal><crate::components::launch_menu::LaunchChooser open_sig=launch_open project_context=launch_project /></leptos::portal::Portal>
             </Show>
         </div>
+    }
+}
+
+fn project_members(
+    state: AppState,
+    project: AgentProjectSection,
+    interactions: AgentsPanelInteractions,
+    collapsed: RwSignal<HashSet<String>>,
+    key: String,
+    show_workbenches: Memo<bool>,
+    launch: Callback<ActiveProjectRef>,
+) -> impl IntoView {
+    let expanded_key = key.clone();
+    let project_expanded =
+        Memo::new(move |_| !collapsed.with(|folders| folders.contains(&expanded_key)));
+    move || {
+        if !show_workbenches.get() {
+            return folder_members(
+                state.clone(),
+                project.swarms.clone(),
+                project.groups.clone(),
+                interactions.clone(),
+                collapsed,
+                key.clone(),
+            )
+            .into_any();
+        }
+        if !project_expanded.get() {
+            return ().into_any();
+        }
+        let mut groups = project.groups.clone();
+        let mut swarms = project.swarms.clone();
+        let workbenches = project.workbenches.iter().map(|workbench| {
+            let target = ActiveProjectRef { host_id: workbench.host_id.clone(), project_id: workbench.project.id.clone() };
+            let (members, remaining): (Vec<_>, Vec<_>) = groups.drain(..).partition(|tree| tree.parent.project_id.as_ref() == Some(&target.project_id));
+            groups = remaining;
+            let (member_swarms, remaining): (Vec<_>, Vec<_>) = swarms.drain(..).partition(|swarm| swarm.project_id == target.project_id);
+            swarms = remaining;
+            let count = members.iter().map(AgentTreeGroup::member_count).sum::<usize>() + member_swarms.len();
+            let folder_key = format!("workbench:{}:{}", target.host_id, target.project_id.0);
+            let label = workbench.project.name.clone();
+            let edit_label = format!("Edit project {label}");
+            let editor = state.project_editor;
+            view! {
+                <section class="agent-sidebar-workbench-section" data-project-id=target.project_id.0.clone()>
+                    <div class="agent-sidebar-project-header agent-sidebar-workbench">
+                        {folder_toggle(collapsed, folder_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
+                        {(count > 0).then(|| view! { <span class="project-heading-count">{count}</span> })}
+                        <ProjectNewAgent target=target.clone() label=label launch=launch />
+                        <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
+                            on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
+                    </div>
+                    {folder_members(state.clone(), member_swarms, members, interactions.clone(), collapsed, folder_key)}
+                </section>
+            }
+        }).collect_view();
+        view! {
+            {folder_members(state.clone(), swarms, groups, interactions.clone(), collapsed, key.clone())}
+            <div class="agent-sidebar-workbenches">{workbenches}</div>
+        }.into_any()
     }
 }
 
@@ -4685,9 +4752,54 @@ mod wasm_tests {
             "Selection uses the existing theme token, not a filled blue mix"
         );
         sample.remove();
+        let row_style = theme.get_computed_style(&selected).unwrap().unwrap();
+        assert_eq!(
+            row_style.get_property_value("border-left-width").unwrap(),
+            "0px",
+            "Flat conversation rows have no decorative rail"
+        );
+        assert_eq!(
+            row_style.get_property_value("border-radius").unwrap(),
+            "0px",
+            "Conversation rows are not rounded cards"
+        );
+        assert_eq!(row_style.get_property_value("box-shadow").unwrap(), "none");
+        let glyph = selected
+            .query_selector("[role='img'][aria-label='Claude']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert_eq!(
+            (glyph.width(), glyph.height()),
+            (18.0, 18.0),
+            "Provider slot stays compact and square"
+        );
+        // Native QA renders the approved two-line parent at 50px and leaves
+        // at 36px. Keep the original compact-row bound for leaf conversations.
         assert!(
-            selected.get_bounding_client_rect().height() <= 40.0,
-            "Collapsed agents remain compact"
+            agent_card_el(&container, "beta-agent")
+                .get_bounding_client_rect()
+                .height()
+                <= 40.0,
+            "Conversations without a child disclosure remain compact"
+        );
+        let name = selected
+            .query_selector(".agent-card-name")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let disclosure = selected
+            .query_selector("[aria-label='Toggle sub-agents']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            disclosure.top() >= name.bottom(),
+            "The child disclosure is below the full conversation name, not competing with it for width"
+        );
+        assert!(
+            selected.get_bounding_client_rect().height() <= 60.0,
+            "A parent keeps its name and child disclosure within two compact lines"
         );
         assert!(
             selected
@@ -4736,6 +4848,24 @@ mod wasm_tests {
                 .unwrap();
             assert!(empty.text_content().unwrap().contains("Empty"));
             assert_eq!(empty.query_selector_all(".agent-card").unwrap().length(), 0);
+            assert!(
+                !empty.text_content().unwrap().contains('0'),
+                "Empty projects never show zero counts"
+            );
+            assert!(
+                empty.get_bounding_client_rect().height() <= 40.0,
+                "An empty project occupies only its tight heading row"
+            );
+            let label = empty
+                .query_selector(".agent-folder-label")
+                .unwrap()
+                .unwrap();
+            let style = theme.get_computed_style(&label).unwrap().unwrap();
+            assert_eq!(
+                style.get_property_value("text-transform").unwrap(),
+                "none",
+                "Project labels preserve server-provided casing"
+            );
             assert_eq!(
                 empty
                     .query_selector_all("button[title^='New agent in']")
@@ -4897,7 +5027,23 @@ mod wasm_tests {
                 .is_none(),
             "Workbench context belongs on its row, not a second project heading"
         );
-        assert!(container.query_selector("[data-project-key='local:alpha'] [data-project-id='alpha-workbench-two'] button[aria-label='New agent in alpha-workbench-two']").unwrap().is_some(), "Workbench has its own exact-project launch control under the parent");
+        let workbench_checkbox = container
+            .query_selector(".agents-workbench-filter input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        assert!(
+            !workbench_checkbox.checked(),
+            "Workbench grouping is opt-in"
+        );
+        assert!(
+            container
+                .query_selector(".agent-sidebar-workbench-section")
+                .unwrap()
+                .is_none(),
+            "All workbench headings are absent by default"
+        );
         let alpha = container
             .query_selector("[data-project-key='local:alpha']")
             .unwrap()
@@ -4911,6 +5057,96 @@ mod wasm_tests {
         }
         assert!(!alpha_text.contains("Remote Collision Agent"));
         assert!(text.contains("Remote Collision"));
+        workbench_checkbox.click();
+        next_tick().await;
+        assert!(workbench_checkbox.checked());
+        agent_card_el(&container, "workbench-agent")
+            .query_selector(".sidebar-card-expand")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        container
+            .query_selector("[aria-label='Project: Beta Project']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            agent_card_el(&container, "workbench-agent")
+                .get_attribute("data-expanded")
+                .as_deref(),
+            Some("true"),
+            "Collapsing another project preserves an open conversation's details"
+        );
+        let bench = container
+            .query_selector("[data-project-key='local:alpha'] [data-project-id='alpha-workbench']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            bench.text_content().unwrap().contains("Workbench Agent"),
+            "Visible workbench grouping contains its exact-project conversation"
+        );
+        assert!(
+            !bench
+                .text_content()
+                .unwrap()
+                .contains("Remote Collision Agent"),
+            "Workbench membership is host scoped"
+        );
+        assert!(container.query_selector("[data-project-key='local:alpha'] [data-project-id='alpha-workbench-two'] button[aria-label='New agent in alpha-workbench-two']").unwrap().is_some(), "Visible workbenches retain exact-project launch controls");
+        let disclosure = bench
+            .query_selector("[aria-label='Workbench: alpha-workbench']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        disclosure.focus().unwrap();
+        disclosure.click();
+        next_tick().await;
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&disclosure)),
+            "Workbench disclosure retains keyboard focus when toggled"
+        );
+        assert!(
+            container
+                .query_selector(
+                    "[data-project-id='alpha-workbench'] [data-agent-id='workbench-agent']"
+                )
+                .unwrap()
+                .is_none(),
+            "Workbench disclosure collapses its conversations"
+        );
+        workbench_checkbox.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(
+                    "[data-project-key='local:alpha'] [data-agent-id='workbench-agent']"
+                )
+                .unwrap()
+                .is_some(),
+            "Hiding grouping reveals conversations even when that workbench was collapsed"
+        );
+        let mut confirmed = state.effective_agents_sidebar_preferences();
+        confirmed.show_workbenches = true;
+        state.apply_agents_view_snapshot("local", sidebar_snapshot(confirmed));
+        next_tick().await;
+        assert!(
+            workbench_checkbox.checked(),
+            "Authoritative preference updates the checkbox"
+        );
+        confirmed = state.effective_agents_sidebar_preferences();
+        confirmed.show_workbenches = false;
+        state.apply_agents_view_snapshot("local", sidebar_snapshot(confirmed));
+        next_tick().await;
 
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
@@ -6614,7 +6850,11 @@ mod wasm_tests {
             .unwrap();
         assert!(bamboo.text_content().unwrap().contains("Bamboo Crew"));
         assert!(!bamboo.text_content().unwrap().contains("Remote Crew"));
-        // Catalog workbenches now have launch rows, but never split the parent group.
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.show_workbenches = true;
+        state.agents_view_preferences.set(preferences);
+        next_tick().await;
+        // Explicit grouping preserves the owning parent and exact launch target.
         assert!(
             container
                 .query_selector("[data-project-key='local:bamboo-bench']")

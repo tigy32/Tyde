@@ -747,6 +747,7 @@ async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() 
     let sidebar = AgentsSidebarPreferences {
         hide_inactive: true,
         hide_sub_agents: true,
+        show_workbenches: true,
         project_visibility: AgentsSidebarProjectVisibility::CurrentProjectOnly,
     };
 
