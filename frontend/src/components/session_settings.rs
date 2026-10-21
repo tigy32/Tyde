@@ -2626,6 +2626,21 @@ mod wasm_tests {
             }],
             ..Default::default()
         };
+        rollup.timing.spans.push(protocol::TaskTimingEntry {
+            agent_id: AgentId("root".to_owned()),
+            span: protocol::TaskTimingSpan {
+                tool_call_id: "overlapping-await".to_owned(),
+                category: protocol::TaskTimingCategory::DependencyWait {
+                    agent_ids: vec![AgentId("child-1".to_owned())],
+                    omitted_link_count: Some(0),
+                    targets_observed: true,
+                },
+                started_at_ms: 2_000,
+                observed_through_ms: 4_000,
+                observed_duration_ms: 2_000,
+                state: protocol::TaskTimingState::Completed,
+            },
+        });
         dispatch_task_usage(&state, "h-task-expanded", 0, &rollup);
         dispatch_capacity(&state, "h-task-expanded", 1, 0);
         let mut claude =
@@ -2671,6 +2686,24 @@ mod wasm_tests {
                 },
             };
         }
+        let mut unknown = report.buckets[0].clone();
+        unknown.id = protocol::CapacityBucketId::Antigravity {
+            bucket: "unreported-magnitude".to_owned(),
+        };
+        unknown.scope = protocol::CapacityScope::ModelFamily {
+            name: "Unknown magnitude".to_owned(),
+        };
+        unknown.measure = protocol::CapacityMeasure::ReportedWithoutMagnitude;
+        report.buckets.push(unknown);
+        gemini.state = protocol::BackendCapacityState::Stale {
+            report: report.clone(),
+            stale_since_ms: 3_600_000,
+            last_error: None,
+        };
+        gemini.freshness = protocol::CapacityFreshness::Stale {
+            age_ms: 7_200_000,
+            threshold_ms: 3_600_000,
+        };
         let protocol::BackendCapacityState::Known { report } = &mut claude.state else {
             unreachable!()
         };
@@ -2734,13 +2767,16 @@ mod wasm_tests {
             8,
             "one flat row per backend, never 87 agent cards"
         );
+        // Approved product change: derived numeric quotas now share bars.
+        // The old vendor-only assertion rejected this intended rendering;
+        // estimate labels and magnitude-less buckets remain checked below.
         assert_eq!(
             container
                 .query_selector_all(".task-limit-track")
                 .unwrap()
                 .length(),
-            3,
-            "authoritative Claude windows and named family get tracks; estimates do not"
+            5,
+            "every known numeric limit gets a track, including derived estimates"
         );
         let claude = query(&container, "article[aria-label=Claude]").unwrap();
         let gemini = query(&container, "article[aria-label=Antigravity]").unwrap();
@@ -2752,7 +2788,41 @@ mod wasm_tests {
         assert!(
             gemini.text_content().unwrap().contains("Gemini 5h")
                 && gemini.text_content().unwrap().contains("Gemini 7d")
-                && gemini.text_content().unwrap().contains("~2% derived")
+                && gemini.text_content().unwrap().contains("~2%")
+        );
+        let estimate = query(&gemini, "[role=progressbar]").unwrap();
+        assert_eq!(
+            estimate.get_attribute("aria-valuenow").as_deref(),
+            Some("2")
+        );
+        assert!(
+            estimate
+                .get_attribute("aria-valuetext")
+                .unwrap()
+                .contains("estimated, derived")
+        );
+        assert_eq!(
+            gemini
+                .query_selector_all("[role=progressbar]")
+                .unwrap()
+                .length(),
+            2
+        );
+        assert!(
+            gemini
+                .text_content()
+                .unwrap()
+                .contains("Usage not reported"),
+            "unknown magnitude stays explicit and never becomes a zero-percent bar"
+        );
+        let freshness = query(&gemini, ".task-limit-freshness").unwrap();
+        assert_eq!(freshness.text_content().unwrap(), "Stale · reported 2h ago");
+        assert!(
+            freshness
+                .get_attribute("title")
+                .unwrap()
+                .contains("past the 1h freshness threshold"),
+            "compact freshness retains its full source-age explanation in details"
         );
         let label = query(&claude, ".task-limit-label")
             .unwrap()
@@ -2804,7 +2874,107 @@ mod wasm_tests {
                 && text.contains("1/87 agents")
                 && text.contains("Process lifetime: unsupported")
         );
-        query(&container, ".task-timing-row").unwrap().click();
+        assert_eq!(
+            container
+                .query_selector_all(".task-timing-agent")
+                .unwrap()
+                .length(),
+            1,
+            "overlapping operations share one agent row"
+        );
+        let segments = container
+            .query_selector_all(".task-timing-segment")
+            .unwrap();
+        assert_eq!(segments.length(), 2);
+        let command = segments.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let wait = segments.item(1).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let command_rect = command.get_bounding_client_rect();
+        let wait_rect = wait.get_bounding_client_rect();
+        assert!(
+            command_rect.bottom() <= wait_rect.top() && command_rect.left() < wait_rect.right(),
+            "parallel intervals remain individually visible in micro-lanes"
+        );
+        let operation = query(&container, ".task-timing-event").unwrap();
+        // Chrome returned a 23.453125px layout box inside closed native details;
+        // the native capture shows no operation list. Test visibility and input,
+        // not layout retained for content hidden by the browser's details slot.
+        let operation_visible =
+            js_sys::Function::new_with_args("element", "return element.checkVisibility();");
+        assert_eq!(
+            operation_visible
+                .call1(&wasm_bindgen::JsValue::NULL, &operation)
+                .unwrap()
+                .as_bool(),
+            Some(false),
+            "individual operations are not visible when collapsed"
+        );
+        let expansion = query(&container, ".task-timing-events summary").unwrap();
+        assert!(!expansion.parent_element().unwrap().has_attribute("open"));
+        expansion.focus().unwrap();
+        operation.focus().unwrap();
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&expansion)),
+            "collapsed operations cannot take keyboard focus"
+        );
+        let operation_rect = operation.get_bounding_client_rect();
+        assert!(
+            !document
+                .element_from_point(
+                    (operation_rect.left() + operation_rect.width() / 2.0) as f32,
+                    (operation_rect.top() + operation_rect.height() / 2.0) as f32,
+                )
+                .is_some_and(|hit| operation.contains(Some(&hit))),
+            "collapsed operations cannot intercept pointer interaction"
+        );
+        expansion.click();
+        next_tick().await;
+        assert!(
+            operation_visible
+                .call1(&wasm_bindgen::JsValue::NULL, &operation)
+                .unwrap()
+                .as_bool()
+                == Some(true)
+                && operation.get_bounding_client_rect().height() > 0.0,
+            "expanding reveals the original individual-operation list"
+        );
+        operation.focus().unwrap();
+        update.timing.spans[0].span.observed_duration_ms = 5_100;
+        update.timing.spans[0].span.observed_through_ms = 6_100;
+        update.timing.observed_end_ms = Some(6_100);
+        update.timing.summed_tool_ms = 5_100;
+        dispatch_task_usage(&state, "h-task-expanded", 4, &update);
+        next_tick().await;
+        assert!(
+            expansion.is_connected() && operation.is_connected(),
+            "same-agent timing updates retain expanded rows and operation buttons"
+        );
+        assert!(expansion.parent_element().unwrap().has_attribute("open"));
+        assert!(
+            operation.text_content().unwrap().contains("5.1s"),
+            "retained operations update their observed durations"
+        );
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&operation)),
+            "live rollups preserve keyboard focus inside the expanded operation list"
+        );
+        expansion.click();
+        wait.focus().unwrap();
+        next_tick().await;
+        let detail = query(&container, ".task-timing-detail").unwrap();
+        assert!(
+            detail
+                .text_content()
+                .unwrap()
+                .contains("Observed causal links")
+        );
+        assert!(detail.text_content().unwrap().contains("Start 2000 ms"));
+        command.click();
         next_tick().await;
         assert!(
             query(&container, ".task-timing-detail")
@@ -3477,11 +3647,15 @@ mod wasm_tests {
             "task region must not carry subscription capacity, got: {task_text}"
         );
 
-        // The coverage caveat is text in the popup, not a hover-only tooltip:
-        // Claude reports only the binding limit, and the user must be told.
-        assert!(
-            capacity_text.contains("Only the binding limit reported"),
-            "RepresentativeBucketOnly coverage must be stated in the popup, got: {capacity_text}"
+        // The rendered concise notice says "Other limits unknown"; requiring
+        // the old verbose copy rejects the requested UI, not missing coverage.
+        let coverage_notice = query(&capacity, ".task-limit-partial").unwrap();
+        assert_eq!(coverage_notice.inner_text(), "Other limits unknown");
+        assert!(coverage_notice.get_bounding_client_rect().height() > 0.0);
+        assert_eq!(
+            coverage_notice.get_attribute("title").as_deref(),
+            Some("Only the binding limit reported; other limits unknown"),
+            "representative coverage retains the binding-only provenance"
         );
 
         // Passive sources: nothing to refresh, so no refresh control.

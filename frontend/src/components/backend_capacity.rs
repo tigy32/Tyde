@@ -14,10 +14,10 @@
 //! 1. **No merged percentage.** Vendor buckets are incomparable (a Codex
 //!    `primary` window is not a Claude `five_hour` window; credits are not a
 //!    percentage at all). Buckets are rendered individually and never averaged,
-//!    summed, or collapsed into one figure. A progress bar is drawn only for a
-//!    bucket the vendor reported an authoritative `used_percent` for — never for
-//!    credits, never for a magnitude-less bucket, and never for a non-`Known`
-//!    state, because an empty bar reads as "0% used".
+//!    summed, or collapsed into one figure. Settings bars use vendor-reported
+//!    percentages; task bars also show known derived percentages with an
+//!    estimate marker. Neither draws bars for credits or magnitude-less buckets,
+//!    because an empty bar reads as "0% used".
 //! 2. **Capacity is not task token usage.** Task tokens are *this task*;
 //!    subscription capacity is *your account*. They are not summable, so the
 //!    compact row lives in its own labelled region with its own heading and its
@@ -724,6 +724,8 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
 
 /// All account-limit buckets for a task backend. Tokens are rendered by the
 /// sibling usage region; this surface never derives quota from task usage.
+/// Known derived percentages share reported bars, marked as estimates; missing
+/// magnitudes never get a bar.
 #[component]
 pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -756,16 +758,16 @@ pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl In
                     let measure = match bucket.measure {
                         CapacityMeasure::UsedPercent { used_percent, provenance, .. }
                         | CapacityMeasure::CreditUsage { used_percent, provenance, .. } => {
-                            if provenance.vendor_reported {
-                                view! {
-                                    <span class="task-limit-track" role="img" aria-label=bucket_aria_label(bucket, used_percent)>
-                                        <span class="task-limit-fill" style=format!("width: {used_percent}%")></span>
-                                        <span class="task-limit-value">{format!("{used_percent}%")}</span>
-                                    </span>
-                                }.into_any()
-                            } else {
-                                view! { <span class="task-limit-estimate">{format!("~{used_percent}% derived")}</span> }.into_any()
-                            }
+                            let estimate = if provenance.vendor_reported { "" } else { "~" };
+                            let provenance_label = if provenance.vendor_reported { "reported" } else { "estimated, derived" };
+                            view! {
+                                <span class="task-limit-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                                    aria-valuenow=used_percent aria-valuetext=format!("{estimate}{used_percent}% used · {provenance_label}")
+                                    aria-label=format!("{} · {provenance_label}", bucket_aria_label(bucket, used_percent))>
+                                    <span class="task-limit-fill" style=format!("width: {used_percent}%")></span>
+                                    <span class="task-limit-value">{format!("{estimate}{used_percent}%")}</span>
+                                </span>
+                            }.into_any()
                         }
                         CapacityMeasure::ReportedWithoutMagnitude => view! { <span class="task-limit-note">"Usage not reported"</span> }.into_any(),
                         CapacityMeasure::Credits { .. } => ().into_any(),
@@ -776,14 +778,12 @@ pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl In
                     };
                     view! { <span class="task-limit" title=description.clone()>
                         <span class="task-limit-label" aria-label=description.clone()>{label}</span>{measure}{reset}
-                        {matches!(bucket.scope, CapacityScope::NotReported).then(|| view! { <span class="task-limit-note">"Scope not reported"</span> })}
-                        {matches!(bucket.window, CapacityWindow::NotReported).then(|| view! { <span class="task-limit-note">"Window not reported"</span> })}
                     </span> }
                 }).collect_view();
                 view! {
                     <div class="task-limit-buckets">{buckets}</div>
-                    <span class="task-limit-freshness">{format!("{}{}", if stale { "Stale · " } else { "" }, freshness_text(&snapshot.freshness))}</span>
-                    {(report.coverage == CapacityCoverage::RepresentativeBucketOnly).then(|| view! { <span class="task-limit-note task-limit-partial">"Only the binding limit reported; other limits unknown"</span> })}
+                    <span class="task-limit-freshness" title=format!("{} · {}", freshness_text(&snapshot.freshness), coverage_text(report.coverage, backend_kind))>{format!("{}reported {}", if stale { "Stale · " } else { "" }, format_age(match snapshot.freshness { CapacityFreshness::Fresh { age_ms } | CapacityFreshness::Stale { age_ms, .. } => age_ms }))}</span>
+                    {(report.coverage == CapacityCoverage::RepresentativeBucketOnly).then(|| view! { <span class="task-limit-note task-limit-partial" tabindex="0" title="Only the binding limit reported; other limits unknown">"Other limits unknown"</span> })}
                     {report.buckets.iter().all(|bucket| matches!(bucket.measure, CapacityMeasure::Credits { .. })).then(|| view! { <span class="task-limit-note">"Subscription limits not reported"</span> })}
                 }.into_any()
             }}
