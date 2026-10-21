@@ -130,6 +130,185 @@ pub(super) fn backend_icon(kind: BackendKind) -> impl IntoView {
 }
 
 #[component]
+fn LaunchProjectPicker(
+    selection: RwSignal<(Option<String>, Option<ActiveProjectRef>)>,
+    label: Memo<String>,
+    on_select: Callback<(Option<String>, Option<ActiveProjectRef>)>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let projects = state.projects;
+    let open = RwSignal::new(false);
+    let query = RwSignal::new(String::new());
+    let storage = web_sys::window()
+        .ok_or_else(|| "Browser window unavailable for workbench preferences.".to_owned())
+        .and_then(|window| {
+            window
+                .local_storage()
+                .map_err(|error| format!("Could not access workbench preferences: {error:?}"))
+        })
+        .and_then(|storage| {
+            storage.ok_or_else(|| {
+                "Allow browser storage to remember workbench preferences.".to_owned()
+            })
+        });
+    let remembered = storage.as_ref().map_err(Clone::clone).and_then(|storage| {
+        match storage.get_item("tyde.launch.show-workbenches") {
+            Ok(None) => Ok(false),
+            Ok(Some(value)) if value == "true" => Ok(true),
+            Ok(Some(value)) if value == "false" => Ok(false),
+            Ok(Some(_)) => Err("Saved workbench preference is invalid.".to_owned()),
+            Err(error) => Err(format!("Could not read workbench preferences: {error:?}")),
+        }
+    });
+    let show_workbenches = RwSignal::new(remembered);
+    let storage = StoredValue::new_local(storage);
+    let wrapper = NodeRef::<leptos::html::Div>::new();
+    let trigger = NodeRef::<leptos::html::Button>::new();
+    let search = NodeRef::<leptos::html::Input>::new();
+    let close = Callback::new(move |()| {
+        open.set(false);
+        if let Some(trigger) = trigger.get_untracked() {
+            let _ = trigger.focus();
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(search) = search.get() {
+            let _ = search.focus();
+        }
+    });
+    let outside = window_event_listener(leptos::ev::pointerdown, move |event| {
+        if open.get_untracked()
+            && !wrapper.get_untracked().is_some_and(|wrapper| {
+                event
+                    .target()
+                    .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|target| wrapper.contains(Some(&target)))
+            })
+        {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || outside.remove());
+    let rows = Memo::new(move |_| {
+        let host = selection.get().0;
+        let projects: Vec<_> = projects
+            .get()
+            .into_iter()
+            .filter(|entry| Some(&entry.host_id) == host.as_ref())
+            .collect();
+        let query = query.get().trim().to_lowercase();
+        let mut rows = Vec::new();
+        for parent in projects
+            .iter()
+            .filter(|entry| !entry.project.is_workbench())
+        {
+            let parent_matches = parent.project.name.to_lowercase().contains(&query);
+            let children: Vec<_> = projects
+                .iter()
+                .filter(|child| {
+                    child.project.parent_project_id() == Some(&parent.project.id)
+                        && show_workbenches.get().is_ok_and(|shown| shown)
+                        && (parent_matches || child.project.name.to_lowercase().contains(&query))
+                })
+                .collect();
+            if parent_matches || !children.is_empty() {
+                rows.push((parent.clone(), false));
+                rows.extend(children.into_iter().map(|child| (child.clone(), true)));
+            }
+        }
+        rows
+    });
+    view! {
+        <div class="launch-project-picker" node_ref=wrapper
+            on:focusout=move |ev| {
+                let inside = ev.related_target().and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|target| wrapper.get_untracked().is_some_and(|wrapper| wrapper.contains(Some(&target))));
+                if !inside { open.set(false); }
+            }
+            on:keydown=move |ev| {
+                if !open.get_untracked() { return; }
+                if ev.key() == "Escape" {
+                    ev.prevent_default(); ev.stop_propagation(); close.run(());
+                } else if ev.key() == "Enter" {
+                    // Project search must never submit the launch dialog.
+                    ev.stop_propagation();
+                    if ev.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok()).is_some_and(|target| target.tag_name() == "INPUT") { ev.prevent_default(); }
+                } else if matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp" | "Home" | "End") {
+                    let Some(wrapper) = wrapper.get_untracked() else { return; };
+                    let Ok(nodes) = wrapper.query_selector_all(".launch-project-options button") else { return; };
+                    let buttons: Vec<_> = (0..nodes.length()).filter_map(|i| nodes.item(i)?.dyn_into::<web_sys::HtmlElement>().ok()).collect();
+                    if buttons.is_empty() { return; }
+                    let active = web_sys::window().and_then(|window| window.document()).and_then(|document| document.active_element());
+                    let index = buttons.iter().position(|button| active.as_ref().is_some_and(|active| active.is_same_node(Some(button))));
+                    if matches!(ev.key().as_str(), "Home" | "End") && index.is_none() { return; }
+                    let next = match ev.key().as_str() {
+                        "Home" => 0, "End" => buttons.len() - 1,
+                        "ArrowUp" => index.map_or(buttons.len() - 1, |i| (i + buttons.len() - 1) % buttons.len()),
+                        _ => index.map_or(0, |i| (i + 1) % buttons.len()),
+                    };
+                    ev.prevent_default(); ev.stop_propagation();
+                    let _ = buttons[next].focus();
+                    buttons[next].scroll_into_view_with_bool(false);
+                }
+            }>
+            <label for="launch-project-select">"Project"</label>
+            <button id="launch-project-select" type="button" class="settings-select" aria-label="Project"
+                aria-expanded=move || open.get().to_string() aria-controls="launch-project-popover"
+                aria-describedby="launch-project-value" title=move || label.get()
+                node_ref=trigger on:keydown=move |ev| {
+                    if !open.get_untracked() && matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp") {
+                        ev.prevent_default(); ev.stop_propagation(); query.set(String::new()); open.set(true);
+                    }
+                } on:click=move |_| { query.set(String::new()); open.update(|open| *open = !*open); }>
+                <span id="launch-project-value">{move || label.get()}</span>
+            </button>
+            <Show when=move || open.get()>
+                <div id="launch-project-popover" class="launch-project-popover" role="group" aria-label="Project choices">
+                    <input type="search" aria-label="Find a project" placeholder="Find a project…" node_ref=search
+                        prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
+                    <Show when=move || show_workbenches.get().is_ok()>
+                        <div class="launch-workbench-toggle">
+                            <span>"Show workbenches"</span>
+                            <label class="settings-toggle">
+                                <input type="checkbox" role="switch" aria-label="Show workbenches" prop:checked=move || show_workbenches.get().is_ok_and(|shown| shown)
+                                    on:change=move |ev| {
+                                        let checked = event_target_checked(&ev);
+                                        let saved = storage.with_value(|storage| storage.as_ref().map_err(Clone::clone).and_then(|storage| {
+                                            storage.set_item("tyde.launch.show-workbenches", if checked { "true" } else { "false" })
+                                                .map(|()| checked).map_err(|error| format!("Could not save workbench preferences: {error:?}"))
+                                        }));
+                                        show_workbenches.set(saved);
+                                    } />
+                                <span class="settings-toggle-slider"></span>
+                            </label>
+                        </div>
+                    </Show>
+                    {move || show_workbenches.get().err().map(|error| view! { <p class="launch-empty" role="alert">{error}</p> })}
+                    <div class="launch-project-options">
+                        <button type="button" aria-pressed=move || selection.get().1.is_none().to_string()
+                            on:click=move |_| { on_select.run((selection.get_untracked().0, None)); close.run(()); }>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m3 11 9-8 9 8M5 10v11h14V10M9 21v-7h6v7" /></svg><span>"No project / Home"</span>
+                        </button>
+                        {move || rows.get().into_iter().map(|(entry, child)| {
+                            let target = ActiveProjectRef { host_id: entry.host_id, project_id: entry.project.id };
+                            let selected = target.clone();
+                            view! {
+                                <button type="button" class:launch-workbench-option=child
+                                    aria-pressed=move || (selection.get().1 == Some(selected.clone())).to_string()
+                                    on:click=move |_| { on_select.run((Some(target.host_id.clone()), Some(target.clone()))); close.run(()); }>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d=if child { "M6 6v12m0-6c8 0 12 0 12-6M9 4a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM9 20a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM21 4a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" } else { "M3 5h7l2 3h9v13H3Z" } /></svg><span>{entry.project.name}</span>
+                                </button>
+                            }
+                        }).collect_view()}
+                        <Show when=move || rows.get().is_empty()><p class="launch-empty">"No matching projects."</p></Show>
+                    </div>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+#[component]
 pub fn LaunchChooser(
     open_sig: RwSignal<bool>,
     #[prop(optional)] initial_backend: Option<BackendKind>,
@@ -147,63 +326,43 @@ pub fn LaunchChooser(
         .or_else(|| state.chat_context_host_id_untracked());
     let selection = RwSignal::new((host.clone(), chosen_project.clone()));
     let selected_host = Memo::new(move |_| selection.get().0);
-    let project_choices_state = state.clone();
-    let project_choices = Memo::new(move |_| {
-        let hosts = project_choices_state.configured_hosts.get();
-        hosts
-            .iter()
-            .flat_map(|host| {
-                let host_label = if hosts
-                    .iter()
-                    .filter(|other| other.label == host.label)
-                    .count()
-                    > 1
-                {
-                    format!("{} ({})", host.label, host.id)
-                } else {
-                    host.label.clone()
-                };
-                let mut choices = vec![(
-                    Some(host.id.clone()),
-                    None,
-                    format!("No project / Home · {host_label}"),
-                )];
-                choices.extend(
-                    project_choices_state
-                        .projects
-                        .get()
-                        .into_iter()
-                        .filter(|project| project.host_id == host.id)
-                        .map(|project| {
-                            (
-                                Some(host.id.clone()),
-                                Some(ActiveProjectRef {
-                                    host_id: host.id.clone(),
-                                    project_id: project.project.id,
-                                }),
-                                format!("{} · {}", host_label, project.project.name),
-                            )
-                        }),
-                );
-                choices
-            })
-            .collect::<Vec<_>>()
-    });
+    let hosts = state.configured_hosts;
+    let projects = state.projects;
     let project_available = Memo::new(move |_| {
-        let selected = selection.get();
-        project_choices
-            .get()
-            .iter()
-            .any(|(host, project, _)| (host, project) == (&selected.0, &selected.1))
+        let (host, project) = selection.get();
+        host.as_ref().is_some_and(|host| {
+            hosts.with(|hosts| hosts.iter().any(|entry| &entry.id == host))
+                && project.as_ref().is_none_or(|selected| {
+                    &selected.host_id == host
+                        && projects.with(|projects| {
+                            projects.iter().any(|entry| {
+                                entry.host_id == selected.host_id
+                                    && entry.project.id == selected.project_id
+                            })
+                        })
+                })
+        })
     });
     let context_label = Memo::new(move |_| {
-        let selected = selection.get();
-        project_choices
-            .get()
-            .into_iter()
-            .find(|(host, project, _)| (host, project) == (&selected.0, &selected.1))
-            .map(|(_, _, label)| label)
-            .unwrap_or_else(|| "Project unavailable".to_owned())
+        let Some(selected) = selection.get().1 else {
+            return "No project / Home".to_owned();
+        };
+        projects.with(|projects| {
+            let Some(entry) = projects.iter().find(|entry| {
+                entry.host_id == selected.host_id && entry.project.id == selected.project_id
+            }) else {
+                return "Project unavailable".to_owned();
+            };
+            match entry.project.parent_project_id() {
+                Some(parent) => match projects.iter().find(|parent_entry| {
+                    parent_entry.host_id == selected.host_id && &parent_entry.project.id == parent
+                }) {
+                    Some(parent) => format!("{} / {}", parent.project.name, entry.project.name),
+                    None => "Workbench parent unavailable".to_owned(),
+                },
+                None => entry.project.name.clone(),
+            }
+        })
     });
     let entries_state = state.clone();
     let entries_host = selected_host;
@@ -329,31 +488,18 @@ pub fn LaunchChooser(
     });
 
     let project_catalogs = state.launch_profile_catalog;
-    let change_project = move |ev: web_sys::Event| {
-        let selected: (Option<String>, Option<ActiveProjectRef>) =
-            match serde_json::from_str(&event_target_value(&ev)) {
-                Ok(selected) => selected,
-                Err(_) => {
-                    log::error!("invalid project picker selection encoding");
-                    return;
-                }
-            };
-        let target = project_choices
-            .get_untracked()
-            .into_iter()
-            .find(|(host, project, _)| (host, project) == (&selected.0, &selected.1));
-        if let Some((host, project, _)) = target {
-            if selection.get_untracked() == (host.clone(), project.clone()) {
+    let change_destination =
+        Callback::new(move |target: (Option<String>, Option<ActiveProjectRef>)| {
+            if selection.get_untracked() == target {
                 return;
             }
             let profile = project_catalogs.with_untracked(|catalogs| {
-                catalogs.get(host.as_ref()?)?.default_profile_id.clone()
+                catalogs.get(target.0.as_ref()?)?.default_profile_id.clone()
             });
-            selection.set((host, project));
+            selection.set(target);
             selected_profile.set(profile);
             role_override.set(None);
-        }
-    };
+        });
 
     let create = Callback::new(move |()| {
         if !open_sig.get_untracked()
@@ -493,16 +639,27 @@ pub fn LaunchChooser(
                     <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
                     <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
                         on:click=move |_| open_sig.set(false)>"×"</button>
-                    <div class="launch-project-picker">
-                        <label for="launch-project-select">"Project"</label>
-                        <select id="launch-project-select" class="settings-select" aria-label="Project" on:change=change_project>
-                            <Show when=move || !project_available.get()><option value="" selected=true disabled=true>"Project unavailable"</option></Show>
-                            {move || project_choices.get().into_iter().map(|(host, project, label)| {
-                                let target = (host, project);
-                                let value = serde_json::json!(target).to_string();
-                                view! { <option value=value selected=move || selection.get() == target>{label}</option> }
-                            }).collect_view()}
-                        </select>
+                    <div class="launch-destination-picker">
+                        <div class="launch-host-picker">
+                            <label for="launch-host-select">"Host"</label>
+                            <select id="launch-host-select" class="settings-select" aria-label="Host"
+                                on:change=move |ev| {
+                                    let host = event_target_value(&ev);
+                                    if hosts.with_untracked(|hosts| hosts.iter().any(|entry| entry.id == host)) {
+                                        change_destination.run((Some(host), None));
+                                    }
+                                }>
+                                <Show when=move || selected_host.get().as_ref().is_none_or(|id| !hosts.with(|hosts| hosts.iter().any(|host| &host.id == id)))><option selected=true disabled=true>"Host unavailable"</option></Show>
+                                {move || hosts.get().into_iter().map(|host| {
+                                    let label = hosts.with(|hosts| if hosts.iter().filter(|entry| entry.label == host.label).count() > 1 {
+                                        format!("{} ({})", host.label, host.id)
+                                    } else { host.label });
+                                    let id = host.id.clone();
+                                    view! { <option value=host.id selected=move || selected_host.get().as_ref() == Some(&id)>{label}</option> }
+                                }).collect_view()}
+                            </select>
+                        </div>
+                        <LaunchProjectPicker selection=selection label=context_label on_select=change_destination />
                     </div>
                 </header>
                 <div class="launch-chooser-body">
@@ -628,6 +785,7 @@ pub fn LaunchChooser(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::ScopedRoot;
     use leptos::mount::mount_to;
     use protocol::{
         CustomAgentId, LaunchProfile, LaunchProfileCatalog, LaunchProfileId, SessionSettingValue,
@@ -640,7 +798,7 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn make_container() -> HtmlElement {
+    fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
         if document
             .get_element_by_id("launch-chooser-test-css")
@@ -659,7 +817,7 @@ mod wasm_tests {
                 "display:flex;flex-direction:column;width:100%;height:680px;",
             )
             .unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(container.dyn_into::<HtmlElement>().unwrap(), "launch-menu")
     }
 
     async fn next_tick() {
@@ -1014,30 +1172,304 @@ mod wasm_tests {
             host_id: "remote".into(),
             project_id: protocol::ProjectId("same-project-id".into()),
         };
-        state.active_project.set(Some(local.clone()));
+        let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        let previous_preference = storage.get_item("tyde.launch.show-workbenches").unwrap();
+        storage.remove_item("tyde.launch.show-workbenches").unwrap();
+        let workbench = ActiveProjectRef {
+            host_id: "local".into(),
+            project_id: protocol::ProjectId("local-workbench".into()),
+        };
+        state.projects.update(|projects| {
+            projects.push(crate::state::ProjectInfo {
+                host_id: "local".into(),
+                project: protocol::Project {
+                    id: workbench.project_id.clone(),
+                    name: "UI polish".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::GitWorkbench {
+                        parent_project_id: local.project_id.clone(),
+                        branch: protocol::GitBranchName("ui-polish".into()),
+                        roots: vec![],
+                        environment: Default::default(),
+                    },
+                },
+            })
+        });
+        state.active_project.set(Some(workbench.clone()));
         let open = RwSignal::new(true);
         let _handle = mount_menu(&container, &state, open);
         next_tick().await;
         let picker = || {
             container
-                .query_selector("select[aria-label='Project']")
+                .query_selector("button[aria-label='Project']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        // The selected trigger also contains the workbench name when discovery
+        // is hidden. Only buttons in the open choices group are discoverable rows.
+        let project_choice = |text: &str| {
+            let nodes = container
+                .query_selector_all("[role=group][aria-label='Project choices'] button")
+                .unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+                .find(|button| button.text_content().as_deref() == Some(text))
+        };
+        let choose_host = |host: &str| {
+            let select = container
+                .query_selector("select[aria-label='Host']")
                 .unwrap()
                 .unwrap()
                 .dyn_into::<web_sys::HtmlSelectElement>()
-                .unwrap()
-        };
-        let choose = |host: &str, project: Option<ActiveProjectRef>| {
-            picker().set_value(&serde_json::json!((Some(host), project)).to_string());
-            picker()
+                .unwrap();
+            select.set_value(host);
+            select
                 .dispatch_event(&web_sys::Event::new("change").unwrap())
                 .unwrap();
         };
+        let choose = async |host: &str, project: Option<ActiveProjectRef>| {
+            choose_host(host);
+            next_tick().await;
+            picker().click();
+            next_tick().await;
+            let text = if project.is_some() {
+                "Shared name"
+            } else {
+                "No project / Home"
+            };
+            project_choice(text).unwrap().click();
+            next_tick().await;
+        };
         assert_eq!(
-            picker().value(),
-            serde_json::json!((Some("local"), Some(local.clone()))).to_string()
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish")
         );
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(!open.get_untracked());
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(workbench.clone()),
+            "hidden active workbench remains the actual launch target"
+        );
+        assert_rendered_draft(&container, "Claude", "Auto").await;
+        open.set(true);
+        next_tick().await;
+        picker().click();
+        next_tick().await;
+        assert!(
+            project_choice("UI polish").is_none(),
+            "workbench discovery defaults off without changing the active launch target"
+        );
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish"),
+            "hiding discovery does not hide the selected destination"
+        );
+        let toggle = container
+            .query_selector("[role=switch][aria-label='Show workbenches']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        toggle.click();
+        next_tick().await;
+        assert_eq!(
+            storage
+                .get_item("tyde.launch.show-workbenches")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        state.projects.update(|projects| {
+            projects.extend((0..24).map(|index| crate::state::ProjectInfo {
+                host_id: "local".into(),
+                project: protocol::Project {
+                    id: protocol::ProjectId(format!("extra-{index}")),
+                    name: format!("Extra project {index:02}"),
+                    sort_order: index,
+                    source: protocol::ProjectSource::Standalone { roots: vec![] },
+                },
+            }));
+        });
+        next_tick().await;
+        let options = project_choice("No project / Home")
+            .unwrap()
+            .parent_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert!(
+            options.scroll_height() > options.client_height(),
+            "large project lists scroll inside the constrained popover"
+        );
+        options.set_scroll_top(options.scroll_height());
+        next_tick().await;
+        let last = project_choice("Extra project 23")
+            .unwrap()
+            .get_bounding_client_rect();
+        let bounds = options.get_bounding_client_rect();
+        assert!(
+            last.top() >= bounds.top() && last.bottom() <= bounds.bottom() + 1.0,
+            "the final choice remains reachable inside the popover"
+        );
+        options.set_scroll_top(0);
+        let child = project_choice("UI polish").unwrap();
+        assert_eq!(child.get_attribute("aria-pressed").as_deref(), Some("true"));
+        let search = container
+            .query_selector("input[aria-label='Find a project']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        search.focus().unwrap();
+        for key in ["Home", "End"] {
+            let init = web_sys::KeyboardEventInit::new();
+            init.set_key(key);
+            init.set_bubbles(true);
+            init.set_cancelable(true);
+            let event = web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                .unwrap();
+            search.dispatch_event(&event).unwrap();
+            assert!(
+                !event.default_prevented(),
+                "text-editing keys retain their native behavior"
+            );
+            assert!(
+                web_sys::window()
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .active_element()
+                    .unwrap()
+                    .is_same_node(Some(&search))
+            );
+            assert_eq!(
+                picker().text_content().as_deref(),
+                Some("Shared name / UI polish")
+            );
+        }
+        let down = web_sys::KeyboardEventInit::new();
+        down.set_key("ArrowDown");
+        down.set_bubbles(true);
+        search
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &down)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("No project / Home")
+        );
+        search.focus().unwrap();
+        search.set_value("absent");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(project_choice("UI polish").is_none());
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish")
+        );
+        toggle.click();
+        next_tick().await;
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish")
+        );
+        let storage_set = js_sys::eval("Storage.prototype.setItem").unwrap();
+        js_sys::eval("Storage.prototype.setItem = function() { throw new DOMException('Storage denied', 'SecurityError'); }").unwrap();
+        toggle.click();
+        next_tick().await;
+        js_sys::Reflect::set(
+            &js_sys::eval("Storage.prototype").unwrap(),
+            &"setItem".into(),
+            &storage_set,
+        )
+        .unwrap();
+        assert!(visible_text(&container).contains("Could not save workbench preferences"));
+        assert!(
+            container
+                .query_selector("[role=switch][aria-label='Show workbenches']")
+                .unwrap()
+                .is_none(),
+            "a failed preference write must not present a successful switch"
+        );
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish")
+        );
+        let escape = web_sys::KeyboardEventInit::new();
+        escape.set_key("Escape");
+        escape.set_bubbles(true);
+        search
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
+                    .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        assert!(
+            open.get_untracked(),
+            "Escape closes the project popover, not the chooser"
+        );
+        assert_eq!(
+            picker().get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&picker()))
+        );
+        picker().click();
+        next_tick().await;
+        project_choice("Shared name").unwrap().click();
+        next_tick().await;
+        // Choosing a destination never navigates the current workspace.
+        assert_eq!(state.active_project.get_untracked(), Some(workbench));
+        state.active_project.set(Some(local.clone()));
+        match previous_preference {
+            Some(value) => storage
+                .set_item("tyde.launch.show-workbenches", &value)
+                .unwrap(),
+            None => storage.remove_item("tyde.launch.show-workbenches").unwrap(),
+        }
+        choose_host("remote");
+        next_tick().await;
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("No project / Home"),
+            "changing hosts clears the old-host launch project even when IDs match"
+        );
+        picker().click();
+        next_tick().await;
+        assert!(
+            project_choice("UI polish").is_none(),
+            "other-host workbenches never leak into choices"
+        );
+        project_choice("No project / Home").unwrap().click();
+        next_tick().await;
+        choose("local", Some(local.clone())).await;
         assert!(find_button_by_text(&container, "Local Claude").is_some());
-        choose("unbootstrapped", None);
+        choose("unbootstrapped", None).await;
         next_tick().await;
         assert!(visible_text(&container).contains("Connect to this host to load launch profiles."));
         assert!(!visible_text(&container).contains("Enable a backend in Settings"));
@@ -1100,7 +1532,7 @@ mod wasm_tests {
             .click();
         next_tick().await;
         assert!(visible_text(&container).contains("Late Claude · Late Help"));
-        choose("remote", Some(remote.clone()));
+        choose("remote", Some(remote.clone())).await;
         next_tick().await;
         assert!(find_button_by_text(&container, "Remote Codex").is_some());
         assert!(find_button_by_text(&container, "Local Claude").is_none());
@@ -1147,7 +1579,7 @@ mod wasm_tests {
 
         open.set(true);
         next_tick().await;
-        choose("local", Some(local));
+        choose("local", Some(local)).await;
         next_tick().await;
         assert!(find_button_by_text(&container, "Local Claude").is_some());
         state
@@ -1172,13 +1604,10 @@ mod wasm_tests {
             "hosts": state.configured_hosts.get_untracked(), "selected_host_id": "remote",
         });
         js_sys::eval(&format!("window.__TAURI__.core.invoke = (cmd) => cmd === 'set_selected_host' ? new Promise(resolve => window.__finishHomeHost = () => resolve({store})) : Promise.resolve()")).unwrap();
-        choose("remote", None);
+        choose("remote", None).await;
         next_tick().await;
         assert!(
             picker()
-                .selected_options()
-                .item(0)
-                .unwrap()
                 .text_content()
                 .unwrap()
                 .contains("No project / Home")
@@ -1548,8 +1977,10 @@ mod wasm_tests {
             )
             .unwrap();
         next_tick().await;
+        // The searchable picker uses a button with the same themed control;
+        // requiring a native select rejects the approved rendered UI.
         let picker = container
-            .query_selector("select[aria-label='Project']")
+            .query_selector("button[aria-label='Project']")
             .unwrap()
             .unwrap();
         let picker_style = web_sys::window()

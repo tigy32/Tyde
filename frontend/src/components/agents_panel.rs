@@ -4926,7 +4926,8 @@ mod wasm_tests {
         crate::dispatch::clear_host_seqs("local");
         crate::dispatch::clear_host_seqs("remote");
         let calls = install_send_stub_with_dialog_ok();
-        let container = make_container();
+        let container =
+            crate::wasm_test_support::ScopedRoot::new(make_container(), "agents-panel-launch");
         let state = make_app_state("local");
         state
             .sidebar_layout
@@ -5248,18 +5249,41 @@ mod wasm_tests {
             .click();
         next_tick().await;
         let document = web_sys::window().unwrap().document().unwrap();
-        let picker = document
-            .query_selector("select[aria-label='Project']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlSelectElement>()
-            .unwrap();
-        let selected: (Option<String>, Option<ActiveProjectRef>) =
-            serde_json::from_str(&picker.value()).unwrap();
-        assert_eq!(
-            selected.1, original_selection,
-            "Toolbar launch defaults to the active typed project"
-        );
+        let dialog = || {
+            document
+                .query_selector("[role='dialog'][aria-label='New agent']")
+                .unwrap()
+                .unwrap()
+        };
+        // Host and Project are now separate controls, not a serialized tuple
+        // in a select or a combined "Host · Project" label in textContent.
+        let assert_destination = |host_id: &str, host_label: &str, project: &str| {
+            let host = dialog()
+                .query_selector("select[aria-label='Host']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlSelectElement>()
+                .unwrap();
+            assert_eq!(host.value(), host_id);
+            assert_eq!(
+                host.item(host.selected_index() as u32)
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                Some(host_label)
+            );
+            assert_eq!(
+                dialog()
+                    .query_selector("button[aria-label='Project']")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                Some(project)
+            );
+        };
+        assert_destination("local", "Local Host", "Alpha Project");
+        assert_eq!(state.active_project.get_untracked(), original_selection);
         document
             .query_selector("[aria-label='Close agent chooser']")
             .unwrap()
@@ -5270,18 +5294,7 @@ mod wasm_tests {
         next_tick().await;
         remote_new().click();
         next_tick().await;
-        let dialog = || {
-            document
-                .query_selector("[role='dialog'][aria-label='New agent']")
-                .unwrap()
-                .unwrap()
-        };
-        assert!(
-            dialog()
-                .text_content()
-                .unwrap()
-                .contains("Remote Host · Empty Remote Project")
-        );
+        assert_destination("remote", "Remote Host", "Empty Remote Project");
         state.projects.update(|projects| {
             projects
                 .iter_mut()
@@ -5291,13 +5304,7 @@ mod wasm_tests {
                 .name = "Updated Empty Remote Project".into()
         });
         next_tick().await;
-        assert!(
-            dialog()
-                .text_content()
-                .unwrap()
-                .contains("Remote Host · Updated Empty Remote Project"),
-            "Live catalog updates preserve the open normal chooser"
-        );
+        assert_destination("remote", "Remote Host", "Updated Empty Remote Project");
         assert_eq!(
             state.active_project.get_untracked(),
             original_selection,
