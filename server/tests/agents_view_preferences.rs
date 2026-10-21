@@ -1054,8 +1054,26 @@ async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_a
         },
     )
     .await;
-    let notify =
-        expect_preferences_notify(&mut fixture.client, "assign tag before filtering").await;
+    // Session publication also emits this notification; the next snapshot is
+    // not an acknowledgement of the tag mutation.
+    let notify = expect_preferences_notify_where(
+        &mut fixture.client,
+        "assigned tag before filtering",
+        |notify| {
+            notify
+                .snapshot
+                .tags
+                .manual_assignments
+                .iter()
+                .any(|assignment| {
+                    assignment.target == target && assignment.tag_ids.contains(&tag_id)
+                })
+        },
+    )
+    .await;
+    eprintln!(
+        "TAGS SNAPSHOT EVIDENCE: observed requested assignment before asserting the complete snapshot"
+    );
     assert_eq!(
         notify.snapshot.tags.manual_assignments,
         vec![protocol::AgentManualTagAssignment {
@@ -1116,7 +1134,11 @@ async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_a
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "tag filter notify").await;
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "tag filter notify", |notify| {
+            notify.snapshot.preferences.filters.tags == filters.tags
+        })
+        .await;
     assert_eq!(notify.snapshot.preferences.filters.tags, filters.tags);
 
     send_set_agents_view_preferences(
@@ -1126,7 +1148,11 @@ async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_a
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "tag group notify").await;
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "tag group notify", |notify| {
+            notify.snapshot.preferences.group_mode == AgentGroupMode::Tag
+        })
+        .await;
     assert_eq!(notify.snapshot.preferences.group_mode, AgentGroupMode::Tag);
 }
 

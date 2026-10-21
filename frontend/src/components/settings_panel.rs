@@ -955,6 +955,13 @@ pub fn SettingsPanel() -> impl IntoView {
         Signal::derive(move || format!("Host · {}", selected_host_label(&nav_state)));
     let active_page = RwSignal::new(SettingsPage::Tab(SettingsTab::Appearance));
     let search_query = RwSignal::new(String::new());
+    let content_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        active_page.track();
+        if let Some(content) = content_ref.get() {
+            content.set_scroll_top(0);
+        }
+    });
 
     // Honor deep-link requests (e.g. the onboarding "Set up an AI engine" CTA
     // asking to open straight to the Backends tab).
@@ -1045,7 +1052,7 @@ pub fn SettingsPanel() -> impl IntoView {
                             </div>
                         </nav>
 
-                        <div class="settings-content">
+                        <div class="settings-content" node_ref=content_ref>
                             <crate::notices::InlineNotices scopes=Signal::derive(move || {
                                 let mut scopes = vec![crate::notices::NoticeScope::Settings(None)];
                                 if let Some(host) = notice_host.get() { scopes.push(crate::notices::NoticeScope::Settings(Some(host))); }
@@ -1188,12 +1195,10 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
 fn WorkbenchesTab() -> impl IntoView {
     let display_state = expect_context::<AppState>();
     view! {
-        <div>
+        <div class="workbenches-settings">
             <h2 class="settings-panel-title">"Workbenches"</h2>
-            <p class="settings-description">"Choose the engine for new workbenches on this host. Existing workbenches are unaffected."</p>
-            <p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p>
-            <p class="settings-description">"Bubblewrap currently supports new normal Codex sessions only. Other providers, modes, and live conversation transfers across engines are explicitly unsupported."</p>
-            <p class="settings-description">"No build runs automatically. Optional .tyde/workbench.json configuration selects opaque snapshot paths and namespace-local services. External host services are not automatically namespace-compatible. Setup or launch errors are reported; Tyde never falls back to Native."</p>
+            <p class="settings-description">"Engine for new workbenches. Existing workbenches are unchanged."</p>
+            <p class="settings-description">"Bubblewrap: Linux only, new normal Codex sessions only. No transfers between engines."</p>
             {move || {
                 let Some(host_id) = display_state.selected_host_id.get() else {
                     return view! { <p class="settings-description">"Select a host to configure workbenches."</p> }.into_any();
@@ -1218,9 +1223,9 @@ fn WorkbenchesTab() -> impl IntoView {
                 let native_state = display_state.clone();
                 let bubblewrap_state = display_state.clone();
                 view! {
-                    <fieldset disabled=disconnected>
+                    <fieldset class="workbench-engine-options" disabled=disconnected>
                         <legend>"Engine for new workbenches"</legend>
-                        <label class="settings-toggle-row" style="gap:0.5rem;">
+                        <label class="workbench-engine-option">
                             <input type="radio" name="workbench-engine" value="native"
                                 prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Native
                                 on:click=move |event| {
@@ -1228,9 +1233,9 @@ fn WorkbenchesTab() -> impl IntoView {
                                     send_host_replace(&native_state, "/workbenches/engine", protocol::WorkbenchEngine::Native);
                                 }
                             />
-                            "Native (default)"
+                            <span>"Native"<small>"Default"</small></span>
                         </label>
-                        <label class="settings-toggle-row" style="gap:0.5rem;">
+                        <label class="workbench-engine-option">
                             <input type="radio" name="workbench-engine" value="bubblewrap"
                                 disabled=!bubblewrap_available
                                 prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Bubblewrap
@@ -1239,11 +1244,11 @@ fn WorkbenchesTab() -> impl IntoView {
                                     send_host_replace(&bubblewrap_state, "/workbenches/engine", protocol::WorkbenchEngine::Bubblewrap);
                                 }
                             />
-                            "Bubblewrap (Linux opt-in)"
+                            <span>"Bubblewrap"<small>"Linux · opt-in"</small></span>
                         </label>
                     </fieldset>
                     <p class="settings-description" role="status">{bubblewrap_status}</p>
-                    <p class="settings-description">{nested_status}</p>
+                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"No build runs automatically. Optional .tyde/workbench.json configuration selects opaque snapshot paths and namespace-local services. External host services are not automatically namespace-compatible. Setup or launch errors are reported; Tyde never falls back to Native."</p></details>
                 }.into_any()
             }}
         </div>
@@ -2569,12 +2574,14 @@ fn AiSummariesTab() -> impl IntoView {
 fn ReviewSettingsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let toggle_state = state.clone();
+    let settings = Memo::new(move |_| state.selected_host_settings());
     view! {
         <section class="review-settings">
             <h2 class="settings-panel-title">"Review"</h2>
-            <label class="settings-toggle-row"><span>"Enable reviews"</span><input type="checkbox" role="switch" aria-label="Enable reviews"
-                prop:checked=move || state.selected_host_settings().is_some_and(|s| s.review.enabled)
-                on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) /></label>
+            <div class="settings-toggle-row"><span class="settings-label">"Enable reviews"</span><label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Enable reviews"
+                prop:checked=move || settings.get().is_some_and(|s| s.review.enabled)
+                disabled=move || settings.get().is_none()
+                on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) /><span class="settings-toggle-slider"></span></label></div>
             <ReviewConfigurationFields />
         </section>
     }
@@ -2606,20 +2613,20 @@ pub(super) fn ReviewConfigurationFields(
     let delete_state = StoredValue::new(state.clone());
     let restore_state = StoredValue::new(state.clone());
     view! {
-        <div class="review-segments" role="group" aria-label="Review mode">
+        <div class="settings-segmented-control review-segments" role="group" aria-label="Review mode">
             {[protocol::ReviewMode::Inline, protocol::ReviewMode::SingleReviewer, protocol::ReviewMode::ReviewTeam].into_iter().map(|mode| {
                 let state = mode_state.get_value();
-                view! { <button type="button" aria-pressed=move || settings.get().is_some_and(|s| s.default_mode == mode)
+                view! { <button type="button" class=move || if settings.get().is_some_and(|s| s.default_mode == mode) { "segment active" } else { "segment" } aria-pressed=move || if settings.get().is_some_and(|s| s.default_mode == mode) { "true" } else { "false" } disabled=move || settings.get().is_none()
                     title=move || if mode == protocol::ReviewMode::SingleReviewer { plan.and_then(|p| p.get()).and_then(|p| match p.fork_capability { protocol::ReviewForkCapability::Unsupported { reason } => Some(reason), _ => None }).unwrap_or_default() } else { String::new() }
                     on:click=move |_| send_host_replace(&state, "/review/default_mode", mode)>{mode.label()}</button> }
             }).collect_view()}
         </div>
         <Show when=move || settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::ReviewTeam)>
-            <h3>"Team layout"</h3>
-            <div class="review-segments" role="group" aria-label="Team layout">
+            <h3 class="settings-section-title">"Team layout"</h3>
+            <div class="settings-segmented-control review-segments" role="group" aria-label="Team layout">
                 {[protocol::ReviewTeamLayout::PerAspect, protocol::ReviewTeamLayout::PerReviewer, protocol::ReviewTeamLayout::EveryCombination].into_iter().map(|layout| {
                     let state = layout_state.get_value();
-                    view! { <button type="button" aria-pressed=move || settings.get().is_some_and(|s| s.team.layout == layout)
+                    view! { <button type="button" class=move || if settings.get().is_some_and(|s| s.team.layout == layout) { "segment active" } else { "segment" } aria-pressed=move || if settings.get().is_some_and(|s| s.team.layout == layout) { "true" } else { "false" } disabled=move || settings.get().is_none()
                         on:click=move |_| send_host_replace(&state, "/review/team/layout", layout)>
                         <span>{layout.label()}</span>
                         {move || plan.and_then(|p| p.get()).and_then(|p| p.layout_counts.into_iter().find(|c| c.layout == layout)).map(|c| view! { <small>{format!("{} agents", c.agent_count)}</small> })}
@@ -9187,23 +9194,23 @@ fn SelfImprovementTab() -> impl IntoView {
     });
     view! {
         <section class="self-improvement-settings">
-            <header class="learning-heading"><div><h2 class="settings-panel-title">"Self-improvement"</h2><p class="settings-description">"Turn durable feedback into steering and review aspects."</p></div>
-                <label class="settings-toggle-row"><input type="checkbox" role="switch" aria-label="Enable self-improvement" disabled=move || config.get().is_none()
+            <h2 class="settings-panel-title">"Self-improvement"</h2><header class="learning-heading"><span class="settings-label">"Enable self-improvement"</span>
+                <label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Enable self-improvement" disabled=move || config.get().is_none()
                     prop:checked=move || config.get().is_some_and(|config| config.enabled)
-                    on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.enabled = event_target_checked(&ev); save.run(config); }/><span>"Enabled"</span></label>
+                    on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.enabled = event_target_checked(&ev); save.run(config); }/><span class="settings-toggle-slider"></span></label>
             </header>
             <div class="learning-config">
-                <div class="learning-row"><label>"Mode"</label><div><div class="review-segments" role="group" aria-label="Self-improvement mode">
-                    {[LearningMode::Suggest, LearningMode::Automatic].into_iter().map(move |mode| view! { <button type="button" aria-pressed=move || config.get().is_some_and(|config| config.mode == mode) disabled=move || config.get().is_none()
+                <div class="learning-row"><label>"Mode"</label><div><div class="settings-segmented-control review-segments" role="group" aria-label="Self-improvement mode">
+                    {[LearningMode::Suggest, LearningMode::Automatic].into_iter().map(move |mode| view! { <button type="button" class=move || if config.get().is_some_and(|config| config.mode == mode) { "segment active" } else { "segment" } aria-pressed=move || if config.get().is_some_and(|config| config.mode == mode) { "true" } else { "false" } disabled=move || config.get().is_none()
                         on:click=move |_| if let Some(mut config) = config.get_untracked() { config.mode = mode; save.run(config); }>{if mode == LearningMode::Suggest { "Suggest" } else { "Automatic" }}</button> }).collect_view()}
-                </div><p class="settings-description">{move || if config.get().is_some_and(|config| config.mode == LearningMode::Automatic) { "Add and update learned rules automatically. Human-owned edits still require approval." } else { "Review proposals before applying. Nothing changes until you Apply." }}</p></div></div>
+                </div><p class="settings-description">{move || if config.get().is_some_and(|config| config.mode == LearningMode::Automatic) { "Apply learned rules automatically; human-owned edits require approval." } else { "Apply proposals manually." }}</p></div></div>
                 <div class="learning-row"><label for="learning-scope">"Scope"</label><div>
                     <select id="learning-scope" class="settings-select" aria-label="Self-improvement scope" prop:value=move || match scope.get() { Some(SteeringScope::Host) => "host".into(), Some(SteeringScope::Project(id)) => id.0, None => String::new() }
                         on:change=move |ev| { let value = event_target_value(&ev); scope.set(if value.is_empty() { None } else if value == "host" { Some(SteeringScope::Host) } else { Some(SteeringScope::Project(ProjectId(value))) }); }>
                         <option value="">"Choose this project"</option>
                         {move || { let state = store.get_value(); let host = state.selected_host_id.get(); state.projects.get().into_iter().filter(|project| Some(&project.host_id) == host.as_ref()).map(|project| view! { <option value=project.project.id.0>{format!("This project · {}", project.project.name)}</option> }).collect_view() }}
                         <option value="host">"Host-wide (explicit opt-in)"</option>
-                    </select><p class="settings-description">"Host-wide learning is separate and off by default. Only the selected scope can be changed."</p>
+                    </select>
                 </div></div>
                 <div class="learning-row"><label>"Analyzer"</label><div class="learning-analyzer">
                     <select class="settings-select" aria-label="Analyzer backend" disabled=move || config.get().is_none() prop:value=move || config.get().and_then(|config| config.analyzer).map(|analyzer| format!("{:?}", analyzer.backend_kind)).unwrap_or_default()
@@ -9215,24 +9222,22 @@ fn SelfImprovementTab() -> impl IntoView {
                         <option value="">"Select a low-cost model"</option>
                         {move || { let state = store.get_value(); let model_options = state.selected_host_id.get().and_then(|host| state.session_schemas.get().get(&host).cloned()).unwrap_or_default().into_values().find_map(|entry| match entry { SessionSchemaEntry::Ready { schema } if schema.backend_kind == BackendKind::Codex => Some(schema.fields), _ => None }).unwrap_or_default().into_iter().find(|field| field.key == "model").and_then(|field| match field.field_type { SessionSettingFieldType::Select { options, .. } => Some(options), _ => None }).unwrap_or_default(); model_options.into_iter().map(|option| view! { <option value=option.value>{option.label}</option> }).collect_view() }}
                     </select>
-                    <p class="settings-description">"Uses your selected provider. Low reasoning effort; no tools, shell, MCP, or sign-in changes. Other backends do not yet support this helper mode."</p>
+                    <p class="settings-description">"Requires tool-free reusable inference. Unsupported analyzers cannot be selected."</p>
                 </div></div>
-                <div class="learning-row"><label>"Run on"</label><div><span>"New user messages"</span><p class="settings-description">"Every new human input, even while an agent is working. Assistant replies and tool activity never trigger analysis."</p></div></div>
+                <div class="learning-row"><label>"Run on"</label><div><span>"New user messages"</span></div></div>
                 <div class="learning-row"><label>"Can update"</label><div class="learning-targets">
-                    <label><input type="checkbox" aria-label="Learn steering" prop:checked=move || config.get().is_some_and(|config| config.steering) disabled=move || config.get().is_none()
-                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.steering = event_target_checked(&ev); save.run(config); }/>"Steering"</label>
-                    <label><input type="checkbox" aria-label="Learn review aspects" prop:checked=move || config.get().is_some_and(|config| config.review_aspects) disabled=move || config.get().is_none()
-                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.review_aspects = event_target_checked(&ev); save.run(config); }/>"Review aspects"</label>
+                    <div class="learning-target"><span>"Steering"</span><label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Learn steering" prop:checked=move || config.get().is_some_and(|config| config.steering) disabled=move || config.get().is_none()
+                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.steering = event_target_checked(&ev); save.run(config); }/><span class="settings-toggle-slider"></span></label></div>
+                    <div class="learning-target"><span>"Review aspects"</span><label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Learn review aspects" prop:checked=move || config.get().is_some_and(|config| config.review_aspects) disabled=move || config.get().is_none()
+                        on:change=move |ev| if let Some(mut config) = config.get_untracked() { config.review_aspects = event_target_checked(&ev); save.run(config); }/><span class="settings-toggle-slider"></span></label></div>
                 </div></div>
                 <footer class="learning-footer"><span>{move || scope_state.get().map(|state| match state.status {
                     protocol::LearningStatus::Disabled => "Disabled · no model calls".into(), protocol::LearningStatus::Ready => "Ready".into(), protocol::LearningStatus::Running => format!("Analyzing · {} queued", state.queued), protocol::LearningStatus::Unsupported { reason } => format!("Unsupported · {reason}"), protocol::LearningStatus::Failed { reason } => format!("Analysis failed · {reason}"),
                 }).unwrap_or_else(|| "Disabled · no model calls".into())}</span><span>{move || scope_state.get().and_then(|state| state.last_checked_ms).map(|time| format!("Last checked {}", js_sys::Date::new(&JsValue::from_f64(time as f64)).to_iso_string().as_string().unwrap_or_default())).unwrap_or_else(|| "Not checked yet".into())}</span><button class="settings-btn" on:click=move |_| usage_open.update(|open| *open = !*open)>"View usage"</button></footer>
             </div>
-            <p class="settings-description">"Learning never interrupts the current turn. Canonical steering is loaded by new and resumed sessions; running sessions keep their launch policy. Editing a learned rule in its normal editor protects it from future automatic edits."</p>
             <Show when=move || snapshot.get().error.is_some()><p role="alert">{move || snapshot.get().error}</p></Show>
             <Show when=move || usage_open.get()><section aria-label="Analyzer usage"><h3>"Analyzer usage"</h3>{move || snapshot.get().usage.into_iter().filter(|usage| Some(&usage.scope) == scope.get().as_ref()).map(|usage| view! { <p>{format!("{:?} · {} · {} human inputs · {}", usage.analyzer.backend_kind, usage.analyzer.model, usage.input_ids.len(), learning_usage_label(&usage.usage))}</p> }).collect_view() }</section></Show>
             <h3>"Recent changes"</h3>
-            <p class="settings-description">"Before, after, reason, and originating feedback. Undo is revision-checked and never overwrites a later edit."</p>
             {move || { let changes = snapshot.get().changes.into_iter().filter(|change| Some(&change.scope) == scope.get().as_ref()).collect::<Vec<_>>();
                 if changes.is_empty() { view! { <p class="settings-description">"No changes in this scope."</p> }.into_any() } else { changes.into_iter().map(move |change| {
                     let id = change.id.clone(); let undo_id = id.clone(); let dismiss_id = id.clone(); let edit = change.clone();
@@ -9758,6 +9763,10 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn workbenches_engine_waits_for_server_state_and_tracks_host_support() {
         let calls = install_settings_send_stub();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
         let state = AppState::new();
         install_scope_bar_hosts(&state, ConnectionStatus::Connected);
         for host in ["host-a", "host-b"] {
@@ -9841,6 +9850,32 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
+        let label = native.closest("label").unwrap().unwrap();
+        let text = label.query_selector("span").unwrap().unwrap();
+        let input_rect = native.get_bounding_client_rect();
+        let text_rect = text.get_bounding_client_rect();
+        assert!(
+            text_rect.left() - input_rect.right() < 20.0,
+            "Engine text must sit beside its radio, not across the page"
+        );
+        assert!(
+            (text_rect.y() + text_rect.height() / 2.0 - input_rect.y() - input_rect.height() / 2.0)
+                .abs()
+                < 8.0
+        );
+        let details = container.query_selector("details").unwrap().unwrap();
+        assert!(!details.has_attribute("open"));
+        details
+            .query_selector("summary")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(
+            details.has_attribute("open"),
+            "Implementation details remain accessible"
+        );
         assert!(native.checked());
         assert!(!bubblewrap.disabled());
         assert!(
@@ -9984,6 +10019,7 @@ mod wasm_tests {
         assert!(!bubblewrap.disabled());
         drop(handle);
         container.remove();
+        style.remove();
     }
 
     // Signal-only: builds the form directly rather than mounting the settings
@@ -18008,6 +18044,16 @@ mod wasm_tests {
     async fn codex_global_settings_edit_and_reset_preserve_document() {
         let calls = install_settings_send_stub();
         let container = make_container();
+        let dom_document = web_sys::window().unwrap().document().unwrap();
+        let style = dom_document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        dom_document.head().unwrap().append_child(&style).unwrap();
+        container
+            .set_attribute("class", "settings-content")
+            .unwrap();
+        container
+            .set_attribute("style", "height: 240px; width: 640px; flex: none")
+            .unwrap();
         let state = AppState::new();
         let document = serde_json::json!({"version":"config-version", "values":{
             "model":"gpt-5.6-sol", "agents.max_concurrent_threads_per_session":3,
@@ -18046,6 +18092,28 @@ mod wasm_tests {
         assert_eq!(
             native_tab_labels(&container),
             vec!["Defaults", "Subagents", "Responses", "Memory", "Advanced"]
+        );
+
+        let defaults = native_tab_by_label(&container, "Defaults");
+        let before = defaults.get_bounding_client_rect();
+        container.set_scroll_top(100);
+        next_tick().await;
+        let scrolled = defaults.get_bounding_client_rect();
+        assert!(container.scroll_top() > 0, "Exercise an actual scrollport");
+        assert!(
+            (before.top() - scrolled.top() - f64::from(container.scroll_top())).abs() < 1.0,
+            "Backend tabs must scroll with the form, not cover model controls"
+        );
+        container.set_scroll_top(0);
+        next_tick().await;
+        let heading = container
+            .query_selector("h2")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            heading.top() >= container.get_bounding_client_rect().top(),
+            "The backend heading must be reachable without clipping"
         );
 
         // An unset boolean selects the default, naming the value in force,
@@ -18214,6 +18282,7 @@ mod wasm_tests {
             sent["settings"]["values"]["agents.max_concurrent_threads_per_session"].is_null(),
             "clearing one override must keep the earlier reset"
         );
+        style.remove();
     }
 
     /// A Ready snapshot renders each server-provided group with its current
@@ -20562,6 +20631,39 @@ mod wasm_tests {
             writes.last().unwrap()["value"]["target"]["kind"],
             "fork_current_agent"
         );
+        let switch = container
+            .query_selector("input[aria-label='Enable reviews']")
+            .unwrap()
+            .unwrap();
+        let switch_rect = switch
+            .closest("label")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            (switch_rect.width() - 36.0).abs() < 1.0 && (switch_rect.height() - 20.0).abs() < 1.0,
+            "Review enablement must render a full toggle switch"
+        );
+        let selected = container
+            .query_selector("[aria-label='Review mode'] button[aria-pressed='true']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.text_content().unwrap(), "Review team");
+        let unselected = find_button_by_text(&container, "Inline").unwrap();
+        let background = |element: &web_sys::Element| {
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap()
+        };
+        assert_ne!(
+            background(&selected),
+            background(unselected.unchecked_ref()),
+            "The server-selected mode must have a distinct visible surface"
+        );
         let modes = container
             .query_selector("[aria-label='Review mode']")
             .unwrap()
@@ -20846,6 +20948,10 @@ mod wasm_tests {
             SelfImprovementState,
         };
         let calls = install_settings_send_stub();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
         let state = AppState::new();
         let host = "learning-dom";
         // Connection routing is installed before bootstrap in the real app;
@@ -20892,6 +20998,31 @@ mod wasm_tests {
             "Selected connected scope must be editable"
         );
         assert!(state.selected_host_stream_untracked().is_some());
+        for name in [
+            "Enable self-improvement",
+            "Learn steering",
+            "Learn review aspects",
+        ] {
+            let input = container
+                .query_selector(&format!("input[aria-label='{name}']"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.get_attribute("role").as_deref(), Some("switch"));
+            let rect = input
+                .closest("label")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                (rect.width() - 36.0).abs() < 1.0 && (rect.height() - 20.0).abs() < 1.0,
+                "Every learning boolean must paint a toggle switch"
+            );
+        }
+        let selected = container
+            .query_selector("[aria-label='Self-improvement mode'] [aria-pressed='true']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.text_content().unwrap(), "Suggest");
         enabled.click();
         next_tick().await;
         let ops = recorded_settings_write_ops(&calls);
@@ -21074,5 +21205,6 @@ mod wasm_tests {
         assert!(find_button_by_text(&container, "Undo").is_none());
         drop(handle);
         container.remove();
+        style.remove();
     }
 }
