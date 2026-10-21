@@ -722,71 +722,153 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
     }
 }
 
-/// All account-limit buckets for a task backend. Tokens are rendered by the
-/// sibling usage region; this surface never derives quota from task usage.
-/// Known derived percentages share reported bars, marked as estimates; missing
-/// magnitudes never get a bar.
+fn task_bucket_priority(bucket: &CapacityBucket) -> (bool, u8, u8) {
+    let rejected = bucket.status == Some(CapacityBucketStatus::Rejected);
+    match bucket.measure {
+        CapacityMeasure::UsedPercent { used_percent, .. }
+        | CapacityMeasure::CreditUsage { used_percent, .. } => (rejected, 2, used_percent),
+        CapacityMeasure::ReportedWithoutMagnitude => (rejected, 1, 0),
+        CapacityMeasure::Credits { .. } => (rejected, 0, 0),
+    }
+}
+
+fn task_limit_view(bucket: &CapacityBucket, snapshot: &BackendCapacitySnapshot) -> AnyView {
+    let scope = match (&bucket.scope, &bucket.id) {
+        (CapacityScope::ModelFamily { name }, _) | (_, CapacityBucketId::ClaudeModel { name }) => {
+            name.clone()
+        }
+        _ => scope_text(&bucket.scope),
+    };
+    let window = match &bucket.window {
+        CapacityWindow::Rolling { duration_minutes } => format_window_minutes(*duration_minutes),
+        CapacityWindow::NotReported => bucket_label_text(bucket),
+    };
+    let qualifier = if matches!(
+        bucket.id,
+        CapacityBucketId::Claude {
+            limit: ClaudeLimitType::SevenDayOverageIncluded
+        }
+    ) {
+        " · overage included"
+    } else {
+        ""
+    };
+    let label = format!("{scope} · {window}{qualifier}");
+    let description = format!(
+        "{} · {} · {} · {}{}",
+        bucket_label_text(bucket),
+        bucket_vendor_id_text(&bucket.id),
+        scope_text(&bucket.scope),
+        window_text(&bucket.window),
+        bucket
+            .status
+            .map(|status| format!(" · {}", bucket_status_text(status)))
+            .unwrap_or_default()
+    );
+    let (track, value) = match bucket.measure {
+        CapacityMeasure::UsedPercent { used_percent, provenance, .. }
+        | CapacityMeasure::CreditUsage { used_percent, provenance, .. } => {
+            let estimate = if provenance.vendor_reported { "" } else { "~" };
+            let provenance_label = if provenance.vendor_reported { "vendor reported" } else { "estimated, derived" };
+            (
+                view! {
+                    <span class="task-limit-track" class:task-limit-high={used_percent >= 90} role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                        aria-valuenow=used_percent aria-valuetext=format!("{estimate}{used_percent}% used · {provenance_label}")
+                        aria-label=format!("{} · {provenance_label}", bucket_aria_label(bucket, used_percent))>
+                        <span class="task-limit-fill" style=format!("width: {used_percent}%")></span>
+                    </span>
+                }.into_any(),
+                view! { <span class="task-limit-value" title=provenance_label>{format!("{estimate}{used_percent}%")}</span> }.into_any(),
+            )
+        }
+        CapacityMeasure::ReportedWithoutMagnitude => (
+            ().into_any(), view! { <span class="task-limit-note">"Usage not reported"</span> }.into_any(),
+        ),
+        CapacityMeasure::Credits { has_credits, unlimited, .. } => (
+            ().into_any(), view! { <span class="task-limit-note">{if unlimited { "Unlimited credits" } else if has_credits { "Credits available" } else { "No credits available" }}</span> }.into_any(),
+        ),
+    };
+    let reset = match bucket.reset {
+        CapacityReset::At { at_ms } => view! { <span class="task-limit-reset" title=format!("Resets at {}", format_absolute_utc(at_ms)) aria-label=format_reset_relative(at_ms, snapshot.retrieved_at_ms.saturating_add(match snapshot.freshness { CapacityFreshness::Fresh { age_ms } | CapacityFreshness::Stale { age_ms, .. } => age_ms }))>{format_reset_relative(at_ms, snapshot.retrieved_at_ms.saturating_add(match snapshot.freshness { CapacityFreshness::Fresh { age_ms } | CapacityFreshness::Stale { age_ms, .. } => age_ms })).trim_start_matches("resets in ").replace("under a minute", "<1m")}</span> }.into_any(),
+        CapacityReset::NotReported => view! { <span class="task-limit-reset">"Reset unknown"</span> }.into_any(),
+    };
+    view! { <div class="task-limit" title=description.clone()>
+        <span class="task-limit-label" aria-label=description.clone()>{label}</span>
+        {track}<span class="task-limit-meta">{value}{reset}</span>
+    </div> }
+    .into_any()
+}
+
+/// Prioritize an explicitly rejected limit, then the highest reported usage.
+/// Ties retain report order. Disclosure preserves every other reported bucket.
 #[component]
 pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl IntoView {
+    use crate::components::task_usage::UsageInfo;
     let state = expect_context::<AppState>();
+    let snapshot = Memo::new(move |_| {
+        state.backend_capacity.with(|hosts| {
+            hosts
+                .get(&host_id)
+                .and_then(|kinds| kinds.get(&backend_kind))
+                .cloned()
+        })
+    });
+    let priority = Memo::new(move |_| {
+        snapshot.get().and_then(|snapshot| {
+            state_report(&snapshot.state).and_then(|report| {
+                report
+                    .buckets
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(index, bucket)| {
+                        (task_bucket_priority(bucket), std::cmp::Reverse(*index))
+                    })
+                    .map(|(index, _)| index)
+            })
+        })
+    });
+    let other_count = Memo::new(move |_| {
+        snapshot
+            .get()
+            .and_then(|snapshot| {
+                state_report(&snapshot.state).map(|report| report.buckets.len().saturating_sub(1))
+            })
+            .unwrap_or(0)
+    });
     view! {
-        <div class="task-capacity-limits" role="group"
-            aria-label=format!("{} account limits", backend_label(backend_kind))>
-            {move || {
-                let snapshot = state.backend_capacity.with(|hosts| hosts.get(&host_id).and_then(|kinds| kinds.get(&backend_kind)).cloned());
-                let Some(snapshot) = snapshot else {
-                    return view! { <span class="task-limit-note">"Limits not reported"</span> }.into_any();
-                };
-                let Some(report) = state_report(&snapshot.state) else {
-                    return view! { <span class="task-limit-note" title=state_explanation(&snapshot.state, backend_kind)>{state_headline(&snapshot.state, backend_kind)}</span> }.into_any();
-                };
-                let stale = matches!(snapshot.state, BackendCapacityState::Stale { .. });
-                let buckets = report.buckets.iter().filter(|bucket| !matches!(bucket.measure, CapacityMeasure::Credits { .. })).map(|bucket| {
-                    let family = match (&bucket.scope, &bucket.id) {
-                        (CapacityScope::ModelFamily { name }, _) | (_, CapacityBucketId::ClaudeModel { name }) => format!("{name} "),
-                        (CapacityScope::Workspace, _) => "Workspace ".to_owned(),
-                        (CapacityScope::Individual, _) => "Individual ".to_owned(),
-                        (CapacityScope::OrganizationSpend, _) => "Org ".to_owned(),
-                        (CapacityScope::NotReported | CapacityScope::Account, _) => String::new(),
+        <div class="task-capacity-limits" role="group" aria-label=format!("{} account limits", backend_label(backend_kind))>
+            <div class="task-limit-primary">
+                {move || {
+                    let Some(snapshot) = snapshot.get() else {
+                        return view! { <span class="task-limit-note">"Limits not reported"</span> }.into_any();
                     };
-                    let qualifier = if matches!(bucket.id, CapacityBucketId::Claude { limit: ClaudeLimitType::SevenDayOverageIncluded }) { "Overage " } else { "" };
-                    let label = match &bucket.window {
-                        CapacityWindow::Rolling { duration_minutes } => format!("{family}{qualifier}{}", format_window_minutes(*duration_minutes)),
-                        CapacityWindow::NotReported => bucket_label_text(bucket),
+                    let Some(report) = state_report(&snapshot.state) else {
+                        return view! { <span class="task-limit-note" tabindex="0" title=state_explanation(&snapshot.state, backend_kind)>{state_headline(&snapshot.state, backend_kind)}</span> }.into_any();
                     };
-                    let description = format!("{} · {} · {} · {}", bucket_label_text(bucket), bucket_vendor_id_text(&bucket.id), scope_text(&bucket.scope), window_text(&bucket.window));
-                    let measure = match bucket.measure {
-                        CapacityMeasure::UsedPercent { used_percent, provenance, .. }
-                        | CapacityMeasure::CreditUsage { used_percent, provenance, .. } => {
-                            let estimate = if provenance.vendor_reported { "" } else { "~" };
-                            let provenance_label = if provenance.vendor_reported { "reported" } else { "estimated, derived" };
-                            view! {
-                                <span class="task-limit-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
-                                    aria-valuenow=used_percent aria-valuetext=format!("{estimate}{used_percent}% used · {provenance_label}")
-                                    aria-label=format!("{} · {provenance_label}", bucket_aria_label(bucket, used_percent))>
-                                    <span class="task-limit-fill" style=format!("width: {used_percent}%")></span>
-                                    <span class="task-limit-value">{format!("{estimate}{used_percent}%")}</span>
-                                </span>
-                            }.into_any()
-                        }
-                        CapacityMeasure::ReportedWithoutMagnitude => view! { <span class="task-limit-note">"Usage not reported"</span> }.into_any(),
-                        CapacityMeasure::Credits { .. } => ().into_any(),
-                    };
-                    let reset = match bucket.reset {
-                        CapacityReset::At { at_ms } => view! { <span class="task-limit-reset" title=format_absolute_utc(at_ms)>{format_reset_relative(at_ms, snapshot.retrieved_at_ms.saturating_add(match snapshot.freshness { CapacityFreshness::Fresh { age_ms } | CapacityFreshness::Stale { age_ms, .. } => age_ms })).trim_start_matches("resets in ").replace("under a minute", "<1m")}</span> }.into_any(),
-                        CapacityReset::NotReported => view! { <span class="task-limit-reset">"Reset not reported"</span> }.into_any(),
-                    };
-                    view! { <span class="task-limit" title=description.clone()>
-                        <span class="task-limit-label" aria-label=description.clone()>{label}</span>{measure}{reset}
-                    </span> }
-                }).collect_view();
-                view! {
-                    <div class="task-limit-buckets">{buckets}</div>
-                    <span class="task-limit-freshness" title=format!("{} · {}", freshness_text(&snapshot.freshness), coverage_text(report.coverage, backend_kind))>{format!("{}reported {}", if stale { "Stale · " } else { "" }, format_age(match snapshot.freshness { CapacityFreshness::Fresh { age_ms } | CapacityFreshness::Stale { age_ms, .. } => age_ms }))}</span>
-                    {(report.coverage == CapacityCoverage::RepresentativeBucketOnly).then(|| view! { <span class="task-limit-note task-limit-partial" tabindex="0" title="Only the binding limit reported; other limits unknown">"Other limits unknown"</span> })}
-                    {report.buckets.iter().all(|bucket| matches!(bucket.measure, CapacityMeasure::Credits { .. })).then(|| view! { <span class="task-limit-note">"Subscription limits not reported"</span> })}
-                }.into_any()
-            }}
+                    match priority.get() {
+                        Some(index) => task_limit_view(&report.buckets[index], &snapshot),
+                        None => view! { <span class="task-limit-note">"Limits not reported"</span> }.into_any(),
+                    }
+                }}
+            </div>
+            <Show when=move || { other_count.get() > 0 }>
+                <details class="task-limit-others">
+                    <summary aria-label=move || format!("Show {} other reported {} limits", other_count.get(), backend_label(backend_kind)) title="Other reported limits"><span>{move || format!("+{}", other_count.get())}</span></summary>
+                    <div class="task-limit-buckets">
+                        {move || snapshot.get().and_then(|snapshot| state_report(&snapshot.state).map(|report| report.buckets.iter().enumerate().filter(|(index, _)| Some(*index) != priority.get()).map(|(_, bucket)| task_limit_view(bucket, &snapshot)).collect_view()))}
+                    </div>
+                </details>
+            </Show>
+            <div class="task-limit-context">
+                {move || snapshot.get().and_then(|snapshot| state_report(&snapshot.state).map(|report| {
+                    let stale = matches!(snapshot.state, BackendCapacityState::Stale { .. });
+                    let partial = report.coverage == CapacityCoverage::RepresentativeBucketOnly;
+                    let detail = format!("{} · {} {} Prioritizes a rejected limit, then the highest usage percentage; ties follow report order. Model-family limits apply only to the named family.", freshness_text(&snapshot.freshness), coverage_text(report.coverage, backend_kind), state_explanation(&snapshot.state, backend_kind).unwrap_or_default());
+                    view! {
+                        {(stale || partial).then(|| view! { <UsageInfo label=match (stale, partial) { (true, true) => "Stale · other limits unknown", (true, false) => "Stale", (false, true) => "Other limits unknown", (false, false) => "" }.to_owned() detail=detail.clone() /> })}
+                    }
+                }))}
+            </div>
         </div>
     }
 }

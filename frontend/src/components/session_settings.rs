@@ -815,41 +815,34 @@ fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) 
     (input, Some(output))
 }
 
-fn task_detail_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) {
-    (
-        format!(
-            "↑{} (cached {})",
-            task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens),
-            task_number(
-                amount,
-                TaskTokenUsageField::CachedPrompt,
-                amount.cached_prompt_tokens
-            )
-        ),
-        Some(format!(
-            "↓{} (reasoning {})",
-            task_number(amount, TaskTokenUsageField::Output, amount.output_tokens),
-            task_number(
-                amount,
-                TaskTokenUsageField::Reasoning,
-                amount.reasoning_tokens
-            )
-        )),
-    )
+pub(super) fn task_detail_tokens(amount: &TaskTokenUsageAmount) -> AnyView {
+    let prompt = task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens);
+    let cached = task_number(
+        amount,
+        TaskTokenUsageField::CachedPrompt,
+        amount.cached_prompt_tokens,
+    );
+    let output = task_number(amount, TaskTokenUsageField::Output, amount.output_tokens);
+    let reasoning = task_number(
+        amount,
+        TaskTokenUsageField::Reasoning,
+        amount.reasoning_tokens,
+    );
+    view! {
+        <span class="token-stat token-stat-input">{format!("↑{prompt}")}<span class="task-token-detail">{format!(" (cached {cached})")}</span></span>
+        <span class="token-stat token-stat-output">{format!("↓{output}")}<span class="task-token-detail">{format!(" (reasoning {reasoning})")}</span></span>
+    }.into_any()
 }
 
 pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
     match scope {
         TaskTokenUsageScope::Known { usage } => {
-            let (input_text, output_text) = task_detail_texts(usage);
+            let tokens = task_detail_tokens(usage);
             view! {
                 <span class="session-task-row-usage">
-                    <span class="token-stat token-stat-input">{input_text}</span>
-                    {output_text.map(|text| view! {
-                        <span class="token-stat token-stat-output">{text}</span>
-                    })}
+                    {tokens}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
-                    {(!usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial" title="≥ marks the reported subtotal; some contributing usage has no breakdown for that field">"partial breakdown"</span> })}
+                    {(!usage.partial_fields.is_empty()).then(|| view! { <crate::components::task_usage::UsageInfo label="partial breakdown".to_owned() detail="≥ marks the reported subtotal; some contributing usage has no breakdown for that field. — means unreported, not zero.".to_owned() /> })}
                 </span>
             }
             .into_any()
@@ -859,16 +852,13 @@ pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
             unavailable_count,
             ..
         } => {
-            let (input_text, output_text) = task_detail_texts(usage);
+            let tokens = task_detail_tokens(usage);
             let marker = format!("partial \u{b7} {unavailable_count} unreported");
             view! {
                 <span class="session-task-row-usage">
-                    <span class="token-stat token-stat-input">{input_text}</span>
-                    {output_text.map(|text| view! {
-                        <span class="token-stat token-stat-output">{text}</span>
-                    })}
+                    {tokens}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
-                    {(!usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial" title="≥ marks the reported subtotal; some contributing usage has no breakdown for that field">"partial breakdown"</span> })}
+                    {(!usage.partial_fields.is_empty()).then(|| view! { <crate::components::task_usage::UsageInfo label="partial breakdown".to_owned() detail="≥ marks the reported subtotal; some contributing usage has no breakdown for that field. — means unreported, not zero.".to_owned() /> })}
                     <span class="session-task-status session-task-status-partial">
                         {marker}
                     </span>
@@ -2392,7 +2382,7 @@ mod wasm_tests {
         );
         let popover_text = popover.text_content().unwrap_or_default();
         assert!(
-            popover_text.contains("By backend"),
+            popover_text.contains("Task usage"),
             "the compact task popup must aggregate by backend"
         );
         assert!(
@@ -2540,13 +2530,20 @@ mod wasm_tests {
                 && text.contains("↓50"),
             "An analyzer-only backend keeps its usage without becoming an agent"
         );
+        // Compact rows show the batch count; the allocation explanation is
+        // disclosed in expanded Overview, not repeated in the compact popup.
+        expand_usage(&container, "Overview").await;
+        let analyzer_coverage = query(&container, ".task-timing-coverage").unwrap();
+        query(&analyzer_coverage, "summary").unwrap().click();
+        next_tick().await;
         assert!(
-            query(&container, ".session-task-popover")
-                .unwrap()
-                .text_content()
-                .unwrap()
-                .contains("not per-task allocations")
+            analyzer_coverage.inner_text().contains(
+                "Shared batches are source scopes, not per-task allocations or additional agents"
+            ),
+            "the disclosed analyzer explanation must distinguish source scopes from task allocations"
         );
+        query(&container, ".task-usage-back").unwrap().click();
+        next_tick().await;
         let mut mixed = partial_rollup("root", 2_000, 200);
         let mut codex_amount = known_amount(2_000, 200);
         codex_amount.input_tokens = Some(1_000);
@@ -2811,6 +2808,13 @@ mod wasm_tests {
         week.window = protocol::CapacityWindow::Rolling {
             duration_minutes: 10_080,
         };
+        week.measure = protocol::CapacityMeasure::UsedPercent {
+            used_percent: 97,
+            remaining_percent: 3,
+            provenance: protocol::ValueProvenance {
+                vendor_reported: true,
+            },
+        };
         report.buckets.push(week);
         let mut gemini = claude.clone();
         gemini.backend_kind = BackendKind::Antigravity;
@@ -2833,6 +2837,29 @@ mod wasm_tests {
                 },
             };
         }
+        let mut argon = report.buckets[1].clone();
+        argon.id = protocol::CapacityBucketId::Antigravity {
+            bucket: "argon-weekly".to_owned(),
+        };
+        argon.scope = protocol::CapacityScope::ModelFamily {
+            name: "Gemini 4 Argon".to_owned(),
+        };
+        argon.measure = protocol::CapacityMeasure::UsedPercent {
+            used_percent: 100,
+            remaining_percent: 0,
+            provenance: protocol::ValueProvenance {
+                vendor_reported: false,
+            },
+        };
+        report.buckets.push(argon);
+        let mut third_party = report.buckets[1].clone();
+        third_party.id = protocol::CapacityBucketId::Antigravity {
+            bucket: "third-party-weekly".to_owned(),
+        };
+        third_party.scope = protocol::CapacityScope::ModelFamily {
+            name: "Claude and GPT models".to_owned(),
+        };
+        report.buckets.push(third_party);
         let mut unknown = report.buckets[0].clone();
         unknown.id = protocol::CapacityBucketId::Antigravity {
             bucket: "unreported-magnitude".to_owned(),
@@ -2860,12 +2887,34 @@ mod wasm_tests {
         };
         family.label = "Fable limit".to_owned();
         report.buckets.push(family);
+        let mut codex = claude.clone();
+        codex.backend_kind = BackendKind::Codex;
+        let protocol::BackendCapacityState::Known { report } = &mut codex.state else {
+            unreachable!()
+        };
+        report.source = protocol::CapacitySource::CodexAccountRateLimitsUpdated;
+        report.buckets.truncate(1);
+        report.buckets[0].id = protocol::CapacityBucketId::Codex {
+            slot: protocol::CodexLimitSlot::Primary,
+        };
+        let mut credits = report.buckets[0].clone();
+        credits.id = protocol::CapacityBucketId::Codex {
+            slot: protocol::CodexLimitSlot::Credits,
+        };
+        credits.label = "credits".to_owned();
+        credits.window = protocol::CapacityWindow::NotReported;
+        credits.measure = protocol::CapacityMeasure::Credits {
+            has_credits: true,
+            unlimited: true,
+            balance: Some("12345.6789".to_owned()),
+        };
+        report.buckets.push(credits);
         let capacity = Envelope::from_payload(
             StreamPath("/host/h-task-expanded".to_owned()),
             FrameKind::BackendCapacity,
             2,
             &protocol::BackendCapacityPayload {
-                snapshots: vec![claude, gemini],
+                snapshots: vec![claude, gemini, codex],
             },
         )
         .unwrap();
@@ -2885,6 +2934,7 @@ mod wasm_tests {
         next_tick().await;
         let badge = query(&container, ".session-task-toggle").unwrap();
         let original = badge.text_content().unwrap();
+        let footer_before = badge.get_bounding_client_rect();
         assert!(
             original.contains("↑86.0K")
                 && original.contains("including 87 agents")
@@ -2914,33 +2964,46 @@ mod wasm_tests {
             8,
             "one flat row per backend, never 87 agent cards"
         );
-        // Approved product change: derived numeric quotas now share bars.
-        // The old vendor-only assertion rejected this intended rendering;
-        // estimate labels and magnitude-less buckets remain checked below.
+        let visible =
+            js_sys::Function::new_with_args("element", "return element.checkVisibility();");
+        let tracks = container.query_selector_all(".task-limit-track").unwrap();
+        let visible_tracks = (0..tracks.length())
+            .filter(|index| {
+                visible
+                    .call1(&wasm_bindgen::JsValue::NULL, &tracks.item(*index).unwrap())
+                    .unwrap()
+                    .as_bool()
+                    == Some(true)
+            })
+            .count();
         assert_eq!(
-            container
-                .query_selector_all(".task-limit-track")
-                .unwrap()
-                .length(),
-            5,
-            "every known numeric limit gets a track, including derived estimates"
+            visible_tracks, 3,
+            "only one priority quota per reporting backend is visible initially"
         );
         let claude = query(&container, "article[aria-label=Claude]").unwrap();
         let gemini = query(&container, "article[aria-label=Antigravity]").unwrap();
         assert!(
-            claude.text_content().unwrap().contains("5h")
-                && claude.text_content().unwrap().contains("7d")
-                && claude.text_content().unwrap().contains("Fable 7d")
+            query(&claude, ".task-limit-primary")
+                .unwrap()
+                .inner_text()
+                .contains("account · 7d")
         );
         assert!(
-            gemini.text_content().unwrap().contains("Gemini 5h")
-                && gemini.text_content().unwrap().contains("Gemini 7d")
-                && gemini.text_content().unwrap().contains("~2%")
+            query(&claude, ".task-limit-primary")
+                .unwrap()
+                .inner_text()
+                .contains("97%")
         );
-        let estimate = query(&gemini, "[role=progressbar]").unwrap();
+        assert!(
+            query(&gemini, ".task-limit-primary")
+                .unwrap()
+                .inner_text()
+                .contains("Gemini 4 Argon · 7d")
+        );
+        let estimate = query(&gemini, ".task-limit-primary [role=progressbar]").unwrap();
         assert_eq!(
             estimate.get_attribute("aria-valuenow").as_deref(),
-            Some("2")
+            Some("100")
         );
         assert!(
             estimate
@@ -2949,43 +3012,135 @@ mod wasm_tests {
                 .contains("estimated, derived")
         );
         assert_eq!(
+            query(&gemini, ".task-limit-others summary")
+                .unwrap()
+                .inner_text(),
+            "+4"
+        );
+        let disclosure = query(&gemini, ".task-limit-others summary").unwrap();
+        disclosure.focus().unwrap();
+        disclosure.click();
+        query(&claude, ".task-limit-others summary")
+            .unwrap()
+            .click();
+        query(
+            &container,
+            "article[aria-label=Codex] .task-limit-others summary",
+        )
+        .unwrap()
+        .click();
+        next_tick().await;
+        let disclosed = query(&gemini, ".task-limit-buckets").unwrap();
+        assert!(
+            disclosed.inner_text().contains("Gemini · 5h")
+                && disclosed.inner_text().contains("Gemini · 7d")
+                && disclosed
+                    .inner_text()
+                    .contains("Claude and GPT models · 7d")
+                && disclosed.inner_text().contains("Unknown magnitude")
+                && disclosed.inner_text().contains("Usage not reported")
+        );
+        assert_eq!(
             gemini
                 .query_selector_all("[role=progressbar]")
                 .unwrap()
                 .length(),
-            2
+            4,
+            "unknown magnitudes never get fake zero bars"
         );
+        assert!(claude.inner_text().contains("Fable · 7d"));
+        let codex = query(&container, "article[aria-label=Codex]").unwrap();
         assert!(
-            gemini
-                .text_content()
-                .unwrap()
-                .contains("Usage not reported"),
-            "unknown magnitude stays explicit and never becomes a zero-percent bar"
+            codex.inner_text().contains("Unlimited credits")
+                && !codex.text_content().unwrap().contains("12345.6789")
         );
-        let freshness = query(&gemini, ".task-limit-freshness").unwrap();
-        assert_eq!(freshness.text_content().unwrap(), "Stale · reported 2h ago");
+        let stale = query(&gemini, ".task-limit-context [role=note]").unwrap();
+        assert_eq!(stale.get_attribute("tabindex").as_deref(), Some("0"));
         assert!(
-            freshness
-                .get_attribute("title")
+            stale
+                .get_attribute("aria-label")
                 .unwrap()
-                .contains("past the 1h freshness threshold"),
-            "compact freshness retains its full source-age explanation in details"
+                .contains("past the 1h freshness threshold")
         );
-        let label = query(&claude, ".task-limit-label")
+        let label = query(&claude, ".task-limit-primary .task-limit-label")
             .unwrap()
             .get_bounding_client_rect();
-        let track = query(&claude, ".task-limit-track")
+        let track = query(&claude, ".task-limit-primary .task-limit-track")
             .unwrap()
             .get_bounding_client_rect();
         assert!(
-            label.right() <= track.left(),
-            "limit label remains outside the matte track"
+            label.bottom() <= track.top(),
+            "plain scope/window label sits above the quiet rounded track"
+        );
+        let first_track = query(&claude, ".task-limit-primary .task-limit-track")
+            .unwrap()
+            .get_bounding_client_rect();
+        let second_track = query(&gemini, ".task-limit-primary .task-limit-track")
+            .unwrap()
+            .get_bounding_client_rect();
+        assert_eq!(
+            first_track.left(),
+            second_track.left(),
+            "priority bars align across backend rows"
+        );
+        let icon = claude
+            .query_selector(".launch-backend-icon")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            icon.width() <= 16.0 && icon.height() <= 16.0,
+            "reuse tiny authentic provider artwork"
+        );
+        assert_eq!(
+            badge.text_content().unwrap(),
+            original,
+            "popup disclosure does not replace or change footer figures"
+        );
+        let footer_after = badge.get_bounding_client_rect();
+        assert_eq!(
+            (footer_before.left(), footer_before.top()),
+            (footer_after.left(), footer_after.top())
+        );
+        let mut refreshed = state.backend_capacity.get_untracked()["h-task-expanded"]
+            [&BackendKind::Antigravity]
+            .clone();
+        let protocol::BackendCapacityState::Stale { report, .. } = &mut refreshed.state else {
+            unreachable!()
+        };
+        report.buckets[2].measure = protocol::CapacityMeasure::UsedPercent {
+            used_percent: 99,
+            remaining_percent: 1,
+            provenance: protocol::ValueProvenance {
+                vendor_reported: false,
+            },
+        };
+        let frame = Envelope::from_payload(
+            StreamPath("/host/h-task-expanded".to_owned()),
+            FrameKind::BackendCapacity,
+            3,
+            &protocol::BackendCapacityPayload {
+                snapshots: vec![refreshed],
+            },
+        )
+        .unwrap();
+        crate::dispatch::dispatch_envelope(&state, "h-task-expanded", frame);
+        next_tick().await;
+        assert!(
+            disclosure.is_connected() && disclosure.parent_element().unwrap().has_attribute("open"),
+            "live quota updates preserve open disclosure and its focusable summary"
+        );
+        assert!(
+            query(&gemini, ".task-limit-primary")
+                .unwrap()
+                .inner_text()
+                .contains("~99%")
         );
         let summary_node = query(&container, ".task-backend-drilldown").unwrap();
         let mut update = rollup.clone();
         update.backends[0].total.usage.input_tokens = Some(999_000);
         update.backends[0].total.usage.prompt_tokens = Some(999_000);
-        dispatch_task_usage(&state, "h-task-expanded", 3, &update);
+        dispatch_task_usage(&state, "h-task-expanded", 4, &update);
         next_tick().await;
         assert!(
             query(&container, "article[aria-label=Claude]")
@@ -3092,7 +3247,7 @@ mod wasm_tests {
         update.timing.spans[0].span.observed_through_ms = 6_100;
         update.timing.observed_end_ms = Some(6_100);
         update.timing.summed_tool_ms = 5_100;
-        dispatch_task_usage(&state, "h-task-expanded", 4, &update);
+        dispatch_task_usage(&state, "h-task-expanded", 5, &update);
         next_tick().await;
         assert!(
             expansion.is_connected() && operation.is_connected(),
@@ -3753,8 +3908,13 @@ mod wasm_tests {
 
         let capacity = query(&container, ".task-capacity-limits")
             .expect("the popup carries the compact capacity row");
-        let task_rows = query(&container, "[aria-label=\"Claude task token usage\"]")
-            .expect("the popup carries the task breakdown");
+        // The compact group now names all four components; exact-matching
+        // the former shorter label misses the existing rendered region.
+        let task_rows = query(
+            &container,
+            "[aria-label=\"Claude task token usage: input, cached input, output and reasoning\"]",
+        )
+        .expect("the popup carries the explicitly labelled four-component task breakdown");
 
         // Two distinct labelled regions, neither nested in the other.
         assert_eq!(capacity.get_attribute("role").as_deref(), Some("group"));
@@ -3796,13 +3956,47 @@ mod wasm_tests {
 
         // The rendered concise notice says "Other limits unknown"; requiring
         // the old verbose copy rejects the requested UI, not missing coverage.
-        let coverage_notice = query(&capacity, ".task-limit-partial").unwrap();
+        let coverage_notice = query(&capacity, ".task-limit-context [role=note]").unwrap();
         assert_eq!(coverage_notice.inner_text(), "Other limits unknown");
         assert!(coverage_notice.get_bounding_client_rect().height() > 0.0);
-        assert_eq!(
-            coverage_notice.get_attribute("title").as_deref(),
-            Some("Only the binding limit reported; other limits unknown"),
-            "representative coverage retains the binding-only provenance"
+        assert!(
+            coverage_notice
+                .get_attribute("aria-label")
+                .unwrap()
+                .contains("only the limit that is currently binding"),
+            "representative coverage retains the binding-only provenance for assistive technology"
+        );
+        coverage_notice.focus().unwrap();
+        next_tick().await;
+        let tooltip = query(&coverage_notice, "[role=tooltip]").unwrap();
+        let tooltip_rect = tooltip.get_bounding_client_rect();
+        let popup_rect = query(&container, ".session-task-popover")
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            tooltip_rect.height() > 0.0
+                && tooltip_rect.left() >= popup_rect.left()
+                && tooltip_rect.right() <= popup_rect.right()
+                && tooltip_rect.top() >= popup_rect.top()
+                && tooltip_rect.bottom() <= popup_rect.bottom(),
+            "the complete keyboard explanation stays inside the visible popup, including the rightmost quota column"
+        );
+        let document = web_sys::window().unwrap().document().unwrap();
+        let hit = document
+            .element_from_point(
+                (tooltip_rect.left() + tooltip_rect.width() / 2.0) as f32,
+                (tooltip_rect.top() + tooltip_rect.height() / 2.0) as f32,
+            )
+            .unwrap();
+        assert!(
+            tooltip.contains(Some(&hit)),
+            "the explanation is actually painted and not clipped by the scrolling body"
+        );
+        tooltip.focus().unwrap();
+        next_tick().await;
+        assert!(
+            tooltip.get_bounding_client_rect().height() > 0.0,
+            "long explanations remain available when focus enters their scrollable text"
         );
 
         // Passive sources: nothing to refresh, so no refresh control.

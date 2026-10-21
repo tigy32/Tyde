@@ -2,8 +2,7 @@ use std::collections::HashSet;
 
 use leptos::prelude::*;
 use protocol::{
-    BackendKind, TaskTimingCategory, TaskTimingState, TaskTokenUsagePayload, TaskTokenUsageScope,
-    TaskTokenUsageStatus,
+    BackendKind, TaskTimingCategory, TaskTimingState, TaskTokenUsagePayload, TaskTokenUsageStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -37,13 +36,59 @@ fn status_text(status: &TaskTokenUsageStatus) -> String {
     }
 }
 
-fn aggregate_view(total: &protocol::TaskTokenUsageAggregate) -> AnyView {
-    match &total.status {
-        TaskTokenUsageStatus::Unavailable { reasons, .. } => view! {
-            <span class="session-task-row-unavailable">{format!("Usage not reported · {}", reasons.iter().map(|reason| task_usage_unavailable_text(*reason)).collect::<Vec<_>>().join(", "))}</span>
-        }.into_any(),
-        _ => task_scope_view(&TaskTokenUsageScope::Known { usage: Box::new(total.usage.clone()) }),
+#[component]
+pub(super) fn UsageInfo(label: String, detail: String) -> impl IntoView {
+    view! {
+        <span class="task-usage-info" tabindex="0" role="note" aria-label=detail.clone() title=detail.clone()>
+            <span aria-hidden="true">{label}</span>
+            <span class="task-usage-tooltip" role="tooltip" tabindex="0">{detail.clone()}</span>
+        </span>
     }
+}
+
+fn aggregate_view(total: &protocol::TaskTokenUsageAggregate) -> AnyView {
+    let tokens = match total.status {
+        TaskTokenUsageStatus::Unavailable { .. } => view! {
+            <span class="token-stat token-stat-input">"↑—"<span class="task-token-detail">" (cached —)"</span></span>
+            <span class="token-stat token-stat-output">"↓—"<span class="task-token-detail">" (reasoning —)"</span></span>
+        }.into_any(),
+        _ => crate::components::session_settings::task_detail_tokens(&total.usage),
+    };
+    let combined = (total.usage.prompt_tokens.is_none()
+        && total.usage.output_tokens.is_none()
+        && !matches!(total.status, TaskTokenUsageStatus::Unavailable { .. }))
+    .then(|| {
+        format!(
+            "Reported combined: {} · input/output unreported",
+            crate::components::chat_message::format_compact(total.usage.total_tokens)
+        )
+    });
+    view! { <span class="session-task-row-usage">{tokens}{combined.map(|text| view! { <span>{text}</span> })}</span> }.into_any()
+}
+
+fn usage_coverage(total: &protocol::TaskTokenUsageAggregate) -> Option<String> {
+    let partial_fields = !total.usage.partial_fields.is_empty();
+    if matches!(total.status, TaskTokenUsageStatus::Known) && !partial_fields {
+        return None;
+    }
+    let mut text = status_text(&total.status);
+    if partial_fields {
+        text.push_str(
+            " · partial breakdown: ≥ marks reported component subtotals, not complete totals",
+        );
+    }
+    match &total.status {
+        TaskTokenUsageStatus::Partial { reasons, .. }
+        | TaskTokenUsageStatus::Unavailable { reasons, .. } => {
+            for reason in reasons {
+                text.push_str(" · ");
+                text.push_str(task_usage_unavailable_text(*reason));
+            }
+        }
+        TaskTokenUsageStatus::Known => {}
+    }
+    text.push_str(". — means unreported, not zero.");
+    Some(text)
 }
 
 fn availability(value: protocol::TimingAvailability) -> &'static str {
@@ -106,10 +151,11 @@ pub(super) fn TaskUsagePopup(
         <section class="session-task-popover" class:task-usage-expanded=move || expanded.get()
             role="dialog" aria-label="Task usage" aria-modal="false">
             <header class="task-usage-heading">
-                <h2 node_ref=heading tabindex="-1">{move || if expanded.get() { "Task usage" } else { "By backend" }}</h2>
-                <span class="task-usage-scope">"Current root agent + descendants"</span>
+                <h2 node_ref=heading tabindex="-1">"Task usage"</h2>
+                <span class="task-usage-count" title="Current root agent and retained descendants">{move || rollup.get().map(|payload| format!("{} agent{}", payload.breakdown.len(), if payload.breakdown.len() == 1 { "" } else { "s" }))}</span>
+                {move || rollup.get().and_then(|payload| usage_coverage(&payload.total).map(|detail| view! { <UsageInfo label=if matches!(payload.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Partial" }.to_owned() detail=detail /> }))}
                 <Show when=move || !expanded.get()>
-                    <button class="task-usage-expand" on:click=move |_| expanded.set(true)>"Expand ↗"</button>
+                    <button class="task-usage-expand" aria-label="Expand task usage" title="Expand task usage" on:click=move |_| expanded.set(true)>"↗"</button>
                 </Show>
                 <Show when=move || expanded.get()>
                     <button class="task-usage-back" on:click=move |_| expanded.set(false)>"← Back"</button>
@@ -139,15 +185,15 @@ pub(super) fn TaskUsagePopup(
                     })}
                 </div>
             </Show>
-            <div class="task-usage-summary">
-                <Show when=move || expanded.get()>{move || rollup.get().map(|payload| aggregate_view(&payload.total))}</Show>
+            <Show when=move || expanded.get()><div class="task-usage-summary">
+                {move || rollup.get().map(|payload| aggregate_view(&payload.total))}
                 {move || rollup.get().map(|payload| view! {
                     <span>{format!("{} agent{} · {} backend{}", payload.breakdown.len(), if payload.breakdown.len() == 1 { "" } else { "s" }, payload.backends.len(), if payload.backends.len() == 1 { "" } else { "s" })}</span>
                     <span class="session-task-popover-status">{status_text(&payload.total.status)}</span>
                 })}
-            </div>
+            </div></Show>
             <div class="task-usage-body" id=move || panel_id.get() role="tabpanel" aria-label=move || match tab.get() { UsageTab::Overview => "Overview", UsageTab::Time => "Time breakdown", UsageTab::Agents => "Agents" }>
-                {move || rollup.get().and_then(|payload| (!payload.helper_usage.is_empty()).then(|| view! {
+                {move || rollup.get().and_then(|payload| (expanded.get() && !payload.helper_usage.is_empty()).then(|| view! {
                     <details class="task-timing-coverage"><summary>{format!("{} analyzer batches", payload.helper_usage.len())}</summary><p>"Grouped by reported backend. Shared batches are source scopes, not per-task allocations or additional agents; their timing is unobserved."</p></details>
                 }))}
                 <Show when=move || !expanded.get() || tab.get() == UsageTab::Overview>
@@ -254,10 +300,12 @@ fn TaskBackendRow(
     view! {
         <article class="task-backend-row" aria-label=backend_label(kind)>
             <div class="task-backend-token-row">
-                <button class="task-backend-drilldown" on:click=move |_| drilldown.run(kind)>{crate::components::launch_menu::backend_icon(kind)}{backend_label(kind)}<span>{move || group.get().map(|group| format!(" · {} agent{} ›", group.agent_count, if group.agent_count == 1 { "" } else { "s" }))}</span></button>
-                <div role="group" aria-label=format!("{} task token usage", backend_label(kind))>{move || group.get().map(|group| aggregate_view(&group.total))}</div>
+                <div class="task-backend-name">
+                    <button class="task-backend-drilldown" aria-label=format!("Show {} agents", backend_label(kind)) on:click=move |_| drilldown.run(kind)>{crate::components::launch_menu::backend_icon(kind)}{backend_label(kind)}<span>{move || group.get().map(|group| format!(" · {} agent{}", group.agent_count, if group.agent_count == 1 { "" } else { "s" }))}</span></button>
+                    {move || group.get().and_then(|group| usage_coverage(&group.total).map(|detail| view! { <UsageInfo label=if matches!(group.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Partial" }.to_owned() detail=format!("{}: {detail} {}/{} agents reporting; {} incomplete.", backend_label(kind), group.reporting_agent_count, group.agent_count, group.incomplete_agent_count) /> }))}
+                </div>
+                <div class="task-backend-tokens" role="group" aria-label=format!("{} task token usage: input, cached input, output and reasoning", backend_label(kind))>{move || group.get().map(|group| aggregate_view(&group.total))}</div>
                 {move || group.get().and_then(|group| (group.analyzer_batch_count > 0).then(|| view! { <span class="task-backend-analyzers">{format!("{} analyzer batch{}", group.analyzer_batch_count, if group.analyzer_batch_count == 1 { "" } else { "es" })}</span> }))}
-                <span class="task-backend-coverage" title=move || group.get().map(|group| format!("{} · {} incomplete", status_text(&group.total.status), group.incomplete_agent_count))>{move || group.get().and_then(|group| (!matches!(group.total.status, TaskTokenUsageStatus::Known)).then(|| format!("{} · {}/{} reporting", if matches!(group.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unavailable" } else { "Partial" }, group.reporting_agent_count, group.agent_count)))}</span>
             </div>
             {move || binding.get().map(|(host, _)| view! { <TaskCapacityLimits host_id=host backend_kind=kind /> })}
         </article>
