@@ -112,6 +112,11 @@ fn plain_tokens<'a>(text: CowStr<'a>, tokens: &[InlineToken]) -> CowStr<'a> {
 /// events, never on the rendered HTML, so a placeholder inside an attribute,
 /// code, or another link can only ever become escaped plain text.
 pub fn render_markdown_with_tokens(input: &str, tokens: &[InlineToken]) -> String {
+    let _diagnostic = crate::perf::UiSpan::new(
+        crate::perf::UiOperation::Markdown,
+        input.len(),
+        tokens.len(),
+    );
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);

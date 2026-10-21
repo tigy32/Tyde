@@ -1445,6 +1445,7 @@ pub fn ChatInput(
     // and aligns the layout pass with the browser's paint cycle.
     let autosize_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     let on_input = move |ev: leptos::ev::Event| {
+        let _diagnostic = crate::perf::UiSpan::new(crate::perf::UiOperation::ComposerInput, 0, 1);
         let target = event_target_value(&ev);
         on_input_composer.text.set(target);
         if autosize_pending.get() {
@@ -1466,6 +1467,8 @@ pub fn ChatInput(
                 return;
             };
             let measure: web_sys::HtmlElement = (*measure).clone().unchecked_into();
+            let _diagnostic =
+                crate::perf::UiSpan::new(crate::perf::UiOperation::ComposerResize, 0, 1);
             resize_composer(&textarea, &measure);
         });
     };
@@ -2446,9 +2449,191 @@ mod wasm_tests {
         .expect("drag event")
     }
 
-    /// R-03: the disabled attribute is reactive and may not be applied when a
-    /// second click arrives, so single-submit has to hold in the commit path.
-    /// Two clicks must produce one Interrupt frame.
+    #[wasm_bindgen_test]
+    async fn typing_capture_exports_bounded_private_context_without_blocking_on_host() {
+        let capture = crate::perf::diagnostic_tests::Capture::new();
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, true, false, "");
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        let textarea = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        // Disabled recording must not retain even a real input event.
+        textarea.set_value("private draft");
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        capture.start();
+        assert_eq!(capture.export()["records"].as_array().unwrap().len(), 0);
+        js_sys::eval(
+            r#"
+            window.__diagnosticHostRelease = null;
+            window.__diagnosticHostEntered = new Promise(entered => {
+                window.__TAURI__.core.invoke = () => new Promise(resolve => {
+                    window.__diagnosticHostRelease = resolve;
+                    entered();
+                });
+            });
+        "#,
+        )
+        .unwrap();
+        let sent = crate::bridge::send_host_line(crate::bridge::SendHostLineRequest {
+            host_id: "private-native-host".to_owned(),
+            line: "private source credential argv bearer".to_owned(),
+        });
+        // Poll the real frontend bridge future to its explicit host barrier.
+        let sent = wasm_bindgen_futures::future_to_promise(async move {
+            sent.await.map(|()| JsValue::NULL).map_err(JsValue::from)
+        });
+        wasm_bindgen_futures::JsFuture::from(
+            js_sys::eval("window.__diagnosticHostEntered")
+                .unwrap()
+                .dyn_into::<js_sys::Promise>()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            js_sys::eval("typeof window.__diagnosticHostRelease === 'function'")
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        textarea.set_value("private chat text");
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            textarea.value() == "private chat text",
+            "typing remains responsive while the host is pending"
+        );
+        capture.step("timer", 1200.0);
+        capture.step("frame", 0.0);
+        let incident = capture.export();
+        assert!(
+            incident["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["operation"] == "composer_input")
+        );
+        assert_eq!(incident["active"][0]["kind"], "async_wait");
+        assert_eq!(
+            incident["gaps"][0]["pendingAsync"][0]["detail"],
+            "send_host_line"
+        );
+        assert_eq!(incident["gaps"][0]["intervalMs"], 1200.0);
+        assert_eq!(incident["capabilities"]["longtask"], "unsupported");
+        assert_eq!(
+            incident["capabilities"]["longAnimationFrame"],
+            "unsupported"
+        );
+        js_sys::eval("window.__diagnosticHostRelease(null); delete window.__diagnosticHostRelease; delete window.__diagnosticHostEntered;").unwrap();
+        wasm_bindgen_futures::JsFuture::from(sent).await.unwrap();
+        // Exercise typed host dispatch and synchronous rendering with private payloads.
+        crate::dispatch::clear_host_seqs("private-native-host");
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "private-native-host",
+            protocol::Envelope::from_payload(
+                StreamPath("/host/private-native-host".to_owned()),
+                protocol::FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                    release_version: None,
+                },
+            )
+            .unwrap(),
+        );
+        let output = crate::markdown::render_markdown("**private source**");
+        let rendered = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("div")
+            .unwrap();
+        rendered.set_inner_html(&output);
+        container.append_child(&rendered).unwrap();
+        assert!(
+            rendered.text_content().unwrap() == "private source\n",
+            "markdown preserves the supplied text"
+        );
+        // Explicit clock advancement proves measured overlap/union, not CPU speed.
+        {
+            let _outer = crate::perf::UiSpan::new(crate::perf::UiOperation::Markdown, 0, 0);
+            capture.step("clock", 300.0);
+            {
+                let _inner =
+                    crate::perf::UiSpan::new(crate::perf::UiOperation::SyntaxHighlight, 0, 0);
+                textarea
+                    .dispatch_event(&web_sys::Event::new("input").unwrap())
+                    .unwrap();
+                capture.step("clock", 400.0);
+            }
+            capture.step("clock", 300.0);
+        }
+        capture.step("timer", 0.0);
+        let measured = capture.export();
+        assert_eq!(measured["gaps"][2]["instrumentedClientUnionMs"], 1000.0);
+        assert_eq!(measured["gaps"][2]["unattributedIntervalMs"], 0.0);
+        capture.visible(false);
+        capture.step("timer", 2000.0);
+        capture.step("frame", 0.0);
+        assert_eq!(
+            capture.export()["gaps"].as_array().unwrap().len(),
+            3,
+            "hidden time is not a foreground stall"
+        );
+        capture.visible(true);
+        capture.step("frame", 80.0);
+        assert_eq!(
+            capture.export()["gaps"].as_array().unwrap().len(),
+            3,
+            "returning to the foreground resets both baselines"
+        );
+        for _ in 0..1100 {
+            textarea
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+        }
+        capture.stop();
+        let exported = capture.export();
+        assert_eq!(exported["records"].as_array().unwrap().len(), 1024);
+        assert!(exported["loss"]["recordsOverwritten"].as_u64().unwrap() > 0);
+        assert_eq!(
+            exported["gaps"][0]["pendingAsync"][0]["detail"],
+            "send_host_line"
+        );
+        let safe = exported.to_string();
+        for secret in ["private", "credential", "argv", "bearer"] {
+            assert!(
+                !safe.contains(secret),
+                "diagnostic export contains forbidden content category"
+            );
+        }
+        capture.step("timer", 2000.0);
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        assert_eq!(capture.export(), exported, "stopped capture is immutable");
+        capture.start();
+        assert!(capture.export()["records"].as_array().unwrap().is_empty());
+        stub_send_host_line();
+        container.remove();
+    }
+
     #[wasm_bindgen_test]
     async fn native_goal_menu_requires_capability_and_keeps_normal_send() {
         let container = make_container();

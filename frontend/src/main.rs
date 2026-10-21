@@ -88,5 +88,6 @@ fn main() {
     }
 
     console_log::init_with_level(log::Level::Debug).expect("failed to init logger");
+    perf::install_diagnostics();
     mount_to_body(app::App);
 }

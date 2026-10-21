@@ -451,6 +451,8 @@ pub mod client {
             let tasks_for_handler = tasks.clone();
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                 move |evt: web_sys::MessageEvent| {
+                    let _diagnostic =
+                        crate::perf::UiSpan::new(crate::perf::UiOperation::WorkerReceive, 0, 1);
                     let value = evt.data();
                     let resp: Response = match serde_wasm_bindgen::from_value(value) {
                         Ok(r) => r,
@@ -521,6 +523,8 @@ pub mod client {
             on_chunk: ChunkCb,
             on_done: DoneCb,
         ) -> u64 {
+            let _diagnostic =
+                crate::perf::UiSpan::new(crate::perf::UiOperation::WorkerSubmit, 0, lines.len());
             let task_id = self.next_task_id.get();
             self.next_task_id.set(task_id + 1);
             self.tasks.insert(

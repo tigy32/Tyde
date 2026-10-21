@@ -354,6 +354,8 @@ pub fn syntax_for_lang_token(token: &str) -> Option<&'static SyntaxReference> {
 /// Returns escaped plain text (no span wrapping) when the input is over the
 /// highlight cap; callers can still inject the result safely as inner HTML.
 pub fn highlight_to_html(text: &str, syntax: &SyntaxReference) -> String {
+    let _diagnostic =
+        crate::perf::UiSpan::new(crate::perf::UiOperation::SyntaxHighlight, text.len(), 0);
     let lines: Vec<&str> = text.split('\n').collect();
     let highlighted = match highlight_lines(&lines, syntax) {
         Some(v) => v,

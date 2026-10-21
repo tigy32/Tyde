@@ -64,10 +64,12 @@ is wrong.
    serialized on the wire.
 
 10. **No device telemetry to Tyde maintainers.**
-    Shipped clients must not record user-interaction diagnostics or offer
-    diagnostic collection/export workflows for maintainers. Communication with
-    the user's selected hosts and agent providers remains part of normal
-    operation, not telemetry to us.
+    No automatic collection or maintainer upload. Explicitly user-started,
+    bounded, content-free local UI timing captures may be inspected/exported
+    through Debug for diagnosing freezes. They must never retain chat, source,
+    credentials, native identifiers or command arguments. Communication with
+    the user's selected hosts and agent providers remains normal operation,
+    not telemetry to us.
 
 ### Bug-Fix Philosophy
 

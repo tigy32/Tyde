@@ -313,6 +313,7 @@ pub(crate) fn should_auto_force_upgrade(
 }
 
 pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
+    let _diagnostic = crate::perf::UiSpan::frame(envelope.kind);
     if let Err(error) = INBOUND_SEQ.with(|validator| {
         validator
             .borrow_mut()

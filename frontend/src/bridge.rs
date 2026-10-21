@@ -19,7 +19,7 @@ pub use host_config::{
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = "invoke", catch)]
-    async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+    async fn raw_tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(
         js_namespace = ["window", "__TAURI__", "event"],
@@ -27,6 +27,13 @@ extern "C" {
         catch
     )]
     fn tauri_listen(event: &str, handler: &Closure<dyn Fn(JsValue)>) -> Result<JsValue, JsValue>;
+}
+
+async fn tauri_invoke(cmd: &'static str, args: JsValue) -> Result<JsValue, JsValue> {
+    let wait = crate::perf::UiSpan::waiting(cmd);
+    let result = raw_tauri_invoke(cmd, args).await;
+    wait.finish(result.is_ok());
+    result
 }
 
 // --- Request/response types (owned by frontend, matching tauri-shell's bridge) ---

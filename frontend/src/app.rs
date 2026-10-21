@@ -254,6 +254,7 @@ pub(crate) fn install_keydown_listener(state: AppState, workspace_width: CenterW
     });
 
     let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        let _diagnostic = crate::perf::UiSpan::new(crate::perf::UiOperation::GlobalKeydown, 0, 0);
         let Ok(ev) = ev.dyn_into::<web_sys::KeyboardEvent>() else {
             return;
         };
@@ -1086,6 +1087,11 @@ pub(crate) async fn install_host_listeners(
     let line_state = state.clone();
     handles.push(
         bridge::listen_host_line(move |event| {
+            let _diagnostic = crate::perf::UiSpan::new(
+                crate::perf::UiOperation::HostReceive,
+                event.line.len(),
+                1,
+            );
             if host_is_manually_disconnected(&line_state, &event.host_id) {
                 return;
             }
