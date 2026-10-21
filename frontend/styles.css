@@ -621,7 +621,7 @@ details summary:focus:not(:focus-visible) {
     margin-left: auto;
 }
 .launch-project-picker label { font-weight: 600; }
-.launch-project-picker select { width: 100%; min-width: 0; padding: 10px 12px; background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border-primary); border-radius: 5px; }
+.launch-project-picker select { width: 100%; min-width: 0; }
 .launch-project-picker select:focus-visible { outline: 2px solid var(--accent-link); outline-offset: 2px; }
 
 .launch-chooser-body {
@@ -17569,8 +17569,9 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-panel .agent-card-top-main { flex-direction: column; align-items: flex-start; gap: 2px; }
 .agents-panel .agent-card-collapse-toggle { min-height: 18px; color: var(--text-tertiary); }
 .agents-panel .agent-card-status { animation: none; }
-.agents-workbench-filter { display: flex; align-items: center; gap: 8px; padding: 5px; font-size: 12px; color: var(--text-primary); cursor: pointer; }
-.agents-workbench-filter input { accent-color: var(--accent-primary); }
+.agents-filter-option { justify-content: space-between; gap: var(--space-4); min-height: 32px; padding: var(--space-1) var(--space-2); border-radius: 4px; font-family: var(--font-sans); font-size: 1rem; color: var(--text-primary); }
+.agents-filter-option:hover { background: var(--surface-hover); }
+.agents-filter-option:focus-within .settings-toggle-slider { outline: 2px solid var(--accent-link); outline-offset: 3px; }
 .agent-sidebar-workbench-section { padding-left: 16px; }
 .agent-sidebar-workbench-section > .agent-card-group { margin-left: 16px; }
 .agent-sidebar-project-header { display: flex; align-items: center; gap: 3px; padding-right: 6px; }
@@ -17598,7 +17599,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-filter-menu { position: absolute; top: 8px; right: 8px; z-index: 3; }
 .agents-filter-menu summary { list-style: none; width: 28px; height: 28px; border: 1px solid var(--border-primary); border-radius: 4px; display: grid; place-items: center; color: var(--text-secondary); cursor: pointer; }
 .agents-filter-menu summary::-webkit-details-marker { display: none; }
-.agents-filter-menu .panel-filters { position: absolute; right: 0; width: 190px; padding: 8px; flex-direction: column; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 5px; box-shadow: 0 4px 12px #0004; }
+.agents-filter-menu summary:focus-visible { outline: 2px solid var(--accent-link); outline-offset: 2px; }
+.agents-filter-menu .panel-filters { position: absolute; right: 0; width: min(250px, calc(100cqw - 16px)); padding: 8px; flex-direction: column; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 5px; box-shadow: 0 4px 12px #0004; }
 .agent-new-project { border: 0; background: transparent; color: var(--accent-link); font-size: 11px; cursor: pointer; }
 .agent-card-top > .agent-card-pin { width: 22px; height: 22px; padding: 2px; }
 

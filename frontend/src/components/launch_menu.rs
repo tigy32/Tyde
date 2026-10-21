@@ -495,7 +495,7 @@ pub fn LaunchChooser(
                         on:click=move |_| open_sig.set(false)>"×"</button>
                     <div class="launch-project-picker">
                         <label for="launch-project-select">"Project"</label>
-                        <select id="launch-project-select" aria-label="Project" on:change=change_project>
+                        <select id="launch-project-select" class="settings-select" aria-label="Project" on:change=change_project>
                             <Show when=move || !project_available.get()><option value="" selected=true disabled=true>"Project unavailable"</option></Show>
                             {move || project_choices.get().into_iter().map(|(host, project, label)| {
                                 let target = (host, project);
@@ -1548,6 +1548,28 @@ mod wasm_tests {
             )
             .unwrap();
         next_tick().await;
+        let picker = container
+            .query_selector("select[aria-label='Project']")
+            .unwrap()
+            .unwrap();
+        let picker_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&picker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            picker_style.get_property_value("appearance").unwrap(),
+            "none"
+        );
+        assert_ne!(
+            picker_style.get_property_value("background-image").unwrap(),
+            "none",
+            "The project dropdown paints Tyde's existing chevron"
+        );
+        assert!(
+            picker.get_bounding_client_rect().height() >= 32.0,
+            "The project dropdown retains the app's normal control height"
+        );
         let backend_list = container
             .query_selector("[aria-label='Backend choices']")
             .unwrap()

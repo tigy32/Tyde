@@ -1370,6 +1370,100 @@ fn AgentRestorationNotice() -> impl IntoView {
     }
 }
 
+fn sidebar_agents(state: &AppState, filters: &AgentsPanelFilters, query: &str) -> Vec<AgentInfo> {
+    let active_project = state.active_project.get();
+    let projects = state.projects.get();
+    let pins = state.agents_view_preferences.get().pins.pinned;
+
+    // Read the noisy maps in place via `with` rather than cloning
+    // them up-front. The Memo re-runs on every keystroke in the
+    // panel-search input, and cloning the streaming/turn-active
+    // HashMaps + the full agents Vec on each keystroke was the
+    // dominant per-keystroke cost in the audit.
+    state.streaming_text.with(|streaming_map| {
+        state.agent_turn_active.with(|turn_active_map| {
+            state.agent_awaiting_user.with(|awaiting_user| {
+                state.agents.with(|agents| {
+                    let swarm_owned = swarm_owned_agents(agents);
+                    agents
+                        .iter()
+                        .filter(|a| {
+                            if pins.contains(&agent_annotation_target(a)) {
+                                return query.is_empty() || a.name.to_lowercase().contains(query);
+                            }
+                            !swarm_owned.contains(&agent_ref(a))
+                                && agent_passes_filters(
+                                    a,
+                                    filters,
+                                    match active_project.as_ref() {
+                                        None => a.project_id.is_none(),
+                                        Some(ap) => {
+                                            a.host_id == ap.host_id
+                                                && agent_ui_project_id(
+                                                    &projects,
+                                                    &a.host_id,
+                                                    a.project_id.as_ref(),
+                                                ) == agent_ui_project_id(
+                                                    &projects,
+                                                    &ap.host_id,
+                                                    Some(&ap.project_id),
+                                                )
+                                        }
+                                    },
+                                    streaming_map,
+                                    turn_active_map,
+                                    awaiting_user,
+                                    query,
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+    })
+}
+
+fn sidebar_swarms(
+    state: &AppState,
+    filters: &AgentsPanelFilters,
+    query: &str,
+) -> Vec<SidebarSwarmRef> {
+    let active_project = state.active_project.get();
+    let projects = state.projects.get();
+    state.swarms.with(|by_host| {
+        let mut refs: Vec<(String, SidebarSwarmRef)> = by_host
+            .iter()
+            .flat_map(|(host_id, swarms)| swarms.values().map(move |swarm| (host_id, swarm)))
+            .filter(|(host_id, swarm)| {
+                swarm_passes_filters(
+                    host_id,
+                    swarm,
+                    filters,
+                    active_project.as_ref(),
+                    &projects,
+                    query,
+                )
+            })
+            .map(|(host_id, swarm)| {
+                (
+                    swarm.name.to_lowercase(),
+                    SidebarSwarmRef {
+                        host_id: host_id.clone(),
+                        project_id: swarm.constraints.project_id.clone(),
+                        swarm_id: swarm.id.clone(),
+                    },
+                )
+            })
+            .collect();
+        refs.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.swarm_id.0.cmp(&b.1.swarm_id.0))
+        });
+        refs.into_iter().map(|(_, swarm)| swarm).collect::<Vec<_>>()
+    })
+}
+
 #[component]
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1440,99 +1534,20 @@ pub fn AgentsPanel() -> impl IntoView {
 
     let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
-        let active_project = filter_state.active_project.get();
-        let projects = filter_state.projects.get();
-        let query = search.get().to_lowercase();
-        let filters = current_filters.get();
-        let pins = filter_state.agents_view_preferences.get().pins.pinned;
-
-        // Read the noisy maps in place via `with` rather than cloning
-        // them up-front. The Memo re-runs on every keystroke in the
-        // panel-search input, and cloning the streaming/turn-active
-        // HashMaps + the full agents Vec on each keystroke was the
-        // dominant per-keystroke cost in the audit.
-        filter_state.streaming_text.with(|streaming_map| {
-            filter_state.agent_turn_active.with(|turn_active_map| {
-                filter_state.agent_awaiting_user.with(|awaiting_user| {
-                    filter_state.agents.with(|agents| {
-                        let swarm_owned = swarm_owned_agents(agents);
-                        agents
-                            .iter()
-                            .filter(|a| {
-                                if pins.contains(&agent_annotation_target(a)) {
-                                    return query.is_empty()
-                                        || a.name.to_lowercase().contains(&query);
-                                }
-                                !swarm_owned.contains(&agent_ref(a))
-                                    && agent_passes_filters(
-                                        a,
-                                        &filters,
-                                        match active_project.as_ref() {
-                                            None => a.project_id.is_none(),
-                                            Some(ap) => {
-                                                a.host_id == ap.host_id
-                                                    && agent_ui_project_id(
-                                                        &projects,
-                                                        &a.host_id,
-                                                        a.project_id.as_ref(),
-                                                    ) == agent_ui_project_id(
-                                                        &projects,
-                                                        &ap.host_id,
-                                                        Some(&ap.project_id),
-                                                    )
-                                            }
-                                        },
-                                        streaming_map,
-                                        turn_active_map,
-                                        awaiting_user,
-                                        &query,
-                                    )
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    })
-                })
-            })
-        })
+        sidebar_agents(
+            &filter_state,
+            &current_filters.get(),
+            &search.get().to_lowercase(),
+        )
     });
 
     let swarm_filter_state = state.clone();
     let filtered_swarms = Memo::new(move |_| {
-        let active_project = swarm_filter_state.active_project.get();
-        let projects = swarm_filter_state.projects.get();
-        let query = search.get().to_lowercase();
-        let filters = current_filters.get();
-        swarm_filter_state.swarms.with(|by_host| {
-            let mut refs: Vec<(String, SidebarSwarmRef)> = by_host
-                .iter()
-                .flat_map(|(host_id, swarms)| swarms.values().map(move |swarm| (host_id, swarm)))
-                .filter(|(host_id, swarm)| {
-                    swarm_passes_filters(
-                        host_id,
-                        swarm,
-                        &filters,
-                        active_project.as_ref(),
-                        &projects,
-                        &query,
-                    )
-                })
-                .map(|(host_id, swarm)| {
-                    (
-                        swarm.name.to_lowercase(),
-                        SidebarSwarmRef {
-                            host_id: host_id.clone(),
-                            project_id: swarm.constraints.project_id.clone(),
-                            swarm_id: swarm.id.clone(),
-                        },
-                    )
-                })
-                .collect();
-            refs.sort_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then_with(|| a.1.swarm_id.0.cmp(&b.1.swarm_id.0))
-            });
-            refs.into_iter().map(|(_, swarm)| swarm).collect::<Vec<_>>()
-        })
+        sidebar_swarms(
+            &swarm_filter_state,
+            &current_filters.get(),
+            &search.get().to_lowercase(),
+        )
     });
 
     let launch_target = RwSignal::new(None::<ActiveProjectRef>);
@@ -1552,8 +1567,7 @@ pub fn AgentsPanel() -> impl IntoView {
         let hide_empty = section_state
             .effective_agents_sidebar_preferences()
             .hide_empty_projects;
-        let actual_agents = section_state.agents.get();
-        let scoped_projects = projects
+        let scoped_projects: Vec<_> = projects
             .iter()
             .filter(|project| {
                 show_other
@@ -1572,6 +1586,23 @@ pub fn AgentsPanel() -> impl IntoView {
             })
             .cloned()
             .collect();
+        // Occupancy uses the same placement rules as rows, without search or
+        // activity narrowing. Pins, custom groups and hidden children cannot
+        // leave an empty heading behind in their original project.
+        let occupancy = hide_empty.then(|| {
+            let mut filters = current_filters.get();
+            filters.hide_inactive = false;
+            let agents = sidebar_agents(&section_state, &filters, "");
+            let swarms = sidebar_swarms(&section_state, &filters, "");
+            build_sidebar_projection(
+                agents,
+                swarms,
+                section_state.configured_hosts.get(),
+                scoped_projects.clone(),
+                snapshot.groups.clone(),
+                snapshot.pins.clone(),
+            )
+        });
         let mut projection = build_sidebar_projection(
             filtered_agents.get(),
             filtered_swarms.get(),
@@ -1580,50 +1611,35 @@ pub fn AgentsPanel() -> impl IntoView {
             snapshot.groups,
             snapshot.pins,
         );
-        if hide_empty {
-            let actual_swarms = section_state.swarms.get();
-            let has_conversations = |target: &ActiveProjectRef| {
-                let agent_projects = actual_agents
-                    .iter()
-                    .filter_map(|agent| agent.project_id.as_ref().map(|id| (&agent.host_id, id)));
-                let swarm_projects = actual_swarms.iter().flat_map(|(host, swarms)| {
-                    swarms
-                        .values()
-                        .map(move |swarm| (host, &swarm.constraints.project_id))
-                });
-                agent_projects.chain(swarm_projects).any(|(host, project)| {
-                    if host != &target.host_id {
-                        return false;
-                    }
-                    let mut current = Some(project);
-                    for _ in 0..=projects.len() {
-                        let Some(id) = current else {
-                            return false;
-                        };
-                        if id == &target.project_id {
-                            return true;
-                        }
-                        current = projects
-                            .iter()
-                            .find(|project| {
-                                project.host_id == target.host_id && &project.project.id == id
-                            })
-                            .and_then(|project| project.project.parent_project_id());
-                    }
-                    false
-                })
-            };
+        if let Some(occupancy) = occupancy {
             for host in &mut projection.hosts {
-                host.projects
-                    .retain(|section| section.project.as_ref().is_none_or(has_conversations));
-                for section in &mut host.projects {
-                    section.workbenches.retain(|workbench| {
-                        has_conversations(&ActiveProjectRef {
-                            host_id: workbench.host_id.clone(),
-                            project_id: workbench.project.id.clone(),
-                        })
+                let occupied_host = occupancy.hosts.iter().find(|entry| entry.key == host.key);
+                host.projects.retain_mut(|section| {
+                    let occupied = occupied_host.and_then(|host| {
+                        host.projects.iter().find(|entry| entry.key == section.key)
                     });
-                }
+                    // Narrowing may filter out an owner and promote a matching
+                    // child out of Pinned/a custom group into this project.
+                    let visible_projects: HashSet<_> = section
+                        .groups
+                        .iter()
+                        .filter_map(|tree| tree.parent.project_id.as_ref())
+                        .chain(section.swarms.iter().map(|swarm| &swarm.project_id))
+                        .collect();
+                    section.workbenches.retain(|workbench| {
+                        visible_projects.contains(&workbench.project.id)
+                            || occupied.is_some_and(|occupied| {
+                                occupied.groups.iter().any(|tree| {
+                                    tree.parent.project_id.as_ref() == Some(&workbench.project.id)
+                                }) || occupied
+                                    .swarms
+                                    .iter()
+                                    .any(|swarm| swarm.project_id == workbench.project.id)
+                            })
+                    });
+                    section.row_count() > 0
+                        || occupied.is_some_and(|section| section.row_count() > 0)
+                });
             }
             projection
                 .hosts
@@ -1716,36 +1732,50 @@ pub fn AgentsPanel() -> impl IntoView {
                         launch_open.set(true);
                     }><span aria-hidden="true">"+"</span><span class="agents-new-label">"New agent"</span></button>
             </div>
-            <details class="agents-filter-menu">
+            <details class="agents-filter-menu" on:keydown=move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Escape" {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    if let Some(menu) = ev.current_target().and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok()) {
+                        let _ = menu.remove_attribute("open");
+                        if let Ok(Some(summary)) = menu.query_selector("summary") {
+                            let _ = summary.unchecked_into::<web_sys::HtmlElement>().focus();
+                        }
+                    }
+                }
+            }>
                 <summary aria-label="Filter agents" title="Filter agents">"▽"</summary>
                 <div class="panel-filters">
-                <button
-                    class=move || if current_filters.get().hide_inactive { "filter-toggle active" } else { "filter-toggle" }
-                    on:click=toggle_inactive
-                >
-                    "Hide inactive"
-                </button>
-                <button
-                    class=move || if current_filters.get().hide_sub_agents { "filter-toggle active" } else { "filter-toggle" }
-                    on:click=toggle_sub
-                >
-                    "Hide sub-agents"
-                </button>
-                <button
-                    class=move || if current_filters.get().show_other_projects { "filter-toggle active" } else { "filter-toggle" }
-                    on:click=toggle_other_projects
-                >
-                    "Show other projects"
-                </button>
-                <label class="agents-workbench-filter">
-                    <input type="checkbox" prop:checked=move || show_workbenches.get()
-                        on:change=toggle_workbenches />
-                    "Show workbenches"
-                </label>
-                <label class="agents-workbench-filter">
-                    <input type="checkbox" prop:checked=move || hide_empty_projects.get() on:change=toggle_empty />
-                    "Hide empty projects"
-                </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Hide inactive"</span>
+                        <input type="checkbox" aria-label="Hide inactive" prop:checked=move || current_filters.get().hide_inactive
+                            on:change=toggle_inactive />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Hide sub-agents"</span>
+                        <input type="checkbox" aria-label="Hide sub-agents" prop:checked=move || current_filters.get().hide_sub_agents
+                            on:change=toggle_sub />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Show other projects"</span>
+                        <input type="checkbox" aria-label="Show other projects" prop:checked=move || current_filters.get().show_other_projects
+                            on:change=toggle_other_projects />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Show workbenches"</span>
+                        <input type="checkbox" aria-label="Show workbenches" prop:checked=move || show_workbenches.get()
+                            on:change=toggle_workbenches />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Hide empty projects"</span>
+                        <input type="checkbox" aria-label="Hide empty projects" prop:checked=move || hide_empty_projects.get()
+                            on:change=toggle_empty />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
                 </div>
             </details>
             <AgentRestorationNotice />
@@ -4940,6 +4970,50 @@ mod wasm_tests {
                 1
             );
         }
+        let menu = container.query_selector("details").unwrap().unwrap();
+        menu.set_attribute("open", "").unwrap();
+        assert_eq!(
+            menu.query_selector_all("input[type='checkbox']")
+                .unwrap()
+                .length(),
+            5,
+            "Every boolean filter exposes the same native keyboard control"
+        );
+        for name in [
+            "Hide inactive",
+            "Hide sub-agents",
+            "Show other projects",
+            "Show workbenches",
+            "Hide empty projects",
+        ] {
+            let control = filter_control(&container, name);
+            control.focus().unwrap();
+            let slider = control.next_element_sibling().unwrap();
+            let bounds = slider.get_bounding_client_rect();
+            assert_eq!(bounds.width(), 36.0, "The standard Tyde toggle is visible");
+            assert_eq!(bounds.height(), 20.0);
+            let style = theme.get_computed_style(&slider).unwrap().unwrap();
+            assert_eq!(style.get_property_value("outline-style").unwrap(), "solid");
+        }
+        let key = web_sys::KeyboardEventInit::new();
+        key.set_key("Escape");
+        key.set_bubbles(true);
+        filter_control(&container, "Hide empty projects")
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &key)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!menu.has_attribute("open"));
+        assert!(
+            theme
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&menu.query_selector("summary").unwrap().unwrap())),
+            "Escape restores the filter disclosure's keyboard focus"
+        );
         let original_selection = state.active_project.get_untracked();
         let original_tabs = state
             .center_zone
@@ -5122,7 +5196,7 @@ mod wasm_tests {
             "Workbench context belongs on its row, not a second project heading"
         );
         let workbench_checkbox = container
-            .query_selector(".agents-workbench-filter input")
+            .query_selector("input[aria-label='Show workbenches']")
             .unwrap()
             .unwrap()
             .dyn_into::<web_sys::HtmlInputElement>()
@@ -5285,7 +5359,7 @@ mod wasm_tests {
                     .query_selector(&format!("[data-project-key='{key}']"))
                     .unwrap()
                     .is_some(),
-                "Idle, pinned and workbench agents count even when activity filters hide every row"
+                "Idle project and workbench conversations remain occupied when activity filters hide rows"
             );
         }
         assert!(
@@ -5295,13 +5369,154 @@ mod wasm_tests {
                 .is_none(),
             "An empty workbench is hidden even when its parent contains agents"
         );
+        // The rendered pinned-only workbench has zero rows: its conversation
+        // moved to Pinned. Keeping its former heading certified the defect.
         assert!(
             container
                 .query_selector("[data-project-id='alpha-workbench']")
                 .unwrap()
-                .is_some(),
-            "A populated idle workbench keeps its heading"
+                .is_none(),
+            "The pinned-only workbench has no rows; its conversation is in Pinned"
         );
+        assert!(
+            container
+                .query_selector(".agent-sidebar-pinned [data-agent-id='workbench-agent']")
+                .unwrap()
+                .is_some(),
+            "Hiding its empty former heading never hides the pinned conversation"
+        );
+        let before_ghost_agents = state.agents.get_untracked();
+        let before_ghost_projects = state.projects.get_untracked();
+        for id in ["child-only", "group-only", "pin-only"] {
+            state.projects.update(|projects| {
+                projects.push(project_info("local", id, id, 3));
+            });
+            push_agent_with_scope(
+                &state,
+                "local",
+                id,
+                id,
+                true,
+                Some(id),
+                (id == "child-only").then_some("parent-alpha"),
+            );
+        }
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.pins.pinned.push(local_target("pin-only"));
+        preferences.groups = AgentGroupsSnapshot {
+            groups: vec![AgentGroup {
+                id: AgentGroupId("recovery-group".into()),
+                name: "Recovery group".into(),
+            }],
+            assignments: vec![AgentGroupAssignment {
+                group_id: AgentGroupId("recovery-group".into()),
+                target: local_target("group-only"),
+            }],
+        };
+        preferences.sidebar.hide_sub_agents = true;
+        preferences.sidebar.hide_inactive = false;
+        for show in [false, true] {
+            preferences.sidebar.show_workbenches = show;
+            state.agents_view_preferences.set(preferences.clone());
+            next_tick().await;
+            for id in ["child-only", "group-only", "pin-only"] {
+                assert!(
+                    container
+                        .query_selector(&format!("[data-project-key='local:{id}']"))
+                        .unwrap()
+                        .is_none(),
+                    "Relocated or hidden rows cannot retain an empty source heading"
+                );
+            }
+            assert!(
+                container
+                    .query_selector(".agent-sidebar-custom-group [data-agent-id='group-only']")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                container
+                    .query_selector(".agent-sidebar-pinned [data-agent-id='pin-only']")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                container
+                    .query_selector(
+                        "[data-project-key='local:alpha'] [data-agent-id='parent-alpha']"
+                    )
+                    .unwrap()
+                    .is_some(),
+                "An idle conversation stays under its project with either grouping choice"
+            );
+        }
+        let ownership_search = container
+            .query_selector("input[placeholder='Filter agents...']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        preferences.sidebar.hide_sub_agents = false;
+        for (owner, child, name, query) in [
+            (
+                "pin-only",
+                "matching-child",
+                "Matching child",
+                "Matching child",
+            ),
+            ("group-only", "working-child", "Working child", ""),
+        ] {
+            push_agent_with_scope(&state, "local", child, name, true, Some(owner), Some(owner));
+            preferences.sidebar.hide_inactive = owner == "group-only";
+            state.agent_turn_active.update(|active| {
+                active.insert(AgentId(child.into()), owner == "group-only");
+            });
+            state.agents_view_preferences.set(preferences.clone());
+            ownership_search.set_value(query);
+            ownership_search
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+            for destination in [owner, "alpha-empty-workbench"] {
+                state.agents.update(|agents| {
+                    for agent in agents
+                        .iter_mut()
+                        .filter(|agent| agent.agent_id.0 == owner || agent.agent_id.0 == child)
+                    {
+                        agent.project_id = Some(ProjectId(destination.into()));
+                    }
+                });
+                next_tick().await;
+                let scope = if destination == owner {
+                    format!("[data-project-key='local:{owner}']")
+                } else {
+                    "[data-project-id='alpha-empty-workbench']".into()
+                };
+                assert!(
+                    container
+                        .query_selector(&format!("{scope} [data-agent-id='{child}']"))
+                        .unwrap()
+                        .is_some(),
+                    "A matching child remains in its exact project/workbench when its owner is filtered out"
+                );
+            }
+        }
+        ownership_search.set_value("");
+        ownership_search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        state.agent_turn_active.update(|active| {
+            for child in ["matching-child", "working-child"] {
+                active.remove(&AgentId(child.into()));
+            }
+        });
+        state.agents.set(before_ghost_agents);
+        state.projects.set(before_ghost_projects);
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.groups = before_empty_filter.groups.clone();
+        preferences.pins = before_empty_filter.pins.clone();
+        preferences.sidebar.hide_inactive = true;
+        state.agents_view_preferences.set(preferences);
+        next_tick().await;
         let search_input = container
             .query_selector("input[placeholder='Filter agents...']")
             .unwrap()
@@ -9673,23 +9888,17 @@ mod wasm_tests {
         state
     }
 
-    fn filter_button(container: &HtmlElement, label: &str) -> HtmlElement {
-        let buttons = container
-            .query_selector_all(".panel-filters button")
-            .unwrap();
-        for i in 0..buttons.length() {
-            let el = buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
-            if el.text_content().unwrap_or_default().contains(label) {
-                return el;
-            }
-        }
-        panic!("filter button {label:?} not found");
+    fn filter_control(container: &HtmlElement, label: &str) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(&format!(".panel-filters input[aria-label='{label}']"))
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap()
     }
 
-    fn button_active(container: &HtmlElement, label: &str) -> bool {
-        filter_button(container, label)
-            .class_name()
-            .contains("active")
+    fn filter_enabled(container: &HtmlElement, label: &str) -> bool {
+        filter_control(container, label).checked()
     }
 
     /// The most recent `set_agents_view_preferences` update payload on the wire.
@@ -9748,7 +9957,7 @@ mod wasm_tests {
                 .is_some()
         };
 
-        assert!(button_active(&container, "Show other projects"));
+        assert!(filter_enabled(&container, "Show other projects"));
         assert!(card_rendered("agent-abc") && card_rendered("agent-xyz"));
 
         agent_card_el(&container, "agent-abc").click();
@@ -9764,7 +9973,7 @@ mod wasm_tests {
             "precondition: opening the agent switched to its project"
         );
         assert!(
-            button_active(&container, "Show other projects"),
+            filter_enabled(&container, "Show other projects"),
             "opening an agent in another project must not turn the selector off"
         );
         assert!(
@@ -9772,9 +9981,9 @@ mod wasm_tests {
             "agents from other projects stay listed after the project switch"
         );
 
-        filter_button(&container, "Show other projects").click();
+        filter_control(&container, "Show other projects").click();
         next_tick().await;
-        assert!(!button_active(&container, "Show other projects"));
+        assert!(!filter_enabled(&container, "Show other projects"));
         assert!(card_rendered("agent-abc") && !card_rendered("agent-xyz"));
 
         state.switch_active_project(None);
@@ -9782,7 +9991,7 @@ mod wasm_tests {
             next_tick().await;
         }
         assert!(
-            !button_active(&container, "Show other projects"),
+            !filter_enabled(&container, "Show other projects"),
             "a pinned off selector stays off when returning Home"
         );
         assert!(
@@ -9803,7 +10012,7 @@ mod wasm_tests {
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
 
-        filter_button(&container, "Show other projects").click();
+        filter_control(&container, "Show other projects").click();
         next_tick().await;
 
         let update = last_view_pref_update(&calls);
@@ -9817,7 +10026,7 @@ mod wasm_tests {
         );
         // Optimistic overlay flips the button immediately.
         assert!(
-            !button_active(&container, "Show other projects"),
+            !filter_enabled(&container, "Show other projects"),
             "overlay reflects the pinned current_project_only immediately"
         );
     }
@@ -9846,14 +10055,14 @@ mod wasm_tests {
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
         trace("mounted");
-        assert!(!button_active(&container, "Hide inactive"));
+        assert!(!filter_enabled(&container, "Hide inactive"));
 
         trace("clicking selector");
-        filter_button(&container, "Hide inactive").click();
+        filter_control(&container, "Hide inactive").click();
         trace("selector clicked");
         next_tick().await;
         assert!(
-            button_active(&container, "Hide inactive"),
+            filter_enabled(&container, "Hide inactive"),
             "overlay reflects hide_inactive immediately"
         );
 
@@ -9867,7 +10076,7 @@ mod wasm_tests {
         }));
         next_tick().await;
         assert!(
-            button_active(&container, "Hide inactive"),
+            filter_enabled(&container, "Hide inactive"),
             "pinned hide_inactive survives a project switch"
         );
 
@@ -9884,7 +10093,7 @@ mod wasm_tests {
         next_tick().await;
         trace("snapshot rendered");
         assert!(
-            button_active(&container, "Hide inactive"),
+            filter_enabled(&container, "Hide inactive"),
             "server snapshot keeps hide_inactive after the overlay is reconciled"
         );
     }
@@ -9899,10 +10108,10 @@ mod wasm_tests {
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
 
-        filter_button(&container, "Hide sub-agents").click();
+        filter_control(&container, "Hide sub-agents").click();
         next_tick().await;
         assert!(
-            button_active(&container, "Hide sub-agents"),
+            filter_enabled(&container, "Hide sub-agents"),
             "overlay turns hide_sub_agents on optimistically"
         );
 
@@ -9916,7 +10125,7 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(
-            !button_active(&container, "Hide sub-agents"),
+            !filter_enabled(&container, "Hide sub-agents"),
             "server snapshot overrides the optimistic overlay"
         );
     }
