@@ -5834,36 +5834,69 @@ impl Project {
         }
     }
 
-    pub fn execution_root_mapping(
+    pub fn execution_root_mappings(
         &self,
-    ) -> Result<Option<(&ProjectRootPath, &ProjectRootPath)>, &'static str> {
+    ) -> Result<Vec<(&ProjectRootPath, &ProjectRootPath)>, &'static str> {
         let ProjectSource::GitWorkbench {
             roots,
-            environment: WorkbenchEnvironment::Bubblewrap { logical_root, .. },
+            environment:
+                WorkbenchEnvironment::Bubblewrap {
+                    logical_root,
+                    additional_roots,
+                    ..
+                },
             ..
         } = &self.source
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let [root] = roots.as_slice() else {
-            return Err("Execution workspace requires one authoritative root");
+        let Some(first) = roots.first() else {
+            return Err("Execution workspace has no roots");
         };
-        for path in [&root.worktree_root.0, &logical_root.0] {
-            if !path.starts_with('/')
-                || path[1..]
-                    .split('/')
-                    .any(|component| matches!(component, "" | "." | ".."))
-            {
-                return Err("Execution workspace roots must be canonical absolute Linux paths");
+        if additional_roots.len() + 1 != roots.len() {
+            return Err("Execution workspace mapping does not cover every registered root");
+        }
+        let mappings = std::iter::once((&first.worktree_root, logical_root))
+            .chain(
+                roots
+                    .iter()
+                    .skip(1)
+                    .zip(additional_roots)
+                    .map(|(root, logical)| (&root.worktree_root, logical)),
+            )
+            .collect::<Vec<_>>();
+        for (host, logical) in &mappings {
+            for path in [&host.0, &logical.0] {
+                if !path.starts_with('/')
+                    || path[1..]
+                        .split('/')
+                        .any(|component| matches!(component, "" | "." | ".."))
+                {
+                    return Err("Execution workspace roots must be canonical absolute Linux paths");
+                }
             }
         }
-        Ok(Some((&root.worktree_root, logical_root)))
+        Ok(mappings)
+    }
+
+    pub fn runtime_path_for_host(&self, path: &str) -> Result<String, &'static str> {
+        for (host, logical) in self.execution_root_mappings()? {
+            match path.strip_prefix(&host.0) {
+                Some("") => return Ok(logical.0.clone()),
+                Some(suffix) if suffix.starts_with('/') => {
+                    return Ok(format!("{}{suffix}", logical.0));
+                }
+                Some(_) | None => {}
+            }
+        }
+        Ok(path.to_owned())
     }
 
     pub fn host_path_for_runtime(&self, path: &str) -> Result<String, &'static str> {
-        let Some((host_root, logical_root)) = self.execution_root_mapping()? else {
+        let mappings = self.execution_root_mappings()?;
+        if mappings.is_empty() {
             return Ok(path.to_owned());
-        };
+        }
         if path.split('/').any(|component| component == "..") {
             return Err("Execution path with parent traversal has no authoritative host mapping");
         }
@@ -5880,21 +5913,30 @@ impl Project {
         } else {
             path
         };
+        for (host, logical) in mappings {
+            match path.strip_prefix(&logical.0) {
+                Some("") => return Ok(host.0.clone()),
+                Some(suffix) if suffix.starts_with('/') => {
+                    return Ok(format!("{}{suffix}", host.0));
+                }
+                Some(_) | None => {}
+            }
+        }
         if path == "/mnt"
-            || ["/mnt/tyde-runtime", "/mnt/tyde-producer-receipts"]
-                .iter()
-                .any(|root| {
-                    path.strip_prefix(root)
-                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-                })
+            || [
+                "/mnt/tyde-workspace",
+                "/mnt/tyde-runtime",
+                "/mnt/tyde-producer-receipts",
+            ]
+            .iter()
+            .any(|root| {
+                path.strip_prefix(root)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            })
         {
             return Err("Engine-only execution path has no host workspace mapping");
         }
-        match path.strip_prefix(&logical_root.0) {
-            Some("") => Ok(host_root.0.clone()),
-            Some(suffix) if suffix.starts_with('/') => Ok(format!("{}{}", host_root.0, suffix)),
-            Some(_) | None => Ok(path.to_owned()),
-        }
+        Ok(path.to_owned())
     }
 
     pub fn is_removing_workbench(&self) -> bool {
@@ -5948,6 +5990,7 @@ pub struct WorkbenchConfiguration {
     pub runtime_directories: Vec<String>,
     pub runtime_files: BTreeMap<String, String>,
     pub runtime_file_bindings: Vec<WorkbenchRuntimeFileBinding>,
+    pub readonly_bindings: Vec<WorkbenchRuntimePathBinding>,
     pub services: Vec<WorkbenchServiceConfiguration>,
 }
 
@@ -5958,6 +6001,10 @@ pub struct WorkbenchSnapshotConfiguration {
     pub include: Vec<String>,
     pub provenance_paths: Vec<String>,
     pub provenance_environment: Vec<String>,
+    #[serde(default)]
+    pub provenance_commands: Vec<Vec<String>>,
+    #[serde(default)]
+    pub optional_include: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5965,6 +6012,13 @@ pub struct WorkbenchSnapshotConfiguration {
 pub struct WorkbenchRuntimeFileBinding {
     pub runtime_file: String,
     pub host_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchRuntimePathBinding {
+    pub host_path: String,
+    pub execution_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -6023,6 +6077,8 @@ pub struct WorkbenchSupport {
 pub enum WorkbenchInitialization {
     Cold,
     Snapshot { cohort: String },
+    Prepared { cohort: String },
+    Blocked { message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6042,6 +6098,12 @@ pub enum WorkbenchEnvironmentLifecycle {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkbenchBuildBlocker {
+    pub logical_root: ProjectRootPath,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkbenchEnvironment {
@@ -6050,7 +6112,11 @@ pub enum WorkbenchEnvironment {
     Bubblewrap {
         manifest_path: HostAbsPath,
         logical_root: ProjectRootPath,
-        support: WorkbenchSupport,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_roots: Vec<ProjectRootPath>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build_blockers: Vec<WorkbenchBuildBlocker>,
+        support: Box<WorkbenchSupport>,
         #[serde(default)]
         lifecycle: WorkbenchEnvironmentLifecycle,
         initialization: WorkbenchInitialization,
@@ -6137,6 +6203,7 @@ pub enum ProjectOperationStage {
     Queue,
     Git,
     Filesystem,
+    PrepareBuilds,
     Persistence,
     Cleanup,
     Fanout,

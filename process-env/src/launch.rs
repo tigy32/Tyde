@@ -73,18 +73,10 @@ impl WorkspacePath {
         let host = path.as_ref().to_path_buf();
         let project = current_project();
         let execution = match &project {
-            Some(project) => match project.execution_root_mapping()? {
-                Some((host_root, execution_root)) => match host.strip_prefix(&host_root.0) {
-                    // Joining an empty suffix adds a separator, changing native
-                    // project indexes and violating canonical workspace APIs.
-                    Ok(relative) if relative.as_os_str().is_empty() => {
-                        std::path::PathBuf::from(&execution_root.0)
-                    }
-                    Ok(relative) => std::path::Path::new(&execution_root.0).join(relative),
-                    Err(_) => host.clone(),
-                },
-                None => host.clone(),
-            },
+            Some(project) => std::path::PathBuf::from(
+                project
+                    .runtime_path_for_host(host.to_str().ok_or("Workspace path must be UTF-8")?)?,
+            ),
             None => host.clone(),
         };
         Ok(Self { host, execution })
@@ -728,23 +720,22 @@ impl GroupCommand {
             return Ok(self);
         };
         project
-            .execution_root_mapping()
+            .execution_root_mappings()
             .map(|_| ())
             .map_err(std::io::Error::other)?;
-        if !cfg!(target_os = "linux") || roots.len() != 1 {
-            return Err(std::io::Error::other(
-                "Bubblewrap requires Linux and one authoritative source root",
-            ));
+        if !cfg!(target_os = "linux") {
+            return Err(std::io::Error::other("Bubblewrap requires Linux"));
         }
         let root = std::path::Path::new(&roots[0].worktree_root.0);
         let cwd = match &self.cwd {
-            Some(cwd) => match cwd.strip_prefix(root) {
-                Ok(relative) if relative.as_os_str().is_empty() => {
-                    std::path::PathBuf::from(&logical_root.0)
-                }
-                Ok(relative) => std::path::Path::new(&logical_root.0).join(relative),
-                Err(_) => cwd.clone(),
-            },
+            Some(cwd) => std::path::PathBuf::from(
+                project
+                    .runtime_path_for_host(
+                        cwd.to_str()
+                            .ok_or_else(|| std::io::Error::other("Workspace path must be UTF-8"))?,
+                    )
+                    .map_err(std::io::Error::other)?,
+            ),
             None => std::path::PathBuf::from(&logical_root.0),
         };
         // The launcher applies cwd before the namespace exists. Only the

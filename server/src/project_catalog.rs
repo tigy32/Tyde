@@ -827,13 +827,6 @@ async fn run_mutation(
             .selected_workbench_engine()
             .await
             .map_err(|error| AppError::internal(operation, anyhow!(error)))?;
-        if engine == protocol::WorkbenchEngine::Bubblewrap && parent.root_paths().len() != 1 {
-            return Err(AppError::invalid(
-                operation,
-                "Bubblewrap workbenches require exactly one project root",
-            )
-            .with_workbench_reason(protocol::WorkbenchUnsupportedReason::UnsupportedRoots));
-        }
         let environment_directory = match engine {
             protocol::WorkbenchEngine::Native => None,
             protocol::WorkbenchEngine::Bubblewrap => Some(catalog.environment_directory()?),
@@ -870,9 +863,8 @@ async fn run_mutation(
             created.push(root.root.clone());
         }
         if let Some(directory) = environment_directory {
-            match crate::workbench::prepare(Path::new(&created[0].worktree_root.0), &directory)
-                .await
-            {
+            catalog.stage(stream, ProjectOperationStage::PrepareBuilds, true);
+            match crate::workbench::prepare(&created, &directory).await {
                 Ok(prepared) => environment = prepared,
                 Err(mut error) => {
                     let environment_cleanup = rollback_workbench_environment(&directory).await;

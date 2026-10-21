@@ -1565,7 +1565,7 @@ pub trait Backend: Send + Sync + 'static {
     {
         async move {
             let projected = match tyde_process_env::launch::current_project() {
-                Some(project) => project.execution_root_mapping()?.is_some(),
+                Some(project) => !project.execution_root_mappings()?.is_empty(),
                 None => false,
             };
             if projected && context.session_store.is_none() {

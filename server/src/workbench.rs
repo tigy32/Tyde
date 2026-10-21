@@ -125,7 +125,17 @@ fn operation_result<T: serde::de::DeserializeOwned>(
         result.status.success()
     );
     if !result.status.success() {
-        let error: EngineErrorOutput = serde_json::from_slice(&result.stderr).map_err(|error| {
+        let failure = result
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .rfind(|line| !line.is_empty())
+            .ok_or_else(|| {
+                AppError::invalid(
+                    "workbench_environment",
+                    "Workbench engine omitted its terminal failure record",
+                )
+            })?;
+        let error: EngineErrorOutput = serde_json::from_slice(failure).map_err(|error| {
             AppError::internal_message(
                 "workbench_environment",
                 "Workbench engine failed without a valid typed failure",
@@ -202,7 +212,7 @@ pub(crate) fn support() -> WorkbenchSupport {
 }
 
 pub(crate) async fn prepare(
-    root: &Path,
+    roots: &[protocol::WorkbenchRoot],
     environment_root: &Path,
 ) -> AppResult<WorkbenchEnvironment> {
     if !cfg!(target_os = "linux") {
@@ -212,26 +222,42 @@ pub(crate) async fn prepare(
         )
         .with_workbench_reason(WorkbenchUnsupportedReason::NotLinux));
     }
-    let path = root.join(".tyde/workbench.json");
-    let config = match tokio::fs::read(&path).await {
-        Ok(contents) => serde_json::from_slice::<protocol::WorkbenchConfiguration>(&contents)
-            .map_err(|_| {
-                AppError::invalid(
-                    "workbench_create",
-                    "Invalid .tyde/workbench.json configuration",
-                )
-                .with_workbench_reason(WorkbenchUnsupportedReason::RuntimeConfigurationInvalid)
-            })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            protocol::WorkbenchConfiguration::default()
+    let mut configurations = Vec::new();
+    let mut automatic = Vec::new();
+    for root in roots {
+        let path = Path::new(&root.worktree_root.0).join(".tyde/workbench.json");
+        match tokio::fs::read(path).await {
+            Ok(contents) => {
+                configurations.push(
+                    serde_json::from_slice::<protocol::WorkbenchConfiguration>(&contents).map_err(
+                        |_| {
+                            AppError::invalid(
+                                "workbench_create",
+                                "Invalid .tyde/workbench.json configuration",
+                            )
+                            .with_workbench_reason(
+                                WorkbenchUnsupportedReason::RuntimeConfigurationInvalid,
+                            )
+                        },
+                    )?,
+                );
+                automatic.push(false);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                configurations.push(protocol::WorkbenchConfiguration::default());
+                automatic.push(true);
+            }
+            Err(error) => return Err(AppError::internal("workbench_create", error)),
         }
-        Err(error) => return Err(AppError::internal("workbench_create", error)),
-    };
-    let mut config_file = tempfile::NamedTempFile::new()
+    }
+    let mut request = tempfile::NamedTempFile::new()
         .map_err(|error| AppError::internal("workbench_create", error))?;
-    serde_json::to_writer(&mut config_file, &config)
+    serde_json::to_writer(&mut request, &serde_json::json!({"roots": roots, "configurations": configurations, "automatic": automatic})).map_err(|error| AppError::internal("workbench_create", error))?;
+    let mut setup = tempfile::NamedTempFile::new()
         .map_err(|error| AppError::internal("workbench_create", error))?;
-    invoke("prepare", &[root, environment_root, config_file.path()]).await
+    std::io::Write::write_all(&mut setup, include_str!("workbench/setup.py").as_bytes())
+        .map_err(|error| AppError::internal("workbench_create", error))?;
+    invoke("prepare", &[request.path(), environment_root, setup.path()]).await
 }
 
 #[derive(Deserialize)]
@@ -252,12 +278,11 @@ pub(crate) async fn seal(project: &Project, discard_artifacts: bool) -> AppResul
     else {
         return Ok(());
     };
-    let [root] = roots.as_slice() else {
-        return Err(AppError::invalid(
-            "workbench_remove",
-            "Bubblewrap requires one authoritative source root",
-        )
-        .with_workbench_reason(WorkbenchUnsupportedReason::UnsupportedRoots));
+    let Some(root) = roots.first() else {
+        return Err(
+            AppError::invalid("workbench_remove", "Bubblewrap requires a source root")
+                .with_workbench_reason(WorkbenchUnsupportedReason::UnsupportedRoots),
+        );
     };
     if !discard_artifacts {
         let result: SnapshotResult = invoke(
@@ -296,7 +321,7 @@ pub(crate) async fn finish(environment: &WorkbenchEnvironment) -> AppResult<()> 
 
 pub(crate) fn validate_execution(project: &Project) -> AppResult<()> {
     project
-        .execution_root_mapping()
+        .execution_root_mappings()
         .map(|_| ())
         .map_err(|message| {
             AppError::invalid("spawn_agent", message)
@@ -318,7 +343,7 @@ pub(crate) async fn prepare_backend_execution(
     let Some(project) = current_project() else {
         return Ok(());
     };
-    project.execution_root_mapping().map(|_| ())?;
+    project.execution_root_mappings().map(|_| ())?;
     let ProjectSource::GitWorkbench {
         environment:
             WorkbenchEnvironment::Bubblewrap {
@@ -332,8 +357,8 @@ pub(crate) async fn prepare_backend_execution(
     else {
         return Ok(());
     };
-    let [root] = roots.as_slice() else {
-        return Err("Execution workspace requires one authoritative source root".to_owned());
+    let Some(root) = roots.first() else {
+        return Err("Execution workspace requires a source root".to_owned());
     };
     let mut environment = invoke::<tyde_process_env::launch::ExecutionEnvironment>(
         "environment",

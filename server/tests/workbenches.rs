@@ -4182,7 +4182,9 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         panic!("Bubblewrap selection cannot route through Native");
     };
     assert_eq!(logical_root.0, "/mnt/tyde-workspace");
-    assert_eq!(*initialization, protocol::WorkbenchInitialization::Cold);
+    assert!(
+        matches!(initialization, protocol::WorkbenchInitialization::Blocked { message } if message.contains("No conventional"))
+    );
     let manifest_path = PathBuf::from(&manifest_path.0);
     let root = project.root_paths()[0].clone();
     let (caller, caller_start) = fixture
@@ -4855,4 +4857,562 @@ os._exit(0)
         output.contains("\"reason\": \"runtime_service_failed\""),
         "actual terminal output must surface the typed runtime service failure"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bubblewrap_automatic_multiroot_builds_reuse_private_artifacts() {
+    use protocol::{WorkbenchEngine, WorkbenchEnvironment, WorkbenchInitialization};
+
+    async fn terminal_record(
+        client: &mut client::Connection,
+        terminal: &NewTerminalPayload,
+        command: String,
+        marker: &str,
+    ) -> Value {
+        client
+            .terminal_send(
+                &terminal.terminal_id,
+                protocol::TerminalSendPayload { data: format!("{command}\nstatus=$?; printf '\\n{{\"terminal_command_finished\":%s}}\\n' \"$status\"\n") },
+            )
+            .await
+            .unwrap();
+        let mut output = String::new();
+        loop {
+            let event = next_frame_matching_on(client, "namespace command completion", |env| {
+                env.stream == terminal.stream
+                    && matches!(
+                        env.kind,
+                        FrameKind::TerminalOutput
+                            | FrameKind::TerminalError
+                            | FrameKind::TerminalExit
+                    )
+            })
+            .await;
+            assert_eq!(event.kind, FrameKind::TerminalOutput);
+            output.push_str(
+                &event
+                    .parse_payload::<protocol::TerminalOutputPayload>()
+                    .unwrap()
+                    .data,
+            );
+            let records = output
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>();
+            if let Some(completed) = records
+                .iter()
+                .find(|record| record.get("terminal_command_finished").is_some())
+            {
+                assert_eq!(
+                    completed["terminal_command_finished"], 0,
+                    "namespace command must succeed"
+                );
+                return records
+                    .into_iter()
+                    .find(|record| record.get(marker).is_some())
+                    .expect("completed command must emit its assertion record");
+            }
+        }
+    }
+
+    let workspace = tempfile::tempdir().expect("sibling repositories");
+    let rust = workspace.path().join("rust");
+    let shared = workspace.path().join("shared");
+    let web = workspace.path().join("web");
+    let library = workspace.path().join("library");
+    for root in [&rust, &shared, &web, &library] {
+        fs::create_dir(root).unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "tests@example.com"]);
+        git(root, &["config", "user.name", "Tests"]);
+        fs::write(
+            root.join(".gitignore"),
+            "/target/\n/node_modules/\n/dist/\n",
+        )
+        .unwrap();
+    }
+    fs::create_dir(rust.join("src")).unwrap();
+    fs::create_dir(shared.join("src")).unwrap();
+    fs::write(rust.join("Cargo.toml"), "[package]\nname='warm_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nwarm_shared={path='../shared'}\n").unwrap();
+    fs::write(
+        rust.join("src/main.rs"),
+        "fn main() { println!(\"{}\", warm_shared::value()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        shared.join("Cargo.toml"),
+        "[package]\nname='warm_shared'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(shared.join("src/lib.rs"), "pub fn value() -> u32 { 42 }\n").unwrap();
+    fs::write(web.join("package.json"), serde_json::to_vec(&json!({"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"},"scripts":{"build":"node build.js"}})).unwrap()).unwrap();
+    fs::write(web.join("package-lock.json"), serde_json::to_vec(&json!({"name":"web","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"}},"../library":{"name":"library","version":"1.0.0"},"node_modules/library":{"resolved":"../library","link":true}}})).unwrap()).unwrap();
+    fs::write(web.join("build.js"), "const fs=require('fs'); const value=String(require('library')); fs.mkdirSync('dist',{recursive:true}); if(!fs.existsSync('dist/value') || fs.readFileSync('dist/value','utf8')!==value) fs.writeFileSync('dist/value',value);\n").unwrap();
+    fs::write(
+        library.join("package.json"),
+        "{\"name\":\"library\",\"version\":\"1.0.0\",\"main\":\"index.js\"}\n",
+    )
+    .unwrap();
+    fs::write(library.join("package-lock.json"), "{\"name\":\"library\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"library\",\"version\":\"1.0.0\"}}}\n").unwrap();
+    fs::write(library.join("index.js"), "module.exports=42;\n").unwrap();
+    for root in [&rust, &shared, &web, &library] {
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "Ordinary project"]);
+    }
+    fs::create_dir(workspace.path().join(".cargo")).unwrap();
+    fs::write(
+        workspace.path().join(".cargo/config.toml"),
+        "[build]\nrustflags=['--cfg=warm_ancestor','--check-cfg=cfg(warm_ancestor)']\n",
+    )
+    .unwrap();
+    fs::create_dir(rust.join(".cargo")).unwrap();
+    fs::write(
+        rust.join(".cargo/config.toml"),
+        "[build]\nrustflags=['--cfg=warm_project','--check-cfg=cfg(warm_project)']\n",
+    )
+    .unwrap();
+    fs::write(rust.join("src/main.rs"), "#[cfg(not(warm_ancestor))] compile_error!(\"ancestor flags missing\");\n#[cfg(not(warm_project))] compile_error!(\"project flags missing\");\nfn main() { println!(\"{}\", warm_shared::value()); }\n").unwrap();
+    git(&rust, &["add", "."]);
+    git(
+        &rust,
+        &[
+            "commit",
+            "-qm",
+            "Require inherited and project Cargo settings",
+        ],
+    );
+    let mut fixture = Fixture::new().await;
+    let parent = create_project(&mut fixture.client, vec![&rust, &shared, &web, &library]).await;
+    let native = create_workbench(&mut fixture.client, &parent, "native-before-selection").await;
+    fixture
+        .client
+        .replace_setting(
+            "/workbenches/engine",
+            WorkbenchEngine::Bubblewrap,
+            WorkbenchEngine::Native,
+        )
+        .await
+        .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::SettingsWriteResult,
+        "select Bubblewrap",
+    )
+    .await;
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("automatic-first".into()),
+            name: "Automatic baseline".into(),
+        })
+        .await
+        .unwrap();
+    let preparation =
+        next_frame_matching_on(&mut fixture.client, "visible baseline preparation", |env| {
+            env.kind == FrameKind::CommandError
+                || (env.kind == FrameKind::ProjectOperation
+                    && matches!(
+                        env.parse_payload::<protocol::ProjectOperationPayload>()
+                            .unwrap()
+                            .state,
+                        protocol::ProjectOperationState::Running {
+                            stage: protocol::ProjectOperationStage::PrepareBuilds
+                        }
+                    ))
+        })
+        .await;
+    assert_eq!(
+        preparation.kind,
+        FrameKind::ProjectOperation,
+        "multi-root setup must enter the typed preparation stage"
+    );
+    let outcome =
+        next_frame_matching_on(&mut fixture.client, "automatic baseline outcome", |env| {
+            matches!(env.kind, FrameKind::ProjectNotify | FrameKind::CommandError)
+        })
+        .await;
+    if outcome.kind == FrameKind::CommandError {
+        let error = outcome.parse_payload::<CommandErrorPayload>().unwrap();
+        match &fixture.bootstrap.workbench_support.bubblewrap {
+            protocol::WorkbenchAvailability::Unsupported { reason, .. } => {
+                assert_eq!(error.workbench_reason, Some(*reason))
+            }
+            protocol::WorkbenchAvailability::Available => assert_eq!(
+                error.workbench_reason,
+                Some(protocol::WorkbenchUnsupportedReason::ReflinkUnsupported)
+            ),
+        }
+        assert!(
+            fixture
+                .connect_with_bootstrap()
+                .await
+                .1
+                .projects
+                .iter()
+                .all(|project| project.parent_project_id() != Some(&parent.id)
+                    || project.id == native.id)
+        );
+        eprintln!(
+            "Automatic warm flow explicitly unavailable: {:?}; no build/reuse pass claimed",
+            error.workbench_reason
+        );
+        return;
+    }
+    let ProjectNotifyPayload::Upsert { project: first } = outcome.parse_payload().unwrap() else {
+        panic!("created workbench")
+    };
+    let ProjectSource::GitWorkbench {
+        environment:
+            WorkbenchEnvironment::Bubblewrap {
+                initialization: WorkbenchInitialization::Prepared { .. },
+                additional_roots,
+                build_blockers,
+                ..
+            },
+        ..
+    } = &first.source
+    else {
+        panic!("first creation must honestly report an initial build")
+    };
+    assert_eq!(additional_roots.len(), 3);
+    assert!(build_blockers.is_empty());
+    let second = create_workbench(&mut fixture.client, &parent, "automatic-second").await;
+    assert!(
+        matches!(
+            second.source,
+            ProjectSource::GitWorkbench {
+                environment: WorkbenchEnvironment::Bubblewrap {
+                    initialization: WorkbenchInitialization::Snapshot { .. },
+                    ..
+                },
+                ..
+            }
+        ),
+        "second creation must restore the verified composite cohort"
+    );
+    let first_roots = first.root_paths();
+    let second_roots = second.root_paths();
+    for roots in [&first_roots, &second_roots] {
+        assert!(
+            Path::new(&roots[0].0)
+                .join("target/debug/warm_app")
+                .is_file()
+        );
+        assert!(
+            Path::new(&roots[1].0)
+                .join("target/debug/libwarm_shared.rlib")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&roots[2].0).join("dist/value")).unwrap(),
+            "42"
+        );
+        // npm's normal locked install may materialize a directory, not a
+        // symlink. Assert the installed sibling code, not that storage choice.
+        assert_eq!(
+            fs::read(Path::new(&roots[2].0).join("node_modules/library/index.js")).unwrap(),
+            fs::read(library.join("index.js")).unwrap()
+        );
+    }
+    fixture
+        .client
+        .terminal_create(TerminalCreatePayload {
+            target: TerminalLaunchTarget::Project {
+                project_id: second.id.clone(),
+                root: second_roots[0].clone(),
+                relative_cwd: None,
+            },
+            cols: 120,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    let terminal = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewTerminal,
+        "warm ordinary build terminal",
+    )
+    .await
+    .parse_payload::<NewTerminalPayload>()
+    .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::TerminalBootstrap,
+        "warm terminal bootstrap",
+    )
+    .await;
+    let js_artifact = Path::new(&second_roots[2].0).join("dist/value");
+    let js_mtime = fs::metadata(&js_artifact).unwrap().modified().unwrap();
+    fixture.client.terminal_send(&terminal.terminal_id, protocol::TerminalSendPayload {data:r#"printf '\n'; cargo build --message-format=json && (cd ../web && npm run build); result=$?; printf '\n{"warm_flow_done":true,"status":%s}\n' "$result"
+"#.into()}).await.unwrap();
+    let mut output = String::new();
+    loop {
+        let event = next_frame_matching_on(
+            &mut fixture.client,
+            "ordinary warm build command completion",
+            |env| {
+                env.stream == terminal.stream
+                    && matches!(
+                        env.kind,
+                        FrameKind::TerminalOutput
+                            | FrameKind::TerminalError
+                            | FrameKind::TerminalExit
+                    )
+            },
+        )
+        .await;
+        assert_eq!(event.kind, FrameKind::TerminalOutput);
+        output.push_str(
+            &event
+                .parse_payload::<protocol::TerminalOutputPayload>()
+                .unwrap()
+                .data,
+        );
+        if let Some(completion) = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["warm_flow_done"] == true)
+        {
+            assert_eq!(
+                completion["status"], 0,
+                "ordinary warm build command must succeed"
+            );
+            break;
+        }
+    }
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "real Cargo must report both workspace artifacts"
+    );
+    assert!(
+        artifacts.iter().all(|value| value["fresh"] == true),
+        "Cargo must actually reuse the restored compilation outputs"
+    );
+    assert_eq!(
+        fs::metadata(&js_artifact).unwrap().modified().unwrap(),
+        js_mtime,
+        "the normal sibling JS build must retain its already-built output"
+    );
+    let written = terminal_record(&mut fixture.client, &terminal, r#"python3 -c 'import json; from pathlib import Path; p=Path("../web/dist/value"); p.write_text("private artifact change"); Path("../shared/src/lib.rs").write_text("private source change"); print("\n"+json.dumps({"isolation_written":True,"inode":p.stat().st_ino}))'
+"#.into(), "isolation_written").await;
+    fixture
+        .client
+        .terminal_create(TerminalCreatePayload {
+            target: TerminalLaunchTarget::Project {
+                project_id: first.id.clone(),
+                root: first_roots[0].clone(),
+                relative_cwd: None,
+            },
+            cols: 120,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    let peer_terminal = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewTerminal,
+        "peer namespace terminal",
+    )
+    .await
+    .parse_payload::<NewTerminalPayload>()
+    .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::TerminalBootstrap,
+        "peer terminal bootstrap",
+    )
+    .await;
+    let checked = terminal_record(&mut fixture.client, &peer_terminal, format!(r#"python3 <<'PY'
+import json
+from pathlib import Path
+p=Path("../web/dist/value")
+print("\n"+json.dumps({{"isolation_checked":True,"artifact_unchanged":p.read_text()=="42","source_unchanged":Path("../shared/src/lib.rs").read_bytes()==Path({}).read_bytes(),"parent_unbuilt":not Path({}).exists() and not Path({}).exists(),"inode":p.stat().st_ino}}))
+PY
+"#, serde_json::to_string(&shared.join("src/lib.rs")).unwrap(), serde_json::to_string(&rust.join("target")).unwrap(), serde_json::to_string(&web.join("node_modules")).unwrap()), "isolation_checked").await;
+    assert_eq!(
+        checked["artifact_unchanged"], true,
+        "peer namespace must retain its original artifact"
+    );
+    assert_eq!(
+        checked["source_unchanged"], true,
+        "peer and Native source must remain unchanged"
+    );
+    assert_eq!(
+        checked["parent_unbuilt"], true,
+        "preparation must not build or seed the Native parent"
+    );
+    assert_ne!(
+        written["inode"], checked["inode"],
+        "namespace artifacts must have independent private inodes"
+    );
+    fs::write(library.join("index.js"), "module.exports=43;\n").unwrap();
+    git(&library, &["add", "."]);
+    git(&library, &["commit", "-qm", "Change sibling build input"]);
+    let changed = create_workbench(&mut fixture.client, &parent, "automatic-changed").await;
+    assert!(
+        matches!(
+            changed.source,
+            ProjectSource::GitWorkbench {
+                environment: WorkbenchEnvironment::Bubblewrap {
+                    initialization: WorkbenchInitialization::Prepared { .. },
+                    ..
+                },
+                ..
+            }
+        ),
+        "a changed sibling revision must prepare a new composite baseline"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(&changed.root_paths()[2].0).join("dist/value")).unwrap(),
+        "43"
+    );
+    let (_, replay) = fixture.connect_with_bootstrap().await;
+    assert!(
+        replay.projects.iter().any(|project| project == &native),
+        "selecting Bubblewrap must not convert an existing Native workbench"
+    );
+    assert!(
+        replay.projects.iter().any(|project| project == &second),
+        "replay must retain the exact server-owned reuse state"
+    );
+    let external = workspace.path().join("external");
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("assets"), "undeclared input").unwrap();
+    std::os::unix::fs::symlink("../external", web.join("vendor")).unwrap();
+    fs::write(web.join("build.js"), "const fs=require('fs'); fs.mkdirSync('dist'); fs.symlinkSync('../vendor/assets','dist/assets');\n").unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-qm", "External chained artifact link"]);
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("reject-external-link".into()),
+            name: "Rejected external link".into(),
+        })
+        .await
+        .unwrap();
+    let rejection = expect_command_error(
+        &mut fixture.client,
+        "reject external artifact symlink chain",
+    )
+    .await;
+    assert_eq!(
+        rejection.workbench_reason,
+        Some(protocol::WorkbenchUnsupportedReason::IncompatibleEnvironment)
+    );
+    assert!(
+        rejection.message.contains("symlink") && rejection.message.contains("outside registered")
+    );
+    fs::write(
+        web.join("build.js"),
+        "process.stderr.write('fixture compilation failed\\n'); process.exit(7);\n",
+    )
+    .unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-qm", "Producer failure diagnostic"]);
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("reject-producer-failure".into()),
+            name: "Rejected producer".into(),
+        })
+        .await
+        .unwrap();
+    let failure = expect_command_error(&mut fixture.client, "actionable producer failure").await;
+    assert!(
+        failure.message.contains("/mnt/tyde-workspace/web")
+            && failure.message.contains("exit 7")
+            && failure.message.contains("redacted build diagnostics")
+    );
+    let manifest = fs::read_to_string(rust.join("Cargo.toml"))
+        .unwrap()
+        .replace("../shared", shared.to_str().unwrap());
+    fs::write(rust.join("Cargo.toml"), manifest).unwrap();
+    git(&rust, &["add", "."]);
+    git(
+        &rust,
+        &["commit", "-qm", "Unmapped absolute source dependency"],
+    );
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("reject-native-source-alias".into()),
+            name: "Rejected native source alias".into(),
+        })
+        .await
+        .unwrap();
+    let unmapped = expect_command_error(
+        &mut fixture.client,
+        "reject unmapped local source dependency",
+    )
+    .await;
+    assert_eq!(
+        unmapped.workbench_reason,
+        Some(protocol::WorkbenchUnsupportedReason::RuntimeConfigurationInvalid)
+    );
+    assert!(
+        unmapped.message.contains("local build input")
+            && unmapped.message.contains("outside registered")
+    );
+    fs::write(rust.join("Cargo.toml"), format!("[package]\nname='warm_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nwarm_shared='0.1.0'\n[patch.crates-io]\nwarm_shared={{path={}}}\n", serde_json::to_string(&shared).unwrap())).unwrap();
+    git(&rust, &["add", "."]);
+    git(
+        &rust,
+        &["commit", "-qm", "Unmapped absolute local Cargo patch"],
+    );
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("reject-native-patch-alias".into()),
+            name: "Rejected native patch alias".into(),
+        })
+        .await
+        .unwrap();
+    let patch =
+        expect_command_error(&mut fixture.client, "reject unmapped Cargo patch input").await;
+    assert_eq!(
+        patch.workbench_reason,
+        Some(protocol::WorkbenchUnsupportedReason::RuntimeConfigurationInvalid)
+    );
+    assert!(
+        patch.message.contains("local build input") && patch.message.contains("outside registered")
+    );
+    let (_, after_failure) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        after_failure
+            .projects
+            .iter()
+            .filter(|project| project.parent_project_id() == Some(&parent.id))
+            .count(),
+        4,
+        "failed setups may not register an environment or Native substitute"
+    );
+    for project in [first, second, changed, native] {
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: project.id.clone(),
+                force: true,
+            })
+            .await
+            .unwrap();
+        next_frame_matching_on(&mut fixture.client, "remove automatic build flow", |env| env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete {project:removed} if removed.id == project.id)).await;
+        assert!(
+            project
+                .root_paths()
+                .iter()
+                .all(|root| !Path::new(&root.0).exists())
+        );
+    }
 }

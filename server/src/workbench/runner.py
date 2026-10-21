@@ -131,14 +131,14 @@ def expand(value, environment):
         fail("runtime_configuration_invalid", "A configured runtime reference has an invalid or unavailable environment variable")
 
 
-def runtime_environment(config):
+def runtime_environment(config, logical_root=LOGICAL_ROOT):
     env = dict(os.environ)
     for key in config["remove_environment"]:
         env.pop(key, None)
-    references = dict(env, TYDE_WORKBENCH_ROOT=LOGICAL_ROOT, TYDE_WORKBENCH_RUNTIME=RUNTIME)
+    references = dict(env, TYDE_WORKBENCH_ROOT=logical_root, TYDE_WORKBENCH_RUNTIME=RUNTIME)
     for key, value in config["environment"].items():
         env[key] = expand(value, references)
-    env["TYDE_WORKBENCH_ROOT"] = LOGICAL_ROOT
+    env["TYDE_WORKBENCH_ROOT"] = logical_root
     env["TYDE_WORKBENCH_RUNTIME"] = RUNTIME
     env["PATH"] = RUNTIME + "/bin:" + env["PATH"]
     return env
@@ -147,14 +147,14 @@ def runtime_environment(config):
 def validate_configuration(config):
     snapshot = config["snapshot"]
     if snapshot is not None:
-        paths = [relative_path(value) for value in snapshot["include"]]
+        paths = [relative_path(value) for value in snapshot["include"] + snapshot.get("optional_include", [])]
         if not snapshot["producer"]:
             fail("runtime_configuration_invalid", "Snapshots require one explicit configured producer command")
         if not paths or len(set(paths)) != len(paths):
             fail("runtime_configuration_invalid", "Snapshot include paths must be nonempty and unique")
         if any(a != b and a in b.parents for a in paths for b in paths):
             fail("runtime_configuration_invalid", "Snapshot include paths must not overlap")
-        if not snapshot["provenance_paths"]:
+        if not snapshot["provenance_paths"] and not snapshot.get("provenance_commands"):
             fail("runtime_configuration_invalid", "Snapshot reuse requires explicit toolchain/ABI/input provenance paths")
     for value in config["runtime_directories"] + list(config["runtime_files"]):
         path = relative_path(value)
@@ -190,9 +190,11 @@ def entry_identity(path):
 
 def included_paths(root, config):
     result = []
-    for value in config["snapshot"]["include"]:
+    for value in config["snapshot"]["include"] + config["snapshot"].get("optional_include", []):
         path = root / relative_path(value)
         if not path.exists() and not path.is_symlink():
+            if value in config["snapshot"].get("optional_include", []):
+                continue
             fail("incompatible_environment", "A configured snapshot path does not exist after producer completion")
         if not path.parent.resolve().is_relative_to(root.resolve()):
             fail("incompatible_environment", "Snapshot include path traverses a symlink outside its project")
@@ -200,20 +202,54 @@ def included_paths(root, config):
     return result
 
 
-def artifact_inventory(root, config):
+def resolved_workspace_link(logical, records, files):
+    # Resolve each component against authoritative mounts, not the host's
+    # differently named sibling worktrees. Artifact-store overlays supply the
+    # selected outputs while committed source supplies the remaining links.
+    links = 0
+    while True:
+        prefix = Path("/")
+        for index, part in enumerate(logical.parts[1:], 1):
+            prefix /= part
+            mapped = next(((number, record) for number, record in enumerate(records) if prefix.is_relative_to(record["logical_root"])), None)
+            if mapped is None:
+                if any(Path(record["logical_root"]).is_relative_to(prefix) for record in records):
+                    continue
+                fail("incompatible_environment", "Artifact symlink resolves outside registered workspace roots")
+            number, record = mapped
+            relative = prefix.relative_to(record["logical_root"])
+            physical = Path(record["root"]) / relative
+            snapshot = record["configuration"]["snapshot"]
+            if files is not None and snapshot is not None and any(relative == Path(value) or Path(value) in relative.parents for value in snapshot["include"] + snapshot.get("optional_include", [])):
+                physical = artifact_root(files, number, len(records)) / relative
+            if physical.is_symlink():
+                target = Path(os.readlink(physical))
+                if target.is_absolute():
+                    fail("incompatible_environment", "Artifact symlink chain contains an absolute link")
+                links += 1
+                if links > 40:
+                    fail("incompatible_environment", "Artifact symlink chain is cyclic or exceeds the filesystem link limit")
+                logical = Path(os.path.normpath(str(prefix.parent / target / Path(*logical.parts[index + 1:]))))
+                break
+        else:
+            return logical
+
+
+def artifact_inventory(root, config, logical_root, records, files):
     entries = {}
     for selected in included_paths(root, config):
         paths = [selected]
         if selected.is_dir() and not selected.is_symlink():
-            for base, dirs, files in os.walk(selected, followlinks=False):
-                paths.extend(Path(base) / name for name in dirs + files)
+            for base, dirs, names in os.walk(selected, followlinks=False):
+                paths.extend(Path(base) / name for name in dirs + names)
         for path in paths:
             value = entry_identity(path)
             if value["kind"] == "symlink":
                 link = Path(value["link"])
-                resolved = (path.parent / link).resolve()
-                if link.is_absolute() or not resolved.is_relative_to(root.resolve()):
-                    fail("incompatible_environment", "Snapshot symlinks must remain relative and inside the project")
+                if link.is_absolute():
+                    fail("incompatible_environment", "Snapshot symlinks must remain relative and inside registered workspace roots")
+                logical = Path(os.path.normpath(str(Path(logical_root) / path.relative_to(root).parent / link)))
+                resolved_workspace_link(logical, records, files)
             entries[str(path.relative_to(root))] = value
     return entries
 
@@ -227,9 +263,11 @@ def source_inventory(root):
     return entries
 
 
-def assert_clean(root):
-    if git(root, "status", "--porcelain=v1", "--untracked-files=normal"):
-        fail("incompatible_environment", "Snapshot production requires clean committed source, including untracked inputs")
+def assert_clean(root, config=None):
+    outputs = [] if config is None or config["snapshot"] is None else config["snapshot"]["include"] + config["snapshot"].get("optional_include", [])
+    for raw in git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").split(b"\0"):
+        if raw and not (raw.startswith(b"?? ") and any(Path(os.fsdecode(raw[3:])) == Path(output) or Path(output) in Path(os.fsdecode(raw[3:])).parents for output in outputs)):
+            fail("incompatible_environment", "Snapshot production requires unchanged committed source and no undeclared untracked inputs")
 
 
 def input_identity(root, config, env):
@@ -257,6 +295,7 @@ def input_identity(root, config, env):
             identity.pop("mtime_ns")
             identities[str(path.relative_to(resolved)) if path != resolved else "."] = identity
         external[value] = digest(json.dumps(identities, sort_keys=True).encode())
+    inputs["commands"] = [digest(checked([expand(value, env) for value in command], cwd=root, env=env)) for command in snapshot.get("provenance_commands", [])]
     inputs["declared_inputs"] = external
     return inputs
 
@@ -275,65 +314,205 @@ def admission(manifest_path, exclusive=False):
         yield
 
 
-def prepare(root, directory, configuration_path):
-    root, directory = Path(root).resolve(), Path(directory).resolve()
-    config = load(configuration_path)
+def retain_build_diagnostics(output, common):
+    import re
+    logs = common / "tyde-workbench-diagnostics"
+    logs.mkdir(mode=0o700, exist_ok=True)
+    path = logs / (uuid.uuid4().hex + ".log")
+    secrets = [value.encode() for key, value in os.environ.items() if value and re.search(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|AUTH|SESSION|CODEWORD", key, re.I)]
+    output.seek(0)
+    with path.open("xb") as log:
+        os.chmod(path, 0o600)
+        for line in output:
+            for secret in secrets:
+                line = line.replace(secret, b"[redacted]")
+            line = re.sub(rb"(?i)(bearer\s+|(?:token|password|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+", rb"\1[redacted]", line)
+            log.write(line)
+    return path
+
+
+def report_failure(reason, message):
+    failure = {"reason": reason, "message": message}
+    if len(sys.argv) > 1 and sys.argv[1] in ("produce", "inside"):
+        save(Path(RECEIPTS) / "failure.json", failure)
+    print(json.dumps({"error": failure}), file=sys.stderr)
+
+
+def root_records(manifest):
+    records = manifest.get("roots")
+    if not isinstance(records, list) or not records:
+        fail("incompatible_environment", "Workbench manifest lacks authoritative registered root mappings; recreate this older or malformed environment from its parent")
+    return records
+
+
+def workspace_identity(manifest, environment):
+    records = root_records(manifest)
+    result = {}
+    for record in records:
+        root, config = Path(record["root"]), record["configuration"]
+        entry = {"tree": git(root, "rev-parse", "HEAD^{tree}").decode().strip(), "commit": git(root, "rev-parse", "HEAD").decode().strip()}
+        if config["snapshot"] is not None:
+            entry["inputs"] = input_identity(root, config, environment)
+        result[record["logical_root"]] = entry
+    return result
+
+
+def workspace_sources(manifest):
+    return {record["logical_root"]: source_inventory(Path(record["root"])) for record in root_records(manifest)}
+
+
+def workspace_artifacts(manifest, files=None):
+    records = root_records(manifest)
+    entries = {}
+    for index, record in enumerate(records):
+        if record["configuration"]["snapshot"] is not None:
+            root = Path(record["root"]) if files is None else artifact_root(files, index, len(records))
+            entries[record["logical_root"]] = artifact_inventory(root, record["configuration"], record["logical_root"], records, files)
+    return entries
+
+
+def artifact_root(files, index, count):
+    return Path(files) if count == 1 else Path(files) / str(index)
+
+
+def workspace_clean(manifest):
+    for record in root_records(manifest):
+        assert_clean(Path(record["root"]), record["configuration"])
+
+
+def prepare(request_path, directory, setup_path):
+    import runpy
+    request = load(request_path)
+    roots = request["roots"]
+    if not roots:
+        fail("unsupported_roots", "Bubblewrap requires at least one registered Git root")
+    parents = [Path(root["parent_root"]).resolve() for root in roots]
+    if len(set(parents)) != len(parents) or any(a != b and a in b.parents for a in parents for b in parents):
+        fail("unsupported_roots", "Duplicate or nested Git roots need distinct source ownership; no roots were flattened")
+    anchor = Path(os.path.commonpath(parents)) if len(parents) > 1 else parents[0]
+    records = [{"root": str(Path(item["worktree_root"]).resolve()), "logical_root": str(Path(LOGICAL_ROOT) / parents[index].relative_to(anchor)), "configuration": request["configurations"][index]} for index, item in enumerate(roots)]
+    automatic = False
+    blockers = []
+    setup = runpy.run_path(setup_path)
+    for index, record in enumerate(records):
+        root = Path(record["root"])
+        logical = record["logical_root"]
+        config = record["configuration"]
+        if request["automatic"][index]:
+            try:
+                detected = setup["configure"](root, logical, config, records)
+            except setup["SetupFailure"] as error:
+                fail("runtime_configuration_invalid", str(error))
+            if detected:
+                automatic = True
+            else:
+                blockers.append({"logical_root": logical, "message": "No conventional Rust or JS/TS build manifest"})
+        validate_configuration(config)
+    config = json.loads(json.dumps(records[0]["configuration"]))
+    # Runtime references are project-wide; conflicting per-root definitions are
+    # explicit configuration errors rather than last-root-wins behavior.
+    for record in records[1:]:
+        other = record["configuration"]
+        for key in ("environment", "runtime_files"):
+            for name, value in other[key].items():
+                if name in config[key] and config[key][name] != value:
+                    fail("runtime_configuration_invalid", "Workspace roots declare conflicting runtime references")
+                config[key][name] = value
+        for key in ("remove_environment", "writable_paths", "runtime_directories", "runtime_file_bindings", "readonly_bindings", "services"):
+            for value in other[key]:
+                if value not in config[key]:
+                    config[key].append(value)
     validate_configuration(config)
     support = probe()
     if support["bubblewrap"]["kind"] != "available":
         result = support["bubblewrap"]
         fail(result["reason"], result["message"])
-    check_reflink(root)
+    for record in records:
+        check_reflink(record["root"])
+    directory = Path(directory).resolve()
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:
+        root = Path(records[0]["root"])
         common = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).strip())
         snapshots = common / "tyde-workbench-snapshots-v2"
         snapshots.mkdir(mode=0o700, exist_ok=True)
-        assert_clean(root)
-        manifest = {"schema": SCHEMA, "root": str(root), "common": str(common), "snapshot_root": str(snapshots), "configuration": config, "support": support, "python": sys.executable, "bwrap": shutil.which("bwrap")}
+        manifest = {"schema": SCHEMA, "root": str(root), "roots": records, "common": str(common), "snapshot_root": str(snapshots), "configuration": config, "support": support, "python": sys.executable, "bwrap": shutil.which("bwrap")}
+        workspace_clean(manifest)
         (directory / "receipts").mkdir()
         (directory / "runs").mkdir()
+        save(directory / "owner.json", {"schema": SCHEMA, "environment": str(directory), "source": str(root)})
+        save(directory / "manifest.json", manifest)
+        shutil.copyfile(__file__, directory / "runner.py")
         initialization = {"kind": "cold"}
-        if config["snapshot"] is not None:
-            inputs = input_identity(root, config, runtime_environment(config))
-            tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
-            key = cohort_key(tree, inputs)
-            snapshot = snapshots / key
-            if snapshot.exists():
-                receipt = load(snapshot / "cohort.json")
-                if receipt["schema"] != SCHEMA or receipt["key"] != key or receipt["inputs"] != inputs or receipt["tree"] != tree:
+        if any(record["configuration"]["snapshot"] is not None for record in records):
+            identity = workspace_identity(manifest, runtime_environment(config, records[0]["logical_root"]))
+            key = cohort_key(None, identity)
+            cohort = snapshots / key
+            if cohort.exists():
+                receipt = load(cohort / "cohort.json")
+                if receipt["schema"] != SCHEMA or receipt["key"] != key or receipt["inputs"] != identity:
                     fail("incompatible_environment", "Stored cohort provenance does not match this environment")
-                if artifact_inventory(snapshot / "files", config) != receipt["artifacts"]:
+                if workspace_artifacts(manifest, cohort / "files") != receipt["artifacts"]:
                     fail("incompatible_environment", "Stored cohort artifacts failed integrity verification")
-                for relative in config["snapshot"]["include"]:
-                    destination = root / relative
-                    if destination.exists() or destination.is_symlink():
-                        existing = artifact_inventory(root, {"snapshot": {"include": [relative]}})
-                        tracked = source_inventory(root)
-                        for name, entry in existing.items():
-                            if entry["kind"] != "directory":
-                                expected = tracked.get(name)
-                                if expected is None or dict(entry, mtime_ns=expected["mtime_ns"]) != expected:
-                                    fail("incompatible_environment", "A snapshot destination contains non-source files; refusing to overwrite")
+                for index, record in enumerate(records):
+                    root = Path(record["root"])
+                    selected = record["configuration"]["snapshot"]
+                    if selected is not None:
+                        files = artifact_root(cohort / "files", index, len(records))
+                        for source in included_paths(files, record["configuration"]):
+                            relative = source.relative_to(files)
+                            destination = root / relative
+                            if destination.exists() or destination.is_symlink():
+                                fail("incompatible_environment", "Snapshot destination already exists; refusing to overwrite source or arbitrary artifacts")
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            strict_clone(source, destination)
+                    current = source_inventory(root)
+                    expected = receipt["source"][record["logical_root"]]
+                    if current.keys() != expected.keys():
+                        fail("incompatible_environment", "Cohort source inventory differs")
+                    for relative, entry in expected.items():
+                        actual = dict(current[relative], mtime_ns=entry["mtime_ns"])
+                        if actual != entry:
+                            fail("incompatible_environment", "Cohort source identity differs")
+                        os.utime(root / relative, ns=(entry["mtime_ns"], entry["mtime_ns"]), follow_symlinks=False)
+                initialization = {"kind": "snapshot", "cohort": key}
+            elif automatic:
+                runtime_diagnostic("baseline_preparation_started", roots=len(records))
+                # Capture command diagnostics separately: engine stdout remains a
+                # single typed result and failures never expose build contents.
+                with tempfile.TemporaryFile() as output:
+                    result = subprocess.run([sys.executable, str(directory / "runner.py"), "launch", str(directory / "manifest.json"), str(root), records[0]["logical_root"], RUNTIME + "/bin/tyde-workbench-produce"], stdout=output, stderr=output)
+                    if result.returncode:
+                        diagnostics = retain_build_diagnostics(output, common)
+                        failure = directory / "receipts/failure.json"
+                        if failure.exists():
+                            cause = load(failure)
+                            fail(cause["reason"], cause["message"] + "; redacted build diagnostics: " + str(diagnostics))
+                        fail("incompatible_environment", "Automatic baseline namespace launch failed (exit %d); redacted build diagnostics: %s" % (result.returncode, diagnostics))
+                result = snapshot(directory / "manifest.json", records[0]["root"])
+                if not result["published"]:
+                    fail("incompatible_environment", "Automatic baseline producer did not publish a verified cohort")
+                # Installers may hardlink outputs to external package stores.
+                # Ready workbenches own strict CoW clones, including the producer.
+                cohort = snapshots / result["cohort"]
+                for index, record in enumerate(records):
+                    if record["configuration"]["snapshot"] is None:
+                        continue
+                    files = artifact_root(cohort / "files", index, len(records))
+                    for source in included_paths(files, record["configuration"]):
+                        destination = Path(record["root"]) / source.relative_to(files)
                         if destination.is_dir() and not destination.is_symlink():
                             shutil.rmtree(destination)
                         else:
                             destination.unlink()
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    strict_clone(snapshot / "files" / relative, destination)
-                current = source_inventory(root)
-                if current.keys() != receipt["source"].keys():
-                    fail("incompatible_environment", "Cohort source inventory differs")
-                for relative, entry in receipt["source"].items():
-                    actual = dict(current[relative], mtime_ns=entry["mtime_ns"])
-                    if actual != entry:
-                        fail("incompatible_environment", "Cohort source identity differs")
-                    os.utime(root / relative, ns=(entry["mtime_ns"], entry["mtime_ns"]), follow_symlinks=False)
-                initialization = {"kind": "snapshot", "cohort": key}
-        save(directory / "owner.json", {"schema": SCHEMA, "environment": str(directory), "source": str(root)})
-        save(directory / "manifest.json", manifest)
-        shutil.copyfile(__file__, directory / "runner.py")
-        return {"kind": "bubblewrap", "manifest_path": str(directory / "manifest.json"), "logical_root": LOGICAL_ROOT, "support": support, "initialization": initialization}
+                        strict_clone(source, destination)
+                if workspace_artifacts(manifest) != load(cohort / "cohort.json")["artifacts"]:
+                    fail("incompatible_environment", "Prepared artifact isolation failed integrity verification")
+                initialization = {"kind": "prepared", "cohort": result["cohort"]}
+                runtime_diagnostic("baseline_preparation_completed", roots=len(records))
+        elif blockers:
+            initialization = {"kind": "blocked", "message": "; ".join(item["logical_root"] + ": " + item["message"] for item in blockers)}
+        return {"kind": "bubblewrap", "manifest_path": str(directory / "manifest.json"), "logical_root": records[0]["logical_root"], "additional_roots": [record["logical_root"] for record in records[1:]], "build_blockers": blockers, "support": support, "initialization": initialization}
     except BaseException:
         shutil.rmtree(directory)
         raise
@@ -346,6 +525,8 @@ def owned_environment(manifest_path, expected_root=None):
     if manifest_path.name != "manifest.json" or owner["schema"] != SCHEMA or owner["environment"] != str(directory) or directory.is_symlink():
         fail("incompatible_environment", "Workbench resource ownership is invalid")
     manifest = load(manifest_path)
+    if "roots" in manifest and (not manifest["roots"] or manifest["roots"][0]["root"] != manifest["root"]):
+        fail("incompatible_environment", "Workbench primary root differs from its authoritative mount record")
     if manifest["schema"] != SCHEMA or owner["source"] != manifest["root"]:
         fail("incompatible_environment", "Workbench source ownership is invalid")
     if expected_root is not None and manifest["root"] != str(Path(expected_root).resolve()):
@@ -368,6 +549,20 @@ def runtime_binds(manifest, env):
             fail("runtime_configuration_invalid", "A writable runtime reference overlaps engine-owned mountpoints")
         if path.exists():
             args += ["--bind", str(path), str(path)]
+    destinations = set()
+    for binding in manifest["configuration"].get("readonly_bindings", []):
+        source = Path(expand(binding["host_path"], env))
+        destination = Path(expand(binding["execution_path"], env))
+        if not source.is_absolute() or not source.exists() or not destination.is_absolute() or str(destination) != os.path.normpath(str(destination)):
+            fail("runtime_configuration_invalid", "Read-only runtime bindings require existing absolute sources and canonical absolute destinations")
+        if not destination.is_relative_to("/mnt") or destination == Path("/mnt") or (destination.parent != Path("/mnt") and not destination.is_relative_to(LOGICAL_ROOT)) or any(destination == engine or destination in engine.parents or engine in destination.parents for engine in map(Path, (RUNTIME, RECEIPTS))):
+            fail("runtime_configuration_invalid", "Read-only runtime bindings must stay inside private non-engine mountpoints")
+        if any(destination == Path(record["logical_root"]) or destination in Path(record["logical_root"]).parents or Path(record["logical_root"]) in destination.parents for record in root_records(manifest)):
+            fail("runtime_configuration_invalid", "Read-only runtime bindings must not overlap registered writable source roots")
+        if destination in destinations:
+            fail("runtime_configuration_invalid", "Read-only runtime bindings have conflicting destinations")
+        destinations.add(destination)
+        args += ["--ro-bind", str(source), str(destination)]
     return args
 
 
@@ -529,7 +724,7 @@ def launch(manifest_path, expected_root, cwd, command, configuration_identity=No
     manifest = owned_environment(manifest_path, expected_root)
     config = manifest["configuration"]
     if configuration_identity is None:
-        env = runtime_environment(config)
+        env = runtime_environment(config, root_records(manifest)[0]["logical_root"])
     else:
         if runner_identity != digest(Path(__file__).read_bytes()):
             fail("incompatible_environment", "The execution runner changed while its backend was active")
@@ -562,7 +757,9 @@ def launch(manifest_path, expected_root, cwd, command, configuration_identity=No
                     fail("runtime_configuration_invalid", "A configured native runtime file binding is absent or not an absolute file")
                 args += ["--ro-bind", str(run / binding["runtime_file"]), str(destination)]
             args += ["--ro-bind", manifest["snapshot_root"], manifest["snapshot_root"]]
-            args += ["--bind", manifest["root"], LOGICAL_ROOT, "--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", manifest["python"], RUNTIME + "/runner.py", "inside", *command]
+            for record in root_records(manifest):
+                args += ["--bind", record["root"], record["logical_root"]]
+            args += ["--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", manifest["python"], RUNTIME + "/runner.py", "inside", *command]
             return guarded_launch(args, env, run, descriptor_path)
 
 
@@ -890,35 +1087,35 @@ def inside(command):
 
 def produce(command):
     manifest = load(RUNTIME + "/manifest.json")
-    config = manifest["configuration"]
-    if command or config["snapshot"] is None:
-        fail("runtime_configuration_invalid", "Invoke tyde-workbench-produce without arguments to run the explicitly configured producer")
-    command = [expand(value, dict(os.environ)) for value in config["snapshot"]["producer"]]
-    root = Path(LOGICAL_ROOT)
-    if not Path.cwd().is_relative_to(root):
-        fail("runtime_configuration_invalid", "Snapshot producers must run at the stable logical project path")
-    # This process owns and joins even orphaned/background descendants of the
-    # explicitly requested producer; daemonizing does not certify completion.
-    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0):
-        fail("incompatible_environment", "Could not establish producer descendant ownership")
+    records = root_records(manifest)
+    if command or not any(record["configuration"]["snapshot"] is not None for record in records):
+        fail("runtime_configuration_invalid", "Invoke tyde-workbench-produce without arguments to run the configured producer")
+    for record in records:
+        record["root"] = record["logical_root"]
+    own_descendants()
     with (Path(RECEIPTS) / "producer.lock").open("a+b") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         receipt_path = Path(RECEIPTS) / "completed.json"
         receipt_path.unlink(missing_ok=True)
-        assert_clean(root)
-        before = source_inventory(root)
-        inputs = input_identity(root, config, dict(os.environ))
-        tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
-        runtime_diagnostic("producer_started")
-        result = subprocess.run(command)
-        runtime_diagnostic("producer_command_exited", exit_code=result.returncode)
-        descendants = join_children()
-        if result.returncode or any(descendants):
-            fail("incompatible_environment", "The explicit snapshot producer or one of its descendants failed")
-        assert_clean(root)
-        if before != source_inventory(root) or inputs != input_identity(root, config, dict(os.environ)):
+        (Path(RECEIPTS) / "failure.json").unlink(missing_ok=True)
+        workspace_clean(manifest)
+        before = workspace_sources(manifest)
+        inputs = workspace_identity(manifest, dict(os.environ))
+        runtime_diagnostic("producer_started", roots=len(records))
+        for record in records:
+            config = record["configuration"]
+            if config["snapshot"] is None:
+                continue
+            command = [expand(value, dict(os.environ)) for value in config["snapshot"]["producer"]]
+            result = subprocess.run(command, cwd=record["logical_root"])
+            runtime_diagnostic("producer_command_exited", exit_code=result.returncode)
+            descendants = join_children()
+            if result.returncode or any(descendants):
+                fail("incompatible_environment", "Snapshot producer failed in " + record["logical_root"] + " (exit %d, failed descendants %d)" % (result.returncode, sum(bool(code) for code in descendants)))
+        workspace_clean(manifest)
+        if before != workspace_sources(manifest) or inputs != workspace_identity(manifest, dict(os.environ)):
             fail("incompatible_environment", "Snapshot producer inputs changed during execution")
-        receipt = {"schema": SCHEMA, "tree": tree, "inputs": inputs, "key": cohort_key(tree, inputs), "source": before, "artifacts": artifact_inventory(root, config), "producer": digest(json.dumps(command).encode())}
+        receipt = {"schema": SCHEMA, "inputs": inputs, "key": cohort_key(None, inputs), "source": before, "artifacts": workspace_artifacts(manifest)}
         save(receipt_path, receipt)
         runtime_diagnostic("producer_completed")
     return 0
@@ -927,35 +1124,37 @@ def produce(command):
 def snapshot(manifest_path, expected_root):
     with admission(manifest_path, exclusive=True):
         manifest = owned_environment(manifest_path, expected_root)
-        config = manifest["configuration"]
         directory = Path(manifest_path).parent
         completed = directory / "receipts/completed.json"
-        if config["snapshot"] is None or not completed.exists():
-            return {"published": False, "reason": "No configured completed producer; no artifacts were advertised as a snapshot"}
-        root = Path(manifest["root"])
-        assert_clean(root)
+        if not completed.exists():
+            return {"published": False, "reason": "No completed producer; no artifacts were advertised as a snapshot"}
+        workspace_clean(manifest)
         receipt = load(completed)
-        inputs = input_identity(root, config, runtime_environment(config))
-        tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
-        if receipt["key"] != cohort_key(tree, inputs) or receipt["source"] != source_inventory(root):
+        inputs = workspace_identity(manifest, runtime_environment(manifest["configuration"], root_records(manifest)[0]["logical_root"]))
+        if receipt["key"] != cohort_key(None, inputs) or receipt["source"] != workspace_sources(manifest):
             fail("incompatible_environment", "Completed producer inputs changed; refusing to snapshot")
-        if receipt["artifacts"] != artifact_inventory(root, config):
+        if receipt["artifacts"] != workspace_artifacts(manifest):
             fail("incompatible_environment", "Configured files changed after producer completion; refusing to snapshot")
         snapshots = Path(manifest["snapshot_root"])
         destination = snapshots / receipt["key"]
         if destination.exists():
             existing = load(destination / "cohort.json")
-            if existing["inputs"] != inputs or existing["tree"] != tree or artifact_inventory(destination / "files", config) != existing["artifacts"]:
+            if existing["inputs"] != inputs or workspace_artifacts(manifest, destination / "files") != existing["artifacts"]:
                 fail("incompatible_environment", "Existing immutable cohort failed provenance or integrity verification")
             return {"published": True, "cohort": receipt["key"]}
         staging = Path(tempfile.mkdtemp(prefix=".preparing-", dir=snapshots))
         try:
+            records = root_records(manifest)
             (staging / "files").mkdir()
-            for relative in config["snapshot"]["include"]:
-                target = staging / "files" / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                strict_clone(root / relative, target)
-            if artifact_inventory(staging / "files", config) != receipt["artifacts"]:
+            for index, record in enumerate(records):
+                if record["configuration"]["snapshot"] is None:
+                    continue
+                root = Path(record["root"])
+                for source in included_paths(root, record["configuration"]):
+                    target = artifact_root(staging / "files", index, len(records)) / source.relative_to(root)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    strict_clone(source, target)
+            if workspace_artifacts(manifest, staging / "files") != receipt["artifacts"]:
                 fail("incompatible_environment", "CoW snapshot failed metadata/content integrity verification")
             save(staging / "cohort.json", receipt)
             os.rename(staging, destination)
@@ -985,7 +1184,7 @@ def main():
                 os.replace(temporary, helper)
             finally:
                 temporary.unlink(missing_ok=True)
-            values = runtime_environment(manifest["configuration"])
+            values = runtime_environment(manifest["configuration"], root_records(manifest)[0]["logical_root"])
             # Launch owns its private bin prefix; a command's explicit PATH
             # remains an override of this same prepared environment.
             values["PATH"] = values["PATH"].removeprefix(RUNTIME + "/bin:")
@@ -1027,8 +1226,8 @@ if __name__ == "__main__":
         if result is not None:
             print(json.dumps(result, sort_keys=True))
     except Failure as error:
-        print(json.dumps({"error": {"reason": error.reason, "message": error.message}}), file=sys.stderr)
+        report_failure(error.reason, error.message)
         sys.exit(1)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-        print(json.dumps({"error": {"reason": "incompatible_environment", "message": "Workbench engine failed at an OS or artifact boundary (" + type(error).__name__ + ", errno=" + str(getattr(error, "errno", None)) + ", operation=" + sys.argv[1] + ")"}}), file=sys.stderr)
+        report_failure("incompatible_environment", "Workbench engine failed at an OS or artifact boundary (" + type(error).__name__ + ", errno=" + str(getattr(error, "errno", None)) + ", operation=" + sys.argv[1] + ")")
         sys.exit(1)

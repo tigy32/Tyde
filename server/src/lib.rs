@@ -176,9 +176,18 @@ pub async fn prepare_workbench_environment(
     root: &std::path::Path,
     environment_root: &std::path::Path,
 ) -> Result<protocol::WorkbenchEnvironment, String> {
-    workbench::prepare(root, environment_root)
-        .await
-        .map_err(|error| error.to_string())
+    let root = root
+        .to_str()
+        .ok_or_else(|| "Workbench root must be UTF-8".to_owned())?;
+    workbench::prepare(
+        &[protocol::WorkbenchRoot {
+            parent_root: protocol::ProjectRootPath(root.to_owned()),
+            worktree_root: protocol::ProjectRootPath(root.to_owned()),
+        }],
+        environment_root,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "test-support")]

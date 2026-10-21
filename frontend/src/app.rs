@@ -1601,6 +1601,8 @@ mod wasm_tests {
                             "/host/workbench/manifest.json".to_owned(),
                         ),
                         logical_root: ProjectRootPath("/workspace".to_owned()),
+                        additional_roots: Vec::new(),
+                        build_blockers: Vec::new(),
                         support: Default::default(),
                         lifecycle: Default::default(),
                         initialization: protocol::WorkbenchInitialization::Cold,

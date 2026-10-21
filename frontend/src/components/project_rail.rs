@@ -632,15 +632,45 @@ fn ProjectRow(
         project_signal().and_then(|project| match project.source {
             ProjectSource::Standalone { .. } => None,
             ProjectSource::GitWorkbench { environment, .. } => Some(match environment {
-                protocol::WorkbenchEnvironment::Native => "Native workbench",
-                protocol::WorkbenchEnvironment::Bubblewrap { initialization, .. } => {
-                    match initialization {
+                protocol::WorkbenchEnvironment::Native => "Native workbench".to_owned(),
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    initialization,
+                    build_blockers,
+                    ..
+                } => {
+                    let title = match &initialization {
                         protocol::WorkbenchInitialization::Cold => {
-                            "Bubblewrap · Cold initialization"
+                            "Bubblewrap · Cold initialization".to_owned()
+                        }
+                        protocol::WorkbenchInitialization::Prepared { .. } => {
+                            "Bubblewrap · Baseline prepared (initial build)".to_owned()
+                        }
+                        protocol::WorkbenchInitialization::Blocked { message } => {
+                            format!("Bubblewrap · Warm builds blocked: {message}")
                         }
                         protocol::WorkbenchInitialization::Snapshot { .. } => {
-                            "Bubblewrap · Snapshot seeded"
+                            "Bubblewrap · Snapshot seeded".to_owned()
                         }
+                    };
+                    if build_blockers.is_empty()
+                        || matches!(
+                            initialization,
+                            protocol::WorkbenchInitialization::Blocked { .. }
+                        )
+                    {
+                        title
+                    } else {
+                        format!(
+                            "{title} · {}",
+                            build_blockers
+                                .iter()
+                                .map(|blocker| format!(
+                                    "{}: {}",
+                                    blocker.logical_root, blocker.message
+                                ))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        )
                     }
                 }
             }),
@@ -1556,6 +1586,8 @@ mod wasm_tests {
             *environment = protocol::WorkbenchEnvironment::Bubblewrap {
                 manifest_path: protocol::HostAbsPath("/tmp/workbench/manifest.json".to_owned()),
                 logical_root: ProjectRootPath("/workspace".to_owned()),
+                additional_roots: Vec::new(),
+                build_blockers: Vec::new(),
                 support: Default::default(),
                 lifecycle: Default::default(),
                 initialization: protocol::WorkbenchInitialization::Cold,
@@ -1604,6 +1636,45 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
+        for (initialization, title) in [
+            (
+                protocol::WorkbenchInitialization::Prepared {
+                    cohort: "prepared".into(),
+                },
+                "Bubblewrap · Baseline prepared (initial build)",
+            ),
+            (
+                protocol::WorkbenchInitialization::Blocked {
+                    message: "No supported build manifest".into(),
+                },
+                "Bubblewrap · Warm builds blocked: No supported build manifest",
+            ),
+        ] {
+            state.projects.update(|projects| {
+                let project = projects
+                    .iter_mut()
+                    .find(|info| info.project.id.0 == "wb-feat")
+                    .unwrap();
+                let ProjectSource::GitWorkbench {
+                    environment:
+                        protocol::WorkbenchEnvironment::Bubblewrap {
+                            initialization: current,
+                            ..
+                        },
+                    ..
+                } = &mut project.project.source
+                else {
+                    panic!("Bubblewrap fixture")
+                };
+                *current = initialization;
+            });
+            next_tick().await;
+            let tag = container
+                .query_selector(".rail-tag[title^='Bubblewrap']")
+                .unwrap()
+                .unwrap();
+            assert_eq!(tag.get_attribute("title").as_deref(), Some(title));
+        }
     }
 
     fn button(container: &HtmlElement, text: &str) -> HtmlElement {

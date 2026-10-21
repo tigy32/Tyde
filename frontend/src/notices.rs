@@ -482,7 +482,7 @@ pub fn ProjectOperationNotices() -> impl IntoView {
                     operations
                         .iter()
                         .filter(|(_, operation)| {
-                            matches!(&operation.state, ProjectOperationState::Failed { .. })
+                            matches!(&operation.state, ProjectOperationState::Failed { .. } | ProjectOperationState::Running { stage: protocol::ProjectOperationStage::PrepareBuilds })
                                 || matches!(
                                     &operation.state,
                                     ProjectOperationState::Committed { warnings } if !warnings.is_empty()
@@ -503,6 +503,7 @@ pub fn ProjectOperationNotices() -> impl IntoView {
                         format!("{} · {}", host_label.unwrap_or_else(|| host.clone()), mutation_label(&state, &host, &operation.mutation))
                     }) };
                     let detail = move || current.get().map(|operation| match operation.state {
+                        ProjectOperationState::Running { stage: protocol::ProjectOperationStage::PrepareBuilds } => "Preparing or restoring a verified warm build baseline; initial preparation may require a full build.".to_owned(),
                         ProjectOperationState::Admitted | ProjectOperationState::Running { .. } => String::new(),
                         ProjectOperationState::Committed { warnings } => format!("Saved, with warnings: {}. Do not repeat this operation.", warnings.iter().map(|warning| warning.message.as_str()).collect::<Vec<_>>().join("; ")),
                         ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } => if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },

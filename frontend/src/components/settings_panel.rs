@@ -1244,11 +1244,11 @@ fn WorkbenchesTab() -> impl IntoView {
                                     send_host_replace(&bubblewrap_state, "/workbenches/engine", protocol::WorkbenchEngine::Bubblewrap);
                                 }
                             />
-                            <span>"Bubblewrap"<small>"Linux · opt-in"</small></span>
+                            <span>"Bubblewrap"<small>"Linux · automatic warm builds"</small></span>
                         </label>
                     </fieldset>
                     <p class="settings-description" role="status">{bubblewrap_status}</p>
-                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"No build runs automatically. Optional .tyde/workbench.json configuration selects opaque snapshot paths and namespace-local services. External host services are not automatically namespace-compatible. Setup or launch errors are reported; Tyde never falls back to Native."</p></details>
+                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"Normal Rust and JS/TS projects prepare a compatible baseline automatically when needed, across every registered root. Initial preparation runs the normal build; later compatible workbenches reuse private snapshots. Preparation, reuse and blockers are reported. Custom recipes and services remain configurable; setup errors never fall back to Native."</p></details>
                 }.into_any()
             }}
         </div>
