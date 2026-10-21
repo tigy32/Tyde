@@ -4,7 +4,7 @@ use std::time::Duration;
 use leptos::prelude::*;
 
 use crate::sidebar_layout::{InterfaceMode, SidebarSide};
-use crate::state::{AppState, ConnectionStatus, DockVisibility};
+use crate::state::{AppState, ConnectionStatus};
 
 /// ssh reports a dropped connection on stderr before the transport loss reaches
 /// the recovery listener, so an arriving host warning cannot be classified yet.
@@ -308,14 +308,9 @@ pub fn Header() -> impl IntoView {
     let toggle_left = move |_| left_state.toggle_sidebar(SidebarSide::Left);
     let right_state = state.clone();
     let toggle_right = move |_| right_state.toggle_sidebar(SidebarSide::Right);
-    let toggle_bottom = move |_| {
-        state.bottom_dock.update(|dock| {
-            *dock = match dock {
-                DockVisibility::Visible => DockVisibility::Hidden,
-                DockVisibility::Hidden => DockVisibility::Visible,
-            }
-        });
-    };
+    let layouts = state.sidebar_layout;
+    let bottom_state = state.clone();
+    let toggle_bottom = move |_| bottom_state.toggle_sidebar(SidebarSide::Bottom);
 
     let user_notice_for_show = user_notice.clone();
     let user_notice_for_kind = user_notice.clone();
@@ -363,9 +358,9 @@ pub fn Header() -> impl IntoView {
                     </div>
                 </div>
                 <div class="header-right">
-                    <button class="header-btn" title="Toggle Left Dock" disabled=move || layout_blocked.get() on:click=toggle_left>"Left"</button>
-                    <button class="header-btn" title="Toggle Bottom Dock" on:click=toggle_bottom>"Bottom"</button>
-                    <button class="header-btn" title="Toggle Right Dock" disabled=move || layout_blocked.get() on:click=toggle_right>"Right"</button>
+                    <button class="header-btn header-dock-toggle" title="Toggle Left Dock" aria-label="Toggle Left Dock" aria-pressed=move || (!layout_blocked.get() && layouts.with(|l| l.current().pane(SidebarSide::Left).visible)).to_string() disabled=move || layout_blocked.get() on:click=toggle_left><crate::components::dock_zone::PanelIcon side=SidebarSide::Left /></button>
+                    <button class="header-btn header-dock-toggle" title="Toggle Bottom Dock" aria-label="Toggle Bottom Dock" aria-pressed=move || (!layout_blocked.get() && layouts.with(|l| l.current().pane(SidebarSide::Bottom).visible)).to_string() disabled=move || layout_blocked.get() on:click=toggle_bottom><crate::components::dock_zone::PanelIcon side=SidebarSide::Bottom /></button>
+                    <button class="header-btn header-dock-toggle" title="Toggle Right Dock" aria-label="Toggle Right Dock" aria-pressed=move || (!layout_blocked.get() && layouts.with(|l| l.current().pane(SidebarSide::Right).visible)).to_string() disabled=move || layout_blocked.get() on:click=toggle_right><crate::components::dock_zone::PanelIcon side=SidebarSide::Right /></button>
                     <button class="header-btn" title="Settings" on:click=move |_| settings.set(true)>"⚙ Settings"</button>
                     <button class="header-btn" title="Send feedback" on:click=move |_| feedback.set(true)>"Feedback"</button>
                 </div>

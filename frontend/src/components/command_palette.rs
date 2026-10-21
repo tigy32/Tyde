@@ -6,8 +6,8 @@ use crate::actions::begin_new_chat;
 use crate::components::center_zone::{MIN_SPLIT_WIDTH, announce, reveal_tab, workspace_width};
 use crate::send;
 use crate::state::{
-    AppState, CENTER_TABS_DISABLED_REASON, DockVisibility, MoveTabEligibility, MoveTabResult,
-    OpenTarget, PaneId, SidebarTab, TabContent, TabId, root_display_name,
+    AppState, CENTER_TABS_DISABLED_REASON, MoveTabEligibility, MoveTabResult, OpenTarget, PaneId,
+    SidebarTab, TabContent, TabId, root_display_name,
 };
 
 use protocol::{
@@ -514,15 +514,6 @@ fn fuzzy_score(query: &str, target: &str) -> Option<u32> {
     None
 }
 
-fn toggle_dock(signal: RwSignal<DockVisibility>) {
-    signal.update(|v: &mut DockVisibility| {
-        *v = match v {
-            DockVisibility::Visible => DockVisibility::Hidden,
-            DockVisibility::Hidden => DockVisibility::Visible,
-        };
-    });
-}
-
 /// Run a command. Refuses to act when the command is unavailable, so a stale
 /// menu row, a shortcut pressed in the wrong context, and a palette selection
 /// all fail the same way — visibly disabled, never a surprise mutation.
@@ -542,7 +533,7 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         }
         CommandId::ToggleLeftPanel => state.toggle_sidebar(crate::state::SidebarSide::Left),
         CommandId::ToggleRightPanel => state.toggle_sidebar(crate::state::SidebarSide::Right),
-        CommandId::ToggleBottomPanel => toggle_dock(state.bottom_dock),
+        CommandId::ToggleBottomPanel => state.toggle_sidebar(crate::state::SidebarSide::Bottom),
         CommandId::OpenWorkflows => {
             state.activate_sidebar_tab(SidebarTab::Workflows);
         }

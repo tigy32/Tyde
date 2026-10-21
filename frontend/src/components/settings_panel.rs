@@ -7538,7 +7538,7 @@ pub(super) fn send_run_backend_setup(
         return;
     };
 
-    state.bottom_dock.set(crate::state::DockVisibility::Visible);
+    state.activate_sidebar_tab(crate::state::SidebarTab::Terminal);
     state.pending_terminal_focus.set(Some(host_id.clone()));
 
     spawn_local(async move {

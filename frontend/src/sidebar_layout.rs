@@ -17,6 +17,7 @@ pub enum InterfaceMode {
 pub enum SidebarSide {
     Left,
     Right,
+    Bottom,
 }
 
 impl SidebarSide {
@@ -24,12 +25,14 @@ impl SidebarSide {
         match self {
             Self::Left => 1,
             Self::Right => 5,
+            Self::Bottom => 3,
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Left => "Left",
             Self::Right => "Right",
+            Self::Bottom => "Bottom",
         }
     }
 }
@@ -44,10 +47,11 @@ pub enum SidebarTab {
     References,
     Swarms,
     Workflows,
+    Terminal,
 }
 
 impl SidebarTab {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Agents,
         Self::Sessions,
         Self::Files,
@@ -56,6 +60,7 @@ impl SidebarTab {
         Self::References,
         Self::Swarms,
         Self::Workflows,
+        Self::Terminal,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -67,10 +72,12 @@ impl SidebarTab {
             Self::References => "Refs",
             Self::Swarms => "Swarms",
             Self::Workflows => "Workflows",
+            Self::Terminal => "Terminal",
         }
     }
     pub fn default_side(self) -> SidebarSide {
         match self {
+            Self::Terminal => SidebarSide::Bottom,
             Self::Files | Self::Git | Self::Search | Self::References => SidebarSide::Left,
             Self::Agents | Self::Sessions | Self::Swarms | Self::Workflows => SidebarSide::Right,
         }
@@ -92,6 +99,17 @@ pub struct SidebarPane {
 pub struct SidebarLayout {
     pub left: SidebarPane,
     pub right: SidebarPane,
+    #[serde(default = "empty_bottom")]
+    pub bottom: SidebarPane,
+}
+
+fn empty_bottom() -> SidebarPane {
+    SidebarPane {
+        tabs: vec![],
+        active: None,
+        visible: false,
+        width: 200.0,
+    }
 }
 
 impl SidebarLayout {
@@ -109,9 +127,9 @@ impl SidebarLayout {
         let active = tabs.first().copied();
         Self {
             left: SidebarPane {
+                visible: !tabs.is_empty(),
                 tabs,
                 active,
-                visible: true,
                 width: 300.0,
             },
             right: SidebarPane {
@@ -127,22 +145,25 @@ impl SidebarLayout {
                 visible: true,
                 width: 360.0,
             },
+            bottom: empty_bottom(),
         }
     }
     pub fn pane(&self, side: SidebarSide) -> &SidebarPane {
         match side {
             SidebarSide::Left => &self.left,
             SidebarSide::Right => &self.right,
+            SidebarSide::Bottom => &self.bottom,
         }
     }
     pub fn pane_mut(&mut self, side: SidebarSide) -> &mut SidebarPane {
         match side {
             SidebarSide::Left => &mut self.left,
             SidebarSide::Right => &mut self.right,
+            SidebarSide::Bottom => &mut self.bottom,
         }
     }
     pub fn side(&self, tab: SidebarTab) -> Option<SidebarSide> {
-        [SidebarSide::Left, SidebarSide::Right]
+        [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom]
             .into_iter()
             .find(|side| self.pane(*side).tabs.contains(&tab))
     }
@@ -177,7 +198,7 @@ impl SidebarLayout {
         if source.active == Some(tab) {
             source.active = source.tabs.first().copied();
         }
-        for side in [SidebarSide::Left, SidebarSide::Right] {
+        for side in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
             if self.pane(side).active == Some(tab) {
                 let pane = self.pane_mut(side);
                 pane.active = pane.tabs.first().copied();
@@ -190,13 +211,21 @@ impl SidebarLayout {
     }
     #[cfg(target_arch = "wasm32")]
     fn validate(&self) -> Result<(), String> {
-        if self.left.active.is_some() && self.left.active == self.right.active {
-            return Err("Duplicated active sidebar panel".into());
+        let active = [self.left.active, self.right.active, self.bottom.active];
+        for (index, tab) in active.iter().enumerate() {
+            if tab.is_some() && active[..index].contains(tab) {
+                return Err("Duplicated active sidebar panel".into());
+            }
         }
         let mut found = Vec::new();
-        for side in [SidebarSide::Left, SidebarSide::Right] {
+        for side in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
             let pane = self.pane(side);
-            if !pane.width.is_finite() || !(160.0..=2400.0).contains(&pane.width) {
+            let minimum = if side == SidebarSide::Bottom {
+                80.0
+            } else {
+                160.0
+            };
+            if !pane.width.is_finite() || !(minimum..=2400.0).contains(&pane.width) {
                 return Err("Invalid sidebar width".into());
             }
             for tab in &pane.tabs {
@@ -221,7 +250,7 @@ pub struct ClientLayouts {
 impl Default for ClientLayouts {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             mode: InterfaceMode::Vibe,
             vibe: SidebarLayout::new(InterfaceMode::Vibe),
             dinosaur: SidebarLayout::new(InterfaceMode::Dinosaur),
@@ -283,7 +312,7 @@ impl AppState {
                     side
                 }
             };
-            for other in [SidebarSide::Left, SidebarSide::Right] {
+            for other in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
                 if other != side && layouts.current().pane(other).active == Some(tab) {
                     layouts.current_mut().pane_mut(other).active = None;
                 }
@@ -302,10 +331,25 @@ impl AppState {
         self.sidebar_layout.update(|layouts| {
             let layout = layouts.current_mut();
             match layout.side(tab) {
-                Some(current) => layout.pane_mut(current).tabs.retain(|item| *item != tab),
+                Some(current) => {
+                    let pane = layout.pane_mut(current);
+                    pane.tabs.retain(|item| *item != tab);
+                    if pane.tabs.is_empty() {
+                        pane.active = None;
+                    }
+                }
                 None => {
+                    for other in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
+                        if other != side && layout.pane(other).active == Some(tab) {
+                            let pane = layout.pane_mut(other);
+                            pane.active = pane.tabs.first().copied();
+                        }
+                    }
                     let pane = layout.pane_mut(side);
                     pane.tabs.push(tab);
+                    if pane.active.is_none() {
+                        pane.active = Some(tab);
+                    }
                     pane.visible = true;
                 }
             }
@@ -341,14 +385,38 @@ impl AppState {
             else {
                 return migrate_legacy_sidebar(&storage);
             };
-            let layouts: ClientLayouts = serde_json::from_str(&raw).map_err(|e| {
-                format!("Cannot read desktop layout v1: {e}. Use Reset sidebar layout in Settings.")
+            let mut layouts: ClientLayouts = serde_json::from_str(&raw).map_err(|e| {
+                format!("Cannot read desktop layout: {e}. Use Reset sidebar layout in Settings.")
             })?;
-            if layouts.version != 1 {
-                return Err(
-                    "Unsupported desktop layout version. Use Reset sidebar layout in Settings."
-                        .into(),
-                );
+            match layouts.version {
+                1 => {
+                    // Version 1 could not render an empty pane without an active
+                    // view, even when its saved visibility bit was true.
+                    for layout in [&mut layouts.vibe, &mut layouts.dinosaur] {
+                        for side in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
+                            let pane = layout.pane_mut(side);
+                            pane.visible &= pane.active.is_some() || !pane.tabs.is_empty();
+                        }
+                    }
+                    layouts.version = 2;
+                }
+                2 => {}
+                _ => {
+                    return Err(
+                        "Unsupported desktop layout version. Use Reset sidebar layout in Settings."
+                            .into(),
+                    );
+                }
+            }
+            // Older layouts retained an active view after its final tab was
+            // unchecked. Empty docks now render the drop target instead.
+            for layout in [&mut layouts.vibe, &mut layouts.dinosaur] {
+                for side in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
+                    let pane = layout.pane_mut(side);
+                    if pane.tabs.is_empty() {
+                        pane.active = None;
+                    }
+                }
             }
             layouts.vibe.validate()?;
             layouts.dinosaur.validate()?;

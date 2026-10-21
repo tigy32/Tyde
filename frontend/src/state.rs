@@ -2138,12 +2138,6 @@ impl Default for CenterZoneState {
 
 // ── Dock ────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum DockVisibility {
-    Visible,
-    Hidden,
-}
-
 pub use crate::sidebar_layout::{SidebarSide, SidebarTab};
 
 /// All persistent state for the project-wide search panel. Lives in `AppState`
@@ -3784,7 +3778,6 @@ pub struct AppState {
     pub sidebar_storage_blocked: RwSignal<bool>,
     pub sidebar_drag: RwSignal<Option<SidebarTab>>,
     pub project_editor: RwSignal<Option<ActiveProjectRef>>,
-    pub bottom_dock: RwSignal<DockVisibility>,
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     /// Server-authored code-intelligence overview per project (full-replacement
@@ -4341,7 +4334,6 @@ impl AppState {
             sidebar_storage_blocked: RwSignal::new(false),
             sidebar_drag: RwSignal::new(None),
             project_editor: RwSignal::new(None),
-            bottom_dock: RwSignal::new(DockVisibility::Hidden),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
             code_intel_overview: RwSignal::new(HashMap::new()),

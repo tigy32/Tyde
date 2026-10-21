@@ -15,20 +15,24 @@ use crate::components::workflows_panel::WorkflowsPanel;
 use crate::sidebar_layout::{SidebarSide, SidebarTab};
 use crate::state::AppState;
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum DockPosition {
-    Left,
-    Right,
-    Bottom,
+#[component]
+pub fn PanelIcon(side: SidebarSide) -> impl IntoView {
+    let divider = match side {
+        SidebarSide::Left => "M7 3v14",
+        SidebarSide::Bottom => "M3 13h14",
+        SidebarSide::Right => "M13 3v14",
+    };
+    view! {
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <rect x="2.75" y="2.75" width="14.5" height="14.5" rx="1.25" />
+            <path d=divider />
+        </svg>
+    }
 }
 
 #[component]
-pub fn DockZone(position: DockPosition) -> impl IntoView {
-    match position {
-        DockPosition::Left => view! { <SidebarTabs side=SidebarSide::Left /> }.into_any(),
-        DockPosition::Right => view! { <SidebarTabs side=SidebarSide::Right /> }.into_any(),
-        DockPosition::Bottom => view! { <TerminalView /> }.into_any(),
-    }
+pub fn DockZone(position: SidebarSide) -> impl IntoView {
+    view! { <SidebarTabs side=position /> }
 }
 
 #[component]
@@ -41,6 +45,7 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
     let over = RwSignal::new(false);
     let move_state = state.clone();
     let checklist_state = state.clone();
+    let empty_move = state.clone();
     let menu = RwSignal::new(None);
     let anchor = NodeRef::<leptos::html::Div>::new();
     view! {
@@ -80,7 +85,7 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                     >
                         <button type="button" class="dock-tab" class:active=move || layouts.with(|l| l.current().pane(side).active == Some(tab))
                             draggable="true" aria-label=tab.label()
-                            title="Drag to either sidebar. Ctrl+Shift+Left/Right moves sides; Ctrl+Shift+Up/Down reorders."
+                            title="Drag to any dock. Ctrl+Shift+Left/Right moves sides; Ctrl+Shift+Up/Down reorders."
                             on:click=move |_| activate.activate_sidebar_tab(tab)
                             on:dragstart=move |ev: web_sys::DragEvent| {
                                 ev.stop_propagation();
@@ -109,7 +114,39 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                     </div>
                 }
             } />
+            <Show when=move || layouts.with(|l| l.current().pane(side).tabs.is_empty())>
+                <button type="button" class="dock-empty-menu" aria-label=format!("{} dock tab menu", side.label()) title="Add tabs"
+                    aria-haspopup="menu" aria-expanded=move || menu.get().is_some().to_string()
+                    on:click=move |ev| {
+                        if let Some(target) = ev.current_target().and_then(|target| target.dyn_into::<web_sys::Element>().ok()) {
+                            let rect = target.get_bounding_client_rect();
+                            menu.set(Some((rect.left(), rect.bottom())));
+                        }
+                    }>"⋯"</button>
+            </Show>
             <span class="sidebar-empty-target" style=move || if dragged.get().is_some() && layouts.with(|l| { let pane = l.current().pane(side); !pane.visible || pane.tabs.is_empty() }) { "" } else { "display:none" }>"Drop tabs here"</span>
+        </div>
+        <div class="dock-empty" aria-label=format!("{} dock empty", side.label())
+            style=move || layouts.with(|l| {
+                let pane = l.current().pane(side);
+                if blocked.get() || !pane.visible || !pane.tabs.is_empty() { "display:none" } else { "" }
+            })
+            on:contextmenu=move |ev| open_card_menu(menu, &ev)
+            on:dragover=move |ev: web_sys::DragEvent| {
+                if dragged.get_untracked().is_some() { ev.prevent_default(); over.set(true); }
+            }
+            on:dragleave=move |_| over.set(false)
+            class:sidebar-drop-over=move || over.get() && dragged.get().is_some()
+            on:drop=move |ev: web_sys::DragEvent| {
+                if let Some(tab) = dragged.get_untracked() {
+                    ev.prevent_default(); ev.stop_propagation();
+                    empty_move.move_sidebar_tab(tab, side, None);
+                }
+                dragged.set(None); over.set(false); hover.set(None);
+            }>
+            <PanelIcon side=side />
+            <span>"Drag a tab here"</span>
+            <small>"Right-click to add tabs"</small>
         </div>
         <CardContextMenu menu=menu label="Sidebar tabs" anchor=anchor>
             <div>
@@ -157,10 +194,10 @@ pub fn SidebarPanels() -> impl IntoView {
             let style = move || {
                 if blocked.get() { return "display:none".into(); }
                 layouts.with(|layouts| {
-                match [SidebarSide::Left, SidebarSide::Right].into_iter().find(|side| layouts.current().pane(*side).active == Some(tab)) {
+                match [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom].into_iter().find(|side| layouts.current().pane(*side).active == Some(tab)) {
                     Some(side) => {
                         let pane = layouts.current().pane(side);
-                        if pane.visible && pane.active == Some(tab) { format!("grid-column:{};grid-row:2", side.column()) } else { "display:none".into() }
+                        if pane.visible && pane.active == Some(tab) { match side { SidebarSide::Bottom => "grid-column:1 / -1;grid-row:5".into(), _ => format!("grid-column:{};grid-row:2", side.column()) } } else { "display:none".into() }
                     },
                     None => "display:none".into(),
                 }
@@ -177,6 +214,7 @@ pub fn SidebarPanels() -> impl IntoView {
                         SidebarTab::References => view! { <ReferencesPanel /> }.into_any(),
                         SidebarTab::Swarms => view! { <SwarmsPanel /> }.into_any(),
                         SidebarTab::Workflows => view! { <WorkflowsPanel /> }.into_any(),
+                        SidebarTab::Terminal => view! { <TerminalView /> }.into_any(),
                     }}
                 </section>
             }

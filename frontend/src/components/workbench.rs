@@ -4,11 +4,10 @@ use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::components::center_zone::CenterZone;
-use crate::components::dock_zone::{DockPosition, DockZone, SidebarPanels};
+use crate::components::dock_zone::{DockZone, SidebarPanels};
 use crate::sidebar_layout::SidebarSide;
-use crate::state::{AppState, DockVisibility};
+use crate::state::AppState;
 
-const BOTTOM_DEFAULT: f64 = 200.0;
 const MIN_DOCK: f64 = 160.0;
 const MIN_CENTER: f64 = 200.0;
 const MIN_BOTTOM: f64 = 80.0;
@@ -60,28 +59,27 @@ pub fn Workbench() -> impl IntoView {
     let layouts = state.sidebar_layout;
     let layout_blocked = state.sidebar_storage_blocked;
     let tab_drag = state.sidebar_drag;
-    let left_visible = move || {
-        !layout_blocked.get()
-            && layouts.with(|l| {
-                l.current().left.visible
-                    && (l.current().left.active.is_some() || !l.current().left.tabs.is_empty())
-            })
-    };
-    let right_visible = move || {
-        !layout_blocked.get()
-            && layouts.with(|l| {
-                l.current().right.visible
-                    && (l.current().right.active.is_some() || !l.current().right.tabs.is_empty())
-            })
-    };
-    let bottom_visible = move || state.bottom_dock.get() == DockVisibility::Visible;
+    let left_visible = move || !layout_blocked.get() && layouts.with(|l| l.current().left.visible);
+    let right_visible =
+        move || !layout_blocked.get() && layouts.with(|l| l.current().right.visible);
+    let bottom_visible =
+        move || !layout_blocked.get() && layouts.with(|l| l.current().bottom.visible);
 
     let left_width = Signal::derive(move || layouts.with(|l| l.current().left.width));
     let right_width = Signal::derive(move || layouts.with(|l| l.current().right.width));
     let set_width = move |side, width: f64| {
-        layouts.update(|l| l.current_mut().pane_mut(side).width = width.clamp(MIN_DOCK, 2400.0))
+        layouts.update(|l| {
+            l.current_mut().pane_mut(side).width = width.clamp(
+                if side == SidebarSide::Bottom {
+                    MIN_BOTTOM
+                } else {
+                    MIN_DOCK
+                },
+                2400.0,
+            )
+        })
     };
-    let bottom_height = RwSignal::new(BOTTOM_DEFAULT);
+    let bottom_height = Signal::derive(move || layouts.with(|l| l.current().bottom.width));
 
     let dragging = RwSignal::new(None::<DragAxis>);
     let drag_start_pos = RwSignal::new(0.0f64);
@@ -157,9 +155,9 @@ pub fn Workbench() -> impl IntoView {
                         let new_h = (start_size + delta).max(MIN_BOTTOM);
                         if let Some(el) = workbench_ref.get_untracked() {
                             let ch = el.client_height() as f64;
-                            bottom_height.set(new_h.min(ch - MIN_CENTER));
+                            set_width(SidebarSide::Bottom, new_h.min(ch - MIN_CENTER));
                         } else {
-                            bottom_height.set(new_h);
+                            set_width(SidebarSide::Bottom, new_h);
                         }
                     }
                 }
@@ -252,32 +250,37 @@ pub fn Workbench() -> impl IntoView {
         let left_handle = if left_visible() { 4 } else { 0 };
         let right_handle = if right_visible() { 4 } else { 0 };
         format!(
-            "grid-template-columns:{left} {left_handle}px minmax(200px, 1fr) {right_handle}px {right}"
+            "grid-template-columns:{left} {left_handle}px minmax(200px, 1fr) {right_handle}px {right};grid-template-rows:34px minmax(0,1fr) {}px {}px {}px",
+            if bottom_visible() { 4 } else { 0 },
+            if bottom_visible() { 34 } else { 0 },
+            if bottom_visible() {
+                (bottom_height.get() - 34.0).max(0.0) as i32
+            } else {
+                0
+            }
         )
     };
-    let bottom_style = move || format!("height:{}px", bottom_height.get() as i32);
 
     view! {
         <div class="workbench" node_ref=workbench_ref>
             <div class="workbench-main sidebar-workspace" style=grid_style>
                 <div class="sidebar-bar sidebar-bar-left" node_ref=left_bar_ref
                     class:sidebar-empty-drop-target=move || !left_visible() && tab_drag.get().is_some()
-                    style=move || if left_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=DockPosition::Left /></div>
+                    style=move || if left_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=SidebarSide::Left /></div>
                 <div class="resize-handle resize-handle-h sidebar-resize-left" style=move || if left_visible() { "" } else { "visibility:hidden" } on:mousedown=on_left_handle></div>
                 <div class="sidebar-center"><CenterZone /></div>
                 <div class="resize-handle resize-handle-h sidebar-resize-right" style=move || if right_visible() { "" } else { "visibility:hidden" } on:mousedown=on_right_handle></div>
                 <div class="sidebar-bar sidebar-bar-right" node_ref=right_bar_ref
                     class:sidebar-empty-drop-target=move || !right_visible() && tab_drag.get().is_some()
-                    style=move || if right_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=DockPosition::Right /></div>
+                    style=move || if right_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=SidebarSide::Right /></div>
+                <div class="resize-handle resize-handle-v sidebar-resize-bottom" style=move || if bottom_visible() { "" } else { "display:none" } on:mousedown=on_bottom_handle></div>
+                <div class="sidebar-bar sidebar-bar-bottom"
+                    class:sidebar-empty-drop-target=move || !bottom_visible() && tab_drag.get().is_some()
+                    style=move || if bottom_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=SidebarSide::Bottom /></div>
                 <SidebarPanels />
                 <div class="sidebar-layout-error" role="alert" style=move || if layout_blocked.get() { "" } else { "display:none" }>"Sidebar layout unavailable. Open Settings → Appearance → Reset sidebar layout to continue."</div>
             </div>
-            <Show when=bottom_visible>
-                <div class="resize-handle resize-handle-v" on:mousedown=on_bottom_handle></div>
-                <div class="dock-zone dock-bottom" style=bottom_style>
-                    <DockZone position=DockPosition::Bottom />
-                </div>
-            </Show>
+
         </div>
     }
 }
@@ -473,6 +476,165 @@ mod wasm_tests {
                 .left(),
             "Vibe reserves no rail, empty tab bar or resize gutter"
         );
+        // Version 1 saved the default empty left pane as visible, although
+        // its old rendering predicate hid it. Upgrade preserves that geometry.
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&storage.get_item(STORAGE_KEY).unwrap().unwrap()).unwrap();
+        legacy["version"] = serde_json::json!(1);
+        legacy["vibe"]["left"]["visible"] = serde_json::json!(true);
+        for mode in ["vibe", "dinosaur"] {
+            legacy[mode].as_object_mut().unwrap().remove("bottom");
+        }
+        drop(handle);
+        storage
+            .set_item(STORAGE_KEY, &serde_json::to_string(&legacy).unwrap())
+            .unwrap();
+        let handle = shell(&container, state.clone());
+        tick().await;
+        assert_eq!(
+            element(&container, ".sidebar-bar-left")
+                .get_bounding_client_rect()
+                .width(),
+            0.0,
+            "Upgrade must not open a formerly hidden default empty dock"
+        );
+        assert!(
+            element(&container, "section[aria-label='Agents panel']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0,
+            "Upgrade preserves the existing populated right dock"
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&storage.get_item(STORAGE_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(upgraded["version"], serde_json::json!(2));
+        for side in ["Left", "Bottom"] {
+            let toggle = element(&container, &format!("[aria-label='Toggle {side} Dock']"));
+            assert_eq!(
+                toggle.get_attribute("aria-pressed").as_deref(),
+                Some("false")
+            );
+            assert!(toggle.query_selector("svg").unwrap().is_some());
+            toggle.click();
+            tick().await;
+            assert_eq!(
+                toggle.get_attribute("aria-pressed").as_deref(),
+                Some("true")
+            );
+            let empty = element(&container, &format!("[aria-label='{side} dock empty']"));
+            assert!(empty.get_bounding_client_rect().width() > 0.0);
+            assert!(empty.get_bounding_client_rect().height() > 0.0);
+            assert_eq!(
+                empty.text_content().unwrap(),
+                "Drag a tab hereRight-click to add tabs"
+            );
+            toggle.click();
+            tick().await;
+            assert_eq!(empty.get_bounding_client_rect().height(), 0.0);
+        }
+        // Add through the same menu, then drag into an explicitly opened empty
+        // dock. Removing the last tab must leave a usable placeholder.
+        element(&container, "[aria-label='Toggle Bottom Dock']").click();
+        tick().await;
+        element(&container, "[aria-label='Bottom dock tab menu']").click();
+        tick().await;
+        let choice = element(&container, "[role='menuitemcheckbox'][aria-label='Search']");
+        let rect = choice.get_bounding_client_rect();
+        let hit = document
+            .element_from_point(
+                (rect.left() + 8.0) as f32,
+                (rect.top() + rect.height() / 2.0) as f32,
+            )
+            .unwrap();
+        assert!(
+            choice.contains(Some(&hit)),
+            "The empty dock menu must receive pointer input"
+        );
+        element(&container, "[role='menuitemcheckbox'][aria-label='Search']").click();
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Search']"),
+            "Escape",
+        );
+        tick().await;
+        let search_tab = element(
+            &container,
+            ".sidebar-bar-bottom button[aria-label='Search']",
+        );
+        assert!(
+            element(&container, "section[aria-label='Search panel']")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        element(&container, "[aria-label='Toggle Left Dock']").click();
+        tick().await;
+        search_tab
+            .dispatch_event(&web_sys::DragEvent::new("dragstart").unwrap())
+            .unwrap();
+        tick().await;
+        element(&container, "[aria-label='Left dock empty']")
+            .dispatch_event(&web_sys::DragEvent::new("drop").unwrap())
+            .unwrap();
+        tick().await;
+        assert!(
+            element(&container, ".sidebar-bar-left button[aria-label='Search']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+        assert!(
+            element(&container, "[aria-label='Bottom dock empty']")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        press(
+            &element(&container, ".sidebar-bar-left .dock-tab-bar"),
+            "ContextMenu",
+        );
+        tick().await;
+        element(&container, "[role='menuitemcheckbox'][aria-label='Search']").click();
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Search']"),
+            "Escape",
+        );
+        tick().await;
+        assert_eq!(
+            element(&container, "section[aria-label='Search panel']")
+                .get_bounding_client_rect()
+                .height(),
+            0.0
+        );
+        assert!(
+            element(&container, "[aria-label='Left dock empty']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+        let context = web_sys::MouseEventInit::new();
+        context.set_bubbles(true);
+        context.set_cancelable(true);
+        element(&container, "[aria-label='Left dock empty']")
+            .dispatch_event(
+                &web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &context)
+                    .unwrap(),
+            )
+            .unwrap();
+        tick().await;
+        assert!(
+            element(&container, "[role='menuitemcheckbox'][aria-label='Search']")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        press(
+            &element(&container, "[role='menuitemcheckbox'][aria-label='Search']"),
+            "Escape",
+        );
+        tick().await;
+        element(&container, "[aria-label='Toggle Left Dock']").click();
+        element(&container, "[aria-label='Toggle Bottom Dock']").click();
+        tick().await;
         let tab = element(&container, ".sidebar-bar-right button[aria-label='Agents']");
         tab.dispatch_event(&web_sys::DragEvent::new("dragstart").unwrap())
             .unwrap();
@@ -731,6 +893,21 @@ mod wasm_tests {
             tabs_before
         );
         assert_eq!(textarea.value(), "Unsent draft\nsecond line");
+        let choice = element(
+            &container,
+            "[role='menuitemcheckbox'][aria-label='History']",
+        );
+        let rect = choice.get_bounding_client_rect();
+        let hit = document
+            .element_from_point(
+                (rect.left() + 8.0) as f32,
+                (rect.top() + rect.height() / 2.0) as f32,
+            )
+            .unwrap();
+        assert!(
+            choice.contains(Some(&hit)),
+            "A populated dock must not cover its tab visibility menu"
+        );
         let history_width = element(&container, "section[aria-label='History panel']")
             .get_bounding_client_rect()
             .width();
@@ -789,7 +966,7 @@ mod wasm_tests {
                 .unwrap()
                 .get_attribute("aria-label")
                 .as_deref(),
-            Some("Workflows")
+            Some("Terminal")
         );
         press(
             &document
@@ -826,12 +1003,12 @@ mod wasm_tests {
             element(&container, "section[aria-label='History panel']")
                 .get_bounding_client_rect()
                 .width(),
-            history_width,
-            "Unchecking the final tab preserves its active panel"
+            0.0,
+            "Removing the final tab shows the empty dock, not an unlisted panel"
         );
         assert!(
             strip.get_bounding_client_rect().width() > 0.0,
-            "Retained view keeps its blank checklist anchor"
+            "The empty dock keeps its usable checklist anchor"
         );
         press(
             &element(&container, "[role='menuitemcheckbox'][aria-label='Agents']"),
@@ -898,6 +1075,7 @@ mod wasm_tests {
         // restore in a fresh component tree, not just in an in-memory mirror.
         state.sidebar_layout.update(|layouts| {
             layouts.current_mut().left.width = 280.0;
+            layouts.current_mut().bottom.visible = true;
             layouts.current_mut().right.visible = false;
         });
         tick().await;
@@ -956,6 +1134,24 @@ mod wasm_tests {
                 .unwrap(),
             "History"
         );
+        assert_eq!(
+            element(&container, "[aria-label='Toggle Bottom Dock']")
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("false"),
+            "Dinosaur has an independent bottom layout"
+        );
+        mode(&container, "vibe").await;
+        tick().await;
+        assert!(
+            element(&container, "[aria-label='Bottom dock empty']")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0,
+            "Explicitly open empty dock survives storage restore and mode switching"
+        );
+        mode(&container, "dinosaur").await;
+        tick().await;
         // Canonical activation follows a moved tab, including developer actions.
         restored.activate_sidebar_tab(SidebarTab::Agents);
         tick().await;

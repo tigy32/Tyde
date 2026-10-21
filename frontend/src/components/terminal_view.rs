@@ -3,7 +3,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, DockVisibility, TerminalInfo, root_display_name};
+use crate::state::{AppState, TerminalInfo, root_display_name};
 use crate::term_bridge;
 
 use protocol::{
@@ -86,9 +86,7 @@ fn TerminalTabBar() -> impl IntoView {
             rows: 24,
         };
 
-        state_for_new_terminal
-            .bottom_dock
-            .set(DockVisibility::Visible);
+        state_for_new_terminal.activate_sidebar_tab(crate::state::SidebarTab::Terminal);
 
         spawn_local(async move {
             if let Err(e) =
