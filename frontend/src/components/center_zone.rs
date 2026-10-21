@@ -1885,6 +1885,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::command_palette::CommandId;
     use crate::state::{FileResourceKey, OpenFile, TAB_LRU_CAPACITY};
+    use crate::wasm_test_support::ScopedRoot;
     use leptos::mount::mount_to;
     use protocol::{ProjectFileVersion, ProjectPath, ProjectRootPath};
     use wasm_bindgen_test::*;
@@ -1926,7 +1927,7 @@ mod wasm_tests {
     /// real layout box: `.center-zone` is `flex: 1` inside a flex column, so
     /// without an explicitly sized parent every rect would be zero and the
     /// geometry assertions below would be vacuous.
-    fn make_container() -> HtmlElement {
+    fn make_container() -> ScopedRoot {
         make_sized_container(CONTAINER_WIDTH, CONTAINER_HEIGHT)
     }
 
@@ -1934,24 +1935,9 @@ mod wasm_tests {
     /// minimum, split availability, and narrow mode all key off the measured
     /// workspace. Those tests size the container themselves and let the
     /// component's own width observer do the measuring.
-    fn make_sized_container(width: f64, height: f64) -> HtmlElement {
+    fn make_sized_container(width: f64, height: f64) -> ScopedRoot {
         ensure_styles_loaded();
         let document = web_sys::window().unwrap().document().unwrap();
-        // Every test in a wasm binary shares one document. A container left
-        // behind by the previous test keeps its fixed, full-viewport box in the
-        // page — where it shadows hit-testing (`elementFromPoint`) and hover for
-        // whatever comes next. Each fixture disposes the last one, so it owns the
-        // page it asserts about.
-        let stale = document
-            .query_selector_all("[data-test-container]")
-            .unwrap();
-        for index in 0..stale.length() {
-            if let Some(node) = stale.item(index)
-                && let Some(parent) = node.parent_node()
-            {
-                let _ = parent.remove_child(&node);
-            }
-        }
         let container = document.create_element("div").unwrap();
         container.set_attribute("data-test-container", "1").unwrap();
         container
@@ -1965,7 +1951,7 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(container.dyn_into::<HtmlElement>().unwrap(), "center-zone")
     }
 
     /// Mirror of the tab-LRU tracker `App` installs (see `app.rs`, "Tab LRU
@@ -3614,9 +3600,11 @@ mod wasm_tests {
             "precondition: the previous fixture measured its workspace"
         );
         drop(handle);
+        let previous_root = (*previous).clone();
+        drop(previous);
         settle().await;
 
-        // A new fixture disposes the old page ...
+        // The previous owner disposed its page; the next fixture need not.
         let container = make_container();
         let document = web_sys::window().unwrap().document().unwrap();
         assert_eq!(
@@ -3628,9 +3616,13 @@ mod wasm_tests {
             "exactly one test container is in the page: the current one"
         );
         assert!(
-            !previous.is_connected(),
+            !previous_root.is_connected(),
             "the previous fixture's DOM is gone, not merely hidden behind the new \
              one — a leftover fixed container shadows hit-testing and hover"
+        );
+        assert!(
+            !previous_root.has_child_nodes(),
+            "the previous fixture also disposes its mounted view"
         );
 
         // ... and starts from clean presentation state.

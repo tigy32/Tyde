@@ -2151,6 +2151,7 @@ fn make_line_span(
 mod wasm_tests {
     use super::*;
     use crate::state::{AppState, FileResourceKey, OpenFile, OpenTarget};
+    use crate::wasm_test_support::ScopedRoot;
     use leptos::mount::mount_to;
     use protocol::{
         ProjectBinaryFilePayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath,
@@ -2186,9 +2187,9 @@ mod wasm_tests {
     }
 
     /// Create a fresh, sized container appended to the document body so child
-    /// elements have a real layout box. Returns the container as an
-    /// `HtmlElement` ready to pass to `mount_to`.
-    fn make_container() -> HtmlElement {
+    /// elements have a real layout box. Its scoped guard dereferences to the
+    /// `HtmlElement` passed to `mount_to`.
+    fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         // Give the container a deterministic size so flex children lay out
@@ -2202,7 +2203,7 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(container.dyn_into::<HtmlElement>().unwrap(), "file-view")
     }
 
     /// Install a stub that captures outbound `send_host_line` Tauri invokes

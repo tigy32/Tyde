@@ -3594,11 +3594,12 @@ mod wasm_tests {
     // Primary "Cancel + send" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_with_session_cancel_send_primary_full_menu() {
-        let container = make_container();
-        let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            configure(&state, true, true, "redirect this");
-            provide_context(state);
+        let container = make_styled_container();
+        let state = AppState::new();
+        configure(&state, true, true, "redirect this");
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
             view! { <ChatInput /> }
         });
         next_tick().await;
@@ -3614,6 +3615,12 @@ mod wasm_tests {
             "Cancel + send must be enabled"
         );
 
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; bottom: 0; left: 0; width: min(800px, 100vw); height: auto;",
+            )
+            .unwrap();
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
@@ -3626,6 +3633,102 @@ mod wasm_tests {
             ],
             "thinking+session+input menu includes attachment and all existing send actions"
         );
+
+        // Chrome hit a foreign 800x600 max-z fixture DIV over a correct menu.
+        // Diagnose component paint separately, but retain global hit checks:
+        // an action hidden by a foreign or portal overlay is not clickable.
+        // Expose the decorative line's hit target without changing its paint.
+        let assert_menu_unobscured = js_sys::Function::new_with_args(
+            "container",
+            r#"
+            const menu = container.querySelector('[role="menu"]');
+            for (const animation of menu.getAnimations()) animation.finish();
+            const bounds = menu.getBoundingClientRect();
+            if (bounds.left < 0 || bounds.top < 0 ||
+                bounds.right > document.documentElement.clientWidth ||
+                bounds.bottom > document.documentElement.clientHeight)
+                throw new Error('Send actions must fit within the viewport');
+            const ring = container.querySelector('[data-testid="chat-thinking-ring"]');
+            const line = ring.getBoundingClientRect();
+            if (!(bounds.top < line.top && bounds.bottom > line.bottom))
+                throw new Error('The fixture must exercise the menu/activity-line overlap');
+            const original = ring.style.pointerEvents;
+            ring.style.pointerEvents = 'auto';
+            let hit; let scopedStack;
+            const point = [bounds.left + bounds.width / 2, line.top + line.height / 2];
+            try {
+                scopedStack = document.elementsFromPoint(...point).filter(node => container.contains(node));
+                if (!scopedStack.includes(ring)) throw new Error('The activity line must paint at the overlap probe');
+                hit = document.elementFromPoint(...point);
+            } finally {
+                ring.style.pointerEvents = original;
+            }
+            if (!menu.contains(scopedStack[0]))
+                throw new Error('The activity line must paint behind the component menu');
+            if (!menu.contains(hit)) {
+                const ancestors = [];
+                for (let node = hit; node; node = node.parentElement) {
+                    ancestors.push({tag: node.tagName, classes: node.className,
+                        bounds: node.getBoundingClientRect().toJSON(),
+                        zIndex: getComputedStyle(node).zIndex,
+                        fixtureOwner: node.getAttribute('data-test-fixture'),
+                        withinFixture: container.contains(node)});
+                }
+                throw new Error('The open send menu must be globally unobscured: ' +
+                    JSON.stringify({point, menu: bounds.toJSON(), line: line.toJSON(), ancestors}));
+            }
+            for (const item of menu.querySelectorAll('[role="menuitem"]')) {
+                const box = item.getBoundingClientRect();
+                if (box.width <= 0 || box.height <= 0 || !item.contains(
+                    document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)))
+                    throw new Error('Every send action must remain a visible hit target');
+            }
+            "#,
+        );
+        for (width, draft) in [
+            (
+                "800px",
+                "Review this menu layout\nKeep the existing actions\nPreserve keyboard behavior\nKeep the activity line\nOnly fix its stacking",
+            ),
+            (
+                "420px",
+                "Review this menu layout\nKeep the existing actions\nPreserve keyboard behavior\nKeep the activity line\nOnly fix its stacking",
+            ),
+            ("420px", "Short draft"),
+        ] {
+            container
+                .style()
+                .set_property("width", &format!("min({width}, 100vw)"))
+                .unwrap();
+            state.composer_untracked().text.set(draft.to_owned());
+            next_tick().await;
+            assert_menu_unobscured
+                .call1(&JsValue::NULL, &container)
+                .expect("the complete menu must paint above activity and remain clickable");
+        }
+
+        let steer = query(&container, "[data-test='chat-send-menu-steer']")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        steer.focus().unwrap();
+        dispatch_keydown(&steer, "Escape", false, false);
+        next_tick().await;
+        assert!(query(&container, "[role='menu']").is_none());
+        open_menu(&container).await;
+        query(&container, ".chat-send-menu-backdrop")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(query(&container, "[role='menu']").is_none());
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "Short draft"
+        );
+        drop(handle);
+        container.remove();
     }
 
     /// Caret is always rendered in the DOM regardless of state — it just becomes

@@ -2736,6 +2736,7 @@ fn AgentMonitorRowView(
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
+    use crate::wasm_test_support::ScopedRoot;
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentManualTagAssignment, AgentManualTagDescriptor, AgentPinsSnapshot,
@@ -2752,7 +2753,7 @@ mod wasm_tests {
 
     const HOST: &str = "local";
 
-    fn make_container() -> HtmlElement {
+    fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
@@ -2763,7 +2764,10 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(
+            container.dyn_into::<HtmlElement>().unwrap(),
+            "agent-monitor",
+        )
     }
 
     /// Capture outbound `send_host_line` Tauri invokes so a test can inspect

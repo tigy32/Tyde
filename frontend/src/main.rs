@@ -22,6 +22,29 @@ mod voice;
 mod wasm_test_support {
     use std::{any::Any, ops::Deref};
 
+    pub struct ScopedRoot(web_sys::HtmlElement);
+
+    impl ScopedRoot {
+        pub fn new(root: web_sys::HtmlElement, owner: &str) -> Self {
+            root.set_attribute("data-test-fixture", owner).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Deref for ScopedRoot {
+        type Target = web_sys::HtmlElement;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for ScopedRoot {
+        fn drop(&mut self) {
+            self.0.remove();
+        }
+    }
+
     pub struct Mounted<T> {
         value: T,
         _handle: Box<dyn Any>,

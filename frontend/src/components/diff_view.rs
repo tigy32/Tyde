@@ -5468,7 +5468,7 @@ mod wasm_tests {
     use super::*;
     use crate::state::DiffViewState;
     use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
-    use crate::wasm_test_support::Mounted;
+    use crate::wasm_test_support::{Mounted, ScopedRoot};
     use leptos::mount::mount_to;
     use protocol::ProjectGitDiffHunk;
     use wasm_bindgen::JsCast;
@@ -7107,40 +7107,10 @@ mod wasm_tests {
     ///
     /// These tests resolve a position with `caretPositionFromPoint`, which
     /// answers by *viewport coordinate*, so unlike the render-only tests they
-    /// are sensitive to where the container actually sits and to what else is
-    /// painted over it. Two things had to be dealt with:
-    ///
-    /// - `make_container`'s divs are never removed, so they pile up on the page
-    ///   and one of them wins hit-testing at our coordinates — the caret then
-    ///   resolves inside *that* div, the handler correctly finds no diff row,
-    ///   and every "did we send a request?" assertion fails as though the
-    ///   feature were broken. They are cleared here (tests run sequentially, so
-    ///   by now they are all finished).
-    /// - Absolutely-positioned containers move with page scroll; a mounted row
-    ///   was landing at `top: -93px`, off-screen, where the caret API returns
-    ///   `None`. `position: fixed` pins this one to the viewport instead.
-    fn make_code_intel_container() -> HtmlElement {
+    /// are sensitive to the container's viewport position. A fixed box avoids
+    /// page scroll moving the row off-screen; its scope owns its teardown.
+    fn make_code_intel_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
-        if let Some(previous) = document.get_element_by_id("code-intel-test-container") {
-            previous.remove();
-        }
-        // Leftover mount containers from earlier tests. Every component's
-        // `make_container` pins one at the top-left corner — some absolute,
-        // some fixed — which is exactly where ours goes, and a `position:
-        // fixed` leftover sits in the same stacking layer, so `z-index` alone
-        // does not reliably keep ours on top. Matching on the shared
-        // "top: 0; left: 0" inline style catches them whichever they use.
-        let stale = document
-            .query_selector_all("div[style*=\"top: 0\"][style*=\"left: 0\"]")
-            .unwrap();
-        for i in 0..stale.length() {
-            if let Some(node) = stale.item(i)
-                && let Ok(element) = node.dyn_into::<web_sys::Element>()
-                && element.id() != "code-intel-test-container"
-            {
-                element.remove();
-            }
-        }
         let container = document.create_element("div").unwrap();
         container.set_id("code-intel-test-container");
         container
@@ -7151,7 +7121,10 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(
+            container.dyn_into::<HtmlElement>().unwrap(),
+            "diff-code-intel",
+        )
     }
 
     /// Viewport coordinates just inside `element`'s left edge.

@@ -3032,6 +3032,9 @@ mod wasm_tests {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
+            .set_attribute("data-test-fixture", "hermes-settings")
+            .unwrap();
+        container
             .set_attribute(
                 "style",
                 "position: fixed; top: 0; left: 0; width: 800px; height: 600px; \
@@ -3265,7 +3268,16 @@ mod wasm_tests {
             .unwrap();
     }
 
-    fn mount_doc(container: &HtmlElement, doc: HermesNativeSettingsDoc) -> impl Sized {
+    struct MountedDoc(crate::wasm_test_support::Mounted<HtmlElement>);
+
+    impl Drop for MountedDoc {
+        fn drop(&mut self) {
+            // Leptos unmounts the view, not this fixture's opaque fixed parent.
+            self.0.remove();
+        }
+    }
+
+    fn mount_doc(container: &HtmlElement, doc: HermesNativeSettingsDoc) -> MountedDoc {
         mount_doc_with_disabled(container, doc, Vec::new())
     }
 
@@ -3276,9 +3288,9 @@ mod wasm_tests {
         container: &HtmlElement,
         doc: HermesNativeSettingsDoc,
         disabled: Vec<String>,
-    ) -> impl Sized {
+    ) -> MountedDoc {
         let container = container.clone();
-        mount_to(container, move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             install_doc(&state, doc.clone());
             if !disabled.is_empty() {
@@ -3324,14 +3336,15 @@ mod wasm_tests {
             }
             provide_context(state);
             hermes_settings_page_body("h")
-        })
+        });
+        MountedDoc(crate::wasm_test_support::Mounted::new(handle, container))
     }
 
     #[wasm_bindgen_test]
     async fn renders_profiles_and_connected_providers() {
         ensure_styles_loaded();
         let container = make_container();
-        let _handle = mount_doc(&container, fixture_doc());
+        let fixture = mount_doc(&container, fixture_doc());
         next_tick().await;
 
         let text = container_text(&container);
@@ -3388,6 +3401,17 @@ mod wasm_tests {
         assert!(
             text.contains("1 provider connected"),
             "the tab should say how many providers are connected: {text}"
+        );
+
+        assert!(container.is_connected(), "settings fixture must be mounted");
+        drop(fixture);
+        assert!(
+            !container.is_connected(),
+            "settings fixture must remove its topmost parent before the next DOM flow"
+        );
+        assert!(
+            !container.has_child_nodes(),
+            "settings fixture must also dispose its Leptos view"
         );
     }
 

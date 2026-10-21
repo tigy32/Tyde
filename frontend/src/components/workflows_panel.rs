@@ -1326,9 +1326,29 @@ mod wasm_tests {
         }
     }
 
-    fn make_container() -> HtmlElement {
+    struct WorkflowContainer(HtmlElement);
+
+    impl std::ops::Deref for WorkflowContainer {
+        type Target = HtmlElement;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for WorkflowContainer {
+        fn drop(&mut self) {
+            // The scoped mount handles unmount children, not this fixed parent.
+            self.0.remove();
+        }
+    }
+
+    fn make_container() -> WorkflowContainer {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
+        container
+            .set_attribute("data-test-fixture", "workflows-panel")
+            .unwrap();
         container
             .set_attribute(
                 "style",
@@ -1338,7 +1358,7 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        WorkflowContainer(container.dyn_into::<HtmlElement>().unwrap())
     }
 
     fn install_send_stub() {
@@ -1555,7 +1575,7 @@ mod wasm_tests {
         let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let captured_for_mount = captured.clone();
 
-        let _handle = mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.selected_host_id.set(Some("host-a".to_owned()));
             state.host_streams.update(|m| {
@@ -1634,6 +1654,19 @@ mod wasm_tests {
             captured_trigger(),
             "",
             "CTA must not trigger/send any frame; the prompt is editable and unsent"
+        );
+
+        let root: HtmlElement = (*container).clone();
+        assert!(root.is_connected(), "workflow fixture must be mounted");
+        drop(handle);
+        assert!(
+            !root.has_child_nodes(),
+            "workflow fixture must dispose its Leptos view"
+        );
+        drop(container);
+        assert!(
+            !root.is_connected(),
+            "workflow fixture must remove its topmost parent before the next DOM flow"
         );
     }
 

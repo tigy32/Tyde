@@ -544,6 +544,7 @@ pub fn OrchestrationView(records: Signal<Vec<OrchestrationRecord>>) -> impl Into
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
+    use crate::wasm_test_support::{Mounted, ScopedRoot};
     use leptos::mount::mount_to;
     use protocol::{
         OrchestrationAgentType, OrchestrationEvent, OrchestrationId, OrchestrationWorkerInfo,
@@ -564,7 +565,7 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn make_container() -> HtmlElement {
+    fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
@@ -576,7 +577,10 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        ScopedRoot::new(
+            container.dyn_into::<HtmlElement>().unwrap(),
+            "orchestration",
+        )
     }
 
     fn event(
@@ -622,14 +626,13 @@ mod wasm_tests {
     const ICON_SUCCEEDED: &str = "\u{2713}";
     const ICON_ABORTED: &str = "\u{2298}";
 
-    fn mount(records: Vec<OrchestrationRecord>) -> HtmlElement {
+    fn mount(records: Vec<OrchestrationRecord>) -> Mounted<ScopedRoot> {
         let container = make_container();
-        mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let signal = RwSignal::new(records.clone());
             view! { <OrchestrationView records=signal.into() /> }
-        })
-        .forget();
-        container
+        });
+        Mounted::new(handle, container)
     }
 
     /// The status glyph shown next to the worker row whose label contains
@@ -811,6 +814,13 @@ mod wasm_tests {
             text.contains("Consensus") && text.contains("round 2"),
             "header must reflect the current workflow phase, got: {text}"
         );
+
+        let root: HtmlElement = (**container).clone();
+        drop(container);
+        assert!(
+            !root.is_connected() && !root.has_child_nodes(),
+            "orchestration fixture must dispose its view and topmost parent"
+        );
     }
 
     /// Driven end-to-end through the live reducer: a new user turn segments the
@@ -827,7 +837,7 @@ mod wasm_tests {
         let container = make_container();
         let stash: Rc<RefCell<Option<(AppState, AgentId)>>> = Rc::new(RefCell::new(None));
         let stash_for_mount = stash.clone();
-        mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let agent_id = AgentId("agent-1".to_owned());
             let records: Signal<Vec<OrchestrationRecord>> = Signal::derive({
@@ -841,8 +851,8 @@ mod wasm_tests {
             });
             *stash_for_mount.borrow_mut() = Some((state.clone(), agent_id.clone()));
             view! { <OrchestrationView records=records /> }
-        })
-        .forget();
+        });
+        let container = Mounted::new(handle, container);
 
         let (state, agent_id) = stash.borrow().clone().unwrap();
         let host = "host";

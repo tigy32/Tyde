@@ -1146,17 +1146,32 @@ mod wasm_tests {
         }
     }
 
-    fn mount_message(entry: ChatMessageEntry) -> HtmlElement {
+    struct MountedMessage(crate::wasm_test_support::Mounted<HtmlElement>);
+
+    impl std::ops::Deref for MountedMessage {
+        type Target = HtmlElement;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for MountedMessage {
+        fn drop(&mut self) {
+            // These opaque, topmost roots otherwise cover later DOM hit tests.
+            self.0.remove();
+        }
+    }
+
+    fn mount_message(entry: ChatMessageEntry) -> MountedMessage {
         mount_message_with_state(entry).0
     }
 
-    fn mount_message_with_state(entry: ChatMessageEntry) -> (HtmlElement, AppState) {
+    fn mount_message_with_state(entry: ChatMessageEntry) -> (MountedMessage, AppState) {
         let container = make_container();
         let mounted_state = std::rc::Rc::new(std::cell::RefCell::new(None));
         let slot = mounted_state.clone();
-        // Leak the mount handle so the component stays mounted after this
-        // helper returns; dropping it would unmount and clear the container.
-        mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             provide_context(state.clone());
             slot.borrow_mut().replace(state);
@@ -1164,10 +1179,12 @@ mod wasm_tests {
                 RwSignal::new(None).into();
             let entry = ArcRwSignal::new(entry.clone());
             view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }
-        })
-        .forget();
+        });
         let state = mounted_state.borrow_mut().take().expect("mount ran");
-        (container, state)
+        (
+            MountedMessage(crate::wasm_test_support::Mounted::new(handle, container)),
+            state,
+        )
     }
 
     struct ClipboardFixture;
@@ -1389,6 +1406,15 @@ mod wasm_tests {
             "long user bubble must respect the 85% width limit; bubble {}px, card {}px",
             long_rect.width(),
             long_card_rect.width(),
+        );
+
+        let short_root: HtmlElement = (*short_container).clone();
+        let long_root: HtmlElement = (*long_container).clone();
+        drop(short_container);
+        drop(long_container);
+        assert!(
+            !short_root.is_connected() && !long_root.is_connected(),
+            "message fixtures must remove their topmost roots before the next DOM flow"
         );
     }
 
@@ -1991,7 +2017,7 @@ mod wasm_tests {
         let agent_id_mount = agent_id.clone();
         let message_id_mount = message_id.clone();
 
-        mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let entry = ChatMessageEntry {
                 message: ChatMessage {
@@ -2023,8 +2049,8 @@ mod wasm_tests {
             let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
                 RwSignal::new(None).into();
             view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }
-        })
-        .forget();
+        });
+        let container = MountedMessage(crate::wasm_test_support::Mounted::new(handle, container));
         next_tick().await;
 
         // Before the patch the request scope is Unavailable: no badge at all.
