@@ -1012,10 +1012,14 @@ def inside(command):
                     fail("runtime_service_failed", "A runtime service is outside its workbench mount namespace")
             finally:
                 listener.close()
-        child = subprocess.Popen(command, env=env, preexec_fn=os.setpgrp)
+        def command_foreground():
+            os.setpgrp()
+            if terminal:
+                # Claim the terminal before exec can read and stop on SIGTTIN.
+                os.tcsetpgrp(0, os.getpgrp())
+        child = subprocess.Popen(command, env=env, preexec_fn=command_foreground)
         runtime_diagnostic("command_started", pid=child.pid, terminal=terminal)
         if terminal:
-            os.tcsetpgrp(0, child.pid)
             runtime_diagnostic("terminal_foreground", process_group=os.tcgetpgrp(0))
         childfd = os.pidfd_open(child.pid)
         try:

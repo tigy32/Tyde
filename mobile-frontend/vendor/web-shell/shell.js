@@ -50,7 +50,7 @@ export function attachShell(root, options = {}) {
         throw new Error("Shell regions must belong to its root");
     const html = document.documentElement;
     const documentHeights = [html, document.body].map(element => preserveStyle(element, ["height"]));
-    const restore = [preserveStyle(root, geometryProperties), preserveAttribute(root, "data-tws-keyboard"), preserveAttribute(root, "data-tws-title-hidden"), preserveAttribute(html, "data-tws-document")];
+    const restore = [preserveStyle(root, [...geometryProperties, "transition"]), preserveAttribute(root, "data-tws-keyboard"), preserveAttribute(root, "data-tws-title-hidden"), preserveAttribute(html, "data-tws-document")];
     restore.push(...documentHeights);
     const viewport = window.visualViewport;
     const keyboard = window.navigator.virtualKeyboard;
@@ -68,6 +68,7 @@ export function attachShell(root, options = {}) {
     let dirty = true;
     let frame = 0;
     let settleUntil = 0;
+    let hinted = null;
     let state = { top: 0, left: 0, width: html.clientWidth, height: html.clientHeight, keyboard: false, scale: 1 };
     const written = new Map();
     const registrations = [];
@@ -99,8 +100,14 @@ export function attachShell(root, options = {}) {
         if (!focused && !state.keyboard)
             browserChrome = Math.max(0, window.outerHeight - layoutHeight);
         const referenceHeight = keyboard && coarsePointer.matches ? Math.max(layoutHeight, window.outerHeight - browserChrome) : layoutHeight;
-        const keyboardOpen = (focused || state.keyboard) && referenceHeight - (viewport?.height ?? layoutHeight) > 80;
-        const measuredHeight = Math.max(1, Math.min(viewport?.height ?? layoutHeight, layoutHeight - top));
+        if (hinted && hinted.until > 0 && window.performance.now() >= hinted.until) {
+            root.style.removeProperty("transition");
+            // A shown keyboard keeps owning the height; a hidden one hands back to measurement.
+            hinted = hinted.overlap > 0 ? { overlap: hinted.overlap, until: 0 } : null;
+        }
+        // A native host's hint owns the height until its animation has finished.
+        const keyboardOpen = hinted ? hinted.overlap > 80 : (focused || state.keyboard) && referenceHeight - (viewport?.height ?? layoutHeight) > 80;
+        const measuredHeight = Math.max(1, Math.min(hinted ? layoutHeight - hinted.overlap : viewport?.height ?? layoutHeight, layoutHeight - top));
         let height = measuredHeight;
         const standalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches;
         const safeTop = standalone ? parseFloat(window.getComputedStyle(root).getPropertyValue("--tws-safe-top")) || 0 : 0;
@@ -185,9 +192,16 @@ export function attachShell(root, options = {}) {
         registrations.push([target, name, callback, capture]);
     };
     const visibility = () => {
-        if (document.hidden && frame !== 0) {
-            window.cancelAnimationFrame(frame);
-            frame = 0;
+        if (document.hidden) {
+            if (options.endEditingOnHidden === true) {
+                const active = document.activeElement;
+                if (root.contains(active) && editable(active))
+                    active.blur();
+            }
+            if (frame !== 0) {
+                window.cancelAnimationFrame(frame);
+                frame = 0;
+            }
         }
         else
             settle();
@@ -220,6 +234,25 @@ export function attachShell(root, options = {}) {
             pinned = true;
             toEnd();
         } },
+        keyboardHint(hint) {
+            const { overlap, duration } = hint;
+            const easing = hint.easing ?? "ease";
+            if (!Number.isFinite(overlap) || overlap < 0)
+                throw new TypeError("Keyboard overlap must be a non-negative number");
+            if (!Number.isFinite(duration) || duration < 0 || duration > 1000)
+                throw new TypeError("Keyboard duration must be 0–1000 ms");
+            if (!window.CSS.supports("transition-timing-function", easing))
+                throw new TypeError("Keyboard easing must be a CSS timing function");
+            if (stopped)
+                return;
+            hinted = { overlap, until: window.performance.now() + duration + 150 };
+            if (duration > 0)
+                root.style.setProperty("transition", `height ${duration}ms ${easing}`);
+            else
+                root.style.removeProperty("transition");
+            settleUntil = Math.max(settleUntil, hinted.until + 900);
+            invalidate();
+        },
         getState: () => ({ ...state, scale: viewport?.scale ?? 1 }),
         destroy() {
             if (stopped)

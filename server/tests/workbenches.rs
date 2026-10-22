@@ -4723,6 +4723,7 @@ with socket.socket(socket.AF_UNIX) as control:
     )
     .expect("real foreground service");
     fs::write(repo.path().join("command.py"), r#"import os,pathlib,select,socket
+assert os.tcgetpgrp(0)==os.getpgrp(), 'native command must own the terminal before input'
 read,write=os.pipe()
 if os.fork():
  os.close(write);assert os.read(read,1)==b'R';os._exit(0)

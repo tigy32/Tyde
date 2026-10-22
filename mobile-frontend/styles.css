@@ -1402,9 +1402,12 @@ input, textarea, select {
 
 .shell-flow { display: flow-root; }
 .tws-content > .shell-flow {
-    padding: var(--tws-clear-top, 12px) var(--space-4) var(--tws-clear-bottom, 12px);
+    padding-block: var(--tws-clear-top, 12px) var(--tws-clear-bottom, 12px);
+    padding-inline: calc(var(--space-4) + var(--tws-safe-left)) calc(var(--space-4) + var(--tws-safe-right));
 }
-.chat-messages > .shell-flow { padding-inline: var(--space-2); }
+.chat-messages > .shell-flow {
+    padding-inline: calc(var(--space-2) + var(--tws-safe-left)) calc(var(--space-2) + var(--tws-safe-right));
+}
 
 .chat-bottom-dock { overflow: visible; }
 

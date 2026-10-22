@@ -5,7 +5,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
-use crate::components::chat_input::ChatInput;
+use crate::components::chat_input::{ChatInput, NewChatOptions};
 use crate::components::chat_message::{ChatMessageView, ContextCompactionMarkerView};
 use crate::components::pending_submissions::AgentPendingSubmissions;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState, Spinner};
@@ -751,6 +751,7 @@ pub fn ChatView() -> impl IntoView {
         };
         pending_for_auto.set(true);
         let pending = pending_for_auto.clone();
+        let active_for_scroll = state_for_auto.active_agent;
         set_timeout(
             move || {
                 pending.set(false);
@@ -760,7 +761,12 @@ pub fn ChatView() -> impl IntoView {
                     el.client_height(),
                     el.scroll_height()
                 );
-                scroll_chat_to_bottom(&el);
+                // Setup belongs at the start; only conversation history follows the end.
+                if active_for_scroll.with_untracked(Option::is_none) {
+                    el.set_scroll_top(0);
+                } else {
+                    scroll_chat_to_bottom(&el);
+                }
             },
             std::time::Duration::from_millis(0),
         );
@@ -1009,6 +1015,7 @@ pub fn ChatView() -> impl IntoView {
                         // message. The composer below is still live and will
                         // spawn a new chat on send.
                         return view! {
+                            <NewChatOptions />
                             <EmptyState
                                 title="Start a new chat"
                                 body="Type below to spawn a new agent on your host. Your conversation history stays in sync with desktop."

@@ -107,6 +107,10 @@ function cleanup() {
 
 Use actual app rendering and form handlers; this package does not send anything.
 Mount after DOM attachment and retain the same native textarea while editing.
+`endEditingOnHidden: true` opts into ending owned editing when the page is
+hidden. Returning users tap to resume; the shell never refocuses automatically.
+It is off by default. This is an editing-lifecycle policy, not keyboard detection
+or a different viewport authority; native hints remain inactive unless called.
 Do not disable user zoom. Keep the shell out of ancestors with transforms,
 filters or containment that establish a different fixed-position containing block.
 
@@ -118,7 +122,7 @@ production app. Their integrations and release gates are separate work.
 
 ### API
 
-`attachShell(root, { followEnd?, initialScroll? })` requires the four structural
+`attachShell(root, { followEnd?, initialScroll?, endEditingOnHidden? })` requires the four structural
 classes shown above. One attached shell per document. Empty or hidden header and
 bottom regions are allowed; their DOM containers remain present.
 

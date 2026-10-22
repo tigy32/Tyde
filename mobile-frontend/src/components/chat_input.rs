@@ -927,7 +927,7 @@ fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
 }
 
 #[component]
-fn NewChatOptions() -> impl IntoView {
+pub(super) fn NewChatOptions() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
 
     let backend_state = state.clone();
@@ -1850,9 +1850,6 @@ pub fn ChatInput() -> impl IntoView {
                         </button>
                     </Show>
                 </div>
-            </Show>
-            <Show when=move || state.active_agent.get().is_none()>
-                <NewChatOptions />
             </Show>
             <Show when=move || !queued_rows_for_render.get().is_empty()>
                 <div class="chat-input-queued-list" data-mobile-test="chat-input-queued-list" aria-live="polite">
@@ -3077,7 +3074,7 @@ mod wasm_tests {
             });
             *handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <ChatInput /> }
+            view! { <crate::components::chat_view::ChatView /> }
         });
         std::mem::forget(h);
         next_tick().await;
@@ -3334,7 +3331,7 @@ mod wasm_tests {
             let mounted_state = state.clone();
             let handle = mount_to(container.clone(), move || {
                 provide_context(mounted_state);
-                view! { <ChatInput /> <crate::components::session_settings::SessionSettingsSheet /> }
+                view! { <crate::components::chat_view::ChatView /> <crate::components::session_settings::SessionSettingsSheet /> }
             });
             next_tick().await;
             let backend = container

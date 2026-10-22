@@ -101,13 +101,17 @@ in `./dev.sh check`.
 
 The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
 copy the viewport algorithm. The pinned revision is
-`b7e76f56111bfd557c25d8bb83f4f48cf7e4a88f`, published on the shell
+`f8b5418d37e35bdedf398a45584677898880bc9c`, published on the shell
 repository's upstream `main`. The unmodified archive was produced locally with
 `npm pack --ignore-scripts` from that clean committed checkout.
 `mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
 unmodified JS is a local wasm-bindgen module, so Trunk includes it under each
 versioned bundle and the existing executable-integrity manifest covers it.
-The shared CSS loads before Tyde's appearance styles.
+The shared CSS loads before Tyde's appearance styles. The main-based archive
+also includes upstream's native `keyboardHint()` API; Tyde web/PWA has no
+binding/caller, so it remains inactive and measured browser geometry stays the
+sole viewport path. The optional hidden-editing policy is not enabled pending
+the consumer UX decision described below.
 
 `mobile-frontend/src/shell.rs` attaches one document owner after mounting and
 rebinds only when navigation replaces its header, scroller, or bottom region.
@@ -133,6 +137,76 @@ part of `./dev.sh check`. The migration exposed and fixed programmatic draft
 notification ordering, queued-editor CSS inheritance, and a compact footer gap
 from an empty pending-submission element. These are DOM integration checks,
 not evidence of native keyboard or existing-installation acceptance.
+
+### Hidden editing and cramped new-chat setup
+
+The recurring raised-composer investigation established a physical standalone
+failure class: after a composer keyboard -> foreign Settings Search keyboard ->
+return trip, WebKit reported a stale 492px visual viewport with no keyboard,
+while the layout viewport was 793px. The shell was live and applying that raw
+measurement. Blurring after the failure did not recover it. This is distinct
+from the earlier investigation that established no fix and from the separately
+landed double-tap zoom work.
+
+The shared shell offers an optional `endEditingOnHidden` policy, default OFF.
+Tyde has not enabled it: ending editing on background changes hardware-keyboard
+focus and requires tapping to edit again on return. That consumer UX decision is
+pending. The supported library candidate ends root-owned editing while hidden,
+not after return, with no replacement height or second viewport controller.
+Visible window blur, focus changes and pageshow do not end editing; there is no
+foreground autofocus. Draft, selection and history were retained in the bounded
+comparison. Uncommitted IME and assistive cursor behavior remain unverified.
+The existing foreground transport recovery is untouched.
+
+One bounded physical iPhone 14 Pro/iOS 27.0 reduced-DOM comparison observed
+hidden focusout, then native-first full-height/no-keyboard return (793px), same
+field/draft/caret and successful keyboard reopening. Its overall CASE remains
+FAIL: a later native Done harness selector was wrong, so candidate Done was not
+verified. It was not a full compiled Tyde app, the unknown original phone or a
+phone identified as Duo. Desktop rendered flows and Air Safari Simulator
+baseline evidence are not physical iOS/PWA certification.
+
+A separate actual-app Air Simulator finding showed introductory text behind
+new-chat project/backend/session controls with the keyboard open. The measured
+369px shell was correct: the floating setup+composer dock occupied 265px, while
+the intro lived in an independent scroller. Setup now shares ordinary flow with
+the introduction; only the composer stays floating. New-chat starts at the top,
+while conversation history retains its existing bottom/history policy. Typed
+selection, session settings and send paths are unchanged. Existing chooser flows
+mount the full chat view, and the existing app-surface flow covers narrow, wide,
+rotation-shaped and cramped layouts, reachable controls and non-overlapping
+setup/intro. These checks do not manufacture native keyboard coverage.
+
+Later scoped Air native-controller testing of the full `c3d449b8` baseline
+observed a 253px setup/composer block in a 142px landscape usable viewport;
+input/Send extended to y255, behind the keyboard. The large Safari case had
+86px usable and the block started at y-167. The existing DOM flow now covers
+these exact sizes and requires the whole input/Send to fit. Air's reduced-shell
+Done/reopen/rotation checks succeeded, but its baseline returned with keys still
+visible: this is not reproduction or prevention proof for the physical stale,
+no-keyboard failure. Full compiled responsive candidate native QA is separate.
+
+The first full compiled responsive candidate passed native input/Send hit tests,
+Done and scrolling on Air's iPhone 17e standalone and 18 Pro Max Safari Simulator,
+including landscape usable heights 142px and 82px. Its setup rows still spanned
+x8..948 in a 956px viewport whose horizontal safe interval was x62..894. Tyde's
+nested `.shell-flow` used fixed app gutters, bypassing the shared shell's
+`.tws-flow` safe padding. The app flow now adds the existing shell left/right
+safe tokens to its own gutters, without changing shell geometry or floating
+chrome. The existing DOM flow supplies those measured CSS inputs across
+rotation-shaped resizes and checks setup, introduction and composer bounds.
+Scoped native follow-up on the full compiled candidate measured rows55..789
+inside47..797 on17e, and70..886 inside62..894 on18ProMax. Setup text/controls,
+scroll reachability, input/Send hit tests, native Done and portrait spot checks
+passed. This was iOS27 Simulator standalone/Safari, not physical-device or Duo
+certification; Send was hit-tested without a provider turn. The background-editing
+policy remains OFF and stale/no-keyboard prevention remains unaccepted.
+
+Root-cause traces, before/after captures, provenance, native FAIL and cleanup
+receipts are retained until user signoff in
+`/home/tyggs/tyde-evidence/mobile-keyboard-viewport-recovery/HANDOFF.md`.
+No existing-installation, full candidate rotation, VoiceOver or IME acceptance
+is implied by source integration.
 
 ### Existing-installation acceptance still required
 

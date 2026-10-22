@@ -1903,6 +1903,21 @@ mod wasm_tests {
             .set_attribute("style", "width:393px;height:852px;border:0")
             .unwrap();
         document.body().unwrap().append_child(&frame).unwrap();
+        async fn render_shell(frame: &web_sys::HtmlIFrameElement) {
+            next_tick().await;
+            for _ in 0..2 {
+                let rendered = js_sys::Promise::new(&mut |resolve, _reject| {
+                    frame
+                        .content_window()
+                        .unwrap()
+                        .request_animation_frame(&resolve)
+                        .unwrap();
+                });
+                wasm_bindgen_futures::JsFuture::from(rendered)
+                    .await
+                    .unwrap();
+            }
+        }
         let frame_document = frame.content_document().unwrap();
         let style = frame_document.create_element("style").unwrap();
         style.set_text_content(Some(concat!(
@@ -2038,14 +2053,14 @@ mod wasm_tests {
             transcript.get_bounding_client_rect().bottom()
         );
         assert!(reachable(), "the shared shell composer is reachable");
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         let scroller: HtmlElement = container
             .query_selector("[data-mobile-test='chat-messages']")
             .unwrap()
             .unwrap()
             .unchecked_into();
         scroller.set_scroll_top(scroller.scroll_height());
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         let dock = container
             .query_selector("[data-mobile-test='chat-bottom-dock']")
             .unwrap()
@@ -2068,7 +2083,7 @@ mod wasm_tests {
             .unwrap()
             .append_child(&safe_area)
             .unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_bottom_gap(&dock, 26.0);
         let standalone_readings = || {
             BrowserOverride(js_sys::Function::new_with_args("w", r#"
@@ -2106,7 +2121,7 @@ mod wasm_tests {
         safe_area.set_text_content(Some(
             ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
         ));
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_physical_bottom(&dock, 852.0 - 26.0);
         for element in [
             frame_document.document_element().unwrap(),
@@ -2141,7 +2156,7 @@ mod wasm_tests {
             "recovered composer remains inside the paintable viewport"
         );
         input.focus().unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_physical_bottom(&dock, 852.0 - 26.0);
         assert!(reachable(), "uncontracted focused Send remains reachable");
         assert!(
@@ -2174,7 +2189,7 @@ mod wasm_tests {
                 w.dispatchEvent(new w.Event('resize'));
             };
         "#).call1(&wasm_bindgen::JsValue::NULL, &frame.content_window().unwrap()).unwrap());
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         wasm_bindgen_test::console_log!(
             "Legacy keyboard shell top={}, composer bottom={}",
             shell.get_bounding_client_rect().top(),
@@ -2210,7 +2225,7 @@ mod wasm_tests {
             &frame.content_window().unwrap(),
         )
         .unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_physical_bottom(&dock, 487.0 - 10.0);
         assert!(reachable(), "fresh keyboard Send remains reachable");
         assert_eq!(input.value(), "preserved draft");
@@ -2219,19 +2234,19 @@ mod wasm_tests {
             ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
         ));
         input.blur().unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_physical_bottom(&dock, 852.0 - 26.0);
         safe_area.set_text_content(Some(
             ".mobile-app { --tws-safe-top: 0px; --tws-safe-bottom: 34px; }",
         ));
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_physical_bottom(&dock, 793.0 - 26.0);
         drop(readings);
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert_bottom_gap(&dock, 8.0);
         scroller.set_scroll_top(scroller.scroll_height());
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         let clearance =
             dock.get_bounding_client_rect().top() - transcript.get_bounding_client_rect().bottom();
         wasm_bindgen_test::console_log!("Transcript end clearance={clearance}");
@@ -2244,7 +2259,7 @@ mod wasm_tests {
             .dispatch_event(&web_sys::Event::new("scroll").unwrap())
             .unwrap();
         state.push_chat_message_entry(&agent_ref, entry);
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert!(
             (scroller.scroll_top() - 100).abs() <= 1,
             "shared shell leaves history anchoring to Tyde"
@@ -2254,28 +2269,22 @@ mod wasm_tests {
         let original_input = input.clone();
         // Real iframe resizing replaces the retired controller's synthetic
         // --app-height writes. It proves layout, not native IME coverage.
-        for (width, height) in [(393, 516), (852, 130), (852, 51), (393, 852)] {
+        for (width, height) in [
+            (393, 516),
+            (852, 130),
+            (852, 51),
+            (320, 568),
+            (430, 932),
+            (932, 430),
+            (393, 852),
+        ] {
             frame
                 .set_attribute(
                     "style",
                     &format!("width:{width}px;height:{height}px;border:0"),
                 )
                 .unwrap();
-            // A timer fired with viewport=130 but the old shell height=516.
-            // The shell applies resize geometry in its owner's animation frame,
-            // not on a wall-clock deadline; let that render cycle complete.
-            for _ in 0..2 {
-                let rendered = js_sys::Promise::new(&mut |resolve, _reject| {
-                    frame
-                        .content_window()
-                        .unwrap()
-                        .request_animation_frame(&resolve)
-                        .unwrap();
-                });
-                wasm_bindgen_futures::JsFuture::from(rendered)
-                    .await
-                    .unwrap();
-            }
+            render_shell(&frame).await;
             let current = container
                 .query_selector("[data-mobile-test='chat-input']")
                 .unwrap()
@@ -2685,7 +2694,21 @@ mod wasm_tests {
                 reachable() && send.contains(Some(&hit_at(point))),
                 "drawer transition must not intercept Send"
             );
-            sleep(Duration::from_millis(250)).await;
+            render_shell(&frame).await;
+            let settled = js_sys::Function::new_with_args(
+                "document",
+                r#"
+                return Promise.all(document.getAnimations()
+                    .filter(animation => animation.effect.getComputedTiming().iterations !== Infinity)
+                    .map(animation => animation.finished));
+            "#,
+            )
+            .call1(&wasm_bindgen::JsValue::NULL, &frame_document)
+            .unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(settled))
+                .await
+                .unwrap();
+            render_shell(&frame).await;
             assert!(
                 reachable() && send.contains(Some(&hit_at(point))),
                 "settled drawer must not intercept Send"
@@ -2701,6 +2724,118 @@ mod wasm_tests {
         );
         drop(contact_guard);
         input.blur().unwrap();
+        state.active_agent.set(None);
+        render_shell(&frame).await;
+        let options = container
+            .query_selector("[data-mobile-test='new-chat-options']")
+            .unwrap()
+            .unwrap();
+        let intro = container
+            .query_selector("[data-mobile-test='chat-empty-new']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(scroller.scroll_top(), 0, "new-chat setup starts at the top");
+        // Air measured landscape safe insets of 47px/62px. Supply the CSS
+        // inputs, not a claim that an iframe reproduces native keyboards.
+        for (width, height, safe) in [
+            (320, 369, 0),
+            (440, 956, 0),
+            (844, 142, 47),
+            (844, 390, 47),
+            (956, 86, 62),
+            (956, 82, 62),
+            (956, 330, 62),
+            (440, 956, 0),
+        ] {
+            safe_area.set_text_content(Some(&format!(
+                ".mobile-app {{ --tws-safe-bottom: 0px; --tws-safe-left: {safe}px; --tws-safe-right: {safe}px; }}"
+            )));
+            frame
+                .set_attribute(
+                    "style",
+                    &format!("width:{width}px;height:{height}px;border:0"),
+                )
+                .unwrap();
+            render_shell(&frame).await;
+            assert!(
+                options.get_bounding_client_rect().bottom()
+                    <= intro.get_bounding_client_rect().top(),
+                "new-chat setup and introduction share non-overlapping flow"
+            );
+            for element in [&options, &intro, &dock] {
+                let rect = element.get_bounding_client_rect();
+                assert!(
+                    rect.left() >= f64::from(safe) && rect.right() <= f64::from(width - safe),
+                    "new-chat content stays inside horizontal safe insets at {width}x{height}"
+                );
+            }
+            assert!(reachable(), "new-chat Send stays reachable after resize");
+            assert!(
+                input.is_same_node(
+                    container
+                        .query_selector("[data-mobile-test='chat-input']")
+                        .unwrap()
+                        .as_ref()
+                        .map(|element| element.as_ref())
+                ),
+                "new-chat setup must not replace the composer"
+            );
+            let input_bounds = input.get_bounding_client_rect();
+            let send_bounds = send.get_bounding_client_rect();
+            assert!(input_bounds.height() >= 44.0);
+            assert!(
+                input_bounds.top() >= 0.0 && input_bounds.bottom() <= f64::from(height),
+                "the whole new-chat input fits the usable viewport"
+            );
+            assert!(
+                send_bounds.top() >= 0.0 && send_bounds.bottom() <= f64::from(height),
+                "the whole new-chat Send fits the usable viewport"
+            );
+            for selector in [
+                "new-chat-project",
+                "new-chat-backend",
+                "new-chat-agent",
+                "new-chat-session-settings",
+            ] {
+                let control = container
+                    .query_selector(&format!("[data-mobile-test='{selector}']"))
+                    .unwrap()
+                    .unwrap();
+                control.scroll_into_view();
+                render_shell(&frame).await;
+                let rect = control.get_bounding_client_rect();
+                assert!(
+                    rect.left() >= f64::from(safe) && rect.right() <= f64::from(width - safe),
+                    "new-chat {selector} stays inside horizontal safe insets"
+                );
+                assert!(
+                    frame_document
+                        .element_from_point(
+                            (rect.x() + rect.width() / 2.0) as f32,
+                            (rect.y() + rect.height() / 2.0) as f32,
+                        )
+                        .is_some_and(|hit| control.contains(Some(&hit))),
+                    "new-chat {selector} is scroll-reachable at {width}x{height}"
+                );
+            }
+            intro.scroll_into_view();
+            render_shell(&frame).await;
+            let rect = intro.get_bounding_client_rect();
+            assert!(
+                rect.top() < dock.get_bounding_client_rect().top()
+                    && rect.bottom() > scroller.get_bounding_client_rect().top(),
+                "introduction remains scroll-reachable"
+            );
+        }
+        frame
+            .set_attribute("style", "width:393px;height:852px;border:0")
+            .unwrap();
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: agent_ref.local_host_id.clone(),
+            agent_id: agent_ref.agent_id.clone(),
+        }));
+        render_shell(&frame).await;
+        assert!(!options.is_connected() && !intro.is_connected());
         state.viewing_chat.set(false);
         let readings = standalone_readings();
         safe_area.set_text_content(Some(
@@ -2713,7 +2848,7 @@ mod wasm_tests {
             MobileTab::Settings,
         ] {
             state.active_tab.set(tab);
-            sleep(Duration::from_millis(100)).await;
+            render_shell(&frame).await;
             let nav = container
                 .query_selector("[data-mobile-test='bottom-nav']")
                 .unwrap()
@@ -2735,7 +2870,7 @@ mod wasm_tests {
             safe_area.set_text_content(Some(
                 ".mobile-app { --tws-safe-top: 0px; --tws-safe-bottom: 34px; }",
             ));
-            sleep(Duration::from_millis(100)).await;
+            render_shell(&frame).await;
             assert_physical_bottom(&nav, 793.0 - 26.0);
             safe_area.set_text_content(Some(
                 ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
@@ -2746,7 +2881,7 @@ mod wasm_tests {
         frame
             .set_attribute("style", "width:852px;height:130px;border:0")
             .unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         let nav = container
             .query_selector("[data-mobile-test='bottom-nav']")
             .unwrap()
@@ -2759,7 +2894,7 @@ mod wasm_tests {
         frame
             .set_attribute("style", "width:393px;height:852px;border:0")
             .unwrap();
-        sleep(Duration::from_millis(100)).await;
+        render_shell(&frame).await;
         assert!(
             nav.get_bounding_client_rect().height() >= 44.0,
             "tabs return after expansion"
