@@ -3962,6 +3962,7 @@ pub struct AppState {
     next_pending_agent_session_settings_id: RwSignal<u64>,
     pub font_size: RwSignal<u32>,
     pub theme: RwSignal<String>,
+    pub chat_appearance: RwSignal<crate::appearance::ChatAppearance>,
     pub font_family: RwSignal<String>,
     /// Active syntect theme name (e.g. "base16-ocean.dark"). Drives both the
     /// file viewer and diff viewer's syntax coloring. Persists across sessions.
@@ -4398,6 +4399,7 @@ impl AppState {
             next_pending_agent_session_settings_id: RwSignal::new(0),
             font_size: RwSignal::new(13),
             theme: RwSignal::new(crate::appearance::DEFAULT_THEME_ID.to_owned()),
+            chat_appearance: RwSignal::new(crate::appearance::ChatAppearance::Current),
             font_family: RwSignal::new("system".to_owned()),
             syntax_theme: RwSignal::new(crate::syntax_highlight::DEFAULT_THEME_NAME.to_owned()),
             diff_view_mode: RwSignal::new(DiffViewMode::Unified),

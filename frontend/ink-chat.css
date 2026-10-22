@@ -1,0 +1,292 @@
+/* Ink is a chat-local presentation. Never change the shell's palette or layout. */
+.chat-view[data-chat-appearance="ink"] {
+    --ink-accent: #9587ff;
+    --ink-user: color-mix(in srgb, #7565ef 14%, var(--surface-base));
+    --ink-muted: var(--text-secondary);
+    background: var(--surface-base);
+}
+
+[data-theme="light"] .chat-view[data-chat-appearance="ink"] {
+    --ink-accent: #5544bb;
+    --ink-user: color-mix(in srgb, #7565ef 9%, var(--surface-base));
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-messages {
+    padding: 22px clamp(14px, 4%, 48px) 32px;
+    scrollbar-gutter: stable;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card {
+    padding: 10px 0;
+    border-radius: 0;
+    animation: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant {
+    background: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body {
+    font-size: 1.115rem;
+    line-height: 1.7;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body p {
+    margin-block: 0 14px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body p:last-child {
+    margin-bottom: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body li::marker {
+    color: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user {
+    width: fit-content;
+    max-width: 88%;
+    margin-left: auto;
+    padding: 12px 16px;
+    border-radius: 10px;
+    background: var(--ink-user);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-header {
+    width: 100%;
+    max-width: none;
+    margin-bottom: 6px;
+    justify-content: flex-start;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-body {
+    max-width: 100%;
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user :is(.chat-card-sender, .chat-card-time) {
+    color: var(--ink-muted);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-footer {
+    border: 0;
+    padding-top: 4px;
+    margin-top: 6px;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.chat-view[data-chat-appearance="ink"] .token-badge {
+    font-family: var(--font-sans);
+    font-size: .85rem;
+    color: var(--ink-muted);
+    flex-wrap: wrap;
+    white-space: normal;
+    overflow: visible;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.token-stat-model, .token-sep, .footer-time) {
+    color: var(--ink-muted);
+    opacity: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .token-stat-agent {
+    color: var(--ink-accent);
+    opacity: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-streaming > .chat-card-header {
+    color: var(--ink-muted);
+    font-size: .85rem;
+    margin-bottom: 8px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning {
+    border: 0;
+    background: transparent;
+    margin-block: 4px 10px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary {
+    padding: 4px 0;
+    color: var(--ink-muted);
+    font-size: .95rem;
+    font-weight: 500;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.reasoning-content, .reasoning-tokens) {
+    color: var(--ink-muted);
+}
+
+.chat-view[data-chat-appearance="ink"] .reasoning-content {
+    padding: 8px 12px;
+    border-left: 1px solid var(--border-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools {
+    border-left: 1px solid var(--border-secondary);
+    border-radius: 0;
+    background: transparent;
+    padding: 0 0 0 14px;
+    gap: 4px;
+    margin-block: 14px 8px;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.tool-card, .tool-list-summary) {
+    border-color: transparent;
+    border-radius: 6px;
+    background: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card[open] {
+    border-color: var(--border-primary);
+    background: var(--surface-0);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card-header {
+    padding: 8px 10px;
+    min-height: 36px;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card-body {
+    background: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-list-summary {
+    color: var(--ink-muted);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-composer {
+    background: transparent;
+    padding: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-input-content {
+    border: 1px solid var(--border-secondary);
+    border-radius: 10px;
+    background: var(--surface-0);
+    /* Compensate the new side borders without changing draft wrapping width. */
+    padding: 10px calc(var(--space-3) - 1px);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-input-content:focus-within {
+    border-color: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.chat-textarea, .chat-textarea-measure) {
+    background: transparent;
+    border-color: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-send-btn {
+    min-height: 36px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-send-btn:not(:disabled) {
+    background: #6553e8;
+    color: #fff;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-send-btn:hover:not(:disabled) {
+    background: #5845db;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(button, summary, a, textarea, select):focus-visible:not(.chat-textarea) {
+    outline: 2px solid var(--ink-accent);
+    outline-offset: 3px;
+}
+
+@media (max-width: 760px) {
+    .chat-view[data-chat-appearance="ink"] .chat-messages {
+        padding: 12px 14px 24px;
+    }
+
+    .chat-view[data-chat-appearance="ink"] .chat-card-body {
+        font-size: 1.077rem;
+    }
+
+    .chat-view[data-chat-appearance="ink"] .chat-card-tools {
+        padding-left: 8px;
+    }
+
+    .chat-view[data-chat-appearance="ink"] .chat-input-content {
+        padding: 8px calc(var(--space-3) - 1px);
+    }
+}
+
+.chat-view[data-chat-appearance="ink"] .session-settings-accordion {
+    border-top: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.task-token-detail, .session-settings-toggle) {
+    color: var(--ink-muted);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.tool-card-detail, .tool-completion-summary, .chat-card-model, .session-task-scope, .session-task-including) {
+    color: var(--ink-muted);
+    opacity: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .footer-copy-btn {
+    color: var(--ink-muted);
+    opacity: 1;
+    width: 28px;
+    height: 28px;
+    border-color: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .session-settings-header {
+    flex-wrap: wrap;
+}
+
+.chat-view[data-chat-appearance="ink"] .session-task-usage {
+    min-width: 0;
+    max-width: 100%;
+    flex-shrink: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .session-task-toggle {
+    flex-wrap: wrap;
+    max-width: 100%;
+    gap: 4px 10px;
+    border-left: 0;
+    font-family: var(--font-sans);
+    font-size: .85rem;
+    white-space: normal;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.session-task-scope, .session-task-including) {
+    font-size: inherit;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-streaming {
+    border-left: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.ask-question-option-desc, .exit-plan-path) {
+    color: var(--ink-muted);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.chat-textarea, .ask-question-custom, .exit-plan-feedback)::placeholder {
+    color: var(--ink-muted);
+    opacity: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-status-text.pending {
+    color: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.chat-card-body, .tool-md) .md-code-block pre {
+    background: var(--code-background);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.chat-card-body, .tool-md) .md-code-block pre code {
+    color: var(--code-foreground);
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.md-code-lang, .md-copy-code) {
+    color: var(--ink-muted);
+}

@@ -5,6 +5,7 @@ pub mod card_menu;
 pub mod center_zone;
 pub mod chat_input;
 pub mod chat_message;
+pub mod chat_presentation;
 pub mod chat_streaming;
 pub mod chat_view;
 pub mod code_intel_ui;

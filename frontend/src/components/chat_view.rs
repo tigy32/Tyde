@@ -915,7 +915,7 @@ pub fn ChatView(
     // (ToolOutputModeToggle is defined below.)
 
     view! {
-        <div class="chat-view">
+        <crate::components::chat_presentation::ChatPresentation>
           <crate::notices::InlineNotices scopes=Signal::derive(move || agent_ref.get()
               .map(|agent| vec![crate::notices::NoticeScope::Agent(agent.host_id, agent.agent_id)])
               .unwrap_or_default()) />
@@ -1123,7 +1123,7 @@ pub fn ChatView(
             </Show>
             </div>
           </div>
-        </div>
+        </crate::components::chat_presentation::ChatPresentation>
     }
 }
 

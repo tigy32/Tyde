@@ -5,7 +5,7 @@ use pulldown_latex::{
     Parser as LatexParser, RenderConfig, Storage, config::DisplayMode, mathml::push_mathml,
 };
 
-use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
+use crate::syntax_highlight::{code_style, color_to_css, highlight_to_html, syntax_for_lang_token};
 
 /// Render agent/assistant markdown to HTML.
 ///
@@ -550,8 +550,12 @@ fn build_code_block(lang: &str, code: &str) -> String {
         None => escape_html(code_trimmed),
     };
 
+    // Retain the palette alongside the syntax colors produced for this block.
+    let style = code_style();
+    let background = color_to_css(style.background);
+    let foreground = color_to_css(style.foreground);
     format!(
-        "<div class=\"md-code-block\">\
+        "<div class=\"md-code-block\" style=\"--code-background:{background};--code-foreground:{foreground}\">\
          <div class=\"md-code-header\">\
          <span class=\"md-code-lang\">{lang_label}</span>\
          <button class=\"md-copy-code\" onclick=\"(() => {{ const c = this.closest('.md-code-block').querySelector('code'); navigator.clipboard.writeText(c.textContent).then(() => {{ this.textContent='\u{2713}'; setTimeout(() => this.textContent='Copy', 1200); }}); }})()\">Copy</button>\

@@ -91,6 +91,10 @@ fn current_theme() -> &'static Theme {
         .expect("default theme present in ThemeSet")
 }
 
+pub fn code_style() -> syntect::highlighting::Style {
+    syntect::highlighting::Highlighter::new(current_theme()).get_default()
+}
+
 /// One styled run inside a single line. `fg` carries syntect's RGBA
 /// foreground; we (de)serialize it as a flat `{r,g,b,a}` so the type
 /// can cross a Web Worker `postMessage` boundary without depending on

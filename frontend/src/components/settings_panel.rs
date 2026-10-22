@@ -149,6 +149,7 @@ fn pairing_status_line(phase: &MobilePairingState) -> Option<String> {
 }
 
 const STORAGE_THEME: &str = "tyde-theme";
+const STORAGE_CHAT_APPEARANCE: &str = "tyde-chat-appearance";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
 const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
 const STORAGE_SYNTAX_THEME: &str = "tyde-syntax-theme";
@@ -327,8 +328,31 @@ pub fn restore_appearance(state: &AppState) {
     let Some(storage) = storage else {
         state.default_send_action.set(None);
         log::error!("could not read default send action: local storage is unavailable");
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Settings(None),
+            "Could not restore chat presentation: local storage is unavailable. Enable local storage and choose a presentation in Appearance.",
+        );
         return;
     };
+
+    match storage.get_item(STORAGE_CHAT_APPEARANCE) {
+        Ok(Some(id)) => match crate::appearance::ChatAppearance::from_id(&id) {
+            Ok(appearance) => state.chat_appearance.set(appearance),
+            Err(error) => {
+                crate::notices::report_error(crate::notices::NoticeScope::Settings(None), error)
+            }
+        },
+        Ok(None) => state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Current),
+        Err(error) => {
+            log::error!("Could not restore chat appearance: {error:?}");
+            crate::notices::report_error(
+                crate::notices::NoticeScope::Settings(None),
+                "Could not restore chat presentation. Enable local storage and choose a presentation in Appearance.",
+            );
+        }
+    }
 
     if let Ok(Some(size_str)) = storage.get_item(STORAGE_FONT_SIZE)
         && let Ok(size) = size_str.parse::<u32>()
@@ -544,6 +568,9 @@ impl SettingsTab {
             ],
             Self::Appearance => &[
                 "Appearance",
+                "Chat presentation",
+                "Current chat",
+                "Ink",
                 "Color Theme",
                 "Choose the color scheme for the interface",
                 "Dark",
@@ -2081,6 +2108,44 @@ fn AppearanceTab() -> impl IntoView {
             >
                 {crate::appearance::THEMES.iter().map(|theme| {
                     view! { <option value=theme.id>{theme.label}</option> }
+                }).collect::<Vec<_>>()}
+            </select>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label" for="chat-appearance">"Chat presentation"</label>
+            <p class="settings-description">"Current chat keeps the existing presentation. Ink uses a continuous, quieter reading flow. Only the chat changes, on this device."</p>
+            <select
+                id="chat-appearance"
+                aria-label="Chat presentation"
+                class="settings-select"
+                prop:value=move || state.chat_appearance.get().id()
+                on:change=move |ev: web_sys::Event| {
+                    let select: web_sys::HtmlSelectElement = event_target(&ev);
+                    let selected = select.value();
+                    select.set_value(state.chat_appearance.get_untracked().id());
+                    let appearance = match crate::appearance::ChatAppearance::from_id(&selected) {
+                        Ok(appearance) => appearance,
+                        Err(error) => {
+                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), error);
+                            return;
+                        }
+                    };
+                    let Some(storage) = local_storage() else {
+                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation: local storage unavailable.");
+                        return;
+                    };
+                    if let Err(error) = storage.set_item(STORAGE_CHAT_APPEARANCE, appearance.id()) {
+                        log::error!("Could not save chat presentation: {error:?}");
+                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation.");
+                        return;
+                    }
+                    state.chat_appearance.set(appearance);
+                    select.set_value(appearance.id());
+                }
+            >
+                {crate::appearance::ChatAppearance::ALL.into_iter().map(|appearance| {
+                    view! { <option value=appearance.id()>{appearance.label()}</option> }
                 }).collect::<Vec<_>>()}
             </select>
         </div>
@@ -10188,6 +10253,445 @@ mod wasm_tests {
             "expected >=20 themes in dropdown, got {}: {options:?}",
             options.len()
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn chat_presentation_is_opt_in_persistent_and_keeps_live_widgets() {
+        use crate::state::{ActiveAgentRef, AgentInfo, TabContent};
+        use protocol::{
+            AgentId, AgentOrigin, BackendKind, ChatEvent, ChatMessage, MessageSender, StreamPath,
+        };
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let storage = window.local_storage().unwrap().unwrap();
+        let previous = storage.get_item(STORAGE_CHAT_APPEARANCE).unwrap();
+        let previous_theme = storage.get_item(STORAGE_THEME).unwrap();
+        let root = document.document_element().unwrap();
+        let previous_scheme = root.get_attribute("data-theme");
+        let previous_appearance = root.get_attribute("data-appearance-theme");
+        storage.remove_item(STORAGE_CHAT_APPEARANCE).unwrap();
+        let calls = install_settings_send_stub();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        let settings = make_container();
+        let chat = make_container();
+        chat.set_attribute(
+            "style",
+            "position:absolute;top:0;left:0;width:700px;height:600px;display:flex",
+        )
+        .unwrap();
+        let state = AppState::new();
+        restore_appearance(&state);
+        let previous_syntax = state.syntax_theme.get_untracked();
+        assert!(crate::syntax_highlight::set_selected_theme(
+            "Catppuccin Mocha"
+        ));
+        state.syntax_theme.set("Catppuccin Mocha".to_owned());
+        apply_theme("light");
+        state.theme.set("light".to_owned());
+        let active = ActiveAgentRef {
+            host_id: "ink-host".to_owned(),
+            agent_id: AgentId("ink-chat".to_owned()),
+        };
+        // A live agent still needs its connected host for Send to be available.
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(active.host_id.clone(), ConnectionStatus::Connected);
+        });
+        state.host_streams.update(|streams| {
+            streams.insert(
+                active.host_id.clone(),
+                StreamPath("/host/ink-host".to_owned()),
+            );
+        });
+        state.agents.set(vec![AgentInfo {
+            tyde_permissions: Default::default(),
+            host_id: active.host_id.clone(),
+            agent_id: active.agent_id.clone(),
+            name: "Ink demo".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            team_member_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/ink-chat".to_owned()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }]);
+        let tab_id = state
+            .open_tab(
+                TabContent::chat_with_agent(active.clone()),
+                "Ink demo".to_owned(),
+                true,
+            )
+            .unwrap();
+        let settings_state = state.clone();
+        let settings_handle = mount_to(settings.clone(), move || {
+            provide_context(settings_state);
+            view! {
+                <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Settings(None)] />
+                <AppearanceTab />
+            }
+        });
+        let mounted = state.clone();
+        let selected = state.active_agent;
+        let chat_handle = mount_to(chat.clone(), move || {
+            provide_context(mounted);
+            view! { <crate::components::chat_view::ChatView tab_id=tab_id
+            agent_ref=Signal::derive(move || selected.get()) is_active=Signal::derive(|| true) /> }
+        });
+        let emit = |event| {
+            crate::dispatch::apply_chat_event(&state, &active.host_id, &active.agent_id, event)
+        };
+        emit(ChatEvent::MessageAdded(ChatMessage {
+            origin: None,
+            message_id: None,
+            timestamp: 0,
+            sender: MessageSender::Assistant {
+                agent: "Codex".to_owned(),
+            },
+            content: "A continuous answer with [a link](https://example.com).\n\n```rust\nlet appearance = ChatAppearance::Ink;\n```".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }));
+        emit(ChatEvent::TypingStatusChanged(true));
+        emit(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "Codex".to_owned(),
+            model: None,
+        }));
+        next_tick().await;
+        let picker: HtmlSelectElement = settings
+            .query_selector("select[aria-label='Chat presentation']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            picker.value(),
+            "current",
+            "new and upgraded clients retain Current chat"
+        );
+        assert!(
+            storage.get_item(STORAGE_CHAT_APPEARANCE).unwrap().is_none(),
+            "startup must not migrate the preference"
+        );
+        let input: web_sys::HtmlTextAreaElement = chat
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("Keep this unsent draft");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        let input_style = window.get_computed_style(&input).unwrap().unwrap();
+        let glyph = document.create_element("span").unwrap();
+        glyph
+            .set_attribute(
+                "style",
+                &format!(
+                    "position:absolute;visibility:hidden;white-space:pre;font:{}",
+                    input_style.get_property_value("font").unwrap()
+                ),
+            )
+            .unwrap();
+        glyph.set_text_content(Some("m"));
+        document.body().unwrap().append_child(&glyph).unwrap();
+        let text_width = input.client_width() as f64
+            - input_style
+                .get_property_value("padding-left")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+            - input_style
+                .get_property_value("padding-right")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap();
+        let draft =
+            "m".repeat((text_width / glyph.get_bounding_client_rect().width()).floor() as usize);
+        glyph.remove();
+        let input_width = input.client_width();
+        input.set_value(&draft);
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        let row = chat
+            .query_selector(".chat-card-assistant")
+            .unwrap()
+            .unwrap();
+        let answer = chat.query_selector(".chat-card-body").unwrap().unwrap();
+        let before = window
+            .get_computed_style(&row)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        let code = chat.query_selector(".md-code-block pre").unwrap().unwrap();
+        let current_code_background = window
+            .get_computed_style(&code)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        let commands_before = calls.length();
+        for id in ["ink", "current", "ink"] {
+            picker.set_value(id);
+            picker
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            let current_input = chat.query_selector("textarea").unwrap().unwrap();
+            assert!(
+                input.is_same_node(Some(&current_input)),
+                "changing presentation must not remount the composer"
+            );
+            let current_row = chat
+                .query_selector(".chat-card-assistant")
+                .unwrap()
+                .unwrap();
+            assert!(
+                row.is_same_node(Some(&current_row)),
+                "live rows stay mounted"
+            );
+            assert!(
+                input.value() == draft,
+                "the unsent wrapping draft must survive"
+            );
+            assert_eq!(
+                input.client_width(),
+                input_width,
+                "Ink must retain the canonical composer text geometry"
+            );
+            let overflow = window
+                .get_computed_style(&input)
+                .unwrap()
+                .unwrap()
+                .get_property_value("overflow-y")
+                .unwrap();
+            assert!(
+                input.scroll_height() <= input.client_height() || overflow == "auto",
+                "every retained draft line must stay accessible without another input event"
+            );
+            assert_eq!(state.active_agent.get_untracked(), Some(active.clone()));
+            assert_eq!(
+                storage
+                    .get_item(STORAGE_CHAT_APPEARANCE)
+                    .unwrap()
+                    .as_deref(),
+                Some(id)
+            );
+            let background = window
+                .get_computed_style(&row)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap();
+            if id == "ink" {
+                input.focus().unwrap();
+                assert_eq!(
+                    window
+                        .get_computed_style(&input)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("outline-style")
+                        .unwrap(),
+                    "none",
+                    "the composer frame must be the sole Ink focus indicator"
+                );
+                assert_eq!(
+                    background, "rgba(0, 0, 0, 0)",
+                    "Ink assistant answers must be unboxed"
+                );
+                assert_eq!(
+                    window
+                        .get_computed_style(&code)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("background-color")
+                        .unwrap(),
+                    "rgb(30, 30, 46)",
+                    "Ink must retain the syntax palette background on a light interface"
+                );
+                assert_eq!(
+                    window
+                        .get_computed_style(&code.query_selector("code").unwrap().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("color")
+                        .unwrap(),
+                    "rgb(205, 214, 244)"
+                );
+            } else {
+                assert_eq!(background, before, "switching back restores Current chat");
+                assert_eq!(
+                    window
+                        .get_computed_style(&code)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("background-color")
+                        .unwrap(),
+                    current_code_background,
+                    "Current code presentation must remain unchanged"
+                );
+            }
+            assert!(
+                answer
+                    .text_content()
+                    .unwrap()
+                    .contains("A continuous answer")
+            );
+        }
+        assert_eq!(
+            calls.length(),
+            commands_before,
+            "presentation changes must not send or cancel work"
+        );
+        assert!(
+            chat.query_selector(".chat-thinking-ring")
+                .unwrap()
+                .is_some(),
+            "the authoritative active turn remains active"
+        );
+        emit(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: ChatMessage {
+                origin: None,
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::Assistant {
+                    agent: "Codex".to_owned(),
+                },
+                content: "Streaming still completes after changing presentation.".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        }));
+        next_tick().await;
+        assert!(
+            chat.text_content()
+                .unwrap()
+                .contains("Streaming still completes")
+        );
+        let restored = AppState::new();
+        restore_appearance(&restored);
+        assert_eq!(
+            restored.chat_appearance.get_untracked(),
+            crate::appearance::ChatAppearance::Ink
+        );
+        emit(ChatEvent::TypingStatusChanged(false));
+        input.set_value("");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        let send: web_sys::HtmlButtonElement = chat
+            .query_selector("[data-test='chat-send-primary']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(send.disabled());
+        // Finish shared CSS transitions; compare settled colors, not frame timing.
+        let settle_send_styles = js_sys::Function::new_with_args(
+            "button",
+            "getComputedStyle(button).backgroundColor; for (const animation of button.getAnimations()) animation.finish();",
+        );
+        settle_send_styles
+            .call1(&wasm_bindgen::JsValue::NULL, &send)
+            .unwrap();
+        let disabled_color = window
+            .get_computed_style(&send)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        input.set_value("Ready to send");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(!send.disabled());
+        settle_send_styles
+            .call1(&wasm_bindgen::JsValue::NULL, &send)
+            .unwrap();
+        let enabled_color = window
+            .get_computed_style(&send)
+            .unwrap()
+            .unwrap()
+            .get_property_value("background-color")
+            .unwrap();
+        assert_ne!(
+            enabled_color, disabled_color,
+            "Ink must visibly distinguish unavailable Send controls"
+        );
+        js_sys::eval(r#"
+            window.__inkOriginalGetItem = Storage.prototype.getItem;
+            Storage.prototype.getItem = function(key) {
+                if (key === 'tyde-chat-appearance') throw new DOMException('Storage denied', 'SecurityError');
+                return window.__inkOriginalGetItem.call(this, key);
+            };
+        "#).unwrap();
+        restore_appearance(&restored);
+        js_sys::eval("Storage.prototype.getItem = window.__inkOriginalGetItem; delete window.__inkOriginalGetItem;").unwrap();
+        next_tick().await;
+        assert!(
+            settings
+                .text_content()
+                .unwrap()
+                .contains("Could not restore chat presentation"),
+            "storage failure must be visible, not silently restored as Current"
+        );
+        assert_eq!(
+            restored.chat_appearance.get_untracked(),
+            crate::appearance::ChatAppearance::Ink,
+            "failed reads must not overwrite an explicit choice"
+        );
+        crate::notices::clear_scope(&crate::notices::NoticeScope::Settings(None));
+        drop(chat_handle);
+        drop(settings_handle);
+        chat.remove();
+        settings.remove();
+        style.remove();
+        match previous {
+            Some(id) => storage.set_item(STORAGE_CHAT_APPEARANCE, &id).unwrap(),
+            None => storage.remove_item(STORAGE_CHAT_APPEARANCE).unwrap(),
+        }
+
+        assert!(crate::syntax_highlight::set_selected_theme(
+            &previous_syntax
+        ));
+        match previous_theme {
+            Some(id) => storage.set_item(STORAGE_THEME, &id).unwrap(),
+            None => storage.remove_item(STORAGE_THEME).unwrap(),
+        }
+        for (attribute, value) in [
+            ("data-theme", previous_scheme),
+            ("data-appearance-theme", previous_appearance),
+        ] {
+            match value {
+                Some(value) => root.set_attribute(attribute, &value).unwrap(),
+                None => root.remove_attribute(attribute).unwrap(),
+            }
+        }
     }
 
     #[wasm_bindgen_test]
