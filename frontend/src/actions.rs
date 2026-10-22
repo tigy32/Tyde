@@ -1816,6 +1816,7 @@ mod wasm_tests {
                     started: true,
                     fatal_error: None,
                     activity_summary: Default::default(),
+                    review_recipient: false,
                 });
                 agents.push(crate::state::AgentInfo {
                     tyde_permissions: Default::default(),
@@ -1836,6 +1837,7 @@ mod wasm_tests {
                     started: true,
                     fatal_error: None,
                     activity_summary: Default::default(),
+                    review_recipient: false,
                 });
             });
 
@@ -1894,6 +1896,7 @@ mod wasm_tests {
                     started: true,
                     fatal_error: Some("backend crashed".to_owned()),
                     activity_summary: Default::default(),
+                    review_recipient: false,
                 });
             });
 

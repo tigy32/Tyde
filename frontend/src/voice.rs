@@ -2212,6 +2212,7 @@ mod wasm_tests {
             started,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }
     }
 

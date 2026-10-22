@@ -2178,6 +2178,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             });
         });
     }
@@ -4226,6 +4227,7 @@ mod wasm_tests {
             instance_stream: StreamPath(format!("/agent/{host}/{agent_id}/inst")),
             started,
             fatal_error: None,
+            review_recipient: false,
         }
     }
 

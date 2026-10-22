@@ -887,6 +887,7 @@ mod wasm_tests {
             instance_stream: StreamPath(format!("/agent/{id}")),
             started: fatal.is_none(),
             fatal_error: fatal.map(String::from),
+            review_recipient: false,
         }
     }
 

@@ -2320,6 +2320,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }]);
         state.connection_statuses.update(|m| {
             m.insert(HOST.to_owned(), ConnectionStatus::Connected);
@@ -3466,6 +3467,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         state.agent_turn_active.update(|turns| {

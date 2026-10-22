@@ -3326,6 +3326,7 @@ impl HostHandle {
                 instance_stream: instance_stream.clone(),
                 activity_summary,
                 activity,
+                review_recipient: agent_handle.review_recipient(),
             };
             subscriber
                 .known_agent_streams
@@ -15173,6 +15174,19 @@ impl HostHandle {
                             agent_id, project_id
                         ));
                     }
+                    if !handle.review_recipient() {
+                        tracing::warn!(
+                            review_id = %review_id,
+                            project_id = %project_id,
+                            target_agent_id = %agent_id,
+                            target_origin = ?start.origin,
+                            "review delivery target cannot receive review feedback"
+                        );
+                        return ReviewDeliveryOutcome::Failed(format!(
+                            "agent {} cannot receive review feedback",
+                            agent_id
+                        ));
+                    }
                     handle
                 };
                 if target_agent
@@ -20448,6 +20462,7 @@ fn emit_new_agent_for_stream(
         instance_stream: instance_stream.clone(),
         activity_summary,
         activity,
+        review_recipient: agent_handle.review_recipient(),
     };
 
     let payload = serde_json::to_value(&new_agent)

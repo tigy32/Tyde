@@ -367,6 +367,7 @@ mod wasm_tests {
             instance_stream: StreamPath(format!("/agent/{id}")),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }
     }
 

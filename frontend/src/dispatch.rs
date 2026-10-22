@@ -1194,6 +1194,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     started,
                     fatal_error: None,
                     activity_summary: payload.activity_summary,
+                    review_recipient: payload.review_recipient,
                 };
                 let project_id = info.project_id.clone();
                 let agent_name_for_upgrade = info.name.clone();
@@ -7266,6 +7267,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         started,
         fatal_error: None,
         activity_summary: payload.activity_summary,
+        review_recipient: payload.review_recipient,
     }
 }
 
@@ -7757,6 +7759,7 @@ pub(crate) mod restore_fixtures {
             instance_stream: StreamPath(format!("/agent/{agent}/inst")),
             activity_summary: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            review_recipient: false,
         }
     }
 
@@ -9566,6 +9569,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         let tool_name = "mcp__tyde-agent-control__tyde_send_agent_message";

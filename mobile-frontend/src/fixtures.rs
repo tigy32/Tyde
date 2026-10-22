@@ -195,6 +195,7 @@ pub fn seed_state(state: &AppState) {
             instance_stream: stream,
             started: true,
             fatal_error: None,
+            review_recipient: false,
         },
         AgentInfo {
             local_host_id: host.clone(),
@@ -211,6 +212,7 @@ pub fn seed_state(state: &AppState) {
             instance_stream: StreamPath("/agent/fixture-agent-tychat/instance".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         },
         AgentInfo {
             local_host_id: host.clone(),
@@ -227,6 +229,7 @@ pub fn seed_state(state: &AppState) {
             instance_stream: StreamPath("/agent/fixture-agent-loose/instance".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         },
     ]);
     state.active_agent.set(Some(ActiveAgentRef {

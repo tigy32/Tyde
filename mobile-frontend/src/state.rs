@@ -652,6 +652,8 @@ pub struct AgentInfo {
     pub instance_stream: StreamPath,
     pub started: bool,
     pub fatal_error: Option<String>,
+    /// Server-owned eligibility to receive submitted review feedback.
+    pub review_recipient: bool,
 }
 
 impl AgentInfo {

@@ -2682,6 +2682,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host.clone(),
@@ -3553,6 +3554,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host_for_mount.clone(),
@@ -4252,6 +4254,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/race/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.agent_message_queue.update(|queues| {
                 queues.insert(
@@ -4559,6 +4562,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host.clone(),
@@ -4656,6 +4660,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host.clone(),
@@ -4753,6 +4758,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host_clone.clone(),
@@ -4827,6 +4833,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host_clone.clone(),
@@ -4892,6 +4899,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host_clone.clone(),
@@ -5004,6 +5012,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: Some("backend crashed".to_owned()),
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host.clone(),
@@ -5253,6 +5262,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/dead/inst".to_owned()),
                 started: true,
                 fatal_error: Some("backend crashed".to_owned()),
+                review_recipient: false,
             };
             // Same textual AgentId, different host, still alive.
             let live = AgentInfo {
@@ -5260,6 +5270,7 @@ mod wasm_tests {
                 name: "Live twin".to_owned(),
                 instance_stream: StreamPath("/agent/live/inst".to_owned()),
                 fatal_error: None,
+                review_recipient: false,
                 ..dead.clone()
             };
             state.agents.set(vec![dead, live]);

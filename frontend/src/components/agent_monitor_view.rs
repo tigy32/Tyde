@@ -2844,6 +2844,7 @@ mod wasm_tests {
             started: true,
             fatal_error: fatal.then(|| "boom".to_owned()),
             activity_summary: Default::default(),
+            review_recipient: false,
         }
     }
 

@@ -228,8 +228,16 @@ pub enum ReviewSubmitTarget {
 }
 ```
 
-`ExistingAgent` is valid only when the agent is live and bound to the same
-project as the review. `NewAgent` spawns an unrestricted same-project agent
+`ExistingAgent` is valid only when the agent is live, bound to the same
+project as the review, and a review recipient. The server publishes that
+eligibility as `NewAgentPayload.review_recipient` (protocol 88): top-level
+`User` agents and `Unrestricted` `AgentControl` agents (for example an
+implementer spawned through `tyde_spawn_agent`) are recipients; read-only
+(advisory or enforced) `AgentControl` agents such as AI reviewers, and team,
+swarm, workflow, Tychat, and provider-native sub-agents are not. Submitting to
+a non-recipient fails with `InvalidSubmitTarget` and keeps every comment. The
+desktop and mobile pickers list exactly the live same-project recipients;
+desktop Auto selects only when exactly one exists. `NewAgent` spawns an unrestricted same-project agent
 using `project.roots` and sends the rendered Markdown review message as the
 initial user input with `MessageOrigin::Review { review_id }`.
 

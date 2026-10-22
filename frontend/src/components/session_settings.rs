@@ -1695,6 +1695,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         let fields = if with_settings_fields {
@@ -3796,6 +3797,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         for _ in 0..4 {

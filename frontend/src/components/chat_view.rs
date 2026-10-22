@@ -2078,6 +2078,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         };
         let project_id = ProjectId("approved".to_owned());
         let mut owner = help.clone();
@@ -3144,6 +3145,7 @@ mod wasm_tests {
                     started: true,
                     fatal_error: None,
                     activity_summary: Default::default(),
+                    review_recipient: false,
                 });
             });
             state.teams.update(|m| {
@@ -3244,6 +3246,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }
     }
 
@@ -3308,6 +3311,7 @@ mod wasm_tests {
                         instance_stream: StreamPath("/agent/same-agent".to_owned()),
                         activity_summary: Default::default(),
                         activity: protocol::AgentActivity::Idle,
+                        review_recipient: false,
                     });
                 });
             }

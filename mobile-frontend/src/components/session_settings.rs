@@ -673,6 +673,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/settings/inst".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         let active = ActiveAgentRef {
             local_host_id: host,

@@ -793,6 +793,27 @@ pub(crate) struct AgentHandle {
     /// without a message round-trip — which makes it structurally impossible
     /// for a stopped actor to cause the old "agent disappeared" panic.
     start: watch::Receiver<AgentStartPayload>,
+    review_recipient: bool,
+}
+
+/// Whether the user may route review feedback to this agent: top-level user
+/// chats, and unrestricted agent-control agents. Read-only (advisory or
+/// enforced) agent-control agents are reviewers or analysts, and every other
+/// origin belongs to a team, swarm, workflow, or provider-native sub-agent.
+pub(crate) fn is_review_recipient(
+    origin: AgentOrigin,
+    parent_agent_id: Option<&AgentId>,
+    access_mode: protocol::BackendAccessMode,
+) -> bool {
+    match origin {
+        AgentOrigin::User => parent_agent_id.is_none(),
+        AgentOrigin::AgentControl => access_mode == protocol::BackendAccessMode::Unrestricted,
+        AgentOrigin::Tychat
+        | AgentOrigin::BackendNative
+        | AgentOrigin::TeamMember
+        | AgentOrigin::SwarmMember
+        | AgentOrigin::Workflow => false,
+    }
 }
 
 pub(crate) struct AgentClosePreparation(Option<Arc<AtomicBool>>);
@@ -1581,6 +1602,10 @@ pub(crate) enum InterruptOutcome {
 }
 
 impl AgentHandle {
+    pub(crate) fn review_recipient(&self) -> bool {
+        self.review_recipient
+    }
+
     pub(crate) async fn record_handoff(
         &self,
         handoff: protocol::AgentHandoff,
@@ -3496,6 +3521,11 @@ pub(crate) fn spawn_agent_actor(
     let closing = Arc::new(AtomicBool::new(false));
     // Session registration precedes replay; only startup_completion admits startup consumers.
     let (session_binding_tx, session_binding_rx) = oneshot::channel();
+    let review_recipient = is_review_recipient(
+        start.origin,
+        start.parent_agent_id.as_ref(),
+        request.resolved_spawn_config.access_mode,
+    );
     let (start_tx, start_rx) = watch::channel(start.clone());
     let (final_usage_tx, final_usage) = watch::channel(None);
     let actor_tx = tx.clone();
@@ -10844,6 +10874,7 @@ pub(crate) fn spawn_agent_actor(
             close_preparing: Arc::new(AtomicBool::new(false)),
             moving_project: Arc::new(AtomicBool::new(false)),
             start: start_rx,
+            review_recipient,
         },
         session_binding_rx,
     )
@@ -10912,6 +10943,11 @@ pub(crate) fn spawn_relay_agent_actor(
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
     let closing = Arc::new(AtomicBool::new(false));
+    let review_recipient = is_review_recipient(
+        start.origin,
+        start.parent_agent_id.as_ref(),
+        protocol::BackendAccessMode::Unrestricted,
+    );
     let (start_tx, start_rx) = watch::channel(start.clone());
     let (final_usage_tx, final_usage) = watch::channel(None);
     let live_archive_start = start_rx.clone();
@@ -11692,6 +11728,7 @@ pub(crate) fn spawn_relay_agent_actor(
         close_preparing: Arc::new(AtomicBool::new(false)),
         moving_project: Arc::new(AtomicBool::new(false)),
         start: start_rx,
+        review_recipient,
     }
 }
 

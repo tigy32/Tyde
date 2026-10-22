@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 87;
+pub const PROTOCOL_VERSION: u32 = 88;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -5158,6 +5158,9 @@ pub struct NewAgentPayload {
     /// the agent's instance stream has no other way to learn it.
     #[serde(default)]
     pub activity: AgentActivity,
+    /// Server-owned eligibility to receive submitted review feedback as an
+    /// existing-agent target. Review submission rejects other agents.
+    pub review_recipient: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

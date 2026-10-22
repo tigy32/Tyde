@@ -1550,6 +1550,7 @@ mod wasm_tests {
             instance_stream: StreamPath("stream/1".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }
     }
 
@@ -1938,6 +1939,7 @@ mod wasm_tests {
                         created_at_ms: 0,
                         activity_summary: Default::default(),
                         activity: protocol::AgentActivity::Thinking,
+                        review_recipient: false,
                     },
                 )
                 .unwrap(),

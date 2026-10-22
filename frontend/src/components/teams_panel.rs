@@ -3122,6 +3122,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
 
@@ -5758,6 +5759,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
             agents.push(crate::state::AgentInfo {
                 tyde_permissions: Default::default(),
@@ -5778,6 +5780,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
 
@@ -6019,6 +6022,7 @@ mod wasm_tests {
                     started: true,
                     fatal_error: None,
                     activity_summary: Default::default(),
+                    review_recipient: false,
                 });
             });
         };
@@ -6171,6 +6175,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         // A second agent for the reporter, present in `state.agents` so it is a
@@ -6197,6 +6202,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
         // Manager: bound and declared available — a valid target on its own.

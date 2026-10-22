@@ -141,6 +141,9 @@ pub struct AgentInfo {
     /// the frontend never infers this — it mirrors server-emitted state from
     /// `NewAgentPayload.activity_summary` and `AgentActivitySummary` frames.
     pub activity_summary: AgentActivitySummaryState,
+    /// Server-owned `NewAgentPayload.review_recipient`: whether review
+    /// feedback may be submitted to this agent.
+    pub review_recipient: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

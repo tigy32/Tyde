@@ -596,6 +596,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 let origin = payload.origin;
                 let started = payload.session_id.is_some();
                 let activity = payload.activity;
+                let review_recipient = payload.review_recipient;
                 log::info!(
                     "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?} activity={:?}",
                     host,
@@ -619,6 +620,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     instance_stream: payload.instance_stream,
                     started,
                     fatal_error: None,
+                    review_recipient,
                 };
                 state.agents.update(|agents| {
                     agents.retain(|a| !(a.local_host_id == *host && a.agent_id == agent_id));
@@ -3368,6 +3370,7 @@ fn agent_info_from_payload(host: &LocalHostId, payload: NewAgentPayload) -> Agen
         instance_stream: payload.instance_stream,
         started,
         fatal_error: None,
+        review_recipient: payload.review_recipient,
     }
 }
 
@@ -4194,6 +4197,7 @@ mod wasm_tests {
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                     activity_summary: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    review_recipient: false,
                 },
             ),
         );
@@ -4255,6 +4259,7 @@ mod wasm_tests {
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
                     activity_summary: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    review_recipient: false,
                 },
             ),
         );
@@ -4482,6 +4487,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
             activity_summary: Default::default(),
             activity: protocol::AgentActivity::Thinking,
+            review_recipient: false,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
             workbench_support: Default::default(),
@@ -4709,6 +4715,7 @@ mod wasm_tests {
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    review_recipient: false,
                 },
             ),
         );
@@ -4831,6 +4838,7 @@ mod wasm_tests {
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    review_recipient: false,
                 },
             ),
         );

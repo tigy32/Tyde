@@ -1294,6 +1294,7 @@ mod wasm_tests {
             instance_stream: protocol::StreamPath(format!("/agent/{agent}/instance")),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         state.active_local_host_id.set(Some(host.clone()));
         state.active_agent.set(Some(crate::state::ActiveAgentRef {

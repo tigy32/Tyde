@@ -1964,6 +1964,7 @@ mod wasm_tests {
             instance_stream: protocol::StreamPath("/agent/composer-agent/instance".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: false,
         }]);
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host,
@@ -3311,6 +3312,7 @@ mod wasm_tests {
                 instance_stream: protocol::StreamPath("/agent/a1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.active_agent.set(Some(crate::state::ActiveAgentRef {
                 local_host_id: host_for_mount.clone(),

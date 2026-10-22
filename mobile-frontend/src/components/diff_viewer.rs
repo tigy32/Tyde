@@ -1320,6 +1320,7 @@ fn SubmitTargetPicker(
                     a.local_host_id == host
                         && a.project_id.as_ref() == Some(&project_id)
                         && a.fatal_error.is_none()
+                        && a.review_recipient
                 })
                 .map(|a| (a.agent_id.clone(), a.name.clone()))
                 .collect::<Vec<_>>()
@@ -1615,6 +1616,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/a".to_owned()),
             started: true,
             fatal_error: None,
+            review_recipient: true,
         }
     }
 
@@ -1890,6 +1892,14 @@ mod wasm_tests {
                     "agent-other",
                     "Other Proj",
                 ));
+                // Same project, but the server marked it ineligible (e.g. a
+                // read-only AI reviewer); the server would reject it as a
+                // submit target, so it must NOT be offered.
+                let mut reviewer =
+                    fixture_agent(&host_for_agents, "p-1", "agent-reviewer", "AI Review");
+                reviewer.origin = AgentOrigin::AgentControl;
+                reviewer.review_recipient = false;
+                a.push(reviewer);
             });
             provide_context(state);
             view! {
@@ -1923,7 +1933,7 @@ mod wasm_tests {
         assert_eq!(
             agent_rows.length(),
             1,
-            "picker must list exactly the one same-project agent"
+            "picker must list exactly the one eligible same-project agent"
         );
         let row = agent_rows.item(0).unwrap();
         let row_el = row.dyn_ref::<web_sys::Element>().unwrap();

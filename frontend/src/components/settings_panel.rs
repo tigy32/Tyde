@@ -10323,6 +10323,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }]);
         let tab_id = state
             .open_tab(
@@ -16806,6 +16807,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }]);
         state.tabs_enabled.set(true);
         state.open_tab(

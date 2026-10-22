@@ -3923,6 +3923,7 @@ mod wasm_tests {
                 started,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             });
         });
     }
@@ -9541,6 +9542,7 @@ mod wasm_tests {
                 instance_stream: agent_stream(agent_id),
                 activity_summary: Default::default(),
                 activity: protocol::AgentActivity::Idle,
+                review_recipient: false,
             },
         );
         // Prime the agent's instance stream so subsequent
@@ -10025,6 +10027,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             },
         );
         // Without an entry in compaction_pending_close,
@@ -10054,6 +10057,7 @@ mod wasm_tests {
                 started: true,
                 fatal_error: None,
                 activity_summary: Default::default(),
+                review_recipient: false,
             },
         );
         assert!(

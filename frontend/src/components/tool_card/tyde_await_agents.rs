@@ -190,6 +190,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
             activity_summary: Default::default(),
+            review_recipient: false,
         }
     }
 

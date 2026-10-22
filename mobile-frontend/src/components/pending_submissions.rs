@@ -964,6 +964,7 @@ mod wasm_tests {
                 instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: fatal.then(|| "backend crashed".to_owned()),
+                review_recipient: false,
             }]);
             state.hold_submission(PendingSubmission {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
@@ -1416,6 +1417,7 @@ mod wasm_tests {
                 instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.hold_submission(PendingSubmission {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
@@ -1515,6 +1517,7 @@ mod wasm_tests {
                 instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                review_recipient: false,
             }]);
             state.hold_submission(PendingSubmission {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),

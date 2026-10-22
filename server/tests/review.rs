@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use fixture::{Fixture, next_frame_matching_on};
 use protocol::{
-    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorPayload,
-    DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
-    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
-    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
+    AgentBootstrapEvent, AgentId, AgentOrigin, AgentStartPayload, BackendKind, ChatEvent,
+    CommandErrorPayload, DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender,
+    NewAgentPayload, Project, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDiffScope,
+    ProjectEventPayload, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload,
+    ProjectRootPath, QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
     ReviewAiReviewerStatus, ReviewAiScope, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
     ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
     ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget,
@@ -6557,4 +6557,202 @@ async fn review_modes_share_persisted_aspects_and_exact_source_assignments() {
         after.settings.review, settings,
         "Aspect edits, sources and mappings persist across host restart"
     );
+}
+
+/// Review feedback must reach agent-control coding agents (e.g. an
+/// implementer spawned by a coordinator), while read-only AI reviewers stay
+/// isolated. The server publishes the eligibility on `NewAgent` and enforces
+/// it at delivery, so a rejected target keeps every comment and an accepted
+/// target receives exactly one bundle carrying every comment.
+#[tokio::test]
+async fn review_feedback_reaches_agent_control_child_but_not_reviewer() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (author, _session_id) = spawn_idle_project_agent(&mut client, &project).await;
+    assert!(
+        author.review_recipient,
+        "a top-level user agent stays a review recipient"
+    );
+
+    let _implementer_reservation = fixture
+        .reserve_next_mock_launch(
+            "Implementer",
+            MockScript::new().with_unbounded_echo().with_user_bubbles(),
+        )
+        .await;
+    let caller = fixture.agent_control_caller(&author.agent_id).await;
+    let (failed, spawned) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_spawn_agent",
+        json!({
+            "prompt": "implement the change",
+            "name": "Implementer",
+            "backend_kind": "claude",
+            "project_id": project.id.0,
+        }),
+    )
+    .await;
+    assert!(!failed, "agent-control spawn failed: {spawned}");
+    let implementer = expect_new_agent(&mut client, "agent-control implementer").await;
+    assert_eq!(implementer.origin, AgentOrigin::AgentControl);
+    assert_eq!(implementer.parent_agent_id.as_ref(), Some(&author.agent_id));
+    assert_eq!(implementer.project_id.as_ref(), Some(&project.id));
+    assert!(
+        implementer.review_recipient,
+        "a writable agent-control coding agent must be offered as a review recipient"
+    );
+
+    let _analyst_reservation = fixture
+        .reserve_next_mock_launch("Analyst", MockScript::one(MockTurn::echo()))
+        .await;
+    let (failed, spawned) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_spawn_agent",
+        json!({
+            "prompt": "inspect the change",
+            "name": "Analyst",
+            "backend_kind": "claude",
+            "project_id": project.id.0,
+            "access_mode": "read_only",
+        }),
+    )
+    .await;
+    assert!(!failed, "read-only agent-control spawn failed: {spawned}");
+    let analyst = expect_new_agent(&mut client, "read-only agent-control analyst").await;
+    assert_eq!(analyst.origin, AgentOrigin::AgentControl);
+    assert!(
+        !analyst.review_recipient,
+        "an advisory read-only agent-control agent must not receive review feedback"
+    );
+
+    let review = create_review(&mut client, &project, &author).await;
+    let _reservation = fixture
+        .reserve_next_mock_launch("AI Review", MockScript::one(MockTurn::echo()))
+        .await;
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                author_agent_id: None,
+                expected_plan: None,
+                mode: None,
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+                scope: ReviewAiScope::WorkingTree,
+            },
+        )
+        .await
+        .expect("start AI reviewer");
+    let mut reviewer = None;
+    let mut reviewer_done = false;
+    next_frame_matching_on(&mut client, "AI reviewer completes", |env| {
+        match env.kind {
+            FrameKind::NewAgent => {
+                let new_agent: NewAgentPayload = env.parse_payload().expect("new agent");
+                if new_agent.name == "AI Review" {
+                    reviewer = Some(new_agent);
+                }
+            }
+            FrameKind::ReviewEvent => {
+                if let Ok(ReviewEventPayload::AiReviewerChanged { state }) = env.parse_payload()
+                    && state.status == ReviewAiReviewerStatus::Completed
+                {
+                    reviewer_done = true;
+                }
+            }
+            _ => {}
+        }
+        reviewer.is_some() && reviewer_done
+    })
+    .await;
+    let reviewer = reviewer.expect("AI reviewer NewAgent");
+    assert_eq!(reviewer.origin, AgentOrigin::AgentControl);
+    assert!(
+        !reviewer.review_recipient,
+        "a read-only AI reviewer must never be offered as a review recipient"
+    );
+
+    add_comment(&mut client, &review, "First implementer comment.").await;
+    add_comment(&mut client, &review, "Second implementer comment.").await;
+
+    client
+        .review_action(&review.id, submit_to(&reviewer))
+        .await
+        .expect("submit to reviewer");
+    let error = expect_review_error(
+        &mut client,
+        "reviewer target error",
+        ReviewErrorCode::InvalidSubmitTarget,
+    )
+    .await;
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("cannot receive review feedback"),
+        "the live reviewer must be rejected for eligibility, not as offline: {}",
+        error.message
+    );
+    assert_no_trailing_review_snapshot(&mut client, "reviewer Submit error").await;
+    let retained = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(retained.status, ReviewStatus::Draft));
+    assert_eq!(
+        retained.comments.len(),
+        2,
+        "a rejected target loses no comments"
+    );
+
+    client
+        .review_action(&review.id, submit_to(&implementer))
+        .await
+        .expect("submit to implementer");
+    let mut cleared = false;
+    let mut delivered = None;
+    next_frame_matching_on(&mut client, "implementer receives review", |env| {
+        match env.kind {
+            FrameKind::ReviewEvent => {
+                if let Ok(ReviewEventPayload::Cleared { review: done }) = env.parse_payload() {
+                    assert_eq!(done.id, review.id);
+                    assert!(done.comments.is_empty());
+                    cleared = true;
+                }
+            }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("chat event");
+                let ChatEvent::MessageAdded(message) = event else {
+                    return false;
+                };
+                if message.content.contains("The user completed a review") {
+                    assert_eq!(
+                        env.stream, implementer.instance_stream,
+                        "review feedback reached an agent other than the selected implementer"
+                    );
+                    if let Some(MessageOrigin::Review { review_id }) = &message.origin {
+                        assert_eq!(review_id, &review.id);
+                        assert!(
+                            matches!(message.sender, MessageSender::System),
+                            "review feedback renders as a system input"
+                        );
+                        assert!(delivered.is_none(), "review feedback was delivered twice");
+                        delivered = Some(message.content);
+                    }
+                }
+            }
+            _ => {}
+        }
+        cleared && delivered.is_some()
+    })
+    .await;
+    let delivered = delivered.expect("delivered review bundle");
+    assert!(delivered.contains("The user completed a review with 2 comments."));
+    assert_eq!(delivered.matches("First implementer comment.").count(), 1);
+    assert_eq!(delivered.matches("Second implementer comment.").count(), 1);
 }
