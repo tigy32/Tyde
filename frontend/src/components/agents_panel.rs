@@ -11366,4 +11366,338 @@ mod wasm_tests {
             "a live restoration status is announced"
         );
     }
+
+    #[wasm_bindgen_test]
+    async fn agents_panel_does_not_overflow_horizontally_at_narrow_and_normal_widths() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let state = make_app_state("local");
+        crate::dispatch::prime_host_for_tests(&state, "local");
+
+        let long_host_name =
+            "Very Long Host Name That Tests Boundary Layout Truncation In The Sidebar";
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", long_host_name)]);
+
+        let parent_project_id = "parent-project";
+        let parent_project_name = "Long Parent Project Name Designed To Exceed Container Boundary";
+        let parent_proj = project_info("local", parent_project_id, parent_project_name, 0);
+
+        let workbench_id = "workbench-project";
+        let workbench_name = "Long Workbench Name Nested Within Parent Project In Sidebar";
+        let mut workbench = project_info("local", workbench_id, workbench_name, 1);
+        workbench.project.source = ProjectSource::GitWorkbench {
+            environment: Default::default(),
+            parent_project_id: ProjectId(parent_project_id.to_owned()),
+            branch: protocol::GitBranchName("feature/nested-workbench-branch-name".to_owned()),
+            roots: vec![protocol::WorkbenchRoot {
+                parent_root: ProjectRootPath(format!("/tmp/{parent_project_id}")),
+                worktree_root: ProjectRootPath(format!("/tmp/{workbench_id}")),
+            }],
+        };
+        state.projects.set(vec![parent_proj, workbench]);
+
+        let group_id = AgentGroupId("custom-group".to_owned());
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.show_workbenches = true;
+        preferences
+            .pins
+            .pinned
+            .push(local_target("workbench-agent"));
+        preferences.groups.groups.push(AgentGroup {
+            id: group_id.clone(),
+            name: "Custom Group With Long Label And Action Buttons".to_owned(),
+        });
+        preferences.groups.assignments.push(AgentGroupAssignment {
+            target: local_target("grouped-agent"),
+            group_id,
+        });
+        state.agents_view_preferences.set(preferences);
+
+        // Parent agent with children
+        push_agent_with_scope(
+            &state,
+            "local",
+            "parent-agent",
+            "Parent Agent With Long Name And Child Disclosure Toggle",
+            true,
+            Some(parent_project_id),
+            None,
+        );
+        // Child agent under parent agent
+        push_agent_with_scope(
+            &state,
+            "local",
+            "child-agent",
+            "Child Agent With Deeply Nested Indentation And Long Name",
+            true,
+            Some(parent_project_id),
+            Some("parent-agent"),
+        );
+        // Workbench agent
+        push_agent_with_scope(
+            &state,
+            "local",
+            "workbench-agent",
+            "Workbench Agent Inside Nested Branch With Long Name",
+            true,
+            Some(workbench_id),
+            None,
+        );
+        // Grouped agent
+        push_agent_with_scope(
+            &state,
+            "local",
+            "grouped-agent",
+            "Grouped Agent With Long Name In Custom Folder",
+            true,
+            Some(parent_project_id),
+            None,
+        );
+
+        // AwaitingUser status on parent agent ("Needs your answer")
+        state.agent_awaiting_user.update(|set| {
+            set.insert(AgentId("parent-agent".to_owned()));
+        });
+        // In-flight compaction status on workbench agent ("Compacting context")
+        state.mark_compaction_started("local", AgentId("workbench-agent".to_owned()));
+        // Active turn on child agent so it is revealed when parent is expanded
+        state.agent_turn_active.update(|turns| {
+            turns.insert(AgentId("child-agent".to_owned()), true);
+        });
+
+        for width in [220, 320] {
+            let container = make_container();
+            container
+                .set_attribute(
+                    "style",
+                    &format!(
+                        "position: absolute; top: 0; left: 0; width: {width}px; height: 800px; overflow: hidden;"
+                    ),
+                )
+                .unwrap();
+            let _handle = mount_panel(&container, state.clone());
+
+            for _ in 0..4 {
+                next_tick().await;
+            }
+
+            // Explicitly require parent card and its collapse toggle (fail if missing)
+            let parent_card = container
+                .query_selector("[data-agent-drop-id='parent-agent']")
+                .unwrap()
+                .expect("parent-agent card must exist in DOM");
+            let toggle: HtmlElement = parent_card
+                .query_selector(".agent-card-collapse-toggle")
+                .unwrap()
+                .expect("parent-agent must have a collapse toggle for its children")
+                .dyn_into()
+                .unwrap();
+            toggle.click();
+            for _ in 0..4 {
+                next_tick().await;
+            }
+
+            // Explicitly assert that child agent rendered with visible, nonzero geometry
+            let child_card: HtmlElement = container
+                .query_selector("[data-agent-drop-id='child-agent']")
+                .unwrap()
+                .expect("child-agent card must be rendered in DOM after expanding parent")
+                .dyn_into()
+                .unwrap();
+            let child_rect = child_card.get_bounding_client_rect();
+            assert!(
+                child_rect.width() > 0.0 && child_rect.height() > 0.0,
+                "child-agent card must have visible nonzero geometry when expanded at {width}px",
+            );
+
+            // Assert that agent name maintains meaningful visible width for identification
+            let child_name: HtmlElement = child_card
+                .query_selector(".agent-card-name")
+                .unwrap()
+                .expect("child-agent name must exist")
+                .dyn_into()
+                .unwrap();
+            let child_name_rect = child_name.get_bounding_client_rect();
+            assert!(
+                child_name_rect.width() >= 40.0,
+                "child-agent name must maintain meaningful visible width for identification at {width}px (got {}px)",
+                child_name_rect.width(),
+            );
+
+            let panel_content: HtmlElement = container
+                .query_selector(".panel-content")
+                .unwrap()
+                .expect("panel-content exists")
+                .dyn_into()
+                .unwrap();
+
+            // Assert that horizontal scroll width does not exceed client width (within 1px subpixel tolerance)
+            assert!(
+                panel_content.scroll_width() <= panel_content.client_width() + 1,
+                "panel-content must not overflow horizontally at {width}px (scroll_width: {}, client_width: {})",
+                panel_content.scroll_width(),
+                panel_content.client_width(),
+            );
+
+            // Verify no horizontal scroll displacement occurs when set
+            panel_content.set_scroll_left(50);
+            assert_eq!(
+                panel_content.scroll_left(),
+                0,
+                "panel-content must have zero horizontal scroll range at {width}px",
+            );
+
+            let panel_rect = panel_content.get_bounding_client_rect();
+            let tolerance = 1.0;
+
+            // Host new-project button stays within bounds
+            let host_new_projects = container.query_selector_all(".agent-new-project").unwrap();
+            for i in 0..host_new_projects.length() {
+                let btn: HtmlElement = host_new_projects.item(i).unwrap().dyn_into().unwrap();
+                let rect = btn.get_bounding_client_rect();
+                assert!(
+                    rect.right() <= panel_rect.right() + tolerance,
+                    "agent-new-project #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
+                    rect.right(),
+                    panel_rect.right(),
+                );
+            }
+
+            // Project & workbench edit pencils stay within bounds
+            let edit_pencils = container
+                .query_selector_all(".project-edit-pencil")
+                .unwrap();
+            for i in 0..edit_pencils.length() {
+                let btn: HtmlElement = edit_pencils.item(i).unwrap().dyn_into().unwrap();
+                let rect = btn.get_bounding_client_rect();
+                assert!(
+                    rect.right() <= panel_rect.right() + tolerance,
+                    "project-edit-pencil #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
+                    rect.right(),
+                    panel_rect.right(),
+                );
+            }
+
+            // Custom group action buttons stay within bounds
+            let group_actions = container
+                .query_selector_all(".agent-sidebar-custom-group-actions")
+                .unwrap();
+            for i in 0..group_actions.length() {
+                let el: HtmlElement = group_actions.item(i).unwrap().dyn_into().unwrap();
+                let rect = el.get_bounding_client_rect();
+                assert!(
+                    rect.right() <= panel_rect.right() + tolerance,
+                    "custom group actions #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
+                    rect.right(),
+                    panel_rect.right(),
+                );
+            }
+
+            // Expand buttons stay within bounds
+            let expand_buttons = container
+                .query_selector_all(".sidebar-card-expand")
+                .unwrap();
+            for i in 0..expand_buttons.length() {
+                let btn: HtmlElement = expand_buttons.item(i).unwrap().dyn_into().unwrap();
+                let rect = btn.get_bounding_client_rect();
+                assert!(
+                    rect.right() <= panel_rect.right() + tolerance,
+                    "sidebar-card-expand #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
+                    rect.right(),
+                    panel_rect.right(),
+                );
+            }
+
+            // Verify pinned agent has visible, nonzero geometry and stays within bounds
+            let pinned_pin: HtmlElement = container
+                .query_selector("[data-agent-drop-id='workbench-agent'] .agent-card-pin.pinned")
+                .unwrap()
+                .expect("pinned workbench-agent must render a visible .agent-card-pin.pinned")
+                .dyn_into()
+                .unwrap();
+            let pinned_rect = pinned_pin.get_bounding_client_rect();
+            assert!(
+                pinned_rect.width() > 0.0 && pinned_rect.height() > 0.0,
+                "pinned pin button must have nonzero visible geometry at {width}px (width: {}, height: {})",
+                pinned_rect.width(),
+                pinned_rect.height(),
+            );
+            assert!(
+                pinned_rect.right() <= panel_rect.right() + tolerance,
+                "pinned pin button must remain within panel at {width}px (right: {}, panel_right: {})",
+                pinned_rect.right(),
+                panel_rect.right(),
+            );
+
+            // Focus child-agent card to reveal its pin control via :focus-within and verify visible geometry
+            child_card.focus().unwrap();
+            for _ in 0..2 {
+                next_tick().await;
+            }
+            let child_pin: HtmlElement = child_card
+                .query_selector(".agent-card-pin")
+                .unwrap()
+                .expect("child-agent pin button must exist")
+                .dyn_into()
+                .unwrap();
+            let child_pin_rect = child_pin.get_bounding_client_rect();
+            assert!(
+                child_pin_rect.width() > 0.0 && child_pin_rect.height() > 0.0,
+                "focused child card pin button must have nonzero visible geometry under focus at {width}px (width: {}, height: {})",
+                child_pin_rect.width(),
+                child_pin_rect.height(),
+            );
+            assert!(
+                child_pin_rect.right() <= panel_rect.right() + tolerance,
+                "focused child card pin button must remain within panel at {width}px (right: {}, panel_right: {})",
+                child_pin_rect.right(),
+                panel_rect.right(),
+            );
+
+            // Verify awaiting-user status text has visible nonzero geometry and stays within panel
+            let awaiting_text: HtmlElement = container
+                .query_selector(
+                    "[data-agent-drop-id='parent-agent'] .agent-card-status.awaiting .agent-card-status-text",
+                )
+                .unwrap()
+                .expect("parent-agent must display awaiting status text")
+                .dyn_into()
+                .unwrap();
+            let awaiting_rect = awaiting_text.get_bounding_client_rect();
+            assert!(
+                awaiting_rect.width() > 0.0 && awaiting_rect.height() > 0.0,
+                "awaiting status text must have nonzero visible geometry at {width}px",
+            );
+            assert!(
+                awaiting_rect.right() <= panel_rect.right() + tolerance,
+                "awaiting status text must remain within panel at {width}px (right: {}, panel_right: {})",
+                awaiting_rect.right(),
+                panel_rect.right(),
+            );
+
+            // Verify compacting status text has visible nonzero geometry and stays within panel
+            let compacting_text: HtmlElement = container
+                .query_selector(
+                    "[data-agent-drop-id='workbench-agent'] .agent-card-status .agent-card-status-text",
+                )
+                .unwrap()
+                .expect("workbench-agent must display compaction status text")
+                .dyn_into()
+                .unwrap();
+            let compacting_rect = compacting_text.get_bounding_client_rect();
+            assert!(
+                compacting_rect.width() > 0.0 && compacting_rect.height() > 0.0,
+                "compaction status text must have nonzero visible geometry at {width}px",
+            );
+            assert!(
+                compacting_rect.right() <= panel_rect.right() + tolerance,
+                "compaction status text must remain within panel at {width}px (right: {}, panel_right: {})",
+                compacting_rect.right(),
+                panel_rect.right(),
+            );
+
+            container.remove();
+        }
+    }
 }
