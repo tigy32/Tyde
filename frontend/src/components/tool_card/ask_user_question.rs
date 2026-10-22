@@ -901,6 +901,7 @@ mod wasm_tests {
         // re-enabled its buttons, although the actor rejects that id as stale.
         // Preserve the open question text without reopening the interaction.
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
@@ -938,6 +939,7 @@ mod wasm_tests {
         // longer answerable. Mirror mobile: render the normal completion body,
         // not the interactive card.
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
@@ -1391,6 +1393,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn expired_question_renders_as_no_longer_answerable() {
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
@@ -1524,6 +1527,7 @@ mod wasm_tests {
         );
 
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask_agent_a".to_owned(),

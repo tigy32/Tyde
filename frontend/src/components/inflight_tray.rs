@@ -4434,6 +4434,7 @@ mod wasm_tests {
 
         fn card_entry(tool_name: &str) -> ToolRequestEntry {
             ToolRequestEntry {
+                presentation: Default::default(),
                 tool_name: tool_name.to_owned(),
                 request: ToolRequest {
                     tool_call_id: format!("toolu_{tool_name}"),

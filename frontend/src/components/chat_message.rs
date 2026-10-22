@@ -722,6 +722,7 @@ mod wasm_tests {
 
     fn tool_entry(id: &str) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "run".to_owned(),
             request: protocol::ToolRequest {
                 tool_call_id: id.to_owned(),

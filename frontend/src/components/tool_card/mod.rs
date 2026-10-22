@@ -165,6 +165,132 @@ fn is_secret_key(key: &str) -> bool {
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod test_utils;
 
+fn completed_file_change(entry: &ToolRequestEntry) -> Option<(&str, u64, u64)> {
+    match (
+        &entry.request.tool_type,
+        entry.result.as_ref().map(|result| &result.outcome),
+    ) {
+        (
+            ToolRequestType::ModifyFile { file_path, .. },
+            Some(ToolExecutionOutcome::Succeeded {
+                result:
+                    ToolExecutionResult::ModifyFile {
+                        lines_added,
+                        lines_removed,
+                    },
+            }),
+        ) => Some((file_path, *lines_added, *lines_removed)),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct ToolDisplayGroup<T> {
+    file_requests: bool,
+    id: String,
+    ids: Vec<String>,
+    entries: Vec<T>,
+}
+
+// Layout tracks identity and membership; entry signals own live outcomes.
+impl<T> PartialEq for ToolDisplayGroup<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_requests == other.file_requests && self.id == other.id && self.ids == other.ids
+    }
+}
+
+fn group_tool_rows<T>(
+    entries: Vec<T>,
+    id: impl Fn(&T) -> String,
+    is_file_request: impl Fn(&T) -> bool,
+    visible_ids: &std::collections::HashSet<String>,
+) -> Vec<ToolDisplayGroup<T>> {
+    let mut groups: Vec<ToolDisplayGroup<T>> = Vec::new();
+    for entry in entries {
+        let file_requests = is_file_request(&entry);
+        let tool_id = id(&entry);
+        if file_requests && let Some(group) = groups.last_mut().filter(|group| group.file_requests)
+        {
+            group.entries.push(entry);
+        } else {
+            groups.push(ToolDisplayGroup {
+                file_requests,
+                id: tool_id,
+                ids: Vec::new(),
+                entries: vec![entry],
+            });
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|mut group| {
+            group.ids = group
+                .entries
+                .iter()
+                .map(&id)
+                .filter(|id| visible_ids.contains(id))
+                .collect();
+            (!group.ids.is_empty()).then_some(group)
+        })
+        .collect()
+}
+
+#[component]
+fn FileChangeGroup(
+    entries: Signal<Vec<ToolRequestEntry>>,
+    expanded: RwSignal<bool>,
+    children: Children,
+) -> impl IntoView {
+    Effect::new(move |_| {
+        let choice = expanded.get();
+        entries.with(|entries| {
+            for entry in entries {
+                let member = &entry.presentation.change_group_expanded;
+                if member.get_untracked() != choice {
+                    member.set(choice);
+                }
+            }
+        });
+    });
+    let has_changes = move || {
+        entries.with(|entries| {
+            entries
+                .iter()
+                .any(|entry| completed_file_change(entry).is_some())
+        })
+    };
+    let label = move || {
+        let entries = entries.get();
+        let count = entries
+            .iter()
+            .filter_map(completed_file_change)
+            .map(|(path, _, _)| path)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        format!(
+            "{count} {} changed",
+            if count == 1 { "file" } else { "files" }
+        )
+    };
+    view! {
+        <div class="file-change-group" class:has-file-changes=has_changes class:file-change-collapsed=move || !expanded.get()>
+            <button type="button" class="file-change-heading" aria-expanded=move || expanded.get().to_string() on:click=move |_| {
+                let next = !expanded.get_untracked();
+                entries.with_untracked(|entries| {
+                    for entry in entries {
+                        entry.presentation.change_group_expanded.set(next);
+                    }
+                });
+            }>
+                <span class="file-change-chevron" aria-hidden="true">{move || if expanded.get() { "⌄" } else { "›" }}</span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h6M9 16h6" /></svg>
+                <span>{label}</span>
+            </button>
+            <div class="file-change-entries">{children()}</div>
+        </div>
+    }
+}
+
 #[component]
 pub fn ToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -173,26 +299,53 @@ pub fn ToolCardListView(
     let entries = Arc::new(entries);
     let expanded = RwSignal::new(false);
     let total = entries.len();
+    let group_entries = entries.clone();
+    let groups = Memo::new(move |_| {
+        let visible_ids = visible_tool_indexes(group_entries.len(), expanded.get(), |index| {
+            is_important_tool(&group_entries[index])
+        })
+        .into_iter()
+        .map(|index| group_entries[index].request.tool_call_id.clone())
+        .collect();
+        group_tool_rows(
+            group_entries.as_ref().clone(),
+            |entry: &ToolRequestEntry| entry.request.tool_call_id.clone(),
+            |entry| matches!(entry.request.tool_type, ToolRequestType::ModifyFile { .. }),
+            &visible_ids,
+        )
+    });
 
     view! {
         <div class="chat-card-tools">
             <For
-                each={
-                    let entries = entries.clone();
-                    move || {
-                        let expanded = expanded.get();
-                        visible_tool_indexes(entries.len(), expanded, |idx| {
-                            is_important_tool(&entries[idx])
-                        })
-                        .into_iter()
-                        .map(|idx| entries[idx].clone())
-                        .collect::<Vec<_>>()
-                    }
-                }
-                key=|entry| entry.request.tool_call_id.clone()
-                let:entry
+                each=move || groups.get()
+                key=|group| group.id.clone()
+                let:group
             >
-                <ToolCardView agent_ref=agent_ref entry=entry />
+                {if group.file_requests {
+                    let expanded = RwSignal::from(group.entries[0].presentation.change_group_expanded.clone());
+                    let id = group.id;
+                    let visible_id = id.clone();
+                    let members = Signal::derive(move || groups.with(|groups| groups.iter()
+                        .filter(|group| group.id == id).flat_map(|group| group.entries.iter().cloned()).collect::<Vec<_>>()));
+                    let visible_members = Signal::derive(move || groups.with(|groups| groups.iter()
+                        .filter(|group| group.id == visible_id).flat_map(|group| group.entries.iter()
+                            .filter(|entry| group.ids.contains(&entry.request.tool_call_id)).cloned()).collect::<Vec<_>>()));
+                    view! {
+                        <FileChangeGroup entries=members expanded=expanded>
+                            <For each=move || visible_members.get() key=|entry| entry.request.tool_call_id.clone() let:entry>
+                                {let row_class = if completed_file_change(&entry).is_some() { "file-tool-row file-change-row" } else { "file-tool-row file-activity-row" };
+                                view! {
+                                    <div class=row_class>
+                                        <ToolCardView agent_ref=agent_ref entry=entry />
+                                    </div>
+                                }}
+                            </For>
+                        </FileChangeGroup>
+                    }.into_any()
+                } else {
+                    group.entries.into_iter().map(|entry| view! { <ToolCardView agent_ref=agent_ref entry=entry /> }).collect::<Vec<_>>().into_any()
+                }}
             </For>
             <ToolListSummary
                 total=move || total
@@ -218,28 +371,59 @@ pub fn StreamingToolCardListView(
     entries: ArcRwSignal<Vec<StreamingToolRequest>>,
 ) -> impl IntoView {
     let expanded = RwSignal::new(false);
+    let group_entries = entries.clone();
+    let groups = Memo::new(move |_| {
+        group_entries.with(|tools| {
+            let visible_ids = visible_tool_indexes(tools.len(), expanded.get(), |index| {
+                tools[index].entry.with_untracked(is_important_tool)
+            })
+            .into_iter()
+            .map(|index| tools[index].tool_call_id.clone())
+            .collect();
+            group_tool_rows(
+                tools.clone(),
+                |tool: &StreamingToolRequest| tool.tool_call_id.clone(),
+                |tool| {
+                    tool.entry.with_untracked(|entry| {
+                        matches!(entry.request.tool_type, ToolRequestType::ModifyFile { .. })
+                    })
+                },
+                &visible_ids,
+            )
+        })
+    });
 
     view! {
         <div class="chat-card-tools">
             <For
-                each={
-                    let entries = entries.clone();
-                    move || {
-                        let expanded = expanded.get();
-                        entries.with(|tools| {
-                            visible_tool_indexes(tools.len(), expanded, |idx| {
-                                tools[idx].entry.with_untracked(is_important_tool)
-                            })
-                            .into_iter()
-                            .map(|idx| tools[idx].clone())
-                            .collect::<Vec<_>>()
-                        })
-                    }
-                }
-                key=|tool| tool.tool_call_id.clone()
-                let:tool
+                each=move || groups.get()
+                key=|group| group.id.clone()
+                let:group
             >
-                <StreamingToolCardView agent_ref=agent_ref entry=tool.entry />
+                {if group.file_requests {
+                    let expanded = RwSignal::from(group.entries[0].entry.with_untracked(|entry| entry.presentation.change_group_expanded.clone()));
+                    let id = group.id;
+                    let visible_id = id.clone();
+                    let members = Signal::derive(move || groups.with(|groups| groups.iter()
+                        .filter(|group| group.id == id).flat_map(|group| group.entries.iter().cloned()).collect::<Vec<_>>()));
+                    let visible_members = Signal::derive(move || groups.with(|groups| groups.iter()
+                        .filter(|group| group.id == visible_id).flat_map(|group| group.entries.iter()
+                            .filter(|entry| group.ids.contains(&entry.tool_call_id)).cloned()).collect::<Vec<_>>()));
+                    view! {
+                        <FileChangeGroup entries=Signal::derive(move || members.get().iter().map(|tool| tool.entry.get()).collect()) expanded=expanded>
+                            <For each=move || visible_members.get() key=|tool| tool.tool_call_id.clone() let:tool>
+                                {let class_entry = tool.entry.clone();
+                                view! {
+                                    <div class=move || if class_entry.with(|entry| completed_file_change(entry).is_some()) { "file-tool-row file-change-row" } else { "file-tool-row file-activity-row" }>
+                                        <StreamingToolCardView agent_ref=agent_ref entry=tool.entry />
+                                    </div>
+                                }}
+                            </For>
+                        </FileChangeGroup>
+                    }.into_any()
+                } else {
+                    group.entries.into_iter().map(|tool| view! { <StreamingToolCardView agent_ref=agent_ref entry=tool.entry /> }).collect::<Vec<_>>().into_any()
+                }}
             </For>
             <ToolListSummary
                 total={
@@ -368,6 +552,26 @@ pub fn ToolCardView(
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
 
+    let disclosure = RwSignal::from(entry.presentation.disclosure.clone());
+    let chat_appearance = state.chat_appearance;
+    // Current retains its component-local lifecycle; only Ink restores choices
+    // across reconstruction. Read untracked inside the streaming row's owner.
+    if chat_appearance.get_untracked() == crate::appearance::ChatAppearance::Current
+        && disclosure.get_untracked() != (None, None)
+    {
+        disclosure.set((None, None));
+    }
+    Effect::new(move |previous: Option<ToolOutputMode>| {
+        let mode = tool_output_mode.get();
+        if previous.is_some()
+            && chat_appearance.get_untracked() == crate::appearance::ChatAppearance::Current
+        {
+            disclosure.set((None, None));
+        }
+        mode
+    });
+    let file_change = completed_file_change(&entry)
+        .map(|(path, added, removed)| (path.to_owned(), added, removed));
     let tool_name = entry.tool_name;
     let tool_call_id = entry.request.tool_call_id.clone();
     let tool_type = entry.request.tool_type;
@@ -539,13 +743,18 @@ pub fn ToolCardView(
     // user had collapsed mid-run.
     let mode_default_open = move || always_open || tool_output_mode.get() == ToolOutputMode::Full;
     // `None` until the user works the disclosure themselves, after which their
-    // choice outranks the default until the output mode changes under them.
-    let user_open: RwSignal<Option<bool>> = RwSignal::new(None);
-    Effect::new(move |_| {
-        tool_output_mode.track();
-        user_open.set(None);
-    });
-    let card_open = move || user_open.get().unwrap_or_else(mode_default_open);
+    // choice outranks the default in the output mode where it was made.
+    let card_open = move || {
+        if normalization_failed {
+            return true;
+        }
+        let (mode, choice) = disclosure.get();
+        if mode == Some(tool_output_mode.get()) {
+            choice.unwrap_or_else(mode_default_open)
+        } else {
+            mode_default_open()
+        }
+    };
     // A collapsed body still renders (and stays mounted across a toggle) so a
     // card keeps its "Show more" and draft-feedback state; `<details>` owns
     // the hiding. `Summary` has no body to render until it is opened.
@@ -554,6 +763,7 @@ pub fn ToolCardView(
     view! {
         <details
             class=if normalization_failed { "tool-card tool-card-malformed" } else { "tool-card" }
+            data-tool-kind=if matches!(tool_type, ToolRequestType::RunCommand { .. }) { "command" } else { "tool" }
             aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
             prop:open=card_open
             on:toggle=move |ev: leptos::ev::Event| {
@@ -563,7 +773,7 @@ pub fn ToolCardView(
                     if normalization_failed && !el.open() {
                         el.set_open(true);
                     }
-                    user_open.set(Some(el.open()));
+                    disclosure.set((Some(tool_output_mode.get_untracked()), Some(el.open())));
                 }
             }
         >
@@ -571,9 +781,15 @@ pub fn ToolCardView(
                 // Purely decorative: the tool name beside it is the accessible
                 // label, so a screen reader announcing the emoji adds only noise.
                 <span class="tool-card-icon" aria-hidden="true">{icon}</span>
-                <span class="tool-card-name">{tool_name}</span>
+                <span class="tool-card-name" title={let title = tool_name.clone(); move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then(|| title.clone())}>{tool_name.clone()}</span>
+                <span class="ink-command-label">"Command"</span>
                 {move || header_detail().map(|d| view! {
-                    <span class="tool-card-detail">{d}</span>
+                    <span class="tool-card-detail" title={let title = d.clone(); move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then(|| title.clone())}>{d.clone()}</span>
+                })}
+                {file_change.map(|(path, added, removed)| view! {
+                    <svg class="ink-file-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h6M9 16h6" /></svg>
+                    <span class="ink-file-path" title=path.clone()>{path.clone()}</span>
+                    <span class="ink-file-counts"><span class="ink-file-added">{format!("+{added}")}</span><span class="ink-file-removed">{format!("−{removed}")}</span></span>
                 })}
                 {completion_summary.map(|s| view! {
                     <span class="tool-completion-summary">{s}</span>
@@ -1465,6 +1681,7 @@ mod live_card_wasm_tests {
 
     fn completed_other_request(tool_call_id: &str, tool_name: &str) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: tool_name.to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
@@ -1486,6 +1703,7 @@ mod live_card_wasm_tests {
         tool_result: ToolExecutionResult,
     ) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "Read".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
@@ -1675,221 +1893,243 @@ mod live_card_wasm_tests {
             "labels": ["first, label", "second, label"],
             "note": "line one\nline two",
         });
-        for (request, failed) in [
-            (
-                ToolRequestType::ViewImage {
-                    path: "/tmp/native-preview.png".to_owned(),
-                },
-                false,
-            ),
-            (ToolRequestType::Other { args: args.clone() }, false),
-            (ToolRequestType::Other { args }, true),
+        for appearance in [
+            crate::appearance::ChatAppearance::Current,
+            crate::appearance::ChatAppearance::Ink,
         ] {
-            let expected_parameters = match &request {
-                ToolRequestType::Other { args } => Some(format!("{args:#}")),
-                _ => None,
-            };
-            for mode in [
-                ToolOutputMode::Full,
-                ToolOutputMode::Compact,
-                ToolOutputMode::Summary,
+            for (request, failed) in [
+                (
+                    ToolRequestType::ViewImage {
+                        path: "/tmp/native-preview.png".to_owned(),
+                    },
+                    false,
+                ),
+                (ToolRequestType::Other { args: args.clone() }, false),
+                (ToolRequestType::Other { args: args.clone() }, true),
             ] {
-                let native_result = ToolExecutionResult::NativeContent {
-                    text: native_text.to_owned(),
-                    images: images.clone(),
+                let expected_parameters = match &request {
+                    ToolRequestType::Other { args } => Some(format!("{args:#}")),
+                    _ => None,
                 };
-                let completion = ToolExecutionCompletedData {
-                    tool_call_id: "native-content".to_owned(),
-                    outcome: if failed {
-                        ToolExecutionOutcome::Failed {
-                            message: failure_message.to_owned(),
-                            details: Some(failure_details.to_owned()),
-                            normalization_failure: None,
-                            result: Some(native_result),
-                        }
-                    } else {
-                        ToolExecutionOutcome::Succeeded {
-                            result: native_result,
-                        }
-                    },
-                };
-                let entry = ArcRwSignal::new(ToolRequestEntry {
-                    tool_name: "catalog_preview".to_owned(),
-                    request: ToolRequest {
+                for mode in [
+                    ToolOutputMode::Full,
+                    ToolOutputMode::Compact,
+                    ToolOutputMode::Summary,
+                ] {
+                    let native_result = ToolExecutionResult::NativeContent {
+                        text: native_text.to_owned(),
+                        images: images.clone(),
+                    };
+                    let completion = ToolExecutionCompletedData {
                         tool_call_id: "native-content".to_owned(),
+                        outcome: if failed {
+                            ToolExecutionOutcome::Failed {
+                                message: failure_message.to_owned(),
+                                details: Some(failure_details.to_owned()),
+                                normalization_failure: None,
+                                result: Some(native_result),
+                            }
+                        } else {
+                            ToolExecutionOutcome::Succeeded {
+                                result: native_result,
+                            }
+                        },
+                    };
+                    let entry = ArcRwSignal::new(ToolRequestEntry {
+                        presentation: Default::default(),
                         tool_name: "catalog_preview".to_owned(),
-                        tool_type: request.clone(),
-                    },
-                    result: None,
-                });
-                let state = AppState::new();
-                state.tool_output_mode.set(mode);
-                let container = make_container();
-                let mount_state = state.clone();
-                let mounted_entry = entry.clone();
-                let handle = mount_to(container.clone(), move || {
-                    provide_context(mount_state);
-                    let agent_ref = Signal::derive(|| Some(chat_agent_ref()));
-                    view! { <StreamingToolCardView agent_ref=agent_ref entry=mounted_entry /> }
-                });
-                next_tick().await;
-                next_tick().await;
-                let pending = container
-                    .query_selector("details")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlDetailsElement>()
-                    .unwrap();
-                if !pending.open() {
-                    pending
-                        .query_selector("summary")
-                        .unwrap()
-                        .unwrap()
-                        .dyn_into::<HtmlElement>()
-                        .unwrap()
-                        .click();
+                        request: ToolRequest {
+                            tool_call_id: "native-content".to_owned(),
+                            tool_name: "catalog_preview".to_owned(),
+                            tool_type: request.clone(),
+                        },
+                        result: None,
+                    });
+                    let state = AppState::new();
+                    state.chat_appearance.set(appearance);
+                    state.tool_output_mode.set(mode);
+                    let container = make_container();
+                    let mount_state = state.clone();
+                    let mounted_entry = entry.clone();
+                    let handle = mount_to(container.clone(), move || {
+                        provide_context(mount_state);
+                        let agent_ref = Signal::derive(|| Some(chat_agent_ref()));
+                        view! { <StreamingToolCardView agent_ref=agent_ref entry=mounted_entry /> }
+                    });
                     next_tick().await;
-                }
-                let assert_parameters = || {
-                    let parameters = container.query_selector(".tool-raw-args").unwrap();
-                    match expected_parameters
-                        .as_ref()
-                        .filter(|_| mode != ToolOutputMode::Summary)
-                    {
-                        Some(expected) => {
-                            let parameters =
-                                parameters.expect("invocation parameters remain visible");
-                            assert_eq!(
-                                parameters.text_content().as_deref(),
-                                Some(expected.as_str())
-                            );
-                            assert!(parameters.get_bounding_client_rect().height() > 0.0);
+                    next_tick().await;
+                    let pending = container
+                        .query_selector("details")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlDetailsElement>()
+                        .unwrap();
+                    if !pending.open() {
+                        let toggled = js_sys::Function::new_with_args(
+                        "details",
+                        "return new Promise(resolve => details.addEventListener('toggle', resolve, {once: true}));",
+                    ).call1(&wasm_bindgen::JsValue::NULL, &pending).unwrap();
+                        pending
+                            .query_selector("summary")
+                            .unwrap()
+                            .unwrap()
+                            .dyn_into::<HtmlElement>()
+                            .unwrap()
+                            .click();
+                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(toggled))
+                            .await
+                            .unwrap();
+                        next_tick().await;
+                    }
+                    assert!(
+                        pending.open(),
+                        "the pending disclosure is explicitly open before completion"
+                    );
+                    let assert_parameters = || {
+                        let parameters = container.query_selector(".tool-raw-args").unwrap();
+                        match expected_parameters
+                            .as_ref()
+                            .filter(|_| mode != ToolOutputMode::Summary)
+                        {
+                            Some(expected) => {
+                                let parameters =
+                                    parameters.expect("invocation parameters remain visible");
+                                assert_eq!(
+                                    parameters.text_content().as_deref(),
+                                    Some(expected.as_str())
+                                );
+                                assert!(parameters.get_bounding_client_rect().height() > 0.0);
+                            }
+                            None => assert!(parameters.is_none()),
                         }
-                        None => assert!(parameters.is_none()),
-                    }
-                };
-                assert_eq!(tool_header_status(&container), "Running…");
-                assert_parameters();
-                entry.update(|entry| entry.result = Some(completion));
-                next_tick().await;
-                next_tick().await;
-                assert_eq!(
-                    tool_header_status(&container),
-                    if failed { "Failed" } else { "Done" }
-                );
-                assert_eq!(count(&container, ".tool-typed-mismatch"), 0);
-                let disclosure = container
-                    .query_selector("details")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlDetailsElement>()
-                    .unwrap();
-                assert_eq!(disclosure.open(), mode == ToolOutputMode::Full);
-                if !disclosure.open() {
-                    disclosure
-                        .query_selector("summary")
+                    };
+                    assert_eq!(tool_header_status(&container), "Running…");
+                    assert_parameters();
+                    entry.update(|entry| entry.result = Some(completion));
+                    next_tick().await;
+                    next_tick().await;
+                    assert_eq!(
+                        tool_header_status(&container),
+                        if failed { "Failed" } else { "Done" }
+                    );
+                    assert_eq!(count(&container, ".tool-typed-mismatch"), 0);
+                    let disclosure = container
+                        .query_selector("details")
                         .unwrap()
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlDetailsElement>()
+                        .unwrap();
+                    if appearance == crate::appearance::ChatAppearance::Current {
+                        assert_eq!(disclosure.open(), mode == ToolOutputMode::Full);
+                    } else {
+                        assert!(disclosure.open(), "Ink retains the opened pending card");
+                    }
+                    if !disclosure.open() {
+                        disclosure
+                            .query_selector("summary")
+                            .unwrap()
+                            .unwrap()
+                            .dyn_into::<HtmlElement>()
+                            .unwrap()
+                            .click();
+                        next_tick().await;
+                    }
+                    assert!(disclosure.open());
+                    assert_parameters();
+                    let output = container
+                        .query_selector(".tool-native-content")
+                        .unwrap()
+                        .expect("typed native output is not discarded by request dispatch");
+                    assert_eq!(
+                        output.text_content().unwrap(),
+                        if failed {
+                            format!("{failure_message}{failure_details}{native_text}")
+                        } else {
+                            native_text.to_owned()
+                        }
+                    );
+                    let blocks = output.query_selector_all("pre").unwrap();
+                    assert_eq!(blocks.length(), if failed { 3 } else { 1 });
+                    let text_block = blocks
+                        .item(blocks.length() - 1)
+                        .unwrap()
+                        .dyn_into::<web_sys::Element>()
+                        .unwrap();
+                    assert_eq!(text_block.text_content().unwrap(), native_text);
+                    assert!(text_block.get_bounding_client_rect().height() > 0.0);
+                    let previews = output.query_selector_all("img").unwrap();
+                    assert_eq!(previews.length(), 2);
+                    for (index, expected) in
+                        [[255, 0, 0, 255], [0, 0, 255, 255]].into_iter().enumerate()
+                    {
+                        let image = previews
+                            .item(index as u32)
+                            .unwrap()
+                            .dyn_into::<web_sys::HtmlImageElement>()
+                            .unwrap();
+                        assert_rendered_pixel(&image, expected).await;
+                        let rect = image.get_bounding_client_rect();
+                        assert!(rect.width() > 0.0 && rect.width() <= 200.0);
+                        assert!(rect.height() > 0.0 && rect.height() <= 200.0);
+                        assert!(text_block.get_bounding_client_rect().bottom() <= rect.top());
+                    }
+                    let buttons = output
+                        .query_selector_all("button[aria-label='Open image full size']")
+                        .unwrap();
+                    buttons
+                        .item(1)
                         .unwrap()
                         .dyn_into::<HtmlElement>()
                         .unwrap()
                         .click();
                     next_tick().await;
-                }
-                assert!(disclosure.open());
-                assert_parameters();
-                let output = container
-                    .query_selector(".tool-native-content")
-                    .unwrap()
-                    .expect("typed native output is not discarded by request dispatch");
-                assert_eq!(
-                    output.text_content().unwrap(),
-                    if failed {
-                        format!("{failure_message}{failure_details}{native_text}")
-                    } else {
-                        native_text.to_owned()
-                    }
-                );
-                let blocks = output.query_selector_all("pre").unwrap();
-                assert_eq!(blocks.length(), if failed { 3 } else { 1 });
-                let text_block = blocks
-                    .item(blocks.length() - 1)
-                    .unwrap()
-                    .dyn_into::<web_sys::Element>()
-                    .unwrap();
-                assert_eq!(text_block.text_content().unwrap(), native_text);
-                assert!(text_block.get_bounding_client_rect().height() > 0.0);
-                let previews = output.query_selector_all("img").unwrap();
-                assert_eq!(previews.length(), 2);
-                for (index, expected) in
-                    [[255, 0, 0, 255], [0, 0, 255, 255]].into_iter().enumerate()
-                {
-                    let image = previews
-                        .item(index as u32)
+                    let viewer = document
+                        .query_selector("[role='dialog'][aria-label='Image viewer']")
+                        .unwrap()
+                        .unwrap();
+                    let image = viewer
+                        .query_selector("img")
+                        .unwrap()
                         .unwrap()
                         .dyn_into::<web_sys::HtmlImageElement>()
                         .unwrap();
-                    assert_rendered_pixel(&image, expected).await;
-                    let rect = image.get_bounding_client_rect();
-                    assert!(rect.width() > 0.0 && rect.width() <= 200.0);
-                    assert!(rect.height() > 0.0 && rect.height() <= 200.0);
-                    assert!(text_block.get_bounding_client_rect().bottom() <= rect.top());
-                }
-                let buttons = output
-                    .query_selector_all("button[aria-label='Open image full size']")
-                    .unwrap();
-                buttons
-                    .item(1)
-                    .unwrap()
-                    .dyn_into::<HtmlElement>()
-                    .unwrap()
-                    .click();
-                next_tick().await;
-                let viewer = document
-                    .query_selector("[role='dialog'][aria-label='Image viewer']")
-                    .unwrap()
-                    .unwrap();
-                let image = viewer
-                    .query_selector("img")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlImageElement>()
-                    .unwrap();
-                assert_rendered_pixel(&image, [0, 0, 255, 255]).await;
-                viewer
-                    .query_selector("button[aria-label='Previous image']")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<HtmlElement>()
-                    .unwrap()
-                    .click();
-                next_tick().await;
-                let image = viewer
-                    .query_selector("img")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlImageElement>()
-                    .unwrap();
-                assert_rendered_pixel(&image, [255, 0, 0, 255]).await;
-                viewer
-                    .query_selector("button[aria-label='Close image viewer']")
-                    .unwrap()
-                    .unwrap()
-                    .dyn_into::<HtmlElement>()
-                    .unwrap()
-                    .click();
-                next_tick().await;
-                assert!(
-                    document
-                        .query_selector("[role='dialog'][aria-label='Image viewer']")
+                    assert_rendered_pixel(&image, [0, 0, 255, 255]).await;
+                    viewer
+                        .query_selector("button[aria-label='Previous image']")
                         .unwrap()
-                        .is_none()
-                );
-                assert_eq!(
-                    tool_header_status(&container),
-                    if failed { "Failed" } else { "Done" }
-                );
-                drop(handle);
-                container.remove();
+                        .unwrap()
+                        .dyn_into::<HtmlElement>()
+                        .unwrap()
+                        .click();
+                    next_tick().await;
+                    let image = viewer
+                        .query_selector("img")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlImageElement>()
+                        .unwrap();
+                    assert_rendered_pixel(&image, [255, 0, 0, 255]).await;
+                    viewer
+                        .query_selector("button[aria-label='Close image viewer']")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<HtmlElement>()
+                        .unwrap()
+                        .click();
+                    next_tick().await;
+                    assert!(
+                        document
+                            .query_selector("[role='dialog'][aria-label='Image viewer']")
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        tool_header_status(&container),
+                        if failed { "Failed" } else { "Done" }
+                    );
+                    drop(handle);
+                    container.remove();
+                }
             }
         }
         style.remove();
@@ -2110,6 +2350,7 @@ mod live_card_wasm_tests {
     /// header already shows.
     fn running_command_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "Bash".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_run".to_owned(),
@@ -2167,6 +2408,24 @@ mod live_card_wasm_tests {
             !card_details(&container).open(),
             "switching back to Compact collapses it again"
         );
+        for appearance in [
+            crate::appearance::ChatAppearance::Current,
+            crate::appearance::ChatAppearance::Ink,
+        ] {
+            state.chat_appearance.set(appearance);
+            set_card_open(&container, true);
+            next_tick().await;
+            assert!(card_details(&container).open());
+            state.tool_output_mode.set(ToolOutputMode::Full);
+            next_tick().await;
+            state.tool_output_mode.set(ToolOutputMode::Compact);
+            next_tick().await;
+            assert_eq!(
+                card_details(&container).open(),
+                appearance == crate::appearance::ChatAppearance::Ink,
+                "only Ink restores the explicit Compact choice after mode changes"
+            );
+        }
     }
 
     /// Regression lock: the disclosure used to be re-asserted from live
@@ -2223,6 +2482,7 @@ mod live_card_wasm_tests {
     #[wasm_bindgen_test]
     async fn approval_cards_open_regardless_of_mode() {
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
@@ -2272,6 +2532,7 @@ mod live_card_wasm_tests {
     async fn background_command_header_uses_actual_command_not_summary() {
         let tool_call_id = "tool-background";
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "Bash".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
@@ -3053,6 +3314,7 @@ mod live_card_wasm_tests {
 
     fn typed_send_entry(message: &str, outcome: Option<ToolExecutionOutcome>) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send".to_owned(),
@@ -3072,6 +3334,7 @@ mod live_card_wasm_tests {
 
     fn typed_await_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "tyde_await_agents".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_agent_control".to_owned(),
@@ -3249,6 +3512,7 @@ mod live_card_wasm_tests {
         normalization_failure: ToolExecutionNormalizationFailure,
     ) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
@@ -3273,6 +3537,7 @@ mod live_card_wasm_tests {
     async fn failed_question_with_unicode_error_remains_readable() {
         let message = "é".repeat(100);
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "unicode-question-error".to_owned(),
@@ -3308,48 +3573,78 @@ mod live_card_wasm_tests {
 
     #[wasm_bindgen_test]
     async fn malformed_drift_forces_open_failed_accessible_shell() {
-        let (container, _state) = mount_card(
-            malformed_entry(
+        for appearance in [
+            crate::appearance::ChatAppearance::Current,
+            crate::appearance::ChatAppearance::Ink,
+        ] {
+            let mut pending = malformed_entry(
                 "canonical data could not be normalized",
                 None,
                 ToolExecutionNormalizationFailure::CanonicalRequest,
-            ),
-            None,
-        );
-        next_tick().await;
+            );
+            let failure = pending.result.take();
+            let entry = ArcRwSignal::new(pending);
+            let state = AppState::new();
+            state.chat_appearance.set(appearance);
+            state.tool_output_mode.set(ToolOutputMode::Summary);
+            let container = make_container();
+            let mounted_entry = entry.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(state);
+                let agent_ref = Signal::derive(|| Some(chat_agent_ref()));
+                view! { <StreamingToolCardView agent_ref=agent_ref entry=mounted_entry /> }
+            });
+            next_tick().await;
+            set_card_open(&container, true);
+            next_tick().await;
+            set_card_open(&container, false);
+            next_tick().await;
+            assert!(
+                !card_details(&container).open(),
+                "user collapsed the running card"
+            );
+            entry.update(|entry| entry.result = failure);
+            next_tick().await;
 
-        let outer = container
-            .query_selector("details.tool-card")
-            .unwrap()
-            .expect("outer tool disclosure")
-            .dyn_into::<web_sys::HtmlDetailsElement>()
-            .expect("details element");
-        assert!(outer.open(), "malformed drift is visibly open");
-        assert_eq!(tool_header_status(&container), "Failed");
-        assert_eq!(
-            outer.get_attribute("aria-label").as_deref(),
-            Some("Tool failed: canonical data could not be normalized")
-        );
-        let alert = container
-            .query_selector(".tool-typed-mismatch")
-            .unwrap()
-            .expect("normalization alert");
-        assert_eq!(alert.get_attribute("role").as_deref(), Some("alert"));
+            let outer = container
+                .query_selector("details.tool-card")
+                .unwrap()
+                .expect("outer tool disclosure")
+                .dyn_into::<web_sys::HtmlDetailsElement>()
+                .expect("details element");
+            assert!(outer.open(), "malformed drift is visibly open");
+            assert_eq!(tool_header_status(&container), "Failed");
+            assert_eq!(
+                outer.get_attribute("aria-label").as_deref(),
+                Some("Tool failed: canonical data could not be normalized")
+            );
+            let alert = container
+                .query_selector(".tool-typed-mismatch")
+                .unwrap()
+                .expect("normalization alert");
+            assert_eq!(alert.get_attribute("role").as_deref(), Some("alert"));
+            assert!(
+                alert.get_bounding_client_rect().height() > 0.0,
+                "the normalization diagnostic is visibly laid out"
+            );
 
-        let nested = container
-            .query_selector("details.tool-malformed-payload")
-            .unwrap()
-            .expect("sanitized nested disclosure")
-            .dyn_into::<web_sys::HtmlDetailsElement>()
-            .expect("details element");
-        assert!(!nested.open(), "only the sanitized payload stays closed");
+            let nested = container
+                .query_selector("details.tool-malformed-payload")
+                .unwrap()
+                .expect("sanitized nested disclosure")
+                .dyn_into::<web_sys::HtmlDetailsElement>()
+                .expect("details element");
+            assert!(!nested.open(), "only the sanitized payload stays closed");
 
-        outer.set_open(false);
-        outer
-            .dispatch_event(&web_sys::Event::new("toggle").unwrap())
-            .unwrap();
-        next_tick().await;
-        assert!(outer.open(), "malformed outer detail cannot be collapsed");
+            outer.set_open(false);
+            outer
+                .dispatch_event(&web_sys::Event::new("toggle").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert!(outer.open(), "malformed outer detail cannot be collapsed");
+            drop(handle);
+            container.remove();
+        }
     }
 
     #[wasm_bindgen_test]

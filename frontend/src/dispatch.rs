@@ -5873,6 +5873,7 @@ impl HistoryReplay {
                     })
                     .unwrap_or_else(|| fallback_tool_name(&request));
                 let tool_entry = ToolRequestEntry {
+                    presentation: Default::default(),
                     tool_name: tool_name.clone(),
                     request,
                     result: None,
@@ -6258,6 +6259,7 @@ pub fn apply_chat_event_from(
                 tool_name
             );
             let tool_entry = ToolRequestEntry {
+                presentation: Default::default(),
                 tool_name: tool_name.clone(),
                 request,
                 result: None,

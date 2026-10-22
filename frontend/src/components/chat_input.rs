@@ -8,7 +8,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::actions::spawn_new_chat;
 use crate::components::inflight_tray::InflightTray;
-use crate::components::session_settings::SessionSettingsBar;
+use crate::components::session_settings::session_settings_views;
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, DefaultSendAction,
@@ -1750,6 +1750,65 @@ pub fn ChatInput(
         }
     });
 
+    // Ink can rewrap an unchanged draft. Restore Current geometry once when
+    // leaving Ink, without changing Current's existing input-driven sizing.
+    type ComposerSizeObserver = Option<(
+        web_sys::ResizeObserver,
+        Closure<dyn FnMut(JsValue, JsValue)>,
+    )>;
+    let size_observer: StoredValue<ComposerSizeObserver, LocalStorage> =
+        StoredValue::new_local(None);
+    let sizing_error = composer.error.clone();
+    let sizing_appearance = state.chat_appearance;
+    Effect::new(move |_| {
+        let appearance = sizing_appearance.get();
+        let (Some(textarea), Some(measure)) = (textarea_ref.get(), textarea_measure_ref.get())
+        else {
+            return;
+        };
+        let textarea: web_sys::HtmlTextAreaElement = (*textarea).clone().unchecked_into();
+        let measure: web_sys::HtmlElement = (*measure).clone().unchecked_into();
+        if appearance == crate::appearance::ChatAppearance::Current {
+            size_observer.update_value(|slot| {
+                if let Some((observer, _callback)) = slot.take() {
+                    observer.disconnect();
+                    resize_composer(&textarea, &measure);
+                }
+            });
+            return;
+        }
+        if size_observer.with_value(|observer| observer.is_some()) {
+            return;
+        }
+        let observed_textarea = textarea.clone();
+        let observed_measure = measure.clone();
+        let callback = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
+            if sizing_appearance.get_untracked() == crate::appearance::ChatAppearance::Ink {
+                resize_composer(&textarea, &measure);
+            }
+        });
+        match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => {
+                observer.observe(observed_textarea.unchecked_ref());
+                observer.observe(observed_measure.unchecked_ref());
+                size_observer.set_value(Some((observer, callback)));
+            }
+            Err(error) => {
+                log::error!("Cannot observe composer sizing: {error:?}");
+                sizing_error.set(Some(
+                    "Composer sizing is unavailable. Reopen this chat.".to_owned(),
+                ));
+            }
+        }
+    });
+    on_cleanup(move || {
+        size_observer.update_value(|slot| {
+            if let Some((observer, _callback)) = slot.take() {
+                observer.disconnect();
+            }
+        });
+    });
+
     let overlay_support_state = state.clone();
     let overlay_support_composer = composer.clone();
     let overlay_is_unsupported = Memo::new(move |_| {
@@ -1799,6 +1858,9 @@ pub fn ChatInput(
     let cancel_usage =
         Callback::new(move |()| interrupt_target_turn(&cancel_usage_state, agent_ref));
     let notice_state = state.clone();
+    let chat_appearance = state.chat_appearance;
+    let (inline_session_settings, session_settings_footer) =
+        session_settings_views(agent_ref, composer.clone());
 
     view! {
         <div class="chat-composer">
@@ -1979,6 +2041,19 @@ pub fn ChatInput(
                         }}
                     </div>
                 </Show>
+                <Show when=move || can_attach.get() && chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                    <button
+                        class="ink-composer-attach"
+                        type="button"
+                        aria-label="Attach image"
+                        title="Attach image"
+                        on:click=on_attach_image
+                    >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                            <path d="M8 12.5 14.5 6a3 3 0 0 1 4.25 4.25l-8.5 8.5a5 5 0 0 1-7.07-7.07l9.2-9.2M6 14.5l8.5-8.5" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                    </button>
+                </Show>
                 <textarea
                     class="chat-textarea"
                     placeholder=move || {
@@ -2005,6 +2080,7 @@ pub fn ChatInput(
                     node_ref=textarea_measure_ref
                 ></div>
                 <crate::voice::VoiceComposerButton agent_ref=agent_ref composer=composer.clone() />
+                {inline_session_settings}
                 <div
                     class="chat-send-split"
                     role="group"
@@ -2075,7 +2151,7 @@ pub fn ChatInput(
                             else { "Send message (Enter)" }
                         }
                     >
-                        <span>{move || {
+                        <span class="chat-send-label">{move || {
                             if is_terminated.get() {
                                 return "Terminated";
                             }
@@ -2089,6 +2165,7 @@ pub fn ChatInput(
                             else if default_send_action.get().is_none() { "Choose send action" }
                             else { "Send" }
                         }}</span>
+
                     </button>
                     <button
                         type="button"
@@ -2212,7 +2289,7 @@ pub fn ChatInput(
             </div>
             </div>
         </div>
-            <SessionSettingsBar agent_ref=agent_ref composer=composer.clone() />
+            {session_settings_footer}
         </div>
     }
 }

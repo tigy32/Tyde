@@ -341,6 +341,7 @@ mod wasm_tests {
 
     fn completed_entry(success: bool) -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
@@ -581,6 +582,7 @@ mod wasm_tests {
 
     fn pending_entry() -> ToolRequestEntry {
         ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
@@ -1005,6 +1007,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn expired_plan_renders_as_no_longer_answerable() {
         let entry = ToolRequestEntry {
+            presentation: Default::default(),
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),

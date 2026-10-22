@@ -446,19 +446,39 @@ pub fn SessionSettingsControls(
     }
 }
 
-#[component]
-pub fn SessionSettingsBar(
-    /// Live-agent identity of the chat this bar belongs to; `None` for a draft.
-    /// Explicit rather than derived from `active_agent` because every chat pane
-    /// renders its own bar, and the unfocused pane must show — and edit — its
-    /// own chat's settings.
+/// Bind settings to this pane's agent/composer, not the globally focused agent.
+pub(crate) fn session_settings_views(
     agent_ref: Signal<Option<ActiveAgentRef>>,
-    /// The same chat's composer, holding the draft session settings shown
-    /// before an agent exists.
     composer: ComposerHandle,
-) -> impl IntoView {
+) -> (AnyView, AnyView) {
     let state = expect_context::<AppState>();
+    let chat_appearance = state.chat_appearance;
     let expanded = RwSignal::new(false);
+    let inline_trigger = NodeRef::<leptos::html::Button>::new();
+    let inline_panel = NodeRef::<leptos::html::Div>::new();
+    let close_inline = Callback::new(move |()| {
+        expanded.set(false);
+        if let Some(trigger) = inline_trigger.get_untracked()
+            && let Err(error) = trigger.focus()
+        {
+            log::error!("Cannot return focus to session settings: {error:?}");
+        }
+    });
+    Effect::new(move |focused: Option<bool>| {
+        if !expanded.get() || chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
+            return false;
+        }
+        if focused == Some(true) {
+            return true;
+        }
+        let Some(panel) = inline_panel.get() else {
+            return false;
+        };
+        if let Err(error) = panel.focus() {
+            log::error!("Cannot focus session settings: {error:?}");
+        }
+        true
+    });
 
     // Memos, not plain closures: the outer view closure below must depend
     // only on these deduped semantic values. `current_binding` reads the raw
@@ -679,7 +699,35 @@ pub fn SessionSettingsBar(
         })
     }
 
-    view! {
+    let inline = view! {
+        <div class="ink-session-slot">
+            <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+            {move || match schema_status.get() {
+                Some((backend, Some(SessionSchemaEntry::Ready { schema }))) if !schema.fields.is_empty() => {
+                    let label = header_label(backend);
+                    view! {
+                        <button
+                            type="button"
+                            class="ink-session-toggle"
+                            node_ref=inline_trigger
+                            aria-label="Model and session settings"
+                            title=label
+                            aria-haspopup="dialog"
+                            aria-expanded=move || expanded.get().to_string()
+                            on:click=move |_| expanded.update(|value| *value = !*value)
+                        >
+                            <span>{crate::components::agents_panel::backend_label(backend)}</span>
+                            <span aria-hidden="true">"⌄"</span>
+                        </button>
+                    }.into_any()
+                }
+                _ => ().into_any(),
+            }}
+            </Show>
+        </div>
+    }.into_any();
+
+    let footer = view! {
         {move || {
             let has_rollup = has_task_rollup.get();
             match schema_status.get() {
@@ -702,11 +750,33 @@ pub fn SessionSettingsBar(
                                 <TaskUsageBadge rollup=task_rollup binding=current_binding />
                             </div>
                             <Show when=move || expanded.get()>
-                                <SessionSettingsControls
-                                    schema=schema.clone()
-                                    values=current_values
-                                    on_change=on_change
-                                />
+                                <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                                    <div class="ink-session-backdrop" on:click=move |_| close_inline.run(())></div>
+                                </Show>
+                                <div class="session-settings-panel"
+                                    node_ref=inline_panel
+                                    role=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("dialog")
+                                    aria-label=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("Model and session settings")
+                                    tabindex=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("-1")
+                                    on:keydown=move |event: leptos::ev::KeyboardEvent| {
+                                        if event.key() == "Escape" && chat_appearance.get() == crate::appearance::ChatAppearance::Ink {
+                                            event.prevent_default();
+                                            close_inline.run(());
+                                        }
+                                    }
+                                >
+                                    <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                                    <div class="ink-session-panel-heading">
+                                        <span>"Model and session settings"</span>
+                                        <button type="button" aria-label="Close session settings" on:click=move |_| close_inline.run(())>"×"</button>
+                                    </div>
+                                    </Show>
+                                    <SessionSettingsControls
+                                        schema=schema.clone()
+                                        values=current_values
+                                        on_change=on_change
+                                    />
+                                </div>
                             </Show>
                         </div>
                     }.into_any())
@@ -735,7 +805,8 @@ pub fn SessionSettingsBar(
                 None => badge_only_row(has_rollup, task_rollup, current_binding),
             }
         }}
-    }
+    }.into_any();
+    (inline, footer)
 }
 
 pub(super) fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'static str {
@@ -881,6 +952,7 @@ fn TaskUsageBadge(
     rollup: Memo<Option<TaskTokenUsagePayload>>,
     binding: Memo<Option<(String, BackendKind)>>,
 ) -> impl IntoView {
+    let chat_appearance = expect_context::<AppState>().chat_appearance;
     let open = RwSignal::new(false);
     let wrapper_ref: NodeRef<leptos::html::Span> = NodeRef::new();
     let toggle_ref: NodeRef<leptos::html::Button> = NodeRef::new();
@@ -922,6 +994,7 @@ fn TaskUsageBadge(
             .map(|payload| format!("session-task-popover-{}", payload.root_agent_id))
     });
     view! {
+        <Show when=move || chat_appearance.get() != crate::appearance::ChatAppearance::Ink || rollup.with(|payload| payload.is_some())>
         <span class="session-task-usage" node_ref=wrapper_ref>
             <button class="session-task-toggle" node_ref=toggle_ref aria-haspopup="dialog"
                 aria-expanded=move || open.get().to_string() aria-controls=move || popover_id.get()
@@ -942,6 +1015,7 @@ fn TaskUsageBadge(
                 <div id=move || popover_id.get()><TaskUsagePopup rollup=rollup binding=binding on_close=close /></div>
             </Show>
         </span>
+        </Show>
     }
 }
 
@@ -1750,7 +1824,7 @@ mod wasm_tests {
             let agent_ref = Signal::derive(move || agent_state.active_agent.get());
             let composer = state.composer_untracked();
             provide_context(state);
-            view! { <SessionSettingsBar agent_ref=agent_ref composer=composer /> }
+            session_settings_views(agent_ref, composer).1
         })
     }
 
@@ -2930,7 +3004,7 @@ mod wasm_tests {
                     agent_id: AgentId("root".to_owned()),
                 })
             });
-            view! { <SessionSettingsBar agent_ref=agent_ref composer=composer /> }
+            session_settings_views(agent_ref, composer).1
         });
         next_tick().await;
         let badge = query(&container, ".session-task-toggle").unwrap();

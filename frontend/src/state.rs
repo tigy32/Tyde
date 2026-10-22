@@ -2233,7 +2233,23 @@ pub struct ChatMessageEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct ToolCardPresentation {
+    pub disclosure: ArcRwSignal<(Option<ToolOutputMode>, Option<bool>)>,
+    pub change_group_expanded: ArcRwSignal<bool>,
+}
+
+impl Default for ToolCardPresentation {
+    fn default() -> Self {
+        Self {
+            disclosure: ArcRwSignal::new((None, None)),
+            change_group_expanded: ArcRwSignal::new(true),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ToolRequestEntry {
+    pub presentation: ToolCardPresentation,
     pub tool_name: String,
     pub request: ToolRequest,
     pub result: Option<ToolExecutionCompletedData>,

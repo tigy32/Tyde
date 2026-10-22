@@ -10288,6 +10288,7 @@ mod wasm_tests {
             "Catppuccin Mocha"
         ));
         state.syntax_theme.set("Catppuccin Mocha".to_owned());
+        root.remove_attribute("data-appearance-theme").unwrap();
         apply_theme("light");
         state.theme.set("light".to_owned());
         let active = ActiveAgentRef {
@@ -10325,6 +10326,36 @@ mod wasm_tests {
             activity_summary: Default::default(),
             review_recipient: false,
         }]);
+        state.agent_session_schemas.update(|schemas| {
+            schemas.insert(
+                active.agent_id.clone(),
+                Some(protocol::SessionSettingsSchema {
+                    backend_kind: BackendKind::Codex,
+                    model_resolutions: Default::default(),
+                    fields: vec![protocol::SessionSettingField {
+                        key: "model".to_owned(),
+                        label: "Model".to_owned(),
+                        description: None,
+                        use_slider: false,
+                        select_options_by_setting: None,
+                        field_type: protocol::SessionSettingFieldType::Select {
+                            options: vec![
+                                protocol::SelectOption {
+                                    value: "demo".to_owned(),
+                                    label: "Demo model".to_owned(),
+                                },
+                                protocol::SelectOption {
+                                    value: "other".to_owned(),
+                                    label: "Other model".to_owned(),
+                                },
+                            ],
+                            default: Some("demo".to_owned()),
+                            nullable: false,
+                        },
+                    }],
+                }),
+            );
+        });
         let tab_id = state
             .open_tab(
                 TabContent::chat_with_agent(active.clone()),
@@ -10370,7 +10401,79 @@ mod wasm_tests {
             agent: "Codex".to_owned(),
             model: None,
         }));
+        for (id, path) in [
+            ("ink-file-a", "src/picker.rs"),
+            ("ink-file-b", "src/state.rs"),
+        ] {
+            emit(ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: id.to_owned(),
+                tool_name: "Update file".to_owned(),
+                tool_type: protocol::ToolRequestType::ModifyFile {
+                    file_path: path.to_owned(),
+                    before: "old\n".to_owned(),
+                    after: "new\n".to_owned(),
+                },
+            }));
+            if id == "ink-file-a" {
+                emit(ChatEvent::ToolExecutionCompleted(
+                    protocol::ToolExecutionCompletedData {
+                        tool_call_id: id.to_owned(),
+                        outcome: protocol::ToolExecutionOutcome::Succeeded {
+                            result: protocol::ToolExecutionResult::ModifyFile {
+                                lines_added: 1,
+                                lines_removed: 1,
+                            },
+                        },
+                    },
+                ));
+            }
+        }
+        emit(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "ink-command".to_owned(),
+            tool_name: "Run command".to_owned(),
+            tool_type: protocol::ToolRequestType::RunCommand {
+                command: "printf 'Readable output'".to_owned(),
+                working_directory: "/workspace".to_owned(),
+            },
+        }));
+        emit(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "ink-command".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout: "Readable output".to_owned(),
+                        stderr: String::new(),
+                    },
+                },
+            },
+        ));
         next_tick().await;
+        let disclosure: web_sys::HtmlDetailsElement = chat
+            .query_selector("details.tool-card[data-tool-kind=command]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        disclosure.set_open(true);
+        disclosure
+            .dispatch_event(&web_sys::Event::new("toggle").unwrap())
+            .unwrap();
+        next_tick().await;
+        let current_command = disclosure
+            .query_selector(".tool-result-command")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            window
+                .get_computed_style(&current_command)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap(),
+            "rgb(250, 250, 250)",
+            "Current light must theme the canonical command surface too"
+        );
         let picker: HtmlSelectElement = settings
             .query_selector("select[aria-label='Chat presentation']")
             .unwrap()
@@ -10450,13 +10553,22 @@ mod wasm_tests {
             .unwrap()
             .get_property_value("background-color")
             .unwrap();
+        let current_draft_height = input.client_height();
         let commands_before = calls.length();
-        for id in ["ink", "current", "ink"] {
+        let painted_layout = js_sys::Function::new_no_args(
+            "return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));",
+        );
+        for (iteration, id) in ["ink", "current", "ink"].into_iter().enumerate() {
             picker.set_value(id);
             picker
                 .dispatch_event(&web_sys::Event::new("change").unwrap())
                 .unwrap();
             next_tick().await;
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                painted_layout.call0(&wasm_bindgen::JsValue::NULL).unwrap(),
+            ))
+            .await
+            .unwrap();
             let current_input = chat.query_selector("textarea").unwrap().unwrap();
             assert!(
                 input.is_same_node(Some(&current_input)),
@@ -10474,11 +10586,41 @@ mod wasm_tests {
                 input.value() == draft,
                 "the unsent wrapping draft must survive"
             );
-            assert_eq!(
-                input.client_width(),
-                input_width,
-                "Ink must retain the canonical composer text geometry"
+            // Native evidence: the inline Ink controls reduce text width;
+            // preserving the old width would reject the approved composition.
+            let draft_rect = input.get_bounding_client_rect();
+            assert!(
+                input.client_width() > 0,
+                "the retained draft has usable space"
             );
+            let controls = chat
+                .query_selector_all(".ink-session-toggle, .chat-send-split")
+                .unwrap();
+            for index in 0..controls.length() {
+                let control: web_sys::Element = controls.item(index).unwrap().dyn_into().unwrap();
+                let rect = control.get_bounding_client_rect();
+                if rect.width() > 0.0
+                    && rect.top() < draft_rect.bottom()
+                    && rect.bottom() > draft_rect.top()
+                {
+                    assert!(
+                        draft_rect.right() <= rect.left(),
+                        "composer controls must not cover the retained draft"
+                    );
+                }
+            }
+            if id == "current" {
+                assert_eq!(
+                    input.client_height(),
+                    current_draft_height,
+                    "returning to Current restores its original draft geometry"
+                );
+                assert_eq!(
+                    input.client_width(),
+                    input_width,
+                    "returning to Current restores its text geometry"
+                );
+            }
             let overflow = window
                 .get_computed_style(&input)
                 .unwrap()
@@ -10504,6 +10646,111 @@ mod wasm_tests {
                 .get_property_value("background-color")
                 .unwrap();
             if id == "ink" {
+                let heading: web_sys::HtmlElement = chat
+                    .query_selector(".file-change-heading")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into()
+                    .unwrap();
+                if iteration == 0 {
+                    assert!(heading.text_content().unwrap().contains("1 file changed"));
+                    let first: web_sys::HtmlDetailsElement = heading
+                        .parent_element()
+                        .unwrap()
+                        .query_selector("details")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into()
+                        .unwrap();
+                    first.set_open(true);
+                    first
+                        .dispatch_event(&web_sys::Event::new("toggle").unwrap())
+                        .unwrap();
+                    heading.click();
+                    let pending = chat.query_selector(".file-activity-row").unwrap().unwrap();
+                    assert!(
+                        pending.get_bounding_client_rect().height() > 0.0,
+                        "folding completed changes must not hide a pending edit"
+                    );
+                    emit(ChatEvent::ToolExecutionCompleted(
+                        protocol::ToolExecutionCompletedData {
+                            tool_call_id: "ink-file-b".to_owned(),
+                            outcome: protocol::ToolExecutionOutcome::Succeeded {
+                                result: protocol::ToolExecutionResult::ModifyFile {
+                                    lines_added: 1,
+                                    lines_removed: 1,
+                                },
+                            },
+                        },
+                    ));
+                    next_tick().await;
+                    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                        painted_layout.call0(&wasm_bindgen::JsValue::NULL).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                    let current_heading = chat
+                        .query_selector(".file-change-heading")
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        heading.is_same_node(Some(&current_heading)),
+                        "completing an adjacent edit must retain the group"
+                    );
+                    let current_first = current_heading
+                        .parent_element()
+                        .unwrap()
+                        .query_selector("details")
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        first.is_same_node(Some(&current_first)) && first.open(),
+                        "an already opened diff must stay mounted and open"
+                    );
+                    assert_eq!(
+                        heading.get_attribute("aria-expanded").as_deref(),
+                        Some("false"),
+                        "new completions must not reopen a collapsed change group"
+                    );
+                    heading.click();
+                }
+                assert!(heading.text_content().unwrap().contains("2 files changed"));
+                let changes = heading.parent_element().unwrap();
+                assert!(changes.text_content().unwrap().contains("src/picker.rs"));
+                assert!(changes.text_content().unwrap().contains("src/state.rs"));
+                assert_eq!(
+                    changes.query_selector_all("details").unwrap().length(),
+                    2,
+                    "only the actual file receipts belong in the change group"
+                );
+                assert!(disclosure.open(), "Ink must keep expanded tool output open");
+                assert!(
+                    disclosure
+                        .text_content()
+                        .unwrap()
+                        .contains("Readable output"),
+                    "the original command output stays readable"
+                );
+                let command = disclosure
+                    .query_selector(".tool-result-command")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    window
+                        .get_computed_style(&command)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("background-color")
+                        .unwrap(),
+                    "rgba(0, 0, 0, 0)",
+                    "Ink command output shares its disclosure surface, not a nested black panel"
+                );
+                let metadata = row.query_selector(".chat-card-footer").unwrap().unwrap();
+                assert!(
+                    metadata.get_bounding_client_rect().bottom()
+                        <= answer.get_bounding_client_rect().top(),
+                    "assistant metadata forms a byline before the continuous answer"
+                );
                 input.focus().unwrap();
                 assert_eq!(
                     window
@@ -10563,12 +10810,171 @@ mod wasm_tests {
             commands_before,
             "presentation changes must not send or cancel work"
         );
+        let session_button: web_sys::HtmlElement = chat
+            .query_selector(".ink-session-toggle")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        session_button.click();
+        next_tick().await;
+        let model: web_sys::HtmlSelectElement = chat
+            .query_selector(".session-setting-select")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            model.value(),
+            "demo",
+            "the inline trigger opens the canonical schema control"
+        );
+        model.set_value("other");
+        model
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        let settings_frame = (commands_before..calls.length())
+            .filter_map(|index| {
+                let call = js_sys::Array::from(&calls.get(index));
+                if call.get(0).as_string().as_deref() != Some("send_host_line") {
+                    return None;
+                }
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.get(1).as_string().unwrap()).unwrap();
+                let frame: serde_json::Value =
+                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                (frame["kind"] == "set_session_settings").then_some(frame)
+            })
+            .next()
+            .expect("the original settings callback must send its typed change");
+        assert_eq!(
+            settings_frame["payload"]["values"]["model"],
+            serde_json::json!({"string": "other"})
+        );
+        let close: web_sys::HtmlElement = chat
+            .query_selector(".ink-session-panel-heading button")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        close.click();
+        next_tick().await;
+        session_button.click();
+        next_tick().await;
+        let dialog = chat
+            .query_selector(".session-settings-panel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dialog.get_attribute("role").as_deref(), Some("dialog"));
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&dialog)),
+            "opening settings moves keyboard focus into its dialog"
+        );
+        input.focus().unwrap();
+        state.agent_session_schemas.update(|schemas| {
+            schemas
+                .get_mut(&active.agent_id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .fields[0]
+                .description = Some("Updated schema description".to_owned());
+        });
+        next_tick().await;
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&input)),
+            "rebuilding an already open settings panel must not steal draft focus"
+        );
+        let dialog = chat
+            .query_selector(".session-settings-panel")
+            .unwrap()
+            .unwrap();
+        let escape = web_sys::KeyboardEventInit::new();
+        escape.set_key("Escape");
+        dialog
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
+                    .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        assert!(
+            chat.query_selector(".session-settings-panel")
+                .unwrap()
+                .is_none()
+        );
+        let current_trigger = chat.query_selector(".ink-session-toggle").unwrap().unwrap();
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&current_trigger)),
+            "Escape returns keyboard focus to the current session trigger after schema replacement"
+        );
         assert!(
             chat.query_selector(".chat-thinking-ring")
                 .unwrap()
                 .is_some(),
             "the authoritative active turn remains active"
         );
+        emit(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "ink-join-anchor".to_owned(),
+            tool_name: "Update file".to_owned(),
+            tool_type: protocol::ToolRequestType::ModifyFile {
+                file_path: "src/joined.rs".to_owned(),
+                before: "old\n".to_owned(),
+                after: "new\n".to_owned(),
+            },
+        }));
+        emit(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "ink-join-anchor".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::ModifyFile {
+                        lines_added: 1,
+                        lines_removed: 1,
+                    },
+                },
+            },
+        ));
+        next_tick().await;
+        let joining_group: web_sys::HtmlElement = chat
+            .query_selector(".ink-file-path[title='src/joined.rs']")
+            .unwrap()
+            .unwrap()
+            .closest(".file-change-group")
+            .unwrap()
+            .unwrap()
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        joining_group.click();
+        emit(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "ink-late-file".to_owned(),
+            tool_name: "Update file".to_owned(),
+            tool_type: protocol::ToolRequestType::ModifyFile {
+                file_path: "src/late.rs".to_owned(),
+                before: "old\n".to_owned(),
+                after: "new\n".to_owned(),
+            },
+        }));
+        next_tick().await;
+        let first_change_group: web_sys::HtmlElement = chat
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        first_change_group.click();
         emit(ChatEvent::StreamEnd(protocol::StreamEndData {
             message: ChatMessage {
                 origin: None,
@@ -10579,7 +10985,38 @@ mod wasm_tests {
                 },
                 content: "Streaming still completes after changing presentation.".to_owned(),
                 reasoning: None,
-                tool_calls: Vec::new(),
+                tool_calls: vec![
+                    protocol::ToolUseData {
+                        tool_call_id: "ink-file-a".to_owned(),
+                        name: "Update file".to_owned(),
+                        arguments: serde_json::json!({"file_path": "src/picker.rs"}),
+                        content_offset: Some(0),
+                    },
+                    protocol::ToolUseData {
+                        tool_call_id: "ink-file-b".to_owned(),
+                        name: "Update file".to_owned(),
+                        arguments: serde_json::json!({"file_path": "src/state.rs"}),
+                        content_offset: Some(54),
+                    },
+                    protocol::ToolUseData {
+                        tool_call_id: "ink-join-anchor".to_owned(),
+                        name: "Update file".to_owned(),
+                        arguments: serde_json::json!({"file_path": "src/joined.rs"}),
+                        content_offset: Some(54),
+                    },
+                    protocol::ToolUseData {
+                        tool_call_id: "ink-late-file".to_owned(),
+                        name: "Update file".to_owned(),
+                        arguments: serde_json::json!({"file_path": "src/late.rs"}),
+                        content_offset: Some(27),
+                    },
+                    protocol::ToolUseData {
+                        tool_call_id: "ink-command".to_owned(),
+                        name: "Run command".to_owned(),
+                        arguments: serde_json::json!({"command": "printf 'Readable output'"}),
+                        content_offset: Some(54),
+                    },
+                ],
                 model_info: None,
                 token_usage: None,
                 context_breakdown: None,
@@ -10592,6 +11029,81 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Streaming still completes")
         );
+        let retained_group = chat
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained_group.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "StreamEnd must preserve the user's folded change group"
+        );
+        let split_group = chat
+            .query_selector(".ink-file-path[title='src/state.rs']")
+            .unwrap()
+            .unwrap()
+            .closest(".file-change-group")
+            .unwrap()
+            .unwrap()
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            split_group.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "a group split by authoritative text offsets keeps the user's folded choice"
+        );
+        emit(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "ink-late-file".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::ModifyFile {
+                        lines_added: 1,
+                        lines_removed: 1,
+                    },
+                },
+            },
+        ));
+        next_tick().await;
+        let retained_group: web_sys::HtmlElement = chat
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            retained_group.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "a late completion must not reopen an existing change group"
+        );
+        let joined_group = chat
+            .query_selector(".ink-file-path[title='src/late.rs']")
+            .unwrap()
+            .unwrap()
+            .closest(".file-change-group")
+            .unwrap()
+            .unwrap()
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            joined_group.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "an edit joining after collapse stays folded when final offsets split it out"
+        );
+        let retained_diff: web_sys::HtmlDetailsElement = retained_group
+            .parent_element()
+            .unwrap()
+            .query_selector("details")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            retained_diff.open(),
+            "the existing opened diff survives message projection updates"
+        );
+        retained_group.click();
         let restored = AppState::new();
         restore_appearance(&restored);
         assert_eq!(
@@ -10611,19 +11123,22 @@ mod wasm_tests {
             .dyn_into()
             .unwrap();
         assert!(send.disabled());
-        // Finish shared CSS transitions; compare settled colors, not frame timing.
+        // Native Current and Ink light both keep rgb(229,229,229) backgrounds.
+        // The canonical split dims foreground from rgb(30,30,30) to (158,158,158)
+        // when unavailable; an Ink-only fill change would violate its design.
+        // Finish transitions so this checks the settled visible distinction.
         let settle_send_styles = js_sys::Function::new_with_args(
             "button",
-            "getComputedStyle(button).backgroundColor; for (const animation of button.getAnimations()) animation.finish();",
+            "getComputedStyle(button).color; for (const animation of button.getAnimations()) animation.finish();",
         );
         settle_send_styles
             .call1(&wasm_bindgen::JsValue::NULL, &send)
             .unwrap();
-        let disabled_color = window
+        let disabled_foreground = window
             .get_computed_style(&send)
             .unwrap()
             .unwrap()
-            .get_property_value("background-color")
+            .get_property_value("color")
             .unwrap();
         input.set_value("Ready to send");
         input
@@ -10634,14 +11149,14 @@ mod wasm_tests {
         settle_send_styles
             .call1(&wasm_bindgen::JsValue::NULL, &send)
             .unwrap();
-        let enabled_color = window
+        let enabled_foreground = window
             .get_computed_style(&send)
             .unwrap()
             .unwrap()
-            .get_property_value("background-color")
+            .get_property_value("color")
             .unwrap();
         assert_ne!(
-            enabled_color, disabled_color,
+            enabled_foreground, disabled_foreground,
             "Ink must visibly distinguish unavailable Send controls"
         );
         js_sys::eval(r#"

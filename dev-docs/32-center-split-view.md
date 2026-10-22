@@ -281,7 +281,7 @@ chat's draft.
 
 Controls that mutate an agent or session receive that pane's explicit agent
 identity; they must not read a global active agent and infer their target. This
-binds `SessionSettingsBar`, session-settings writes, and fork/send: an edit made
+binds `session_settings_views`, session-settings writes, and fork/send: an edit made
 in the pane the user is not focused on must reach that pane's agent.
 
 Thus a file beside a chat keeps the chat's composer while the file pane is
