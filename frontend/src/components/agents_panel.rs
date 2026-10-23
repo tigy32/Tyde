@@ -485,6 +485,21 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
     }
 }
 
+fn status_label_visible(derived: &DerivedAgentState) -> bool {
+    match derived {
+        DerivedAgentState::Cancelling
+        | DerivedAgentState::AwaitingUser
+        | DerivedAgentState::CompactionQueued
+        | DerivedAgentState::Compacting => true,
+        DerivedAgentState::Initializing
+        | DerivedAgentState::Thinking
+        | DerivedAgentState::Idle
+        | DerivedAgentState::BackgroundWork
+        | DerivedAgentState::Cancelled
+        | DerivedAgentState::Terminated => false,
+    }
+}
+
 pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
@@ -1855,7 +1870,7 @@ pub fn AgentsPanel() -> impl IntoView {
         pointer_cancel.remove();
         pointer_blur.remove();
     });
-    let preview_state = state.clone();
+    let preview_state = StoredValue::new(state.clone());
 
     let on_search = move |ev: leptos::ev::Event| {
         let val = event_target_value(&ev);
@@ -2290,12 +2305,22 @@ pub fn AgentsPanel() -> impl IntoView {
             </div>
             <leptos::portal::Portal>
                 {move || pointer_drag.get().filter(|drag| drag.active).and_then(|drag| {
-                    let agent = preview_state.agents.with(|agents| agents.iter().find(|agent| agent_ref(agent) == drag.agent).cloned())?;
+                    let (agent, derived) = preview_state.with_value(|state| {
+                        let agent = state.agents.with(|agents| agents.iter().find(|agent| agent_ref(agent) == drag.agent).cloned())?;
+                        let derived = derive_agent_state_with_background(state, &agent);
+                        Some((agent, derived))
+                    })?;
                     Some(view! {
                         <div class="agent-row-drag-preview" aria-hidden="true"
                             style=format!("left:clamp(8px, {}px, calc(100vw - 248px));top:clamp(8px, {}px, calc(100vh - 44px))", drag.position.0 + 14, drag.position.1 + 14)>
+                            <span class=status_class(&derived) title=status_label(&derived)>
+                                <span aria-hidden="true">{status_icon(&derived)}</span>
+                                {status_label_visible(&derived).then(|| view! {
+                                    <span class="agent-card-status-text">{status_label(&derived)}</span>
+                                })}
+                            </span>
+                            <span class="agent-card-name">{agent.name.clone()}</span>
                             <span class="agent-backend-glyph">{crate::components::launch_menu::backend_icon(agent.backend_kind)}</span>
-                            <span class="agent-card-name">{agent.name}</span>
                         </div>
                     })
                 })}
@@ -2803,27 +2828,7 @@ fn agent_card(
     let status_icon_sig = move || status_icon(&derived.get());
     let status_title_sig = move || status_label(&derived.get());
     let status_label_sig = move || status_label(&derived.get());
-    // Running, idle, and background-work states are conventional enough to
-    // read from their glyph and color alone. A cancelled or cancelling turn
-    // is not: `⊘` is ambiguous, and "your work was stopped" is exactly the
-    // outcome a user must not have to hover or use a screen reader to
-    // discover.
-    // Compaction joins the visible-label set for the same reason cancellation
-    // is in it: `⟲` is not self-explanatory, and "your context is being
-    // rewritten for the next few minutes" is not an outcome a user should have
-    // to hover or use a screen reader to discover.
-    let status_label_visible_sig = {
-        move || {
-            matches!(
-                derived.get(),
-                DerivedAgentState::Cancelled
-                    | DerivedAgentState::Cancelling
-                    | DerivedAgentState::AwaitingUser
-                    | DerivedAgentState::CompactionQueued
-                    | DerivedAgentState::Compacting
-            )
-        }
-    };
+    let status_label_visible_sig = move || status_label_visible(&derived.get());
 
     // Compact action.
     //
@@ -2945,22 +2950,25 @@ fn agent_card(
             on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
         >
             <div class="agent-card-top">
-                <button
-                    type="button"
-                    class="agent-card-actions"
-                    aria-haspopup="menu"
-                    aria-expanded=move || card_menu.get().is_some().to_string()
-                    title="Agent actions"
-                    aria-label="Agent actions"
-                    on:click=move |ev: web_sys::MouseEvent| open_card_menu_below(card_menu, &ev)
-                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                <span
+                    class=move || {
+                        if status_label_visible_sig() {
+                            format!("{} agent-card-status-labelled", status_class_sig())
+                        } else {
+                            status_class_sig().to_string()
+                        }
+                    }
+                    title=status_title_sig
                 >
-                    "⋯"
-                </button>
-                <span class="agent-backend-glyph" role="img" aria-label=backend_label(backend) title=backend_label(backend)>
-                    {crate::components::launch_menu::backend_icon(backend)}
+                    <span aria-hidden="true">{status_icon_sig}</span>
+                    <span class=move || {
+                        if status_label_visible_sig() {
+                            "agent-card-status-text"
+                        } else {
+                            "visually-hidden"
+                        }
+                    }>{status_label_sig}</span>
                 </span>
-
                 <div class="agent-card-top-main">
                 {move || {
                     if editing_agent.with(|e| e.as_ref() == Some(&edit_ref_for_block)) {
@@ -3087,25 +3095,6 @@ fn agent_card(
                         }
                     }}
                 </Show>
-                <span
-                    class=move || {
-                        if status_label_visible_sig() {
-                            format!("{} agent-card-status-labelled", status_class_sig())
-                        } else {
-                            status_class_sig().to_string()
-                        }
-                    }
-                    title=status_title_sig
-                >
-                    <span aria-hidden="true">{status_icon_sig}</span>
-                    <span class=move || {
-                        if status_label_visible_sig() {
-                            "agent-card-status-text"
-                        } else {
-                            "visually-hidden"
-                        }
-                    }>{status_label_sig}</span>
-                </span>
                 <button
                     type="button"
                     class="agent-card-pin"
@@ -3120,6 +3109,21 @@ fn agent_card(
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                         <path d="m16 3 5 5-4 1-3 5v3l-3-3-6 6-1-1 6-6-3-3h3l5-3z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
                     </svg>
+                </button>
+                <span class="agent-backend-glyph" role="img" aria-label=backend_label(backend) title=backend_label(backend)>
+                    {crate::components::launch_menu::backend_icon(backend)}
+                </span>
+                <button
+                    type="button"
+                    class="agent-card-actions"
+                    aria-haspopup="menu"
+                    aria-expanded=move || card_menu.get().is_some().to_string()
+                    title="Agent actions"
+                    aria-label="Agent actions"
+                    on:click=move |ev: web_sys::MouseEvent| open_card_menu_below(card_menu, &ev)
+                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                >
+                    "⋯"
                 </button>
 
             </div>
@@ -4554,7 +4558,7 @@ mod wasm_tests {
         let text = card.text_content().unwrap_or_default();
         assert!(
             text.contains("Cancelled"),
-            "the cancelled outcome must be visible without hovering, got: {text:?}"
+            "the cancelled outcome must stay available to assistive tech, got: {text:?}"
         );
         let status = card
             .query_selector(".agent-card-status")
@@ -4564,6 +4568,20 @@ mod wasm_tests {
         assert!(
             !class.contains("completed"),
             "a cancelled turn must not reuse the completed style, got: {class}"
+        );
+        let hidden = status
+            .query_selector(".visually-hidden")
+            .unwrap()
+            .expect("cancelled keeps an accessible label");
+        assert_eq!(hidden.text_content().as_deref(), Some("Cancelled"));
+        assert_eq!(status.get_attribute("title").as_deref(), Some("Cancelled"));
+        assert!(
+            hidden.get_bounding_client_rect().width() <= 1.0,
+            "the cancelled word must not paint"
+        );
+        assert!(
+            text.contains('\u{2298}'),
+            "a cancelled turn shows the cancel glyph, got: {text:?}"
         );
         assert!(
             !text.contains('\u{2713}'),
@@ -7759,9 +7777,29 @@ mod wasm_tests {
                 .length(),
             1
         );
+        let preview_el = preview.dyn_ref::<HtmlElement>().unwrap();
         assert_eq!(
-            preview.dyn_ref::<HtmlElement>().unwrap().inner_text(),
+            preview_el
+                .query_selector(".agent-card-name")
+                .unwrap()
+                .unwrap()
+                .dyn_ref::<HtmlElement>()
+                .unwrap()
+                .inner_text(),
             "Parent Alpha Agent"
+        );
+        let left_of = |selector: &str| {
+            preview
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect()
+                .left()
+        };
+        assert!(
+            left_of(".agent-card-status") < left_of(".agent-card-name")
+                && left_of(".agent-card-name") < left_of(".agent-backend-glyph"),
+            "the drag preview leads with activity and trails the backend glyph"
         );
         let size = preview.get_bounding_client_rect();
         assert!(
@@ -7782,6 +7820,86 @@ mod wasm_tests {
             "Preview background is opaque"
         );
         assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+        let assert_drag_status = |label: &str, glyph: &str| {
+            let row = agent_card_el(&container, "parent-alpha");
+            let preview = document
+                .query_selector(".agent-row-drag-preview")
+                .unwrap()
+                .expect("held drag stays mounted across status changes");
+            for surface in [row.as_ref(), &preview] {
+                let status = surface
+                    .query_selector(".agent-card-status")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+                assert_eq!(
+                    status
+                        .query_selector("[aria-hidden='true']")
+                        .unwrap()
+                        .unwrap()
+                        .text_content()
+                        .as_deref(),
+                    Some(glyph),
+                    "row and drag preview must agree on live activity"
+                );
+            }
+        };
+        assert_drag_status("Idle", "\u{2713}");
+        let dragged_id = AgentId("parent-alpha".to_owned());
+        let apply = |event| {
+            crate::dispatch::apply_chat_event(&state, "local", &dragged_id, event);
+        };
+        apply(protocol::ChatEvent::ToolProgress(
+            protocol::ToolProgressData {
+                tool_call_id: "drag-background".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({
+                        "task_id": "drag-task",
+                        "description": "Held background work",
+                    }),
+                },
+            },
+        ));
+        next_tick().await;
+        assert_drag_status("Background work", "\u{29D7}");
+        apply(protocol::ChatEvent::TypingStatusChanged(true));
+        next_tick().await;
+        assert_drag_status("Thinking", "\u{25F7}");
+        state.agent_awaiting_user.update(|awaiting| {
+            awaiting.insert(dragged_id.clone());
+        });
+        next_tick().await;
+        assert_drag_status("Needs your answer", "?");
+        state.agent_awaiting_user.update(|awaiting| {
+            awaiting.remove(&dragged_id);
+        });
+        apply(protocol::ChatEvent::OperationCancelled(
+            protocol::OperationCancelledData {
+                message: "Operation cancelled".to_owned(),
+            },
+        ));
+        next_tick().await;
+        assert_drag_status("Cancelled", "\u{2298}");
+        apply(protocol::ChatEvent::TypingStatusChanged(true));
+        next_tick().await;
+        assert_drag_status("Thinking", "\u{25F7}");
+        apply(protocol::ChatEvent::TypingStatusChanged(false));
+        next_tick().await;
+        assert_drag_status("Background work", "\u{29D7}");
+        apply(protocol::ChatEvent::ToolExecutionCompleted(
+            crate::components::tool_card::test_utils::succeeded_completion(
+                "drag-background",
+                protocol::ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ),
+        ));
+        next_tick().await;
+        assert_drag_status("Idle", "\u{2713}");
         dispatch_key(&parent, "Escape");
         next_tick().await;
         assert!(
@@ -11367,6 +11485,7 @@ mod wasm_tests {
         // AwaitingUser status on parent agent ("Needs your answer")
         state.agent_awaiting_user.update(|set| {
             set.insert(AgentId("parent-agent".to_owned()));
+            set.insert(AgentId("grouped-agent".to_owned()));
         });
         // In-flight compaction status on workbench agent ("Compacting context")
         state.mark_compaction_started("local", AgentId("workbench-agent".to_owned()));
@@ -11584,6 +11703,11 @@ mod wasm_tests {
                 "a row with a glyph-only status is one 28px line at {width}px, got {}px",
                 at_rest[0]
             );
+            // height, glyph.left, glyph.top, name.left, name.top, status.left, status.top, actions.left, actions.top
+            assert!(
+                at_rest[5] < at_rest[3] && at_rest[3] < at_rest[1] && at_rest[1] < at_rest[7],
+                "activity leads the name and the backend glyph trails it at {width}px: {at_rest:?}"
+            );
 
             // Focus child-agent card to reveal its pin control via :focus-within and verify visible geometry
             child_card.focus().unwrap();
@@ -11615,6 +11739,23 @@ mod wasm_tests {
                 child_pin_rect.right(),
                 panel_rect.right(),
             );
+
+            for id in ["grouped-agent", "workbench-agent"] {
+                let card = agent_card_el(&container, id);
+                let at_rest = row_geometry(&card);
+                assert_eq!(
+                    at_rest[0], 28.0,
+                    "a labelled leaf row stays one line at {width}px"
+                );
+                assert!(at_rest[5] < at_rest[3] && at_rest[3] < at_rest[1]);
+                card.focus().unwrap();
+                next_tick().await;
+                assert_eq!(
+                    row_geometry(&card),
+                    at_rest,
+                    "revealing a labelled row's pin cannot wrap or move its content at {width}px"
+                );
+            }
 
             // Verify awaiting-user status text has visible nonzero geometry and stays within panel
             let awaiting_text: HtmlElement = container

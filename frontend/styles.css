@@ -7101,6 +7101,8 @@ math merror {
     overflow: hidden;
 }
 
+.agent-row-drag-preview .agent-card-name { flex: 1; }
+
 .agent-card-name {
     font-size: 0.923rem;
     font-weight: 600;
@@ -7162,7 +7164,7 @@ math merror {
 /* A cancelled turn is neither a success nor a failure — the user stopped it
    deliberately. Neutral, so it never reads as a completed result. */
 .agent-card-status.cancelled {
-    color: var(--text-tertiary);
+    color: var(--text-secondary);
 }
 
 /* The turn is over but work is still running in the background; the agent
@@ -17574,12 +17576,12 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-card-group .agent-card[aria-current="true"] { background: var(--accent-subtle); border-color: var(--border-secondary); }
 .agent-card[data-sidebar-backend]:hover { background: var(--surface-hover); }
 .agent-card[data-sidebar-backend]:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: -2px; }
-.agent-card-top > .agent-card-actions { order: 6; }
-.agent-card-top > .agent-card-pin { order: 3; display: none; }
-.agent-card-top > .agent-card-status { order: 4; }
+.agent-card-top > .agent-card-pin { display: none; }
+/* Labelled rows reserve the pin slot so revealing it cannot resize the status. */
+.agent-card-top:has(> .agent-card-status-labelled) > .agent-card-pin { display: inline-flex; visibility: hidden; }
 .agent-card:hover > .agent-card-top > .agent-card-pin,
 .agent-card:focus-within > .agent-card-top > .agent-card-pin,
-.agent-card-top > .agent-card-pin.pinned { display: inline-flex; }
+.agent-card-top > .agent-card-pin.pinned { display: inline-flex; visibility: visible; }
 .agent-backend-glyph { width: 18px; height: 18px; flex-shrink: 0; display: inline-flex; color: var(--text-primary); }
 .agent-backend-glyph .launch-backend-icon { width: 18px; height: 18px; object-fit: contain; }
 .agent-card-collapse-toggle { flex-shrink: 0; font-size: 11px; line-height: 1.4; color: var(--accent-primary); gap: 3px; }
@@ -17600,17 +17602,21 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-sidebar-host-header { display: flex; align-items: center; justify-content: space-between; min-height: 30px; border-bottom: 1px solid var(--border-primary); margin-block: 8px 5px; }
 .agent-sidebar-host-header > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-sidebar-project-header { text-transform: none; letter-spacing: normal; font-size: 13px; color: var(--text-primary); min-height: 32px; }
-.agents-panel .agent-card-name { font-weight: 400; max-width: 100%; line-height: 20px; }
+.agents-panel .agent-card-name,
+.agent-row-drag-preview .agent-card-name { font-weight: 400; max-width: 100%; line-height: 20px; }
 .agents-panel .agent-card-name-input { height: 20px; padding: 0 4px; line-height: 18px; }
 .agents-panel .agent-card-top { align-items: flex-start; min-width: 0; width: 100%; gap: 6px; }
 .agents-panel .agent-card-top > .agent-backend-glyph { margin-block: 1px; }
 .agents-panel .agent-card-top-main { flex-direction: column; align-items: flex-start; gap: 2px; }
 .agents-panel .agent-card-collapse-toggle { min-height: 18px; color: var(--text-tertiary); }
-.agents-panel .agent-card-status { animation: none; display: inline-flex; align-items: center; height: 20px; min-width: 0; }
+.agents-panel .agent-card-status,
+.agent-row-drag-preview .agent-card-status { animation: none; display: inline-flex; align-items: center; height: 20px; min-width: 0; }
 .agents-panel .agent-card-status > [aria-hidden="true"] { flex-shrink: 0; }
 .agents-panel .agent-card-top > .agent-card-actions,
 .agents-panel .agent-card-top > .agent-card-status { flex-shrink: 0; }
-.agents-panel .agent-card-status-text { max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agents-panel .agent-card-top > .agent-card-status-labelled { flex-shrink: 1; }
+.agents-panel .agent-card-status-text,
+.agent-row-drag-preview .agent-card-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agents-filter-option { justify-content: space-between; gap: var(--space-4); min-height: 32px; padding: var(--space-1) var(--space-2); border-radius: 4px; font-family: var(--font-sans); font-size: 1rem; color: var(--text-primary); }
 .agents-filter-option:hover { background: var(--surface-hover); }
 .agents-filter-option:focus-within .settings-toggle-slider { outline: 2px solid var(--accent-link); outline-offset: 3px; }
@@ -17641,20 +17647,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-panel > .panel-content { overflow-x: hidden; }
 .agents-panel .agent-card-top-main { min-width: 45px; }
 @container (max-width: 270px) {
-    .agents-panel .agent-card-top {
-        flex-wrap: wrap;
-        row-gap: 3px;
-        column-gap: 4px;
-    }
-    /* A spelled-out status needs the width a narrow row does not have, so
-       it takes a line of its own under the name. A glyph-only status stays
-       on the row's single line. */
-    .agents-panel .agent-card-top > .agent-card-status-labelled {
-        order: 10;
-        margin-left: 24px;
-        flex-basis: calc(100% - 24px);
-        max-width: calc(100% - 24px);
-    }
+    .agents-panel .agent-card-top { column-gap: 4px; }
+    .agents-panel .agent-card-top > .agent-card-status-labelled { max-width: 42%; }
     .agents-panel .agent-card-top .agent-card-status-text {
         max-width: none;
         overflow: hidden;
@@ -17671,7 +17665,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-card-top > .agent-card-pin { width: 20px; height: 20px; padding: 2px; }
 
 .sidebar-layout-error { grid-column: 1 / 6; grid-row: 1; z-index: 6; background: var(--surface-2); color: var(--error); padding: 7px 12px; font-size: 12px; }
-.agent-card-top > .agent-pin-host { order: 2; max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); font-size: 10px; flex-shrink: 1; }
+.agent-card-top > .agent-pin-host { max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); font-size: 10px; flex-shrink: 1; }
 .agent-card-top > button.agent-pin-host-error { background: transparent; border: 0; padding: 0; color: var(--error); font: inherit; font-size: 10px; cursor: pointer; }
 /* Task detail surfaces share one flat backend list at both sizes. */
 .session-task-popover {
