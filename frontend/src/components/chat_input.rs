@@ -3645,7 +3645,7 @@ mod wasm_tests {
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
             provide_context(mount_state);
-            view! { <crate::components::chat_presentation::ChatPresentation><ChatInput /></crate::components::chat_presentation::ChatPresentation> }
+            view! { <crate::components::chat_presentation::ChatPresentation><div style="flex: 1"></div><ChatInput /></crate::components::chat_presentation::ChatPresentation><crate::components::settings_panel::SettingsPanel /> }
         });
         next_tick().await;
 
@@ -3843,6 +3843,25 @@ mod wasm_tests {
             seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &800.into())
                 .unwrap();
             assert_eq!(prop("background-position"), "0% 0px");
+            let content = query(&container, ".chat-input-content").unwrap();
+            textarea.blur().unwrap();
+            let neutral_border = window
+                .get_computed_style(&content)
+                .unwrap()
+                .unwrap()
+                .get_property_value("border-top-color")
+                .unwrap();
+            textarea.focus().unwrap();
+            let focused_border = window
+                .get_computed_style(&content)
+                .unwrap()
+                .unwrap()
+                .get_property_value("border-top-color")
+                .unwrap();
+            assert_eq!(
+                focused_border, neutral_border,
+                "focusing a working composer must not erase the shimmer with a same-color solid border"
+            );
             assert_eq!(textarea.value(), "Keep this draft");
             assert!(
                 window.document().unwrap().active_element()
@@ -3859,6 +3878,148 @@ mod wasm_tests {
                 "Current keeps its original top line"
             );
         }
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        next_tick().await;
+        let reduced_style = js_sys::Function::new_with_args("ring", r#"
+            const changed = [];
+            try {
+                for (const sheet of document.styleSheets) {
+                    for (const rule of sheet.cssRules) {
+                        if (rule.media?.mediaText === '(prefers-reduced-motion: reduce)' && rule.cssText.includes('.chat-thinking-ring')) {
+                            changed.push(rule);
+                            rule.media.mediaText = 'all';
+                        }
+                    }
+                }
+                const style = getComputedStyle(ring);
+                return [changed.length, style.animationName, style.backgroundImage, style.opacity];
+            } finally {
+                for (const rule of changed) rule.media.mediaText = '(prefers-reduced-motion: reduce)';
+            }
+        "#).call1(&wasm_bindgen::JsValue::NULL, &ring).unwrap();
+        let reduced_style = js_sys::Array::from(&reduced_style);
+        assert!(reduced_style.get(0).as_f64().unwrap() >= 2.0);
+        assert_eq!(reduced_style.get(1).as_string().unwrap(), "none");
+        assert_eq!(reduced_style.get(2).as_string().unwrap(), "none");
+        assert_eq!(reduced_style.get(3).as_string().unwrap(), "0.45");
+        // Keep the absolute fixture anchored: making it relative puts this
+        // probe in document flow below the containers left by earlier tests.
+        let tab = query(&container, ".ink-activity-tab").unwrap();
+        tab.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        let tab_bounds = tab.get_bounding_client_rect();
+        let misplaced_probe = js_sys::Function::new_with_args(
+            "container, target",
+            "const position=container.style.position;try{container.style.position='relative';const r=target.getBoundingClientRect();return JSON.stringify({relativeTop:r.top,relativeBottom:r.bottom,viewportHeight:innerHeight});}finally{container.style.position=position;}",
+        ).call2(&wasm_bindgen::JsValue::NULL, &container, &tab).unwrap();
+        wasm_bindgen_test::console_log!(
+            "Former relative-fixture probe: {}",
+            misplaced_probe.as_string().unwrap()
+        );
+        wasm_bindgen_test::console_log!(
+            "Settings layering probe: tab_top={} tab_bottom={} viewport_height={}",
+            tab_bounds.top(),
+            tab_bounds.bottom(),
+            window.inner_height().unwrap().as_f64().unwrap()
+        );
+        let is_target_on_top = js_sys::Function::new_with_args(
+            "container, target",
+            "const r=target.getBoundingClientRect();const hit=document.elementsFromPoint(r.x+r.width/2,r.y+r.height/2).filter(e=>container.contains(e))[0];return target.contains(hit);",
+        );
+        assert!(
+            is_target_on_top
+                .call2(&wasm_bindgen::JsValue::NULL, &container, &tab)
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "the active child tab really occupies the probe before Settings opens"
+        );
+        assert!(tab_bounds.width() > 0.0 && tab_bounds.height() > 0.0);
+        state.settings_open.set(true);
+        next_tick().await;
+        let bounds = tab.get_bounding_client_rect();
+        assert!(
+            bounds.width() > 0.0 && bounds.height() > 0.0,
+            "the active child tab is rendered beneath Settings"
+        );
+        assert!(
+            bounds.left() >= 0.0
+                && bounds.top() >= 0.0
+                && bounds.right() <= window.inner_width().unwrap().as_f64().unwrap()
+                && bounds.bottom() <= window.inner_height().unwrap().as_f64().unwrap(),
+            "the probe lies inside the viewport"
+        );
+        let hit_test = js_sys::Function::new_with_args(
+            "container, x, y",
+            "return document.elementsFromPoint(x, y).filter(e => container.contains(e))[0]?.closest('.settings-overlay') != null;",
+        );
+        assert!(
+            hit_test
+                .call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &container,
+                    &(bounds.x() + bounds.width() / 2.0).into(),
+                    &(bounds.y() + bounds.height() / 2.0).into()
+                )
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "Settings owns hit testing above the active Ink drawer"
+        );
+        state.settings_open.set(false);
+        next_tick().await;
+        assert_eq!(
+            primary(&container).text_content().unwrap().trim(),
+            "Cancel + send"
+        );
+
+        query(&container, ".ink-session-toggle")
+            .unwrap()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let panel =
+            query(&container, ".session-settings-panel").expect("Ink model popover is open");
+        let panel_bounds = panel.get_bounding_client_rect();
+        assert!(panel_bounds.width() > 0.0 && panel_bounds.height() > 0.0);
+        assert!(
+            is_target_on_top
+                .call2(&wasm_bindgen::JsValue::NULL, &container, &panel)
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "the popover is visible before Settings opens"
+        );
+        state.settings_open.set(true);
+        next_tick().await;
+        assert!(
+            hit_test
+                .call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &container,
+                    &(panel_bounds.x() + panel_bounds.width() / 2.0).into(),
+                    &(panel_bounds.y() + panel_bounds.height() / 2.0).into()
+                )
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "Settings also owns hit testing over the Ink model popover"
+        );
+        state.settings_open.set(false);
+        next_tick().await;
+        query(&container, "button[aria-label='Close session settings']")
+            .unwrap()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Current);
+        next_tick().await;
+
         state.composer_untracked().text.set(String::new());
         state.agent_turn_active.update(|active| {
             active.remove(&child_id);
@@ -3876,6 +4037,47 @@ mod wasm_tests {
             "idle composers have no shimmer"
         );
         assert_eq!(primary(&container).text_content().unwrap().trim(), "Send");
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        next_tick().await;
+        let content = query(&container, ".chat-input-content").unwrap();
+        textarea.blur().unwrap();
+        let idle_neutral = window
+            .get_computed_style(&content)
+            .unwrap()
+            .unwrap()
+            .get_property_value("border-top-color")
+            .unwrap();
+        textarea.focus().unwrap();
+        let idle_focused = window
+            .get_computed_style(&content)
+            .unwrap()
+            .unwrap()
+            .get_property_value("border-top-color")
+            .unwrap();
+        assert_ne!(
+            idle_focused, idle_neutral,
+            "idle Ink keeps its visible focus border"
+        );
+        state.agent_turn_active.update(|active| {
+            active.insert(AgentId(AGENT.to_owned()), true);
+        });
+        next_tick().await;
+        let working_focused = window
+            .get_computed_style(&content)
+            .unwrap()
+            .unwrap()
+            .get_property_value("border-top-color")
+            .unwrap();
+        assert_eq!(
+            working_focused, idle_neutral,
+            "a working focused composer uses the same neutral underlying border as idle unfocused, never opaque shimmer blue"
+        );
+        state.agent_turn_active.update(|active| {
+            active.remove(&AgentId(AGENT.to_owned()));
+        });
+        next_tick().await;
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────

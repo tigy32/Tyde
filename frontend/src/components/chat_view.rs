@@ -199,17 +199,12 @@ pub fn ChatView(
     // Ink groups the transcript into stretches; Current renders rows alone
     // and subscribes to nothing here.
     let ink_state = state.clone();
-    let tool_output_mode = state.tool_output_mode;
     let ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>> = Memo::new(move |_| {
         if ink_state.chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
             return None;
         }
-        let agent_id = active_agent_id()?;
-        Some(Arc::new(ink_row_layouts(
-            &ink_state,
-            &agent_id,
-            &row_handles(),
-        )))
+        active_agent_id()?;
+        Some(Arc::new(ink_row_layouts(&row_handles())))
     });
 
     let prior_history: Signal<Option<crate::state::SessionHistoryState>> =
@@ -772,34 +767,17 @@ pub fn ChatView(
         let vp = viewport_height_sig.get();
         let layouts = ink_layouts.get();
         let row_gap = if layouts.is_some() { 0.0 } else { ROW_GAP_PX };
-        let ink = layouts
-            .as_ref()
-            .map(|layouts| (layouts, tool_output_mode.get()));
         let rows = row_handles();
         let n = rows.len();
         if n == 0 {
             return VirtualWindow::EMPTY;
         }
         row_heights.with_value(|map| {
-            // A row folded into its Ink run's summary renders nothing; its
-            // cached height stays the unfolded measurement for when the
-            // run opens again.
-            let folded = |idx: usize| {
-                ink.is_some_and(|(layouts, mode)| {
-                    layouts
-                        .get(&rows[idx].id)
-                        .and_then(|layout| layout.run.as_ref())
-                        .is_some_and(|run| run.hidden(mode))
-                })
-            };
             // `slot_height` includes the top margin that separates this
             // row from the previous one, so the running sum matches
             // what the browser actually lays out. The very first row
             // gets no leading gap.
             let slot_height = |idx: usize| -> f64 {
-                if folded(idx) {
-                    return 0.0;
-                }
                 let raw = map
                     .get(&rows[idx].id)
                     .copied()
@@ -1209,7 +1187,6 @@ fn MeasuredRow(
     ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>>,
 ) -> impl IntoView {
     let row_id = row.id;
-    let tool_output_mode = expect_context::<AppState>().tool_output_mode;
     let ink_layout: Memo<Option<InkRowLayout>> = Memo::new(move |_| {
         ink_layouts.with(|layouts| {
             layouts
@@ -1222,10 +1199,6 @@ fn MeasuredRow(
             let Some(layout) = layout else {
                 return "virt-row".to_owned();
             };
-            let run = layout.run.as_ref();
-            if run.is_some_and(|run| run.hidden(tool_output_mode.get())) {
-                return "virt-row ink-row ink-run-hidden".to_owned();
-            }
             let mut class = String::from("virt-row ink-row");
             match layout.gap {
                 InkGap::None => class.push_str(" ink-gap-none"),
@@ -1235,9 +1208,8 @@ fn MeasuredRow(
             if layout.continuation {
                 class.push_str(" ink-continuation");
             }
-            // An open run's later rows continue its column of actions.
-            if run.is_some_and(|run| !run.head) {
-                class.push_str(" ink-run-follower");
+            if layout.actions_only {
+                class.push_str(" ink-actions-only");
             }
             class
         })
@@ -1296,16 +1268,8 @@ fn MeasuredRow(
                         // visible window onto rows that are actually below the
                         // viewport. Ignore zero/negative measurements; the next
                         // observer fire after the tab is shown again will
-                        // record the real height. An Ink row folded into its
-                        // run keeps its unfolded height, which the window
-                        // skips while the run is closed.
-                        let folded = ink_layout.with_untracked(|layout| {
-                            layout
-                                .as_ref()
-                                .and_then(|layout| layout.run.as_ref())
-                                .is_some_and(|run| run.hidden(tool_output_mode.get_untracked()))
-                        });
-                        if folded || h <= 0.0 || h.is_nan() {
+                        // record the real height.
+                        if h <= 0.0 || h.is_nan() {
                             return;
                         }
                         let changed = row_heights.with_value(|map| {
@@ -1576,6 +1540,7 @@ fn ChatNoticeView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     notice: ArcRwSignal<ChatNotice>,
 ) -> impl IntoView {
+    let appearance = expect_context::<AppState>().chat_appearance;
     view! {
         {move || match notice.get() {
             ChatNotice::AgentHandoff(handoff) => view! {
@@ -1599,6 +1564,18 @@ fn ChatNoticeView(
                         <p class="md-paragraph">{message}</p>
                     </div>
                 </div>
+            }.into_any(),
+            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms }
+                if appearance.get() == crate::appearance::ChatAppearance::Ink => view! {
+                <details class="ink-retry" data-test="chat-notice-retry">
+                    <summary>
+                        <span>"Retry"</span>
+                        <span>{format!("Attempt {attempt} of {max_retries}")}</span>
+                        <span class="ink-retry-disclosure">"Details"</span>
+                    </summary>
+                    <p>{error}</p>
+                    <p>{format!("Reported backoff: {backoff_ms}ms")}</p>
+                </details>
             }.into_any(),
             ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms } => view! {
                 <div class="chat-card chat-card-retry" data-test="chat-notice-retry">
@@ -2628,7 +2605,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn ink_folds_a_working_stretch_into_one_quiet_disclosure() {
+    async fn ink_keeps_actions_visible_and_expands_only_their_output() {
         use crate::appearance::ChatAppearance;
         use crate::state::ToolOutputMode;
         ensure_styles_loaded();
@@ -2698,16 +2675,34 @@ mod wasm_tests {
             dispatch(ChatEvent::ToolExecutionCompleted(
                 protocol::ToolExecutionCompletedData {
                     tool_call_id: tool_call_id.clone(),
-                    outcome: protocol::ToolExecutionOutcome::Succeeded {
-                        result: protocol::ToolExecutionResult::RunCommand {
-                            exit_code: 0,
-                            stdout: "ok\n".to_owned(),
-                            stderr: String::new(),
-                        },
+                    outcome: if index == 1 {
+                        protocol::ToolExecutionOutcome::Failed {
+                            message: "Probe failed".to_owned(),
+                            details: None,
+                            normalization_failure: None,
+                            result: None,
+                        }
+                    } else {
+                        protocol::ToolExecutionOutcome::Succeeded {
+                            result: protocol::ToolExecutionResult::RunCommand {
+                                exit_code: 0,
+                                stdout: "ok\n".to_owned(),
+                                stderr: String::new(),
+                            },
+                        }
                     },
                 },
             ));
             let mut message = assistant(text);
+            if index == 0 {
+                message.reasoning = Some(protocol::ReasoningData {
+                    text: "Weighing the results.".to_owned(),
+                    tokens: Some(12),
+                    signature: None,
+                    blob: None,
+                });
+            }
+
             message.tool_calls.push(protocol::ToolUseData {
                 tool_call_id,
                 name: "Bash".to_owned(),
@@ -2767,103 +2762,152 @@ mod wasm_tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let summary = || {
-            let summaries = visible(".ink-actions-summary");
-            assert_eq!(summaries.len(), 1, "one disclosure for the whole stretch");
-            summaries.into_iter().next().unwrap()
-        };
-
+        // The user explicitly replaced the old folded-action contract:
+        // Summary hides output, never the action chronology itself.
         settle().await;
-        let collapsed = summary();
-        assert_eq!(text_of(&collapsed).trim(), "3 completed actions");
         assert_eq!(
-            collapsed.get_attribute("aria-expanded").as_deref(),
-            Some("false")
+            visible(".chat-card-reasoning").len(),
+            1,
+            "reasoning retains its own disclosure beside visible actions"
         );
         assert_eq!(bylines(), 1, "the stretch carries a single byline");
-        assert!(command_headers().is_empty(), "completed actions fold away");
-        let hidden_rows = message_rows(&container)
-            .iter()
-            .filter(|row| row.get_bounding_client_rect().height() == 0.0)
-            .count();
-        assert_eq!(
-            hidden_rows, 2,
-            "activity-only replies collapse into the summary"
-        );
-        let done = visible(".chat-card-body")
-            .into_iter()
-            .find(|body| text_of(body).contains("All done."))
-            .expect("closing prose stays visible");
-        let summary_bottom = collapsed.get_bounding_client_rect().bottom();
-        let gap = done.get_bounding_client_rect().top() - summary_bottom;
-        assert!(
-            (0.0..40.0).contains(&gap),
-            "prose follows the summary without a gap, got {gap}px"
-        );
-
-        collapsed.dyn_ref::<HtmlElement>().unwrap().click();
-        settle().await;
-        let expanded = summary();
-        assert_eq!(
-            expanded.get_attribute("aria-expanded").as_deref(),
-            Some("true")
-        );
         let headers = command_headers();
-        assert_eq!(headers.len(), 3, "an open run lists every action");
-        let tops = headers
-            .iter()
-            .map(|header| header.get_bounding_client_rect().top())
-            .collect::<Vec<_>>();
-        console_log!("Open Ink run action tops: {tops:?}");
-        assert!(
-            ((tops[1] - tops[0]) - (tops[2] - tops[1])).abs() < 0.5,
-            "an open run is one evenly spaced column: {tops:?}"
+        assert_eq!(
+            headers.len(),
+            3,
+            "Compact shows every action without a group disclosure"
         );
-        // The card nests; its header bleeds 8px left for the hover surface.
-        let summary_left = expanded.get_bounding_client_rect().left();
-        for header in &headers {
-            let card = header.parent_element().expect("tool card");
-            let indent = card.get_bounding_client_rect().left() - summary_left;
-            assert!(
-                indent >= 20.0,
-                "actions nest under their summary, got {indent}px"
-            );
-        }
+        let cards: Vec<web_sys::HtmlDetailsElement> = headers
+            .iter()
+            .map(|header| header.parent_element().unwrap().dyn_into().unwrap())
+            .collect();
+        assert!(
+            cards.iter().all(|card| !card.open()),
+            "Compact hides output by default"
+        );
+        assert!(
+            headers[1]
+                .text_content()
+                .unwrap_or_default()
+                .contains("Failed"),
+            "failed actions remain readable between successes"
+        );
+        assert!(
+            headers
+                .windows(2)
+                .all(|pair| pair[0].get_bounding_client_rect().top()
+                    < pair[1].get_bounding_client_rect().top()),
+            "actions stay chronological"
+        );
 
         state.tool_output_mode.set(ToolOutputMode::Summary);
         settle().await;
         assert_eq!(
-            summary().get_attribute("aria-expanded").as_deref(),
-            Some("false")
+            command_headers().len(),
+            3,
+            "Summary still shows all actions"
         );
-        assert!(
-            command_headers().is_empty(),
-            "a choice stays in its own mode"
+        assert!(cards.iter().all(|card| !card.open()));
+        headers[0].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        assert!(cards[0].open(), "Summary permits explicit output expansion");
+        let stdout = cards[0]
+            .query_selector(".tool-result-stdout")
+            .unwrap()
+            .expect("explicit expansion renders stdout");
+        assert_eq!(
+            stdout.text_content().unwrap().trim(),
+            "ok",
+            "Summary reveals the command output only when requested"
         );
+        assert!(stdout.get_bounding_client_rect().height() > 0.0);
+        assert!(!cards[1].open());
 
         state.tool_output_mode.set(ToolOutputMode::Full);
         settle().await;
-        assert_eq!(
-            summary().get_attribute("aria-expanded").as_deref(),
-            Some("true")
+        assert_eq!(command_headers().len(), 3);
+        assert!(
+            cards.iter().all(|card| card.open()),
+            "Full opens all outputs"
         );
-        assert_eq!(command_headers().len(), 3, "Full opens every run");
-
         state.tool_output_mode.set(ToolOutputMode::Compact);
+        settle().await;
+        assert!(cards.iter().all(|card| !card.open()));
+        headers[0].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        assert!(cards[0].open());
         state.chat_appearance.set(ChatAppearance::Current);
         settle().await;
-        assert!(visible(".ink-actions-summary").is_empty());
         assert_eq!(command_headers().len(), 3, "Current shows every tool card");
         assert_eq!(bylines(), 4, "Current keeps a byline per reply");
-
         state.chat_appearance.set(ChatAppearance::Ink);
         settle().await;
-        assert_eq!(
-            summary().get_attribute("aria-expanded").as_deref(),
-            Some("true"),
-            "the Compact choice returns with its mode"
-        );
         assert_eq!(command_headers().len(), 3);
+        assert!(
+            headers[0].is_same_node(command_headers().first().map(|element| element.as_ref())),
+            "appearance switches retain the tool node"
+        );
+        assert!(
+            cards[0].open(),
+            "explicit output choice survives appearance switches"
+        );
+
+        let root = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let original_style = root.get_attribute("style");
+        root.style()
+            .set_property("--font-sans", "monospace")
+            .unwrap();
+        for size in [11, 13, 20] {
+            root.style()
+                .set_property("--base-font-size", &format!("{size}px"))
+                .unwrap();
+            let roles = [
+                ".chat-card-body",
+                ".tool-card-header",
+                ".tool-card-name",
+                ".chat-textarea",
+            ];
+            state.chat_appearance.set(ChatAppearance::Current);
+            settle().await;
+            let styles = |selector: &str| {
+                let node = container.query_selector(selector).unwrap().unwrap();
+                let style = web_sys::window()
+                    .unwrap()
+                    .get_computed_style(&node)
+                    .unwrap()
+                    .unwrap();
+                (
+                    style.get_property_value("font-size").unwrap(),
+                    style.get_property_value("font-family").unwrap(),
+                )
+            };
+            let current: Vec<_> = roles.iter().map(|selector| styles(selector)).collect();
+            state.chat_appearance.set(ChatAppearance::Ink);
+            settle().await;
+            for (selector, expected) in roles.iter().zip(current) {
+                assert_eq!(
+                    styles(selector).0,
+                    expected.0,
+                    "Ink uses the configured application role size: {selector}"
+                );
+            }
+            assert!(
+                styles(".chat-card-body").1.contains("monospace"),
+                "Ink honors the selected typeface"
+            );
+        }
+        match original_style {
+            Some(style) => root.set_attribute("style", &style).unwrap(),
+            None => root.remove_attribute("style").unwrap(),
+        }
+        settle().await;
 
         dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
             agent: "claude".to_owned(),
@@ -2891,7 +2935,7 @@ mod wasm_tests {
         let question = visible(".tool-card-header")
             .into_iter()
             .find(|header| text_of(header).contains("Awaiting answer"))
-            .expect("a live pending decision stays outside the fold");
+            .expect("a live pending decision stays readable alongside settled actions");
         let card = question.parent_element().expect("decision card");
         let frame = web_sys::window()
             .unwrap()
@@ -2901,251 +2945,155 @@ mod wasm_tests {
             .get_property_value("border-top-width")
             .unwrap();
         assert_eq!(frame, "1px", "a pending decision is framed");
-        assert_eq!(
-            text_of(&summary()).trim(),
-            "3 completed actions",
-            "a pending decision does not join the folded run"
-        );
-        drop(handle);
-        container.remove();
-    }
-
-    #[wasm_bindgen_test]
-    async fn ink_runs_keep_reasoning_and_offscreen_actions_in_place() {
-        use crate::appearance::ChatAppearance;
-        use crate::state::ToolOutputMode;
-        ensure_styles_loaded();
-        let container = make_container();
-        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
-        let setup_handle = state_handle.clone();
-        let agent_id = AgentId("agent-ink-offscreen".to_owned());
-        let bound = ActiveAgentRef {
-            host_id: "host-ink-offscreen".to_owned(),
-            agent_id: agent_id.clone(),
-        };
-        let bound_for_mount = bound.clone();
-        let handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            *setup_handle.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! {
-                <ChatView
-                    tab_id=TabId(10_042)
-                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
-                    is_active=Signal::derive(|| true)
-                />
-            }
-        });
-        next_tick().await;
-        let state = state_handle.borrow().clone().expect("mounted state");
-        state.chat_appearance.set(ChatAppearance::Ink);
-        let dispatch = |event| {
-            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
-        };
-        let start = || {
-            dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
-                agent: "claude".to_owned(),
-                model: Some("claude-test".to_owned()),
-            }));
-        };
-        let end = |message: ChatMessage| {
-            dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
-        };
-        let assistant = |text: &str| {
-            let mut message = mk_user_msg(text).message;
-            message.sender = MessageSender::Assistant {
-                agent: "claude".to_owned(),
-            };
-            message
-        };
-        async fn settle() {
-            next_tick().await;
-            next_animation_frame().await;
-            next_animation_frame().await;
-        }
-        let visible = |selector: &str| {
-            let nodes = container.query_selector_all(selector).unwrap();
-            (0..nodes.length())
-                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
-                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
-                .collect::<Vec<_>>()
-        };
-
-        dispatch(ChatEvent::MessageAdded(
-            mk_user_msg("Inspect the workspace").message,
-        ));
-        for (index, command) in ["python3 first.py", "python3 second.py"]
-            .into_iter()
-            .enumerate()
-        {
-            let tool_call_id = format!("ink-offscreen-{index}");
-            start();
-            dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: "Bash".to_owned(),
-                tool_type: protocol::ToolRequestType::RunCommand {
-                    command: command.to_owned(),
-                    working_directory: "/workspace".to_owned(),
-                },
-            }));
-            dispatch(ChatEvent::ToolExecutionCompleted(
-                protocol::ToolExecutionCompletedData {
-                    tool_call_id: tool_call_id.clone(),
-                    outcome: protocol::ToolExecutionOutcome::Succeeded {
-                        result: protocol::ToolExecutionResult::RunCommand {
-                            exit_code: 0,
-                            stdout: "ok\n".to_owned(),
-                            stderr: String::new(),
-                        },
-                    },
-                },
-            ));
-            let mut message = assistant(if index == 0 { "Checking." } else { "" });
-            message.tool_calls.push(protocol::ToolUseData {
-                tool_call_id,
-                name: "Bash".to_owned(),
-                arguments: serde_json::json!({ "command": command }),
-                content_offset: None,
-            });
-            end(message);
-        }
-        let mut thinking = assistant("");
-        thinking.reasoning = Some(protocol::ReasoningData {
-            text: "Weighing the results.".to_owned(),
-            tokens: Some(12),
-            signature: None,
-            blob: None,
-        });
-        start();
-        end(thinking);
+        state.tool_output_mode.set(ToolOutputMode::Summary);
         settle().await;
-
-        let summaries = visible(".ink-actions-summary");
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(
-            summaries[0].text_content().unwrap_or_default().trim(),
-            "2 completed actions"
-        );
-        assert_eq!(
-            visible(".chat-card-reasoning").len(),
-            1,
-            "a reasoning-only reply keeps its own disclosure"
-        );
-        let folded = message_rows(&container)
-            .iter()
-            .filter(|row| row.get_bounding_client_rect().height() == 0.0)
-            .count();
-        assert_eq!(folded, 1, "only the activity-only reply folds");
-
-        let scroller: HtmlElement = container
-            .query_selector(".chat-messages")
+        let answer = container
+            .query_selector("input.ask-question-custom")
             .unwrap()
-            .expect("chat scroller present")
-            .dyn_into()
+            .expect("pending question accepts a custom answer")
+            .dyn_into::<web_sys::HtmlInputElement>()
             .unwrap();
-        // A mounted row's ResizeObserver reports in the next frame and the
-        // row records its height in a 0ms timer queued from that report; a
-        // 0ms timer queued after the following frame runs after that one.
-        async fn measured() {
-            next_animation_frame().await;
-            next_animation_frame().await;
-            next_tick().await;
-        }
-        // Each row's on-screen height, in transcript order.
-        let mut heights: Vec<f64> = message_rows(&container)
-            .iter()
-            .map(|row| row.get_bounding_client_rect().height())
-            .collect();
-        assert_eq!(heights.len(), 4, "the short transcript is fully on screen");
-        // The chat continues one reply at a time, pinned to the bottom. Every
-        // reply is measured on screen before later replies push it, and then
-        // the run, out of view.
-        for index in 0..40 {
-            start();
-            end(assistant(&format!("Note {index}: the workspace is fine.")));
-            measured().await;
-            let rows = message_rows(&container);
-            let newest = rows.last().expect("the pinned chat shows its newest reply");
-            assert!(
-                newest
-                    .text_content()
-                    .unwrap_or_default()
-                    .trim()
-                    .starts_with(&format!("Note {index}:")),
-                "the pinned chat ends at the reply that just arrived"
-            );
-            heights.push(f64::NAN);
-            let first = heights.len() - rows.len();
-            for (offset, row) in rows.iter().enumerate() {
-                heights[first + offset] = row.get_bounding_client_rect().height();
-            }
-        }
-        let snapshot = |scroller: &HtmlElement| {
-            let spacer = |selector: &str| {
-                container
-                    .query_selector(selector)
-                    .unwrap()
-                    .map_or(-1.0, |element| element.get_bounding_client_rect().height())
-            };
-            let rows = message_rows(&container)
-                .iter()
-                .map(|row| {
-                    let text = row.text_content().unwrap_or_default();
-                    let text: String = text.trim().chars().take(14).collect();
-                    format!("{}:{}", row.get_bounding_client_rect().height(), text)
-                })
-                .collect::<Vec<_>>();
-            format!(
-                "st={} ch={} sh={} top={} bottom={} rows={rows:?}",
-                scroller.scroll_top(),
-                scroller.client_height(),
-                scroller.scroll_height(),
-                spacer(".virt-spacer-top"),
-                spacer(".virt-spacer-bottom"),
-            )
-        };
-        // The newest reply records its height too; then every row holds its
-        // measured height, so the totals differ only by the run's folded row.
-        measured().await;
-        let at_rest = snapshot(&scroller);
-        assert!(
-            container
-                .query_selector(".ink-actions-summary")
+        answer.set_value("Workspace note");
+        answer
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        for appearance in [ChatAppearance::Current, ChatAppearance::Ink] {
+            state.chat_appearance.set(appearance);
+            settle().await;
+            let current_answer = container
+                .query_selector("input.ask-question-custom")
                 .unwrap()
-                .is_none(),
-            "precondition: the folded run is outside the rendered window: {at_rest}"
-        );
-        let above = heights.len() - message_rows(&container).len();
-        let above_rows: f64 = heights[..above].iter().sum();
-        let top_spacer = container
-            .query_selector(".virt-spacer-top")
-            .unwrap()
-            .expect("the windowed transcript reserves the rows above it")
-            .get_bounding_client_rect()
-            .height();
-        assert!(
-            (top_spacer - above_rows).abs() < 0.5 * above as f64,
-            "precondition: the {above} rows above the window keep their on-screen \
-             heights: spacer {top_spacer}px, rows {above_rows}px; {at_rest}; \
-             heights {heights:?}"
-        );
-        let before = scroller.scroll_height();
-
-        state.tool_output_mode.set(ToolOutputMode::Full);
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap();
+            assert!(
+                answer.is_same_node(Some(current_answer.as_ref())),
+                "appearance switches do not rebuild an interactive decision"
+            );
+            assert_eq!(current_answer.value(), "Workspace note");
+        }
+        let mut question_message = assistant("");
+        question_message.tool_calls.push(protocol::ToolUseData {
+            tool_call_id: "ink-stretch-ask".to_owned(),
+            name: "AskUserQuestion".to_owned(),
+            arguments: serde_json::json!({}),
+            content_offset: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: question_message,
+        }));
+        dispatch(ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+            attempt: 1,
+            max_retries: 3,
+            error: "Transport interrupted".to_owned(),
+            backoff_ms: 250,
+        }));
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: Some("claude-test".to_owned()),
+        }));
+        dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "ink-stretch-send".to_owned(),
+            tool_name: "tyde_send_agent_message".to_owned(),
+            tool_type: protocol::ToolRequestType::TydeSendAgentMessage {
+                agent_id: AgentId("ink-recipient".to_owned()),
+                message: "Inspect the workspace and retain the current layout.\n\n".repeat(40),
+                interrupt: false,
+            },
+        }));
+        dispatch(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "ink-stretch-send".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::TydeSendAgentMessage,
+                },
+            },
+        ));
+        let mut sent_message = assistant("");
+        sent_message.tool_calls.push(protocol::ToolUseData {
+            tool_call_id: "ink-stretch-send".to_owned(),
+            name: "tyde_send_agent_message".to_owned(),
+            arguments: serde_json::json!({}),
+            content_offset: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: sent_message,
+        }));
         settle().await;
-        let after = scroller.scroll_height();
+        let send_header = visible(".tool-card-header")
+            .into_iter()
+            .find(|header| text_of(header).contains("tyde_send_agent_message"))
+            .expect("the message action stays visible in Summary");
+        send_header.dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        let body = container
+            .query_selector(".tool-send-message-body")
+            .unwrap()
+            .expect("the explicitly opened message body is visible in Summary");
+        let send_card = body.closest(".tool-card").unwrap().unwrap();
+        let send_header = send_card.query_selector("summary").unwrap().unwrap();
+        let retry = container
+            .query_selector("[data-test=chat-notice-retry]")
+            .unwrap()
+            .unwrap();
+        let current_question = container
+            .query_selector("input.ask-question-custom")
+            .unwrap()
+            .unwrap()
+            .closest(".tool-card")
+            .unwrap()
+            .unwrap();
+        let gap_before_retry = retry.get_bounding_client_rect().top()
+            - current_question.get_bounding_client_rect().bottom();
+        let gap_after_retry = send_header.get_bounding_client_rect().top()
+            - retry.get_bounding_client_rect().bottom();
+        assert!(gap_before_retry >= 0.0 && gap_after_retry >= 0.0);
         assert!(
-            after > before,
-            "opening a run out of view makes room for its folded action: \
-             {before}px -> {after}px\nbefore: {at_rest}\nafter: {}",
-            snapshot(&scroller)
+            gap_after_retry <= gap_before_retry,
+            "a retry does not create a turn-sized gap inside the same stretch: \
+             before={gap_before_retry}px, after={gap_after_retry}px"
         );
+        let show_more = send_card
+            .query_selector("button.tool-show-more")
+            .unwrap()
+            .expect("the long message has an output disclosure");
+        show_more.dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        assert_eq!(
+            show_more.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        for appearance in [ChatAppearance::Current, ChatAppearance::Ink] {
+            state.chat_appearance.set(appearance);
+            settle().await;
+            let current_body = container
+                .query_selector(".tool-send-message-body")
+                .unwrap()
+                .unwrap();
+            assert!(
+                body.is_same_node(Some(&current_body)),
+                "appearance changes retain identical non-decision bodies"
+            );
+            let current_toggle = current_body
+                .closest(".tool-card")
+                .unwrap()
+                .unwrap()
+                .query_selector("button.tool-show-more")
+                .unwrap()
+                .unwrap();
+            assert!(show_more.is_same_node(Some(&current_toggle)));
+            assert_eq!(
+                current_toggle.get_attribute("aria-expanded").as_deref(),
+                Some("true"),
+                "appearance changes retain the message output expansion"
+            );
+        }
         drop(handle);
         container.remove();
     }
 
     #[wasm_bindgen_test]
-    async fn ink_folds_a_long_tool_list_with_its_overflow_bar() {
+    async fn ink_keeps_the_shared_long_list_overflow_accessible() {
         use crate::appearance::ChatAppearance;
         ensure_styles_loaded();
         let container = make_container();
@@ -3232,34 +3180,35 @@ mod wasm_tests {
         dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
         settle().await;
 
-        let summaries = visible(".ink-actions-summary");
-        assert_eq!(summaries.len(), 1, "the long list folds under one summary");
-        assert!(
-            visible(".tool-list-summary").is_empty(),
-            "a folded run hides its overflow bar with its actions"
-        );
-        assert!(
-            !container
-                .query_selector(".chat-card-assistant")
-                .unwrap()
-                .expect("the reply renders")
-                .dyn_into::<HtmlElement>()
-                .unwrap()
-                .inner_text()
-                .contains("tools hidden"),
-            "no overflow text shows while the run is folded"
-        );
-
-        summaries[0].dyn_ref::<HtmlElement>().unwrap().click();
-        settle().await;
         let bars = visible(".tool-list-summary");
-        assert_eq!(bars.len(), 1, "an open run keeps its overflow bar");
-        assert!(
-            bars[0]
-                .text_content()
-                .unwrap_or_default()
-                .contains("tools hidden")
+        assert_eq!(
+            bars.len(),
+            1,
+            "the existing long-list limit remains explicit, never hidden under an Ink action fold"
         );
+        assert!(
+            !visible(".tool-card-header").is_empty(),
+            "compact action rows are visible by default"
+        );
+        bars[0]
+            .query_selector("button")
+            .unwrap()
+            .unwrap()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        settle().await;
+        let headers = visible(".tool-card-header");
+        assert_eq!(headers.len(), 90);
+        for (index, header) in headers.iter().enumerate() {
+            assert!(
+                header
+                    .text_content()
+                    .unwrap_or_default()
+                    .contains(&format!("python3 step_{index}.py")),
+                "long lists retain chronological action labels"
+            );
+        }
         drop(handle);
         container.remove();
     }
@@ -5757,24 +5706,87 @@ mod wasm_tests {
             "the notice still says what happened and which attempt: {text}"
         );
 
-        let notice_bottom = notice.get_bounding_client_rect().bottom();
-        let later = message_rows(&container)
-            .into_iter()
-            .filter(|row| {
-                let text = row.text_content().unwrap_or_default();
-                text.contains("later turn one") || text.contains("later turn two")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(later.len(), 2, "both later turns rendered");
-        for row in later {
-            let top = row.get_bounding_client_rect().top();
-            assert!(
-                top >= notice_bottom,
-                "a turn that happened after the retry must render below it, not \
+        let assert_order = |notice: &Element| {
+            let notice_bottom = notice.get_bounding_client_rect().bottom();
+            let later = message_rows(&container)
+                .into_iter()
+                .filter(|row| {
+                    let text = row.text_content().unwrap_or_default();
+                    text.contains("later turn one") || text.contains("later turn two")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(later.len(), 2, "both later turns rendered");
+            for row in later {
+                let top = row.get_bounding_client_rect().top();
+                assert!(
+                    top >= notice_bottom,
+                    "a turn that happened after the retry must render below it, not \
                  above; {:?} rendered at {top} with the notice ending at {notice_bottom}",
-                row.text_content().unwrap_or_default(),
-            );
-        }
+                    row.text_content().unwrap_or_default(),
+                );
+            }
+        };
+        assert_order(&notice);
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        next_tick().await;
+        let ink_notice = query(&container, "[data-test='chat-notice-retry']").unwrap();
+        let details = ink_notice
+            .clone()
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .unwrap();
+        let summary = ink_notice.query_selector("summary").unwrap().unwrap();
+        let error = ink_notice.query_selector("p").unwrap().unwrap();
+        assert!(!details.open());
+        assert!(
+            !summary
+                .text_content()
+                .unwrap_or_default()
+                .contains("Rate Limited"),
+            "generic typed retries must not claim a rate-limit classification"
+        );
+        assert!(
+            summary
+                .text_content()
+                .unwrap_or_default()
+                .contains("Attempt 1 of 3")
+        );
+        // Chrome reports a nonzero descendant rect inside closed details.
+        // Test painted text and the enclosing row's space, not that rect.
+        wasm_bindgen_test::console_log!(
+            "Closed retry layout: descendant_height={} row_height={} summary_height={}",
+            error.get_bounding_client_rect().height(),
+            ink_notice.get_bounding_client_rect().height(),
+            summary.get_bounding_client_rect().height()
+        );
+        assert!(
+            !details.inner_text().contains("429 Too Many Requests")
+                && !details.inner_text().contains("Reported backoff"),
+            "closed retry details do not expose their text"
+        );
+        assert!(
+            (ink_notice.get_bounding_client_rect().height()
+                - summary.get_bounding_client_rect().height())
+            .abs()
+                < 0.5,
+            "the retry record is one restrained summary row"
+        );
+        summary.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        assert!(details.open());
+        assert!(error.get_bounding_client_rect().height() > 0.0);
+        assert!(
+            error
+                .text_content()
+                .unwrap_or_default()
+                .contains("429 Too Many Requests")
+        );
+        assert!(
+            details.inner_text().contains("Reported backoff: 4000ms"),
+            "the exact protocol backoff remains accessible with the error details"
+        );
+        assert_order(&ink_notice);
     }
 
     /// A deferred operation is waiting for a safe point, not hung. Saying so

@@ -1,13 +1,11 @@
 /* Ink owns chat presentation only; the surrounding shell keeps its theme. */
 .chat-view[data-chat-appearance="ink"] {
-    --font-sans: Arial, sans-serif;
     --ink-accent: var(--accent-link);
     --ink-user: var(--surface-2);
     --ink-muted: var(--text-secondary);
     --ink-activity-tab-height: 32px;
     background: var(--surface-base);
     color: var(--text-primary);
-    font-size: 1.154rem;
     font-family: var(--font-sans);
 }
 
@@ -45,16 +43,6 @@
     padding-top: 0;
 }
 
-.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-hidden {
-    height: 0;
-    padding: 0;
-    overflow: hidden;
-}
-
-.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-hidden > * {
-    display: none;
-}
-
 .chat-view[data-chat-appearance="ink"] .chat-card-assistant {
     display: flex;
     flex-direction: column;
@@ -62,7 +50,6 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-body {
-    font-size: 1.385rem;
     line-height: 1.45;
 }
 
@@ -116,7 +103,6 @@
 
 .chat-view[data-chat-appearance="ink"] .chat-card-user :is(.chat-card-sender, .chat-card-time) {
     color: var(--text-secondary);
-    font-size: 1rem;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-time {
@@ -162,13 +148,18 @@
     pointer-events: auto;
 }
 
+/* Tool-only continuations have no prose to copy. Their hover metadata must
+   not cover the first action's status or output disclosure. */
+.chat-view[data-chat-appearance="ink"] .ink-continuation.ink-actions-only .chat-card-footer {
+    display: none;
+}
+
 .chat-view[data-chat-appearance="ink"] .ink-continuation .token-badge {
     display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .token-badge {
     font-family: var(--font-sans);
-    font-size: .923rem;
     color: var(--text-secondary);
     flex-wrap: wrap;
     white-space: normal;
@@ -180,7 +171,6 @@
 .chat-view[data-chat-appearance="ink"] .token-stat-agent {
     order: -2;
     color: var(--ink-accent);
-    font-size: 1.154rem;
     font-weight: 600;
     opacity: 1;
     margin-right: 6px;
@@ -193,7 +183,6 @@
     background: var(--accent-subtle);
     color: var(--ink-accent);
     padding: 2px 10px;
-    font-size: .923rem;
     opacity: 1;
 }
 
@@ -204,7 +193,6 @@
 .chat-view[data-chat-appearance="ink"] .footer-time {
     color: var(--text-secondary);
     opacity: 1;
-    font-size: .923rem;
     font-family: var(--font-sans);
 }
 
@@ -245,7 +233,6 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-assistant .chat-card-sender {
-    font-size: 1.154rem;
     color: var(--ink-accent);
 }
 
@@ -255,13 +242,13 @@
     background: var(--accent-subtle);
     color: var(--ink-accent);
     padding: 2px 10px;
-    font: .923rem var(--font-sans);
+    font-family: var(--font-sans);
 }
 
 /* The working stretch: actions, reasoning and tools sit in one lightly
    indented column under flush prose. */
-.chat-view[data-chat-appearance="ink"] .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools, .ink-actions-summary),
-.chat-view[data-chat-appearance="ink"] .chat-card-assistant > .chat-card-phase > :is(.chat-card-tools, .ink-actions-summary) {
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools),
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant > .chat-card-phase > .chat-card-tools {
     margin-left: var(--ink-activity-indent, 28px);
 }
 
@@ -280,7 +267,6 @@
     border-radius: 5px;
     list-style: none;
     color: var(--text-tertiary);
-    font-size: .923rem;
     font-weight: 400;
 }
 
@@ -316,80 +302,6 @@
     margin: 2px 0 8px 2px;
     padding: 4px 0 4px 14px;
     border-left: 1px solid var(--border-primary);
-    font-size: .962rem;
-}
-
-/* One discreet line for a tool group's completed actions. Its cards stay in
-   the group's list, folded until the line opens. */
-.chat-view[data-chat-appearance="ink"] .ink-actions-summary {
-    display: inline-flex;
-    align-self: flex-start;
-    align-items: center;
-    gap: 10px;
-    min-height: 30px;
-    margin-block: 6px 2px;
-    padding: 3px 8px 3px 0;
-    border: 0;
-    border-radius: 5px;
-    background: transparent;
-    color: var(--text-secondary);
-    font: 1rem var(--font-sans);
-    cursor: pointer;
-}
-
-.chat-view[data-chat-appearance="ink"] .ink-actions-summary[aria-expanded="false"] {
-    margin-bottom: 6px;
-}
-
-.chat-view[data-chat-appearance="ink"] .chat-card-assistant > .ink-actions-summary {
-    margin-block: 4px;
-}
-
-.chat-view[data-chat-appearance="ink"] .ink-actions-summary:hover {
-    color: var(--text-primary);
-}
-
-.chat-view[data-chat-appearance="ink"] .ink-actions-check {
-    flex: 0 0 16px;
-    color: var(--text-secondary);
-}
-
-.chat-view[data-chat-appearance="ink"] .ink-actions-chevron {
-    width: 6px;
-    height: 6px;
-    border-right: 1.5px solid currentColor;
-    border-bottom: 1.5px solid currentColor;
-    transform: rotate(-45deg);
-    transition: transform 120ms ease;
-}
-
-.chat-view[data-chat-appearance="ink"] .ink-actions-summary[aria-expanded="true"] .ink-actions-chevron {
-    transform: rotate(45deg);
-}
-
-/* Completed actions lead their list, nested under the summary line. */
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold] {
-    order: -1;
-}
-
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold="open"] {
-    margin-left: var(--ink-nested-indent, 26px);
-}
-
-/* A long list's overflow bar counts the folded actions, so it folds too. */
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold="folded"],
-.chat-view[data-chat-appearance="ink"] .chat-card-tools:has(> [data-ink-fold="folded"]) > .tool-list-summary,
-.chat-view[data-chat-appearance="ink"] .chat-card-tools:not(:has(> :not([data-ink-fold="folded"], .tool-list-summary))) {
-    display: none;
-}
-
-/* An open run lists its actions as one nested column under the summary. */
-.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-follower {
-    padding-top: 0;
-}
-
-.chat-view[data-chat-appearance="ink"] .chat-card-tools[data-ink-run] {
-    margin-block: 0;
 }
 
 /* Each real tool keeps its disclosure/body; only its visual frame changes.
@@ -429,7 +341,6 @@
     margin-inline: -8px;
     padding: 4px 8px;
     border-radius: 5px;
-    font-size: 1rem;
     list-style: none;
 }
 
@@ -450,7 +361,8 @@
     height: 16px;
     color: var(--text-secondary);
     text-align: center;
-    font: 13px/16px var(--font-sans);
+    line-height: 1;
+    font-family: var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-header:has(.failure, .rejected)::before {
@@ -493,7 +405,8 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--text-primary);
-    font: 500 1rem var(--font-sans);
+    font-weight: 500;
+    font-family: var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-detail {
@@ -503,19 +416,18 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--text-secondary);
-    font-size: .962rem;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-completion-summary {
     flex: 0 0 auto;
     margin-left: auto;
     color: var(--text-tertiary);
-    font: .923rem var(--font-sans);
+    font-family: var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-status-text {
     flex: 0 0 auto;
-    font: .923rem var(--font-sans);
+    font-family: var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-status-text.success {
@@ -557,7 +469,6 @@
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     background: var(--surface-0);
-    font-size: .962rem;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-body {
@@ -585,7 +496,7 @@
 .chat-view[data-chat-appearance="ink"] .tool-cwd {
     display: block;
     color: var(--text-tertiary);
-    font: .846rem var(--font-mono);
+    font-family: var(--font-mono);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-result-command-content {
@@ -599,12 +510,10 @@
     border: 0;
     padding: 2px 0;
     color: var(--text-secondary);
-    font-size: .923rem;
     line-height: 1.5;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-exit-code {
-    font-size: .846rem;
     padding: 2px 6px;
 }
 
@@ -653,14 +562,14 @@
     }
 }
 
-.chat-view[data-chat-appearance="ink"] .chat-input-content:focus-within {
+/* A solid accent border under the same-color shimmer erases its motion. */
+.chat-view[data-chat-appearance="ink"] .chat-input-area:not(:has(> .chat-thinking-ring)) > .chat-input-content:focus-within {
     border-color: var(--ink-accent);
 }
 
 .chat-view[data-chat-appearance="ink"] :is(.chat-textarea, .chat-textarea-measure) {
     background: transparent;
     border-color: transparent;
-    font-size: 1.231rem;
     line-height: 1.5;
 }
 
@@ -694,13 +603,12 @@
     max-width: 100%;
     gap: 4px 10px;
     border-left: 0;
-    font: .923rem var(--font-sans);
+    font-family: var(--font-sans);
     white-space: normal;
 }
 
 .chat-view[data-chat-appearance="ink"] :is(.session-task-scope, .session-task-including) {
     color: var(--text-secondary);
-    font-size: inherit;
     opacity: 1;
 }
 
@@ -728,10 +636,6 @@
 @media (max-width: 760px) {
     .chat-view[data-chat-appearance="ink"] .chat-messages {
         padding: 20px 18px 24px;
-    }
-
-    .chat-view[data-chat-appearance="ink"] .chat-card-body {
-        font-size: 1.231rem;
     }
 
     .chat-view[data-chat-appearance="ink"] .chat-card-user {
@@ -795,7 +699,6 @@
 
 .chat-view[data-chat-appearance="ink"] :is(.tool-file-path, .tool-read-file-path) {
     color: var(--text-secondary);
-    font-size: 1rem;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-inline-diff {
@@ -804,13 +707,12 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .inline-diff-code {
-    font-size: 1rem;
     line-height: 1.5;
 }
 
 
 .chat-view[data-chat-appearance="ink"] .chat-textarea {
-    max-height: calc(1.231rem * 1.5 * 5 + 16px);
+    max-height: calc(1.077rem * 1.5 * 5 + 16px);
 }
 
 
@@ -836,7 +738,8 @@
 /* A command reads as the command itself, wrapping in full once opened. */
 .chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail {
     color: var(--text-primary);
-    font: .962rem/1.5 var(--font-mono);
+    line-height: 1.5;
+    font-family: var(--font-mono);
 }
 
 .chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail::before {
@@ -872,7 +775,8 @@
     border-radius: 6px 6px 0 0;
     background: var(--surface-1);
     color: var(--text-primary);
-    font: 500 1.231rem var(--font-sans);
+    font-weight: 500;
+    font-family: var(--font-sans);
     text-align: left;
     cursor: pointer;
 }
@@ -962,7 +866,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font: 1rem var(--font-mono);
+    font-family: var(--font-mono);
     color: var(--text-secondary);
 }
 
@@ -971,7 +875,7 @@
     grid-column: 3;
     grid-row: 1;
     gap: 18px;
-    font: 1rem var(--font-mono);
+    font-family: var(--font-mono);
 }
 
 .chat-view[data-chat-appearance="ink"] .ink-file-added { color: var(--success); }
@@ -1009,14 +913,14 @@
 .chat-view[data-chat-appearance="ink"] .ink-session-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 79;
+    z-index: 40;
 }
 .chat-view[data-chat-appearance="ink"] .session-settings-panel {
     display: block;
     position: absolute;
     right: 14px;
     bottom: calc(100% - 4px);
-    z-index: 80;
+    z-index: 41;
     width: min(420px, calc(100% - 28px));
     max-height: 60vh;
     overflow: auto;
@@ -1057,13 +961,15 @@
     gap: 12px;
 }
 .chat-view[data-chat-appearance="ink"] .session-settings-panel :is(.session-setting-label, .session-setting-value-label) {
-    font: 1.077rem/1.4 var(--font-sans);
+    line-height: 1.4;
+    font-family: var(--font-sans);
     white-space: normal;
 }
 .chat-view[data-chat-appearance="ink"] .session-settings-panel :is(.session-setting-select, .session-setting-number) {
     min-width: 0;
     min-height: 42px;
-    font: 1.077rem/1.4 var(--font-sans);
+    line-height: 1.4;
+    font-family: var(--font-sans);
     border-radius: 8px;
     padding: 9px 32px 9px 12px;
     border-color: var(--border-secondary);
@@ -1081,7 +987,8 @@
 .chat-view[data-chat-appearance="ink"] .chat-send-menu-item {
     min-height: 40px;
     padding: 10px 12px;
-    font: 1.077rem/1.35 var(--font-sans);
+    line-height: 1.35;
+    font-family: var(--font-sans);
     border-radius: 6px;
 }
 .chat-view[data-chat-appearance="ink"] .chat-send-menu-item:hover:not(:disabled) {
@@ -1089,7 +996,7 @@
     color: var(--text-primary);
 }
 .chat-view[data-chat-appearance="ink"] .chat-send-menu-shortcut {
-    font: .923rem var(--font-sans);
+    font-family: var(--font-sans);
 }
 
 @media (max-width: 760px) {
@@ -1121,13 +1028,8 @@
     display: none;
 }
 
-.chat-view[data-chat-appearance="ink"] .file-change-row .inline-diff-line {
-    font-size: 1rem;
-}
-
 .chat-view[data-chat-appearance="ink"] .file-change-row .tool-inline-diff {
     margin-left: 30px;
-    font-size: 1rem;
     line-height: 1.5;
 }
 
@@ -1164,7 +1066,7 @@
     right: 16px;
     bottom: 0;
     left: 16px;
-    z-index: 80;
+    z-index: 30;
     border: 1px solid var(--border-secondary);
     border-bottom: 0;
     border-radius: 12px 12px 0 0;
@@ -1410,4 +1312,35 @@
     .chat-view[data-chat-appearance="ink"] :is(.ink-activity-drawer, .ink-activity-chevron, .ink-activity-reveal, .ink-activity-clip) {
         transition: none;
     }
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-retry {
+    color: var(--text-secondary);
+    font-size: .923rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-retry summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 12px;
+    width: fit-content;
+    padding: 4px 0;
+    cursor: pointer;
+    list-style: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-retry summary::-webkit-details-marker {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-retry-disclosure {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-retry p {
+    margin: 4px 0 8px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }

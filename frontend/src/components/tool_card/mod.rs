@@ -21,7 +21,6 @@ use protocol::{
 };
 use wasm_bindgen::JsCast;
 
-use crate::components::ink_transcript::InkFold;
 use crate::components::workflow_view::{WorkflowRunPanel, run_status_label};
 use crate::state::{
     ActiveAgentRef, AgentInfo, AppState, StreamingToolRequest, TabContent, ToolCallId,
@@ -296,11 +295,7 @@ fn FileChangeGroup(
 pub fn ToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: Vec<ToolRequestEntry>,
-    /// Ink's fold of this list; absent in Current.
-    #[prop(optional, into)]
-    ink_fold: Option<Signal<Option<InkFold>>>,
 ) -> impl IntoView {
-    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     let entries = Arc::new(entries);
     let expanded = RwSignal::new(false);
     let total = entries.len();
@@ -321,7 +316,7 @@ pub fn ToolCardListView(
     });
 
     view! {
-        <div class="chat-card-tools" data-ink-run=move || ink_run_attribute(ink_fold)>
+        <div class="chat-card-tools">
             <For
                 each=move || groups.get()
                 key=|group| group.id.clone()
@@ -350,8 +345,7 @@ pub fn ToolCardListView(
                     }.into_any()
                 } else {
                     group.entries.into_iter().map(|entry| {
-                        let fold = ink_card_fold(ink_fold, entry.request.tool_call_id.clone());
-                        view! { <ToolCardView agent_ref=agent_ref entry=entry ink_fold=fold /> }
+                        view! { <ToolCardView agent_ref=agent_ref entry=entry /> }
                     }).collect::<Vec<_>>().into_any()
                 }}
             </For>
@@ -377,11 +371,7 @@ pub fn ToolCardListView(
 pub fn StreamingToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: ArcRwSignal<Vec<StreamingToolRequest>>,
-    /// Ink's fold of this list; absent in Current.
-    #[prop(optional, into)]
-    ink_fold: Option<Signal<Option<InkFold>>>,
 ) -> impl IntoView {
-    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     let expanded = RwSignal::new(false);
     let group_entries = entries.clone();
     let groups = Memo::new(move |_| {
@@ -406,7 +396,7 @@ pub fn StreamingToolCardListView(
     });
 
     view! {
-        <div class="chat-card-tools" data-ink-run=move || ink_run_attribute(ink_fold)>
+        <div class="chat-card-tools">
             <For
                 each=move || groups.get()
                 key=|group| group.id.clone()
@@ -435,8 +425,7 @@ pub fn StreamingToolCardListView(
                     }.into_any()
                 } else {
                     group.entries.into_iter().map(|tool| {
-                        let fold = ink_card_fold(ink_fold, tool.tool_call_id.clone());
-                        view! { <StreamingToolCardView agent_ref=agent_ref entry=tool.entry ink_fold=fold /> }
+                        view! { <StreamingToolCardView agent_ref=agent_ref entry=tool.entry /> }
                     }).collect::<Vec<_>>().into_any()
                 }}
             </For>
@@ -467,25 +456,10 @@ pub fn StreamingToolCardListView(
 fn StreamingToolCardView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entry: ArcRwSignal<ToolRequestEntry>,
-    #[prop(optional, into)] ink_fold: Option<Signal<Option<&'static str>>>,
 ) -> impl IntoView {
-    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     view! {
-        {move || view! { <ToolCardView agent_ref=agent_ref entry=entry.get() ink_fold=ink_fold /> }}
+        {move || view! { <ToolCardView agent_ref=agent_ref entry=entry.get() /> }}
     }
-}
-
-fn ink_run_attribute(fold: Signal<Option<InkFold>>) -> Option<&'static str> {
-    fold.with(|fold| fold.as_ref().is_some_and(|fold| fold.run).then_some(""))
-}
-
-fn ink_card_fold(
-    fold: Signal<Option<InkFold>>,
-    tool_call_id: String,
-) -> Signal<Option<&'static str>> {
-    Signal::derive(move || {
-        fold.with(|fold| fold.as_ref().and_then(|fold| fold.card(&tool_call_id)))
-    })
 }
 
 #[component]
@@ -571,34 +545,6 @@ fn is_important_tool(entry: &ToolRequestEntry) -> bool {
             .is_some_and(|result| normalization_failure(result).is_some())
 }
 
-/// A succeeded, settled tool Ink folds into its completed-actions line. Live,
-/// failed, decision and file-change cards stay in view.
-pub(crate) fn ink_quiet_action(
-    state: &AppState,
-    agent_id: &protocol::AgentId,
-    entry: &ToolRequestEntry,
-) -> bool {
-    if is_important_tool(entry)
-        || matches!(entry.request.tool_type, ToolRequestType::ModifyFile { .. })
-    {
-        return false;
-    }
-    let key = (
-        agent_id.clone(),
-        ToolCallId(entry.request.tool_call_id.clone()),
-    );
-    !state
-        .tool_progress
-        .with(|map| map.get(&key).cloned())
-        .is_some_and(|progress| {
-            progress.with(|data| match &data.update {
-                ToolProgressUpdate::Workflow(run) => run.status == WorkflowRunStatus::Running,
-                ToolProgressUpdate::SubAgent(progress) => !progress.completed,
-                ToolProgressUpdate::AgentControl(_) | ToolProgressUpdate::Other { .. } => false,
-            })
-        })
-}
-
 #[component]
 pub fn ToolCardView(
     /// The chat's agent, plumbed explicitly from the owning view (`None`
@@ -606,9 +552,6 @@ pub fn ToolCardView(
     /// cards exist there). Never inferred from the active tab.
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entry: ToolRequestEntry,
-    /// Whether Ink folds this card behind its group's summary line.
-    #[prop(optional, into)]
-    ink_fold: Option<Signal<Option<&'static str>>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
@@ -821,6 +764,50 @@ pub fn ToolCardView(
     // the hiding. `Summary` has no body to render until it is opened.
     let render_body_when = move || tool_output_mode.get() != ToolOutputMode::Summary || card_open();
 
+    // Only renderers with different Summary output depend on appearance;
+    // rebuilding identical bodies would discard their disclosure/feedback state.
+    let summary_request_has_output = match &tool_type {
+        ToolRequestType::ModifyFile { .. }
+        | ToolRequestType::RunCommand { .. }
+        | ToolRequestType::ReadFiles { .. }
+        | ToolRequestType::SearchTypes { .. }
+        | ToolRequestType::GetTypeDocs { .. }
+        | ToolRequestType::ViewImage { .. }
+        | ToolRequestType::Other { .. } => true,
+        ToolRequestType::TydeSendAgentMessage { .. }
+        | ToolRequestType::TydeAwaitAgents { .. }
+        | ToolRequestType::AskUserQuestion { .. }
+        | ToolRequestType::ExitPlanMode { .. }
+        | ToolRequestType::AgentSpawn { .. }
+        | ToolRequestType::GenerateImage { .. }
+        | ToolRequestType::WebSearch { .. }
+        | ToolRequestType::Sleep { .. } => false,
+    };
+    let summary_hides_output = match result.as_ref().map(|result| &result.outcome) {
+        Some(
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::NativeContent { .. },
+            }
+            | ToolExecutionOutcome::Failed {
+                result: Some(ToolExecutionResult::NativeContent { .. }),
+                ..
+            },
+        ) => false,
+        Some(ToolExecutionOutcome::Cancelled { .. }) => false,
+        Some(ToolExecutionOutcome::Failed { .. }) => true,
+        Some(ToolExecutionOutcome::Succeeded { .. }) | None => summary_request_has_output,
+    };
+    let body_mode = Memo::new(move |_| {
+        let mode = tool_output_mode.get();
+        if summary_hides_output
+            && mode == ToolOutputMode::Summary
+            && chat_appearance.get() == crate::appearance::ChatAppearance::Ink
+        {
+            ToolOutputMode::Compact
+        } else {
+            mode
+        }
+    });
     view! {
         <details
             class=if normalization_failed { "tool-card tool-card-malformed" } else { "tool-card" }
@@ -829,7 +816,6 @@ pub fn ToolCardView(
                 ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. } => "decision",
                 _ => "tool",
             }
-            data-ink-fold=move || ink_fold.and_then(|fold| fold.get())
             aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
             prop:open=card_open
             on:toggle=move |ev: leptos::ev::Event| {
@@ -895,7 +881,7 @@ pub fn ToolCardView(
                                     })
                                 }}
                                 {move || {
-                                    let mode = tool_output_mode.get();
+                                    let mode = body_mode.get();
                                     tool_call_id_slot.with_value(|tool_call_id| {
                                         body_tool_type_slot.with_value(|body_tool_type| {
                                             body_outcome_slot.with_value(|body_outcome| {
@@ -2051,12 +2037,13 @@ mod live_card_wasm_tests {
                         pending.open(),
                         "the pending disclosure is explicitly open before completion"
                     );
-                    let assert_parameters = || {
+                    let assert_parameters = |pending: bool| {
                         let parameters = container.query_selector(".tool-raw-args").unwrap();
-                        match expected_parameters
-                            .as_ref()
-                            .filter(|_| mode != ToolOutputMode::Summary)
-                        {
+                        // Explicit Ink expansion reveals pending invocation output
+                        // in Summary; native completion keeps its own Summary body.
+                        let show_parameters = mode != ToolOutputMode::Summary
+                            || (pending && appearance == crate::appearance::ChatAppearance::Ink);
+                        match expected_parameters.as_ref().filter(|_| show_parameters) {
                             Some(expected) => {
                                 let parameters =
                                     parameters.expect("invocation parameters remain visible");
@@ -2066,11 +2053,14 @@ mod live_card_wasm_tests {
                                 );
                                 assert!(parameters.get_bounding_client_rect().height() > 0.0);
                             }
-                            None => assert!(parameters.is_none()),
+                            None => assert!(
+                                parameters.is_none(),
+                                "no invocation parameters for appearance={appearance:?} mode={mode:?} pending={pending}"
+                            ),
                         }
                     };
                     assert_eq!(tool_header_status(&container), "Running…");
-                    assert_parameters();
+                    assert_parameters(true);
                     entry.update(|entry| entry.result = Some(completion));
                     next_tick().await;
                     next_tick().await;
@@ -2101,7 +2091,7 @@ mod live_card_wasm_tests {
                         next_tick().await;
                     }
                     assert!(disclosure.open());
-                    assert_parameters();
+                    assert_parameters(false);
                     let output = container
                         .query_selector(".tool-native-content")
                         .unwrap()

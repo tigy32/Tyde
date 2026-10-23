@@ -5,12 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use wasm_bindgen::JsCast;
 
-use crate::components::ink_transcript::{
-    ActionsDisclosure, InkGroupSummary, InkRowLayout, ink_tool_group,
-};
+use crate::components::ink_transcript::InkRowLayout;
 use crate::components::tool_card::StreamingToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, AppState, StreamingState};
+use crate::state::{ActiveAgentRef, StreamingState};
 
 /// Stream-delta cadence at which we re-parse markdown for the in-flight
 /// assistant response. The raw `streaming.text` signal updates on every
@@ -31,9 +29,6 @@ pub fn ChatStreamingView(
     #[prop(optional, into)]
     ink_layout: Option<Signal<Option<InkRowLayout>>>,
 ) -> impl IntoView {
-    let ink_mode = ink_layout
-        .is_some()
-        .then(|| expect_context::<AppState>().tool_output_mode);
     let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
     let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
     let show_header = Memo::new(move |_| {
@@ -57,36 +52,6 @@ pub fn ChatStreamingView(
     let reasoning_has_content = Memo::new(move |_| reasoning.with(|text| !text.is_empty()));
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
-
-    // Ink folds the stream's completed actions in place, so the cards stay
-    // mounted across presentations.
-    let ink_group = ink_mode.map(|mode| {
-        let tool_requests = tool_requests.clone();
-        let group = Memo::new(move |_| {
-            let tools: Vec<(String, ActionsDisclosure)> = tool_requests.with(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| {
-                        let disclosure = tool
-                            .entry
-                            .with(|entry| entry.presentation.actions_disclosure.clone());
-                        (tool.tool_call_id.clone(), disclosure)
-                    })
-                    .collect()
-            });
-            ink_layout.with(|layout| {
-                layout
-                    .as_ref()
-                    .map(|layout| ink_tool_group(layout, mode.get(), &tools, false))
-            })
-        });
-        (mode, group)
-    });
-    let fold = Signal::derive(move || {
-        ink_group.and_then(|(_, group)| {
-            group.with(|group| group.as_ref().map(|group| group.fold.clone()))
-        })
-    });
 
     view! {
         <div class="chat-card chat-card-assistant chat-card-streaming">
@@ -162,13 +127,12 @@ pub fn ChatStreamingView(
                     }
                 }
             </div>
-            {ink_group.map(|(mode, group)| view! { <InkGroupSummary group=group mode=mode /> })}
             {move || {
                 if tool_requests.with(|tools| tools.is_empty()) {
                     None
                 } else {
                     Some(view! {
-                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() ink_fold=fold />
+                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() />
                     })
                 }
             }}

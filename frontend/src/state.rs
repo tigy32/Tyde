@@ -2236,8 +2236,6 @@ pub struct ChatMessageEntry {
 pub struct ToolCardPresentation {
     pub disclosure: ArcRwSignal<(Option<ToolOutputMode>, Option<bool>)>,
     pub change_group_expanded: ArcRwSignal<bool>,
-    /// Ink's completed-actions disclosure containing this tool.
-    pub actions_disclosure: ArcRwSignal<(Option<ToolOutputMode>, Option<bool>)>,
 }
 
 impl Default for ToolCardPresentation {
@@ -2245,7 +2243,6 @@ impl Default for ToolCardPresentation {
         Self {
             disclosure: ArcRwSignal::new((None, None)),
             change_group_expanded: ArcRwSignal::new(true),
-            actions_disclosure: ArcRwSignal::new((None, None)),
         }
     }
 }
