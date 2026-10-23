@@ -15,7 +15,10 @@ use protocol::{
 };
 
 use crate::components::agent_monitor_view::{agent_annotation_target, send_pins_update};
-use crate::components::card_menu::{CardContextMenu, CardMenuPosition, open_card_menu};
+use crate::components::card_menu::{
+    CardContextMenu, CardMenuPosition, open_card_menu, open_card_menu_below,
+};
+use crate::components::launch_menu::LaunchDestination;
 use crate::components::swarm_view::{lifecycle_label, member_is_working, open_swarm_tab};
 use crate::send::{close_agent, send_frame};
 use crate::state::{
@@ -1649,9 +1652,9 @@ pub fn AgentsPanel() -> impl IntoView {
         )
     });
 
-    let launch_target = RwSignal::new(None::<ActiveProjectRef>);
+    let launch_target = RwSignal::new(None::<LaunchDestination>);
     let launch_open = RwSignal::new(false);
-    let launch_project = Memo::new(move |_| launch_target.get());
+    let launch_destination = Memo::new(move |_| launch_target.get());
     let launch = Callback::new(move |target| {
         launch_target.set(Some(target));
         launch_open.set(true);
@@ -1941,7 +1944,11 @@ pub fn AgentsPanel() -> impl IntoView {
                 />
                 <button type="button" class="agents-new-button" title="New agent" aria-label="New agent"
                     on:click=move |_| {
-                        launch_target.set(toolbar_state.active_project_ref_untracked());
+                        launch_target.set(
+                            toolbar_state
+                                .active_project_ref_untracked()
+                                .map(LaunchDestination::Project),
+                        );
                         launch_open.set(true);
                     }><span aria-hidden="true">"+"</span><span class="agents-new-label">"New agent"</span></button>
             </div>
@@ -2011,6 +2018,8 @@ pub fn AgentsPanel() -> impl IntoView {
                         let hosts = projection.hosts.into_iter().map(|host| {
                         let add_project_state = state.clone();
                         let add_project_host = host.key.clone();
+                        let host_id_for_projects = host.key.clone();
+                        let host_label_for_projects = host.label.clone();
                         let custom_groups = host.custom_groups;
                         let custom_groups_view = if custom_groups.is_empty() {
                             ().into_any()
@@ -2214,6 +2223,8 @@ pub fn AgentsPanel() -> impl IntoView {
                                     data-agent-drop-kind="ungroup"
                                 >
                                             {host.projects.into_iter().map(|project| {
+                                                let no_project_host = host_id_for_projects.clone();
+                                                let no_project_host_label = host_label_for_projects.clone();
                                                 let folder_key = format!("project:{}", project.key);
                                                 let member_count = project.row_count();
                                                 let editor = state.project_editor;
@@ -2225,11 +2236,24 @@ pub fn AgentsPanel() -> impl IntoView {
                                                         <div class="agent-sidebar-project-header">
                                                             {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
                                                             {(member_count > 0).then(|| view! { <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span> })}
-                                                            {target.map(|target| view! {
-                                                                <ProjectNewAgent target=target.clone() label=project.label.clone() launch=launch />
-                                                                <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
-                                                                    on:click=move |_| editor.set(Some(target.clone()))>"⋯"</button>
-                                                            })}
+                                                            {match target {
+                                                                Some(target) => view! {
+                                                                    <ProjectNewAgent
+                                                                        destination=LaunchDestination::Project(target.clone())
+                                                                        name=format!("New agent in {}", project.label)
+                                                                        launch=launch
+                                                                    />
+                                                                    <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
+                                                                        on:click=move |_| editor.set(Some(target.clone()))>"⋯"</button>
+                                                                }.into_any(),
+                                                                None => view! {
+                                                                    <ProjectNewAgent
+                                                                        destination=LaunchDestination::NoProject { host_id: no_project_host.clone() }
+                                                                        name=format!("New agent without a project on {no_project_host_label}")
+                                                                        launch=launch
+                                                                    />
+                                                                }.into_any(),
+                                                            }}
                                                         </div>
                                                         {project_members(state.clone(), project.clone(), interactions.clone(), collapsed_folders, folder_key, show_workbenches, launch)}
                                                     </section>
@@ -2277,7 +2301,7 @@ pub fn AgentsPanel() -> impl IntoView {
                 })}
             </leptos::portal::Portal>
             <Show when=move || launch_open.get()>
-                <leptos::portal::Portal><crate::components::launch_menu::LaunchChooser open_sig=launch_open project_context=launch_project /></leptos::portal::Portal>
+                <leptos::portal::Portal><crate::components::launch_menu::LaunchChooser open_sig=launch_open destination=launch_destination /></leptos::portal::Portal>
             </Show>
         </div>
     }
@@ -2290,7 +2314,7 @@ fn project_members(
     collapsed: RwSignal<HashSet<String>>,
     key: String,
     show_workbenches: Memo<bool>,
-    launch: Callback<ActiveProjectRef>,
+    launch: Callback<LaunchDestination>,
 ) -> impl IntoView {
     let expanded_key = key.clone();
     let project_expanded =
@@ -2328,7 +2352,7 @@ fn project_members(
                     <div class="agent-sidebar-project-header agent-sidebar-workbench">
                         {folder_toggle(collapsed, folder_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
                         {(count > 0).then(|| view! { <span class="project-heading-count">{count}</span> })}
-                        <ProjectNewAgent target=target.clone() label=label launch=launch />
+                        <ProjectNewAgent destination=LaunchDestination::Project(target.clone()) name=format!("New agent in {label}") launch=launch />
                         <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
                             on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
                     </div>
@@ -2345,14 +2369,13 @@ fn project_members(
 
 #[component]
 fn ProjectNewAgent(
-    target: ActiveProjectRef,
-    label: String,
-    launch: Callback<ActiveProjectRef>,
+    destination: LaunchDestination,
+    name: String,
+    launch: Callback<LaunchDestination>,
 ) -> impl IntoView {
-    let name = format!("New agent in {label}");
     view! {
         <button type="button" class="project-new-agent" title=name.clone() aria-label=name
-            on:click=move |_| launch.run(target.clone())>"+"</button>
+            on:click=move |_| launch.run(destination.clone())>"+"</button>
     }
 }
 
@@ -2590,23 +2613,6 @@ fn agent_card(
     let agent_id = agent.agent_id.clone();
     let name = agent.name.clone();
     let backend = agent.backend_kind;
-    let workflow_badge_title = agent
-        .workflow
-        .as_ref()
-        .map(|metadata| format!("Workflow run {}", metadata.workflow_run_id));
-    let created = agent.created_at_ms;
-    let custom_agent_id = agent.custom_agent_id.clone();
-    let custom_agent_host_id = agent.host_id.clone();
-    let custom_agent_state = state.clone();
-    let custom_agent_name = move || {
-        custom_agent_id.as_ref().and_then(|id| {
-            custom_agent_state
-                .custom_agents
-                .get()
-                .get(&custom_agent_host_id)
-                .and_then(|map| map.get(id).map(|a| a.name.clone()))
-        })
-    };
 
     let error_msg = agent.fatal_error.clone();
 
@@ -2623,16 +2629,6 @@ fn agent_card(
         open_agent_chat(&click_state, &click_agent);
     };
 
-    let kd_state = state.clone();
-    let kd_agent = agent.clone();
-    let on_keydown_card = move |ev: web_sys::KeyboardEvent| {
-        if matches!(ev.key().as_str(), "Enter" | " ") {
-            ev.prevent_default();
-            // Identical behavior to the mouse handler so the two can't drift.
-            open_agent_chat(&kd_state, &kd_agent);
-        }
-    };
-
     let drag_ref = agent_ref(&agent);
     let pointer_ref = drag_ref.clone();
     let on_pointerdown = move |ev: web_sys::PointerEvent| {
@@ -2647,7 +2643,7 @@ fn agent_card(
             return;
         };
         if target
-            .closest("button, input, textarea, select, a, summary, .sidebar-card-details")
+            .closest("button, input, textarea, select, a, summary")
             .ok()
             .flatten()
             .is_some()
@@ -2665,63 +2661,71 @@ fn agent_card(
         }));
     };
 
-    let move_handle_ref = drag_ref.clone();
-    let move_handle_name = name.clone();
-    let move_handle_state = state.clone();
-    let move_handle_agent = agent.clone();
-    let on_move_handle_keydown = move |ev: web_sys::KeyboardEvent| {
-        ev.stop_propagation();
+    // The row is its own keyboard drop target, the same way it is the pointer
+    // drop target: once an agent is picked up (from the actions menu), focus
+    // walks the rows, groups, and Ungroup, and Space or Enter drops onto the
+    // focused one. Otherwise Space and Enter open the chat.
+    let kd_state = state.clone();
+    let kd_agent = agent.clone();
+    let kd_ref = drag_ref.clone();
+    let on_keydown_card = move |ev: web_sys::KeyboardEvent| {
+        let Some(picked) = keyboard_agent.get_untracked() else {
+            if matches!(ev.key().as_str(), "Enter" | " ") {
+                ev.prevent_default();
+                // Identical behavior to the mouse handler so the two can't drift.
+                open_agent_chat(&kd_state, &kd_agent);
+            }
+            return;
+        };
         match ev.key().as_str() {
             " " | "Enter" => {
                 ev.prevent_default();
-                if let Some(picked) = keyboard_agent.get_untracked() {
-                    if picked == move_handle_ref {
-                        keyboard_agent.set(None);
-                        keyboard_target.set(None);
-                        group_live_status.set("Move cancelled".to_owned());
-                    } else {
-                        drop_agent_on_agent(
-                            &move_handle_state,
-                            Some(picked),
-                            move_handle_agent.clone(),
-                            pending_rename_group_name,
-                            group_live_status,
-                        );
-                        keyboard_agent.set(None);
-                        keyboard_target.set(None);
-                    }
+                ev.stop_propagation();
+                if picked == kd_ref {
+                    group_live_status.set("Move cancelled".to_owned());
                 } else {
-                    keyboard_agent.set(Some(move_handle_ref.clone()));
-                    keyboard_target.set(Some(SidebarDropTarget::Agent(move_handle_ref.clone())));
-                    group_live_status.set(format!(
-                        "Picked up {move_handle_name}. Move focus to a group, agent, or Ungroup and press Space or Enter."
-                    ));
+                    drop_agent_on_agent(
+                        &kd_state,
+                        Some(picked),
+                        kd_agent.clone(),
+                        pending_rename_group_name,
+                        group_live_status,
+                    );
                 }
+                keyboard_agent.set(None);
+                keyboard_target.set(None);
             }
             "Escape" => {
+                ev.stop_propagation();
                 keyboard_agent.set(None);
                 keyboard_target.set(None);
                 group_live_status.set("Move cancelled".to_owned());
             }
             "ArrowDown" | "ArrowRight" => {
                 ev.prevent_default();
-                focus_relative_drop_target(&ev.target().expect("keydown target"), 1);
+                ev.stop_propagation();
+                if let Some(row) = ev.current_target() {
+                    focus_relative_drop_target(&row, 1);
+                }
             }
             "ArrowUp" | "ArrowLeft" => {
                 ev.prevent_default();
-                focus_relative_drop_target(&ev.target().expect("keydown target"), -1);
+                ev.stop_propagation();
+                if let Some(row) = ev.current_target() {
+                    focus_relative_drop_target(&row, -1);
+                }
             }
             _ => {}
         }
     };
-    let move_focus_ref = drag_ref.clone();
-    let on_move_handle_focus = move |_| {
-        keyboard_target.set(Some(SidebarDropTarget::Agent(move_focus_ref.clone())));
+    let focus_drop_ref = drag_ref.clone();
+    let on_card_focus = move |_: web_sys::FocusEvent| {
+        if keyboard_agent.get_untracked().is_some() {
+            keyboard_target.set(Some(SidebarDropTarget::Agent(focus_drop_ref.clone())));
+        }
     };
-    let move_click_name = name.clone();
     let class_drag_ref = drag_ref.clone();
     let aria_drag_ref = drag_ref.clone();
-    let click_drag_ref = drag_ref.clone();
 
     let input_ref = NodeRef::<leptos::html::Input>::new();
 
@@ -2872,15 +2876,12 @@ fn agent_card(
 
     let edit_ref_for_block = agent_ref(&agent);
     let card_anchor = NodeRef::<leptos::html::Div>::new();
-    // The row is one line until the reader asks for more. Details and actions
-    // live behind the chevron and behind right-click; neither appears on hover,
-    // which used to cover the list while the pointer merely crossed it.
-    let expanded = RwSignal::new(false);
+    // The row is one line. Its actions live in one menu, reached by right-click
+    // or by the row's `⋯` button; nothing opens on hover or inside the row.
     let card_menu: CardMenuPosition = RwSignal::new(None);
-    let menu_rename = on_rename.clone();
-    let menu_close = on_close.clone();
-    let menu_compact = on_compact.clone();
-    let menu_compaction_control = compaction_control.clone();
+    let menu_rename = on_rename;
+    let menu_close = on_close;
+    let menu_toggle_pin = toggle_pin.clone();
     let menu_move_ref = drag_ref.clone();
     let menu_move_name = name.clone();
     let on_menu_move = move |_: web_sys::MouseEvent| {
@@ -2895,52 +2896,19 @@ fn agent_card(
                 "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
                 menu_move_name
             ));
+            // The menu item that had focus is gone; the keyboard continues
+            // from the row it picked up.
+            if let Some(card) = card_anchor.get_untracked() {
+                let _ = card.focus();
+            }
         }
     };
     let agent_ref_for_disclosure = agent_ref(&agent);
-    let show_backend_labels = state.sidebar_backend_labels;
     let selected_agent = agent_chat_ref(&agent);
     let selected = {
         let active = state.active_agent;
         Memo::new(move |_| active.get().as_ref() == Some(&selected_agent))
     };
-    let details_host = agent.host_id.clone();
-    let details_workspace = agent.workspace_roots.join(" · ");
-    let context_agent = agent_ref(&agent);
-    let context_agents = state.agents;
-    let context_projects = state.projects;
-    let workbench_context = Memo::new(move |_| {
-        context_agents.with(|agents| {
-            let agent = agents
-                .iter()
-                .find(|agent| agent_ref(agent) == context_agent)?;
-            context_projects.with(|projects| {
-                let project = projects.iter().find(|project| {
-                    project.host_id == agent.host_id
-                        && Some(&project.project.id) == agent.project_id.as_ref()
-                })?;
-                match &project.project.source {
-                    protocol::ProjectSource::GitWorkbench { .. } => {
-                        Some(project.project.name.clone())
-                    }
-                    protocol::ProjectSource::Standalone { .. } => None,
-                }
-            })
-        })
-    });
-    let role_target = agent_chat_ref(&agent);
-    let role_agents = state.agents;
-    let tyde_permissions = Signal::derive(move || {
-        role_agents.with(|agents| {
-            agents
-                .iter()
-                .find(|agent| {
-                    agent.host_id == role_target.host_id && agent.agent_id == role_target.agent_id
-                })
-                .map(|agent| agent.tyde_permissions)
-                .unwrap_or_default()
-        })
-    });
 
     view! {
         <div
@@ -2954,39 +2922,37 @@ fn agent_card(
             node_ref=card_anchor
             data-sidebar-backend=backend_label(backend)
             aria-current=move || if selected.get() { "true" } else { "false" }
-            data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
             draggable="false"
             data-agent-drop-kind="agent"
             data-agent-drop-host=agent.host_id.clone()
             data-agent-drop-id=agent.agent_id.0.clone()
+            data-agent-group-keyboard-target="true"
             aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
+            aria-grabbed=move || {
+                keyboard_agent
+                    .get()
+                    .as_ref()
+                    .is_some_and(|picked| picked == &aria_drag_ref)
+                    .to_string()
+            }
             on:click=on_click
             on:contextmenu=move |ev: web_sys::MouseEvent| open_card_menu(card_menu, &ev)
-            on:keydown=move |ev: web_sys::KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    expanded.set(false);
-                    ev.stop_propagation();
-                } else {
-                    on_keydown_card(ev);
-                }
-            }
+            on:keydown=on_keydown_card
+            on:focus=on_card_focus
             on:pointerdown=on_pointerdown
             on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
         >
             <div class="agent-card-top">
-                <span class="agent-card-grip" aria-hidden="true" title="Drag agent to a group or onto another agent">"⠿"</span>
                 <button
                     type="button"
-                    class="sidebar-card-expand"
-                    aria-expanded=move || expanded.get().to_string()
-                    title=move || if expanded.get() { "Hide details" } else { "Show details and actions" }
-                    aria-label=move || if expanded.get() { "Hide agent details" } else { "Show agent details" }
-                    on:click=move |ev: web_sys::MouseEvent| {
-                        ev.stop_propagation();
-                        expanded.update(|open| *open = !*open);
-                    }
+                    class="agent-card-actions"
+                    aria-haspopup="menu"
+                    aria-expanded=move || card_menu.get().is_some().to_string()
+                    title="Agent actions"
+                    aria-label="Agent actions"
+                    on:click=move |ev: web_sys::MouseEvent| open_card_menu_below(card_menu, &ev)
                     on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
                 >
                     "⋯"
@@ -3121,7 +3087,16 @@ fn agent_card(
                         }
                     }}
                 </Show>
-                <span class=status_class_sig title=status_title_sig>
+                <span
+                    class=move || {
+                        if status_label_visible_sig() {
+                            format!("{} agent-card-status-labelled", status_class_sig())
+                        } else {
+                            status_class_sig().to_string()
+                        }
+                    }
+                    title=status_title_sig
+                >
                     <span aria-hidden="true">{status_icon_sig}</span>
                     <span class=move || {
                         if status_label_visible_sig() {
@@ -3154,130 +3129,6 @@ fn agent_card(
             {move || compaction_error_msg().map(|msg| view! {
                 <div class="agent-card-error agent-card-error-compaction">{msg}</div>
             })}
-            <div class="sidebar-card-details"
-                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
-                on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
-            >
-                <div class="sidebar-card-meta">
-                <span class="agent-tyde-permissions" title=move || format!("Tyde permissions: {}", tyde_permissions.get().label())
-                    aria-label=move || format!("Tyde permissions: {}", tyde_permissions.get().label())>
-                    <crate::components::chat_view::TydePermissionsIcon permissions=tyde_permissions />
-                </span>
-                <Show when=move || show_backend_labels.get()>
-                    <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
-                </Show>
-                <span class="agent-card-time">{relative_time(created)}</span>
-                </div>
-                {move || workbench_context.get().map(|name| view! { <div class="agent-workbench-context" title=format!("Workbench: {name}")>"Workbench: "{name.clone()}</div> })}
-                <details class="sidebar-card-technical">
-                    <summary>"Workspace details"</summary>
-                    <dl><dt>"Host"</dt><dd>{details_host}</dd><dt>"Source roots"</dt><dd class="sidebar-card-workspace">{details_workspace}</dd></dl>
-                </details>
-            <div class="agent-card-bottom">
-                {move || custom_agent_name().map(|n| {
-                    let title = format!("Custom agent: {n}");
-                    view! {
-                        <span class="agent-card-custom-agent" title=title>{n}</span>
-                    }
-                })}
-                {workflow_badge_title.map(|title| view! {
-                    <span class="agent-card-workflow-badge" title=title>"Workflow"</span>
-                })}
-
-            </div>
-                <div class="agent-card-top-actions">
-                    <button
-                        type="button"
-                        class="filter-toggle agent-card-move agent-card-action"
-                        title="Move agent to group"
-                        aria-label="Move agent to group"
-                        aria-grabbed=move || {
-                            keyboard_agent
-                                .get()
-                                .as_ref()
-                                .is_some_and(|picked| picked == &aria_drag_ref)
-                                .to_string()
-                        }
-                        data-agent-group-keyboard-target="true"
-                        on:focus=on_move_handle_focus
-                        on:keydown=on_move_handle_keydown
-                        on:click=move |ev: web_sys::MouseEvent| {
-                            ev.stop_propagation();
-                            if keyboard_agent.get_untracked().as_ref() == Some(&click_drag_ref) {
-                                keyboard_agent.set(None);
-                                keyboard_target.set(None);
-                                group_live_status.set("Move cancelled".to_owned());
-                            } else {
-                                keyboard_agent.set(Some(click_drag_ref.clone()));
-                                keyboard_target.set(Some(SidebarDropTarget::Agent(click_drag_ref.clone())));
-                                group_live_status.set(format!(
-                                    "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
-                                    move_click_name
-                                ));
-                            }
-                        }
-                    >
-                        "\u{2630}"
-                    </button>
-                    <button type="button" class="filter-toggle agent-card-action" title="Move to project…" aria-label="Move to project…"
-                        on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); moving_project.set(true); }>
-                        "Move to project…"
-                    </button>
-                    <button
-                        type="button"
-                        class="filter-toggle agent-card-action"
-                        title="Rename agent"
-                        aria-label="Rename agent"
-                        on:click=on_rename
-                    >
-                        "\u{270E}"
-                    </button>
-                    {move || {
-                        let control = compaction_control();
-                        let enabled = control.is_enabled();
-                        // The reason rides on both `title` and `aria-label` so
-                        // it reaches a pointer user and a screen-reader user
-                        // by the same route.
-                        let label = match control.reason() {
-                            None => "Compact context".to_owned(),
-                            Some(reason) => format!("Compact context — unavailable: {reason}"),
-                        };
-                        view! {
-                            <button
-                                type="button"
-                                class="filter-toggle agent-card-compact agent-card-action"
-                                title=label.clone()
-                                aria-label=label
-                                // `aria-disabled` rather than the native
-                                // `disabled` attribute. A natively-disabled
-                                // button is removed from the tab order, so the
-                                // reason on `title`/`aria-label` is reachable
-                                // only by pointer hover — no keyboard or
-                                // screen-reader user can ever discover why the
-                                // control is unavailable. The click handler
-                                // re-checks the gate, so it is inert either way.
-                                aria-disabled=move || if enabled { "false" } else { "true" }
-                                data-test="agent-card-compact"
-                                on:click=on_compact.clone()
-                                on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                            >
-                                "\u{27F2}"
-                            </button>
-                        }
-                    }}
-                    <button
-                        type="button"
-                        class="filter-toggle agent-card-close agent-card-action"
-                        title="Close agent"
-                        aria-label="Close agent"
-                        disabled=is_tychat
-                        on:click=on_close
-                        on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                    >
-                        "\u{00D7}"
-                    </button>
-                </div>
-            </div>
             <Show when=move || moving_project.get()>
                 <MoveAgentProjectDialog state=move_project_state.clone() agent=move_project_agent.clone() open=moving_project />
             </Show>
@@ -3301,6 +3152,20 @@ fn agent_card(
                     class="context-menu-item"
                     role="menuitem"
                     on:click={
+                        let toggle = menu_toggle_pin.clone();
+                        move |ev: web_sys::MouseEvent| {
+                            card_menu.set(None);
+                            toggle(ev);
+                        }
+                    }
+                >
+                    {move || if is_pinned.get() { "Unpin chat" } else { "Pin chat" }}
+                </button>
+                <button
+                    type="button"
+                    class="context-menu-item"
+                    role="menuitem"
+                    on:click={
                         let pick_up = on_menu_move.clone();
                         move |ev: web_sys::MouseEvent| {
                             card_menu.set(None);
@@ -3315,41 +3180,44 @@ fn agent_card(
                     "Move to project…"
                 </button>
                 {
-                    let control = menu_compaction_control.clone();
-                    let compact = menu_compact.clone();
+                    let control = compaction_control.clone();
+                    let compact = on_compact.clone();
                     move || {
-                        let control = control();
-                        let enabled = control.is_enabled();
-                        // Unavailable stays visible and says why, the same way
-                        // the button in the expanded panel does.
-                        let label = match control.reason() {
-                            None => "Compact context".to_owned(),
-                            Some(reason) => format!("Compact context — unavailable: {reason}"),
-                        };
-                        let compact = compact.clone();
-                        let title = label.clone();
-                        view! {
-                            <button
-                                type="button"
-                                class="context-menu-item"
-                                role="menuitem"
-                                data-test="agent-menu-compact"
-                                aria-disabled=move || if enabled { "false" } else { "true" }
-                                title=title
-                                on:click=move |ev: web_sys::MouseEvent| {
-                                    card_menu.set(None);
-                                    compact(ev);
-                                }
-                            >
-                                {label}
-                            </button>
-                        }
+                    let control = control();
+                    let enabled = control.is_enabled();
+                    // Unavailable stays visible and says why. `aria-disabled`
+                    // rather than `disabled`, so the reason is reachable by
+                    // keyboard and screen reader, not only by hover; the action
+                    // re-checks the gate, so it is inert either way.
+                    let label = match control.reason() {
+                        None => "Compact context".to_owned(),
+                        Some(reason) => format!("Compact context — unavailable: {reason}"),
+                    };
+                    let compact = compact.clone();
+                    let title = label.clone();
+                    view! {
+                        <button
+                            type="button"
+                            class="context-menu-item"
+                            role="menuitem"
+                            data-test="agent-menu-compact"
+                            aria-disabled=move || if enabled { "false" } else { "true" }
+                            title=title
+                            on:click=move |ev: web_sys::MouseEvent| {
+                                card_menu.set(None);
+                                compact(ev);
+                            }
+                        >
+                            {label}
+                        </button>
+                    }
                     }
                 }
                 <button
                     type="button"
                     class="context-menu-item"
                     role="menuitem"
+                    disabled=is_tychat
                     on:click={
                         let close = menu_close.clone();
                         move |ev: web_sys::MouseEvent| {
@@ -3814,17 +3682,43 @@ mod wasm_tests {
             .expect("dispatch contextmenu event");
     }
 
-    /// Open a row's details panel, where its actions live.
-    fn expand_row(container: &HtmlElement, agent_id: &str) {
-        container
-            .query_selector(&format!(
-                "[data-agent-id='{agent_id}'] .sidebar-card-expand"
-            ))
+    /// Open a row's actions menu from its visible `⋯` button.
+    async fn open_row_menu(row: &web_sys::Element) {
+        row.query_selector(".agent-card-actions")
             .unwrap()
-            .unwrap_or_else(|| panic!("row {agent_id} should offer a chevron"))
+            .expect("every agent row offers its actions")
             .dyn_into::<HtmlElement>()
             .unwrap()
             .click();
+        next_tick().await;
+    }
+
+    /// Pick a row up for a keyboard move, through its actions menu.
+    async fn pick_up_for_keyboard_move(container: &HtmlElement, agent_id: &str) {
+        open_row_menu(&agent_card_el(container, agent_id)).await;
+        menu_item(container, "Move to group").click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+    }
+
+    /// Every item of the open card menu: its text, `aria-disabled`, and
+    /// whether it is natively disabled.
+    fn open_menu_items(container: &HtmlElement) -> Vec<(String, Option<String>, bool)> {
+        let items = container
+            .query_selector_all(".sidebar-card-menu [role='menuitem']")
+            .unwrap();
+        (0..items.length())
+            .map(|index| {
+                let item: web_sys::HtmlButtonElement =
+                    items.item(index).unwrap().dyn_into().unwrap();
+                (
+                    item.text_content().unwrap_or_default(),
+                    item.get_attribute("aria-disabled"),
+                    item.disabled(),
+                )
+            })
+            .collect()
     }
 
     /// The open card menu's item with this label.
@@ -4086,20 +3980,24 @@ mod wasm_tests {
         });
     }
 
-    /// The control is always rendered; unavailability is reported through
-    /// `aria-disabled` plus a reason on the accessible name.
-    fn compact_btn_state(container: &HtmlElement) -> (HtmlElement, bool, String) {
-        let btn = compact_btn(container).expect("the compact control is always rendered");
-        let enabled = btn.get_attribute("aria-disabled").as_deref() == Some("false");
-        let label = btn.get_attribute("aria-label").unwrap_or_default();
-        (btn, enabled, label)
-    }
-
-    fn compact_btn(container: &HtmlElement) -> Option<HtmlElement> {
-        container
-            .query_selector(".agent-card-compact")
+    /// Opens the first row's actions menu and returns its Compact item. The
+    /// item is always offered; unavailability is reported through
+    /// `aria-disabled` plus a reason in its name.
+    async fn compact_btn_state(container: &HtmlElement) -> (HtmlElement, bool, String) {
+        let row = container
+            .query_selector(".agent-card")
             .unwrap()
-            .map(|e| e.dyn_into::<HtmlElement>().unwrap())
+            .expect("an agent row is rendered");
+        open_row_menu(&row).await;
+        let btn: HtmlElement = container
+            .query_selector("[data-test='agent-menu-compact']")
+            .unwrap()
+            .expect("the actions menu always offers Compact context")
+            .dyn_into()
+            .unwrap();
+        let enabled = btn.get_attribute("aria-disabled").as_deref() == Some("false");
+        let label = btn.text_content().unwrap_or_default();
+        (btn, enabled, label)
     }
 
     /// Mount `AgentsPanel` and return the handle. Caller MUST bind the
@@ -4123,96 +4021,13 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn sidebar_tyde_permissions_react_on_the_same_row_without_crossing_hosts() {
-        let _calls = install_send_stub_with_dialog_ok();
-        let state = make_app_state("local");
-        crate::dispatch::prime_host_for_tests(&state, "local");
-        crate::dispatch::prime_host_for_tests(&state, "remote");
-        state.configured_hosts.set(vec![
-            configured_host("local", "Local Host"),
-            configured_host("remote", "Remote Host"),
-        ]);
-        push_agent(
-            &state,
-            "local",
-            "same-lock-agent",
-            "Local locked agent",
-            true,
-        );
-        push_agent(
-            &state,
-            "remote",
-            "same-lock-agent",
-            "Remote unlocked agent",
-            true,
-        );
-        state
-            .agents
-            .update(|agents| agents[0].tyde_permissions = protocol::AgentTydePermissions::Root);
-        let container = make_container();
-        let _handle = mount_panel(&container, state.clone());
-        next_tick().await;
-        let indicator = |host: &str| {
-            container
-                .query_selector(&format!(
-                    "[data-host-id='{host}'] [aria-label^='Tyde permissions:']"
-                ))
-                .unwrap()
-        };
-        let role = |host: &str| {
-            indicator(host)
-                .unwrap()
-                .get_attribute("aria-label")
-                .unwrap()
-        };
-        assert_eq!(role("local"), "Tyde permissions: Root");
-        assert_eq!(role("remote"), "Tyde permissions: Agent");
-        assert!(
-            indicator("local")
-                .unwrap()
-                .text_content()
-                .unwrap()
-                .trim()
-                .is_empty()
-        );
-        let apply = |host: &str, seq, access| {
-            dispatch_frame(
-                &state,
-                host,
-                StreamPath(format!("/host/{host}")),
-                FrameKind::AgentTydePermissionsChanged,
-                seq,
-                &protocol::AgentTydePermissionsChangedPayload {
-                    agent_id: AgentId("same-lock-agent".to_owned()),
-                    access,
-                },
-            )
-        };
-        apply("local", 0, protocol::AgentTydePermissions::Orchestrator);
-        next_tick().await;
-        assert_eq!(role("local"), "Tyde permissions: Tyde Orchestrator");
-        assert_eq!(role("remote"), "Tyde permissions: Agent");
-        apply("remote", 0, protocol::AgentTydePermissions::Root);
-        next_tick().await;
-        assert_eq!(role("remote"), "Tyde permissions: Root");
-        apply("local", 1, protocol::AgentTydePermissions::Agent);
-        next_tick().await;
-        assert_eq!(role("local"), "Tyde permissions: Agent");
-        assert_eq!(
-            role("remote"),
-            "Tyde permissions: Root",
-            "Changing another host must not change this row"
-        );
-    }
-
-    #[wasm_bindgen_test]
     async fn compact_cards_keep_identity_and_offer_persistent_color_only_mode() {
         use crate::components::sessions_panel::SessionsPanel;
         use crate::components::settings_panel::{SettingsPanel, restore_appearance};
         use crate::state::SessionInfo;
         use protocol::{SessionId, SessionSummary};
 
-        install_send_stub_with_dialog_ok();
+        let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
         push_agent(
@@ -4222,6 +4037,7 @@ mod wasm_tests {
             "Review authentication flow",
             true,
         );
+        push_agent(&state, "local", "neighbour-card", "Neighbour chat", true);
         state.agents.update(|agents| {
             agents
                 .iter_mut()
@@ -4266,6 +4082,7 @@ mod wasm_tests {
             next_tick().await;
         }
         let agent = agent_card_el(&container, "compact-card");
+        let neighbour = agent_card_el(&container, "neighbour-card");
         let history: HtmlElement = container
             .query_selector(".session-card")
             .unwrap()
@@ -4280,19 +4097,26 @@ mod wasm_tests {
             "Agent identity uses the shared backend glyph"
         );
         assert!(
-            agent
-                .query_selector(".agent-card-top .backend-badge")
-                .unwrap()
-                .is_none(),
-            "Agent heading does not duplicate backend identity"
+            agent.query_selector(".backend-badge").unwrap().is_none(),
+            "An agent row does not repeat its backend as text"
         );
-        for card in [&agent, &history] {
-            let height = card.get_bounding_client_rect().height();
-            assert!(
-                (30.0..=40.0).contains(&height),
-                "a normal row must fit on one compact line, got {height}px"
-            );
-        }
+        // A conversation row is one 20px line plus 4px of padding above and
+        // below it: nothing reserves room for a handle or a hidden panel.
+        let collapsed_height = agent.get_bounding_client_rect().height();
+        assert!(
+            (27.0..=29.0).contains(&collapsed_height),
+            "an agent row must be one 28px line, got {collapsed_height}px"
+        );
+        let history_height = history.get_bounding_client_rect().height();
+        assert!(
+            (30.0..=40.0).contains(&history_height),
+            "a saved conversation stays one compact line, got {history_height}px"
+        );
+        let row_text = agent.text_content().unwrap_or_default();
+        assert!(
+            !row_text.contains('⠿'),
+            "no row carries a permanent drag grip, got {row_text:?}"
+        );
         for card in [&history] {
             let label = card.query_selector(".backend-badge").unwrap().unwrap();
             let window = web_sys::window().unwrap();
@@ -4313,146 +4137,36 @@ mod wasm_tests {
                 "the backend label must teach the matching edge color"
             );
         }
-        // Nothing opens on hover or on focus any more: a row stays one line
-        // until the reader asks it for more. The hover popover this replaces
-        // covered the rows underneath whenever the pointer merely crossed the
-        // list, and a click left it stranded over the view it had just opened.
-        let collapsed_height = agent.get_bounding_client_rect().height();
+        // Nothing opens on hover or on focus: a row stays one line.
         agent.focus().unwrap();
         next_tick().await;
-        let details = agent
-            .query_selector(".sidebar-card-details")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            details.get_bounding_client_rect().height(),
-            0.0,
-            "focusing a row must not open anything over the list"
-        );
         assert_eq!(
             agent.get_bounding_client_rect().height(),
             collapsed_height,
-            "and it must not grow the row"
+            "focusing a row must not grow it"
         );
 
-        // The chevron is the affordance that says the row has more, and the
-        // expansion opens inside the row rather than over its neighbours.
-        let chevron: HtmlElement = agent
-            .query_selector(".sidebar-card-expand")
+        // The row's `⋯` is a menu button for the same menu right-click opens,
+        // not a disclosure: nothing expands inside the row.
+        let actions: HtmlElement = agent
+            .query_selector(".agent-card-actions")
             .unwrap()
-            .expect("every row offers a chevron")
+            .expect("every agent row offers its actions")
             .dyn_into()
             .unwrap();
+        assert_eq!(actions.text_content().as_deref(), Some("⋯"));
         assert_eq!(
-            chevron.get_attribute("aria-expanded").as_deref(),
-            Some("false"),
-            "a collapsed row says so"
+            actions.get_attribute("aria-label").as_deref(),
+            Some("Agent actions")
         );
-        chevron.click();
-        next_tick().await;
         assert_eq!(
-            chevron.get_attribute("aria-expanded").as_deref(),
-            Some("true")
+            actions.get_attribute("aria-haspopup").as_deref(),
+            Some("menu")
         );
-        let details_text = details.text_content().unwrap_or_default();
-        let title = agent
-            .query_selector(".agent-card-name")
-            .unwrap()
-            .unwrap()
-            .text_content()
-            .unwrap();
-        assert!(
-            !details_text.contains(&title),
-            "Expanded information must not repeat the visible chat title"
-        );
-        let technical = details
-            .query_selector(".sidebar-card-technical")
-            .unwrap()
-            .expect("Technical details stay accessible");
-        let roots = technical
-            .query_selector("dd.sidebar-card-workspace")
-            .unwrap()
-            .unwrap();
-        assert!(!technical.has_attribute("open"));
-        let compact_height = agent.get_bounding_client_rect().height();
-        technical
-            .query_selector("summary")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
-        next_tick().await;
-        // Closed native details can retain child rectangles in Chrome. Their
-        // contribution to the visible card, not that cached child box, matters.
-        let technical_height = agent.get_bounding_client_rect().height();
-        eprintln!(
-            "Technical disclosure geometry: compact={compact_height}, open={technical_height}"
-        );
-        assert!(technical.has_attribute("open"));
-        assert!(
-            technical_height > compact_height,
-            "Opening technical details makes room for the source roots"
-        );
-        assert_eq!(roots.text_content().unwrap(), "/workspace/ui-review");
-        technical
-            .query_selector("summary")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
-        next_tick().await;
-        assert!(
-            details_text.contains("Claude"),
-            "the expanded row names its backend, got: {details_text:?}"
-        );
-        assert!(
-            details.get_bounding_client_rect().height() > 40.0,
-            "the expanded details are readable, not a sliver"
-        );
-        assert!(
-            agent.get_bounding_client_rect().height() > collapsed_height,
-            "the details belong to the row: expanding grows it"
-        );
-        // The same actions right-click offers are here too, because right-click
-        // is not an affordance anyone can see.
-        for action in [
-            ".agent-card-move",
-            ".agent-card-compact",
-            ".agent-card-close",
-        ] {
-            let button: HtmlElement = details
-                .query_selector(action)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{action} must live in the expanded row"))
-                .dyn_into()
-                .unwrap();
-            assert!(
-                button.get_bounding_client_rect().height() > 0.0,
-                "{action} must be visible once the row is expanded"
-            );
-        }
-
-        let escape = web_sys::KeyboardEventInit::new();
-        escape.set_key("Escape");
-        escape.set_bubbles(true);
-        agent
-            .dispatch_event(
-                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
-                    .unwrap(),
-            )
-            .unwrap();
-        next_tick().await;
         assert_eq!(
-            agent.get_bounding_client_rect().height(),
-            collapsed_height,
-            "Escape puts the row back to one line"
+            actions.get_attribute("aria-expanded").as_deref(),
+            Some("false")
         );
-
-        // Right-click is the fast path to the same actions. It has to be, since
-        // the chevron is the only visible affordance and a menu the pointer
-        // user expects must still be there.
         assert!(
             container
                 .query_selector(".sidebar-card-menu")
@@ -4460,25 +4174,76 @@ mod wasm_tests {
                 .is_none(),
             "no menu until it is asked for"
         );
-        dispatch_context_menu(&agent, 40.0, 60.0);
+        actions.click();
         next_tick().await;
         let menu = container
             .query_selector(".sidebar-card-menu")
             .unwrap()
-            .expect("right-clicking a row opens its actions");
-        let menu_text = menu.text_content().unwrap_or_default();
-        for item in [
-            "Rename agent",
-            "Move to group",
-            "Move to project…",
-            "Compact context",
-            "Close agent",
-        ] {
-            assert!(
-                menu_text.contains(item),
-                "the menu must offer {item}, got: {menu_text:?}"
-            );
-        }
+            .expect("the row's actions button opens its menu");
+        assert!(
+            agent.contains(Some(&menu)),
+            "the menu belongs to the row whose button was pressed"
+        );
+        assert_eq!(
+            actions.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let menu_rect = menu.get_bounding_client_rect();
+        let actions_rect = actions.get_bounding_client_rect();
+        assert!(
+            (menu_rect.top() - actions_rect.bottom()).abs() <= 1.0
+                && menu_rect.left() <= actions_rect.left() + 1.0
+                && menu_rect.right() >= actions_rect.right() - 1.0,
+            "the menu opens directly under its button"
+        );
+        assert_eq!(
+            agent.get_bounding_client_rect().height(),
+            collapsed_height,
+            "opening the actions does not expand the row"
+        );
+        let row_text = agent
+            .query_selector(".agent-card-top")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            !row_text.contains("ui-review") && !row_text.contains("Claude"),
+            "the row shows no inline details, got {row_text:?}"
+        );
+        assert!(
+            agent
+                .query_selector(".sidebar-card-details")
+                .unwrap()
+                .is_none(),
+            "an agent row has no inline details panel"
+        );
+        let from_button = open_menu_items(&container);
+        let labels: Vec<&str> = from_button
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            6,
+            "the actions menu offers every row action: {labels:?}"
+        );
+        assert_eq!(
+            [labels[0], labels[1], labels[2], labels[3], labels[5]],
+            [
+                "Rename agent",
+                "Pin chat",
+                "Move to group",
+                "Move to project…",
+                "Close agent",
+            ],
+        );
+        assert!(
+            labels[4].starts_with("Compact context — unavailable:")
+                && from_button[4].1.as_deref() == Some("true"),
+            "unavailable compaction stays visible and says why: {:?}",
+            from_button[4]
+        );
         dispatch_key(&menu.clone().dyn_into::<HtmlElement>().unwrap(), "Escape");
         next_tick().await;
         assert!(
@@ -4489,6 +4254,10 @@ mod wasm_tests {
             "Escape closes the menu"
         );
         assert_eq!(
+            actions.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
             document()
                 .active_element()
                 .map(|el| el.is_same_node(Some(&agent))),
@@ -4496,17 +4265,40 @@ mod wasm_tests {
             "dismissing the menu returns the keyboard to the row it came from"
         );
 
-        // A menu item does the row's own action, then gets out of the way.
+        // Right-click is the fast path to the very same menu.
         dispatch_context_menu(&agent, 40.0, 60.0);
+        next_tick().await;
+        let menu = container
+            .query_selector(".sidebar-card-menu")
+            .unwrap()
+            .expect("right-clicking a row opens its actions");
+        assert!(agent.contains(Some(&menu)));
+        assert_eq!(
+            open_menu_items(&container),
+            from_button,
+            "right-click and the actions button open one menu, with the same availability"
+        );
+        dispatch_key(&menu.clone().dyn_into::<HtmlElement>().unwrap(), "Escape");
+        next_tick().await;
+
+        // A menu item does its own row's action, then gets out of the way.
+        actions.click();
         next_tick().await;
         menu_item(&container, "Rename agent").click();
         next_tick().await;
         assert!(
-            container
+            agent
                 .query_selector(".agent-card-name-input")
                 .unwrap()
                 .is_some(),
-            "Rename from the menu opens the row's own name editor"
+            "Rename from the menu opens this row's own name editor"
+        );
+        assert!(
+            neighbour
+                .query_selector(".agent-card-name-input")
+                .unwrap()
+                .is_none(),
+            "and no other row's"
         );
         assert!(
             container
@@ -4525,6 +4317,66 @@ mod wasm_tests {
             "Escape",
         );
         next_tick().await;
+
+        // The pin item asks the server to change this row's pin, and the menu
+        // follows the server's authoritative pin state.
+        let pin_requests = || -> Vec<(JsonValue, String)> {
+            recorded_frames(&calls)
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "set_agent_pins")
+                .map(|(_, payload, stream)| (payload["update"].clone(), stream))
+                .collect()
+        };
+        let row_actions = || -> HtmlElement {
+            agent_card_el(&container, "compact-card")
+                .query_selector(".agent-card-actions")
+                .unwrap()
+                .expect("the row offers its actions")
+                .dyn_into()
+                .unwrap()
+        };
+        let pins_from_server = |pinned: Vec<AgentAnnotationTarget>| {
+            let mut snapshot = state.agents_view_preferences.get_untracked();
+            snapshot.pins.pinned = pinned;
+            state.apply_agents_view_snapshot("local", snapshot);
+        };
+        pins_from_server(Vec::new());
+        next_tick().await;
+        row_actions().click();
+        next_tick().await;
+        menu_item(&container, "Pin chat").click();
+        next_tick().await;
+        let pin_frame = |kind: &str| {
+            (
+                serde_json::json!({"kind": kind, "target": local_target("compact-card")}),
+                "/host/local".to_owned(),
+            )
+        };
+        assert_eq!(
+            pin_requests(),
+            vec![pin_frame("pin")],
+            "the menu pins exactly this row, on its own host"
+        );
+        pins_from_server(vec![local_target("compact-card")]);
+        next_tick().await;
+        row_actions().click();
+        next_tick().await;
+        assert!(
+            open_menu_items(&container)
+                .iter()
+                .any(|(text, _, _)| text == "Unpin chat"),
+            "a pinned row's menu offers Unpin"
+        );
+        menu_item(&container, "Unpin chat").click();
+        next_tick().await;
+        assert_eq!(
+            pin_requests(),
+            vec![pin_frame("pin"), pin_frame("unpin")],
+            "Unpin from the menu unpins the same row"
+        );
+        pins_from_server(Vec::new());
+        next_tick().await;
+        let agent = agent_card_el(&container, "compact-card");
 
         // A saved conversation is the same row shape, with its own actions.
         let history_chevron: HtmlElement = history
@@ -4595,13 +4447,16 @@ mod wasm_tests {
         assert!(toggle.checked(), "backend labels are visible by default");
         toggle.click();
         next_tick().await;
-        for card in [&agent, &history] {
-            assert!(
-                card.query_selector(".backend-badge").unwrap().is_none(),
-                "color-only mode removes the inline label"
-            );
-            assert!(card.get_bounding_client_rect().height() <= 40.0);
-        }
+        assert!(
+            history.query_selector(".backend-badge").unwrap().is_none(),
+            "color-only mode removes the inline label"
+        );
+        assert!(history.get_bounding_client_rect().height() <= 40.0);
+        assert_eq!(
+            agent.get_bounding_client_rect().height(),
+            collapsed_height,
+            "an agent row has no label to remove, so it does not change"
+        );
         let restored = AppState::new();
         restore_appearance(&restored);
         restored.settings_open.set(true);
@@ -4625,12 +4480,14 @@ mod wasm_tests {
         reopened.remove();
         toggle.click();
         next_tick().await;
-        for card in [&agent, &history] {
-            assert!(
-                card.query_selector(".backend-badge").unwrap().is_some(),
-                "turning labels back on restores both lists immediately"
-            );
-        }
+        assert!(
+            history.query_selector(".backend-badge").unwrap().is_some(),
+            "turning labels back on restores them immediately"
+        );
+        assert!(
+            agent.query_selector(".backend-badge").unwrap().is_none(),
+            "and still never adds one to an agent row"
+        );
         drop(handle);
         container.remove();
     }
@@ -5085,14 +4942,21 @@ mod wasm_tests {
             (18.0, 18.0),
             "Provider slot stays compact and square"
         );
-        // Native QA renders the approved two-line parent at 50px and leaves
-        // at 36px. Keep the original compact-row bound for leaf conversations.
+        // A leaf conversation is one 28px line: no grip, no reserved space.
+        let leaf = agent_card_el(&container, "beta-agent");
         assert!(
-            agent_card_el(&container, "beta-agent")
-                .get_bounding_client_rect()
-                .height()
-                <= 40.0,
+            leaf.get_bounding_client_rect().height() <= 29.0,
             "Conversations without a child disclosure remain compact"
+        );
+        assert!(
+            !container
+                .query_selector(".agents-panel")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default()
+                .contains('⠿'),
+            "No row carries a permanent drag grip"
         );
         let name = selected
             .query_selector(".agent-card-name")
@@ -5293,6 +5157,79 @@ mod wasm_tests {
             .unwrap()
             .click();
         next_tick().await;
+
+        // Each No project heading offers the same New agent button as a
+        // project, and it launches into No project on that heading's own
+        // host, never into the active project or another host.
+        let project_add = container
+            .query_selector("[data-project-key='local:empty'] button[title^='New agent in']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        for (host, host_label) in [("remote", "Remote Host"), ("local", "Local Host")] {
+            let group = container
+                .query_selector(&format!("[data-project-key='{host}:no-project']"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{host} renders its No project group"));
+            let rows = group.query_selector_all(".agent-card").unwrap().length();
+            assert!(
+                rows > 0,
+                "{host}'s No project group holds its unscoped chat"
+            );
+            let header_text = group
+                .query_selector(".agent-sidebar-project-header")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default();
+            let add: HtmlElement = group
+                .query_selector(".agent-sidebar-project-header button.project-new-agent")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{host}'s No project heading offers New agent"))
+                .dyn_into()
+                .unwrap();
+            assert_eq!(add.text_content().as_deref(), Some("+"));
+            assert_eq!(
+                add.get_attribute("aria-label"),
+                Some(format!("New agent without a project on {host_label}"))
+            );
+            let add_rect = add.get_bounding_client_rect();
+            assert_eq!(
+                (add_rect.width(), add_rect.height()),
+                (project_add.width(), project_add.height()),
+                "No project's button is the same unobtrusive control a project has"
+            );
+            add.click();
+            next_tick().await;
+            assert_destination(host, host_label, "No project / Home");
+            assert_eq!(
+                state.active_project.get_untracked(),
+                original_selection,
+                "Opening the chooser cannot navigate"
+            );
+            dialog()
+                .query_selector("[aria-label='Close agent chooser']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            next_tick().await;
+            assert_eq!(
+                group.query_selector_all(".agent-card").unwrap().length(),
+                rows
+            );
+            assert_eq!(
+                group
+                    .query_selector(".agent-sidebar-project-header")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default(),
+                header_text,
+                "the heading and its count are unchanged"
+            );
+        }
         remote_new().click();
         next_tick().await;
         assert_destination("remote", "Remote Host", "Empty Remote Project");
@@ -5449,14 +5386,6 @@ mod wasm_tests {
         workbench_checkbox.click();
         next_tick().await;
         assert!(workbench_checkbox.checked());
-        agent_card_el(&container, "workbench-agent")
-            .query_selector(".sidebar-card-expand")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
-        next_tick().await;
         container
             .query_selector("[aria-label='Project: Beta Project']")
             .unwrap()
@@ -5465,13 +5394,6 @@ mod wasm_tests {
             .unwrap()
             .click();
         next_tick().await;
-        assert_eq!(
-            agent_card_el(&container, "workbench-agent")
-                .get_attribute("data-expanded")
-                .as_deref(),
-            Some("true"),
-            "Collapsing another project preserves an open conversation's details"
-        );
         let bench = container
             .query_selector("[data-project-key='local:alpha'] [data-project-id='alpha-workbench']")
             .unwrap()
@@ -7794,14 +7716,8 @@ mod wasm_tests {
         );
 
         let parent = agent_card_el(&container, "parent-alpha");
-        expand_row(&container, "parent-alpha");
-        parent
-            .query_selector("[aria-label='Rename agent']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        open_row_menu(&parent).await;
+        menu_item(&container, "Rename agent").click();
         next_tick().await;
         assert_eq!(
             container
@@ -8071,19 +7987,8 @@ mod wasm_tests {
             "Ungroup target should not clutter the sidebar before keyboard pickup"
         );
 
-        // The handle lives in the row's expanded panel, which is where a
-        // keyboard user reaches it.
-        expand_row(&container, "beta-agent");
-        let move_button: HtmlElement = container
-            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
-            .unwrap()
-            .expect("move handle")
-            .dyn_into()
-            .unwrap();
-        dispatch_key(&move_button, " ");
-        for _ in 0..4 {
-            next_tick().await;
-        }
+        // A keyboard user picks a row up from its actions menu.
+        pick_up_for_keyboard_move(&container, "beta-agent").await;
         assert!(
             container
                 .query_selector(".agent-ungroup-drop-target")
@@ -8117,19 +8022,8 @@ mod wasm_tests {
             "Ungroup target should stay hidden when groups exist but no move is active"
         );
 
-        // The handle lives in the row's expanded panel, which is where a
-        // keyboard user reaches it.
-        expand_row(&container, "beta-agent");
-        let move_button: HtmlElement = container
-            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
-            .unwrap()
-            .expect("move handle")
-            .dyn_into()
-            .unwrap();
-        dispatch_key(&move_button, " ");
-        for _ in 0..4 {
-            next_tick().await;
-        }
+        // A keyboard user picks a row up from its actions menu.
+        pick_up_for_keyboard_move(&container, "beta-agent").await;
         let ungroup_target: HtmlElement = container
             .query_selector(".agent-ungroup-drop-target")
             .unwrap()
@@ -8221,17 +8115,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        expand_row(&container_no_groups, "beta-agent");
-        let move_button: HtmlElement = container_no_groups
-            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
-            .unwrap()
-            .expect("move handle")
-            .dyn_into()
-            .unwrap();
-        dispatch_key(&move_button, " ");
-        for _ in 0..4 {
-            next_tick().await;
-        }
+        pick_up_for_keyboard_move(&container_no_groups, "beta-agent").await;
         assert_eq!(
             count(&container_no_groups),
             0,
@@ -8352,7 +8236,7 @@ mod wasm_tests {
         }
 
         // Capability unknown → visible, disabled, and it says why.
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "unknown capability must not optimistically enable"
@@ -8367,7 +8251,7 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let (btn, enabled, label) = compact_btn_state(&container);
+        let (btn, enabled, label) = compact_btn_state(&container).await;
         assert!(enabled, "a declared-available idle agent is compactable");
         assert_eq!(
             label, "Compact context",
@@ -8463,7 +8347,7 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render for the initializing agent"
         );
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "compact must be refused while the agent is still initializing"
@@ -8498,7 +8382,7 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render for the thinking agent"
         );
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             enabled,
             "an active turn must not refuse a request the server would defer: {label}"
@@ -8726,7 +8610,7 @@ mod wasm_tests {
                 .with_untracked(|map| map.get(&AgentId("a-blank".to_owned())).is_none()),
             "precondition: this agent has no loaded rows"
         );
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             enabled,
             "an agent with no loaded rows is still compactable when declared available: {label}"
@@ -8752,7 +8636,7 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render even when host is disconnected"
         );
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "compact must be refused when the host is disconnected"
@@ -8784,7 +8668,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "compact must be refused once a compaction is in flight"
@@ -8828,7 +8712,7 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let (btn, enabled, _) = compact_btn_state(&container);
+        let (btn, enabled, _) = compact_btn_state(&container).await;
         assert!(enabled, "precondition: the control is offered");
         btn.click();
         for _ in 0..4 {
@@ -8841,7 +8725,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             !enabled && label.contains("already in progress"),
             "the mounted control reflects the change while the dialog is open: {label}"
@@ -8888,7 +8772,7 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let (btn, enabled, _) = compact_btn_state(&container);
+        let (btn, enabled, _) = compact_btn_state(&container).await;
         assert!(enabled, "precondition: the control is offered");
         btn.click();
         for _ in 0..4 {
@@ -8910,7 +8794,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
-        let (_, enabled, _) = compact_btn_state(&container);
+        let (_, enabled, _) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "the mounted control disables when capability is withdrawn"
@@ -8971,7 +8855,7 @@ mod wasm_tests {
         // `is_some()` became vacuous when the control stopped hiding: it is now
         // rendered for every agent card regardless of state. Assert what the
         // line was actually claiming — that the control is *offered* again.
-        let (_, enabled, label) = compact_btn_state(&container);
+        let (_, enabled, label) = compact_btn_state(&container).await;
         assert!(
             enabled,
             "compact should be offered again after a non-fatal failure: {label}"
@@ -9362,7 +9246,7 @@ mod wasm_tests {
             next_tick().await;
         }
 
-        let (btn, enabled, _) = compact_btn_state(&container);
+        let (btn, enabled, _) = compact_btn_state(&container).await;
         assert!(enabled, "precondition: the control is offered");
         btn.click();
         for _ in 0..8 {
@@ -9398,7 +9282,7 @@ mod wasm_tests {
             "agent should be flagged as in-flight while the server processes"
         );
         // And the same gate refuses a second submit.
-        let (btn, enabled, _) = compact_btn_state(&container);
+        let (btn, enabled, _) = compact_btn_state(&container).await;
         assert!(
             !enabled,
             "the control disables while its request is in flight"
@@ -10827,13 +10711,34 @@ mod wasm_tests {
                 .is_none(),
             "A workbench does not split its parent group"
         );
+        // Rows no longer carry the inline details panel, whose collapsed-hidden
+        // "Workbench:" line this once probed; the sidebar's visible workbench
+        // grouping is what identifies the row's actual workbench.
+        let show_workbenches = container
+            .query_selector("input[aria-label='Show workbenches']")
+            .unwrap()
+            .expect("the agent filters offer workbench grouping")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        show_workbenches.click();
+        next_tick().await;
+        let bench = container
+            .query_selector("[data-project-key='local:source'] [data-project-id='workbench']")
+            .unwrap()
+            .expect("the parent group renders the workbench the chat entered");
         assert!(
-            after
-                .query_selector("[title='Workbench: Task workbench']")
+            bench
+                .query_selector("[aria-label='Workbench: Task workbench']")
                 .unwrap()
                 .is_some(),
+            "the workbench grouping is labelled with the workbench's name"
+        );
+        assert!(
+            bench.contains(Some(&agent_card_el(&container, "worker"))),
             "The grouped row still identifies its actual workbench"
         );
+        show_workbenches.click();
+        next_tick().await;
         assert_eq!(
             container
                 .query_selector_all("[data-project-key]")
@@ -11598,16 +11503,23 @@ mod wasm_tests {
                 );
             }
 
-            // Expand buttons stay within bounds
-            let expand_buttons = container
-                .query_selector_all(".sidebar-card-expand")
-                .unwrap();
-            for i in 0..expand_buttons.length() {
-                let btn: HtmlElement = expand_buttons.item(i).unwrap().dyn_into().unwrap();
+            // Every row's actions button stays visible and within bounds
+            let action_buttons = container.query_selector_all(".agent-card-actions").unwrap();
+            assert_eq!(
+                action_buttons.length(),
+                container
+                    .query_selector_all(".agent-card[data-agent-drop-id]")
+                    .unwrap()
+                    .length(),
+                "every agent row offers its actions at {width}px"
+            );
+            for i in 0..action_buttons.length() {
+                let btn: HtmlElement = action_buttons.item(i).unwrap().dyn_into().unwrap();
                 let rect = btn.get_bounding_client_rect();
                 assert!(
-                    rect.right() <= panel_rect.right() + tolerance,
-                    "sidebar-card-expand #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
+                    rect.width() > 0.0 && rect.right() <= panel_rect.right() + tolerance,
+                    "agent actions #{i} must be visible within panel at {width}px (width: {}, right: {}, panel_right: {})",
+                    rect.width(),
                     rect.right(),
                     panel_rect.right(),
                 );
@@ -11634,11 +11546,56 @@ mod wasm_tests {
                 panel_rect.right(),
             );
 
+            // Revealing the pin (hover and focus share one rule) must not move
+            // anything already on the row, or change its height.
+            let row_geometry = |card: &HtmlElement| {
+                let mut geometry = vec![card.get_bounding_client_rect().height()];
+                for part in [
+                    ".agent-backend-glyph",
+                    ".agent-card-name",
+                    ".agent-card-status",
+                    ".agent-card-actions",
+                ] {
+                    let rect = card
+                        .query_selector(part)
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("child-agent row must render {part}"))
+                        .get_bounding_client_rect();
+                    geometry.extend([rect.left(), rect.top()]);
+                }
+                geometry
+            };
+            let child_pin_width = || {
+                child_card
+                    .query_selector(".agent-card-pin")
+                    .unwrap()
+                    .expect("child-agent pin button must exist")
+                    .get_bounding_client_rect()
+                    .width()
+            };
+            assert_eq!(
+                child_pin_width(),
+                0.0,
+                "the pin of an unpinned row waits for hover or focus"
+            );
+            let at_rest = row_geometry(&child_card);
+            assert!(
+                (27.0..=29.0).contains(&at_rest[0]),
+                "a row with a glyph-only status is one 28px line at {width}px, got {}px",
+                at_rest[0]
+            );
+
             // Focus child-agent card to reveal its pin control via :focus-within and verify visible geometry
             child_card.focus().unwrap();
             for _ in 0..2 {
                 next_tick().await;
             }
+            assert!(child_pin_width() > 0.0);
+            assert_eq!(
+                row_geometry(&child_card),
+                at_rest,
+                "revealing the pin must not move the glyph, name, status or actions at {width}px"
+            );
             let child_pin: HtmlElement = child_card
                 .query_selector(".agent-card-pin")
                 .unwrap()

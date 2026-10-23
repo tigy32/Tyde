@@ -2077,7 +2077,7 @@ fn AppearanceTab() -> impl IntoView {
             <div class="settings-toggle-row">
                 <div>
                     <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
-                    <p class="settings-description">"Show backend names in agent details and on history cards. Agent glyphs always identify the backend."</p>
+                    <p class="settings-description">"Show backend names on history cards. Agent glyphs always identify the backend."</p>
                 </div>
                 <label class="settings-toggle">
                     <input id="sidebar-backend-labels" type="checkbox"

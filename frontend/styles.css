@@ -3218,7 +3218,6 @@ kbd {
    attribute, so they stay in the tab order and their reason is reachable by
    keyboard and screen reader instead of hover-only. They still have to *look*
    unavailable. */
-.agent-card-compact[aria-disabled="true"],
 .team-member-icon-btn-compact[aria-disabled="true"],
 .team-card-compact[aria-disabled="true"] {
     opacity: 0.45;
@@ -3280,12 +3279,6 @@ kbd {
 .chat-tyde-permissions-toggle:disabled {
     opacity: 0.4;
     cursor: default;
-}
-
-.agent-tyde-permissions {
-    display: inline-flex;
-    flex-shrink: 0;
-    color: var(--text-secondary);
 }
 
 /* --- System / Warning / Error --- */
@@ -7052,7 +7045,6 @@ math merror {
 .agents-panel .agent-card-top input { cursor: text; user-select: text; -webkit-user-select: text; }
 .agents-panel[data-agent-dragging="true"],
 .agents-panel[data-agent-dragging="true"] * { cursor: grabbing; }
-.agent-card-grip { flex-shrink: 0; color: var(--text-tertiary); font-size: 16px; line-height: 1; }
 .agent-row-drag-preview {
     position: fixed;
     z-index: 10000;
@@ -7061,8 +7053,8 @@ math merror {
     align-items: center;
     gap: 8px;
     width: min(240px, calc(100vw - 16px));
-    height: 32px;
-    padding: 5px 8px;
+    height: 28px;
+    padding: 4px 8px;
     background: var(--surface-2);
     color: var(--text-primary);
     border: 1px solid var(--border-secondary);
@@ -7109,13 +7101,6 @@ math merror {
     overflow: hidden;
 }
 
-.agent-card-top-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-}
-
 .agent-card-name {
     font-size: 0.923rem;
     font-weight: 600;
@@ -7143,22 +7128,6 @@ math merror {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-}
-
-.agent-card-backend {
-    margin-left: auto;
-}
-
-/* Reached by expanding the row, or by right-clicking it. Nothing hides these
-   once the panel they live in is open: a control that appears on hover is
-   invisible to a keyboard or screen-reader user in browse mode, which is what
-   the old clipped-until-hover treatment amounted to. */
-.agent-card-action {
-    min-width: 24px;
-    min-height: 24px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
 }
 
 .agent-card-status {
@@ -7217,24 +7186,6 @@ math merror {
 
 .agent-card-status.error {
     color: var(--error);
-}
-
-.agent-card-time {
-    font-size: 0.769rem;
-    color: var(--text-tertiary);
-}
-
-.agent-card-custom-agent {
-    font-size: 0.72rem;
-    color: var(--text-tertiary);
-    padding: 0.05rem 0.4rem;
-    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
-    border-radius: 3px;
-    margin-left: 0.3rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 120px;
 }
 
 .agent-card-error {
@@ -7379,8 +7330,9 @@ math merror {
     flex-shrink: 0;
 }
 
-/* The chevron on a sidebar row. Quiet until the row is hovered or focused, but
-   always present: it is the only affordance that says the row has more. */
+/* The chevron on a saved-session row. Quiet until the row is hovered or
+   focused, but always present: it is the only affordance that says the row has
+   more. */
 .sidebar-card-expand {
     flex-shrink: 0;
     width: 14px;
@@ -7394,9 +7346,7 @@ math merror {
 }
 
 .sidebar-card-expand:hover,
-.agent-card:hover .sidebar-card-expand,
 .session-card:hover .sidebar-card-expand,
-.agent-card:focus-within .sidebar-card-expand,
 .session-card:focus-within .sidebar-card-expand {
     color: var(--text-primary);
 }
@@ -7406,7 +7356,6 @@ math merror {
     white-space: normal;
 }
 
-.agent-card[data-expanded="true"] > .sidebar-card-details,
 .session-card[data-expanded="true"] > .sidebar-card-details {
     display: block;
     margin-top: 6px;
@@ -7416,6 +7365,34 @@ math merror {
     font-size: 0.78rem;
 }
 
+/* An agent row's actions button: opens the same menu as right-click. Quiet
+   until the row is hovered or focused, but always present. */
+.agent-card-actions {
+    flex-shrink: 0;
+    width: 18px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 16px;
+    line-height: 20px;
+    cursor: pointer;
+}
+
+.agent-card-actions:hover,
+.agent-card-actions[aria-expanded="true"],
+.agent-card:hover .agent-card-actions,
+.agent-card:focus-within .agent-card-actions {
+    color: var(--text-primary);
+}
+
+.agent-card-actions:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: -1px;
+}
+
 /* Catches the press that dismisses an open card menu. */
 .card-menu-backdrop {
     position: fixed;
@@ -7423,10 +7400,16 @@ math merror {
     z-index: 1000;
 }
 
+/* A width of its own: a fixed box sized by the space right of its left edge
+   is squeezed next to the window edge, and the viewport clamp then measures
+   the squeezed box instead of moving the menu to fit. */
+.sidebar-card-menu {
+    width: max-content;
+    max-width: min(300px, calc(100vw - 16px));
+}
+
 .sidebar-card-details > * + * { margin-top: 8px; }
 .sidebar-card-details strong { display: block; overflow-wrap: anywhere; }
-.sidebar-card-details .agent-card-top-actions { justify-content: flex-end; }
-.sidebar-card-details .agent-card-error,
 .sidebar-card-details .session-card-id,
 .sidebar-card-details .session-card-workspace {
     white-space: normal;
@@ -14987,16 +14970,6 @@ pre.tool-error-pre {
 }
 
 /* ===== Workflows Panel ===== */
-.agent-card-workflow-badge {
-    font-size: 0.69rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    color: var(--accent-secondary, #8ab4ff);
-    padding: 0.05rem 0.35rem;
-    border: 1px solid var(--accent-secondary, #8ab4ff);
-    border-radius: 3px;
-    margin-left: 0.3rem;
-}
 
 .workflows-panel,
 .workflows-panel-body {
@@ -17601,9 +17574,9 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-card-group .agent-card[aria-current="true"] { background: var(--accent-subtle); border-color: var(--border-secondary); }
 .agent-card[data-sidebar-backend]:hover { background: var(--surface-hover); }
 .agent-card[data-sidebar-backend]:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: -2px; }
-.agent-card-top > .sidebar-card-expand { order: 6; font-size: 16px; width: 18px; }
-.agent-card-top > .agent-card-status { order: 3; margin-left: auto; }
-.agent-card-top > .agent-card-pin { order: 5; display: none; }
+.agent-card-top > .agent-card-actions { order: 6; }
+.agent-card-top > .agent-card-pin { order: 3; display: none; }
+.agent-card-top > .agent-card-status { order: 4; }
 .agent-card:hover > .agent-card-top > .agent-card-pin,
 .agent-card:focus-within > .agent-card-top > .agent-card-pin,
 .agent-card-top > .agent-card-pin.pinned { display: inline-flex; }
@@ -17612,7 +17585,9 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-card-collapse-toggle { flex-shrink: 0; font-size: 11px; line-height: 1.4; color: var(--accent-primary); gap: 3px; }
 .agent-show-inactive { align-self: flex-start; margin-left: 32px; border: none; background: transparent; color: var(--text-tertiary); font-size: 11px; padding: 6px; cursor: pointer; }
 .agent-show-inactive[aria-expanded="true"] { color: var(--accent-primary); }
-.agents-panel .agent-card { background: transparent; border: 0; border-radius: 0; box-shadow: none; padding: 7px 8px; min-height: 36px; min-width: 0; max-width: 100%; }
+/* One 20px line box for every item on a row's first line, so revealing the pin
+   on hover or focus cannot change the row's height or move its text. */
+.agents-panel .agent-card { background: transparent; border: 0; border-radius: 0; box-shadow: none; padding: 4px 8px; min-height: 28px; min-width: 0; max-width: 100%; }
 .agents-panel .agent-card:hover { background: var(--surface-hover); box-shadow: none; }
 .agents-panel .agent-card[aria-current="true"] { background: var(--accent-subtle); }
 .agents-panel .agent-card-group,
@@ -17625,13 +17600,15 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-sidebar-host-header { display: flex; align-items: center; justify-content: space-between; min-height: 30px; border-bottom: 1px solid var(--border-primary); margin-block: 8px 5px; }
 .agent-sidebar-host-header > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-sidebar-project-header { text-transform: none; letter-spacing: normal; font-size: 13px; color: var(--text-primary); min-height: 32px; }
-.agents-panel .agent-card-name { font-weight: 400; max-width: 100%; }
+.agents-panel .agent-card-name { font-weight: 400; max-width: 100%; line-height: 20px; }
+.agents-panel .agent-card-name-input { height: 20px; padding: 0 4px; line-height: 18px; }
 .agents-panel .agent-card-top { align-items: flex-start; min-width: 0; width: 100%; gap: 6px; }
+.agents-panel .agent-card-top > .agent-backend-glyph { margin-block: 1px; }
 .agents-panel .agent-card-top-main { flex-direction: column; align-items: flex-start; gap: 2px; }
 .agents-panel .agent-card-collapse-toggle { min-height: 18px; color: var(--text-tertiary); }
-.agents-panel .agent-card-status { animation: none; display: inline-flex; align-items: center; min-width: 0; }
+.agents-panel .agent-card-status { animation: none; display: inline-flex; align-items: center; height: 20px; min-width: 0; }
 .agents-panel .agent-card-status > [aria-hidden="true"] { flex-shrink: 0; }
-.agents-panel .agent-card-top > .sidebar-card-expand,
+.agents-panel .agent-card-top > .agent-card-actions,
 .agents-panel .agent-card-top > .agent-card-status { flex-shrink: 0; }
 .agents-panel .agent-card-status-text { max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agents-filter-option { justify-content: space-between; gap: var(--space-4); min-height: 32px; padding: var(--space-1) var(--space-2); border-radius: 4px; font-family: var(--font-sans); font-size: 1rem; color: var(--text-primary); }
@@ -17669,24 +17646,20 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
         row-gap: 3px;
         column-gap: 4px;
     }
-    .agents-panel .agent-card-top > .agent-card-status {
+    /* A spelled-out status needs the width a narrow row does not have, so
+       it takes a line of its own under the name. A glyph-only status stays
+       on the row's single line. */
+    .agents-panel .agent-card-top > .agent-card-status-labelled {
         order: 10;
-        margin-left: 22px;
-        flex-basis: calc(100% - 22px);
-        max-width: calc(100% - 22px);
+        margin-left: 24px;
+        flex-basis: calc(100% - 24px);
+        max-width: calc(100% - 24px);
     }
     .agents-panel .agent-card-top .agent-card-status-text {
         max-width: none;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-    }
-    .agents-panel .agent-card-top > .agent-card-pin {
-        order: 4;
-        margin-left: auto;
-    }
-    .agents-panel .agent-card-top > .sidebar-card-expand {
-        order: 5;
     }
 }
 .agents-filter-menu { position: absolute; top: 8px; right: 8px; z-index: 3; }
@@ -17695,7 +17668,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-filter-menu summary:focus-visible { outline: 2px solid var(--accent-link); outline-offset: 2px; }
 .agents-filter-menu .panel-filters { position: absolute; right: 0; width: min(250px, calc(100cqw - 16px)); padding: 8px; flex-direction: column; background: var(--surface-2); border: 1px solid var(--border-primary); border-radius: 5px; box-shadow: 0 4px 12px #0004; }
 .agent-new-project { border: 0; background: transparent; color: var(--accent-link); font-size: 11px; cursor: pointer; flex-shrink: 0; white-space: nowrap; }
-.agent-card-top > .agent-card-pin { width: 22px; height: 22px; padding: 2px; }
+.agent-card-top > .agent-card-pin { width: 20px; height: 20px; padding: 2px; }
 
 .sidebar-layout-error { grid-column: 1 / 6; grid-row: 1; z-index: 6; background: var(--surface-2); color: var(--error); padding: 7px 12px; font-size: 12px; }
 .agent-card-top > .agent-pin-host { order: 2; max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); font-size: 10px; flex-shrink: 1; }
@@ -17885,19 +17858,6 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .project-new-agent:hover, .project-new-agent:focus-visible { color: var(--text-primary); background: var(--surface-hover); outline: 1px solid var(--accent-primary); outline-offset: -1px; }
 .agent-sidebar-project-section { margin-top: 4px; border: 0; border-radius: 0; padding: 0; }
 .agent-sidebar-project-header { padding: 2px 5px; }
-.agent-workbench-context { overflow-wrap: anywhere; color: var(--text-secondary); font-size: 11px; }
-.agent-card[data-expanded="true"] > .sidebar-card-details { padding: 6px 0 0 28px; }
-.agent-card > .sidebar-card-details > * + * { margin-top: 6px; }
-.sidebar-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
-.sidebar-card-meta .agent-tyde-permissions { display: inline-flex; }
-.sidebar-card-meta .agent-card-time { margin-left: auto; }
-.sidebar-card-meta .agent-card-backend { background: none; padding: 0; font-weight: 400; font-size: inherit; color: var(--text-secondary); }
-.sidebar-card-technical summary { cursor: pointer; color: var(--text-secondary); font-size: 11px; }
-.sidebar-card-technical dl { margin: 6px 0 0; font-size: 11px; }
-.sidebar-card-technical dt { margin-top: 5px; color: var(--text-tertiary); }
-.sidebar-card-technical dd { margin: 2px 0 0; overflow-wrap: anywhere; font-family: var(--font-mono); }
-.agent-card > .sidebar-card-details .agent-card-bottom:empty { display: none; }
-.agent-card > .sidebar-card-details .agent-card-top-actions { justify-content: flex-start; gap: 4px; }
 .project-editor .modal-body { gap: 8px; margin-bottom: 16px; }
 .project-editor-name-row { display: flex; align-items: center; gap: 8px; }
 .project-editor-name-row .modal-input { min-width: 0; flex: 1; font-family: var(--font-sans); }

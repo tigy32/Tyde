@@ -3037,23 +3037,47 @@ mod wasm_tests {
             .count();
         assert_eq!(folded, 1, "only the activity-only reply folds");
 
-        for index in 0..40 {
-            start();
-            end(assistant(&format!("Note {index}: the workspace is fine.")));
-        }
         let scroller: HtmlElement = container
             .query_selector(".chat-messages")
             .unwrap()
             .expect("chat scroller present")
             .dyn_into()
             .unwrap();
-        async fn settled_height(scroller: &HtmlElement) -> i32 {
-            loop {
-                let height = scroller.scroll_height();
-                settle().await;
-                if scroller.scroll_height() == height {
-                    return height;
-                }
+        // A mounted row's ResizeObserver reports in the next frame and the
+        // row records its height in a 0ms timer queued from that report; a
+        // 0ms timer queued after the following frame runs after that one.
+        async fn measured() {
+            next_animation_frame().await;
+            next_animation_frame().await;
+            next_tick().await;
+        }
+        // Each row's on-screen height, in transcript order.
+        let mut heights: Vec<f64> = message_rows(&container)
+            .iter()
+            .map(|row| row.get_bounding_client_rect().height())
+            .collect();
+        assert_eq!(heights.len(), 4, "the short transcript is fully on screen");
+        // The chat continues one reply at a time, pinned to the bottom. Every
+        // reply is measured on screen before later replies push it, and then
+        // the run, out of view.
+        for index in 0..40 {
+            start();
+            end(assistant(&format!("Note {index}: the workspace is fine.")));
+            measured().await;
+            let rows = message_rows(&container);
+            let newest = rows.last().expect("the pinned chat shows its newest reply");
+            assert!(
+                newest
+                    .text_content()
+                    .unwrap_or_default()
+                    .trim()
+                    .starts_with(&format!("Note {index}:")),
+                "the pinned chat ends at the reply that just arrived"
+            );
+            heights.push(f64::NAN);
+            let first = heights.len() - rows.len();
+            for (offset, row) in rows.iter().enumerate() {
+                heights[first + offset] = row.get_bounding_client_rect().height();
             }
         }
         let snapshot = |scroller: &HtmlElement| {
@@ -3080,42 +3104,41 @@ mod wasm_tests {
                 spacer(".virt-spacer-bottom"),
             )
         };
-        // Walk the transcript once so every rendered row has a measured
-        // height; the totals then differ only by the run's folded row. The
-        // new rows must lay out and pin to the bottom first, or the walk
-        // starts at the bottom and measures nothing.
-        settled_height(&scroller).await;
-        let mut walk = vec![snapshot(&scroller)];
-        scroller.set_scroll_top(0);
-        settled_height(&scroller).await;
-        walk.push(snapshot(&scroller));
-        loop {
-            let top = scroller.scroll_top();
-            scroller.set_scroll_top(top + scroller.client_height());
-            settled_height(&scroller).await;
-            walk.push(snapshot(&scroller));
-            if scroller.scroll_top() == top {
-                break;
-            }
-        }
-        let before = settled_height(&scroller).await;
-        walk.push(snapshot(&scroller));
+        // The newest reply records its height too; then every row holds its
+        // measured height, so the totals differ only by the run's folded row.
+        measured().await;
+        let at_rest = snapshot(&scroller);
         assert!(
             container
                 .query_selector(".ink-actions-summary")
                 .unwrap()
                 .is_none(),
-            "precondition: the folded run is outside the rendered window"
+            "precondition: the folded run is outside the rendered window: {at_rest}"
         );
+        let above = heights.len() - message_rows(&container).len();
+        let above_rows: f64 = heights[..above].iter().sum();
+        let top_spacer = container
+            .query_selector(".virt-spacer-top")
+            .unwrap()
+            .expect("the windowed transcript reserves the rows above it")
+            .get_bounding_client_rect()
+            .height();
+        assert!(
+            (top_spacer - above_rows).abs() < 0.5 * above as f64,
+            "precondition: the {above} rows above the window keep their on-screen \
+             heights: spacer {top_spacer}px, rows {above_rows}px; {at_rest}; \
+             heights {heights:?}"
+        );
+        let before = scroller.scroll_height();
 
         state.tool_output_mode.set(ToolOutputMode::Full);
-        let after = settled_height(&scroller).await;
-        walk.push(snapshot(&scroller));
+        settle().await;
+        let after = scroller.scroll_height();
         assert!(
             after > before,
             "opening a run out of view makes room for its folded action: \
-             {before}px -> {after}px; walk:\n{}",
-            walk.join("\n")
+             {before}px -> {after}px\nbefore: {at_rest}\nafter: {}",
+            snapshot(&scroller)
         );
         drop(handle);
         container.remove();

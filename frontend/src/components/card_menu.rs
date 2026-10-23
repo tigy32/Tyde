@@ -1,9 +1,9 @@
 //! The right-click menu shared by the sidebar's agent and saved-session rows.
 //!
-//! The rows are one line each and carry no hover text: everything they used to
-//! reveal on hover is now either in the row's expanded details or in this menu.
-//! Both surfaces offer the same actions, because right-click is not a
-//! discoverable affordance on its own.
+//! The rows are one line each and carry no hover text. Right-click is not a
+//! discoverable affordance on its own, so each row also has a visible way to
+//! the same actions: an agent row's `⋯` button opens this very menu, and a
+//! saved-session row's chevron expands its details.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -24,6 +24,20 @@ pub(crate) fn open_card_menu(menu: CardMenuPosition, ev: &web_sys::MouseEvent) {
     ev.prevent_default();
     ev.stop_propagation();
     menu.set(Some((ev.client_x() as f64, ev.client_y() as f64)));
+}
+
+/// Open the menu under the button that was pressed, so a menu button and a
+/// right-click open one menu at a place each user expects.
+pub(crate) fn open_card_menu_below(menu: CardMenuPosition, ev: &web_sys::MouseEvent) {
+    ev.stop_propagation();
+    let Some(button) = ev
+        .current_target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+    else {
+        return;
+    };
+    let rect = button.get_bounding_client_rect();
+    menu.set(Some((rect.left(), rect.bottom())));
 }
 
 /// Renders `children` as menu items at the pointer, with a backdrop that

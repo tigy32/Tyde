@@ -5,7 +5,7 @@ use crate::actions::begin_new_chat_default;
 use crate::components::host_browser::{
     open_project_browser, open_project_browser_on_selected_host,
 };
-use crate::components::launch_menu::LaunchChooser;
+use crate::components::launch_menu::{LaunchChooser, LaunchDestination};
 use crate::state::{AppState, ConnectionStatus};
 use protocol::{BackendKind, BackendSetupAction, BackendSetupStatus, LaunchProfileEntry};
 use wasm_bindgen::JsCast;
@@ -352,9 +352,11 @@ fn GettingStartedGuide() -> impl IntoView {
         })
     });
     let launch_project = Memo::new(move |_| {
-        project.get().map(|project| ActiveProjectRef {
-            host_id: project.host_id,
-            project_id: project.project.id,
+        project.get().map(|project| {
+            LaunchDestination::Project(ActiveProjectRef {
+                host_id: project.host_id,
+                project_id: project.project.id,
+            })
         })
     });
     let catalog_state = state.clone();
@@ -633,7 +635,7 @@ fn GettingStartedGuide() -> impl IntoView {
             }}
         </Show>
         <Show when=move || chooser_open.get()>
-            {move || selected.get().map(|kind| view! { <LaunchChooser open_sig=chooser_open initial_backend=kind project_context=launch_project on_created=created /> })}
+            {move || selected.get().map(|kind| view! { <LaunchChooser open_sig=chooser_open initial_backend=kind destination=launch_project on_created=created /> })}
         </Show>
     }
 }

@@ -308,23 +308,38 @@ fn LaunchProjectPicker(
     }
 }
 
+/// Where a New Agent dialog opens. A project names its own host; a chat with
+/// no project still belongs to exactly one host, so that host travels with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchDestination {
+    Project(ActiveProjectRef),
+    NoProject { host_id: String },
+}
+
 #[component]
 pub fn LaunchChooser(
     open_sig: RwSignal<bool>,
     #[prop(optional)] initial_backend: Option<BackendKind>,
-    #[prop(optional)] project_context: Option<Memo<Option<ActiveProjectRef>>>,
+    /// The destination the caller opened the dialog for. `Some(None)` means no
+    /// particular destination: the dialog opens without a project on the chat
+    /// context's host. Omitted, it opens on the active project.
+    #[prop(optional)]
+    destination: Option<Memo<Option<LaunchDestination>>>,
     #[prop(optional)] on_created: Option<Callback<()>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let chosen_project = match project_context {
-        Some(context) => context.get_untracked(),
-        None => state.active_project_ref_untracked(),
+    let destination = match destination {
+        Some(destination) => destination.get_untracked(),
+        None => state
+            .active_project_ref_untracked()
+            .map(LaunchDestination::Project),
     };
-    let host = chosen_project
-        .as_ref()
-        .map(|project| project.host_id.clone())
-        .or_else(|| state.chat_context_host_id_untracked());
-    let selection = RwSignal::new((host.clone(), chosen_project.clone()));
+    let (host, chosen_project) = match destination {
+        Some(LaunchDestination::Project(project)) => (Some(project.host_id.clone()), Some(project)),
+        Some(LaunchDestination::NoProject { host_id }) => (Some(host_id), None),
+        None => (state.chat_context_host_id_untracked(), None),
+    };
+    let selection = RwSignal::new((host.clone(), chosen_project));
     let selected_host = Memo::new(move |_| selection.get().0);
     let hosts = state.configured_hosts;
     let projects = state.projects;
