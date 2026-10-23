@@ -27,9 +27,8 @@ pub fn run() -> Result<(), String> {
     {
         let notification = server::host_launch::take_notification();
         server::init_process_env()?;
-        if let Err(err) = super::logging::init_host_uds_logging() {
-            eprintln!("warning: failed to initialize host UDS logging: {err}");
-        }
+        super::logging::init_host_uds_logging()
+            .map_err(|error| format!("Failed to initialize host UDS logging: {error}"))?;
 
         let socket_path = resolve_socket_path()?;
         tracing::info!("starting tyde host UDS mode at {}", socket_path.display());

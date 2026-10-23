@@ -54,6 +54,19 @@ struct TauriEvent<T> {
 
 // --- Command invocations ---
 
+pub(crate) async fn log_ui_diagnostic(
+    record: host_config::diagnostics::FrontendDiagnosticRecord,
+) -> Result<(), JsValue> {
+    #[derive(Serialize)]
+    struct Args {
+        record: host_config::diagnostics::FrontendDiagnosticRecord,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { record })?;
+    // Do not instrument the diagnostic sink itself.
+    raw_tauri_invoke("log_ui_diagnostic", args).await?;
+    Ok(())
+}
+
 const UNKNOWN_DESKTOP_HOST_ERROR: &str = "The desktop host returned an unknown error.";
 
 fn tauri_error_message(command: &'static str, value: JsValue) -> String {

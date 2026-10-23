@@ -842,8 +842,10 @@ pub fn App() -> impl IntoView {
     // visibly-jarring second.
     spawn_local(async {
         yield_to_browser().await;
+        crate::perf::startup_phase(crate::perf::FrontendStartupPhase::HighlightWarmupBegin);
         crate::syntax_highlight::warm_up();
         let _ = crate::highlight_worker::shared();
+        crate::perf::startup_phase(crate::perf::FrontendStartupPhase::HighlightWarmupEnd);
     });
     Effect::new(move |_| {
         if app_shell_ref.get().is_none() || frontend_ready_sent.get_value() {
@@ -857,6 +859,8 @@ pub fn App() -> impl IntoView {
                 crate::components::header::report_user_error(format!(
                     "Tyde’s interface loaded, but the desktop shell did not acknowledge it. Restart Tyde. {error}"
                 ));
+            } else {
+                crate::perf::startup_phase(crate::perf::FrontendStartupPhase::ReadyAcknowledged);
             }
         });
     });
@@ -1004,6 +1008,8 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
         }
     };
 
+    crate::perf::startup_phase(crate::perf::FrontendStartupPhase::HostListenersReady);
+
     if app_listener_token_is_current(listener_token) {
         HOST_LISTENER_HANDLES.with(|slot| {
             slot.borrow_mut().extend(handles);
@@ -1016,6 +1022,7 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
     }
 
     refresh_configured_hosts(&state).await;
+    crate::perf::startup_phase(crate::perf::FrontendStartupPhase::ConfiguredHostsRefreshReturned);
 
     if !app_listener_token_is_current(listener_token) {
         return;
@@ -1036,6 +1043,7 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
         let state = state.clone();
         spawn_local(async move { connect_one_host(state, host_id).await });
     }
+    crate::perf::startup_phase(crate::perf::FrontendStartupPhase::HostConnectionsScheduled);
 }
 
 fn configured_host_label(state: &AppState, host_id: &str) -> Option<String> {

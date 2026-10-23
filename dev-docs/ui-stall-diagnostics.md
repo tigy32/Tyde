@@ -1,4 +1,71 @@
-# Local UI stall capture
+# Local startup and UI stall diagnostics
+
+## Automatic local desktop log
+
+No Debug setting or capture is needed. The desktop shell writes to the existing
+hourly `~/.tyde/tracing/tyde-shell.log.YYYY-MM-DD-HH` files (on macOS,
+`/Users/<you>/.tyde/tracing/`). `TYDE_TRACING_DIR_PATH`, when configured,
+selects the directory instead. The default `info` filter includes these lines;
+a restrictive `RUST_LOG` can exclude them. Shell logs retain the newest 48
+hourly files, not a guaranteed 48 hours of history. Other log prefixes keep
+their existing retention. File-logger initialization errors fail startup
+explicitly on stderr; there is no console-only substitute.
+
+Look for `ui.startup`, `ui.diagnostic`, and adjacent `webview.lifecycle` lines
+around the incident. These new lines are pasteable, content-free diagnostics:
+
+- `ui.startup layer=native`: begin/end, duration and completion/aborted status
+  for environment setup, macOS WebKit defaults, shell build, host-store load,
+  host startup, native media and updater initialization. Nested phase durations
+  overlap: do not add them. A begin without an end narrows where startup stopped.
+- `ui.diagnostic event=enabled`: version and actual sampling/retention policy.
+- `layer=frontend ... record=... event=startup`: monotonic `since_wasm_ms`
+  markers for WASM entry, mount, highlight warmup, host listener installation,
+  host-list refresh return, connection scheduling and readiness acknowledgement.
+  These are concurrent startup paths, not a serial waterfall. Refresh return
+  does not imply success; scheduling does not imply connected. Readiness is not
+  proof of paint or completion of host replay. Before WASM runs, only native
+  phases and page-load events can be present.
+- `layer=frontend ... event=event_loop_gap`: a visible-page timer interval of
+  at least 1250ms (nominal 1000ms). Includes focus, the longest completed
+  instrumented synchronous operation >=100ms since the preceding tick, and
+  the number of pending bridge waits. The operation duration is inclusive;
+  it is not a union, sum, CPU sample or proof of causation. Bridge waits are
+  **not** blocking time. No operation details or arguments are recorded.
+- `layer=native event=dispatch_pending/dispatch_completed`: a background task
+  queued a main-thread callback, observed it still pending at the next tick,
+  and later measured its queue interval. At most one callback is pending.
+  This distinguishes native UI-dispatch delay from frontend-only delay without
+  claiming an OS/browser stack or guessing which work blocked the thread.
+- On Linux, the first `web_process_terminated` line per webview records WebKit's
+  coarse termination reason. This observes process loss without reloading or
+  inventing a recovery policy. macOS keeps its existing termination/recovery
+  lifecycle logs. Neither is a stack or an explanation of a crash's cause.
+
+There is no upload, new diagnostic export/collection workflow, interaction
+listener, payload logging, DOM scan, stack sampling or always-on animation-frame
+loop. Normal one-second samples write nothing. Existing named call sites keep
+only a longest-duration aggregate and pending-wait count. The frontend has one
+in-flight delivery, at most 16 queued records, and at most 32 admitted records
+per minute; native ingress and native dispatch each have a 32-line/minute
+budget. `dropped`/`native_dropped` report suppression on the next admitted line.
+The existing nonblocking tracing writer is bounded and lossy under saturation;
+these limits bound diagnostic contribution, not all pre-existing log traffic
+or total file bytes. Existing general logs can contain paths/IDs: do not assume
+an entire log file is sanitized just because these new lines are.
+
+**Limits:** scheduling gaps can also mean OS suspension, debugger pauses,
+unfocused-window WebKit throttling, or uninstrumented browser work. Visibility
+changes reset frontend baselines; focus is reported, not guessed. Frontend
+records reach disk only when JS and the desktop bridge can execute; a permanent
+WebContent hang or process exit can prevent delivery. Native sampling starts in
+shell setup and requires the async runtime to run; an entire-process suspension
+cannot be diagnosed while suspended. File timestamps are receipt times;
+`since_wasm_ms` is a page-relative source timestamp. Missing lines are not proof
+of responsiveness, and these diagnostics cannot establish the reported work
+Mac's cause retrospectively. No affected-machine reproduction is claimed.
+
+## Existing opt-in detailed capture
 
 The client recorder is off until explicitly started. It uses the existing
 UI-debug Evaluate endpoint (or the webview console); no data is uploaded or
@@ -73,7 +140,8 @@ pending remote work cannot hide synchronous UI spans). Each incident retains at 
 records are not proof that no work occurred. Export serializes only this bounded
 state, on explicit request. There is no per-record console/network/disk output,
 DOM traversal, stack capture, payload serialization, mutation observer or global
-function patching. While disabled, call sites only check the recorder.
+function patching. While detailed capture is disabled, call sites still update the automatic
+local aggregate described above.
 
 Records contain only fixed operation/command names, protocol FrameKind names,
 times, numeric sizes/counts, coarse outcome and visibility. No argument values,

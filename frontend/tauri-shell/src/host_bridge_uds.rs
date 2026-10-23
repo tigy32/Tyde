@@ -13,9 +13,8 @@ pub fn run() -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        if let Err(err) = super::logging::init_host_bridge_uds_logging() {
-            eprintln!("warning: failed to initialize host UDS bridge logging: {err}");
-        }
+        super::logging::init_host_bridge_uds_logging()
+            .map_err(|error| format!("Failed to initialize host bridge UDS logging: {error}"))?;
 
         install_parent_death_watch();
 

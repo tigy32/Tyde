@@ -4,9 +4,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub fn run() -> Result<(), String> {
-    if let Err(err) = super::logging::init_host_stdio_logging() {
-        eprintln!("warning: failed to initialize host stdio logging: {err}");
-    }
+    super::logging::init_host_stdio_logging()
+        .map_err(|error| format!("Failed to initialize host stdio logging: {error}"))?;
 
     tracing::info!("starting tyde host stdio mode");
 

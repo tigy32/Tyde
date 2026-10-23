@@ -1,5 +1,25 @@
-// Only explicitly started captures retain data. Nothing is sent or persisted.
+// Detailed captures remain opt-in and memory-only. The separate local monitor
+// schedules aggregate diagnostics through the typed Rust desktop bridge.
 let recorder;
+
+export function createLocalMonitor(env, tick, reset) {
+    let timer;
+    const now = () => env.performance.now();
+    const run = () => {
+        tick(now(), env.document.visibilityState === 'visible', env.document.hasFocus());
+        timer = env.setTimeout(run, 1000);
+    };
+    const visibility = () => reset(now());
+    env.document.addEventListener('visibilitychange', visibility);
+    timer = env.setTimeout(run, 1000);
+    return {now, stop() {
+        env.clearTimeout(timer);
+        env.document.removeEventListener('visibilitychange', visibility);
+    }};
+}
+
+export function localMonitorNow(monitor) { return monitor.now(); }
+export function stopLocalMonitor(monitor) { monitor.stop(); }
 
 function ring(capacity) {
     const rows = new Array(capacity);

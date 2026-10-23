@@ -1020,6 +1020,14 @@ fn mark_frontend_ready(webview: tauri::Webview, state: tauri::State<'_, ShellSta
     tracing::info!("webview.lifecycle event=frontend_ready label={label} generation={generation}");
 }
 
+#[tauri::command]
+async fn log_ui_diagnostic(
+    state: tauri::State<'_, logging::DiagnosticSink>,
+    record: host_config::diagnostics::FrontendDiagnosticRecord,
+) -> Result<(), &'static str> {
+    state.write(record).await
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FrontendLifecycleEvent {
@@ -1201,6 +1209,7 @@ macro_rules! other_production_invoke_handler {
             set_selected_host,
             mark_ui_debug_ready,
             mark_frontend_ready,
+            log_ui_diagnostic,
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
@@ -1230,6 +1239,7 @@ macro_rules! other_production_invoke_handler {
             set_selected_host,
             mark_ui_debug_ready,
             mark_frontend_ready,
+            log_ui_diagnostic,
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
@@ -1341,16 +1351,25 @@ fn install_linux_edit_history_keys(window: &tauri::WebviewWindow) -> tauri::Resu
 }
 
 pub fn run() {
-    #[cfg(desktop)]
-    if let Err(error) = server::init_process_env() {
-        eprintln!("Failed to initialize child process environment: {error}");
+    if let Err(error) = logging::init_gui_logging() {
+        eprintln!("Failed to initialize GUI logging: {error}");
         std::process::exit(1);
     }
+    #[cfg(desktop)]
+    {
+        let phase = logging::startup(logging::StartupPhase::ProcessEnvironment);
+        if let Err(error) = server::init_process_env() {
+            tracing::error!("Native startup failed phase=ProcessEnvironment");
+            eprintln!("Failed to initialize child process environment: {error}");
+            std::process::exit(1);
+        }
+        phase.finish();
+    }
     #[cfg(target_os = "macos")]
-    macos_webview_defaults::apply();
-
-    if let Err(err) = logging::init_gui_logging() {
-        eprintln!("warning: failed to initialize GUI logging: {err}");
+    {
+        let phase = logging::startup(logging::StartupPhase::WebviewDefaults);
+        macos_webview_defaults::apply();
+        phase.finish();
     }
 
     tracing::info!("starting tyde shell");
@@ -1592,13 +1611,18 @@ pub fn run() {
         context
     };
 
+    let build_phase = logging::startup(logging::StartupPhase::BuildShell);
     let app = builder
         .setup(move |app| {
+            let setup_phase = logging::startup(logging::StartupPhase::Setup);
+            app.manage(logging::start_ui_diagnostics(app.handle()));
+            let phase = logging::startup(logging::StartupPhase::HostStore);
             tracing::info!("setup: spawning host and router");
             let host_store_path =
                 host_store::HostStore::default_path().map_err(std::io::Error::other)?;
             let host_store =
                 host_store::HostStore::load(host_store_path).map_err(std::io::Error::other)?;
+            phase.finish();
             let router = ProxyRouterHandle::new();
             let ui_debug = Arc::new(devtools::UiDebugBridgeState::default());
             let ui_debug_addr =
@@ -1614,6 +1638,7 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             let settings_path = server::store::settings::HostSettingsStore::default_path()
                 .map_err(std::io::Error::other)?;
+            let phase = logging::startup(logging::StartupPhase::SpawnHost);
             let host = server::spawn_host_with_store_paths_and_runtime_config(
                 session_path,
                 project_path,
@@ -1622,6 +1647,7 @@ pub fn run() {
             )
             .map_err(std::io::Error::other)?;
 
+            phase.finish();
             if let Some(addr) =
                 dev_host::start_dev_host_listener(host.clone()).map_err(std::io::Error::other)?
             {
@@ -1629,8 +1655,12 @@ pub fn run() {
             }
 
             #[cfg(not(target_os = "windows"))]
-            let voice_media =
-                voice_media::NativeVoiceMedia::new().map_err(std::io::Error::other)?;
+            let voice_media = {
+                let phase = logging::startup(logging::StartupPhase::NativeMedia);
+                let media = voice_media::NativeVoiceMedia::new().map_err(std::io::Error::other)?;
+                phase.finish();
+                media
+            };
             #[cfg(not(target_os = "windows"))]
             app.manage(voice_media.clone());
             app.manage(ShellState {
@@ -1643,12 +1673,18 @@ pub fn run() {
                 voice_media,
             });
             #[cfg(desktop)]
-            updates::init(app.handle())?;
+            {
+                let phase = logging::startup(logging::StartupPhase::Updates);
+                updates::init(app.handle())?;
+                phase.finish();
+            }
             #[cfg(target_os = "linux")]
             if let Some(window) = app.get_webview_window("main") {
+                logging::observe_web_process(&window)?;
                 install_linux_pinch_zoom_guard(&window)?;
                 install_linux_edit_history_keys(&window)?;
             }
+            setup_phase.finish();
             Ok(())
         })
         .invoke_handler(production_invoke_handler::<tauri::Wry, _>(
@@ -1656,6 +1692,7 @@ pub fn run() {
         ))
         .build(context)
         .expect("failed to build desktop shell");
+    build_phase.finish();
 
     app.run(move |app, event| {
         if let RunEvent::ExitRequested { code, api, .. } = event {

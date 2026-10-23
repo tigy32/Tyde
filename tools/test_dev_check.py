@@ -2396,10 +2396,12 @@ fi
                 + r"\s*#\[tauri::command(?:\([^\n]*\))?\]\s*async fn "
                 + command,
             )
+        # Startup timing wraps construction in a cfg-gated initializer block;
+        # require the constructor inside that block, not adjacent to `=`.
         self.assertRegex(
             shell_lib,
             non_windows_cfg
-            + r"\s*let voice_media =\s*voice_media::NativeVoiceMedia::new",
+            + r"\s*let voice_media =\s*\{[^{}]*voice_media::NativeVoiceMedia::new",
         )
         self.assertEqual(
             len(re.findall(non_windows_cfg + r"\s*(?:let media_result|if let Err\(error\))", shell_lib)),
