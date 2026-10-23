@@ -221,9 +221,14 @@ fn LaunchProjectPicker(
     view! {
         <div class="launch-project-picker" node_ref=wrapper
             on:focusout=move |ev| {
-                let inside = ev.related_target().and_then(|target| target.dyn_into::<web_sys::Node>().ok())
-                    .is_some_and(|target| wrapper.get_untracked().is_some_and(|wrapper| wrapper.contains(Some(&target))));
-                if !inside { open.set(false); }
+                // Only focus moving to an element outside closes the picker. macOS
+                // WebKit never mouse-focuses buttons: pressing one blurs with no
+                // related target, and closing then would unmount a choice before
+                // its click or let the Project button's click reopen the picker.
+                // Outside presses close above.
+                let left = ev.related_target().and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|target| wrapper.get_untracked().is_some_and(|wrapper| !wrapper.contains(Some(&target))));
+                if left { open.set(false); }
             }
             on:keydown=move |ev| {
                 if !open.get_untracked() { return; }
@@ -263,7 +268,14 @@ fn LaunchProjectPicker(
                 <span id="launch-project-value">{move || label.get()}</span>
             </button>
             <Show when=move || open.get()>
-                <div id="launch-project-popover" class="launch-project-popover" role="group" aria-label="Project choices">
+                <div id="launch-project-popover" class="launch-project-popover" role="group" aria-label="Project choices"
+                    on:mousedown=move |ev| {
+                        // Presses inside the picker keep keyboard focus in it; macOS
+                        // WebKit would otherwise strand focus on the page.
+                        let in_search = ev.target().is_some_and(|target| search.get_untracked()
+                            .is_some_and(|search| search.is_same_node(target.dyn_ref::<web_sys::Node>())));
+                        if !in_search { ev.prevent_default(); }
+                    }>
                     <input type="search" aria-label="Find a project" placeholder="Find a project…" node_ref=search
                         prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
                     <Show when=move || show_workbenches.get().is_ok()>
@@ -277,6 +289,11 @@ fn LaunchProjectPicker(
                                             storage.set_item("tyde.launch.show-workbenches", if checked { "true" } else { "false" })
                                                 .map(|()| checked).map_err(|error| format!("Could not save workbench preferences: {error:?}"))
                                         }));
+                                        // A failed save removes this switch; keep keyboard focus
+                                        // in the open picker.
+                                        if saved.is_err() && let Some(search) = search.get_untracked() {
+                                            let _ = search.focus();
+                                        }
                                         show_workbenches.set(saved);
                                     } />
                                 <span class="settings-toggle-slider"></span>
@@ -845,6 +862,71 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    /// Presses a control the way native macOS WebKit delivers a real pointer
+    /// click: pointerdown/mousedown reach the element under the pointer;
+    /// unless the page cancels mousedown, the focused field blurs with no
+    /// related target because buttons and switches are never mouse-focusable
+    /// there; the page renders; mouseup/click reach whatever is under the
+    /// pointer at release.
+    async fn press(control: &web_sys::Element) {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let rect = control.get_bounding_client_rect();
+        let (x, y) = (
+            rect.left() + rect.width() / 2.0,
+            rect.top() + rect.height() / 2.0,
+        );
+        let pressed = document
+            .element_from_point(x as f32, y as f32)
+            .filter(|hit| control.contains(Some(hit)))
+            .expect("the pressed control is the topmost element under the pointer");
+        let pointer = web_sys::PointerEventInit::new();
+        pointer.set_bubbles(true);
+        pointer.set_cancelable(true);
+        pointer.set_pointer_id(1);
+        pointer.set_pointer_type("mouse");
+        pointer.set_is_primary(true);
+        pointer.set_client_x(x as i32);
+        pointer.set_client_y(y as i32);
+        pressed
+            .dispatch_event(
+                &web_sys::PointerEvent::new_with_event_init_dict("pointerdown", &pointer).unwrap(),
+            )
+            .unwrap();
+        let mouse = |kind: &str, target: &web_sys::Element| {
+            let init = web_sys::MouseEventInit::new();
+            init.set_bubbles(true);
+            init.set_cancelable(true);
+            init.set_client_x(x as i32);
+            init.set_client_y(y as i32);
+            target
+                .dispatch_event(
+                    &web_sys::MouseEvent::new_with_mouse_event_init_dict(kind, &init).unwrap(),
+                )
+                .unwrap()
+        };
+        let focus_moves = mouse("mousedown", &pressed);
+        if focus_moves
+            && let Some(focused) = document
+                .active_element()
+                .and_then(|focused| focused.dyn_into::<HtmlElement>().ok())
+        {
+            focused.blur().unwrap();
+        }
+        next_tick().await;
+        let released = document
+            .element_from_point(x as f32, y as f32)
+            .expect("the release lands on a rendered element");
+        mouse("mouseup", &released);
+        if pressed.is_connected() {
+            let mut target = released;
+            while !target.contains(Some(&pressed)) {
+                target = target.parent_element().unwrap();
+            }
+            mouse("click", &target);
+        }
+        next_tick().await;
+    }
+
     fn visible_text(container: &HtmlElement) -> String {
         container.text_content().unwrap_or_default()
     }
@@ -1247,15 +1329,19 @@ mod wasm_tests {
         let choose = async |host: &str, project: Option<ActiveProjectRef>| {
             choose_host(host);
             next_tick().await;
-            picker().click();
-            next_tick().await;
+            press(&picker()).await;
             let text = if project.is_some() {
                 "Shared name"
             } else {
                 "No project / Home"
             };
-            project_choice(text).unwrap().click();
-            next_tick().await;
+            press(&project_choice(text).unwrap()).await;
+            assert_eq!(picker().text_content().as_deref(), Some(text));
+            assert_eq!(
+                picker().get_attribute("aria-expanded").as_deref(),
+                Some("false"),
+                "a pointer choice closes the popover"
+            );
         };
         assert_eq!(
             picker().text_content().as_deref(),
@@ -1291,8 +1377,8 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<web_sys::HtmlInputElement>()
             .unwrap();
-        toggle.click();
-        next_tick().await;
+        let switch = toggle.closest("label").unwrap().unwrap();
+        press(&switch).await;
         assert_eq!(
             storage
                 .get_item("tyde.launch.show-workbenches")
@@ -1399,16 +1485,29 @@ mod wasm_tests {
             picker().text_content().as_deref(),
             Some("Shared name / UI polish")
         );
-        toggle.click();
-        next_tick().await;
+        press(&switch.previous_element_sibling().unwrap()).await;
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&search)),
+            "a press inside the open picker keeps keyboard focus in it"
+        );
+        assert_eq!(
+            picker().get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        press(&switch).await;
         assert_eq!(
             picker().text_content().as_deref(),
             Some("Shared name / UI polish")
         );
         let storage_set = js_sys::eval("Storage.prototype.setItem").unwrap();
         js_sys::eval("Storage.prototype.setItem = function() { throw new DOMException('Storage denied', 'SecurityError'); }").unwrap();
-        toggle.click();
-        next_tick().await;
+        press(&switch).await;
         js_sys::Reflect::set(
             &js_sys::eval("Storage.prototype").unwrap(),
             &"setItem".into(),
@@ -1427,10 +1526,20 @@ mod wasm_tests {
             picker().text_content().as_deref(),
             Some("Shared name / UI polish")
         );
+        let focused = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .unwrap();
+        assert!(
+            focused.is_same_node(Some(&search)),
+            "keyboard focus stays in the open picker when its switch disappears"
+        );
         let escape = web_sys::KeyboardEventInit::new();
         escape.set_key("Escape");
         escape.set_bubbles(true);
-        search
+        focused
             .dispatch_event(
                 &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
                     .unwrap(),
@@ -1454,10 +1563,51 @@ mod wasm_tests {
                 .unwrap()
                 .is_same_node(Some(&picker()))
         );
-        picker().click();
-        next_tick().await;
-        project_choice("Shared name").unwrap().click();
-        next_tick().await;
+        let expanded = || picker().get_attribute("aria-expanded");
+        press(&picker()).await;
+        assert_eq!(expanded().as_deref(), Some("true"));
+        press(&picker()).await;
+        assert_eq!(
+            expanded().as_deref(),
+            Some("false"),
+            "pressing the Project button closes the open picker"
+        );
+        press(&picker()).await;
+        let heading = container
+            .query_selector("[role=dialog] h2")
+            .unwrap()
+            .unwrap();
+        press(&heading).await;
+        assert_eq!(
+            expanded().as_deref(),
+            Some("false"),
+            "a press outside closes the picker"
+        );
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name / UI polish")
+        );
+        press(&picker()).await;
+        press(&project_choice("Shared name").unwrap()).await;
+        assert_eq!(
+            picker().text_content().as_deref(),
+            Some("Shared name"),
+            "a pointer press selects the requested project"
+        );
+        assert_eq!(
+            picker().get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&picker())),
+            "choosing returns focus to the Project control"
+        );
         // Choosing a destination never navigates the current workspace.
         assert_eq!(state.active_project.get_untracked(), Some(workbench));
         state.active_project.set(Some(local.clone()));
@@ -1480,8 +1630,7 @@ mod wasm_tests {
             project_choice("UI polish").is_none(),
             "other-host workbenches never leak into choices"
         );
-        project_choice("No project / Home").unwrap().click();
-        next_tick().await;
+        press(&project_choice("No project / Home").unwrap()).await;
         choose("local", Some(local.clone())).await;
         assert!(find_button_by_text(&container, "Local Claude").is_some());
         choose("unbootstrapped", None).await;
