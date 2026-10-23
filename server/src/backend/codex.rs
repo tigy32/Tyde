@@ -2210,9 +2210,9 @@ impl CodexSession {
         let mut skill_setup = skill_setup;
         skill_setup.diagnostics.splice(0..0, skill_notices);
 
-        if access_mode == BackendAccessMode::EnforcedReadOnly && rpc.rollout_trace_root.is_none() {
+        if rpc.rollout_trace_root.is_none() {
             cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-            return Err("Codex protected Fork requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned());
+            return Err("Codex Fork requires the process-owned native execution source; this transport does not expose it".to_owned());
         }
 
         let mut fork_params = json!({
@@ -2260,10 +2260,10 @@ impl CodexSession {
             cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
             return Err("Codex thread/fork response missing thread.id".to_string());
         };
-        if access_mode == BackendAccessMode::EnforcedReadOnly {
+        {
             if forked_thread_id.trim().is_empty() || forked_thread_id == from_thread_id {
                 cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-                return Err("Codex protected fork did not return a new thread identity".to_owned());
+                return Err("Codex fork did not return a new thread identity".to_owned());
             }
             if let Err(error) = rpc.install_native_execution_trace(forked_thread_id).await {
                 cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
@@ -2318,17 +2318,7 @@ impl CodexSession {
                 CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(&thread_id)))
             }
             "thread/fork" => {
-                if config.access_mode == BackendAccessMode::EnforcedReadOnly
-                    && config.execution_mode == BackendExecutionMode::Agent
-                {
-                    CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(
-                        &thread_id,
-                    )))
-                } else {
-                    CodexResponseProjection::Items {
-                        last_token_usage: None,
-                    }
-                }
+                CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(&thread_id)))
             }
             _ => {
                 return Err(format!(
@@ -3644,6 +3634,14 @@ impl CodexResponseSplitter {
             return None;
         }
         let opened = self.ensure_open(turn_id)?;
+        if item.get("name").and_then(Value::as_str) == Some("write_stdin") {
+            tracing::info!(
+                target: "tyde_codex_model_tools",
+                item_identity_present = item.get("id").and_then(|value| value.as_str()).is_some(),
+                call_identity_present = item.get("call_id").and_then(|value| value.as_str()).is_some(),
+                "Observed Codex polling declaration at response boundary"
+            );
+        }
         let Some(item_id) = item
             .get("id")
             .and_then(Value::as_str)
@@ -3679,6 +3677,15 @@ impl CodexResponseSplitter {
                     .provider_call_id
                     .as_deref()
                     .is_some_and(|call_id| self.typed_item_owns_call(call_id));
+            if request
+                .arguments
+                .as_str()
+                .is_some_and(|source| source.contains("tools.write_stdin("))
+            {
+                tracing::info!(target: "tyde_codex_model_tools",
+                    typed_owner_present = typed_owns_call,
+                    "Observed Codex polling cell at canonical response boundary");
+            }
             tracing::debug!(
                 probe = "raw",
                 provider_call_id = request.provider_call_id.is_some(),
@@ -9354,16 +9361,8 @@ impl CodexInner {
         session_id: String,
         settings: &Value,
     ) -> Result<(), String> {
-        let protected = {
-            self.state
-                .with(move |state| {
-                    state.access_mode == BackendAccessMode::EnforcedReadOnly
-                        && state.execution_mode == BackendExecutionMode::Agent
-                })
-                .await
-        };
-        if protected && self.rpc.rollout_trace_root.is_none() {
-            return Err("Codex protected Resume requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned());
+        if self.rpc.rollout_trace_root.is_none() {
+            return Err("Codex Resume requires the process-owned native execution source; this transport does not expose it".to_owned());
         }
         {
             let session_id = session_id.clone();
@@ -9431,9 +9430,6 @@ impl CodexInner {
                         .clone(),
                 );
             }
-            if !protected {
-                params["experimentalRawEvents"] = json!(CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS);
-            }
             tracing::info!(
                 sandbox = params["sandbox"].as_str(),
                 workspace_root_count = params["runtimeWorkspaceRoots"].as_array().map(Vec::len),
@@ -9447,22 +9443,6 @@ impl CodexInner {
             }
             let response = self.rpc.request("thread/resume", params).await?;
 
-            // Ordinary resume retains its existing best-effort raw negotiation.
-            let raw_events_enabled = match response.get("experimentalRawEvents") {
-                Some(Value::Bool(enabled)) => *enabled,
-                None => false,
-                Some(_) => {
-                    return Err(
-                        "Codex thread/resume response has invalid experimentalRawEvents".to_owned(),
-                    );
-                }
-            };
-            tracing::info!(
-                raw_events_requested = !protected && CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
-                raw_events_enabled,
-                "Codex resume raw event negotiation"
-            );
-
             let thread = response
                 .get("thread")
                 .ok_or("Codex thread/resume response missing thread")?;
@@ -9471,16 +9451,12 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .ok_or("Codex thread/resume response missing thread.id")?
                 .to_string();
-            if protected {
-                if resumed_thread_id != session_id {
-                    return Err(
-                        "Codex protected Resume returned a different native identity".to_owned(),
-                    );
-                }
-                self.rpc
-                    .install_native_execution_trace(&resumed_thread_id)
-                    .await?;
+            if resumed_thread_id != session_id {
+                return Err("Codex Resume returned a different native identity".to_owned());
             }
+            self.rpc
+                .install_native_execution_trace(&resumed_thread_id)
+                .await?;
             let resumed_model = response
                 .get("model")
                 .and_then(Value::as_str)
@@ -9490,10 +9466,10 @@ impl CodexInner {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
-            Ok::<_, String>((resumed_thread_id, resumed_model, turns, raw_events_enabled))
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
         }
         .await;
-        let (resumed_thread_id, resumed_model, turns, raw_events_enabled) = match resumed {
+        let (resumed_thread_id, resumed_model, turns) = match resumed {
             Ok(resumed) => resumed,
             Err(error) => {
                 self.state
@@ -9523,8 +9499,7 @@ impl CodexInner {
                                 CodexResponseSplitter::new(&resumed_thread_id),
                             )),
                         );
-                        state.experimental_raw_events_requested =
-                            !protected && CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS;
+                        state.experimental_raw_events_requested = false;
                         state.raw_response_item_completed_seen = false;
                         state.raw_contract_drift_warned = false;
                         if let Some(model) = resumed_model.clone() {
@@ -9555,9 +9530,6 @@ impl CodexInner {
         self.apply_local_settings(settings).await;
 
         self.emitter.conversation_cleared();
-        if !protected {
-            emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), raw_events_enabled);
-        }
         self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
@@ -10683,7 +10655,11 @@ impl CodexInner {
             .await
     }
 
-    async fn complete_strict_raw_tool_output(&self, params: &Value) -> bool {
+    async fn complete_strict_raw_tool_output(
+        &self,
+        params: &Value,
+        native_outcome: CodexRawToolOutcome,
+    ) -> bool {
         let Some(item) = params.get("item") else {
             return false;
         };
@@ -11005,10 +10981,16 @@ impl CodexInner {
                 (exit_code != 0).then(|| format!("Command failed with exit code {exit_code}")),
             )
         } else {
-            let success = !output.starts_with("Script failed");
-            let error = (!success).then(|| output.clone());
+            let (result, error) = match native_outcome {
+                CodexRawToolOutcome::Presentation => {
+                    let error = output.starts_with("Script failed").then(|| output.clone());
+                    (Value::String(output.clone()), error)
+                }
+                CodexRawToolOutcome::Native { result, error } => (result, error),
+            };
+            let success = error.is_none();
             let tool_result = if success {
-                json!({ "kind": "Other", "result": output })
+                json!({ "kind": "Other", "result": result })
             } else {
                 json!({
                     "kind": "Error",
@@ -11768,10 +11750,10 @@ impl CodexInner {
             source = "native_execution_trace",
             observation_available = false,
             reason,
-            "Codex protected native execution observation unavailable"
+            "Codex native execution observation unavailable"
         );
         self.emitter.backend_error(&format!(
-            "Codex protected native execution observation unavailable: {reason}; no execution outcome was inferred"
+            "Codex native execution observation unavailable: {reason}; no execution outcome was inferred"
         ));
     }
 
@@ -11821,6 +11803,18 @@ impl CodexInner {
                 }
                 CodexNativeTraceDelivery::ObservationError(reason) => {
                     self.report_native_trace_error(reason)
+                }
+                CodexNativeTraceDelivery::RawToolOutput {
+                    turn_id,
+                    item,
+                    outcome,
+                } => {
+                    let thread_id = self.state.with(|state| state.thread_id.clone()).await;
+                    let params = json!({"threadId": thread_id, "turnId": turn_id, "item": item});
+                    for process_id in self.correlate_yielded_command_owners(&params).await {
+                        self.promote_command(&params, &process_id).await;
+                    }
+                    self.complete_strict_raw_tool_output(&params, outcome).await;
                 }
                 CodexNativeTraceDelivery::CompletedCall(call) => {
                     let thread_id = self.state.with(move |state| state.thread_id.clone()).await;
@@ -11953,6 +11947,12 @@ impl CodexInner {
                 .await;
         }
         self.observe_strict_raw_response_item(&params).await;
+        if item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant")
+        {
+            self.promote_root_commands_before_agent_response(&params)
+                .await;
+        }
         let (content, reasoning) = match item.get("type").and_then(Value::as_str) {
             Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
                 (extract_codex_item_text(item), false)
@@ -12158,7 +12158,8 @@ impl CodexInner {
                 CodexUnlinkedRawToolResolution::Failed => true,
                 CodexUnlinkedRawToolResolution::OrdinaryCompletion
                 | CodexUnlinkedRawToolResolution::Correlated(_) => {
-                    self.complete_strict_raw_tool_output(params).await
+                    self.complete_strict_raw_tool_output(params, CodexRawToolOutcome::Presentation)
+                        .await
                 }
             };
             if matches!(
@@ -18444,8 +18445,9 @@ let stream_key = stream_key.as_str();
             error,
             normalization_failure,
         );
-        eprintln!(
-            "TYDE CODEX TOOL TERMINAL source=provider tool_name={tool_name} outcome={outcome:?}"
+        tracing::debug!(
+            succeeded = matches!(outcome, ToolExecutionOutcome::Succeeded { .. }),
+            "Codex provider tool completed"
         );
         self.emitter.tool_completed(tool_call_id, outcome);
         self.mark_tool_completed(tool_call_id).await;
@@ -21514,9 +21516,22 @@ struct CodexNativeTraceNotification {
     bytes: usize,
 }
 
+enum CodexRawToolOutcome {
+    Presentation,
+    Native {
+        result: Value,
+        error: Option<String>,
+    },
+}
+
 enum CodexNativeTraceDelivery {
     Notification(CodexNativeTraceNotification),
     CompletedCall(CodexNativeTraceCall),
+    RawToolOutput {
+        turn_id: String,
+        item: Value,
+        outcome: CodexRawToolOutcome,
+    },
     ModelItem {
         turn_id: String,
         item: Value,
@@ -21735,7 +21750,7 @@ fn run_codex_native_trace_io(
         } => {
             let outcome = CodexNativeExecutionTrace::open(&root, &thread_id)
                 .map(|trace| transport = Some(trace))
-                .map_err(|reason| format!("Codex protected execution trace unavailable: {reason}"));
+                .map_err(|reason| format!("Codex native execution trace unavailable: {reason}"));
             let _ = reply.send(outcome);
         }
         CodexNativeTraceCommand::Status(reply) => {
@@ -21796,7 +21811,7 @@ fn run_codex_native_trace_io(
 }
 
 // A provider transport cursor: this native trace is the sole raw narrative
-// source for protected rejoined threads. Never merge its original item IDs with
+// source for rejoined threads. Never merge its original item IDs with
 // the optional replacement IDs assigned later by native stdout projection.
 struct CodexNativeExecutionTrace {
     root: std::fs::File,
@@ -21813,6 +21828,11 @@ struct CodexNativeExecutionTrace {
     active_turn: Option<String>,
     started_turns: HashSet<String>,
     calls: HashMap<(String, String), CodexNativeTraceCall>,
+    code_cells: HashMap<(String, String), String>,
+    runtime_call_slots: HashMap<(String, String), String>,
+    raw_calls: HashSet<(String, String)>,
+    raw_outputs: IndexMap<(String, String), (Value, CodexRawToolOutcome)>,
+    code_cell_receipts: HashSet<(String, String)>,
     inferences: HashMap<(String, String), CodexNativeTraceInference>,
     inference_order: VecDeque<(String, String)>,
     runtime_calls: HashSet<(String, String)>,
@@ -21985,6 +22005,11 @@ impl CodexNativeExecutionTrace {
             active_turn: None,
             started_turns: HashSet::new(),
             calls: HashMap::new(),
+            code_cells: HashMap::new(),
+            runtime_call_slots: HashMap::new(),
+            raw_calls: HashSet::new(),
+            raw_outputs: IndexMap::new(),
+            code_cell_receipts: HashSet::new(),
             inferences: HashMap::new(),
             inference_order: VecDeque::new(),
             runtime_calls: HashSet::new(),
@@ -22005,6 +22030,11 @@ impl CodexNativeExecutionTrace {
         // The new binding must not republish earlier turns of this process.
         trace.started_turns.clear();
         trace.calls.clear();
+        trace.code_cells.clear();
+        trace.runtime_call_slots.clear();
+        trace.raw_calls.clear();
+        trace.raw_outputs.clear();
+        trace.code_cell_receipts.clear();
         trace.inferences.clear();
         trace.inference_order.clear();
         trace.runtime_calls.clear();
@@ -22112,6 +22142,17 @@ impl CodexNativeExecutionTrace {
                 );
             }
         }
+        for (item, outcome) in self.raw_outputs.values() {
+            let native = match outcome {
+                CodexRawToolOutcome::Presentation => None,
+                CodexRawToolOutcome::Native { result, error } => Some((result, error)),
+            };
+            retained_bytes = retained_bytes.saturating_add(
+                serde_json::to_vec(&(item, native))
+                    .map_err(|_| "native_trace_retained_encoding_failed")?
+                    .len(),
+            );
+        }
         for inference in self.inferences.values() {
             retained_bytes = retained_bytes.saturating_add(
                 serde_json::to_vec(&inference.items)
@@ -22155,6 +22196,8 @@ impl CodexNativeExecutionTrace {
         if !matches!(
             kind,
             "tool_call_started"
+                | "code_cell_started"
+                | "code_cell_initial_response"
                 | "tool_call_runtime_started"
                 | "tool_call_runtime_ended"
                 | "tool_call_ended"
@@ -22258,7 +22301,86 @@ impl CodexNativeExecutionTrace {
                     CodexResponseEnd::Interrupted
                 };
             }
+            "code_cell_started" => {
+                let cell = codex_native_trace_id(payload.get("runtime_cell_id"))?.to_owned();
+                let call = codex_native_trace_id(payload.get("model_visible_call_id"))?.to_owned();
+                if self.code_cells.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+                    || self.code_cells.insert((turn_id, cell), call).is_some()
+                {
+                    return Err("native_trace_code_cell_identity_or_budget_invalid");
+                }
+            }
+            "code_cell_initial_response" => {
+                let cell = codex_native_trace_id(payload.get("runtime_cell_id"))?;
+                let call = self
+                    .code_cells
+                    .get(&(turn_id.clone(), cell.to_owned()))
+                    .ok_or("native_trace_code_cell_owner_missing")?
+                    .clone();
+                let result = self.payload(
+                    payload
+                        .get("response_payload")
+                        .ok_or("native_trace_code_cell_result_missing")?,
+                    "tool_result",
+                )?;
+                let response = result
+                    .get("response")
+                    .and_then(Value::as_object)
+                    .filter(|response| response.len() == 1)
+                    .ok_or("native_trace_code_cell_response_invalid")?;
+                let value = response
+                    .get("Result")
+                    .or_else(|| response.get("Yielded"))
+                    .ok_or("native_trace_code_cell_response_kind_invalid")?;
+                if value.get("cell_id").and_then(Value::as_str) != Some(cell) {
+                    return Err("native_trace_code_cell_result_identity_mismatch");
+                }
+                let output = value
+                    .get("content_items")
+                    .and_then(Value::as_array)
+                    .ok_or("native_trace_code_cell_content_missing")?
+                    .clone();
+                let error = match value.get("error_text") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(error)) => Some(error.clone()),
+                    _ => return Err("native_trace_code_cell_error_invalid"),
+                };
+                if self.code_cell_receipts.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+                    || !self
+                        .code_cell_receipts
+                        .insert((turn_id.clone(), cell.to_owned()))
+                {
+                    return Err("native_trace_code_cell_result_repeated_or_budget_invalid");
+                }
+                self.buffer_raw_output(
+                    turn_id,
+                    call.clone(),
+                    json!({
+                        "type": "custom_tool_call_output", "call_id": call, "output": output,
+                    }),
+                    CodexRawToolOutcome::Native { result, error },
+                )?;
+            }
             "tool_call_started" => {
+                if payload.pointer("/requester/type").and_then(Value::as_str) == Some("code_cell") {
+                    let cell =
+                        codex_native_trace_id(payload.pointer("/requester/runtime_cell_id"))?;
+                    let slot = self
+                        .code_cells
+                        .get(&(turn_id.clone(), cell.to_owned()))
+                        .ok_or("native_trace_nested_code_cell_owner_missing")?
+                        .clone();
+                    let call = codex_native_trace_id(payload.get("tool_call_id"))?.to_owned();
+                    if self.runtime_call_slots.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+                        || self
+                            .runtime_call_slots
+                            .insert((turn_id, call), slot)
+                            .is_some()
+                    {
+                        return Err("native_trace_nested_call_identity_or_budget_invalid");
+                    }
+                    return Ok(());
+                }
                 if payload.pointer("/requester/type").and_then(Value::as_str) != Some("model") {
                     return Ok(());
                 }
@@ -22277,6 +22399,14 @@ impl CodexNativeExecutionTrace {
                         .ok_or("native_trace_invocation_missing")?,
                     "tool_invocation",
                 )?;
+                if invocation.get("tool_name").and_then(Value::as_str) != Some("exec_command") {
+                    if self.raw_calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+                        || !self.raw_calls.insert((turn_id, call_id))
+                    {
+                        return Err("native_trace_raw_call_identity_or_budget_invalid");
+                    }
+                    return Ok(());
+                }
                 if invocation.get("tool_name").and_then(Value::as_str) != Some("exec_command")
                     || invocation.get("tool_namespace").is_some_and(|namespace| {
                         !namespace.is_null() && namespace.as_str() != Some("functions")
@@ -22334,6 +22464,48 @@ impl CodexNativeExecutionTrace {
             "tool_call_ended" => {
                 let id = codex_native_trace_id(payload.get("tool_call_id"))?.to_owned();
                 let key = (turn_id, id.clone());
+                if self.raw_calls.remove(&key) {
+                    let result = self.payload(
+                        payload
+                            .get("result_payload")
+                            .ok_or("native_trace_raw_result_missing")?,
+                        "tool_result",
+                    )?;
+                    let (item, error) = match result.get("type").and_then(Value::as_str) {
+                        Some("direct_response") => {
+                            let item = result
+                                .get("response_item")
+                                .ok_or("native_trace_raw_response_missing")?;
+                            if !is_raw_codex_tool_output_item_type(
+                                item.get("type").and_then(Value::as_str),
+                            ) || item.get("call_id").and_then(Value::as_str) != Some(id.as_str())
+                            {
+                                return Err("native_trace_raw_result_identity_mismatch");
+                            }
+                            (item.clone(), None)
+                        }
+                        Some("error") => {
+                            let error = result
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .ok_or("native_trace_raw_error_missing")?
+                                .to_owned();
+                            (
+                                json!({"type": "function_call_output", "call_id": id, "output": error}),
+                                Some(error),
+                            )
+                        }
+                        _ => return Err("native_trace_raw_result_shape_invalid"),
+                    };
+                    let result = Value::String(raw_custom_tool_output_text(&item));
+                    self.buffer_raw_output(
+                        key.0,
+                        id,
+                        item,
+                        CodexRawToolOutcome::Native { result, error },
+                    )?;
+                    return Ok(());
+                }
                 if !self.calls.contains_key(&key) {
                     return Ok(());
                 }
@@ -22504,10 +22676,15 @@ impl CodexNativeExecutionTrace {
                 }
             }
         }
+        let model_slot = call_key.as_ref().map(|key| {
+            self.runtime_call_slots
+                .get(key)
+                .map_or_else(|| key.clone(), |slot| (key.0.clone(), slot.clone()))
+        });
         // Only unreleased native call slots depend on the narrative source.
         // Output/progress for a published slot must never accumulate here.
         if method != "turn/completed"
-            && call_key
+            && model_slot
                 .as_ref()
                 .is_none_or(|key| self.released_call_slots.contains(key))
         {
@@ -22515,6 +22692,14 @@ impl CodexNativeExecutionTrace {
                 .incoming_notification
                 .take()
                 .ok_or("native_trace_incoming_notification_missing")?;
+            if let Some(key) = call_key.as_ref() {
+                if self.released_call_slots.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+                    && !self.released_call_slots.contains(key)
+                {
+                    return Err("native_trace_released_slot_budget_exceeded");
+                }
+                self.released_call_slots.insert(key.clone());
+            }
             self.pending_deliveries
                 .push(CodexNativeTraceDelivery::Notification(notification));
             let deliveries = self.release(None)?;
@@ -22749,9 +22934,20 @@ impl CodexNativeExecutionTrace {
                     let mut remaining = VecDeque::new();
                     while let Some(mut notification) = self.notifications.pop_front() {
                         if extract_turn_id(&notification.params).as_deref() == Some(key.0.as_str())
-                            && codex_native_trace_notification_call(&notification)
-                                == Some(call_id.as_str())
+                            && codex_native_trace_notification_call(&notification).is_some_and(
+                                |id| {
+                                    id == call_id
+                                        || self
+                                            .runtime_call_slots
+                                            .get(&(key.0.clone(), id.to_owned()))
+                                            .is_some_and(|slot| slot == &call_id)
+                                },
+                            )
                         {
+                            if let Some(id) = codex_native_trace_notification_call(&notification) {
+                                self.released_call_slots
+                                    .insert((key.0.clone(), id.to_owned()));
+                            }
                             self.notification_bytes -= notification.bytes;
                             if let Some(query) = hosted_query.as_ref()
                                 && notification.method == "item/started"
@@ -22785,6 +22981,7 @@ impl CodexNativeExecutionTrace {
                     self.notifications = remaining;
                 }
             }
+            self.release_raw_outputs();
             self.pending_deliveries
                 .push(CodexNativeTraceDelivery::InferenceEnd {
                     turn_id: key.0,
@@ -22793,7 +22990,28 @@ impl CodexNativeExecutionTrace {
                     ending: inference.ending,
                 });
         }
+        self.release_raw_outputs();
         if let Some(turn) = terminal {
+            if self.raw_outputs.keys().any(|(id, _)| id == turn) {
+                return Err("native_trace_raw_result_without_model_slot");
+            }
+            let completed = self
+                .ended_turns
+                .get(turn)
+                .is_some_and(|(_, status)| *status == CodexNativeTraceTurnEnd::Completed);
+            if completed
+                && (self.raw_calls.iter().any(|(id, _)| id == turn)
+                    || self
+                        .code_cells
+                        .keys()
+                        .any(|key| key.0 == turn && !self.code_cell_receipts.contains(key)))
+            {
+                return Err("native_trace_completed_turn_raw_result_missing");
+            }
+            self.code_cells.retain(|(id, _), _| id != turn);
+            self.code_cell_receipts.retain(|(id, _)| id != turn);
+            self.runtime_call_slots.retain(|(id, _), _| id != turn);
+            self.raw_calls.retain(|(id, _)| id != turn);
             if self.inference_order.iter().any(|(id, _)| id == turn) {
                 return Err("native_trace_terminal_inference_not_reconciled");
             }
@@ -22828,6 +23046,43 @@ impl CodexNativeExecutionTrace {
             }
         }
         Ok(std::mem::take(&mut self.pending_deliveries))
+    }
+
+    fn buffer_raw_output(
+        &mut self,
+        turn: String,
+        call: String,
+        item: Value,
+        outcome: CodexRawToolOutcome,
+    ) -> Result<(), &'static str> {
+        if self.raw_outputs.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
+            || self
+                .raw_outputs
+                .insert((turn, call), (item, outcome))
+                .is_some()
+        {
+            return Err("native_trace_raw_result_identity_or_budget_invalid");
+        }
+        Ok(())
+    }
+
+    fn release_raw_outputs(&mut self) {
+        let ready = self
+            .raw_outputs
+            .keys()
+            .filter(|key| self.released_call_slots.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in ready {
+            if let Some((item, outcome)) = self.raw_outputs.shift_remove(&key) {
+                self.pending_deliveries
+                    .push(CodexNativeTraceDelivery::RawToolOutput {
+                        turn_id: key.0,
+                        item,
+                        outcome,
+                    });
+            }
+        }
     }
 
     fn close(
@@ -23874,7 +24129,7 @@ impl CodexRpc {
 
     async fn install_native_execution_trace(&self, thread_id: &str) -> Result<(), String> {
         let root = self.rollout_trace_root.as_ref().ok_or_else(|| {
-            "Codex protected Fork/Resume requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned()
+            "Codex Fork/Resume requires the process-owned native execution source; this transport does not expose it".to_owned()
         })?;
         self.native_execution_trace
             .install(root.path().to_path_buf(), thread_id.to_owned())
@@ -23883,7 +24138,7 @@ impl CodexRpc {
             target: "tyde_codex_model_tools",
             source = "native_execution_trace",
             native_thread_start_verified = true,
-            "Codex protected lifecycle execution source installed"
+            "Codex rejoined lifecycle execution source installed"
         );
         Ok(())
     }
@@ -23894,12 +24149,10 @@ impl CodexRpc {
                 .native_execution_trace
                 .status()
                 .await
-                .map_err(|reason| {
-                    format!("Codex protected execution trace unavailable: {reason}")
-                })?;
+                .map_err(|reason| format!("Codex native execution trace unavailable: {reason}"))?;
             if let CodexNativeTraceStatus::Failed(reason) = status {
                 return Err(format!(
-                    "Codex protected execution trace unavailable: {reason}"
+                    "Codex native execution trace unavailable: {reason}"
                 ));
             }
         }
