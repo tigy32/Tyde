@@ -4,6 +4,7 @@
     --ink-accent: var(--accent-link);
     --ink-user: var(--surface-2);
     --ink-muted: var(--text-secondary);
+    --ink-activity-tab-height: 32px;
     background: var(--surface-base);
     color: var(--text-primary);
     font-size: 1.154rem;
@@ -21,10 +22,37 @@
     animation: none;
 }
 
-.chat-view[data-chat-appearance="ink"] .virt-row + .virt-row,
 .chat-view[data-chat-appearance="ink"] .chat-card + .chat-card,
 .chat-view[data-chat-appearance="ink"] .virt-spacer-bottom ~ .chat-card {
     margin-top: 26px;
+}
+
+/* Ink spaces rows inside the measured row box, so the virtualizer reserves
+   exactly what is drawn; a working stretch's rows sit close together. */
+.chat-view[data-chat-appearance="ink"] .virt-row + .virt-row {
+    margin-top: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-row {
+    padding-top: 26px;
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-gap-tight {
+    padding-top: 10px;
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-gap-none {
+    padding-top: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-hidden {
+    height: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-hidden > * {
+    display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-assistant {
@@ -99,13 +127,43 @@
 .chat-view[data-chat-appearance="ink"] .chat-card-footer {
     order: -1;
     justify-content: flex-start;
+    align-items: center;
     border: 0;
     padding: 0;
-    margin: 0 0 12px;
-    gap: 12px;
+    margin: 0 0 10px;
+    gap: 8px;
     flex-wrap: wrap;
-    min-height: 25px;
+    min-height: 26px;
     color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant {
+    position: relative;
+}
+
+/* Later rows of a stretch keep their time and copy action, out of the flow
+   until the row is hovered or focused. */
+.chat-view[data-chat-appearance="ink"] .ink-continuation .chat-card-footer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
+    margin: 0;
+    padding: 0 0 0 10px;
+    border-radius: 6px;
+    background: var(--surface-base);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-continuation:is(:hover, :focus-within) .chat-card-footer {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-continuation .token-badge {
+    display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .token-badge {
@@ -139,15 +197,19 @@
     opacity: 1;
 }
 
-.chat-view[data-chat-appearance="ink"] .token-badge > .token-sep:nth-child(2) {
+.chat-view[data-chat-appearance="ink"] .token-badge > :is(.token-sep, .token-stat-input, .token-stat-output) {
     display: none;
 }
 
-.chat-view[data-chat-appearance="ink"] :is(.token-sep, .token-stat-input, .token-stat-output, .footer-time) {
+.chat-view[data-chat-appearance="ink"] .footer-time {
     color: var(--text-secondary);
     opacity: 1;
     font-size: .923rem;
     font-family: var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-row:not(.ink-continuation) .footer-time::before {
+    content: "· ";
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-footer-right {
@@ -157,10 +219,19 @@
 .chat-view[data-chat-appearance="ink"] .footer-copy-btn {
     margin-left: auto;
     color: var(--text-secondary);
-    opacity: 1;
+    opacity: 0;
     width: 26px;
     height: 26px;
     border-color: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card:is(:hover, :focus-within) .footer-copy-btn,
+.chat-view[data-chat-appearance="ink"] .footer-copy-btn:is(.copied, .copy-failed) {
+    opacity: 1;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-continuation .footer-copy-btn {
+    margin-left: 0;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-streaming {
@@ -168,8 +239,9 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-streaming > .chat-card-header {
-    margin-bottom: 12px;
-    gap: 12px;
+    margin-bottom: 10px;
+    gap: 8px;
+    min-height: 26px;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-assistant .chat-card-sender {
@@ -186,17 +258,54 @@
     font: .923rem var(--font-sans);
 }
 
+/* The working stretch: actions, reasoning and tools sit in one lightly
+   indented column under flush prose. */
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools, .ink-actions-summary),
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant > .chat-card-phase > :is(.chat-card-tools, .ink-actions-summary) {
+    margin-left: var(--ink-activity-indent, 28px);
+}
+
 .chat-view[data-chat-appearance="ink"] .chat-card-reasoning {
     border: 0;
+    border-radius: 0;
     background: transparent;
-    margin-block: 0 12px;
+    margin-block: 2px;
+    align-self: flex-start;
+    max-width: calc(100% - var(--ink-activity-indent, 28px));
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary {
-    padding: 4px 0;
-    color: var(--text-secondary);
-    font-size: 1.077rem;
-    font-weight: 500;
+    gap: 8px;
+    padding: 2px 8px 2px 0;
+    border-radius: 5px;
+    list-style: none;
+    color: var(--text-tertiary);
+    font-size: .923rem;
+    font-weight: 400;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary::-webkit-details-marker {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    margin: 0 5px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 120ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning[open] summary::before {
+    transform: rotate(45deg);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary:hover {
+    background: transparent;
+    color: var(--text-primary);
 }
 
 .chat-view[data-chat-appearance="ink"] :is(.reasoning-content, .reasoning-tokens) {
@@ -204,38 +313,129 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .reasoning-content {
-    padding: 8px 14px;
-    border-left: 1px solid var(--border-secondary);
+    margin: 2px 0 8px 2px;
+    padding: 4px 0 4px 14px;
+    border-left: 1px solid var(--border-primary);
+    font-size: .962rem;
 }
 
-/* Each real tool keeps its disclosure/body; only its visual frame changes. */
+/* One discreet line for a tool group's completed actions. Its cards stay in
+   the group's list, folded until the line opens. */
+.chat-view[data-chat-appearance="ink"] .ink-actions-summary {
+    display: inline-flex;
+    align-self: flex-start;
+    align-items: center;
+    gap: 10px;
+    min-height: 30px;
+    margin-block: 6px 2px;
+    padding: 3px 8px 3px 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: 1rem var(--font-sans);
+    cursor: pointer;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-actions-summary[aria-expanded="false"] {
+    margin-bottom: 6px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-assistant > .ink-actions-summary {
+    margin-block: 4px;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-actions-summary:hover {
+    color: var(--text-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-actions-check {
+    flex: 0 0 16px;
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-actions-chevron {
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 120ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-actions-summary[aria-expanded="true"] .ink-actions-chevron {
+    transform: rotate(45deg);
+}
+
+/* Completed actions lead their list, nested under the summary line. */
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold] {
+    order: -1;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold="open"] {
+    margin-left: var(--ink-nested-indent, 26px);
+}
+
+/* A long list's overflow bar counts the folded actions, so it folds too. */
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > [data-ink-fold="folded"],
+.chat-view[data-chat-appearance="ink"] .chat-card-tools:has(> [data-ink-fold="folded"]) > .tool-list-summary,
+.chat-view[data-chat-appearance="ink"] .chat-card-tools:not(:has(> :not([data-ink-fold="folded"], .tool-list-summary))) {
+    display: none;
+}
+
+/* An open run lists its actions as one nested column under the summary. */
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-run-follower {
+    padding-top: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools[data-ink-run] {
+    margin-block: 0;
+}
+
+/* Each real tool keeps its disclosure/body; only its visual frame changes.
+   Settled successes and live non-command tools (an await) are plain rows, as
+   in prototype A; running commands, pending decisions and failures get a
+   frame so they stand out from the stretch. */
 .chat-view[data-chat-appearance="ink"] .chat-card-tools {
     border: 0;
     border-radius: 0;
     background: transparent;
     padding: 0;
     gap: 0;
-    margin: 24px 0 12px;
+    margin: 4px 0 6px;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card {
     border: 0;
-    border-radius: 0;
+    border-radius: 6px;
     background: transparent;
     overflow: visible;
     position: relative;
 }
 
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)),
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending) {
+    margin-block: 4px;
+    border: 1px solid var(--border-primary);
+    background: var(--surface-0);
+}
+
 .chat-view[data-chat-appearance="ink"] .tool-card-header {
     position: relative;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto 12px;
-    padding: 8px 0;
-    min-height: 38px;
-    gap: 5px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 32px;
+    margin-inline: -8px;
+    padding: 4px 8px;
     border-radius: 5px;
-    font-size: 1.077rem;
+    font-size: 1rem;
     list-style: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-header {
+    margin-inline: 0;
+    padding: 7px 12px;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-header::-webkit-details-marker {
@@ -243,38 +443,42 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-header::before {
-    content: "";
-    position: absolute;
-    left: -37px;
-    top: 12px;
-    width: 18px;
-    height: 18px;
-    box-sizing: border-box;
-    border: 2px solid var(--text-secondary);
-    border-radius: 50%;
-    background: var(--surface-base);
-    box-shadow: 0 0 0 4px var(--surface-base);
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-card-header:has(.success)::before {
     content: "✓";
-    border-color: var(--accent-primary);
-    background: var(--accent-primary);
-    color: var(--text-on-accent);
+    flex: 0 0 16px;
+    box-sizing: border-box;
+    width: 16px;
+    height: 16px;
+    color: var(--text-secondary);
     text-align: center;
-    font: 12px/14px var(--font-sans);
+    font: 13px/16px var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-header:has(.failure, .rejected)::before {
     content: "!";
-    border-color: var(--error);
     color: var(--error);
-    text-align: center;
-    font: 12px/14px var(--font-sans);
+    font-weight: 700;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card-header:has(.cancelled)::before {
+    content: "–";
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-header:has(.pending)::before {
-    border-color: var(--ink-accent);
+    content: "";
+    border: 2px solid color-mix(in srgb, var(--ink-accent) 25%, transparent);
+    border-top-color: var(--ink-accent);
+    border-radius: 50%;
+    animation: ink-tool-spin .9s linear infinite;
+}
+
+@keyframes ink-tool-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-view[data-chat-appearance="ink"] .tool-card-header:has(.pending)::before {
+        animation: none;
+    }
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-icon {
@@ -282,34 +486,40 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-name {
-    font: 500 1.077rem var(--font-sans);
-    color: var(--text-primary);
-    flex-shrink: 0;
-    max-width: 100%;
-    grid-column: 1;
-    grid-row: 1;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 45%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-primary);
+    font: 500 1rem var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-detail {
-    font-size: 1rem;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--text-secondary);
+    font-size: .962rem;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-completion-summary {
-    font: .923rem var(--font-sans);
-    color: var(--text-secondary);
+    flex: 0 0 auto;
     margin-left: auto;
+    color: var(--text-tertiary);
+    font: .923rem var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-status-text {
+    flex: 0 0 auto;
     font: .923rem var(--font-sans);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-status-text.success {
-    color: var(--text-secondary);
+    display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-status-text.pending {
@@ -317,11 +527,22 @@
     animation: none;
 }
 
+.chat-view[data-chat-appearance="ink"] .tool-status-text:is(.failure, .rejected) {
+    color: var(--error);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-status-text.cancelled {
+    color: var(--text-secondary);
+}
+
 .chat-view[data-chat-appearance="ink"] .tool-chevron {
-    width: 7px;
-    height: 7px;
+    flex: 0 0 6px;
+    width: 6px;
+    height: 6px;
+    margin: 0 4px 0 2px;
     border-right: 1.5px solid currentColor;
     border-bottom: 1.5px solid currentColor;
+    color: var(--text-secondary);
     transform: rotate(-45deg);
     font-size: 0;
 }
@@ -331,11 +552,21 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card-body {
-    padding: 12px 16px;
-    margin: 4px 0 10px;
+    padding: 8px 12px;
+    margin: 2px 0 8px 26px;
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     background: var(--surface-0);
+    font-size: .962rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-body {
+    margin: 0;
+    padding: 8px 14px 10px 38px;
+    border: 0;
+    border-top: 1px solid var(--border-primary);
+    border-radius: 0 0 6px 6px;
+    background: transparent;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-result-command {
@@ -345,33 +576,31 @@
     background: transparent;
 }
 
-.chat-view[data-chat-appearance="ink"] .tool-command-line {
-    background: transparent;
-    padding: 0;
-    font-size: 1rem;
-    line-height: 1.6;
-    overflow-wrap: anywhere;
-    word-break: normal;
+/* The header already shows the command; the body keeps its directory and
+   output. */
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] .tool-command-line {
+    display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-cwd {
-    color: var(--text-secondary);
-    font-size: .923rem;
-    margin-top: 4px;
+    display: block;
+    color: var(--text-tertiary);
+    font: .846rem var(--font-mono);
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-result-command-content {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px solid var(--border-primary);
+    margin-top: 4px;
+    padding-top: 0;
+    border-top: 0;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-pre-block pre {
     background: transparent;
     border: 0;
-    padding: 4px 0;
-    font-size: 1rem;
-    line-height: 1.55;
+    padding: 2px 0;
+    color: var(--text-secondary);
+    font-size: .923rem;
+    line-height: 1.5;
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-exit-code {
@@ -410,6 +639,12 @@
     -webkit-mask-composite: xor;
     mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     mask-composite: exclude;
+}
+
+/* The attached activity tab sits above the composer inside the same input
+   area; the shimmer stays on the composer's border. */
+.chat-view[data-chat-appearance="ink"] .chat-input-area:has(> .ink-activity) > .chat-thinking-ring {
+    top: var(--ink-activity-tab-height);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -503,20 +738,25 @@
         max-width: 94%;
     }
 
-    .chat-view[data-chat-appearance="ink"] .tool-card-header::before {
-        left: -30px;
-    }
-
-    .chat-view[data-chat-appearance="ink"] .tool-card-detail {
-        flex-basis: 55%;
+    .chat-view[data-chat-appearance="ink"] {
+        --ink-activity-indent: 16px;
     }
 
     .chat-view[data-chat-appearance="ink"] .tool-completion-summary {
-        margin-left: 0;
+        display: none;
+    }
+
+    .chat-view[data-chat-appearance="ink"] .tool-card-name {
+        max-width: 60%;
     }
 
     .chat-view[data-chat-appearance="ink"] .tool-card-body {
-        padding: 10px 12px;
+        margin-left: 0;
+        padding: 8px 10px;
+    }
+
+    .chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-body {
+        padding-left: 12px;
     }
 
     .chat-view[data-chat-appearance="ink"] .chat-composer {
@@ -589,47 +829,25 @@
     max-width: min(100%, 64.615rem);
 }
 
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card {
-    margin-left: 18px;
-    padding-left: 28px;
-    border-left: 1px solid var(--border-secondary);
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-card-detail {
-    grid-column: 1 / -1;
-    grid-row: 2;
-    line-height: 1.5;
-    padding-right: 16px;
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-completion-summary {
-    grid-column: 2;
-    grid-row: 1;
-    margin: 0;
-    color: var(--text-tertiary);
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-status-text {
-    grid-column: 3;
-    grid-row: 1;
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-chevron {
-    grid-column: 4;
-    grid-row: 1;
-    margin: 0;
-}
-
 .chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-name {
     display: none;
 }
 
-.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .ink-command-label {
-    display: block;
-    grid-column: 1;
-    grid-row: 1;
-    font-size: 1.077rem;
+/* A command reads as the command itself, wrapping in full once opened. */
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail {
     color: var(--text-primary);
+    font: .962rem/1.5 var(--font-mono);
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail::before {
+    content: ">_";
+    margin-right: 10px;
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"][open] > .tool-card-header > .tool-card-detail {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 
 .chat-view[data-chat-appearance="ink"] .file-change-group {
@@ -697,9 +915,7 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .file-activity-row {
-    margin: 4px 16px 4px 18px;
-    padding-left: 28px;
-    border-left: 1px solid var(--border-secondary);
+    margin: 2px 16px;
 }
 
 .chat-view[data-chat-appearance="ink"] .file-change-collapsed .file-change-row {
@@ -715,9 +931,11 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .file-change-row .tool-card-header {
+    display: grid;
     grid-template-columns: 18px minmax(0, 32ch) minmax(max-content, 1fr) 12px;
     min-height: 30px;
-    padding-block: 4px;
+    margin: 0;
+    padding: 4px 0;
     gap: 12px;
 }
 
@@ -876,16 +1094,13 @@
 
 @media (max-width: 760px) {
     .chat-view[data-chat-appearance="ink"] .file-change-row { padding-left: 16px; }
-    .chat-view[data-chat-appearance="ink"] .file-activity-row { margin-left: 10px; padding-left: 20px; }
+    .chat-view[data-chat-appearance="ink"] .file-activity-row { margin-inline: 10px; }
     .chat-view[data-chat-appearance="ink"] .file-change-row .tool-card-header {
         grid-template-columns: 16px minmax(0, 1fr) auto 10px;
         gap: 8px;
     }
     .chat-view[data-chat-appearance="ink"] .file-change-row .ink-file-counts { gap: 8px; }
-    .chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card { margin-left: 10px; padding-left: 20px; }
-    .chat-view[data-chat-appearance="ink"] .tool-card-header::before { left: -30px; }
-    .chat-view[data-chat-appearance="ink"] .tool-card-header { gap: 5px 8px; }
-    .chat-view[data-chat-appearance="ink"] .tool-completion-summary { justify-self: end; }
+    .chat-view[data-chat-appearance="ink"] .tool-card-header { gap: 8px; }
     .chat-view[data-chat-appearance="ink"] .chat-input-row { flex-wrap: wrap; }
     .chat-view[data-chat-appearance="ink"] .chat-textarea { flex-basis: calc(100% - 48px); }
     .chat-view[data-chat-appearance="ink"] .ink-session-slot { margin-left: auto; }
@@ -900,7 +1115,6 @@
     background: var(--surface-3);
 }
 
-.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"][open] > .tool-card-header > .tool-card-detail,
 .chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] .tool-exit-code,
 .chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-status-text.success,
 .chat-view[data-chat-appearance="ink"] .file-change-row .tool-file-path {
@@ -936,4 +1150,264 @@
 
 .chat-view[data-chat-appearance="ink"] .session-settings-header {
     justify-content: flex-start;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity {
+    position: relative;
+    height: var(--ink-activity-tab-height);
+}
+
+/* Anchored to the composer's top edge so expanding grows the tray upward over
+   the transcript instead of reflowing it. */
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer {
+    position: absolute;
+    right: 16px;
+    bottom: 0;
+    left: 16px;
+    z-index: 80;
+    border: 1px solid var(--border-secondary);
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
+    background: var(--surface-0);
+    overflow: hidden;
+    transition: box-shadow 200ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer.expanded {
+    box-shadow: 0 -10px 28px #0000002e;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-tab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    height: 31px;
+    padding: 0 14px;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font: 500 .923rem/1 var(--font-sans);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-tab:hover,
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer.expanded .ink-activity-tab {
+    color: var(--text-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-tab:focus-visible {
+    outline: 2px solid var(--ink-accent);
+    outline-offset: -2px;
+    border-radius: 11px 11px 0 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-tab-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-dot {
+    flex: 0 0 6px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-chevron {
+    flex: 0 0 12px;
+    width: 12px;
+    height: 12px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 200ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer.expanded .ink-activity-chevron {
+    transform: rotate(180deg);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-reveal {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 200ms ease;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer.expanded .ink-activity-reveal {
+    grid-template-rows: 1fr;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-clip {
+    min-height: 0;
+    overflow: hidden;
+    visibility: hidden;
+    transition: visibility 0s linear 200ms;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-drawer.expanded .ink-activity-clip {
+    visibility: visible;
+    transition-delay: 0s;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list {
+    max-height: min(360px, 45vh);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0 16px 10px;
+    border-top: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-waiting {
+    margin: 10px 0 0;
+    color: var(--text-secondary);
+    font-size: .923rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-section h3 {
+    margin: 12px 0 2px;
+    color: var(--text-secondary);
+    font: 500 .923rem var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-section + .ink-activity-section {
+    margin-top: 6px;
+    border-top: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-row {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    gap: 3px 10px;
+    min-height: 48px;
+    padding: 8px 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-row + .tool-live-agent-row {
+    border-top: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-row::before {
+    content: "";
+    grid-column: 1;
+    grid-row: 1;
+    align-self: start;
+    justify-self: center;
+    width: 8px;
+    height: 8px;
+    margin-top: 6px;
+    border-radius: 50%;
+    background: var(--success);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-commands .tool-live-agent-row::before {
+    content: ">_";
+    width: auto;
+    height: auto;
+    margin-top: 2px;
+    border-radius: 0;
+    background: none;
+    color: var(--text-secondary);
+    font: .846rem var(--font-mono);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-main {
+    grid-column: 2;
+    flex-wrap: wrap;
+    gap: 2px 8px;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-name {
+    flex-basis: 100%;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+    font: 500 1.077rem/1.35 var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-commands .tool-live-agent-name {
+    font: .923rem/1.5 var(--font-mono);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list :is(.tool-live-agent-status, .tool-live-agent-backend) {
+    font-size: .923rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-status.running {
+    color: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .inflight-tray-row-actions {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: start;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list :is(.tool-live-agent-preview, .tool-live-agent-output, .tool-live-agent-summary, .tool-live-agent-stats, .tool-agent-open-feedback) {
+    grid-column: 2 / -1;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list :is(.tool-live-agent-preview, .tool-live-agent-output) {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+    font-size: .923rem;
+    line-height: 1.45;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-summary {
+    font-size: .923rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-agent-stats {
+    font-size: .846rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-link {
+    min-height: 30px;
+    padding: 0 12px;
+    border: 1px solid color-mix(in srgb, var(--ink-accent) 45%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--ink-accent) 10%, transparent);
+    color: var(--ink-accent);
+    font: 500 .923rem var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .tool-live-link:hover {
+    background: color-mix(in srgb, var(--ink-accent) 18%, transparent);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .inflight-tray-cancel {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    font-size: 1.077rem;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .inflight-tray-queue {
+    gap: 6px;
+    margin: 6px 0 4px;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-activity-list .queued-message-item {
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: .923rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-view[data-chat-appearance="ink"] :is(.ink-activity-drawer, .ink-activity-chevron, .ink-activity-reveal, .ink-activity-clip) {
+        transition: none;
+    }
 }

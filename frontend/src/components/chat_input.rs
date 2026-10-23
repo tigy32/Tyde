@@ -3811,8 +3811,12 @@ mod wasm_tests {
                 .chat_appearance
                 .set(crate::appearance::ChatAppearance::Ink);
             next_tick().await;
+            // Ink attaches running work as a tab inside the input area, above
+            // the composer box; the shimmer outlines the box, not the tab.
             let bounds = ring.get_bounding_client_rect();
-            let area = composer.get_bounding_client_rect();
+            let area = query(&container, ".chat-input-content")
+                .expect("composer box")
+                .get_bounding_client_rect();
             for (actual, expected) in [
                 (bounds.top(), area.top()),
                 (bounds.bottom(), area.bottom()),
@@ -3821,6 +3825,13 @@ mod wasm_tests {
             ] {
                 assert!((actual - expected).abs() < 0.5, "Ink outlines the composer");
             }
+            let tab = query(&container, "[data-testid='ink-activity']")
+                .expect("Ink attaches the running child to the composer")
+                .get_bounding_client_rect();
+            assert!(
+                (tab.bottom() - bounds.top()).abs() < 0.5,
+                "the activity tab sits on the shimmer, never under it"
+            );
             assert_eq!(prop("padding-top"), "1px");
             assert_eq!(
                 prop("mask-composite"),

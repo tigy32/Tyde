@@ -5,9 +5,13 @@ use protocol::MessageSender;
 use wasm_bindgen::JsCast;
 
 use crate::components::image_lightbox::ImageLightbox;
+use crate::components::ink_transcript::{
+    ActionsDisclosure, InkActionsRun, InkActionsSummary, InkGroupSummary, InkRowLayout,
+    ink_tool_group,
+};
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, ChatMessageEntry, ToolRequestEntry};
+use crate::state::{ActiveAgentRef, AppState, ChatMessageEntry, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
 ///
@@ -194,11 +198,38 @@ pub(crate) fn render_message_images(images: Vec<protocol::ImageData>) -> impl In
     }
 }
 
+/// The last tool group of a message when no visible content follows it.
+pub(crate) fn trailing_tools_index(segments: &[MessageSegment]) -> Option<usize> {
+    for (index, segment) in segments.iter().enumerate().rev() {
+        match segment {
+            MessageSegment::Tools { .. } => return Some(index),
+            MessageSegment::Content(text) if text.trim().is_empty() => {}
+            MessageSegment::Content(_) | MessageSegment::Images => return None,
+        }
+    }
+    None
+}
+
 #[component]
 pub fn ChatMessageView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entry: ArcRwSignal<ChatMessageEntry>,
+    /// Ink's grouping for this row; absent, the row renders on its own.
+    #[prop(optional, into)]
+    ink_layout: Option<Signal<Option<InkRowLayout>>>,
 ) -> impl IntoView {
+    let ink_mode = ink_layout
+        .is_some()
+        .then(|| expect_context::<AppState>().tool_output_mode);
+    let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
+    let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
+    let ink_run: Memo<Option<InkActionsRun>> =
+        Memo::new(move |_| ink_layout.with(|layout| layout.as_ref().and_then(|l| l.run.clone())));
+    // A run without its own prose shows its summary line at the top of its
+    // head row; a lead row summarizes the run at its trailing tool group.
+    let run_head = Memo::new(move |_| {
+        ink_run.with(|run| run.as_ref().is_some_and(|run| run.head && !run.lead))
+    });
     // Each Memo reads through `with` to avoid cloning the entire
     // ChatMessageEntry (which carries a potentially-long
     // `message.content: String`) just to extract a field. Memos
@@ -331,6 +362,19 @@ pub fn ChatMessageView(
                 </div>
             </Show>
 
+            {move || {
+                let mode = ink_mode?;
+                run_head.get().then(|| {
+                    view! {
+                        <InkActionsSummary
+                            count=Signal::derive(move || ink_run.with(|run| run.as_ref().map_or(0, |run| run.count)))
+                            members=Signal::derive(move || ink_run.with(|run| run.as_ref().map(|run| run.members.clone()).unwrap_or_else(|| Arc::new([]))))
+                            mode=mode
+                        />
+                    }
+                })
+            }}
+
             // Reasoning (collapsible)
             {move || {
                 entry_for_reasoning.with(|entry| entry.message.reasoning.as_ref().map(|r| r.tokens)).map(|token_count| {
@@ -345,12 +389,18 @@ pub fn ChatMessageView(
                                 }
                             }
                         >
-                            <summary>
-                                <span class="reasoning-icon">"💭"</span>
-                                " Thinking"
-                                {token_count.map(|t| view! {
-                                    <span class="reasoning-tokens">{format!(" ({} tokens)", format_compact(t))}</span>
-                                })}
+                            <summary title=move || is_ink.get().then(|| token_count.map(|t| format!("{} reasoning tokens", format_compact(t)))).flatten()>
+                                {move || if is_ink.get() {
+                                    "Reasoning".into_any()
+                                } else {
+                                    view! {
+                                        <span class="reasoning-icon">"💭"</span>
+                                        " Thinking"
+                                        {token_count.map(|t| view! {
+                                            <span class="reasoning-tokens">{format!(" ({} tokens)", format_compact(t))}</span>
+                                        })}
+                                    }.into_any()
+                                }}
                             </summary>
                             <Show when=move || reasoning_open.get()>
                                 {move || {
@@ -382,6 +432,7 @@ pub fn ChatMessageView(
                     entry.tool_requests,
                     images.as_ref().is_some_and(|imgs| !imgs.is_empty()),
                 );
+                let trailing = trailing_tools_index(&segments);
 
                 // Each provider response is one group, so assistive technology
                 // walks the card as the sequence of responses it was rather
@@ -412,7 +463,7 @@ pub fn ChatMessageView(
                     );
                 };
 
-                for segment in segments {
+                for (segment_index, segment) in segments.into_iter().enumerate() {
                     match segment {
                         MessageSegment::Content(text) => {
                             // Each phase is its own document: it was produced by
@@ -450,8 +501,22 @@ pub fn ChatMessageView(
                             phase.push(view);
                         }
                         MessageSegment::Tools { entries, placed } => {
+                            // Ink folds completed actions in place, so the
+                            // cards stay mounted across presentations.
+                            let ink_group = ink_mode.map(|mode| {
+                                let tools: Vec<(String, ActionsDisclosure)> = entries
+                                    .iter()
+                                    .map(|entry| (entry.request.tool_call_id.clone(), entry.presentation.actions_disclosure.clone()))
+                                    .collect();
+                                let trailing = Some(segment_index) == trailing;
+                                (mode, Memo::new(move |_| {
+                                    ink_layout.with(|layout| layout.as_ref().map(|layout| ink_tool_group(layout, mode.get(), &tools, trailing)))
+                                }))
+                            });
+                            let fold = Signal::derive(move || ink_group.and_then(|(_, group)| group.with(|group| group.as_ref().map(|group| group.fold.clone()))));
                             let view = view! {
-                                <ToolCardListView agent_ref=agent_ref entries=entries />
+                                {ink_group.map(|(mode, group)| view! { <InkGroupSummary group=group mode=mode /> })}
+                                <ToolCardListView agent_ref=agent_ref entries=entries ink_fold=fold />
                             }
                             .into_any();
                             if placed {

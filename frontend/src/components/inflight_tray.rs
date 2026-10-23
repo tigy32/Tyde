@@ -42,6 +42,7 @@ use protocol::{
     ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 
+use crate::appearance::ChatAppearance;
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
 use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::components::tool_card::{
@@ -681,8 +682,164 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         persist_expanded(next);
     };
 
+    let chat_appearance = state.chat_appearance;
+    let is_ink = move || chat_appearance.get() == ChatAppearance::Ink;
+    let has_work = move || !snapshot.get().is_empty() || !queued_row_ids.get().is_empty();
+    let ink_open = RwSignal::new(false);
+    let ink_tab = NodeRef::<leptos::html::Button>::new();
+    let ink_owner = Memo::new(move |_| agent_ref.get());
+    Effect::new(move |_| {
+        ink_owner.track();
+        chat_appearance.track();
+        ink_open.set(false);
+    });
+    Effect::new(move |_| {
+        if !has_work() {
+            ink_open.set(false);
+        }
+    });
+    let collapse_ink = Callback::new(move |()| {
+        ink_open.set(false);
+        if let Some(tab) = ink_tab.get_untracked()
+            && let Err(error) = tab.focus()
+        {
+            log::error!("Cannot return focus to background activity: {error:?}");
+        }
+    });
+    let ink_tab_text = move || {
+        let snapshot = snapshot.get();
+        let mut parts = Vec::new();
+        let agents = snapshot.children.len() + snapshot.subagents.len();
+        if agents > 0 {
+            parts.push(count_label(agents, "agent", "agents"));
+        }
+        if !snapshot.workflows.is_empty() {
+            parts.push(count_label(
+                snapshot.workflows.len(),
+                "workflow",
+                "workflows",
+            ));
+        }
+        if !snapshot.commands.is_empty() {
+            parts.push(count_label(snapshot.commands.len(), "command", "commands"));
+        }
+        let queued = queued_row_ids.get().len();
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        parts.join(" \u{b7} ")
+    };
+
     view! {
-        <Show when=move || !snapshot.get().is_empty() || !queued_row_ids.get().is_empty()>
+        <Show when=move || has_work() && is_ink()>
+            <div class="ink-activity" data-testid="ink-activity">
+                <div
+                    class="ink-activity-drawer"
+                    class:expanded=move || ink_open.get()
+                    on:keydown=move |event: leptos::ev::KeyboardEvent| {
+                        if event.key() == "Escape" && ink_open.get_untracked() {
+                            event.prevent_default();
+                            event.stop_propagation();
+                            collapse_ink.run(());
+                        }
+                    }
+                >
+                    <button
+                        type="button"
+                        class="ink-activity-tab"
+                        node_ref=ink_tab
+                        aria-expanded=move || ink_open.get().to_string()
+                        on:click=move |_| ink_open.update(|open| *open = !*open)
+                    >
+                        <span class="ink-activity-dot" aria-hidden="true"></span>
+                        <span class="ink-activity-tab-text">{ink_tab_text}</span>
+                        <svg class="ink-activity-chevron" viewBox="0 0 16 16" aria-hidden="true">
+                            <path d="M4 10L8 6L12 10" />
+                        </svg>
+                    </button>
+                    <div
+                        class="ink-activity-reveal"
+                        role="region"
+                        aria-label="Background activity"
+                        aria-hidden=move || (!ink_open.get()).to_string()
+                        inert=move || !ink_open.get()
+                    >
+                        <div class="ink-activity-clip">
+                            <div class="ink-activity-list">
+                                {move || waiting.get().map(|waiting| view! {
+                                    <p class="ink-activity-waiting">{waiting}</p>
+                                })}
+                                <Show when=move || snapshot.with(|snapshot| {
+                                    !snapshot.children.is_empty() || !snapshot.subagents.is_empty()
+                                })>
+                                    <section class="ink-activity-section ink-activity-agents">
+                                        <h3>"Agents"</h3>
+                                        <For
+                                            each=move || snapshot.get().children
+                                            key=|agent_id| agent_id.0.clone()
+                                            let:agent_id
+                                        >
+                                            <ChildAgentRow parent_ref=agent_ref agent_id=agent_id />
+                                        </For>
+                                        <For
+                                            each=move || snapshot.get().subagents
+                                            key=|call_id| call_id.0.clone()
+                                            let:call_id
+                                        >
+                                            <SubagentRow parent_ref=agent_ref tool_call_id=call_id />
+                                        </For>
+                                    </section>
+                                </Show>
+                                <Show when=move || snapshot.with(|snapshot| !snapshot.workflows.is_empty())>
+                                    <section class="ink-activity-section ink-activity-workflows">
+                                        <h3>"Workflows"</h3>
+                                        <For
+                                            each=move || snapshot.get().workflows
+                                            key=|call_id| call_id.0.clone()
+                                            let:call_id
+                                        >
+                                            <WorkflowRow parent_ref=agent_ref tool_call_id=call_id />
+                                        </For>
+                                    </section>
+                                </Show>
+                                <Show when=move || snapshot.with(|snapshot| !snapshot.commands.is_empty())>
+                                    <section class="ink-activity-section ink-activity-commands">
+                                        <h3>"Commands"</h3>
+                                        <For
+                                            each=move || snapshot.get().commands
+                                            key=|call_id| call_id.0.clone()
+                                            let:call_id
+                                        >
+                                            <CommandRow parent_ref=agent_ref tool_call_id=call_id />
+                                        </For>
+                                    </section>
+                                </Show>
+                                <Show when=move || !queued_row_ids.get().is_empty()>
+                                    <section class="ink-activity-section ink-activity-queued">
+                                        <h3>"Queued messages"</h3>
+                                        <div class="inflight-tray-queue">
+                                            <For
+                                                each=move || queued_row_ids.get()
+                                                key=|id| id.0.clone()
+                                                let:id
+                                            >
+                                                <QueuedMessageRow
+                                                    id=id
+                                                    agent_ref=agent_ref
+                                                    queued_edit=queued_edit
+                                                    focus_return=queued_edit_focus_return
+                                                />
+                                            </For>
+                                        </div>
+                                    </section>
+                                </Show>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </Show>
+        <Show when=move || has_work() && !is_ink()>
             <div class="inflight-tray">
                 <button type="button" class="inflight-tray-header" on:click=on_toggle>
                     <span
@@ -1802,6 +1959,10 @@ fn format_summary_age(summary: &AgentActivitySummary) -> String {
     } else {
         format!("updated {}d ago", diff_secs / 86400)
     }
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
 fn streaming_preview(text: &str) -> Option<String> {

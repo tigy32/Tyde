@@ -13,6 +13,7 @@ use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::inflight_tray::InflightTray;
+use crate::components::ink_transcript::{InkGap, InkRowLayout, ink_row_layouts};
 use crate::components::orchestration_view::OrchestrationView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
@@ -47,7 +48,8 @@ const VIRT_OVERSCAN: usize = 5;
 /// so the spacer/scroll math has to add this back per non-first row,
 /// otherwise the scrollbar drifts (under-reports total content height
 /// by `ROW_GAP_PX` per unmounted gap on long transcripts). Must stay
-/// in lockstep with the CSS rule.
+/// in lockstep with the CSS rule. Ink spaces rows with padding inside
+/// the measured row instead, so its gap is zero.
 const ROW_GAP_PX: f64 = 6.0;
 
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
@@ -193,6 +195,22 @@ pub fn ChatView(
         }
         rows
     };
+
+    // Ink groups the transcript into stretches; Current renders rows alone
+    // and subscribes to nothing here.
+    let ink_state = state.clone();
+    let tool_output_mode = state.tool_output_mode;
+    let ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>> = Memo::new(move |_| {
+        if ink_state.chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
+            return None;
+        }
+        let agent_id = active_agent_id()?;
+        Some(Arc::new(ink_row_layouts(
+            &ink_state,
+            &agent_id,
+            &row_handles(),
+        )))
+    });
 
     let prior_history: Signal<Option<crate::state::SessionHistoryState>> =
         Signal::derive(move || {
@@ -752,22 +770,41 @@ pub fn ChatView(
         let _ = heights_version.get();
         let st = scroll_top_sig.get();
         let vp = viewport_height_sig.get();
+        let layouts = ink_layouts.get();
+        let row_gap = if layouts.is_some() { 0.0 } else { ROW_GAP_PX };
+        let ink = layouts
+            .as_ref()
+            .map(|layouts| (layouts, tool_output_mode.get()));
         let rows = row_handles();
         let n = rows.len();
         if n == 0 {
             return VirtualWindow::EMPTY;
         }
         row_heights.with_value(|map| {
+            // A row folded into its Ink run's summary renders nothing; its
+            // cached height stays the unfolded measurement for when the
+            // run opens again.
+            let folded = |idx: usize| {
+                ink.is_some_and(|(layouts, mode)| {
+                    layouts
+                        .get(&rows[idx].id)
+                        .and_then(|layout| layout.run.as_ref())
+                        .is_some_and(|run| run.hidden(mode))
+                })
+            };
             // `slot_height` includes the top margin that separates this
             // row from the previous one, so the running sum matches
             // what the browser actually lays out. The very first row
             // gets no leading gap.
             let slot_height = |idx: usize| -> f64 {
+                if folded(idx) {
+                    return 0.0;
+                }
                 let raw = map
                     .get(&rows[idx].id)
                     .copied()
                     .unwrap_or(ESTIMATED_ROW_HEIGHT);
-                if idx == 0 { raw } else { raw + ROW_GAP_PX }
+                if idx == 0 { raw } else { raw + row_gap }
             };
 
             let mut acc = 0.0_f64;
@@ -1074,6 +1111,7 @@ pub fn ChatView(
                                 row=row
                                 row_heights=row_heights
                                 heights_version=heights_version
+                                ink_layouts=ink_layouts
                             />
                         </For>
                         <div
@@ -1168,8 +1206,43 @@ fn MeasuredRow(
     row: ChatRowHandle,
     row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage>,
     heights_version: RwSignal<u32>,
+    ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>>,
 ) -> impl IntoView {
     let row_id = row.id;
+    let tool_output_mode = expect_context::<AppState>().tool_output_mode;
+    let ink_layout: Memo<Option<InkRowLayout>> = Memo::new(move |_| {
+        ink_layouts.with(|layouts| {
+            layouts
+                .as_ref()
+                .map(|layouts| layouts.get(&row_id).cloned().unwrap_or_default())
+        })
+    });
+    let row_class = move || {
+        ink_layout.with(|layout| {
+            let Some(layout) = layout else {
+                return "virt-row".to_owned();
+            };
+            let run = layout.run.as_ref();
+            if run.is_some_and(|run| run.hidden(tool_output_mode.get())) {
+                return "virt-row ink-row ink-run-hidden".to_owned();
+            }
+            let mut class = String::from("virt-row ink-row");
+            match layout.gap {
+                InkGap::None => class.push_str(" ink-gap-none"),
+                InkGap::Tight => class.push_str(" ink-gap-tight"),
+                InkGap::Normal => {}
+            }
+            if layout.continuation {
+                class.push_str(" ink-continuation");
+            }
+            // An open run's later rows continue its column of actions.
+            if run.is_some_and(|run| !run.head) {
+                class.push_str(" ink-run-follower");
+            }
+            class
+        })
+    };
+    let ink_layout_signal: Signal<Option<InkRowLayout>> = ink_layout.into();
     let node_ref: NodeRef<leptos::html::Div> = NodeRef::new();
     let row_mounted = Arc::new(AtomicBool::new(true));
 
@@ -1223,8 +1296,16 @@ fn MeasuredRow(
                         // visible window onto rows that are actually below the
                         // viewport. Ignore zero/negative measurements; the next
                         // observer fire after the tab is shown again will
-                        // record the real height.
-                        if h <= 0.0 || h.is_nan() {
+                        // record the real height. An Ink row folded into its
+                        // run keeps its unfolded height, which the window
+                        // skips while the run is closed.
+                        let folded = ink_layout.with_untracked(|layout| {
+                            layout
+                                .as_ref()
+                                .and_then(|layout| layout.run.as_ref())
+                                .is_some_and(|run| run.hidden(tool_output_mode.get_untracked()))
+                        });
+                        if folded || h <= 0.0 || h.is_nan() {
                             return;
                         }
                         let changed = row_heights.with_value(|map| {
@@ -1257,13 +1338,13 @@ fn MeasuredRow(
     });
 
     view! {
-        <div class="virt-row" node_ref=node_ref>
+        <div class=row_class node_ref=node_ref>
             {match row.content {
                 ChatRowContent::Streaming(streaming) => {
-                    view! { <ChatStreamingView agent_ref=agent_ref streaming=streaming /> }.into_any()
+                    view! { <ChatStreamingView agent_ref=agent_ref streaming=streaming ink_layout=ink_layout_signal /> }.into_any()
                 }
                 ChatRowContent::Message(entry) => {
-                    view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }.into_any()
+                    view! { <ChatMessageView agent_ref=agent_ref entry=entry ink_layout=ink_layout_signal /> }.into_any()
                 }
                 ChatRowContent::ContextCompaction(event) => {
                     view! { <ContextCompactionMarker event=event /> }.into_any()
@@ -2542,6 +2623,620 @@ mod wasm_tests {
         let completed_gap = measure_gap("completed");
         assert!((thinking_gap - completed_gap).abs() < 0.5);
         assert!((streaming_gap - completed_gap).abs() < 0.5);
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn ink_folds_a_working_stretch_into_one_quiet_disclosure() {
+        use crate::appearance::ChatAppearance;
+        use crate::state::ToolOutputMode;
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-ink-stretch".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-ink-stretch".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_041)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        state.chat_appearance.set(ChatAppearance::Ink);
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        let assistant = |text: &str| {
+            let mut message = mk_user_msg(text).message;
+            message.sender = MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            };
+            message
+        };
+
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Inspect the workspace").message,
+        ));
+        let commands = ["python3 first.py", "python3 second.py", "python3 third.py"];
+        for (index, command) in commands.into_iter().enumerate() {
+            let text = if index == 0 {
+                "I'll inspect the workspace."
+            } else {
+                ""
+            };
+            let tool_call_id = format!("ink-stretch-{index}");
+            dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: Some("claude-test".to_owned()),
+            }));
+            if !text.is_empty() {
+                dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                    text: text.to_owned(),
+                }));
+            }
+            dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "Bash".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: command.to_owned(),
+                    working_directory: "/workspace".to_owned(),
+                },
+            }));
+            dispatch(ChatEvent::ToolExecutionCompleted(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.clone(),
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::RunCommand {
+                            exit_code: 0,
+                            stdout: "ok\n".to_owned(),
+                            stderr: String::new(),
+                        },
+                    },
+                },
+            ));
+            let mut message = assistant(text);
+            message.tool_calls.push(protocol::ToolUseData {
+                tool_call_id,
+                name: "Bash".to_owned(),
+                arguments: serde_json::json!({ "command": command }),
+                content_offset: None,
+            });
+            dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
+        }
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: Some("claude-test".to_owned()),
+        }));
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: "All done.".to_owned(),
+        }));
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: assistant("All done."),
+        }));
+
+        async fn settle() {
+            next_tick().await;
+            next_animation_frame().await;
+            next_animation_frame().await;
+        }
+        let text_of = |element: &Element| element.text_content().unwrap_or_default();
+        let visible = |selector: &str| {
+            let nodes = container.query_selector_all(selector).unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
+                .collect::<Vec<_>>()
+        };
+        let bylines = || {
+            visible(".chat-card-assistant > .chat-card-footer")
+                .into_iter()
+                .filter(|footer| {
+                    web_sys::window()
+                        .unwrap()
+                        .get_computed_style(footer)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("opacity")
+                        .unwrap()
+                        != "0"
+                })
+                .count()
+        };
+        let command_headers = || {
+            let headers = visible(".tool-card-header");
+            commands
+                .iter()
+                .filter_map(|command| {
+                    headers
+                        .iter()
+                        .find(|header| text_of(header).contains(command))
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let summary = || {
+            let summaries = visible(".ink-actions-summary");
+            assert_eq!(summaries.len(), 1, "one disclosure for the whole stretch");
+            summaries.into_iter().next().unwrap()
+        };
+
+        settle().await;
+        let collapsed = summary();
+        assert_eq!(text_of(&collapsed).trim(), "3 completed actions");
+        assert_eq!(
+            collapsed.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(bylines(), 1, "the stretch carries a single byline");
+        assert!(command_headers().is_empty(), "completed actions fold away");
+        let hidden_rows = message_rows(&container)
+            .iter()
+            .filter(|row| row.get_bounding_client_rect().height() == 0.0)
+            .count();
+        assert_eq!(
+            hidden_rows, 2,
+            "activity-only replies collapse into the summary"
+        );
+        let done = visible(".chat-card-body")
+            .into_iter()
+            .find(|body| text_of(body).contains("All done."))
+            .expect("closing prose stays visible");
+        let summary_bottom = collapsed.get_bounding_client_rect().bottom();
+        let gap = done.get_bounding_client_rect().top() - summary_bottom;
+        assert!(
+            (0.0..40.0).contains(&gap),
+            "prose follows the summary without a gap, got {gap}px"
+        );
+
+        collapsed.dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        let expanded = summary();
+        assert_eq!(
+            expanded.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let headers = command_headers();
+        assert_eq!(headers.len(), 3, "an open run lists every action");
+        let tops = headers
+            .iter()
+            .map(|header| header.get_bounding_client_rect().top())
+            .collect::<Vec<_>>();
+        console_log!("Open Ink run action tops: {tops:?}");
+        assert!(
+            ((tops[1] - tops[0]) - (tops[2] - tops[1])).abs() < 0.5,
+            "an open run is one evenly spaced column: {tops:?}"
+        );
+        // The card nests; its header bleeds 8px left for the hover surface.
+        let summary_left = expanded.get_bounding_client_rect().left();
+        for header in &headers {
+            let card = header.parent_element().expect("tool card");
+            let indent = card.get_bounding_client_rect().left() - summary_left;
+            assert!(
+                indent >= 20.0,
+                "actions nest under their summary, got {indent}px"
+            );
+        }
+
+        state.tool_output_mode.set(ToolOutputMode::Summary);
+        settle().await;
+        assert_eq!(
+            summary().get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert!(
+            command_headers().is_empty(),
+            "a choice stays in its own mode"
+        );
+
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        settle().await;
+        assert_eq!(
+            summary().get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        assert_eq!(command_headers().len(), 3, "Full opens every run");
+
+        state.tool_output_mode.set(ToolOutputMode::Compact);
+        state.chat_appearance.set(ChatAppearance::Current);
+        settle().await;
+        assert!(visible(".ink-actions-summary").is_empty());
+        assert_eq!(command_headers().len(), 3, "Current shows every tool card");
+        assert_eq!(bylines(), 4, "Current keeps a byline per reply");
+
+        state.chat_appearance.set(ChatAppearance::Ink);
+        settle().await;
+        assert_eq!(
+            summary().get_attribute("aria-expanded").as_deref(),
+            Some("true"),
+            "the Compact choice returns with its mode"
+        );
+        assert_eq!(command_headers().len(), 3);
+
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: Some("claude-test".to_owned()),
+        }));
+        dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "ink-stretch-ask".to_owned(),
+            tool_name: "AskUserQuestion".to_owned(),
+            tool_type: protocol::ToolRequestType::AskUserQuestion {
+                mode: protocol::UserQuestionMode::Blocking,
+                questions: vec![protocol::AskUserQuestion {
+                    id: None,
+                    question: "Which workspace?".to_owned(),
+                    header: Some("Workspace".to_owned()),
+                    answer_schema: None,
+                    multi_select: false,
+                    options: vec![protocol::AskUserQuestionOption {
+                        label: "Current".to_owned(),
+                        description: None,
+                    }],
+                }],
+            },
+        }));
+        settle().await;
+        let question = visible(".tool-card-header")
+            .into_iter()
+            .find(|header| text_of(header).contains("Awaiting answer"))
+            .expect("a live pending decision stays outside the fold");
+        let card = question.parent_element().expect("decision card");
+        let frame = web_sys::window()
+            .unwrap()
+            .get_computed_style(&card)
+            .unwrap()
+            .unwrap()
+            .get_property_value("border-top-width")
+            .unwrap();
+        assert_eq!(frame, "1px", "a pending decision is framed");
+        assert_eq!(
+            text_of(&summary()).trim(),
+            "3 completed actions",
+            "a pending decision does not join the folded run"
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn ink_runs_keep_reasoning_and_offscreen_actions_in_place() {
+        use crate::appearance::ChatAppearance;
+        use crate::state::ToolOutputMode;
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-ink-offscreen".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-ink-offscreen".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_042)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        state.chat_appearance.set(ChatAppearance::Ink);
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        let start = || {
+            dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: Some("claude-test".to_owned()),
+            }));
+        };
+        let end = |message: ChatMessage| {
+            dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
+        };
+        let assistant = |text: &str| {
+            let mut message = mk_user_msg(text).message;
+            message.sender = MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            };
+            message
+        };
+        async fn settle() {
+            next_tick().await;
+            next_animation_frame().await;
+            next_animation_frame().await;
+        }
+        let visible = |selector: &str| {
+            let nodes = container.query_selector_all(selector).unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
+                .collect::<Vec<_>>()
+        };
+
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Inspect the workspace").message,
+        ));
+        for (index, command) in ["python3 first.py", "python3 second.py"]
+            .into_iter()
+            .enumerate()
+        {
+            let tool_call_id = format!("ink-offscreen-{index}");
+            start();
+            dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "Bash".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: command.to_owned(),
+                    working_directory: "/workspace".to_owned(),
+                },
+            }));
+            dispatch(ChatEvent::ToolExecutionCompleted(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.clone(),
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::RunCommand {
+                            exit_code: 0,
+                            stdout: "ok\n".to_owned(),
+                            stderr: String::new(),
+                        },
+                    },
+                },
+            ));
+            let mut message = assistant(if index == 0 { "Checking." } else { "" });
+            message.tool_calls.push(protocol::ToolUseData {
+                tool_call_id,
+                name: "Bash".to_owned(),
+                arguments: serde_json::json!({ "command": command }),
+                content_offset: None,
+            });
+            end(message);
+        }
+        let mut thinking = assistant("");
+        thinking.reasoning = Some(protocol::ReasoningData {
+            text: "Weighing the results.".to_owned(),
+            tokens: Some(12),
+            signature: None,
+            blob: None,
+        });
+        start();
+        end(thinking);
+        settle().await;
+
+        let summaries = visible(".ink-actions-summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].text_content().unwrap_or_default().trim(),
+            "2 completed actions"
+        );
+        assert_eq!(
+            visible(".chat-card-reasoning").len(),
+            1,
+            "a reasoning-only reply keeps its own disclosure"
+        );
+        let folded = message_rows(&container)
+            .iter()
+            .filter(|row| row.get_bounding_client_rect().height() == 0.0)
+            .count();
+        assert_eq!(folded, 1, "only the activity-only reply folds");
+
+        for index in 0..40 {
+            start();
+            end(assistant(&format!("Note {index}: the workspace is fine.")));
+        }
+        let scroller: HtmlElement = container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .expect("chat scroller present")
+            .dyn_into()
+            .unwrap();
+        async fn settled_height(scroller: &HtmlElement) -> i32 {
+            loop {
+                let height = scroller.scroll_height();
+                settle().await;
+                if scroller.scroll_height() == height {
+                    return height;
+                }
+            }
+        }
+        let snapshot = |scroller: &HtmlElement| {
+            let spacer = |selector: &str| {
+                container
+                    .query_selector(selector)
+                    .unwrap()
+                    .map_or(-1.0, |element| element.get_bounding_client_rect().height())
+            };
+            let rows = message_rows(&container)
+                .iter()
+                .map(|row| {
+                    let text = row.text_content().unwrap_or_default();
+                    let text: String = text.trim().chars().take(14).collect();
+                    format!("{}:{}", row.get_bounding_client_rect().height(), text)
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "st={} ch={} sh={} top={} bottom={} rows={rows:?}",
+                scroller.scroll_top(),
+                scroller.client_height(),
+                scroller.scroll_height(),
+                spacer(".virt-spacer-top"),
+                spacer(".virt-spacer-bottom"),
+            )
+        };
+        // Walk the transcript once so every rendered row has a measured
+        // height; the totals then differ only by the run's folded row. The
+        // new rows must lay out and pin to the bottom first, or the walk
+        // starts at the bottom and measures nothing.
+        settled_height(&scroller).await;
+        let mut walk = vec![snapshot(&scroller)];
+        scroller.set_scroll_top(0);
+        settled_height(&scroller).await;
+        walk.push(snapshot(&scroller));
+        loop {
+            let top = scroller.scroll_top();
+            scroller.set_scroll_top(top + scroller.client_height());
+            settled_height(&scroller).await;
+            walk.push(snapshot(&scroller));
+            if scroller.scroll_top() == top {
+                break;
+            }
+        }
+        let before = settled_height(&scroller).await;
+        walk.push(snapshot(&scroller));
+        assert!(
+            container
+                .query_selector(".ink-actions-summary")
+                .unwrap()
+                .is_none(),
+            "precondition: the folded run is outside the rendered window"
+        );
+
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        let after = settled_height(&scroller).await;
+        walk.push(snapshot(&scroller));
+        assert!(
+            after > before,
+            "opening a run out of view makes room for its folded action: \
+             {before}px -> {after}px; walk:\n{}",
+            walk.join("\n")
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn ink_folds_a_long_tool_list_with_its_overflow_bar() {
+        use crate::appearance::ChatAppearance;
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-ink-overflow".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-ink-overflow".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_043)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        state.chat_appearance.set(ChatAppearance::Ink);
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        async fn settle() {
+            next_tick().await;
+            next_animation_frame().await;
+            next_animation_frame().await;
+        }
+        let visible = |selector: &str| {
+            let nodes = container.query_selector_all(selector).unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
+                .collect::<Vec<_>>()
+        };
+
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Run the batch").message,
+        ));
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: Some("claude-test".to_owned()),
+        }));
+        let mut message = mk_user_msg("Running the batch.").message;
+        message.sender = MessageSender::Assistant {
+            agent: "claude".to_owned(),
+        };
+        for index in 0..90 {
+            let tool_call_id = format!("ink-overflow-{index}");
+            let command = format!("python3 step_{index}.py");
+            dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "Bash".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: command.clone(),
+                    working_directory: "/workspace".to_owned(),
+                },
+            }));
+            dispatch(ChatEvent::ToolExecutionCompleted(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.clone(),
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::RunCommand {
+                            exit_code: 0,
+                            stdout: "ok\n".to_owned(),
+                            stderr: String::new(),
+                        },
+                    },
+                },
+            ));
+            message.tool_calls.push(protocol::ToolUseData {
+                tool_call_id,
+                name: "Bash".to_owned(),
+                arguments: serde_json::json!({ "command": command }),
+                content_offset: None,
+            });
+        }
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
+        settle().await;
+
+        let summaries = visible(".ink-actions-summary");
+        assert_eq!(summaries.len(), 1, "the long list folds under one summary");
+        assert!(
+            visible(".tool-list-summary").is_empty(),
+            "a folded run hides its overflow bar with its actions"
+        );
+        assert!(
+            !container
+                .query_selector(".chat-card-assistant")
+                .unwrap()
+                .expect("the reply renders")
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .inner_text()
+                .contains("tools hidden"),
+            "no overflow text shows while the run is folded"
+        );
+
+        summaries[0].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        let bars = visible(".tool-list-summary");
+        assert_eq!(bars.len(), 1, "an open run keeps its overflow bar");
+        assert!(
+            bars[0]
+                .text_content()
+                .unwrap_or_default()
+                .contains("tools hidden")
+        );
         drop(handle);
         container.remove();
     }

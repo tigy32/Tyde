@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use wasm_bindgen::JsCast;
 
+use crate::components::ink_transcript::{
+    ActionsDisclosure, InkGroupSummary, InkRowLayout, ink_tool_group,
+};
 use crate::components::tool_card::StreamingToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, StreamingState};
+use crate::state::{ActiveAgentRef, AppState, StreamingState};
 
 /// Stream-delta cadence at which we re-parse markdown for the in-flight
 /// assistant response. The raw `streaming.text` signal updates on every
@@ -24,7 +27,18 @@ const REASONING_RENDER_BYTE_CAP: usize = 40_000;
 pub fn ChatStreamingView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     streaming: StreamingState,
+    /// Ink's grouping for this row; absent, the row renders on its own.
+    #[prop(optional, into)]
+    ink_layout: Option<Signal<Option<InkRowLayout>>>,
 ) -> impl IntoView {
+    let ink_mode = ink_layout
+        .is_some()
+        .then(|| expect_context::<AppState>().tool_output_mode);
+    let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
+    let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
+    let show_header = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_none_or(|layout| layout.byline))
+    });
     let text = streaming.text;
     let reasoning = streaming.reasoning;
     let tool_requests = streaming.tool_requests;
@@ -32,7 +46,8 @@ pub fn ChatStreamingView(
     let model = streaming.model;
 
     let throttled_text = throttled_string_signal(text.clone(), clone_text, None);
-    let reasoning_open = RwSignal::new(true);
+    // Ink keeps live reasoning folded behind its quiet label.
+    let reasoning_open = RwSignal::new(!is_ink.get_untracked());
     let throttled_reasoning = throttled_string_signal(
         reasoning.clone(),
         capped_reasoning_text,
@@ -43,15 +58,47 @@ pub fn ChatStreamingView(
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
 
+    // Ink folds the stream's completed actions in place, so the cards stay
+    // mounted across presentations.
+    let ink_group = ink_mode.map(|mode| {
+        let tool_requests = tool_requests.clone();
+        let group = Memo::new(move |_| {
+            let tools: Vec<(String, ActionsDisclosure)> = tool_requests.with(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        let disclosure = tool
+                            .entry
+                            .with(|entry| entry.presentation.actions_disclosure.clone());
+                        (tool.tool_call_id.clone(), disclosure)
+                    })
+                    .collect()
+            });
+            ink_layout.with(|layout| {
+                layout
+                    .as_ref()
+                    .map(|layout| ink_tool_group(layout, mode.get(), &tools, false))
+            })
+        });
+        (mode, group)
+    });
+    let fold = Signal::derive(move || {
+        ink_group.and_then(|(_, group)| {
+            group.with(|group| group.as_ref().map(|group| group.fold.clone()))
+        })
+    });
+
     view! {
         <div class="chat-card chat-card-assistant chat-card-streaming">
-            <div class="chat-card-header">
-                <span class="chat-card-sender">{agent_name}</span>
-                {model.map(|m| view! {
-                    <span class="chat-card-model">{m}</span>
-                })}
-                <span class="streaming-dot"></span>
-            </div>
+            <Show when=move || show_header.get()>
+                <div class="chat-card-header">
+                    <span class="chat-card-sender">{agent_name.clone()}</span>
+                    {model.clone().map(|m| view! {
+                        <span class="chat-card-model">{m}</span>
+                    })}
+                    <span class="streaming-dot"></span>
+                </div>
+            </Show>
             {move || {
                 if !reasoning_has_content.get() {
                     None
@@ -59,7 +106,7 @@ pub fn ChatStreamingView(
                     Some(view! {
                         <details
                             class="chat-card-reasoning"
-                            open=true
+                            open=reasoning_open.get_untracked()
                             on:toggle=move |ev: leptos::ev::Event| {
                                 if let Some(target) = ev.target()
                                     && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
@@ -69,8 +116,15 @@ pub fn ChatStreamingView(
                             }
                         >
                             <summary>
-                                <span class="reasoning-icon">"💭"</span>
-                                " Thinking"
+                                {move || if is_ink.get() {
+                                    "Reasoning".into_any()
+                                } else {
+                                    view! {
+                                        <span class="reasoning-icon">"💭"</span>
+                                        " Thinking"
+                                    }
+                                    .into_any()
+                                }}
                             </summary>
                             <Show when=move || reasoning_open.get()>
                                 <pre class="reasoning-content">
@@ -108,12 +162,13 @@ pub fn ChatStreamingView(
                     }
                 }
             </div>
+            {ink_group.map(|(mode, group)| view! { <InkGroupSummary group=group mode=mode /> })}
             {move || {
                 if tool_requests.with(|tools| tools.is_empty()) {
                     None
                 } else {
                     Some(view! {
-                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() />
+                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() ink_fold=fold />
                     })
                 }
             }}

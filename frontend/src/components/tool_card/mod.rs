@@ -21,6 +21,7 @@ use protocol::{
 };
 use wasm_bindgen::JsCast;
 
+use crate::components::ink_transcript::InkFold;
 use crate::components::workflow_view::{WorkflowRunPanel, run_status_label};
 use crate::state::{
     ActiveAgentRef, AgentInfo, AppState, StreamingToolRequest, TabContent, ToolCallId,
@@ -295,7 +296,11 @@ fn FileChangeGroup(
 pub fn ToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: Vec<ToolRequestEntry>,
+    /// Ink's fold of this list; absent in Current.
+    #[prop(optional, into)]
+    ink_fold: Option<Signal<Option<InkFold>>>,
 ) -> impl IntoView {
+    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     let entries = Arc::new(entries);
     let expanded = RwSignal::new(false);
     let total = entries.len();
@@ -316,7 +321,7 @@ pub fn ToolCardListView(
     });
 
     view! {
-        <div class="chat-card-tools">
+        <div class="chat-card-tools" data-ink-run=move || ink_run_attribute(ink_fold)>
             <For
                 each=move || groups.get()
                 key=|group| group.id.clone()
@@ -344,7 +349,10 @@ pub fn ToolCardListView(
                         </FileChangeGroup>
                     }.into_any()
                 } else {
-                    group.entries.into_iter().map(|entry| view! { <ToolCardView agent_ref=agent_ref entry=entry /> }).collect::<Vec<_>>().into_any()
+                    group.entries.into_iter().map(|entry| {
+                        let fold = ink_card_fold(ink_fold, entry.request.tool_call_id.clone());
+                        view! { <ToolCardView agent_ref=agent_ref entry=entry ink_fold=fold /> }
+                    }).collect::<Vec<_>>().into_any()
                 }}
             </For>
             <ToolListSummary
@@ -369,7 +377,11 @@ pub fn ToolCardListView(
 pub fn StreamingToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: ArcRwSignal<Vec<StreamingToolRequest>>,
+    /// Ink's fold of this list; absent in Current.
+    #[prop(optional, into)]
+    ink_fold: Option<Signal<Option<InkFold>>>,
 ) -> impl IntoView {
+    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     let expanded = RwSignal::new(false);
     let group_entries = entries.clone();
     let groups = Memo::new(move |_| {
@@ -394,7 +406,7 @@ pub fn StreamingToolCardListView(
     });
 
     view! {
-        <div class="chat-card-tools">
+        <div class="chat-card-tools" data-ink-run=move || ink_run_attribute(ink_fold)>
             <For
                 each=move || groups.get()
                 key=|group| group.id.clone()
@@ -422,7 +434,10 @@ pub fn StreamingToolCardListView(
                         </FileChangeGroup>
                     }.into_any()
                 } else {
-                    group.entries.into_iter().map(|tool| view! { <StreamingToolCardView agent_ref=agent_ref entry=tool.entry /> }).collect::<Vec<_>>().into_any()
+                    group.entries.into_iter().map(|tool| {
+                        let fold = ink_card_fold(ink_fold, tool.tool_call_id.clone());
+                        view! { <StreamingToolCardView agent_ref=agent_ref entry=tool.entry ink_fold=fold /> }
+                    }).collect::<Vec<_>>().into_any()
                 }}
             </For>
             <ToolListSummary
@@ -452,10 +467,25 @@ pub fn StreamingToolCardListView(
 fn StreamingToolCardView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entry: ArcRwSignal<ToolRequestEntry>,
+    #[prop(optional, into)] ink_fold: Option<Signal<Option<&'static str>>>,
 ) -> impl IntoView {
+    let ink_fold = ink_fold.unwrap_or_else(|| Signal::stored(None));
     view! {
-        {move || view! { <ToolCardView agent_ref=agent_ref entry=entry.get() /> }}
+        {move || view! { <ToolCardView agent_ref=agent_ref entry=entry.get() ink_fold=ink_fold /> }}
     }
+}
+
+fn ink_run_attribute(fold: Signal<Option<InkFold>>) -> Option<&'static str> {
+    fold.with(|fold| fold.as_ref().is_some_and(|fold| fold.run).then_some(""))
+}
+
+fn ink_card_fold(
+    fold: Signal<Option<InkFold>>,
+    tool_call_id: String,
+) -> Signal<Option<&'static str>> {
+    Signal::derive(move || {
+        fold.with(|fold| fold.as_ref().and_then(|fold| fold.card(&tool_call_id)))
+    })
 }
 
 #[component]
@@ -541,6 +571,34 @@ fn is_important_tool(entry: &ToolRequestEntry) -> bool {
             .is_some_and(|result| normalization_failure(result).is_some())
 }
 
+/// A succeeded, settled tool Ink folds into its completed-actions line. Live,
+/// failed, decision and file-change cards stay in view.
+pub(crate) fn ink_quiet_action(
+    state: &AppState,
+    agent_id: &protocol::AgentId,
+    entry: &ToolRequestEntry,
+) -> bool {
+    if is_important_tool(entry)
+        || matches!(entry.request.tool_type, ToolRequestType::ModifyFile { .. })
+    {
+        return false;
+    }
+    let key = (
+        agent_id.clone(),
+        ToolCallId(entry.request.tool_call_id.clone()),
+    );
+    !state
+        .tool_progress
+        .with(|map| map.get(&key).cloned())
+        .is_some_and(|progress| {
+            progress.with(|data| match &data.update {
+                ToolProgressUpdate::Workflow(run) => run.status == WorkflowRunStatus::Running,
+                ToolProgressUpdate::SubAgent(progress) => !progress.completed,
+                ToolProgressUpdate::AgentControl(_) | ToolProgressUpdate::Other { .. } => false,
+            })
+        })
+}
+
 #[component]
 pub fn ToolCardView(
     /// The chat's agent, plumbed explicitly from the owning view (`None`
@@ -548,6 +606,9 @@ pub fn ToolCardView(
     /// cards exist there). Never inferred from the active tab.
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entry: ToolRequestEntry,
+    /// Whether Ink folds this card behind its group's summary line.
+    #[prop(optional, into)]
+    ink_fold: Option<Signal<Option<&'static str>>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
@@ -763,7 +824,12 @@ pub fn ToolCardView(
     view! {
         <details
             class=if normalization_failed { "tool-card tool-card-malformed" } else { "tool-card" }
-            data-tool-kind=if matches!(tool_type, ToolRequestType::RunCommand { .. }) { "command" } else { "tool" }
+            data-tool-kind=match tool_type {
+                ToolRequestType::RunCommand { .. } => "command",
+                ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. } => "decision",
+                _ => "tool",
+            }
+            data-ink-fold=move || ink_fold.and_then(|fold| fold.get())
             aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
             prop:open=card_open
             on:toggle=move |ev: leptos::ev::Event| {
