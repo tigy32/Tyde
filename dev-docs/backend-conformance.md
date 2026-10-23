@@ -1731,3 +1731,86 @@ cards) and passed the complete extended flow on CLI 0.162.1 with Luna/low on
 2026-10-23: nextest `3368a93a-3b13-47e0-8686-4f9023bb7c52`, 97.802 seconds.
 No other backend declares the required yielding capabilities. The isolated
 source build took 5m46s and is not a warmed validation-gate measurement.
+
+## Claude reviewer native configuration
+
+Enforced read-only Claude launches use native safe mode with user settings
+only (`--safe-mode --setting-sources user`), not an empty `--setting-sources`
+list or bare mode. Claude keeps the user's auth, provider and model
+configuration (including `apiKeyHelper`, OAuth/keychain and settings `env`),
+while suppressing ambient plugins, skills, agents, user hooks, LSP and other
+executable customization. Safe mode still runs credential helpers, so the
+reviewed workspace's project and local settings stay excluded: a helper there
+is workspace-controlled code, possibly part of the diff under review. Auth
+defined only in those files is not available to enforced reviewers; define
+it at user scope. Native read-only tools, `dontAsk`, user hook suppression,
+strict MCP isolation, delegation exclusions and per-process tool catalog
+verification remain enforced. Ordinary launches are unchanged. Enforced
+read-only sessions with explicitly selected Tyde skills are rejected before
+materialization: safe mode cannot load them, and starting a degraded session
+would misrepresent the selection.
+
+Safe mode also suppresses explicit `--mcp-config`. Before admitting a turn,
+the Backend registers the exact host-owned MCP set through Claude's native
+`mcp_set_servers` control and checks its acknowledgement and authoritative
+connected state. Rejection, partial registration or missing authorization
+fails startup; there is no less-isolated retry. Fresh, forked and resumed
+processes share this policy. Claude emits session-bearing frames before
+initialization, so restricted fresh and forked spawns, like resume, finish
+this verification before admitting the initial prompt or reporting ready.
+Provider configuration is not copied or
+reinterpreted by Tyde. The user's auth helpers are necessary credential
+operations, not reviewer-selected tools.
+
+Administrator-managed policy is outside the reviewer's customization boundary.
+Claude documents that safe mode still applies managed settings, including
+policy-configured hooks, status line and file-suggestion commands, and that
+only a managed-level `disableAllHooks` can disable managed hooks. The previous
+empty `--setting-sources` launch applied the same managed tier: owned native
+2.1.296 controls ran a managed `SessionStart` command under both launch
+policies. Those commands are organization code, not reviewer capabilities; the
+reviewer's own catalog stays read-only. Tyde neither masks nor parses managed
+policy. Bare mode skips such hooks but discards OAuth/keychain auth, so it is
+not used.
+
+`real_claude_review_configuration` is a Claude-native configuration regression,
+like the existing Codex-native settings case, not a cross-provider settings
+schema. It requires explicit `TYDE_TEST_CLAUDE_API_KEY`,
+`TYDE_TEST_CLAUDE_BASE_URL` and `TYDE_TEST_CLAUDE_MODEL` inputs. An owned native
+home supplies credentials only through `apiKeyHelper` and provider/model
+routing through settings. The workspace's project settings define a competing
+`apiKeyHelper`. An ordinary real Backend turn positively exercises the user
+hook, ambient MCP and workspace helper. Fresh, forked and resumed enforced
+reviewers must authenticate through the user's helper, report the
+settings-routed provider model in native responses, complete dedicated
+feedback calls, leave protected files unchanged, expose no
+mutation/delegation/ambient tools and execute no user hook, MCP process or
+workspace helper. The original settings must remain byte-identical.
+The fresh reviewer also calls both advertised native control tools once.
+Real Claude refusals are tool-specific: `AskUserQuestion` is denied because
+the CLI is in don't-ask mode, and `ExitPlanMode` reports that it is not in
+plan mode. Neither says `No such tool available`. The case requires these
+specific refusals, not arbitrary failures; unavailable mutation/delegation
+tools must still report the exact attempted tool as unavailable. Successful,
+cancelled or unnormalizable forbidden calls remain failures. A real-provider
+native control run demonstrated both refusals and that the former blanket
+unavailable-tool assertion rejects them. This does not identify the tool in
+the earlier fork failure, whose identity was not retained.
+Both control refusals must survive native resume replay unchanged.
+Assistant wording is not an isolation oracle: a real Haiku resumed turn
+completed dedicated feedback, one read and one exact native unavailable-tool
+denial without a forbidden success, but omitted at least one requested
+`WRITE_BLOCKED`/`DELEGATION_BLOCKED` token. The former prose conjunction
+rejected that turn. Isolation is instead required by the strict native
+outcomes and catalog, protected file bytes, child observations and executable
+customization markers; none of those assertions depends on model prose.
+The real Backend refusal regression also exposed a normalization defect:
+the adapter converted every native `ExitPlanMode` error into success and
+discarded the error text. Native plan-exit errors now remain failures in
+both live events and history. Plan-approval decisions still complete through
+the existing control bridge; `EnterPlanMode` handling is unchanged.
+The case installs no administrator-managed policy and does not claim managed
+hooks are suppressed. No credentials are copied to the fixture or retained in
+its diagnostics. The shared `real_enforced_review_feedback` and
+`real_enforced_read_only` cases continue to cover transport failure and native
+restriction contracts.

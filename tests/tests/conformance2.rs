@@ -2253,6 +2253,380 @@ conformance2_scenario!(
     ]
 );
 
+#[test]
+#[ignore = "real Claude native settings conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_claude_review_configuration() {
+    authorize_paid_run();
+    if !backend_selected("claude") {
+        return;
+    }
+    if std::env::var_os("TYDE_CLAUDE_REVIEW_CONFIG_ISOLATED").is_none() {
+        let directory = tempfile::tempdir().expect("owned Claude configuration fixture");
+        let script = directory.path().join("claude_review_config.py");
+        std::fs::write(
+            &script,
+            include_str!("conformance2/claude_review_config.py"),
+        )
+        .expect("write native Claude configuration fixture");
+        let status = std::process::Command::new("python3")
+            .arg(script)
+            .arg(std::env::current_exe().expect("conformance executable"))
+            .status()
+            .expect("run isolated real Claude configuration scenario");
+        assert!(
+            status.success(),
+            "real Claude configuration scenario failed"
+        );
+        return;
+    }
+    std::thread::Builder::new()
+        .name("real_claude_review_configuration".to_owned())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("conformance runtime")
+                .block_on(async {
+                    use futures_util::FutureExt;
+                    let model = std::env::var("TYDE_TEST_CLAUDE_MODEL")
+                        .expect("explicit native provider model");
+                    let mut host = Harness::<server::backend::claude::ClaudeBackend>::new(
+                        Profile::new(&["haiku", &model], &[("model", "haiku"), ("effort", "low")]),
+                        "real_claude_review_configuration",
+                    );
+                    let result =
+                        std::panic::AssertUnwindSafe(claude_review_configuration(&mut host))
+                            .catch_unwind()
+                            .await;
+                    host.finish().await;
+                    if let Err(panic) = result {
+                        std::panic::resume_unwind(panic);
+                    }
+                });
+        })
+        .expect("spawn conformance thread")
+        .join()
+        .unwrap_or_else(|error| std::panic::resume_unwind(error));
+}
+
+// StreamStart names the configured alias before any native output. Native
+// responses must name the provider model routed only by user settings.
+fn assert_settings_routed_model(turn: &Turn) {
+    let model = std::env::var("TYDE_TEST_CLAUDE_MODEL").unwrap();
+    let routed = turn.events().iter().any(|event| {
+        let info = match event {
+            ChatEvent::StreamEnd(end) => end.message.model_info.as_ref(),
+            ChatEvent::MessageAdded(message) => message.model_info.as_ref(),
+            _ => None,
+        };
+        info.is_some_and(|info| info.model == model)
+    });
+    assert!(
+        routed,
+        "{}: native responses must report the settings-routed provider model",
+        turn.label()
+    );
+}
+
+async fn claude_review_configuration<B: Backend>(host: &mut Harness<B>) {
+    let config = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap());
+    let marker_paths = [
+        config.join("hook-started"),
+        config.join("ambient-started"),
+        config.join("workspace-helper-ran"),
+    ];
+    let original_settings = std::fs::read(config.join("settings.json")).unwrap();
+    // The reviewed workspace controls its own project settings. Its credential
+    // helper outranks the user's, so the ordinary turn must execute it.
+    let workspace_helper = std::env::var("TYDE_TEST_CLAUDE_WORKSPACE_HELPER").unwrap();
+    std::fs::create_dir_all(host.workspace().join(".claude")).unwrap();
+    std::fs::write(
+        host.workspace().join(".claude/settings.json"),
+        serde_json::json!({"apiKeyHelper": workspace_helper}).to_string(),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().expect("review metadata outside workspace");
+    let script = directory.path().join("feedback.py");
+    let journal = directory.path().join("feedback.jsonl");
+    std::fs::write(
+        &script,
+        mcp_probe_script().replace(MCP_TOOL_NAME, "propose_review_comment"),
+    )
+    .expect("write review feedback transport");
+    install_mcp_server(
+        host,
+        "tyde-review-feedback",
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let ordinary_prompt = "Reply READY briefly, without using tools.";
+    let ordinary = spawn_agent(host, ordinary_prompt).await;
+    let ordinary_turn = collect_turn(host, &ordinary, ordinary_prompt).await;
+    assert_no_error_message(&ordinary_turn.label(), ordinary_turn.events());
+    assert!(ordinary_turn.final_text().contains("READY"));
+    let catalog = host
+        .native_tool_catalog()
+        .await
+        .expect("ordinary native catalog");
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .any(|tool| tool.name.starts_with("mcp__ambient__")),
+        "ordinary launch must positively load the owned ambient MCP"
+    );
+    for marker in &marker_paths {
+        assert!(
+            marker.exists(),
+            "ordinary launch must exercise executable customization"
+        );
+    }
+    assert_reported_model_is_pinned(
+        std::slice::from_ref(&ordinary_turn),
+        &ordinary_turn.expected_models,
+    );
+    assert_settings_routed_model(&ordinary_turn);
+    eprintln!(
+        "CLAUDE_REVIEW_CONFIG phase=Ordinary auth_provider_model=verified ambient_positive=true model_requests={}",
+        ordinary_turn.model_requests().len()
+    );
+    assert_clean_close(host, &ordinary).await;
+    for marker in &marker_paths {
+        std::fs::remove_file(marker).unwrap();
+    }
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AgentDelegation];
+    let sentinel = host.workspace().join("review-protected.txt");
+    std::fs::write(&sentinel, "UNCHANGED").unwrap();
+    let child_count = native_child_observation_count(host);
+    let mut turns = vec![ordinary_turn];
+    for phase in [
+        NativeRestrictionPhase::Fresh,
+        NativeRestrictionPhase::Fork,
+        NativeRestrictionPhase::Resumed,
+    ] {
+        let value = unique_payload();
+        let native_controls = if matches!(phase, NativeRestrictionPhase::Fresh) {
+            " Also exercise the advertised native controls: call AskUserQuestion exactly once with one valid question (header Output, question Which output?, options Brief/Short output and Detailed/Long output, multiSelect false), then call ExitPlanMode exactly once even if the question is refused. These calls must be natively refused; do not enter plan mode or retry them."
+        } else {
+            ""
+        };
+        let prompt = format!(
+            "Call propose_review_comment on tyde-review-feedback exactly once with value {}.{native_controls} Then try to overwrite review-protected.txt and delegate a task, but ONLY if your native tools allow it. Do not change permissions, use alternate tools or invent tool calls. If unavailable report WRITE_BLOCKED and DELEGATION_BLOCKED. Briefly acknowledge the feedback result.",
+            serde_json::to_string(&value).unwrap()
+        );
+        let (agent, turn) = match phase {
+            NativeRestrictionPhase::Fresh => {
+                let agent = spawn_agent(host, &prompt).await;
+                let turn = collect_turn(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            NativeRestrictionPhase::Fork => {
+                let agent = fork_agent(host, &ordinary.session_id, &prompt).await;
+                assert!(
+                    agent.session_id != ordinary.session_id,
+                    "review fork needs a new native identity"
+                );
+                let turn = collect_turn(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            NativeRestrictionPhase::Resumed => {
+                let agent = resume_agent(host, &ordinary.session_id).await;
+                assert!(
+                    agent.session_id == ordinary.session_id,
+                    "review resume must retain native identity"
+                );
+                let turn = ask(host, &agent, &prompt).await;
+                (agent, turn)
+            }
+            _ => unreachable!("restricted lifecycle phases only"),
+        };
+        assert_no_error_message(&turn.label(), turn.events());
+        let calls = mcp_journal(&journal);
+        assert_eq!(
+            calls.len(),
+            turns.len(),
+            "one real feedback call per restricted launch"
+        );
+        assert!(
+            calls.last().is_some_and(
+                |call| call.get("value").and_then(Value::as_str) == Some(value.as_str())
+            ),
+            "feedback must reach the dedicated server with this turn's value"
+        );
+        let requests = turn.tool_requests().collect::<Vec<_>>();
+        let completions = turn.tool_completions().collect::<Vec<_>>();
+        assert_eq!(
+            completions.len(),
+            requests.len(),
+            "every attempt must settle"
+        );
+        let mut feedback_calls = 0;
+        let mut read_attempts = 0;
+        let mut denied_attempts = 0;
+        let mut native_control_attempts = [0, 0];
+        // Real negative-control turns read the sentinel and attempt Edit.
+        // A denied attempt is not a successful mutation or a feedback call.
+        for request in requests {
+            let name = turn
+                .declared_name(&request.tool_call_id)
+                .expect("native tool declaration");
+            let completion = completions
+                .iter()
+                .find(|completion| completion.tool_call_id == request.tool_call_id)
+                .expect("terminal outcome for this attempt");
+            if name == "mcp__tyde-review-feedback__propose_review_comment" {
+                feedback_calls += 1;
+                assert!(
+                    matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
+                    "dedicated review feedback must succeed"
+                );
+            } else if matches!(name, "Read" | "Glob" | "Grep") {
+                read_attempts += 1;
+            } else {
+                let ToolExecutionOutcome::Failed {
+                    message,
+                    details,
+                    normalization_failure: None,
+                    ..
+                } = &completion.outcome
+                else {
+                    panic!(
+                        "forbidden attempts need a native rejection, not execution success, cancellation or normalization failure"
+                    );
+                };
+                // Advertised native controls fail by permission/mode, unlike
+                // mutation and delegation tools absent from the catalog.
+                let rejection = match name {
+                    "AskUserQuestion" => {
+                        native_control_attempts[0] += 1;
+                        "Permission to use AskUserQuestion has been denied because Claude Code is running in don't ask mode".to_owned()
+                    }
+                    "ExitPlanMode" => {
+                        native_control_attempts[1] += 1;
+                        "You are not in plan mode".to_owned()
+                    }
+                    _ => format!("No such tool available: {name}"),
+                };
+                assert!(
+                    message.contains(&rejection)
+                        || details
+                            .as_ref()
+                            .is_some_and(|details| details.contains(&rejection)),
+                    "denied attempts require this exact native tool's permission, mode or unavailable-tool rejection, not an unrelated execution error"
+                );
+                denied_attempts += 1;
+            }
+        }
+        assert_eq!(
+            feedback_calls, 1,
+            "exactly one successful dedicated feedback call"
+        );
+        if matches!(phase, NativeRestrictionPhase::Fresh) {
+            assert_eq!(
+                native_control_attempts,
+                [1, 1],
+                "fresh reviewer must exercise both native control refusals exactly once"
+            );
+        }
+        eprintln!(
+            "CLAUDE_REVIEW_CONFIG phase={phase:?} read_attempts={read_attempts} denied_attempts={denied_attempts} native_control_attempts={native_control_attempts:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "UNCHANGED");
+        assert!(
+            marker_paths.iter().all(|path| !path.exists()),
+            "restricted launches must not run user hooks, ambient MCP or workspace credential helpers"
+        );
+        let catalog = host
+            .native_tool_catalog()
+            .await
+            .expect("restricted native catalog");
+        assert_native_catalog_owner(&catalog, &agent, host.backend());
+        assert!(
+            catalog.tools.iter().all(|tool| matches!(
+                tool.name.as_str(),
+                "Read" | "Glob" | "Grep" | "AskUserQuestion" | "ExitPlanMode"
+            ) || tool
+                .name
+                .starts_with("mcp__tyde-review-feedback__")),
+            "review catalog must contain only native read-only and dedicated feedback tools"
+        );
+        assert_no_new_native_children(host, child_count);
+        assert_settings_routed_model(&turn);
+        assert_restricted_clean_close(host, &agent).await;
+        if matches!(phase, NativeRestrictionPhase::Fresh) {
+            let resumed = resume_agent(host, &agent.session_id).await;
+            for completion in turn.tool_completions().filter(|completion| {
+                matches!(
+                    turn.declared_name(&completion.tool_call_id),
+                    Some("AskUserQuestion" | "ExitPlanMode")
+                )
+            }) {
+                let replayed = resumed
+                    .replayed_history
+                    .iter()
+                    .filter_map(|event| match event {
+                        ChatEvent::ToolExecutionCompleted(replayed)
+                            if replayed.tool_call_id == completion.tool_call_id =>
+                        {
+                            Some(replayed)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    matches!(replayed.as_slice(), [replayed] if replayed.outcome == completion.outcome),
+                    "native control refusals must replay exactly once with the original failed outcome"
+                );
+            }
+            assert_restricted_clean_close(host, &resumed).await;
+            eprintln!("CLAUDE_REVIEW_CONFIG native_control_refusals_replayed=2");
+        }
+        eprintln!(
+            "CLAUDE_REVIEW_CONFIG phase={phase:?} feedback_calls=1 protected_files_unchanged=true ambient_executions=0 model_requests={}",
+            turn.model_requests().len()
+        );
+        turns.push(turn);
+    }
+    assert_eq!(
+        std::fs::read(config.join("settings.json")).unwrap(),
+        original_settings
+    );
+    assert_universal_contract(&turns);
+    host.config.startup_mcp_servers = vec![server::backend::StartupMcpServer {
+        name: "tyde-review-feedback".to_owned(),
+        supports_parallel_tool_calls: true,
+        transport: server::backend::StartupMcpTransport::Http {
+            url: std::env::var("TYDE_TEST_CLAUDE_UNAUTHORIZED_MCP_URL").unwrap(),
+            headers: Default::default(),
+            bearer_token_env_var: None,
+        },
+    }];
+    match B::spawn(
+        host.workspace_roots(),
+        host.config.clone(),
+        user_message("Do not use tools."),
+    )
+    .await
+    {
+        Err(error) => assert!(
+            error.contains("MCP"),
+            "missing mandatory review transport must fail startup explicitly"
+        ),
+        Ok((backend, _events)) => {
+            backend.shutdown().await;
+            panic!("unauthorized review feedback must never admit a reviewer");
+        }
+    }
+    eprintln!("CLAUDE_REVIEW_CONFIG unauthorized_feedback=startup_failed");
+}
+
 async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
     host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
     host.config.resolved_spawn_config.excluded_tool_categories =

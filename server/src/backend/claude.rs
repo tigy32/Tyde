@@ -2416,7 +2416,7 @@ impl ClaudeInner {
             },
         });
         match this
-            .send_control_request_value(request_id, request, CLAUDE_CONTROL_RESPONSE_TIMEOUT)
+            .send_control_request_value(request_id, request, Some(CLAUDE_CONTROL_RESPONSE_TIMEOUT))
             .await
         {
             Ok(_) => CancelBackgroundTaskOutcome::Cancelled,
@@ -4362,18 +4362,22 @@ impl ClaudeInner {
         // respawn must be checked against its own rather than inheriting the
         // previous one's verdict.
         self.reset_skill_readiness().await;
-        let startup_mcp_names = config
+        let startup_mcp_config = config
             .startup_mcp_config_json
             .as_deref()
-            .and_then(|config| serde_json::from_str::<Value>(config).ok())
-            .and_then(|config| config.get("mcpServers").and_then(Value::as_object).cloned())
-            .map(|servers| {
-                servers
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|_| "Invalid Claude startup MCP configuration".to_owned())?;
+        let startup_mcp_servers = match startup_mcp_config.as_ref() {
+            Some(config) => config
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "Claude startup MCP configuration omitted servers".to_owned())?
+                .clone(),
+            None => serde_json::Map::new(),
+        };
+        let startup_mcp_names = startup_mcp_servers.keys().cloned().collect::<HashSet<_>>();
+        let enforced_read_only = config.access_mode == BackendAccessMode::EnforcedReadOnly;
         let spawned = tokio::select! {
             biased;
             _ = self.process_start_cancellation.cancelled() => {
@@ -4454,11 +4458,17 @@ impl ClaudeInner {
                 }
                 self.configure_capacity_from_initialize(&response).await;
                 self.schedule_capacity_refresh().await;
-                if !startup_mcp_names.is_empty()
-                    && let Err(error) = self
-                        .await_startup_mcp_ready(&startup_mcp_names, process_generation)
+                let mcp_ready = if enforced_read_only {
+                    // Safe mode suppresses even --mcp-config. Register only the
+                    // host-owned servers after initialization, before any turn.
+                    self.configure_restricted_mcp(startup_mcp_servers).await
+                } else if !startup_mcp_names.is_empty() {
+                    self.await_startup_mcp_ready(&startup_mcp_names, process_generation)
                         .await
-                {
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = mcp_ready {
                     self.shutdown_process().await;
                     return Err(error);
                 }
@@ -4473,6 +4483,95 @@ impl ClaudeInner {
             }
         }
 
+        Ok(())
+    }
+
+    async fn configure_restricted_mcp(
+        &self,
+        servers: serde_json::Map<String, Value>,
+    ) -> Result<(), String> {
+        let expected = servers.keys().cloned().collect::<HashSet<_>>();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let response = self
+            .send_control_request_value(
+                request_id.clone(),
+                json!({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": {"subtype": "mcp_set_servers", "servers": servers},
+                }),
+                None,
+            )
+            .await?;
+        let added = response
+            .get("added")
+            .and_then(Value::as_array)
+            .and_then(|names| {
+                names
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<HashSet<_>>>()
+            })
+            .ok_or_else(|| {
+                "Claude omitted restricted MCP registration acknowledgement".to_owned()
+            })?;
+        let errors = response
+            .get("errors")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "Claude omitted restricted MCP registration errors".to_owned())?;
+        let removed = response
+            .get("removed")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Claude omitted restricted MCP removal acknowledgement".to_owned())?;
+        if !errors.is_empty()
+            || !removed.is_empty()
+            || added != expected.iter().map(String::as_str).collect::<HashSet<_>>()
+        {
+            return Err("Claude failed to register the exact restricted MCP server set".to_owned());
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let status = self
+            .send_control_request_value(
+                request_id.clone(),
+                json!({"type": "control_request", "request_id": request_id,
+                    "request": {"subtype": "mcp_status"}}),
+                None,
+            )
+            .await?;
+        let observed = status
+            .get("mcpServers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Claude omitted restricted MCP connection state".to_owned())?;
+        if observed.len() != expected.len() {
+            return Err("Claude reported a different restricted MCP server set".to_owned());
+        }
+        for name in &expected {
+            let server = observed
+                .iter()
+                .find(|server| server.get("name").and_then(Value::as_str) == Some(name))
+                .ok_or_else(|| "Claude omitted a restricted MCP server".to_owned())?;
+            match server.get("status").and_then(Value::as_str) {
+                Some("connected") => {}
+                Some("needs-auth") => {
+                    return Err("Claude review MCP server requires authorization".to_owned());
+                }
+                Some("failed" | "disabled") => {
+                    return Err(
+                        "Claude review MCP server connection failed or was disabled".to_owned()
+                    );
+                }
+                _ => {
+                    return Err(
+                        "Claude completed MCP registration without confirming a settled connection"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            server_count = added.len(),
+            "Connected isolated Claude review MCP servers"
+        );
         Ok(())
     }
 
@@ -5187,7 +5286,7 @@ impl ClaudeInner {
                 "subtype": subtype,
             },
         });
-        self.send_control_request_value(request_id, request, timeout_duration)
+        self.send_control_request_value(request_id, request, Some(timeout_duration))
             .await
     }
 
@@ -5195,7 +5294,7 @@ impl ClaudeInner {
         &self,
         request_id: String,
         value: Value,
-        timeout_duration: Duration,
+        timeout_duration: Option<Duration>,
     ) -> Result<Value, String> {
         let (tx, rx) = oneshot::channel();
         let waiter_id = request_id.clone();
@@ -5226,7 +5325,11 @@ impl ClaudeInner {
             return Err(err);
         }
 
-        match tokio::time::timeout(timeout_duration, rx).await {
+        let received = match timeout_duration {
+            Some(duration) => tokio::time::timeout(duration, rx).await.map_err(|_| ()),
+            None => Ok(rx.await),
+        };
+        match received {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(format!(
                 "Claude control request '{request_id}' was dropped before a response"
@@ -6911,8 +7014,15 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String
         cli_args.extend([
             "--tools".to_owned(),
             "Read,Glob,Grep,AskUserQuestion,ExitPlanMode".to_owned(),
+            // Keep the user's native auth/provider/model settings, not
+            // executable customization. Safe mode still runs credential
+            // helpers, so workspace-controlled project/local settings stay
+            // excluded. --bare would also discard OAuth/keychain auth.
+            "--safe-mode".to_owned(),
             "--setting-sources".to_owned(),
-            String::new(),
+            "user".to_owned(),
+            "--disable-slash-commands".to_owned(),
+            "--no-chrome".to_owned(),
             "--strict-mcp-config".to_owned(),
             "--allowedTools".to_owned(),
             format!(
@@ -6920,6 +7030,8 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String
                 REVIEW_FEEDBACK_TOOLS.join(",")
             ),
         ]);
+        // Disables user hooks only. Administrator-managed policy hooks still
+        // run by Claude's contract; Tyde does not override organization policy.
         cli_settings.insert("disableAllHooks".to_owned(), json!(true));
     }
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
@@ -6949,10 +7061,11 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String
         cli_args.push(effort_level.as_str().to_string());
     }
 
-    if let Some(mcp_config_json) = config
-        .startup_mcp_config_json
-        .as_deref()
-        .and_then(normalize_nonempty)
+    if !enforced_read_only
+        && let Some(mcp_config_json) = config
+            .startup_mcp_config_json
+            .as_deref()
+            .and_then(normalize_nonempty)
     {
         cli_args.push("--mcp-config".to_string());
         cli_args.push(mcp_config_json);
@@ -8930,7 +9043,7 @@ async fn relocate_claude_workspace(
                     "trust_accepted": true, "trusted_directory": cwd,
                 },
             }),
-            CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+            Some(CLAUDE_CONTROL_RESPONSE_TIMEOUT),
         )
         .await
         .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
@@ -8979,7 +9092,7 @@ async fn relocate_claude_workspace(
                     "permissions": {"additionalDirectories": super::execution_workspace_roots(&roots[1..]).map_err(super::WorkspaceRelocationError::Rejected)?}
                 }}
             }),
-            CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+            Some(CLAUDE_CONTROL_RESPONSE_TIMEOUT),
         )
         .await
         .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
@@ -13221,13 +13334,6 @@ fn claude_is_exit_plan_mode_tool_name(tool_name: &str) -> bool {
     normalize_tool_name(tool_name) == "exitplanmode"
 }
 
-fn claude_is_user_input_tool_name(tool_name: &str) -> bool {
-    matches!(
-        normalize_tool_name(tool_name).as_str(),
-        "askuserquestion" | "exitplanmode" | "enterplanmode"
-    )
-}
-
 /// Convert a TodoWrite tool call's arguments into a TaskUpdate event value.
 ///
 /// Claude Code's TodoWrite sends `{ "todos": [{ "content": "...", "status": "...", "activeForm": "..." }, ...] }`.
@@ -14913,31 +15019,15 @@ fn extract_tool_result_events_from_message(
         }
 
         if is_error {
-            // AskUserQuestion, ExitPlanMode, and EnterPlanMode return is_error in
-            // --print mode because they need interactive input. This is expected —
-            // treat them as successful end-of-turn signals.
-            if claude_is_user_input_tool_name(&tool_name)
-                && normalize_tool_name(&tool_name) != "askuserquestion"
-            {
-                let tool_result = if normalize_tool_name(&tool_name) == "exitplanmode" {
-                    match exit_plan_mode_plan_info_from_tool_calls(tool_call_by_id.values()) {
-                        Some(info) => json!({
-                            "kind": "Other",
-                            "result": {
-                                "plan_content": info.plan,
-                                "plan_path": info.plan_path,
-                            }
-                        }),
-                        None => json!({ "kind": "Other", "result": null }),
-                    }
-                } else {
-                    json!({ "kind": "Other", "result": null })
-                };
+            // EnterPlanMode's print-mode notice ends the turn. ExitPlanMode
+            // approval completes through the control bridge; native errors
+            // such as "not in plan mode" must remain failures.
+            if normalize_tool_name(&tool_name) == "enterplanmode" {
                 events.push(ClaudeReplayToolExecution {
                     tool_call_id,
                     tool_name,
                     success: true,
-                    tool_result,
+                    tool_result: json!({ "kind": "Other", "result": null }),
                     error: None,
                 });
                 continue;
@@ -15436,6 +15526,11 @@ impl ClaudeBackend {
         fork_from_session_id: Option<SessionId>,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
+        if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly
+            && !config.resolved_spawn_config.skills.is_empty()
+        {
+            return Err("Claude enforced read-only sessions cannot load selected skills in native safe mode".to_owned());
+        }
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
@@ -15576,6 +15671,27 @@ impl ClaudeBackend {
 
             if let Some(emitter) = initial_emitter {
                 session.set_subagent_emitter(emitter).await;
+            }
+
+            // The CLI emits session-bearing frames before initialization, so a
+            // reviewer whose mandatory MCP set fails verification would
+            // otherwise report ready. Verify before admitting a turn, as
+            // resume does.
+            if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly {
+                let verified = tokio::select! {
+                    biased;
+                    _ = &mut startup_cancel_rx => {
+                        session.shutdown().await;
+                        return;
+                    }
+                    verified = session.inner.ensure_process_ready() => verified,
+                };
+                if let Err(err) = verified {
+                    let _ =
+                        ready_tx.send(Err(format!("Failed to initialize Claude session: {err}")));
+                    session.shutdown().await;
+                    return;
+                }
             }
 
             // The forward task is the sole owner of the readiness reply; an
@@ -16572,6 +16688,11 @@ impl Backend for ClaudeBackend {
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
+        if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly
+            && !config.resolved_spawn_config.skills.is_empty()
+        {
+            return Err("Claude enforced read-only sessions cannot load selected skills in native safe mode".to_owned());
+        }
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();

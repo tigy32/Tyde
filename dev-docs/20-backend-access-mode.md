@@ -71,7 +71,13 @@ native agent-delegation exclusion. Claude and Codex implement those contracts;
 other backends fail admission rather than receiving a weaker substitute.
 
 - Claude restricts the native tool catalog, withholds shell and file-mutation
-  tools, disables ambient hooks/settings, and rejects other tool permissions.
+  tools, and rejects other tool permissions. Native safe mode with user
+  settings only keeps the user's auth, provider and model settings but
+  disables user hooks, ambient MCP servers, skills and other executable
+  customization. Workspace project and local settings, including their
+  credential helpers, are not loaded. Administrator-managed policy, including
+  its hooks, still applies by Claude's contract; Tyde does not bypass
+  organization policy.
 - Codex applies its native read-only sandbox and approval policy at process,
   start, fork, resume, and turn boundaries. Code-execution kernels and native
   delegation remain disabled; supported native read tools are exposed directly
