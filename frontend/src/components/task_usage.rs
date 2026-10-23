@@ -24,7 +24,7 @@ fn status_text(status: &TaskTokenUsageStatus) -> String {
         TaskTokenUsageStatus::Partial {
             unavailable_count, ..
         } => format!(
-            "Partial · {unavailable_count} scope{} unreported",
+            "{unavailable_count} scope{} unreported",
             if *unavailable_count == 1 { "" } else { "s" }
         ),
         TaskTokenUsageStatus::Unavailable {
@@ -67,16 +67,10 @@ fn aggregate_view(total: &protocol::TaskTokenUsageAggregate) -> AnyView {
 }
 
 fn usage_coverage(total: &protocol::TaskTokenUsageAggregate) -> Option<String> {
-    let partial_fields = !total.usage.partial_fields.is_empty();
-    if matches!(total.status, TaskTokenUsageStatus::Known) && !partial_fields {
+    if matches!(total.status, TaskTokenUsageStatus::Known) {
         return None;
     }
     let mut text = status_text(&total.status);
-    if partial_fields {
-        text.push_str(
-            " · partial breakdown: ≥ marks reported component subtotals, not complete totals",
-        );
-    }
     match &total.status {
         TaskTokenUsageStatus::Partial { reasons, .. }
         | TaskTokenUsageStatus::Unavailable { reasons, .. } => {
@@ -153,7 +147,7 @@ pub(super) fn TaskUsagePopup(
             <header class="task-usage-heading">
                 <h2 node_ref=heading tabindex="-1">"Task usage"</h2>
                 <span class="task-usage-count" title="Current root agent and retained descendants">{move || rollup.get().map(|payload| format!("{} agent{}", payload.breakdown.len(), if payload.breakdown.len() == 1 { "" } else { "s" }))}</span>
-                {move || rollup.get().and_then(|payload| usage_coverage(&payload.total).map(|detail| view! { <UsageInfo label=if matches!(payload.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Partial" }.to_owned() detail=detail /> }))}
+                {move || rollup.get().and_then(|payload| usage_coverage(&payload.total).map(|detail| view! { <UsageInfo label=if matches!(payload.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Unreported scopes" }.to_owned() detail=detail /> }))}
                 <Show when=move || !expanded.get()>
                     <button class="task-usage-expand" aria-label="Expand task usage" title="Expand task usage" on:click=move |_| expanded.set(true)>"↗"</button>
                 </Show>
@@ -302,7 +296,7 @@ fn TaskBackendRow(
             <div class="task-backend-token-row">
                 <div class="task-backend-name">
                     <button class="task-backend-drilldown" aria-label=format!("Show {} agents", backend_label(kind)) on:click=move |_| drilldown.run(kind)>{crate::components::launch_menu::backend_icon(kind)}{backend_label(kind)}<span>{move || group.get().map(|group| format!(" · {} agent{}", group.agent_count, if group.agent_count == 1 { "" } else { "s" }))}</span></button>
-                    {move || group.get().and_then(|group| usage_coverage(&group.total).map(|detail| view! { <UsageInfo label=if matches!(group.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Partial" }.to_owned() detail=format!("{}: {detail} {}/{} agents reporting; {} incomplete.", backend_label(kind), group.reporting_agent_count, group.agent_count, group.incomplete_agent_count) /> }))}
+                    {move || group.get().and_then(|group| usage_coverage(&group.total).map(|detail| view! { <UsageInfo label=if matches!(group.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Unreported scopes" }.to_owned() detail=format!("{}: {detail} {}/{} agents reporting; {} incomplete.", backend_label(kind), group.reporting_agent_count, group.agent_count, group.incomplete_agent_count) /> }))}
                 </div>
                 <div class="task-backend-tokens" role="group" aria-label=format!("{} task token usage: input, cached input, output and reasoning", backend_label(kind))>{move || group.get().map(|group| aggregate_view(&group.total))}</div>
                 {move || group.get().and_then(|group| (group.analyzer_batch_count > 0).then(|| view! { <span class="task-backend-analyzers">{format!("{} analyzer batch{}", group.analyzer_batch_count, if group.analyzer_batch_count == 1 { "" } else { "es" })}</span> }))}

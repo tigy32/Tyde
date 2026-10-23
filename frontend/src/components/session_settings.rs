@@ -829,18 +829,10 @@ pub(super) fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReaso
     }
 }
 
-// Keep the footer's established arrow/subset presentation. Prompt totals
-// arrive already aggregated: missing cache breakdowns must not erase input
-// contributed by other backends or turn an unknown subset into zero.
-fn task_number(
-    amount: &TaskTokenUsageAmount,
-    field: TaskTokenUsageField,
-    value: Option<u64>,
-) -> String {
+// Show the best reported figure. partial_fields stays on the amount for
+// accounting; rendered numbers are not qualified. Missing values stay em dashes.
+fn task_number(value: Option<u64>) -> String {
     match value {
-        Some(value) if amount.partial_fields.contains(&field) => {
-            format!("≥{}", format_compact(value))
-        }
         Some(value) => format_compact(value),
         None => "—".to_owned(),
     }
@@ -856,14 +848,11 @@ fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) 
         {
             format!(
                 "↑{} (cached {})",
-                task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens),
-                task_number(amount, TaskTokenUsageField::CachedPrompt, Some(cached))
+                task_number(amount.prompt_tokens),
+                task_number(Some(cached))
             )
         }
-        _ => format!(
-            "↑{}",
-            task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens)
-        ),
+        _ => format!("↑{}", task_number(amount.prompt_tokens)),
     };
     let output = match amount.reasoning_tokens {
         Some(reasoning)
@@ -874,31 +863,20 @@ fn task_amount_texts(amount: &TaskTokenUsageAmount) -> (String, Option<String>) 
         {
             format!(
                 "↓{} (reasoning {})",
-                task_number(amount, TaskTokenUsageField::Output, amount.output_tokens),
-                task_number(amount, TaskTokenUsageField::Reasoning, Some(reasoning))
+                task_number(amount.output_tokens),
+                task_number(Some(reasoning))
             )
         }
-        _ => format!(
-            "↓{}",
-            task_number(amount, TaskTokenUsageField::Output, amount.output_tokens)
-        ),
+        _ => format!("↓{}", task_number(amount.output_tokens)),
     };
     (input, Some(output))
 }
 
 pub(super) fn task_detail_tokens(amount: &TaskTokenUsageAmount) -> AnyView {
-    let prompt = task_number(amount, TaskTokenUsageField::Prompt, amount.prompt_tokens);
-    let cached = task_number(
-        amount,
-        TaskTokenUsageField::CachedPrompt,
-        amount.cached_prompt_tokens,
-    );
-    let output = task_number(amount, TaskTokenUsageField::Output, amount.output_tokens);
-    let reasoning = task_number(
-        amount,
-        TaskTokenUsageField::Reasoning,
-        amount.reasoning_tokens,
-    );
+    let prompt = task_number(amount.prompt_tokens);
+    let cached = task_number(amount.cached_prompt_tokens);
+    let output = task_number(amount.output_tokens);
+    let reasoning = task_number(amount.reasoning_tokens);
     view! {
         <span class="token-stat token-stat-input">{format!("↑{prompt}")}<span class="task-token-detail">{format!(" (cached {cached})")}</span></span>
         <span class="token-stat token-stat-output">{format!("↓{output}")}<span class="task-token-detail">{format!(" (reasoning {reasoning})")}</span></span>
@@ -913,7 +891,6 @@ pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
                 <span class="session-task-row-usage">
                     {tokens}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
-                    {(!usage.partial_fields.is_empty()).then(|| view! { <crate::components::task_usage::UsageInfo label="partial breakdown".to_owned() detail="≥ marks the reported subtotal; some contributing usage has no breakdown for that field. — means unreported, not zero.".to_owned() /> })}
                 </span>
             }
             .into_any()
@@ -924,12 +901,11 @@ pub(super) fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
             ..
         } => {
             let tokens = task_detail_tokens(usage);
-            let marker = format!("partial \u{b7} {unavailable_count} unreported");
+            let marker = format!("{unavailable_count} unreported");
             view! {
                 <span class="session-task-row-usage">
                     {tokens}
                     {(usage.prompt_tokens.is_none() && usage.output_tokens.is_none()).then(|| view! { <span>{format!("Reported combined: {} · input/output unreported", format_compact(usage.total_tokens))}</span> })}
-                    {(!usage.partial_fields.is_empty()).then(|| view! { <crate::components::task_usage::UsageInfo label="partial breakdown".to_owned() detail="≥ marks the reported subtotal; some contributing usage has no breakdown for that field. — means unreported, not zero.".to_owned() /> })}
                     <span class="session-task-status session-task-status-partial">
                         {marker}
                     </span>
@@ -998,7 +974,7 @@ fn TaskUsageBadge(
         <span class="session-task-usage" node_ref=wrapper_ref>
             <button class="session-task-toggle" node_ref=toggle_ref aria-haspopup="dialog"
                 aria-expanded=move || open.get().to_string() aria-controls=move || popover_id.get()
-                title="Cumulative tokens across this task's requests and agents. The context panel shows the latest request's occupancy instead. ≥ marks a reported subtotal with incomplete breakdown coverage."
+                title="Cumulative tokens across this task's requests and agents. The context panel shows the latest request's occupancy instead. — means unreported, not zero."
                 on:click=move |_| open.update(|open| *open = !*open)>
                 <span class="session-task-scope">"Task"</span>
                 {move || rollup.get().map(|payload| match payload.total.status {
@@ -1009,7 +985,6 @@ fn TaskUsageBadge(
                     }
                 })}
                 {move || rollup.get().and_then(|payload| (payload.breakdown.len() > 1).then(|| view! { <span class="session-task-including">{format!("including {} agents", payload.breakdown.len())}</span> }))}
-                {move || rollup.get().and_then(|payload| (matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. }) || !payload.total.usage.partial_fields.is_empty()).then(|| view! { <span class="session-task-status session-task-status-partial">"partial"</span> }))}
             </button>
             <Show when=move || open.get()>
                 <div id=move || popover_id.get()><TaskUsagePopup rollup=rollup binding=binding on_close=close /></div>
@@ -2399,7 +2374,7 @@ mod wasm_tests {
 
     /// A multi-agent task renders the combined left-style total sourced from
     /// the server rollup (not summed chat rows), with an `including N agents`
-    /// suffix (N = breakdown length) and a `partial` marker. Clicking opens the
+    /// suffix (N = breakdown length), without qualifying known figures. Clicking opens the
     /// breakdown (rows in server order, indented by depth, unavailable reason
     /// spelled out), a live server update re-renders the open popover, and
     /// clicking again closes it.
@@ -2429,8 +2404,8 @@ mod wasm_tests {
             "badge should carry the breakdown-length agent count, got: {badge_text}"
         );
         assert!(
-            badge_text.contains("partial"),
-            "a Partial rollup must be visibly marked, got: {badge_text}"
+            !badge_text.contains("partial") && !badge_text.contains('≥'),
+            "a partial rollup shows the known total without a qualifier, got: {badge_text}"
         );
         assert!(
             !badge_text.contains("unavailable"),
@@ -2689,10 +2664,11 @@ mod wasm_tests {
             .text_content()
             .unwrap();
         assert!(
-            text.contains("↑≥3.0K (cached ≥1.7K)")
-                && text.contains("↓≥300 (reasoning ≥70)")
-                && text.contains("partial"),
-            "known component subtotals stay visible with incomplete coverage"
+            text.contains("↑3.0K (cached 1.7K)")
+                && text.contains("↓300 (reasoning 70)")
+                && !text.contains('≥')
+                && !text.contains("partial"),
+            "known component subtotals stay visible without a qualifier"
         );
         let codex = query(&container, "article[aria-label=Codex]")
             .unwrap()
@@ -2708,9 +2684,10 @@ mod wasm_tests {
             .text_content()
             .unwrap();
         assert!(
-            claude.contains("↑≥1.0K (cached ≥700)")
-                && claude.contains("↓≥100 (reasoning ≥20)")
-                && claude.contains("partial breakdown")
+            claude.contains("↑1.0K (cached 700)")
+                && claude.contains("↓100 (reasoning 20)")
+                && !claude.contains('≥')
+                && !claude.contains("partial")
         );
         expand_usage(&container, "Agents").await;
         let rows = container.query_selector_all(".session-task-row").unwrap();
@@ -3013,7 +2990,8 @@ mod wasm_tests {
         assert!(
             original.contains("↑86.0K")
                 && original.contains("including 87 agents")
-                && original.contains("partial")
+                && !original.contains("partial")
+                && !original.contains('≥')
         );
         badge.click();
         next_tick().await;
@@ -3613,8 +3591,8 @@ mod wasm_tests {
             "partial row must show the reported token figure, got: {child_a_text}"
         );
         assert!(
-            child_a_text.contains("partial") && child_a_text.contains("1 unreported"),
-            "partial row must show an unreported marker, got: {child_a_text}"
+            child_a_text.contains("1 unreported") && !child_a_text.contains("partial"),
+            "partial row counts unreported scopes without a partial label, got: {child_a_text}"
         );
         assert!(
             !child_a_text.contains("usage unavailable")
@@ -3669,6 +3647,13 @@ mod wasm_tests {
         assert!(
             popover_text.contains("no completed turns"),
             "rows must spell out the unavailable reason, got: {popover_text}"
+        );
+        assert!(
+            popover_text.contains("↑— (cached —)")
+                && popover_text.contains("↓— (reasoning —)")
+                && !popover_text.contains("↑0")
+                && !popover_text.contains("↓0"),
+            "unreported components must remain em dashes, not fabricated zeroes"
         );
         rollup.total.status = TaskTokenUsageStatus::Unavailable {
             unavailable_count: 3,
