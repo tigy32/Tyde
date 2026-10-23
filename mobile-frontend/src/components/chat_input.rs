@@ -1970,20 +1970,11 @@ pub fn ChatInput() -> impl IntoView {
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
-                    <svg
+                    <div
                         class="chat-thinking-ring"
                         data-mobile-test="chat-thinking-ring"
                         aria-hidden="true"
-                    >
-                        <rect
-                            class="chat-thinking-ring-tail"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                        <rect
-                            class="chat-thinking-ring-head"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                    </svg>
+                    ></div>
                 </Show>
                 <textarea
                     class="chat-input-field"
@@ -5445,45 +5436,44 @@ mod wasm_tests {
             .trim_end_matches("px")
             .parse()
             .expect("capsule radius in px");
-        let strokes = ring_el.query_selector_all("rect").unwrap();
-        assert!(strokes.length() > 0, "the ring is stroked outlines");
-        for i in 0..strokes.length() {
-            let stroke: web_sys::Element = strokes.get(i).unwrap().dyn_into().unwrap();
-            let style = window
-                .get_computed_style(&stroke)
-                .unwrap()
-                .expect("stroke style");
-            let prop = |name: &str| style.get_property_value(name).unwrap();
-            assert_eq!(prop("fill"), "none", "an outline, not a filled shape");
-            let width: f64 = prop("stroke-width")
-                .trim_end_matches("px")
-                .parse()
-                .expect("stroke width in px");
-            assert!(
-                (0.5..=2.0).contains(&width),
-                "a hairline, like desktop's one-pixel edge line: {width}px"
+        let style = window.get_computed_style(&ring_el).unwrap().unwrap();
+        let prop = |name: &str| style.get_property_value(name).unwrap();
+        assert_eq!(prop("pointer-events"), "none");
+        assert_eq!(prop("filter"), "none", "no glowing orbit");
+        assert_eq!(prop("padding-top"), "1px", "a one-pixel edge");
+        assert_eq!(
+            prop("mask-composite"),
+            "exclude, exclude",
+            "the center is cut out"
+        );
+        assert_eq!(prop("background-size"), "200% 100%");
+        assert_eq!(prop("animation-duration"), "1.6s");
+        assert_eq!(prop("animation-timing-function"), "ease-in-out");
+        assert_eq!(prop("animation-iteration-count"), "infinite");
+        let radius: f64 = prop("border-top-left-radius")
+            .trim_end_matches("px")
+            .parse()
+            .expect("radius in px");
+        assert!((radius - capsule_radius).abs() < 0.01);
+        let seek = js_sys::Function::new_with_args(
+            "element, time",
+            "const animation = element.getAnimations()[0]; animation.pause(); animation.currentTime = time;",
+        );
+        for (time, position) in [(0, "100% 0px"), (800, "0% 0px"), (1600, "100% 0px")] {
+            seek.call2(&wasm_bindgen::JsValue::NULL, &ring_el, &time.into())
+                .unwrap();
+            assert_eq!(prop("background-position"), position, "horizontal sweep");
+        }
+        for (theme, accent) in [("light", "rgb(37, 99, 235)"), ("dark", "rgb(0, 122, 204)")] {
+            container.set_attribute("data-theme", theme).unwrap();
+            let gradient = prop("background-image");
+            assert_eq!(
+                gradient,
+                format!(
+                    "linear-gradient(90deg, rgba(0, 0, 0, 0) 0%, {accent} 40%, {accent} 60%, rgba(0, 0, 0, 0) 100%)"
+                ),
+                "one selected-theme accent fades through transparent edges"
             );
-            let radius: f64 = prop("rx").trim_end_matches("px").parse().expect("rx in px");
-            assert!(
-                (radius - (capsule_radius - 1.0)).abs() < 1.0,
-                "the outline follows the capsule's corner radius ({radius} vs {capsule_radius})"
-            );
-            let dashes = prop("stroke-dasharray");
-            let lit: f64 = dashes
-                .split([',', ' '])
-                .filter(|part| !part.is_empty())
-                .map(|part| {
-                    part.trim_end_matches("px")
-                        .parse::<f64>()
-                        .expect("dash length")
-                })
-                .step_by(2)
-                .sum();
-            assert!(
-                lit > 0.0 && lit < 50.0,
-                "a lit segment that leaves most of the rim dark, got {dashes}"
-            );
-            assert_ne!(prop("animation-name"), "none", "the segment orbits the rim");
         }
 
         state.agent_turn_active.update(|m| {

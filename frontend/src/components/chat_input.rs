@@ -3645,7 +3645,7 @@ mod wasm_tests {
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
             provide_context(mount_state);
-            view! { <ChatInput /> }
+            view! { <crate::components::chat_presentation::ChatPresentation><ChatInput /></crate::components::chat_presentation::ChatPresentation> }
         });
         next_tick().await;
 
@@ -3796,6 +3796,59 @@ mod wasm_tests {
         next_tick().await;
         assert!(query(&container, ".inflight-tray-body").is_some());
         assert_outline_bounds();
+        let textarea = query(&container, "textarea")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        textarea.focus().unwrap();
+        state
+            .composer_untracked()
+            .text
+            .set("Keep this draft".to_owned());
+        for width in ["800px", "390px"] {
+            container.style().set_property("width", width).unwrap();
+            state
+                .chat_appearance
+                .set(crate::appearance::ChatAppearance::Ink);
+            next_tick().await;
+            let bounds = ring.get_bounding_client_rect();
+            let area = composer.get_bounding_client_rect();
+            for (actual, expected) in [
+                (bounds.top(), area.top()),
+                (bounds.bottom(), area.bottom()),
+                (bounds.left(), area.left()),
+                (bounds.right(), area.right()),
+            ] {
+                assert!((actual - expected).abs() < 0.5, "Ink outlines the composer");
+            }
+            assert_eq!(prop("padding-top"), "1px");
+            assert_eq!(
+                prop("mask-composite"),
+                "exclude, exclude",
+                "Ink leaves the center clear"
+            );
+            assert_eq!(prop("border-top-left-radius"), "9px");
+            assert_eq!(prop("animation-duration"), "1.6s");
+            seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &800.into())
+                .unwrap();
+            assert_eq!(prop("background-position"), "0% 0px");
+            assert_eq!(textarea.value(), "Keep this draft");
+            assert!(
+                window.document().unwrap().active_element()
+                    == Some(textarea.clone().unchecked_into())
+            );
+            state
+                .chat_appearance
+                .set(crate::appearance::ChatAppearance::Current);
+            next_tick().await;
+            assert_outline_bounds();
+            assert_eq!(
+                prop("mask-image"),
+                "none",
+                "Current keeps its original top line"
+            );
+        }
+        state.composer_untracked().text.set(String::new());
         state.agent_turn_active.update(|active| {
             active.remove(&child_id);
         });

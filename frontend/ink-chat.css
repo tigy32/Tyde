@@ -398,6 +398,26 @@
     padding: 8px calc(var(--space-3) - 1px);
 }
 
+.chat-view[data-chat-appearance="ink"] .chat-thinking-ring {
+    inset: 0;
+    height: auto;
+    border-radius: 9px;
+    padding: 1px;
+    /* Match Tychat's masked horizontal shimmer, not a perimeter orbit. */
+    background: linear-gradient(90deg, transparent 0%, var(--ink-accent) 40%, var(--ink-accent) 60%, transparent 100%);
+    background-size: 200% 100%;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-view[data-chat-appearance="ink"] .chat-thinking-ring {
+        background: var(--ink-accent);
+    }
+}
+
 .chat-view[data-chat-appearance="ink"] .chat-input-content:focus-within {
     border-color: var(--ink-accent);
 }
