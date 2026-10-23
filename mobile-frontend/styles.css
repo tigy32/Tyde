@@ -1619,6 +1619,10 @@ input, textarea, select {
     object-fit: contain;
 }
 
+.tool-card .chat-message-image {
+    max-height: min(320px, 45dvh);
+}
+
 /* The native modal top layer escapes transcript clipping without remounting chat. */
 .phone-image-viewer {
     position: fixed;

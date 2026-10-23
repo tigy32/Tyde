@@ -315,6 +315,25 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             _ => None,
         };
         if let Some((label, detail)) = native_detail {
+            let preview = matches!(entry.request.tool_type, ToolRequestType::ViewImage { .. })
+                .then(|| match entry.result.as_ref().map(|completion| &completion.outcome) {
+                    Some(ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ViewImage { image: Some(image), .. } }) => {
+                        crate::components::chat_message::render_message_images(vec![image.clone()]).into_any()
+                    }
+                    Some(ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ViewImage { preview_error, .. } }) => view! {
+                        <div role="status">{preview_error.clone().unwrap_or_else(|| "No image preview was saved for this tool call.".to_owned())}</div>
+                    }.into_any(),
+                    Some(ToolExecutionOutcome::Failed { message, .. }) => view! {
+                        <div role="alert">{message.clone()}</div>
+                    }.into_any(),
+                    Some(ToolExecutionOutcome::Cancelled { message }) => view! {
+                        <div role="status">{message.clone()}</div>
+                    }.into_any(),
+                    None => view! { <div role="status">"Waiting for image preview…"</div> }.into_any(),
+                    Some(ToolExecutionOutcome::Succeeded { .. }) => view! {
+                        <div role="alert">"Image result could not be read."</div>
+                    }.into_any(),
+                });
             return view! {
                 <div
                     class=format!("tool-card {status_class} native-tool")
@@ -324,6 +343,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                         <span class="tool-name">{label}</span>
                     </div>
                     <div class="tool-native-detail">{detail}</div>
+                    {preview}
                 </div>
             }
             .into_any();
@@ -365,7 +385,7 @@ fn render_generic_card(
         )
     );
 
-    let has_native_images = match &outcome {
+    let native_images = match &outcome {
         Some(
             ToolExecutionOutcome::Succeeded {
                 result: ToolExecutionResult::NativeContent { images, .. },
@@ -374,8 +394,8 @@ fn render_generic_card(
                 result: Some(ToolExecutionResult::NativeContent { images, .. }),
                 ..
             },
-        ) => !images.is_empty(),
-        _ => false,
+        ) => images.clone(),
+        _ => Vec::new(),
     };
 
     // A canonical-request normalization marker pairs with the preserved `Other`
@@ -479,20 +499,20 @@ fn render_generic_card(
                                     class="tool-result"
                                     data-mobile-test="tool-card-result"
                                     prop:open=move || {
-                                        force_show || has_native_images || tool_output_mode.get() == ToolOutputMode::Full
+                                        force_show || tool_output_mode.get() == ToolOutputMode::Full
                                     }
                                 >
                                     <summary>"Result"</summary>
                                     {move || match &outcome {
                                         Some(ToolExecutionOutcome::Succeeded {
-                                            result: ToolExecutionResult::NativeContent { text, images },
-                                        }) => render_native_content(text, images, None),
+                                            result: ToolExecutionResult::NativeContent { text, .. },
+                                        }) => render_native_content(text, None),
                                         Some(ToolExecutionOutcome::Failed {
                                             message,
                                             details,
-                                            result: Some(ToolExecutionResult::NativeContent { text, images }),
+                                            result: Some(ToolExecutionResult::NativeContent { text, .. }),
                                             ..
-                                        }) => render_native_content(text, images, Some((message, details.as_deref()))),
+                                        }) => render_native_content(text, Some((message, details.as_deref()))),
                                         _ => view! {
                                             <pre class="tool-output">{outcome.as_ref().map(|outcome| format!("{outcome:?}")).unwrap_or_default()}</pre>
                                         }.into_any(),
@@ -503,16 +523,15 @@ fn render_generic_card(
                     </Show>
                 }
             }
+            {(!native_images.is_empty()).then(|| {
+                crate::components::chat_message::render_message_images(native_images)
+            })}
         </div>
     }
     .into_any()
 }
 
-fn render_native_content(
-    text: &str,
-    images: &[protocol::ImageData],
-    failure: Option<(&str, Option<&str>)>,
-) -> AnyView {
+fn render_native_content(text: &str, failure: Option<(&str, Option<&str>)>) -> AnyView {
     view! {
         <div class="tool-native-content">
             {failure.map(|(message, details)| view! {
@@ -523,9 +542,6 @@ fn render_native_content(
             })}
             {(!text.is_empty()).then(|| view! {
                 <pre class="tool-output">{text.to_owned()}</pre>
-            })}
-            {(!images.is_empty()).then(|| {
-                crate::components::chat_message::render_message_images(images.to_vec())
             })}
         </div>
     }
@@ -5173,7 +5189,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn view_image_path_stays_inside_phone_width() {
+    async fn viewed_images_stay_visible_without_expanding_tool_text() {
         crate::components::test_styles::ensure_styles_loaded();
         let path = format!(
             "/Users/mike/Tyggs/Ascendra/test-results/assets/cottage/{}/diagnostic/contact-sheet.png",
@@ -5223,6 +5239,137 @@ mod wasm_tests {
                 data: web_sys::window().unwrap().btoa(&svg).unwrap(),
             }
         }).collect::<Vec<_>>();
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            let state = AppState::new();
+            state.tool_output_mode.set(mode);
+            let entry = RwSignal::new(ToolRequestEntry {
+                tool_name: "provider-native-image-tool".to_owned(),
+                request: ToolRequest {
+                    tool_call_id: "viewed-image".to_owned(),
+                    tool_name: "provider-native-image-tool".to_owned(),
+                    tool_type: ToolRequestType::ViewImage {
+                        path: "/remote/screenshot.png".to_owned(),
+                    },
+                },
+                result: None,
+            });
+            let container = make_container();
+            container.style().set_property("width", "320px").unwrap();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(state);
+                let viewer = crate::components::image_viewer::image_viewer();
+                view! { {viewer} {move || view! { <ToolCardView owner_agent_ref=owner_ref() entry=entry.get() /> }} }
+            });
+            next_tick().await;
+            assert!(
+                container
+                    .text_content()
+                    .unwrap()
+                    .contains("Waiting for image preview")
+            );
+            entry.update(|entry| {
+                entry.result = Some(ToolExecutionCompletedData {
+                    tool_call_id: "viewed-image".to_owned(),
+                    outcome: ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::ViewImage {
+                            image: Some(images[0].clone()),
+                            preview_error: None,
+                        },
+                    },
+                })
+            });
+            next_tick().await;
+            let image = container
+                .query_selector("button[aria-label='Open image full size'] img")
+                .unwrap()
+                .expect("the typed viewed image must be visible, not just its filename")
+                .dyn_into::<web_sys::HtmlImageElement>()
+                .unwrap();
+            assert_rendered_pixel(&image, [255, 0, 0, 255]).await;
+            assert!(image.closest("details:not([open])").unwrap().is_none());
+            for width in [320, 740] {
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                next_tick().await;
+                let rect = image.get_bounding_client_rect();
+                assert!(rect.width() > 0.0 && rect.width() <= width as f64);
+                assert!(rect.height() > 0.0 && rect.height() <= 320.0);
+                assert!(
+                    rect.height()
+                        <= web_sys::window()
+                            .unwrap()
+                            .inner_height()
+                            .unwrap()
+                            .as_f64()
+                            .unwrap()
+                            * 0.45
+                            + 1.0
+                );
+                assert!(container.scroll_width() <= container.client_width() + 1);
+            }
+            entry.update(|entry| {
+                entry.result = Some(ToolExecutionCompletedData {
+                    tool_call_id: "viewed-image".to_owned(),
+                    outcome: ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::ViewImage {
+                            image: None,
+                            preview_error: Some("Image unavailable on its host".to_owned()),
+                        },
+                    },
+                })
+            });
+            next_tick().await;
+            assert!(
+                container
+                    .text_content()
+                    .unwrap()
+                    .contains("Image unavailable on its host")
+            );
+            assert!(
+                container
+                    .query_selector("button[aria-label='Open image full size']")
+                    .unwrap()
+                    .is_none()
+            );
+            entry.update(|entry| {
+                entry.result = Some(ToolExecutionCompletedData {
+                    tool_call_id: "viewed-image".to_owned(),
+                    outcome: ToolExecutionOutcome::Failed {
+                        message: "Image result could not be normalized".to_owned(),
+                        details: None,
+                        normalization_failure: Some(
+                            ToolExecutionNormalizationFailure::CanonicalResult,
+                        ),
+                        result: None,
+                    },
+                })
+            });
+            next_tick().await;
+            // The closed viewer also contains a hidden decode-error alert.
+            let alert = container
+                .query_selector("[data-mobile-test='tool-card-native'] [role='alert']")
+                .unwrap()
+                .expect("terminal image failure must remain visible");
+            assert_eq!(
+                alert.text_content().as_deref(),
+                Some("Image result could not be normalized")
+            );
+            assert!(alert.get_bounding_client_rect().height() > 0.0);
+            assert!(
+                !container
+                    .text_content()
+                    .unwrap()
+                    .contains("Waiting for image preview")
+            );
+            drop(handle);
+            container.remove();
+        }
         let args = serde_json::json!({
             "path": "/tmp/retained-invocation-context.png",
             "labels": ["first, label", "second, label"],
@@ -5329,10 +5476,9 @@ mod wasm_tests {
                 );
                 let disclosure = details(&container, "tool-card-result")
                     .expect("native output remains reachable in every output mode");
-                assert!(
-                    disclosure.open(),
-                    "typed images are visible without disclosure taps in every mode"
-                );
+                // The old renderer forced stdout open whenever images existed.
+                // Media stays visible independently; successful text obeys the mode.
+                assert_eq!(disclosure.open(), failed || mode == ToolOutputMode::Full);
                 assert_parameters();
                 let output = container
                     .query_selector(".tool-native-content")
@@ -5357,8 +5503,10 @@ mod wasm_tests {
                     .dyn_into::<web_sys::Element>()
                     .unwrap();
                 assert_eq!(text_block.text_content().unwrap(), native_text);
-                assert!(text_block.get_bounding_client_rect().height() > 0.0);
-                let previews = output
+                if disclosure.open() {
+                    assert!(text_block.get_bounding_client_rect().height() > 0.0);
+                }
+                let previews = card
                     .query_selector_all("button[aria-label='Open image full size'] img")
                     .unwrap();
                 assert_eq!(previews.length(), 2);
@@ -5374,8 +5522,55 @@ mod wasm_tests {
                     let rect = image.get_bounding_client_rect();
                     assert!(rect.width() > 0.0 && rect.width() <= container.client_width() as f64);
                     assert!(rect.height() > 0.0 && rect.height() <= 320.0);
-                    assert!(text_block.get_bounding_client_rect().bottom() <= rect.top());
+                    assert!(
+                        rect.height()
+                            <= web_sys::window()
+                                .unwrap()
+                                .inner_height()
+                                .unwrap()
+                                .as_f64()
+                                .unwrap()
+                                * 0.45
+                                + 1.0
+                    );
+                    assert!(image.closest("details").unwrap().is_none());
                 }
+                let buttons = card
+                    .query_selector_all("button[aria-label='Open image full size']")
+                    .unwrap();
+                buttons
+                    .item(1)
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                let viewer = container
+                    .query_selector("dialog[open][aria-label='Image viewer']")
+                    .unwrap()
+                    .unwrap();
+                let selected = viewer
+                    .query_selector("img")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlImageElement>()
+                    .unwrap();
+                assert_rendered_pixel(&selected, [0, 0, 255, 255]).await;
+                let dismissed = js_sys::Function::new_no_args(
+                    "return new Promise(resolve => window.addEventListener('popstate', resolve, {once:true}));",
+                ).call0(&wasm_bindgen::JsValue::NULL).unwrap().unchecked_into::<js_sys::Promise>();
+                viewer
+                    .query_selector("button[aria-label='Close image viewer']")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .unwrap()
+                    .click();
+                wasm_bindgen_futures::JsFuture::from(dismissed)
+                    .await
+                    .unwrap();
+                next_tick().await;
+                assert!(container.query_selector("dialog[open]").unwrap().is_none());
                 assert!(container.scroll_width() <= container.client_width() + 1);
                 assert_eq!(
                     card.get_attribute("data-mobile-test").as_deref(),
