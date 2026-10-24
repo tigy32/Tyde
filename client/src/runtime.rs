@@ -135,7 +135,7 @@ pub enum HostEvent {
     HostSettings(HostSettingsPayload),
     SettingsWriteResult(protocol::SettingsWriteResultPayload),
     AgentActivitySummary(AgentActivitySummaryPayload),
-    TaskTokenUsage(TaskTokenUsagePayload),
+    TaskTokenUsage(Box<TaskTokenUsagePayload>),
     AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
     BackendSetup(BackendSetupPayload),
     BackendConfigSchemas(BackendConfigSchemasPayload),
@@ -996,7 +996,9 @@ async fn handle_host_envelope(
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
-            let _ = host_tx.send(HostEvent::TaskTokenUsage(payload)).await;
+            let _ = host_tx
+                .send(HostEvent::TaskTokenUsage(Box::new(payload)))
+                .await;
             true
         }
         FrameKind::AgentsViewPreferencesNotify => {

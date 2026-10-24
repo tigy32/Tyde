@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 88;
+pub const PROTOCOL_VERSION: u32 = 89;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -4831,11 +4831,144 @@ pub struct TaskTimingSpan {
     pub state: TaskTimingState,
 }
 
+/// Exclusive server-observed classification of one agent's wall clock.
+/// Concurrent foreground work is attributed by precedence: human wait,
+/// dependency wait, command, other tool, then model response. Parallel
+/// tool durations are reported separately as spans, never added here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTimePhase {
+    /// From actor launch until the server first observes the agent's
+    /// status: backend launch and session setup, with the first prompt
+    /// possibly already in flight.
+    Starting,
+    /// The turn is active with no foreground tool, dependency wait or user
+    /// answer outstanding. Request latency, streaming and provider-internal
+    /// compute are indistinguishable to Tyde and are all included.
+    ModelResponse,
+    Command,
+    Tool,
+    DependencyWait,
+    HumanWait,
+    /// Idle between turns with queued input not yet delivered.
+    Queued,
+    Idle,
+    /// The agent was stopped cleanly and was not running.
+    NotRunning,
+    /// Recording ended without a clean stop; what happened is unknown.
+    Unobserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTimePhaseEnd {
+    /// Still current; `ended_at_ms` is the server's latest observation.
+    Open,
+    Ended,
+    /// Recording stopped without a clean stop; `ended_at_ms` is the last
+    /// durable observation, not the true endpoint.
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimePhaseSegment {
+    pub phase: TaskTimePhase,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub end: TaskTimePhaseEnd,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimePhaseTotals {
+    pub starting_ms: u64,
+    pub model_response_ms: u64,
+    pub command_ms: u64,
+    pub tool_ms: u64,
+    pub dependency_wait_ms: u64,
+    pub human_wait_ms: u64,
+    pub queued_ms: u64,
+    pub idle_ms: u64,
+    pub not_running_ms: u64,
+    pub unobserved_ms: u64,
+}
+
+impl TaskTimePhaseTotals {
+    pub fn get(&self, phase: TaskTimePhase) -> u64 {
+        match phase {
+            TaskTimePhase::Starting => self.starting_ms,
+            TaskTimePhase::ModelResponse => self.model_response_ms,
+            TaskTimePhase::Command => self.command_ms,
+            TaskTimePhase::Tool => self.tool_ms,
+            TaskTimePhase::DependencyWait => self.dependency_wait_ms,
+            TaskTimePhase::HumanWait => self.human_wait_ms,
+            TaskTimePhase::Queued => self.queued_ms,
+            TaskTimePhase::Idle => self.idle_ms,
+            TaskTimePhase::NotRunning => self.not_running_ms,
+            TaskTimePhase::Unobserved => self.unobserved_ms,
+        }
+    }
+
+    pub fn add(&mut self, phase: TaskTimePhase, ms: u64) {
+        let total = match phase {
+            TaskTimePhase::Starting => &mut self.starting_ms,
+            TaskTimePhase::ModelResponse => &mut self.model_response_ms,
+            TaskTimePhase::Command => &mut self.command_ms,
+            TaskTimePhase::Tool => &mut self.tool_ms,
+            TaskTimePhase::DependencyWait => &mut self.dependency_wait_ms,
+            TaskTimePhase::HumanWait => &mut self.human_wait_ms,
+            TaskTimePhase::Queued => &mut self.queued_ms,
+            TaskTimePhase::Idle => &mut self.idle_ms,
+            TaskTimePhase::NotRunning => &mut self.not_running_ms,
+            TaskTimePhase::Unobserved => &mut self.unobserved_ms,
+        };
+        *total = total.saturating_add(ms);
+    }
+
+    pub fn sum(&self) -> u64 {
+        TaskTimePhase::ALL
+            .iter()
+            .fold(0u64, |sum, phase| sum.saturating_add(self.get(*phase)))
+    }
+}
+
+impl TaskTimePhase {
+    pub const ALL: [TaskTimePhase; 10] = [
+        TaskTimePhase::Starting,
+        TaskTimePhase::ModelResponse,
+        TaskTimePhase::Command,
+        TaskTimePhase::Tool,
+        TaskTimePhase::DependencyWait,
+        TaskTimePhase::HumanWait,
+        TaskTimePhase::Queued,
+        TaskTimePhase::Idle,
+        TaskTimePhase::NotRunning,
+        TaskTimePhase::Unobserved,
+    ];
+}
+
+/// One agent's complete server-observed wall-clock account. `totals` covers
+/// every millisecond from `started_at_ms` through `observed_through_ms`
+/// exactly once. `phases` is the contiguous retained tail ending at
+/// `observed_through_ms`; it starts later than `started_at_ms` only after
+/// older segments were compacted, which `totals` still include.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTimeAccount {
+    pub started_at_ms: u64,
+    pub observed_through_ms: u64,
+    pub totals: TaskTimePhaseTotals,
+    pub phases: Vec<TaskTimePhaseSegment>,
+    pub compacted_phase_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTimingTrace {
     pub availability: TimingAvailability,
     pub dropped_span_count: u64,
     pub spans: Vec<TaskTimingSpan>,
+    /// Absent for records written before wall-clock accounting existed;
+    /// earlier activity is never reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AgentTimeAccount>,
 }
 
 impl Default for AgentTimingTrace {
@@ -4844,8 +4977,29 @@ impl Default for AgentTimingTrace {
             availability: TimingAvailability::Unobserved,
             dropped_span_count: 0,
             spans: Vec::new(),
+            account: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimeAccountEntry {
+    pub agent_id: AgentId,
+    pub account: AgentTimeAccount,
+}
+
+/// The task's elapsed interval: every account and span in the rollup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimeInterval {
+    pub started_at_ms: u64,
+    pub observed_through_ms: u64,
+    /// The root agent's exclusive account over the whole interval; time
+    /// outside its account is unobserved. Sums exactly to the interval.
+    pub wall_clock: TaskTimePhaseTotals,
+    /// Every accounted agent's exclusive time, summed. Concurrent agents
+    /// overlap, so this is agent-time and can exceed the wall clock.
+    pub agent_time: TaskTimePhaseTotals,
+    pub accounted_agent_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4874,6 +5028,12 @@ pub struct TaskTimingSummary {
     pub model_compute: TimingAvailability,
     pub cpu: TimingAvailability,
     pub spans: Vec<TaskTimingEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<TaskTimeInterval>,
+    /// Breakdown order. Retained phases are bounded across the rollup;
+    /// each account's `compacted_phase_count` reports what was dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<TaskTimeAccountEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

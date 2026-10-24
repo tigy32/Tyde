@@ -3885,7 +3885,10 @@ pub(crate) fn spawn_agent_actor(
             }
         }
         if let Some(session) = resume_session_id.as_ref() {
-            event_log.timing.restore(&session_store, session).await;
+            event_log
+                .timing
+                .restore(&session_store, session, &status_handle)
+                .await;
             event_log.own_usage = Some(activity_stats.usage_snapshot());
         }
         #[cfg(feature = "test-support")]
@@ -4186,7 +4189,7 @@ pub(crate) fn spawn_agent_actor(
                             reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
-                                &event_log,
+                                &mut event_log,
                             ));
                         }
                         AgentCommand::ScheduleProjectMove { reply, .. } => {
@@ -4660,7 +4663,7 @@ pub(crate) fn spawn_agent_actor(
         if !is_resume {
             event_log
                 .timing
-                .restore(&session_store, &actor_session_id)
+                .restore(&session_store, &actor_session_id, &status_handle)
                 .await;
         }
         event_log.timing_context = Some((Arc::clone(&session_store), actor_session_id.clone()));
@@ -5193,6 +5196,7 @@ pub(crate) fn spawn_agent_actor(
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed agent replay log must project latest output");
+            observe_timing_status(&mut event_log).await;
             publish_activity_change(&status_handle, &mut published_activity, &mut subscribers)
                 .await;
             // The loop turns whenever a backend event or command lands, which
@@ -10436,7 +10440,7 @@ pub(crate) fn spawn_agent_actor(
                             reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
-                                &event_log,
+                                &mut event_log,
                             ));
                         }
                         AgentCommand::CancelBackgroundTask {
@@ -11023,7 +11027,10 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut close_deadline: Option<tokio::time::Instant> = None;
-        event_log.timing.restore(&session_store, &session_id).await;
+        event_log
+            .timing
+            .restore(&session_store, &session_id, &status_handle)
+            .await;
         let mut model_usage_open = true;
         let mut total_usage_open = true;
 
@@ -11096,6 +11103,7 @@ pub(crate) fn spawn_relay_agent_actor(
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed relay replay log must project latest output");
+            observe_timing_status(&mut event_log).await;
             publish_activity_change(&status_handle, &mut published_activity, &mut subscribers)
                 .await;
             tokio::select! {
@@ -11602,7 +11610,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
-                                &event_log,
+                                &mut event_log,
                             ));
                         }
                         AgentCommand::StopForRestart { reply } => {
@@ -11982,6 +11990,7 @@ fn publish_final_usage(
     event_log: &mut AgentEventLog,
 ) -> AgentUsageSnapshot {
     event_log.timing.interrupt();
+    event_log.timing.stop();
     let mut snapshot = agent_usage_snapshot_from_log(start, event_log);
     snapshot.observation = protocol::TaskUsageObservation::Closed;
     if let Some(publisher) = &event_log.final_usage_tx {
@@ -11997,6 +12006,13 @@ async fn finish_actor_close(
     finish: ActorFinish,
     usage: ActorUsageFinalization<'_>,
 ) {
+    // A clean stop is durable before close, so a later reopen reports the
+    // gap as not running rather than unobserved.
+    if let Some((store, session)) = usage.event_log.timing_context.clone() {
+        usage.event_log.timing.interrupt();
+        usage.event_log.timing.stop();
+        usage.event_log.timing.persist(&store, &session).await;
+    }
     publish_final_usage(usage.start, usage.event_log);
     accepting_input.store(false, Ordering::SeqCst);
     match finish {
@@ -12773,6 +12789,7 @@ async fn park_terminal_agent(
     status_handle: &registry::AgentStatusHandle,
 ) {
     event_log.timing.interrupt();
+    event_log.timing.stop();
     if let Some(session_id) = session_id {
         event_log.timing.persist(session_store, session_id).await;
     }
@@ -13040,6 +13057,7 @@ async fn park_relay_terminal_agent(
     canonical_stream: &str,
 ) {
     event_log.timing.interrupt();
+    event_log.timing.stop();
     event_log.timing.persist(session_store, session_id).await;
     let usage = publish_final_usage(current_start, event_log);
     let mut archived = usage.clone();
@@ -14695,6 +14713,12 @@ async fn persist_model_request_checkpoint(
     }
 }
 
+async fn observe_timing_status(event_log: &mut AgentEventLog) {
+    if let Some((store, session)) = event_log.timing_context.clone() {
+        event_log.timing.observe_status(&store, &session).await;
+    }
+}
+
 async fn archive_live_usage(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
@@ -15702,7 +15726,7 @@ fn activity_history_snapshot(
 fn agent_usage_snapshot_from_tracker(
     start: &AgentStartPayload,
     tracker: &AgentActivityStatsTracker,
-    event_log: &AgentEventLog,
+    event_log: &mut AgentEventLog,
 ) -> AgentUsageSnapshot {
     let (usage, model) = tracker.usage_snapshot();
     let shared = matches!(
@@ -15735,7 +15759,7 @@ fn agent_usage_snapshot_from_tracker(
 
 fn agent_usage_snapshot_from_log(
     start: &AgentStartPayload,
-    event_log: &AgentEventLog,
+    event_log: &mut AgentEventLog,
 ) -> AgentUsageSnapshot {
     let (usage, model) = event_log.own_usage.clone().unwrap_or((
         TaskTokenUsageScope::Unavailable {

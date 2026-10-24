@@ -17790,7 +17790,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .task-timing-legend > span[class] { padding-left: 8px; border-left: 5px solid currentColor; }
 .timing-command { color: #4d9bea; }
 .timing-tool { color: #ad83e6; }
-.timing-wait { color: var(--text-secondary); }
+.timing-wait { color: #e0a33a; }
+[data-theme="light"] .timing-wait, [data-theme="light"] .phase-wait { color: #7a4f00; }
 .task-timing-agent, .task-timing-axis { display: grid; grid-template-columns: minmax(140px, 220px) minmax(120px, 1fr); align-items: start; gap: 12px; padding: 6px 16px; border-bottom: 1px solid var(--border-primary); }
 .task-timing-axis { color: var(--text-tertiary); font-size: .75rem; }
 .task-timing-axis > span:last-child { display: flex; justify-content: space-between; }
@@ -17806,6 +17807,36 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .task-timing-coverage { margin: 8px 16px; color: var(--text-secondary); }
 .task-timing-detail h3 { margin: 0; font-size: .9rem; overflow-wrap: anywhere; }
 .task-timing-detail { margin: 16px; border: 1px solid var(--border-primary); padding: 12px; border-radius: 8px; }
+.task-time-breakdown { margin: 8px 16px; }
+.task-time-breakdown h3 { margin: 0 0 6px; font-size: .9rem; }
+.task-time-stack { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--surface-2); }
+.task-time-part { display: block; flex: none; height: 100%; background: currentColor; }
+.task-time-totals { list-style: none; padding: 0; margin: 6px 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 2px 16px; }
+.task-time-totals li { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto 3.5em; gap: 6px; align-items: center; }
+.task-time-totals li > span:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
+.task-time-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: currentColor; margin-right: 4px; }
+.task-time-phase-legend > span { display: inline-flex; align-items: center; }
+.task-time-agent-time { margin-top: 4px; color: var(--text-secondary); }
+.task-time-agent-time summary { cursor: pointer; }
+.task-time-agent-account p { margin: 4px 0; color: var(--text-tertiary); font-size: .75rem; }
+.task-time-lanes { min-width: 0; }
+.task-time-phase-lane { position: relative; height: 14px; background: var(--surface-2); margin-top: 2px; }
+.task-time-phase { position: absolute; top: 0; bottom: 0; background: currentColor; }
+.task-time-no-account { font-size: .75rem; color: var(--text-secondary); line-height: 14px; padding-left: 4px; }
+.task-time-interrupted { background-image: linear-gradient(90deg, transparent calc(100% - 3px), var(--text-primary) calc(100% - 3px)); }
+.phase-starting { color: #8aa4b8; }
+.phase-model { color: #3fb68b; }
+.phase-command { color: #4d9bea; }
+.phase-tool { color: #ad83e6; }
+.phase-wait { color: #e0a33a; }
+.phase-human { color: #e5605b; }
+.phase-queued { color: #c9b458; }
+.phase-idle { color: #6b7280; }
+.phase-stopped { color: var(--text-secondary); }
+.phase-unobserved, .task-time-compacted { color: var(--text-tertiary); }
+.task-time-part.phase-unobserved, .task-time-phase.phase-unobserved, .task-time-swatch.phase-unobserved { background: repeating-linear-gradient(-45deg, currentColor 0 1px, transparent 1px 5px); }
+.task-time-part.phase-stopped, .task-time-phase.phase-stopped, .task-time-swatch.phase-stopped { background: repeating-linear-gradient(90deg, currentColor 0 2px, transparent 2px 5px); }
+.task-time-phase.task-time-compacted, .task-time-swatch.task-time-compacted { background: repeating-linear-gradient(45deg, currentColor 0 2px, transparent 2px 6px); }
 @media (max-width: 700px) {
     .task-usage-expanded { inset: 8px 8px auto; width: auto; transform: none; max-height: calc(100dvh - 16px); }
     .session-task-popover:not(.task-usage-expanded) { position: fixed; left: 8px; right: 8px; bottom: 70px; width: auto; transform: none; }

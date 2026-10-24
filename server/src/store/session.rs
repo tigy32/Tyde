@@ -699,6 +699,15 @@ impl SessionStore {
                             span.state = protocol::TaskTimingState::Interrupted;
                         }
                     }
+                    if let Some(last) = snapshot
+                        .timing
+                        .account
+                        .as_mut()
+                        .and_then(|account| account.phases.last_mut())
+                        && last.end == protocol::TaskTimePhaseEnd::Open
+                    {
+                        last.end = protocol::TaskTimePhaseEnd::Interrupted;
+                    }
                 }
                 if shared {
                     snapshot.usage = protocol::TaskTokenUsageScope::Unavailable {

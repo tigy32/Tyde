@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
+use crate::agent::timing::{TimingEdge, TimingLifecycle};
 use crate::agent::{
     AgentActorRuntimeResources, AgentHandle, RelayAgentRuntimeResources, RelayEventReceivers,
     now_ms, spawn_agent_actor, spawn_relay_agent_actor,
@@ -112,6 +113,19 @@ impl AgentStatus {
             AgentActivity::AwaitingUser
         } else {
             AgentActivity::Idle
+        }
+    }
+
+    pub fn timing_lifecycle(&self) -> TimingLifecycle {
+        if self.terminated {
+            return TimingLifecycle::Terminated;
+        }
+        match self.activity() {
+            AgentActivity::AwaitingUser => TimingLifecycle::AwaitingUser,
+            AgentActivity::Thinking if !self.started => TimingLifecycle::Starting,
+            AgentActivity::Thinking => TimingLifecycle::Working,
+            AgentActivity::Idle if self.has_queued_messages => TimingLifecycle::Queued,
+            AgentActivity::Idle => TimingLifecycle::Idle,
         }
     }
 
@@ -519,6 +533,7 @@ pub(crate) struct AgentStatusHandle {
     status_change_tx: watch::Sender<u64>,
     status_change_counter: Arc<AtomicU64>,
     transition_tx: broadcast::Sender<AgentStatusTransition>,
+    timing_edges: watch::Sender<Option<mpsc::UnboundedSender<TimingEdge>>>,
 }
 
 impl AgentStatusHandle {
@@ -541,6 +556,7 @@ impl AgentStatusHandle {
             status_change_tx,
             status_change_counter,
             transition_tx,
+            timing_edges: watch::channel(None).0,
         };
         tokio::spawn(run_recovery_actor(
             commands,
@@ -750,6 +766,7 @@ impl AgentStatusHandle {
         F: FnOnce(&mut AgentStatus),
     {
         self.status.send_modify(|status| {
+            let lifecycle = status.timing_lifecycle();
             let from = status.status();
             let was_active = status.is_active();
             let had_background_work = status.has_background_work;
@@ -775,6 +792,16 @@ impl AgentStatusHandle {
                     restored_without_live_turn: status.restored_without_live_turn,
                 });
             }
+            // Stamped under the status write so edges keep mutation order.
+            let next_lifecycle = status.timing_lifecycle();
+            if next_lifecycle != lifecycle
+                && let Some(edges) = self.timing_edges.borrow().as_ref()
+            {
+                let _ = edges.send(TimingEdge {
+                    at: tokio::time::Instant::now(),
+                    lifecycle: next_lifecycle,
+                });
+            }
         });
 
         let next = self.status_change_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -787,6 +814,19 @@ impl AgentStatusHandle {
 
     pub fn current(&self) -> AgentStatus {
         self.status.borrow().clone()
+    }
+
+    /// Routes every later lifecycle edge to `edges`, starting with the
+    /// current lifecycle, replacing any previous actor's receiver.
+    pub fn attach_timing(&self, edges: mpsc::UnboundedSender<TimingEdge>) {
+        self.status.send_if_modified(|status| {
+            let _ = edges.send(TimingEdge {
+                at: tokio::time::Instant::now(),
+                lifecycle: status.timing_lifecycle(),
+            });
+            self.timing_edges.send_replace(Some(edges));
+            false
+        });
     }
 }
 

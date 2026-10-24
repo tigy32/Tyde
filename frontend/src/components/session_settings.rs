@@ -2837,6 +2837,51 @@ mod wasm_tests {
                 state: protocol::TaskTimingState::Completed,
             },
         });
+        use protocol::TaskTimePhase as P;
+        use protocol::TaskTimePhaseEnd as E;
+        let phase = |phase, started_at_ms, ended_at_ms, end| protocol::TaskTimePhaseSegment {
+            phase,
+            started_at_ms,
+            ended_at_ms,
+            end,
+        };
+        let root_totals = protocol::TaskTimePhaseTotals {
+            starting_ms: 500,
+            model_response_ms: 2_000,
+            command_ms: 3_000,
+            dependency_wait_ms: 2_000,
+            human_wait_ms: 1_000,
+            idle_ms: 500,
+            unobserved_ms: 1_000,
+            ..Default::default()
+        };
+        rollup.timing.accounts = vec![protocol::TaskTimeAccountEntry {
+            agent_id: AgentId("root".to_owned()),
+            account: protocol::AgentTimeAccount {
+                started_at_ms: 0,
+                observed_through_ms: 10_000,
+                totals: root_totals.clone(),
+                // Starting (0–500 ms) was compacted; the totals still hold it.
+                phases: vec![
+                    phase(P::ModelResponse, 500, 1_000, E::Ended),
+                    phase(P::Command, 1_000, 2_000, E::Ended),
+                    phase(P::DependencyWait, 2_000, 4_000, E::Ended),
+                    phase(P::Command, 4_000, 6_000, E::Ended),
+                    phase(P::HumanWait, 6_000, 7_000, E::Ended),
+                    phase(P::Idle, 7_000, 7_500, E::Interrupted),
+                    phase(P::Unobserved, 7_500, 8_500, E::Ended),
+                    phase(P::ModelResponse, 8_500, 10_000, E::Open),
+                ],
+                compacted_phase_count: 1,
+            },
+        }];
+        rollup.timing.interval = Some(protocol::TaskTimeInterval {
+            started_at_ms: 0,
+            observed_through_ms: 10_000,
+            wall_clock: root_totals.clone(),
+            agent_time: root_totals,
+            accounted_agent_count: 1,
+        });
         dispatch_task_usage(&state, "h-task-expanded", 0, &rollup);
         dispatch_capacity(&state, "h-task-expanded", 1, 0);
         let mut claude =
@@ -3229,6 +3274,92 @@ mod wasm_tests {
                 && text.contains("1/87 agents")
                 && text.contains("Process lifetime: unsupported")
         );
+        let breakdown = query(&container, ".task-time-breakdown").unwrap();
+        let breakdown_text = breakdown.text_content().unwrap();
+        assert!(breakdown_text.contains("Wall clock · 10.0s"));
+        let rows = breakdown.query_selector_all(":scope > ul > li").unwrap();
+        assert_eq!(
+            (0..rows.length())
+                .map(|index| rows.item(index).unwrap().text_content().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Starting500ms5%",
+                "Model response2.0s20%",
+                "Commands3.0s30%",
+                "Waiting on agents2.0s20%",
+                "Waiting on you1.0s10%",
+                "Idle500ms5%",
+                "Unobserved1.0s10%",
+            ],
+            "every category of the elapsed interval is named with its exclusive share"
+        );
+        assert!(breakdown_text.contains(
+            "Agent-time ∑ across 1 accounted agent · 10.0s (every agent's time summed, idle included; can exceed wall clock)"
+        ));
+        fn rects(root: &web_sys::Element, selector: &str) -> Vec<web_sys::DomRect> {
+            let nodes = root.query_selector_all(selector).unwrap();
+            (0..nodes.length())
+                .map(|index| {
+                    nodes
+                        .item(index)
+                        .unwrap()
+                        .dyn_into::<web_sys::Element>()
+                        .unwrap()
+                        .get_bounding_client_rect()
+                })
+                .collect()
+        }
+        let stack = query(&breakdown, "[role=img]")
+            .unwrap()
+            .get_bounding_client_rect();
+        let stacked: f64 = rects(&breakdown, "[role=img] > span")
+            .iter()
+            .map(|rect| rect.width())
+            .sum();
+        assert!(
+            stack.width() > 0.0 && (stacked - stack.width()).abs() < 1.0,
+            "the wall-clock bar is fully occupied: {stacked} of {}",
+            stack.width()
+        );
+        let lane = query(&container, "[aria-label='Exclusive phase lane']").unwrap();
+        let lane_rect = lane.get_bounding_client_rect();
+        let tiles = rects(&lane, ":scope > span");
+        assert_eq!(
+            tiles.len(),
+            9,
+            "compacted history plus every retained phase"
+        );
+        let mut through = lane_rect.left();
+        for tile in &tiles {
+            assert!(
+                (tile.left() - through).abs() < 0.5 && tile.width() > 0.0,
+                "phases tile the agent's lane without gaps or overlap"
+            );
+            through = tile.right();
+        }
+        assert!((through - lane_rect.right()).abs() < 0.5);
+        let tile_labels = lane.query_selector_all(":scope > span").unwrap();
+        let tile_label = |index| {
+            tile_labels
+                .item(index)
+                .unwrap()
+                .dyn_into::<web_sys::Element>()
+                .unwrap()
+                .get_attribute("aria-label")
+                .unwrap()
+        };
+        assert_eq!(
+            tile_label(0),
+            "1 earlier phases not retained · 500ms included in totals"
+        );
+        assert_eq!(
+            tile_label(6),
+            "Idle · 500ms · interrupted; endpoint unknown"
+        );
+        assert_eq!(
+            tile_label(8),
+            "Model response · 1.5s · in progress, observed so far"
+        );
         assert_eq!(
             container
                 .query_selector_all(".task-timing-agent")
@@ -3295,11 +3426,40 @@ mod wasm_tests {
                 && operation.get_bounding_client_rect().height() > 0.0,
             "expanding reveals the original individual-operation list"
         );
+        let agent_time = query(&breakdown, ".task-time-agent-time").unwrap();
+        query(&agent_time, "summary").unwrap().click();
+        next_tick().await;
+        assert!(agent_time.has_attribute("open"));
         operation.focus().unwrap();
         update.timing.spans[0].span.observed_duration_ms = 5_100;
         update.timing.spans[0].span.observed_through_ms = 6_100;
         update.timing.observed_end_ms = Some(6_100);
         update.timing.summed_tool_ms = 5_100;
+        update.timing.accounts.push(protocol::TaskTimeAccountEntry {
+            agent_id: AgentId("child-1".to_owned()),
+            account: protocol::AgentTimeAccount {
+                started_at_ms: 2_000,
+                observed_through_ms: 10_000,
+                totals: protocol::TaskTimePhaseTotals {
+                    model_response_ms: 1_000,
+                    idle_ms: 7_000,
+                    ..Default::default()
+                },
+                phases: vec![
+                    phase(P::ModelResponse, 2_000, 3_000, E::Ended),
+                    phase(P::Idle, 3_000, 10_000, E::Open),
+                ],
+                compacted_phase_count: 0,
+            },
+        });
+        let interval = update.timing.interval.as_mut().unwrap();
+        interval.agent_time.model_response_ms += 1_000;
+        interval.agent_time.idle_ms += 7_000;
+        interval.accounted_agent_count = 2;
+        let mut legacy = update.timing.spans[1].clone();
+        legacy.agent_id = AgentId("legacy-worker".to_owned());
+        legacy.span.tool_call_id = "legacy-await".to_owned();
+        update.timing.spans.push(legacy);
         dispatch_task_usage(&state, "h-task-expanded", 5, &update);
         next_tick().await;
         assert!(
@@ -3317,6 +3477,34 @@ mod wasm_tests {
                 .unwrap()
                 .is_same_node(Some(&operation)),
             "live rollups preserve keyboard focus inside the expanded operation list"
+        );
+        let agent_rows = container.query_selector_all(".task-timing-agent").unwrap();
+        assert_eq!(
+            agent_rows.length(),
+            3,
+            "accounted and span-only agents each get a row"
+        );
+        assert!(
+            agent_rows
+                .item(2)
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("No wall-clock account recorded"),
+            "an agent without a recorded account is not given invented phases"
+        );
+        let breakdown_text = query(&container, ".task-time-breakdown")
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            breakdown_text.contains("Wall clock · 10.0s")
+                && breakdown_text.contains("Agent-time ∑ across 2 accounted agents · 18.0s"),
+            "parallel agents add agent time, never wall-clock time"
+        );
+        assert!(
+            agent_time.is_connected() && agent_time.has_attribute("open"),
+            "live rollups keep the expanded agent-time breakdown open"
         );
         expansion.click();
         wait.focus().unwrap();

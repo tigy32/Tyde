@@ -1046,6 +1046,8 @@ pub struct HostHandle {
     /// reporting a stale "current" etag. Never held across non-settings
     /// work; the state owner is not occupied during backend I/O.
     settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
+    #[cfg(feature = "test-support")]
+    task_usage_refresh_sync: mpsc::UnboundedSender<oneshot::Sender<()>>,
     spawn_operations: SpawnOperationHandle,
     spawn_operation_owner: Option<Arc<SpawnOperationOwner>>,
 }
@@ -1259,6 +1261,8 @@ pub(crate) struct WeakHostHandle {
     backend_setup_refresh_lock: Weak<Mutex<()>>,
     session_schema_refresh_lock: Weak<Mutex<()>>,
     settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
+    #[cfg(feature = "test-support")]
+    task_usage_refresh_sync: mpsc::UnboundedSender<oneshot::Sender<()>>,
     spawn_operations: SpawnOperationHandle,
 }
 
@@ -1273,6 +1277,8 @@ impl WeakHostHandle {
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
+            #[cfg(feature = "test-support")]
+            task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
             spawn_operations: host.spawn_operations.clone(),
         }
     }
@@ -1287,6 +1293,8 @@ impl WeakHostHandle {
             backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
             session_schema_refresh_lock: self.session_schema_refresh_lock.upgrade()?,
             settings_apply_tx: self.settings_apply_tx.clone(),
+            #[cfg(feature = "test-support")]
+            task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         })
@@ -1304,6 +1312,8 @@ impl Clone for HostHandle {
             backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::clone(&self.session_schema_refresh_lock),
             settings_apply_tx: self.settings_apply_tx.clone(),
+            #[cfg(feature = "test-support")]
+            task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
             spawn_operations: self.spawn_operations.clone(),
             spawn_operation_owner: None,
         }
@@ -10382,14 +10392,24 @@ std::ops::ControlFlow::Continue((
         }
     }
 
-    pub(crate) async fn fan_out_task_token_usages(&self) {
-        let (handles, closed_snapshots, live_agent_ids, agent_sessions) = {
-            {
-                self.state
-                    .with(move |state| task_token_usage_sources_for_state(state))
-                    .await
-            }
-        };
+    /// Settles pending status or elapsed refresh work, then acknowledges the
+    /// armed deadline. A future timer is not fired or rearmed by this barrier.
+    #[cfg(feature = "test-support")]
+    pub async fn synchronize_task_usage_refresh_for_test(&self) {
+        let (reply, done) = oneshot::channel();
+        self.task_usage_refresh_sync
+            .send(reply)
+            .expect("task usage worker is running");
+        done.await.expect("task usage worker synchronized");
+    }
+
+    /// Returns when a task's in-progress working or waiting time is next
+    /// worth re-sending, if any task has such a phase.
+    pub(crate) async fn fan_out_task_token_usages(&self) -> Option<Duration> {
+        let (handles, closed_snapshots, live_agent_ids, agent_sessions) = self
+            .state
+            .with(|state| task_token_usage_sources_for_state(state))
+            .await;
         let mut payloads = task_token_usage_rollups_from_handles(
             handles,
             closed_snapshots,
@@ -10400,13 +10420,9 @@ std::ops::ControlFlow::Continue((
         )
         .await;
         attach_learning_accounting(&mut payloads, self.config.usage().await);
-        {
-            self.state
-                .with(move |state| {
-                    fan_out_task_token_usages(state, payloads);
-                })
-                .await
-        }
+        self.state
+            .with(move |state| fan_out_task_token_usages(state, payloads))
+            .await
     }
 
     pub(crate) async fn backend_native_settings_write(
@@ -19698,6 +19714,8 @@ fn spawn_host_inner(
         #[cfg(any(test, feature = "test-support"))]
         session_schema_probe_count: 0,
     });
+    #[cfg(feature = "test-support")]
+    let (task_usage_refresh_sync, task_usage_refresh_rx) = mpsc::unbounded_channel();
     let host = HostHandle {
         project_catalog: project_store.clone(),
         config,
@@ -19711,6 +19729,8 @@ fn spawn_host_inner(
         backend_setup_refresh_lock: Arc::new(Mutex::new(())),
         session_schema_refresh_lock: Arc::new(Mutex::new(())),
         settings_apply_tx,
+        #[cfg(feature = "test-support")]
+        task_usage_refresh_sync,
         spawn_operations: spawn_operation_handle.clone(),
         spawn_operation_owner: Some(Arc::clone(&spawn_operations)),
     };
@@ -19729,6 +19749,8 @@ fn spawn_host_inner(
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
+            #[cfg(feature = "test-support")]
+            task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
             spawn_operations: spawn_operation_handle,
         },
         spawn_operation_rx,
@@ -19757,6 +19779,8 @@ fn spawn_host_inner(
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
             session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
+            #[cfg(feature = "test-support")]
+            task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
             spawn_operations: host.spawn_operations.clone(),
         },
         agent_turn_state_transitions,
@@ -19870,7 +19894,11 @@ fn spawn_host_inner(
     );
     spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
-    spawn_task_token_usage_task(host.clone());
+    spawn_task_token_usage_task(
+        host.clone(),
+        #[cfg(feature = "test-support")]
+        task_usage_refresh_rx,
+    );
     spawn_agent_activity_summary_task(host.clone());
     spawn_supervisor_compaction_executor(host.clone(), supervisor_compaction_rx);
     let dots_state_on_start_failure = dots_state.clone();
@@ -20547,32 +20575,85 @@ impl HostHandle {
     }
 }
 
-fn spawn_task_token_usage_task(host: HostHandle) {
+fn spawn_task_token_usage_task(
+    host: HostHandle,
+    #[cfg(feature = "test-support")] mut sync_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+) {
+    use tokio::time::Instant;
+
     let worker = async move {
         let mut status_rx = host.subscribe_agent_status_changes().await;
         tracing::debug!(
             status_version = *status_rx.borrow(),
             "task token usage worker subscribed; synchronizing current state"
         );
-        host.fan_out_task_token_usages().await;
+        let mut refresh_at = host
+            .fan_out_task_token_usages()
+            .await
+            .map(|delay| Instant::now() + delay);
         loop {
-            if status_rx.changed().await.is_err() {
-                break;
-            }
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
+            #[cfg(feature = "test-support")]
+            let sync = sync_rx.recv();
+            #[cfg(not(feature = "test-support"))]
+            let sync = std::future::pending::<Option<oneshot::Sender<()>>>();
+            tokio::pin!(sync);
+            let mut synchronized = None;
+            tokio::select! {
+                reply = &mut sync => {
+                    let Some(reply) = reply else { break };
+                    let status_pending = match status_rx.has_changed() {
+                        Ok(changed) => changed,
+                        Err(_) => return,
+                    };
+                    let timer_due = refresh_at.is_some_and(|at| at <= Instant::now());
+                    tracing::debug!(status_pending, timer_due, "task usage refresh barrier");
+                    if !status_pending && !timer_due {
+                        let _ = reply.send(());
+                        continue;
+                    }
+                    status_rx.borrow_and_update();
+                    synchronized = Some(reply);
                 }
-                let quiet_period = remaining.min(Duration::from_millis(500));
-                match tokio::time::timeout(quiet_period, status_rx.changed()).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(_)) => return,
-                    Err(_) => break,
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let quiet_period = remaining.min(Duration::from_millis(500));
+                        tokio::select! {
+                            reply = &mut sync => {
+                                let Some(reply) = reply else { return };
+                                status_rx.borrow_and_update();
+                                synchronized = Some(reply);
+                                break;
+                            }
+                            changed = status_rx.changed() => {
+                                if changed.is_err() { return; }
+                            }
+                            () = tokio::time::sleep(quiet_period) => break,
+                        }
+                    }
                 }
+                // Working and waiting time grows without any status change.
+                () = async {
+                    match refresh_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
             }
-            host.fan_out_task_token_usages().await;
+            refresh_at = host
+                .fan_out_task_token_usages()
+                .await
+                .map(|delay| Instant::now() + delay);
+            if let Some(reply) = synchronized {
+                let _ = reply.send(());
+            }
         }
     };
 
@@ -23406,10 +23487,10 @@ fn send_queued_host_frame(
     Ok(())
 }
 
-fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsagePayload>) {
-    if payloads.is_empty() {
-        return;
-    }
+fn fan_out_task_token_usages(
+    state: &mut HostState,
+    payloads: Vec<TaskTokenUsagePayload>,
+) -> Option<Duration> {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -23429,7 +23510,13 @@ fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsage
             if subscriber
                 .last_task_token_usages
                 .get(&payload.root_agent_id)
-                == Some(payload)
+                .is_some_and(|previous| {
+                    same_task_usage_apart_from_horizon(previous, payload)
+                        && live_refresh_quantum_ms(previous).is_none_or(|quantum| {
+                            task_usage_horizon(payload)
+                                < task_usage_horizon(previous).saturating_add(quantum)
+                        })
+                })
             {
                 continue;
             }
@@ -23446,6 +23533,162 @@ fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsage
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+    payloads
+        .iter()
+        .filter_map(live_refresh_quantum_ms)
+        .min()
+        .map(Duration::from_millis)
+}
+
+fn task_usage_horizon(payload: &TaskTokenUsagePayload) -> u64 {
+    payload
+        .timing
+        .interval
+        .as_ref()
+        .map_or(0, |interval| interval.observed_through_ms)
+}
+
+/// While an agent is working or waiting, its in-progress time is re-sent
+/// once the youngest such phase has grown by a tenth, and at least a second
+/// apart: live while short, bounded when a question waits overnight.
+fn live_refresh_quantum_ms(payload: &TaskTokenUsagePayload) -> Option<u64> {
+    payload
+        .timing
+        .accounts
+        .iter()
+        .filter_map(|entry| {
+            let phase = entry.account.phases.last()?;
+            (phase.end == protocol::TaskTimePhaseEnd::Open
+                && !matches!(
+                    phase.phase,
+                    protocol::TaskTimePhase::Queued
+                        | protocol::TaskTimePhase::Idle
+                        | protocol::TaskTimePhase::NotRunning
+                        | protocol::TaskTimePhase::Unobserved
+                ))
+            .then(|| phase.ended_at_ms - phase.started_at_ms)
+        })
+        .min()
+        .map(|age| (age / 10).max(1_000))
+}
+
+/// Equal apart from how far open phases have been observed. Growing open
+/// time alone is not re-sent to every subscriber; a phase edge or any other
+/// change is, carrying the current observation.
+fn same_task_usage_apart_from_horizon(
+    previous: &TaskTokenUsagePayload,
+    next: &TaskTokenUsagePayload,
+) -> bool {
+    let TaskTokenUsagePayload {
+        helper_usage,
+        root_agent_id,
+        root_session_id,
+        total,
+        self_usage,
+        descendant_usage,
+        descendant_count,
+        breakdown,
+        backends,
+        timing,
+    } = next;
+    let protocol::TaskTimingSummary {
+        covered_agent_count,
+        unobserved_agent_count,
+        persistence_failed_agent_count,
+        dropped_span_count,
+        omitted_span_count,
+        observed_start_ms,
+        observed_end_ms,
+        summed_tool_ms,
+        classified_tool_count,
+        summed_unclassified_ms,
+        unclassified_tool_count,
+        summed_dependency_wait_ms,
+        command_count,
+        process_lifetime,
+        provider_request_round_trip,
+        model_compute,
+        cpu,
+        spans,
+        // Derived from the accounts and spans compared below.
+        interval: _,
+        accounts,
+    } = timing;
+    let before = &previous.timing;
+    previous.helper_usage == *helper_usage
+        && previous.root_agent_id == *root_agent_id
+        && previous.root_session_id == *root_session_id
+        && previous.total == *total
+        && previous.self_usage == *self_usage
+        && previous.descendant_usage == *descendant_usage
+        && previous.descendant_count == *descendant_count
+        && previous.breakdown == *breakdown
+        && previous.backends == *backends
+        && before.covered_agent_count == *covered_agent_count
+        && before.unobserved_agent_count == *unobserved_agent_count
+        && before.persistence_failed_agent_count == *persistence_failed_agent_count
+        && before.dropped_span_count == *dropped_span_count
+        && before.omitted_span_count == *omitted_span_count
+        && before.observed_start_ms == *observed_start_ms
+        && before.observed_end_ms == *observed_end_ms
+        && before.summed_tool_ms == *summed_tool_ms
+        && before.classified_tool_count == *classified_tool_count
+        && before.summed_unclassified_ms == *summed_unclassified_ms
+        && before.unclassified_tool_count == *unclassified_tool_count
+        && before.summed_dependency_wait_ms == *summed_dependency_wait_ms
+        && before.command_count == *command_count
+        && before.process_lifetime == *process_lifetime
+        && before.provider_request_round_trip == *provider_request_round_trip
+        && before.model_compute == *model_compute
+        && before.cpu == *cpu
+        && before.spans == *spans
+        && before.accounts.len() == accounts.len()
+        && before
+            .accounts
+            .iter()
+            .zip(accounts)
+            .all(|(previous, next)| {
+                previous.agent_id == next.agent_id
+                    && same_account_apart_from_horizon(&previous.account, &next.account)
+            })
+}
+
+fn same_account_apart_from_horizon(
+    previous: &protocol::AgentTimeAccount,
+    next: &protocol::AgentTimeAccount,
+) -> bool {
+    fn split(
+        account: &protocol::AgentTimeAccount,
+    ) -> (
+        &[protocol::TaskTimePhaseSegment],
+        Option<&protocol::TaskTimePhaseSegment>,
+    ) {
+        match account.phases.split_last() {
+            Some((open, closed)) if open.end == protocol::TaskTimePhaseEnd::Open => {
+                (closed, Some(open))
+            }
+            _ => (&account.phases, None),
+        }
+    }
+    let closed_total = |account: &protocol::AgentTimeAccount,
+                        open: Option<&protocol::TaskTimePhaseSegment>,
+                        phase| {
+        account.totals.get(phase).saturating_sub(
+            open.filter(|open| open.phase == phase)
+                .map_or(0, |open| open.ended_at_ms - open.started_at_ms),
+        )
+    };
+    let (previous_closed, previous_open) = split(previous);
+    let (next_closed, next_open) = split(next);
+    previous.started_at_ms == next.started_at_ms
+        && previous.compacted_phase_count == next.compacted_phase_count
+        && previous_closed == next_closed
+        && previous_open.map(|open| (open.phase, open.started_at_ms))
+            == next_open.map(|open| (open.phase, open.started_at_ms))
+        && (next_open.is_some() || previous.observed_through_ms == next.observed_through_ms)
+        && protocol::TaskTimePhase::ALL.into_iter().all(|phase| {
+            closed_total(previous, previous_open, phase) == closed_total(next, next_open, phase)
+        })
 }
 
 fn task_token_usage_sources_for_state(
@@ -23844,8 +24087,89 @@ fn task_timing_rollup(
         .min(u32::MAX as usize) as u32;
     summary.spans.truncate(256);
     summary.spans.reverse();
+    let accounts = entries
+        .iter()
+        .filter_map(|entry| {
+            let account = snapshots.get(&entry.agent_id)?.timing.account.as_ref()?;
+            Some((entry.agent_id.clone(), account))
+        })
+        .collect::<Vec<_>>();
+    if accounts.is_empty() {
+        return summary;
+    }
+    let started_at_ms = accounts
+        .iter()
+        .map(|(_, account)| account.started_at_ms)
+        .chain(summary.observed_start_ms)
+        .min()
+        .expect("accounts are present");
+    let root_account = entries
+        .first()
+        .and_then(|root| accounts.iter().find(|(id, _)| *id == root.agent_id))
+        .map(|(_, account)| *account);
+    // A live root bounds the interval: other agents' snapshots are read at
+    // slightly different moments, and that skew is not unobserved time.
+    let observed_through_ms = match root_account {
+        Some(root)
+            if root
+                .phases
+                .last()
+                .is_some_and(|phase| phase.end == protocol::TaskTimePhaseEnd::Open) =>
+        {
+            root.observed_through_ms
+        }
+        _ => accounts
+            .iter()
+            .map(|(_, account)| account.observed_through_ms)
+            .chain(summary.observed_end_ms)
+            .max()
+            .expect("accounts are present"),
+    };
+    let mut agent_time = protocol::TaskTimePhaseTotals::default();
+    for (_, account) in &accounts {
+        for phase in protocol::TaskTimePhase::ALL {
+            agent_time.add(phase, account.totals.get(phase));
+        }
+    }
+    let mut wall_clock = root_account
+        .map(|account| account.totals.clone())
+        .unwrap_or_default();
+    let root_covered = root_account.map_or(0, |account| {
+        account
+            .observed_through_ms
+            .saturating_sub(account.started_at_ms)
+    });
+    wall_clock.add(
+        protocol::TaskTimePhase::Unobserved,
+        observed_through_ms
+            .saturating_sub(started_at_ms)
+            .saturating_sub(root_covered),
+    );
+    summary.interval = Some(protocol::TaskTimeInterval {
+        started_at_ms,
+        observed_through_ms,
+        wall_clock,
+        agent_time,
+        accounted_agent_count: accounts.len().min(u32::MAX as usize) as u32,
+    });
+    // Bounded across the task; every account keeps its exact totals.
+    let retained = (TASK_TIME_PHASE_BUDGET / accounts.len()).max(MIN_AGENT_TIME_PHASES);
+    summary.accounts = accounts
+        .into_iter()
+        .map(|(agent_id, account)| {
+            let mut account = account.clone();
+            let excess = account.phases.len().saturating_sub(retained);
+            account.phases.drain(..excess);
+            account.compacted_phase_count =
+                account.compacted_phase_count.saturating_add(excess as u64);
+            protocol::TaskTimeAccountEntry { agent_id, account }
+        })
+        .collect();
     summary
 }
+
+const TASK_TIME_PHASE_BUDGET: usize = 2048;
+const MIN_AGENT_TIME_PHASES: usize = 8;
 
 fn collect_task_token_usage_entries(
     agent_id: &AgentId,

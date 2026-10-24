@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use leptos::prelude::*;
 use protocol::{
-    BackendKind, TaskTimingCategory, TaskTimingState, TaskTokenUsagePayload, TaskTokenUsageStatus,
+    BackendKind, TaskTimeInterval, TaskTimePhase, TaskTimePhaseEnd, TaskTimePhaseTotals,
+    TaskTimingCategory, TaskTimingState, TaskTimingSummary, TaskTokenUsagePayload,
+    TaskTokenUsageStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -353,43 +355,203 @@ fn timing_state(state: TaskTimingState) -> &'static str {
     }
 }
 
+fn phase_label(phase: TaskTimePhase) -> &'static str {
+    match phase {
+        TaskTimePhase::Starting => "Starting",
+        TaskTimePhase::ModelResponse => "Model response",
+        TaskTimePhase::Command => "Commands",
+        TaskTimePhase::Tool => "Other tools",
+        TaskTimePhase::DependencyWait => "Waiting on agents",
+        TaskTimePhase::HumanWait => "Waiting on you",
+        TaskTimePhase::Queued => "Queued input held",
+        TaskTimePhase::Idle => "Idle",
+        TaskTimePhase::NotRunning => "Not running",
+        TaskTimePhase::Unobserved => "Unobserved",
+    }
+}
+
+fn phase_class(phase: TaskTimePhase) -> &'static str {
+    match phase {
+        TaskTimePhase::Starting => "phase-starting",
+        TaskTimePhase::ModelResponse => "phase-model",
+        TaskTimePhase::Command => "phase-command",
+        TaskTimePhase::Tool => "phase-tool",
+        TaskTimePhase::DependencyWait => "phase-wait",
+        TaskTimePhase::HumanWait => "phase-human",
+        TaskTimePhase::Queued => "phase-queued",
+        TaskTimePhase::Idle => "phase-idle",
+        TaskTimePhase::NotRunning => "phase-stopped",
+        TaskTimePhase::Unobserved => "phase-unobserved",
+    }
+}
+
+fn phase_meaning(phase: TaskTimePhase) -> &'static str {
+    match phase {
+        TaskTimePhase::Starting => {
+            "Tyde was launching the agent and setting up its session. The first message may already have been sent."
+        }
+        TaskTimePhase::ModelResponse => {
+            "The agent was working with no tool running and nothing to wait for. This includes network delay, streaming and the model's own thinking; Tyde cannot tell them apart."
+        }
+        TaskTimePhase::Command => "A foreground command was running.",
+        TaskTimePhase::Tool => "A foreground tool other than a command was running.",
+        TaskTimePhase::DependencyWait => "Waiting for other agents to finish work it handed off.",
+        TaskTimePhase::HumanWait => "Waiting for you to answer a question or approve something.",
+        TaskTimePhase::Queued => "Not working; your queued messages had not been sent yet.",
+        TaskTimePhase::Idle => "Not working and nothing waiting to be sent.",
+        TaskTimePhase::NotRunning => "The agent was stopped, so nothing was running.",
+        TaskTimePhase::Unobserved => {
+            "Tyde has no record of this time: recording stopped unexpectedly, or the agent was not being tracked."
+        }
+    }
+}
+
+fn share(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "—".to_owned();
+    }
+    let percent = 100.0 * part as f64 / whole as f64;
+    if part > 0 && percent < 1.0 {
+        "<1%".to_owned()
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
+/// The shared axis: the task's accounted interval, else the retained spans.
+fn timing_axis(timing: &TaskTimingSummary) -> Option<(u64, u64)> {
+    match &timing.interval {
+        Some(interval) => Some((interval.started_at_ms, interval.observed_through_ms)),
+        None => Some((timing.observed_start_ms?, timing.observed_end_ms?)),
+    }
+}
+
+fn axis_style(axis: (u64, u64), start: u64, end: u64) -> String {
+    let width = axis.1.saturating_sub(axis.0).max(1) as f64;
+    let start = start.clamp(axis.0, axis.1);
+    let end = end.clamp(start, axis.1);
+    format!(
+        "left: {}%; width: {}%",
+        100.0 * start.saturating_sub(axis.0) as f64 / width,
+        100.0 * end.saturating_sub(start) as f64 / width
+    )
+}
+
+fn phase_rows(totals: &TaskTimePhaseTotals) -> Vec<(TaskTimePhase, u64)> {
+    TaskTimePhase::ALL
+        .into_iter()
+        .map(|phase| (phase, totals.get(phase)))
+        .filter(|(_, ms)| *ms > 0)
+        .collect()
+}
+
+fn phase_totals_view(totals: &TaskTimePhaseTotals, whole: u64) -> impl IntoView + use<> {
+    view! { <ul class="task-time-totals">
+        {phase_rows(totals).into_iter().map(|(phase, ms)| view! {
+            <li title=phase_meaning(phase)><span class=format!("task-time-swatch {}", phase_class(phase))></span><span>{phase_label(phase)}</span><span>{duration(ms)}</span><span>{share(ms, whole)}</span></li>
+        }).collect_view()}
+    </ul> }
+}
+
+#[component]
+fn TaskTimeBreakdown(interval: Memo<Option<TaskTimeInterval>>) -> impl IntoView {
+    let elapsed = move || {
+        interval.with(|interval| {
+            interval.as_ref().map_or(0, |interval| {
+                interval
+                    .observed_through_ms
+                    .saturating_sub(interval.started_at_ms)
+            })
+        })
+    };
+    let wall_clock = move || {
+        interval.with(|interval| {
+            interval
+                .as_ref()
+                .map(|interval| interval.wall_clock.clone())
+                .unwrap_or_default()
+        })
+    };
+    let agent_time = move || {
+        interval.with(|interval| {
+            interval
+                .as_ref()
+                .map(|interval| (interval.agent_time.clone(), interval.accounted_agent_count))
+                .unwrap_or_default()
+        })
+    };
+    view! { <section class="task-time-breakdown" aria-label="Wall-clock breakdown">
+        <h3>{move || format!("Wall clock · {}", duration(elapsed()))}</h3>
+        <div class="task-time-stack" role="img" aria-label=move || format!("Wall clock {}: {}", duration(elapsed()), phase_rows(&wall_clock()).into_iter().map(|(phase, ms)| format!("{} {}", phase_label(phase), share(ms, elapsed()))).collect::<Vec<_>>().join(", "))>
+            {move || { let elapsed = elapsed(); phase_rows(&wall_clock()).into_iter().map(|(phase, ms)| view! {
+                <span class=format!("task-time-part {}", phase_class(phase)) style=format!("width: {}%", 100.0 * ms as f64 / elapsed.max(1) as f64) title=format!("{} · {} · {}", phase_label(phase), duration(ms), share(ms, elapsed))></span>
+            }).collect_view() }}
+        </div>
+        {move || phase_totals_view(&wall_clock(), elapsed())}
+        <p class="task-usage-note">"Each moment is counted once, so these add up to the wall clock. When several things happen at once, the time counts as waiting on you first, then waiting on agents, commands, other tools, and model response."</p>
+        <details class="task-time-agent-time"><summary>{move || { let (totals, agents) = agent_time(); format!("Agent-time ∑ across {} accounted agent{} · {} (every agent's time summed, idle included; can exceed wall clock)", agents, if agents == 1 { "" } else { "s" }, duration(totals.sum())) }}</summary>
+            {move || { let (totals, _) = agent_time(); let whole = totals.sum(); phase_totals_view(&totals, whole) }}
+        </details>
+    </section> }
+}
+
 #[component]
 fn TaskTimeView(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView {
     let selected = RwSignal::new(None::<(protocol::AgentId, String)>);
     let agents = Memo::new(move |_| {
         let mut agents = Vec::new();
         if let Some(payload) = rollup.get() {
-            for entry in payload.timing.spans {
-                if !agents.contains(&entry.agent_id) {
-                    agents.push(entry.agent_id);
+            for agent_id in payload
+                .timing
+                .accounts
+                .into_iter()
+                .map(|entry| entry.agent_id)
+                .chain(payload.timing.spans.into_iter().map(|entry| entry.agent_id))
+            {
+                if !agents.contains(&agent_id) {
+                    agents.push(agent_id);
                 }
             }
         }
         agents
     });
+    let interval = Memo::new(move |_| {
+        rollup.with(|payload| {
+            payload
+                .as_ref()
+                .and_then(|payload| payload.timing.interval.clone())
+        })
+    });
     view! { <div class="task-time-view">
-        <p class="task-usage-note" title="Retained live tool round-trips, not lifetime coverage or transcript timestamps. Not process lifetime or model compute.">"Observed tool intervals · gaps unobserved"</p>
+        <Show when=move || interval.with(Option::is_some) fallback=move || rollup.with(Option::is_some).then(|| view! { <p class="task-usage-note" title="Recorded before Tyde kept a wall-clock account; earlier activity is not reconstructed.">"Tool calls only · no wall-clock account recorded · time between them unknown"</p> })>
+            <TaskTimeBreakdown interval=interval />
+        </Show>
         {move || rollup.get().map(|payload| {
             let timing = payload.timing;
             let range = match (timing.observed_start_ms, timing.observed_end_ms) { (Some(start), Some(end)) => duration(end.saturating_sub(start)), _ => "Unobserved".to_owned() };
             view! {
                 <dl class="task-time-metrics">
-                    <div><dt>"Observed range"</dt><dd>{range}</dd></div>
+                    <div><dt title="First tool call start to last tool call end">"Tool-call range"</dt><dd>{range}</dd></div>
                     <div><dt title="Classified tools, summed parallel; not elapsed time">"Tools ∑"</dt><dd>{if timing.classified_tool_count == 0 { "Unobserved".to_owned() } else { duration(timing.summed_tool_ms) }}</dd></div>
-                    <div><dt title="Dependency waits, summed separately; child work is not added">"Dependency waits ∑"</dt><dd>{if timing.covered_agent_count == 0 { "Unobserved".to_owned() } else { duration(timing.summed_dependency_wait_ms) }}</dd></div>
+                    <div><dt title="Waiting on agents, summed across agents; their work is not added">"Waiting on agents ∑"</dt><dd>{if timing.covered_agent_count == 0 { "Unobserved".to_owned() } else { duration(timing.summed_dependency_wait_ms) }}</dd></div>
                     <div><dt title="Unclassified round-trips; excluded from the tool sum">"Unclassified (excluded)"</dt><dd>{duration(timing.summed_unclassified_ms)}</dd></div>
                     <div><dt>"Agents with observations"</dt><dd>{format!("{}/{} agents", timing.covered_agent_count, payload.breakdown.len())}</dd></div>
                 </dl>
                 <p class="task-usage-note">{format!("{} command runs · {} spans dropped · {} additional spans omitted · {} persistence failures", timing.command_count, timing.dropped_span_count, timing.omitted_span_count, timing.persistence_failed_agent_count)}</p>
             }
         })}
-        <div class="task-timing-legend"><span class="timing-command">"Commands (tool round-trip)"</span><span class="timing-tool">"Other tools"</span><span class="timing-wait">"Dependency waits"</span><span>"Interrupted = unknown endpoint"</span></div>
+        <Show when=move || interval.with(Option::is_some)>
+        <div class="task-timing-legend task-time-phase-legend" aria-label="Phase lane">
+            {TaskTimePhase::ALL.into_iter().map(|phase| view! { <span title=phase_meaning(phase)><span class=format!("task-time-swatch {}", phase_class(phase))></span>{phase_label(phase)}</span> }).collect_view()}
+            <span title="Older phase boundaries beyond the retained limit; their time stays in the totals"><span class="task-time-swatch task-time-compacted"></span>"Detail not retained"</span>
+        </div>
+        </Show>
+        <div class="task-timing-legend"><span class="timing-command">"Commands (tool round-trip)"</span><span class="timing-tool">"Other tools"</span><span class="timing-wait">"Waiting on agents"</span><span>"Tool rows may overlap · Interrupted = end time unknown"</span></div>
         {move || rollup.get().and_then(|payload| {
-            let start = payload.timing.observed_start_ms?;
-            let end = payload.timing.observed_end_ms?;
+            let (start, end) = timing_axis(&payload.timing)?;
             Some(view! { <div class="task-timing-axis" aria-label="Shared elapsed time axis"><span>"Agent"</span><span><span>"0"</span><span>{duration(end.saturating_sub(start))}</span></span></div> })
         })}
-        <div class="task-timeline" role="group" aria-label="Observed tool timeline">
+        <div class="task-timeline" role="group" aria-label="Agent timeline">
             <Show when=move || agents.get().is_empty()><p class="task-usage-note">"No observed operations"</p></Show>
             <For each=move || agents.get() key=|id| id.clone() children=move |agent_id| view! {
                 <TaskTimingAgentRow agent_id=agent_id rollup=rollup selected=selected />
@@ -467,16 +629,62 @@ fn TaskTimingAgentRow(
     let lanes = Memo::new(move |_| {
         placements.with(|entries| entries.iter().map(|(_, lane)| lane + 1).max().unwrap_or(0))
     });
+    let account = Memo::new(move |_| {
+        rollup.with(|payload| {
+            payload.as_ref().and_then(|payload| {
+                payload
+                    .timing
+                    .accounts
+                    .iter()
+                    .find(|entry| entry.agent_id == agent.get_value())
+                    .map(|entry| entry.account.clone())
+            })
+        })
+    });
+    let axis = Memo::new(move |_| {
+        rollup.with(|payload| {
+            payload
+                .as_ref()
+                .and_then(|payload| timing_axis(&payload.timing))
+        })
+    });
     view! { <div class="task-timing-agent">
         <details class="task-timing-events"><summary title=move || name.get()>{move || name.get().unwrap_or_else(|| "Agent unavailable".to_owned())}<span>{move || format!("{} ops{}", placements.with(Vec::len), if lanes.get() > 1 { " · overlaps" } else { "" })}</span></summary>
+            {move || account.get().map(|account| {
+                let accounted = account.observed_through_ms.saturating_sub(account.started_at_ms);
+                view! { <div class="task-time-agent-account"><p>{format!("Accounted {} · {}", duration(accounted), match account.phases.last().map(|phase| phase.end) { Some(TaskTimePhaseEnd::Open) => "live, observed so far", Some(TaskTimePhaseEnd::Interrupted) => "last endpoint unknown", _ => "ended" })}</p>{phase_totals_view(&account.totals, accounted)}</div> }
+            })}
             <For each={move || placements.with(|entries| entries.iter().map(|(entry, _)| entry.span.tool_call_id.clone()).collect::<Vec<_>>())} key=|id| id.clone() children=move |tool_call_id| view! {
                 <TaskTimingOperation tool_call_id=tool_call_id placements=placements lanes=lanes rollup=rollup selected=selected segment=false />
             } />
         </details>
-        <div class="task-timing-lane" style=move || format!("height: {}px", 20.max(lanes.get() * 8)) role="group" aria-label="Observed intervals; gaps unobserved">
+        <div class="task-time-lanes">
+        <div class="task-time-phase-lane" role="group" aria-label="Exclusive phase lane">
+            {move || match (account.get(), axis.get()) {
+                (Some(account), Some(axis)) => {
+                    let retained_from = account.phases.first().map_or(account.observed_through_ms, |phase| phase.started_at_ms);
+                    let compacted = (account.compacted_phase_count > 0 && retained_from > account.started_at_ms).then(|| {
+                        let label = format!("{} earlier phases not retained · {} included in totals", account.compacted_phase_count, duration(retained_from - account.started_at_ms));
+                        view! { <span class="task-time-phase task-time-compacted" style=axis_style(axis, account.started_at_ms, retained_from) title=label.clone() aria-label=label></span> }
+                    });
+                    let phases = account.phases.into_iter().map(|phase| {
+                        let label = format!("{} · {} · {}", phase_label(phase.phase), duration(phase.ended_at_ms.saturating_sub(phase.started_at_ms)), match phase.end {
+                            TaskTimePhaseEnd::Open => "in progress, observed so far",
+                            TaskTimePhaseEnd::Ended => "ended",
+                            TaskTimePhaseEnd::Interrupted => "interrupted; endpoint unknown",
+                        });
+                        view! { <span class=format!("task-time-phase {}{}", phase_class(phase.phase), if phase.end == TaskTimePhaseEnd::Interrupted { " task-time-interrupted" } else { "" }) style=axis_style(axis, phase.started_at_ms, phase.ended_at_ms) title=label.clone() aria-label=label></span> }
+                    }).collect_view();
+                    view! { {compacted}{phases} }.into_any()
+                }
+                _ => view! { <span class="task-time-no-account">"No wall-clock account recorded"</span> }.into_any(),
+            }}
+        </div>
+        <div class="task-timing-lane" style=move || format!("height: {}px", 12.max(lanes.get() * 8)) role="group" aria-label="Tool round-trips; may overlap">
             <For each={move || placements.with(|entries| entries.iter().map(|(entry, _)| entry.span.tool_call_id.clone()).collect::<Vec<_>>())} key=|id| id.clone() children=move |tool_call_id| view! {
                 <TaskTimingOperation tool_call_id=tool_call_id placements=placements lanes=lanes rollup=rollup selected=selected segment=true />
             } />
+        </div>
         </div>
     </div> }
 }
@@ -519,13 +727,9 @@ fn TaskTimingOperation(
         style=move || {
             if !segment { return None; }
             let (entry, lane) = entry.get()?;
-            let range = rollup.with(|payload| payload.as_ref().map(|payload| (payload.timing.observed_start_ms, payload.timing.observed_end_ms)))?;
+            let axis = rollup.with(|payload| payload.as_ref().and_then(|payload| timing_axis(&payload.timing)))?;
             let span = entry.span;
-            let (width, offset) = match range {
-                (Some(start), Some(end)) if end > start => (100.0 * span.observed_through_ms.saturating_sub(span.started_at_ms) as f64 / (end - start) as f64, 100.0 * span.started_at_ms.saturating_sub(start) as f64 / (end - start) as f64),
-                _ => (0.0, 0.0),
-            };
-            Some(format!("left: {offset}%; width: {width}%; top: {}%; height: {}%", 100.0 * lane as f64 / lanes.get() as f64, 100.0 / lanes.get() as f64))
+            Some(format!("{}; top: {}%; height: {}%", axis_style(axis, span.started_at_ms, span.observed_through_ms), 100.0 * lane as f64 / lanes.get() as f64, 100.0 / lanes.get() as f64))
         }
         title=move || description.get() aria-label=move || description.get() aria-controls="task-timing-operation"
         aria-pressed=move || entry.get().is_some_and(|(entry, _)| selected.get().as_ref() == Some(&(entry.agent_id, entry.span.tool_call_id))).to_string()

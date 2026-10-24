@@ -655,6 +655,28 @@ time. Commands are runs, not agents. An exact `./dev.sh check` request receives 
 check-run label. Opaque calls, including unclassified command-wait interactions,
 are shown separately and do not create additional command executions.
 
+Each agent also has a server-owned exclusive wall-clock account
+(`AgentTimeAccount`). Phase edges are stamped where `AgentStatusHandle` applies
+`TypingStatusChanged`, activity and queue state, and the actor's live tool
+stream: Starting, then while working the highest of dependency wait, foreground
+command, other foreground tool, else model response; otherwise waiting on the
+user, queued, idle or not running. Background tools are not foreground work,
+and an idle edge retires any foreground tool its turn left unfinished.
+Model response is observable latency between tool results and the next request
+or turn end — network, provider queueing, streaming and harness time included —
+not provider-internal compute. Every moment is counted once, so totals equal
+the observed interval. The task interval is the root account's wall clock;
+summed agent time across accounts is labelled separately and may exceed it.
+Growing open time alone is re-sent only while an agent is working or waiting,
+once its youngest such phase has grown by a tenth and at least a second
+later; a resting task's growing idle time arrives with its next change.
+Accounts persist on resting edges, close and graceful restart (the downtime is
+not running). After a crash the last durable open phase is interrupted and the
+gap is unobserved. Each agent retains 256 phases and each task payload at most
+2048; older boundaries are compacted, counted, and kept in the totals. Records
+without an account show only their spans; nothing is reconstructed from
+transcripts or inferred from gaps.
+
 Process lifetime, provider-request round-trip, model compute and CPU have typed
 unsupported states: existing source events do not attest those boundaries.
 Background tool return is not process exit. Review state has round identities

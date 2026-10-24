@@ -2356,9 +2356,52 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         .iter()
         .find(|item| item.root_agent_id == usage.root_agent_id)
         .expect("native reconnect observations");
-    assert_eq!(
-        repeated.timing, usage.timing,
-        "a lost native source cannot invent active downtime on reconnect"
+    // Reconnect observations differed only by 67ms of the live root's idle
+    // horizon. Freezing the whole summary rejects that correct observation;
+    // require every other endpoint, total and retained tool to remain exact.
+    let mut observed = repeated.timing.clone();
+    let interval = observed.interval.as_mut().expect("reconnect interval");
+    let earlier = usage.timing.interval.as_ref().expect("earlier interval");
+    let idle_growth = interval
+        .observed_through_ms
+        .checked_sub(earlier.observed_through_ms)
+        .expect("reconnect horizon cannot regress");
+    interval.observed_through_ms = earlier.observed_through_ms;
+    interval.wall_clock.idle_ms = interval
+        .wall_clock
+        .idle_ms
+        .checked_sub(idle_growth)
+        .expect("wall-clock growth is idle only");
+    interval.agent_time.idle_ms = interval
+        .agent_time
+        .idle_ms
+        .checked_sub(idle_growth)
+        .expect("agent-time growth is idle only");
+    let root = &mut observed
+        .accounts
+        .iter_mut()
+        .find(|entry| entry.agent_id == usage.root_agent_id)
+        .expect("live root account")
+        .account;
+    root.observed_through_ms = root
+        .observed_through_ms
+        .checked_sub(idle_growth)
+        .expect("root horizon includes the same idle growth");
+    root.totals.idle_ms = root
+        .totals
+        .idle_ms
+        .checked_sub(idle_growth)
+        .expect("root growth is idle only");
+    let phase = root.phases.last_mut().expect("live root phase");
+    assert_eq!(phase.phase, protocol::TaskTimePhase::Idle);
+    assert_eq!(phase.end, protocol::TaskTimePhaseEnd::Open);
+    phase.ended_at_ms = phase
+        .ended_at_ms
+        .checked_sub(idle_growth)
+        .expect("open idle endpoint grows with the horizon");
+    assert!(
+        observed == usage.timing,
+        "reconnect may extend only the live root's idle endpoint; lost native sources and all retained timing remain exact"
     );
 }
 
@@ -2724,11 +2767,13 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         protocol::TaskUsageNavigation::LiveAgent,
         "queued canonical usage must become navigable after ordered NewAgent delivery"
     );
+    wall_clock_account(&pending_usage, &pending.agent_id);
     let bootstrapped = bootstrap
         .task_token_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .expect("HostBootstrap should include root task token usage");
+    wall_clock_account(bootstrapped, &root.agent_id);
     assert_eq!(
         bootstrapped.total.usage.total_tokens,
         MOCK_TURN_TOKEN_TOTAL * 3
@@ -3612,10 +3657,81 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
     );
 }
 
+/// The agent's exclusive wall-clock account, checked for the invariants every
+/// consumer relies on: one phase per moment, and a task interval whose primary
+/// totals add up to exactly its elapsed time.
+fn wall_clock_account<'a>(
+    usage: &'a TaskTokenUsagePayload,
+    agent_id: &protocol::AgentId,
+) -> &'a protocol::AgentTimeAccount {
+    let interval = usage
+        .timing
+        .interval
+        .as_ref()
+        .expect("task wall-clock interval");
+    assert_eq!(
+        interval.wall_clock.sum(),
+        interval.observed_through_ms - interval.started_at_ms,
+        "primary totals must reconcile to the elapsed interval"
+    );
+    let account = &usage
+        .timing
+        .accounts
+        .iter()
+        .find(|entry| &entry.agent_id == agent_id)
+        .expect("agent wall-clock account")
+        .account;
+    assert_eq!(account.compacted_phase_count, 0);
+    assert_eq!(
+        account.totals.sum(),
+        account.observed_through_ms - account.started_at_ms,
+        "each accounted moment is in exactly one phase"
+    );
+    let mut through = account.started_at_ms;
+    for segment in &account.phases {
+        assert_eq!(
+            segment.started_at_ms, through,
+            "phases must cover the account without gaps or overlap"
+        );
+        through = segment.ended_at_ms;
+    }
+    assert_eq!(through, account.observed_through_ms);
+    account
+}
+
+fn is_activity_change(
+    env: &Envelope,
+    stream: &StreamPath,
+    activity: protocol::AgentActivity,
+) -> bool {
+    env.stream == *stream
+        && env.kind == FrameKind::AgentActivityChanged
+        && env
+            .parse_payload::<protocol::AgentActivityChangedPayload>()
+            .is_ok_and(|payload| payload.activity == activity)
+}
+
+fn phase_durations(
+    account: &protocol::AgentTimeAccount,
+) -> Vec<(protocol::TaskTimePhase, u64, protocol::TaskTimePhaseEnd)> {
+    account
+        .phases
+        .iter()
+        .map(|segment| {
+            (
+                segment.phase,
+                segment.ended_at_ms - segment.started_at_ms,
+                segment.end,
+            )
+        })
+        .collect()
+}
+
 /// These are receipt-boundary measurements on the real server/protocol,
 /// deliberately not provider or process-lifetime measurements.
 #[tokio::test(start_paused = true)]
 async fn task_timing_observes_overlap_background_completion_and_restart_without_replay() {
+    let (clock_resumed_tx, clock_resumed_rx) = tokio::sync::oneshot::channel();
     let scenario = async {
         let mut fixture = Fixture::new().await;
         let root = fixture
@@ -3700,6 +3816,25 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             protocol::TaskTimingCategory::Command { check: true, .. }
         ) && entry.span.state
             == protocol::TaskTimingState::Open));
+        use protocol::TaskTimePhase::{
+            Command, DependencyWait, HumanWait, Idle, ModelResponse, NotRunning, Tool, Unobserved,
+        };
+        use protocol::TaskTimePhaseEnd::{Ended, Interrupted, Open};
+        let root_account = wall_clock_account(running, &root.new_agent.agent_id);
+        assert_eq!(
+            phase_durations(root_account),
+            vec![(DependencyWait, 2_000, Ended), (Idle, 0, Open)],
+            "the overlapping command is wall time already spent waiting on the child"
+        );
+        assert_eq!(root_account.totals.command_ms, 0);
+        let interval = running.timing.interval.as_ref().expect("running interval");
+        assert_eq!(interval.wall_clock.dependency_wait_ms, 2_000);
+        assert_eq!(interval.wall_clock.sum(), 2_000);
+        assert_eq!(interval.accounted_agent_count, 2);
+        assert_eq!(
+            wall_clock_account(running, &child.agent_id).totals.idle_ms,
+            2_000
+        );
         tokio::time::advance(Duration::from_secs(3)).await;
         background.release_one();
         fixture.next_chat_event_matching(&root, "background completion", |event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "timing-check")).await;
@@ -3718,6 +3853,25 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                 .spans
                 .iter()
                 .all(|entry| entry.span.state == protocol::TaskTimingState::Completed)
+        );
+        let root_account = wall_clock_account(completed, &root.new_agent.agent_id);
+        let task_started_at = root_account.started_at_ms;
+        assert_eq!(
+            phase_durations(root_account),
+            vec![(DependencyWait, 2_000, Ended), (Idle, 3_000, Open)],
+            "a background command does not keep an idle agent working"
+        );
+        let interval = completed
+            .timing
+            .interval
+            .as_ref()
+            .expect("completed interval");
+        assert_eq!(interval.started_at_ms, task_started_at);
+        assert_eq!(interval.wall_clock.sum(), 5_000);
+        assert_eq!(
+            interval.agent_time.sum(),
+            10_000,
+            "summed agent time counts the idle child alongside the root"
         );
         let session = completed.root_session_id.clone().expect("root session");
         // Begin another open span, then restart. Historical tool replay must
@@ -3758,6 +3912,7 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                 break;
             }
         }
+        tokio::time::advance(Duration::from_secs(4)).await;
         fixture
             .client
             .spawn_agent(SpawnAgentPayload {
@@ -3791,6 +3946,19 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             "close/resume must keep the last observed endpoint"
         );
         assert_eq!(reopened_usage.timing.spans.len(), 3);
+        let reopened_account = wall_clock_account(reopened_usage, &reopened.agent_id);
+        assert_eq!(reopened_account.started_at_ms, task_started_at);
+        assert_eq!(
+            phase_durations(reopened_account),
+            vec![
+                (DependencyWait, 2_000, Ended),
+                (Idle, 3_000, Ended),
+                (Command, 1_000, Ended),
+                (NotRunning, 4_000, Ended),
+                (Idle, 0, Open),
+            ],
+            "a clean close is a known endpoint followed by not-running time"
+        );
         fixture
             .mock_by_id(&reopened.agent_id)
             .await
@@ -3853,7 +4021,288 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                     && entry.span.state == protocol::TaskTimingState::Interrupted
                     && entry.span.observed_duration_ms == 2_000)
         );
+        let restored_account = wall_clock_account(restored, &restored_agent.agent_id);
+        assert_eq!(
+            phase_durations(restored_account)[3..],
+            [
+                (NotRunning, 4_000, Ended),
+                (Command, 2_000, Ended),
+                (Idle, 0, Open)
+            ],
+            "a graceful restart ends the open phase at the durable stop"
+        );
+        // Human wait, then a crash: only the last durable observation is kept.
+        let question = MockGateHandle::new();
+        fixture
+            .mock_by_id(&restored_agent.agent_id)
+            .await
+            .enqueue(MockTurn::blocking_question_request(
+                "timing-question",
+                &question,
+            ))
+            .await;
+        fixture
+            .client
+            .send_message(&restored_agent.instance_stream, "ask timing".to_owned())
+            .await
+            .expect("ask timing question");
+        question.wait_until_entered().await;
+        question.release_one();
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "timing question awaits the user",
+            |env| {
+                is_activity_change(
+                    env,
+                    &restored_agent.instance_stream,
+                    protocol::AgentActivity::AwaitingUser,
+                )
+            },
+        )
+        .await;
+        // Connected clients see live waits grow and end, not only new bootstraps.
+        let live_tail = |payload: &TaskTokenUsagePayload, count: usize| {
+            let phases = phase_durations(wall_clock_account(payload, &restored_agent.agent_id));
+            phases[phases.len().saturating_sub(count)..].to_vec()
+        };
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        expect_task_token_usage_matching(
+            &mut fixture.client,
+            &restored_agent.agent_id,
+            "live human wait",
+            |payload| live_tail(payload, 1) == [(HumanWait, 1_000, Open)],
+        )
+        .await;
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        expect_task_token_usage_matching(
+            &mut fixture.client,
+            &restored_agent.agent_id,
+            "human wait refreshes without a status change",
+            |payload| live_tail(payload, 1) == [(HumanWait, 2_000, Open)],
+        )
+        .await;
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        tokio::time::advance(Duration::from_secs(28)).await;
+        expect_task_token_usage_matching(
+            &mut fixture.client,
+            &restored_agent.agent_id,
+            "long human wait grows without status changes",
+            |payload| live_tail(payload, 1) == [(HumanWait, 30_000, Open)],
+        )
+        .await;
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        fixture
+            .client
+            .list_sessions(ListSessionsPayload::default())
+            .await
+            .expect("long-wait protocol barrier");
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "long waits do not retain a one-second refresh cadence",
+            |env| {
+                if env.kind == FrameKind::TaskTokenUsage {
+                    let usage: TaskTokenUsagePayload =
+                        env.parse_payload().expect("timing cadence frame");
+                    assert!(
+                        usage.root_agent_id != restored_agent.agent_id,
+                        "no new task observation before the three-second refresh quantum"
+                    );
+                }
+                env.kind == FrameKind::SessionList
+            },
+        )
+        .await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        expect_task_token_usage_matching(
+            &mut fixture.client,
+            &restored_agent.agent_id,
+            "long wait refreshes at its decayed cadence",
+            |payload| live_tail(payload, 1) == [(HumanWait, 33_000, Open)],
+        )
+        .await;
+        fixture
+            .client
+            .interrupt(&restored_agent.instance_stream)
+            .await
+            .expect("cancel timing question");
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "cancelled timing question settles idle",
+            |env| {
+                is_activity_change(
+                    env,
+                    &restored_agent.instance_stream,
+                    protocol::AgentActivity::Idle,
+                )
+            },
+        )
+        .await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        fixture
+            .host_for_test()
+            .synchronize_task_usage_refresh_for_test()
+            .await;
+        expect_task_token_usage_matching(
+            &mut fixture.client,
+            &restored_agent.agent_id,
+            "human wait ends live",
+            |payload| live_tail(payload, 2) == [(HumanWait, 33_000, Ended), (Idle, 2_000, Open)],
+        )
+        .await;
+        let killed = fixture.relaunch_host_after_kill().await;
+        let killed_agents = fixture
+            .restored_agents(&killed, std::slice::from_ref(&session))
+            .await;
+        let restored_agent = &killed_agents[&session];
+        let (_, crashed) = fixture.connect_with_bootstrap().await;
+        let crashed = crashed
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+            .expect("crash-restored timing");
+        let crashed_account = wall_clock_account(crashed, &restored_agent.agent_id);
+        assert_eq!(crashed_account.started_at_ms, task_started_at);
+        assert_eq!(
+            phase_durations(crashed_account)[5..],
+            [
+                (HumanWait, 33_000, Ended),
+                (Idle, 0, Interrupted),
+                (Unobserved, 2_000, Ended),
+                (Idle, 0, Open),
+            ],
+            "time after the last durable observation is unobserved, never invented"
+        );
+        assert_eq!(crashed_account.totals.unobserved_ms, 2_000);
+        // A tool left unfinished by its turn cannot classify the next turn.
+        let model = MockGateHandle::new();
+        let tool = MockGateHandle::new();
+        fixture
+            .mock_by_id(&restored_agent.agent_id)
+            .await
+            .enqueue(MockTurn::timing_model_then_unfinished_tool(
+                "timing-read",
+                &model,
+                &tool,
+            ))
+            .await;
+        fixture
+            .client
+            .send_message(&restored_agent.instance_stream, "read timing".to_owned())
+            .await
+            .expect("start unfinished tool turn");
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "model response starts",
+            |env| {
+                is_activity_change(
+                    env,
+                    &restored_agent.instance_stream,
+                    protocol::AgentActivity::Thinking,
+                )
+            },
+        )
+        .await;
+        model.wait_until_entered().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        model.release_one();
+        fixture::next_logical_frame_matching_on(&mut fixture.client, "unfinished read requested", |env| env.stream == restored_agent.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "timing-read"))).await;
+        tool.wait_until_entered().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tool.release_one();
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "unfinished tool turn ends",
+            |env| {
+                is_activity_change(
+                    env,
+                    &restored_agent.instance_stream,
+                    protocol::AgentActivity::Idle,
+                )
+            },
+        )
+        .await;
+        let after = MockGateHandle::new();
+        fixture
+            .mock_by_id(&restored_agent.agent_id)
+            .await
+            .enqueue(MockTurn::gated_text("after unfinished tool", &after))
+            .await;
+        fixture
+            .client
+            .send_message(&restored_agent.instance_stream, "after read".to_owned())
+            .await
+            .expect("start turn after unfinished tool");
+        fixture::next_logical_frame_matching_on(&mut fixture.client, "next turn starts", |env| {
+            is_activity_change(
+                env,
+                &restored_agent.instance_stream,
+                protocol::AgentActivity::Thinking,
+            )
+        })
+        .await;
+        after.wait_until_entered().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_, next_turn) = fixture.connect_with_bootstrap().await;
+        let next_turn = next_turn
+            .task_token_usages
+            .iter()
+            .find(|payload| payload.root_agent_id == restored_agent.agent_id)
+            .expect("next-turn timing");
+        assert_eq!(
+            phase_durations(wall_clock_account(next_turn, &restored_agent.agent_id))[5..],
+            [
+                (HumanWait, 33_000, Ended),
+                (Idle, 0, Interrupted),
+                (Unobserved, 2_000, Ended),
+                (ModelResponse, 1_000, Ended),
+                (Tool, 1_000, Ended),
+                (ModelResponse, 1_000, Open),
+            ],
+            "the next turn is model response, not the previous turn's tool"
+        );
+        assert!(
+            next_turn
+                .timing
+                .spans
+                .iter()
+                .any(|entry| entry.span.tool_call_id == "timing-read"
+                    && entry.span.state == protocol::TaskTimingState::Open),
+            "ending the turn leaves the unfinished read open, not completed"
+        );
+        after.release_one();
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "turn after unfinished tool ends",
+            |env| {
+                is_activity_change(
+                    env,
+                    &restored_agent.instance_stream,
+                    protocol::AgentActivity::Idle,
+                )
+            },
+        )
+        .await;
         tokio::time::resume();
+        clock_resumed_tx.send(()).expect("clock resume observed");
         fixture
             .mock_by_id(&restored_agent.agent_id)
             .await
@@ -3910,16 +4359,24 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .timing;
         assert_eq!(timing.spans.len(), 256);
         assert_eq!(timing.omitted_span_count, 64);
-        assert_eq!(timing.dropped_span_count, 9);
+        // Seven root drops (four timing spans, the question, the unfinished
+        // read, one round trip) and one per child.
+        assert_eq!(timing.dropped_span_count, 11);
     };
     tokio::pin!(scenario);
+    tokio::pin!(clock_resumed_rx);
     loop {
         tokio::select! {
             biased;
-            () = &mut scenario => break,
+            () = &mut scenario => return,
+            result = &mut clock_resumed_rx => {
+                result.expect("scenario resumes clock");
+                break;
+            }
             () = tokio::task::yield_now() => {},
         }
     }
+    scenario.await;
 }
 
 /// A descendant whose first turn reports no usage first marks the whole

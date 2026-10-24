@@ -809,6 +809,27 @@ impl MockTurn {
         Self::done(steps)
     }
 
+    /// Responds, then ends the turn while a foreground read never completes.
+    pub fn timing_model_then_unfinished_tool(
+        tool_call_id: &str,
+        model: &MockGateHandle,
+        tool: &MockGateHandle,
+    ) -> Self {
+        Self::done(vec![
+            MockStep::emit(emit::typing(true)),
+            MockStep::Gate(model.gate()),
+            MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "read_files".to_owned(),
+                tool_type: protocol::ToolRequestType::ReadFiles {
+                    file_paths: vec!["/tmp/test/notes.md".to_owned()],
+                },
+            })),
+            MockStep::Gate(tool.gate()),
+            MockStep::emit(emit::typing(false)),
+        ])
+    }
+
     pub fn text_with_late_zero_native_usage(
         text: impl Into<String>,
         gate: &MockGateHandle,
