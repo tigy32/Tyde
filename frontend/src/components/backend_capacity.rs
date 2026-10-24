@@ -135,18 +135,13 @@ fn source_label(source: CapacitySource) -> &'static str {
     }
 }
 
-/// Mandatory on every surface — never a tooltip. Without it, Claude's
-/// single-bucket report and Codex's complete report render identically, and a
-/// user looking at a healthy Claude row has no way to know a *different* Claude
-/// limit sits at 98%.
 fn coverage_text(coverage: CapacityCoverage, kind: BackendKind) -> String {
     let vendor = backend_label(kind);
     match coverage {
         CapacityCoverage::AllVendorBuckets => format!("All limits reported by {vendor}."),
-        CapacityCoverage::RepresentativeBucketOnly => format!(
-            "{vendor} reports only the limit that is currently binding. \
-             Other limits exist and are not reported here."
-        ),
+        CapacityCoverage::RepresentativeBucketOnly => {
+            format!("Limits reported by {vendor}; completeness not reported.")
+        }
     }
 }
 
@@ -865,7 +860,7 @@ pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl In
                     let partial = report.coverage == CapacityCoverage::RepresentativeBucketOnly;
                     let detail = format!("{} · {} {} Prioritizes a rejected limit, then the highest usage percentage; ties follow report order. Model-family limits apply only to the named family.", freshness_text(&snapshot.freshness), coverage_text(report.coverage, backend_kind), state_explanation(&snapshot.state, backend_kind).unwrap_or_default());
                     view! {
-                        {(stale || partial).then(|| view! { <UsageInfo label=match (stale, partial) { (true, true) => "Stale · other limits unknown", (true, false) => "Stale", (false, true) => "Other limits unknown", (false, false) => "" }.to_owned() detail=detail.clone() /> })}
+                        {(stale || partial).then(|| view! { <UsageInfo label=match (stale, partial) { (true, true) => "Stale · completeness not reported", (true, false) => "Stale", (false, true) => "Completeness not reported", (false, false) => "" }.to_owned() detail=detail.clone() /> })}
                     }
                 }))}
             </div>
@@ -1626,10 +1621,9 @@ mod wasm_tests {
         assert_eq!(bar.get_attribute("role").as_deref(), Some("img"));
     }
 
-    /// Coverage is mandatory text on every surface, and the two vendors say
-    /// different things: Codex reports all its buckets, Claude reports only the
-    /// limit that currently binds. Without this, a healthy-looking Claude row
-    /// hides the fact that another Claude limit could be at 98%.
+    // A native Codex report can have one 7-day window and null secondary.
+    // That does not establish a binding limit or the existence of other limits;
+    // the old assertions incorrectly required both claims in the rendered UI.
     #[wasm_bindgen_test]
     async fn coverage_is_stated_per_vendor() {
         let container = make_container();
@@ -1640,24 +1634,40 @@ mod wasm_tests {
             0,
             vec![claude_known(), codex_known()],
         );
-        let _handle = mount_settings(&container, state);
+        let _handle = mount_settings(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
 
         let text = text_of(&container);
         assert!(
-            text.contains("reports only the limit that is currently binding"),
-            "RepresentativeBucketOnly must be spelled out, got: {text}"
+            text.contains("Limits reported by Claude; completeness not reported."),
+            "partial coverage must identify the source without claiming completeness, got: {text}"
         );
         assert!(
-            text.contains("Other limits exist and are not reported here"),
-            "the caveat must say the other limits are unknown, not fine, got: {text}"
+            !text.contains("currently binding") && !text.contains("Other limits exist"),
+            "coverage must not invent binding or missing limits, got: {text}"
         );
         assert!(
             text.contains("All limits reported by Codex"),
             "AllVendorBuckets must be spelled out too, got: {text}"
         );
+        let mut codex = codex_known();
+        if let BackendCapacityState::Known { report } = &mut codex.state {
+            report.buckets = vec![
+                codex_window_bucket(CodexLimitSlot::Primary, "primary limit", 10, 10_080),
+                codex_credits_bucket(),
+            ];
+            report.coverage = CapacityCoverage::RepresentativeBucketOnly;
+        }
+        dispatch_capacity(&state, "h-cap-coverage", 1, vec![codex]);
+        next_tick().await;
+        let text = text_of(&container);
+        assert!(text.contains("Limits reported by Codex; completeness not reported."));
+        assert!(text.contains("10% used") && text.contains("rolling 7d window"));
+        assert!(text.contains("credit balance: 12.5"));
+        assert!(!text.contains("secondary limit"));
+        assert!(!text.contains("currently binding") && !text.contains("Other limits exist"));
     }
 
     /// Credits are not a percentage and must never be rendered as a bar — an

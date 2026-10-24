@@ -4015,17 +4015,17 @@ mod wasm_tests {
             "task region must not carry subscription capacity, got: {task_text}"
         );
 
-        // The rendered concise notice says "Other limits unknown"; requiring
-        // the old verbose copy rejects the requested UI, not missing coverage.
+        // A partial provider report does not establish missing or binding limits.
+        // Keep the visible and accessible completeness disclosure without those claims.
         let coverage_notice = query(&capacity, ".task-limit-context [role=note]").unwrap();
-        assert_eq!(coverage_notice.inner_text(), "Other limits unknown");
+        assert_eq!(coverage_notice.inner_text(), "Completeness not reported");
         assert!(coverage_notice.get_bounding_client_rect().height() > 0.0);
         assert!(
             coverage_notice
                 .get_attribute("aria-label")
                 .unwrap()
-                .contains("only the limit that is currently binding"),
-            "representative coverage retains the binding-only provenance for assistive technology"
+                .contains("Limits reported by Claude; completeness not reported."),
+            "partial coverage retains source and unknown completeness for assistive technology"
         );
         coverage_notice.focus().unwrap();
         next_tick().await;
