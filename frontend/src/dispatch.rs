@@ -4250,6 +4250,11 @@ pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &p
         });
         state.switch_active_project(fallback);
     }
+    state.project_editor.update(|editor| {
+        if editor.as_ref() == Some(&deleted_ref) {
+            *editor = None;
+        }
+    });
     state.forget_project_view_memory(&deleted_ref);
     // Drop per-project caches keyed by the deleted ProjectId so they can't
     // leak or be misread if the id ever reappears. Mirrors the mobile

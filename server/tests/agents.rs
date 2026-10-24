@@ -13715,14 +13715,35 @@ async fn projects_persist_to_disk_and_replay_from_fresh_host() {
 #[tokio::test]
 async fn project_delete_detaches_sessions_that_reference_it() {
     let mut fixture = Fixture::new().await;
+    let root = tempfile::tempdir().expect("create project source directory");
+    let source = root.path().join("keep.txt");
+    std::fs::write(&source, "Keep project source files").expect("write project source file");
 
     let project = create_project(
         &mut fixture.client,
         "Delete Guard",
-        vec!["/tmp/delete-guard".to_owned()],
+        vec![root.path().to_string_lossy().into_owned()],
     )
     .await;
 
+    let first_turn = MockGateHandle::new();
+    let running_turn = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "delete-guard-agent",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: hold project",
+                &first_turn,
+            ))
+            .then(MockTurn::text_completion_after_gate(
+                "Turn survives project removal",
+                &running_turn,
+            ))
+            .then(MockTurn::text(
+                "mock backend response to: continue after project removal",
+            )),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -13754,6 +13775,8 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         "delete guard AgentStart",
     )
     .await;
+    drop(reservation);
+    first_turn.release_one();
     expect_strict_mock_turn(
         &mut fixture.client,
         &new_agent.instance_stream,
@@ -13779,6 +13802,69 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         .map(|session| session.id.clone())
         .expect("spawned session should reference project before delete");
 
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Delete startup");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Delete startup".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&project),
+                prompt: "start after project removal".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn held startup in project");
+    startup_gate.wait_until_entered().await;
+    let starting = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "held project agent",
+    )
+    .await;
+    let starting: NewAgentPayload = starting.parse_payload().expect("parse held project agent");
+    let (mut lazy_observer, _) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "project-delete-observer",
+    )
+    .await;
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "remain active during project removal".into(),
+        )
+        .await
+        .expect("start turn before project deletion");
+    running_turn.wait_until_entered().await;
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "working before project deletion",
+        |event| {
+            event.stream == new_agent.instance_stream
+                && event.kind == FrameKind::ChatEvent
+                && matches!(
+                    event.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::TypingStatusChanged(true))
+                )
+        },
+    )
+    .await;
+    eprintln!(
+        "PROJECT DELETE EVIDENCE: authoritative working event received; completion gate remains held"
+    );
+
     fixture
         .client
         .project_delete(ProjectDeletePayload {
@@ -13787,12 +13873,28 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         .await
         .expect("project_delete failed");
 
-    let env = expect_kind(
+    let mut detached_agents = Vec::new();
+    let env = fixture::next_frame_matching_on(
         &mut fixture.client,
-        FrameKind::ProjectNotify,
-        "project delete notify",
+        "project delete with live ownership",
+        |event| {
+            if event.kind == FrameKind::AgentProjectChanged {
+                let start: AgentStartPayload =
+                    event.parse_payload().expect("parse canonical detachment");
+                assert!(start.project_id.is_none());
+                assert_eq!(start.workspace_roots, project_roots(&project));
+                detached_agents.push(start.agent_id);
+            }
+            event.kind == FrameKind::ProjectNotify
+        },
     )
     .await;
+    for agent_id in [&new_agent.agent_id, &starting.agent_id] {
+        assert!(
+            detached_agents.contains(agent_id),
+            "Deletion publishes live and starting agent ownership before removing the project"
+        );
+    }
     match env
         .parse_payload::<ProjectNotifyPayload>()
         .expect("parse project delete notify")
@@ -13813,7 +13915,97 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         .find(|session| session.id == session_id)
         .expect("detached session should remain in list");
     assert_eq!(session.project_id, None);
+    let lazy_change = fixture::next_frame_matching_on(
+        &mut lazy_observer,
+        "unattached agent project detachment",
+        |event| event.kind == FrameKind::AgentProjectChanged,
+    )
+    .await;
+    let lazy_start: AgentStartPayload = lazy_change
+        .parse_payload()
+        .expect("parse lazy project detachment");
+    assert!(lazy_start.project_id.is_none());
+    assert_eq!(lazy_start.workspace_roots, project_roots(&project));
+    running_turn.release_one();
+    let completed = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "preserved turn completion",
+        |event| {
+            event.stream == new_agent.instance_stream
+                && event.kind == FrameKind::ChatEvent
+                && matches!(
+                    event.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::StreamEnd(_))
+                )
+        },
+    )
+    .await;
+    assert!(
+        matches!(completed.parse_payload::<ChatEvent>().expect("parse preserved turn completion"), ChatEvent::StreamEnd(end) if end.message.content.contains("Turn survives project removal")),
+        "Deletion must preserve the in-flight turn"
+    );
+    eprintln!(
+        "PROJECT DELETE EVIDENCE: live and starting ownership detached; in-flight turn completed after removal"
+    );
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "original client observes preserved turn completion",
+        |event| {
+            event.stream == new_agent.instance_stream
+                && event.kind == FrameKind::ChatEvent
+                && matches!(
+                    event.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::TypingStatusChanged(false))
+                )
+        },
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("project deletion must preserve source files"),
+        "Keep project source files"
+    );
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "continue after project removal".into(),
+        )
+        .await
+        .expect("existing agent must remain usable after project deletion");
+    expect_strict_mock_turn(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: continue after project removal",
+    )
+    .await;
 
+    startup_gate.release_one();
+    let started = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &starting.instance_stream,
+        "detached startup AgentStart",
+    )
+    .await;
+    assert!(
+        started.project_id.is_none(),
+        "Startup must publish the detached ownership without losing the agent"
+    );
+    assert_eq!(started.workspace_roots, project_roots(&project));
+    let (_observer, live_bootstrap) = fixture.connect_with_bootstrap().await;
+    let live_agent = live_bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == new_agent.agent_id)
+        .expect("project deletion must preserve the live agent");
+    assert!(
+        live_agent.project_id.is_none(),
+        "Deleted project ownership must not replay on live agents"
+    );
+    assert_eq!(
+        live_agent.workspace_roots,
+        project_roots(&project),
+        "Detachment must preserve the agent workspace"
+    );
     let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     assert!(
         bootstrap.projects.is_empty(),

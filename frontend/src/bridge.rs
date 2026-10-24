@@ -386,6 +386,16 @@ pub async fn write_clipboard_text(text: &str) -> Result<(), String> {
 /// `window.confirm()` API is silently no-op'd inside Tauri, so this is the
 /// only way to get a working confirmation prompt in the desktop/mobile shell.
 pub async fn confirm_dialog(title: &str, message: &str) -> bool {
+    match try_confirm_dialog(title, message).await {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            crate::components::header::report_user_error(error);
+            false
+        }
+    }
+}
+
+pub async fn try_confirm_dialog(title: &str, message: &str) -> Result<bool, String> {
     #[derive(Serialize)]
     struct Args<'a> {
         title: &'a str,
@@ -393,24 +403,20 @@ pub async fn confirm_dialog(title: &str, message: &str) -> bool {
         kind: &'a str,
         buttons: &'a str,
     }
-    let args = match serde_wasm_bindgen::to_value(&Args {
+    let args = serde_wasm_bindgen::to_value(&Args {
         title,
         message,
         kind: "warning",
         buttons: "OkCancel",
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("confirm_dialog: failed to serialize args: {e}");
-            return false;
-        }
-    };
-    match tauri_invoke("plugin:dialog|message", args).await {
-        Ok(v) => v.as_string().as_deref() == Some("Ok"),
-        Err(e) => {
-            log::error!("confirm_dialog: plugin:dialog|message failed: {e:?}");
-            false
-        }
+    })
+    .map_err(|error| format!("Could not prepare confirmation: {error}"))?;
+    let result = tauri_invoke("plugin:dialog|message", args)
+        .await
+        .map_err(|error| tauri_error_message("Could not open confirmation", error))?;
+    match result.as_string().as_deref() {
+        Some("Ok") => Ok(true),
+        Some("Cancel") => Ok(false),
+        _ => Err("Confirmation returned an invalid result".to_owned()),
     }
 }
 

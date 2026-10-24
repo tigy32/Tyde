@@ -3570,7 +3570,10 @@ mod wasm_tests {
                 window.__TAURI__.core.invoke = function(cmd, args) {
                     window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
                     if (cmd === 'plugin:dialog|message') {
-                        return Promise.resolve('Ok');
+                        if (window.__test_dialog_error) {
+                            return Promise.reject('Native confirmation unavailable');
+                        }
+                        return Promise.resolve(window.__test_dialog_result || 'Ok');
                     }
                     return Promise.resolve();
                 };
@@ -6033,7 +6036,7 @@ mod wasm_tests {
         let mounted = state.clone();
         let handle = mount_to(container.clone(), move || {
             provide_context(mounted.clone());
-            view! { <style>{include_str!("../../styles.css")}</style><AgentsPanel /><crate::components::project_rail::ProjectEditor /><crate::components::host_browser::HostBrowser /> }
+            view! { <style>{include_str!("../../styles.css")}</style><crate::notices::ProjectOperationNotices /><AgentsPanel /><crate::components::project_rail::ProjectEditor /><crate::components::host_browser::HostBrowser /> }
         });
         for _ in 0..4 {
             next_tick().await;
@@ -6372,8 +6375,362 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
+        let delete_button = |editor: &web_sys::Element| {
+            let buttons = editor.query_selector_all("button").unwrap();
+            (0..buttons.length())
+                .filter_map(|index| buttons.item(index))
+                .find(|node| node.text_content().as_deref() == Some("Delete project"))
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+        };
+        let mut child = project_info("local", "delete-child", "Delete child", 1).project;
+        child.source = ProjectSource::GitWorkbench {
+            parent_project_id: ProjectId("alpha".into()),
+            branch: protocol::GitBranchName("delete-child".into()),
+            roots: vec![],
+            environment: protocol::WorkbenchEnvironment::Native,
+        };
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectNotify,
+            2,
+            &protocol::ProjectNotifyPayload::Upsert { project: child },
+        );
+        next_tick().await;
+        let blocked = delete_button(&editor);
+        assert!(blocked.disabled());
+        assert!(
+            editor
+                .text_content()
+                .unwrap()
+                .contains("Remove this project's workbenches")
+        );
+        let before_delete = calls.length();
+        blocked.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            before_delete,
+            "Blocked deletion never opens confirmation or submits a command"
+        );
         state.project_editor.set(None);
         next_tick().await;
+        container
+            .query_selector("[aria-label='Edit project Gamma Project']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let editor = container
+            .query_selector("[aria-label='Edit project']")
+            .unwrap()
+            .unwrap();
+        crate::notices::report_project_send_failure(
+            &state,
+            "remote".into(),
+            protocol::ProjectMutation::Delete(protocol::ProjectDeletePayload {
+                id: ProjectId("another-remote-project".into()),
+            }),
+            "Another project's deletion could not be sent",
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Another project's deletion could not be sent"),
+            "Host-wide failures remain visible in the operation notices"
+        );
+        assert!(
+            !editor
+                .text_content()
+                .unwrap()
+                .contains("Another project's deletion could not be sent"),
+            "An unrelated project's failure must not appear inside this editor"
+        );
+        crate::notices::clear_scope(&crate::notices::NoticeScope::ProjectOperations(
+            "remote".into(),
+        ));
+        let delete = delete_button(&editor);
+        assert!(
+            !delete.disabled(),
+            "A remote standalone project is deletable even while a local project has workbenches"
+        );
+        js_sys::eval("window.__test_dialog_result = 'Cancel'").unwrap();
+        let before_projects = state.projects.get_untracked();
+        let before_agents = state.agents.get_untracked();
+        delete.click();
+        next_tick().await;
+        assert!(
+            !recorded_frames(&calls)
+                .iter()
+                .any(|(kind, _, _)| kind == "project_delete")
+        );
+        assert_eq!(state.projects.get_untracked(), before_projects);
+        assert_eq!(state.agents.get_untracked(), before_agents);
+        assert!(
+            container
+                .query_selector("[aria-label='Edit project']")
+                .unwrap()
+                .is_some()
+        );
+        let dialog = calls
+            .iter()
+            .filter_map(|call| {
+                let call = call.dyn_into::<js_sys::Array>().unwrap();
+                (call.get(0).as_string().as_deref() == Some("plugin:dialog|message")).then(|| {
+                    serde_json::from_str::<JsonValue>(&call.get(1).as_string().unwrap()).unwrap()
+                })
+            })
+            .next_back()
+            .unwrap();
+        let message = dialog["message"].as_str().unwrap();
+        for expected in [
+            "Gamma Project",
+            "Source files stay on disk",
+            "sessions and history are preserved",
+            "steering and reviews are removed",
+        ] {
+            assert!(
+                message.contains(expected),
+                "Confirmation must explain the target and actual effects"
+            );
+        }
+        js_sys::eval("delete window.__test_dialog_result; window.__test_dialog_error = true")
+            .unwrap();
+        delete.click();
+        next_tick().await;
+        assert!(
+            editor
+                .text_content()
+                .unwrap()
+                .contains("Native confirmation unavailable")
+        );
+        assert!(
+            !recorded_frames(&calls)
+                .iter()
+                .any(|(kind, _, _)| kind == "project_delete")
+        );
+        assert_eq!(state.projects.get_untracked(), before_projects);
+        assert_eq!(state.agents.get_untracked(), before_agents);
+        js_sys::eval("delete window.__test_dialog_error").unwrap();
+        editor
+            .query_selector("[aria-label='Dismiss notice']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            !editor
+                .text_content()
+                .unwrap()
+                .contains("Native confirmation unavailable")
+        );
+        state.host_streams.update(|streams| {
+            streams.insert("remote".into(), StreamPath("/host/remote".into()));
+        });
+        delete.click();
+        next_tick().await;
+        let frames = recorded_frames(&calls);
+        let (_, payload, operation_stream) = frames
+            .iter()
+            .find(|(kind, _, _)| kind == "project_delete")
+            .unwrap();
+        assert_eq!(payload["id"], "gamma");
+        let send = calls
+            .iter()
+            .filter_map(|call| {
+                let call = call.dyn_into::<js_sys::Array>().unwrap();
+                let args: JsonValue =
+                    serde_json::from_str(&call.get(1).as_string().unwrap()).unwrap();
+                (call.get(0).as_string().as_deref() == Some("send_host_line")
+                    && args["line"]
+                        .as_str()
+                        .is_some_and(|line| line.contains("project_delete")))
+                .then_some(args)
+            })
+            .next_back()
+            .unwrap();
+        assert_eq!(
+            send["hostId"], "remote",
+            "Deletion routes to the editor's host, not the active project"
+        );
+        assert_eq!(
+            state.projects.get_untracked(),
+            before_projects,
+            "Confirmation is not a catalog update"
+        );
+        crate::dispatch::reset_inbound_state_for_host("remote");
+        dispatch_frame(
+            &state,
+            "remote",
+            StreamPath("/host/remote".into()),
+            FrameKind::ProjectOperation,
+            0,
+            &protocol::ProjectOperationPayload {
+                host_id: protocol::HostFilterId("remote".into()),
+                stream: StreamPath(operation_stream.clone()),
+                mutation: protocol::ProjectMutation::Delete(protocol::ProjectDeletePayload {
+                    id: ProjectId("gamma".into()),
+                }),
+                state: protocol::ProjectOperationState::Failed {
+                    code: protocol::CommandErrorCode::Conflict,
+                    message: "Remove this project's workbenches before deleting the project".into(),
+                    cleanup_may_be_partial: false,
+                },
+            },
+        );
+        next_tick().await;
+        assert!(
+            editor
+                .query_selector("[role='alert']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Remove this project's workbenches")
+        );
+        assert_eq!(
+            state.projects.get_untracked(),
+            before_projects,
+            "Failure leaves the catalog unchanged"
+        );
+        delete.click();
+        next_tick().await;
+        assert!(
+            !editor
+                .text_content()
+                .unwrap()
+                .contains("Remove this project's workbenches"),
+            "A confirmed retry retires the superseded failure"
+        );
+        dispatch_frame(
+            &state,
+            "remote",
+            StreamPath("/host/remote".into()),
+            FrameKind::ProjectOperation,
+            1,
+            &protocol::ProjectOperationPayload {
+                host_id: protocol::HostFilterId("remote".into()),
+                stream: StreamPath("/project-operation/second-delete".into()),
+                mutation: protocol::ProjectMutation::Delete(protocol::ProjectDeletePayload {
+                    id: ProjectId("gamma".into()),
+                }),
+                state: protocol::ProjectOperationState::Failed {
+                    code: protocol::CommandErrorCode::Internal,
+                    message: "Project catalog could not be saved".into(),
+                    cleanup_may_be_partial: false,
+                },
+            },
+        );
+        next_tick().await;
+        assert!(
+            editor
+                .text_content()
+                .unwrap()
+                .contains("Project catalog could not be saved")
+        );
+        assert!(
+            !editor
+                .text_content()
+                .unwrap()
+                .contains("Remove this project's workbenches")
+        );
+        let gamma = state.projects.with_untracked(|projects| {
+            projects
+                .iter()
+                .find(|info| info.host_id == "remote" && info.project.id.0 == "gamma")
+                .unwrap()
+                .project
+                .clone()
+        });
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectNotify,
+            3,
+            &protocol::ProjectNotifyPayload::Delete {
+                project: gamma.clone(),
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Edit project']")
+                .unwrap()
+                .is_some(),
+            "Another host's deletion must not close this editor"
+        );
+        let agent = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.agent_id.0 == "gamma-agent")
+                .unwrap()
+                .clone()
+        });
+        dispatch_frame(
+            &state,
+            "remote",
+            StreamPath("/agent/gamma-agent".into()),
+            FrameKind::AgentProjectChanged,
+            0,
+            &protocol::AgentStartPayload {
+                tyde_permissions: agent.tyde_permissions,
+                swarm_membership: None,
+                agent_id: agent.agent_id,
+                name: agent.name,
+                origin: agent.origin,
+                backend_kind: agent.backend_kind,
+                launch_profile_id: None,
+                workspace_roots: agent.workspace_roots,
+                project_id: None,
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                workflow: None,
+                created_at_ms: agent.created_at_ms,
+            },
+        );
+        dispatch_frame(
+            &state,
+            "remote",
+            StreamPath("/host/remote".into()),
+            FrameKind::ProjectNotify,
+            2,
+            &protocol::ProjectNotifyPayload::Delete { project: gamma },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Edit project']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .query_selector("[data-project-key='remote:gamma']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .agents
+                .get_untracked()
+                .iter()
+                .any(|agent| agent.name == "Gamma Agent"),
+            "Project deletion must not delete conversations"
+        );
+        crate::dispatch::reset_inbound_state_for_host("remote");
         crate::dispatch::reset_inbound_state_for_host("local");
         drop(handle);
         container.remove();

@@ -495,6 +495,10 @@ enum AgentCommand {
         movement: ScheduledProjectMove,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    DetachProject {
+        project_id: protocol::ProjectId,
+        reply: oneshot::Sender<AgentStartPayload>,
+    },
     MoveToProject {
         project_id: Option<protocol::ProjectId>,
         roots: Vec<String>,
@@ -978,6 +982,20 @@ async fn apply_agent_project_move(
     overwrite_agent_start_payload(context.event_log, context.current_start);
     context.start_tx.send_replace(context.current_start.clone());
     Ok(context.current_start.clone())
+}
+
+fn detach_agent_project(
+    project_id: &protocol::ProjectId,
+    current_start: &mut AgentStartPayload,
+    start_tx: &watch::Sender<AgentStartPayload>,
+    event_log: &mut AgentEventLog,
+) -> AgentStartPayload {
+    if current_start.project_id.as_ref() == Some(project_id) {
+        current_start.project_id = None;
+        overwrite_agent_start_payload(event_log, current_start);
+        start_tx.send_replace(current_start.clone());
+    }
+    current_start.clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1990,6 +2008,19 @@ impl AgentHandle {
         received
             .await
             .map_err(|_| "Agent stopped before entry was admitted".to_owned())?
+    }
+
+    pub(crate) async fn detach_project(
+        &self,
+        project_id: protocol::ProjectId,
+    ) -> Result<AgentStartPayload, String> {
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::DetachProject { project_id, reply })
+            .map_err(|_| "Agent stopped before project detachment".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Agent stopped before completing project detachment".to_owned())
     }
 
     pub async fn move_to_project(
@@ -4197,6 +4228,13 @@ pub(crate) fn spawn_agent_actor(
                                 "This agent cannot enter another project in its current state"
                                     .to_owned(),
                             ));
+                        }
+                        AgentCommand::DetachProject { project_id, reply } => {
+                            if current_start.project_id.as_ref() == Some(&project_id) {
+                                current_start.project_id = None;
+                                start_tx.send_replace(current_start.clone());
+                            }
+                            let _ = reply.send(current_start.clone());
                         }
                         AgentCommand::MoveToProject { reply, .. } => {
                             let _ = reply.send(Err(
@@ -10280,6 +10318,10 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Ok(()));
                             }
                         }
+                        AgentCommand::DetachProject { project_id, reply } => {
+                            let start = detach_agent_project(&project_id, &mut current_start, &start_tx, &mut event_log);
+                            let _ = reply.send(start);
+                        }
                         AgentCommand::MoveToProject { project_id, roots, reply } => {
                             let result = if !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
                                 Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned())
@@ -11501,6 +11543,10 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ = reply.send(InterruptOutcome::Rejected);
                         }
                         AgentCommand::ScheduleProjectMove { reply, .. } => { let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned())); }
+                        AgentCommand::DetachProject { project_id, reply } => {
+                            let start = detach_agent_project(&project_id, &mut current_start, &start_tx, &mut event_log);
+                            let _ = reply.send(start);
+                        }
                         AgentCommand::MoveToProject { reply, .. } => { let _ = reply.send(Err("This agent cannot move in its current state".to_owned())); }
             AgentCommand::RecordHandoff { reply, .. } => {
                 let _ = reply.send(Err("Handoff source is not running".to_owned()));
@@ -12810,6 +12856,10 @@ async fn park_terminal_agent(
                     "This agent cannot enter another project in its current state".to_owned(),
                 ));
             }
+            AgentCommand::DetachProject { project_id, reply } => {
+                let start = detach_agent_project(&project_id, current_start, start_tx, event_log);
+                let _ = reply.send(start);
+            }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
@@ -13092,6 +13142,10 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(Err(
                     "This agent cannot enter another project in its current state".to_owned(),
                 ));
+            }
+            AgentCommand::DetachProject { project_id, reply } => {
+                let start = detach_agent_project(&project_id, current_start, start_tx, event_log);
+                let _ = reply.send(start);
             }
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));

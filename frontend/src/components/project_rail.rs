@@ -1222,6 +1222,92 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
             crate::notices::project_mutation_pending(&state, &project.host_id, &project.project_id)
         })
     };
+    let delete_blocked = {
+        let state = state.clone();
+        let project = project.clone();
+        Memo::new(move |_| {
+            if info.with(|info| {
+                info.as_ref()
+                    .is_some_and(|info| info.project.is_workbench())
+            }) {
+                Some("Use Remove Workbench in the project menu to remove this workbench.")
+            } else if state.projects.with(|projects| {
+                projects.iter().any(|info| {
+                    info.host_id == project.host_id
+                        && info.project.parent_project_id() == Some(&project.project_id)
+                })
+            }) {
+                Some("Remove this project's workbenches before deleting the project.")
+            } else {
+                None
+            }
+        })
+    };
+    let delete_errors = {
+        let state = state.clone();
+        let project = project.clone();
+        move || {
+            let mut errors = state.project_operations.with(|operations| {
+                operations.iter().filter_map(|((host, stream), operation)| {
+                    if host == &project.host_id
+                        && matches!(&operation.mutation, protocol::ProjectMutation::Delete(payload) if payload.id == project.project_id)
+                        && let protocol::ProjectOperationState::Failed { message, .. } = &operation.state
+                    {
+                        Some((stream.clone(), message.clone()))
+                    } else {
+                        None
+                    }
+                }).collect::<Vec<_>>()
+            });
+            errors.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+            errors
+                .into_iter()
+                .map(|(_, message)| view! { <p role="alert">{message}</p> })
+                .collect_view()
+        }
+    };
+    let confirming = RwSignal::new(false);
+    let delete_state = state.clone();
+    let delete_target = project.clone();
+    let on_delete = move |_| {
+        if confirming.get_untracked()
+            || busy.get_untracked()
+            || delete_blocked.get_untracked().is_some()
+        {
+            return;
+        }
+        let Some(info) = info.get_untracked() else {
+            return;
+        };
+        confirming.set(true);
+        let state = delete_state.clone();
+        let target = delete_target.clone();
+        spawn_local(async move {
+            let message = format!(
+                "Delete project \"{}\"? Source files stay on disk. Agent sessions and history are preserved and detached from the project. Project-scoped steering and reviews are removed, and team project references are cleared.",
+                info.project.name
+            );
+            let confirmed = crate::bridge::try_confirm_dialog("Delete project", &message).await;
+            confirming.try_set(false);
+            match confirmed {
+                Ok(true) => {
+                    state.project_operations.update(|operations| {
+                        operations.retain(|(host, _), operation| {
+                            !(host == &target.host_id
+                                && matches!(&operation.mutation, protocol::ProjectMutation::Delete(payload) if payload.id == target.project_id)
+                                && matches!(operation.state, protocol::ProjectOperationState::Failed { .. }))
+                        });
+                    });
+                    delete_project(&state, target.host_id, target.project_id);
+                }
+                Ok(false) => {}
+                Err(error) => crate::notices::report_error(
+                    crate::notices::NoticeScope::Project(target.host_id, target.project_id),
+                    error,
+                ),
+            }
+        });
+    };
     let save_state = state.clone();
     let save_project = project.clone();
     let save = move |_| {
@@ -1318,7 +1404,16 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                         <p>"Roots are managed by workbench creation while this project is a workbench or has workbenches."</p>
                     </Show>
                 </div>
-                <div class="modal-actions"><button class="modal-button primary" on:click=move |_| close.set(None)>"Done"</button></div>
+                <Show when=move || delete_blocked.get().is_some()>
+                    <p id="project-delete-blocked" role="status">{move || delete_blocked.get()}</p>
+                </Show>
+                {delete_errors}
+                <div class="modal-actions">
+                    <button class="modal-button danger" aria-describedby=move || delete_blocked.get().map(|_| "project-delete-blocked")
+                        disabled=move || confirming.get() || busy.get() || info.get().is_none() || delete_blocked.get().is_some()
+                        on:click=on_delete>"Delete project"</button>
+                    <button class="modal-button primary" on:click=move |_| close.set(None)>"Done"</button>
+                </div>
             </div>
         </div>
     }

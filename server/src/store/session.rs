@@ -630,7 +630,9 @@ impl SessionStore {
     }
 
     pub fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
-        self.cas(&[], |records| {
+        self.reservation_transaction(|transaction| {
+            let original = read_raw_records(transaction, &[])?;
+            let mut records = decode_records(&original)?;
             let mut detached = Vec::new();
             for record in records.values_mut() {
                 if record.project_id.as_ref() == Some(project_id) {
@@ -638,11 +640,32 @@ impl SessionStore {
                     detached.push(record.id.clone());
                 }
             }
-            if detached.is_empty() {
-                return Ok((detached, false));
+            let reservations = {
+                let mut statement = transaction
+                    .prepare("SELECT record FROM startup_reservations")
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sql_error)?;
+                rows.map(|row| {
+                    serde_json::from_str::<StartupReservation>(&row.map_err(sql_error)?)
+                        .map_err(|error| format!("decode startup reservation: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut wrote = !detached.is_empty();
+            for mut reservation in reservations {
+                if reservation.spawn.project_id.as_ref() == Some(project_id) {
+                    reservation.spawn.project_id = None;
+                    write_reservation(transaction, &reservation)?;
+                    wrote = true;
+                }
+            }
+            if !detached.is_empty() {
+                write_records(transaction, &original, records)?;
             }
             detached.sort_by(|left, right| left.0.cmp(&right.0));
-            Ok((detached, true))
+            Ok((detached, wrote))
         })
     }
 

@@ -8558,6 +8558,51 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 self.delete_session(session_id).await?;
             }
         } else {
+            let id = project_id.clone();
+            let agents = self
+                .state
+                .with(move |state| {
+                    state
+                        .registry
+                        .agent_ids()
+                        .into_iter()
+                        .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
+                        .filter(|handle| handle.snapshot().project_id.as_ref() == Some(&id))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for agent in agents {
+                let start = agent
+                    .detach_project(project_id.clone())
+                    .await
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                self.state
+                    .with(move |state| {
+                        let prefix = format!("/agent/{}/", start.agent_id);
+                        let payload = serde_json::to_value(&start)
+                            .expect("typed agent project assignment must serialize");
+                        let mut disconnected = Vec::new();
+                        for (path, subscriber) in state.host_streams.iter_mut() {
+                            if subscriber
+                                .known_agent_streams
+                                .iter()
+                                .any(|stream| stream.0.starts_with(&prefix))
+                                && emit_or_queue_host_frame(
+                                    subscriber,
+                                    FrameKind::AgentProjectChanged,
+                                    payload.clone(),
+                                )
+                                .is_err()
+                            {
+                                disconnected.push(path.clone());
+                            }
+                        }
+                        for path in disconnected {
+                            state.host_streams.remove(&path);
+                        }
+                    })
+                    .await;
+            }
             sessions
                 .detach_project(project_id)
                 .await
