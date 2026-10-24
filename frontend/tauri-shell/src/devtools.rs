@@ -15,15 +15,59 @@ use uuid::Uuid;
 const UI_DEBUG_BIND_ENV: &str = "TYDE_DEV_UI_DEBUG_BIND_ADDR";
 const UI_DEBUG_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
-#[derive(Default)]
 pub struct UiDebugBridgeState {
     ready: AtomicBool,
     pending: Mutex<HashMap<String, oneshot::Sender<UiDebugResponse>>>,
+    startup: tokio::sync::mpsc::UnboundedSender<oneshot::Sender<Result<(), String>>>,
+}
+
+impl Default for UiDebugBridgeState {
+    fn default() -> Self {
+        let (startup, mut requests) =
+            tokio::sync::mpsc::unbounded_channel::<oneshot::Sender<Result<(), String>>>();
+        tauri::async_runtime::spawn(async move {
+            let mut outcome: Option<Result<(), String>> = None;
+            while let Some(reply) = requests.recv().await {
+                let result = match &outcome {
+                    Some(result) => result.clone(),
+                    None => {
+                        let result = match tokio::task::spawn_blocking(|| {
+                            devtools_protocol::notify_dev_instance_startup(
+                                devtools_protocol::DevInstanceStartupSignal::UiReady,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                Err(format!("DEV startup notification task failed: {error}"))
+                            }
+                        };
+                        outcome = Some(result.clone());
+                        result
+                    }
+                };
+                let _ = reply.send(result);
+            }
+        });
+        Self {
+            ready: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
+            startup,
+        }
+    }
 }
 
 impl UiDebugBridgeState {
-    pub fn mark_ready(&self) {
+    pub async fn mark_ready(&self) -> Result<(), String> {
         self.ready.store(true, Ordering::Release);
+        let (reply, result) = oneshot::channel();
+        self.startup
+            .send(reply)
+            .map_err(|_| "DEV startup notification owner stopped".to_owned())?;
+        result
+            .await
+            .map_err(|_| "DEV startup notification owner dropped its result".to_owned())?
     }
 
     pub async fn dispatch_request(

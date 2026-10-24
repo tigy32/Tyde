@@ -31,6 +31,9 @@ fn is_control_plane_noise(env: &Envelope) -> bool {
             | FrameKind::SessionList
             | FrameKind::WorkflowNotify
             | FrameKind::AgentsViewPreferencesNotify
+            // The slow-Git flow has a live agent. Its host-level usage update
+            // legitimately interleaves with the independent project's upsert.
+            | FrameKind::TaskTokenUsage
             | FrameKind::ProjectEvent
     )
 }

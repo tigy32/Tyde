@@ -1005,8 +1005,8 @@ fn set_selected_host(
 }
 
 #[tauri::command]
-fn mark_ui_debug_ready(state: tauri::State<'_, ShellState>) {
-    state.ui_debug.mark_ready();
+async fn mark_ui_debug_ready(state: tauri::State<'_, ShellState>) -> Result<(), String> {
+    state.ui_debug.mark_ready().await
 }
 
 #[tauri::command]

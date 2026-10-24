@@ -192,6 +192,125 @@ pub const DEV_INSTANCE_MUTABLE_PATHS: &[DevInstanceMutablePath] = &[
     },
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "launcher", derive(JsonSchema))]
+#[serde(transparent)]
+pub struct DevInstanceId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevInstanceStartupPhase {
+    Preparing,
+    Frontend,
+    Desktop,
+    HostHandshake,
+    UiHandshake,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DevInstanceFailureKind {
+    Startup,
+    Cancelled,
+    HostProtocolIncompatible { client: u32, server: u32 },
+    HostHandshake,
+    UiHandshake,
+    ChildExit,
+    TaskFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DevInstanceStatus {
+    Starting {
+        phase: DevInstanceStartupPhase,
+    },
+    Ready,
+    Failed {
+        phase: DevInstanceStartupPhase,
+        failure: DevInstanceFailureKind,
+        error: String,
+        cleanup_error: Option<String>,
+    },
+    Exited {
+        exit_status: String,
+    },
+    StatusError {
+        error: String,
+    },
+    CleanupFailed {
+        error: String,
+    },
+    Stopped,
+}
+
+pub const DEV_INSTANCE_STARTUP_ADDR_ENV: &str = "TYDE_DEV_INSTANCE_STARTUP_ADDR";
+pub const DEV_INSTANCE_ID_ENV: &str = "TYDE_DEV_INSTANCE_ID";
+pub const DEV_INSTANCE_STARTUP_CONTRACT_PATH: &str = "devtools-protocol/dev-instance-startup.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevInstanceStartupProtocol {
+    NotificationsV1,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevInstanceStartupContract {
+    pub protocol: DevInstanceStartupProtocol,
+}
+
+pub const DEV_INSTANCE_STARTUP_CONTRACT: DevInstanceStartupContract = DevInstanceStartupContract {
+    protocol: DevInstanceStartupProtocol::NotificationsV1,
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DevInstanceStartupSignal {
+    HostListening { address: std::net::SocketAddr },
+    UiReady,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevInstanceStartupNotification {
+    pub protocol: DevInstanceStartupProtocol,
+    pub instance_id: DevInstanceId,
+    pub signal: DevInstanceStartupSignal,
+}
+
+#[cfg(feature = "launcher")]
+pub fn notify_dev_instance_startup(signal: DevInstanceStartupSignal) -> Result<(), String> {
+    use std::io::Write;
+    let address = std::env::var(DEV_INSTANCE_STARTUP_ADDR_ENV);
+    let instance_id = std::env::var(DEV_INSTANCE_ID_ENV);
+    let (address, instance_id) = match (address, instance_id) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => return Ok(()),
+        (Ok(address), Ok(instance_id)) => (address, DevInstanceId(instance_id)),
+        _ => return Err("Incomplete DEV startup notification ownership".to_owned()),
+    };
+    let address: std::net::SocketAddr = address
+        .parse()
+        .map_err(|error| format!("Invalid DEV startup notification endpoint: {error}"))?;
+    if !address.ip().is_loopback() {
+        return Err("DEV startup notifications require a loopback endpoint".to_owned());
+    }
+    let body = serde_json::to_vec(&DevInstanceStartupNotification {
+        protocol: DEV_INSTANCE_STARTUP_CONTRACT.protocol,
+        instance_id,
+        signal,
+    })
+    .map_err(|error| format!("Cannot serialize DEV startup notification: {error}"))?;
+    let mut stream = std::net::TcpStream::connect(address)
+        .map_err(|error| format!("Cannot connect to DEV startup owner: {error}"))?;
+    stream
+        .write_all(&body)
+        .map_err(|error| format!("Cannot notify DEV startup owner: {error}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| format!("Cannot finish DEV startup notification: {error}"))
+}
+
 /// The parent's Claude CLI credential store, for a dev instance whose
 /// `CLAUDE_CONFIG_DIR` is isolated. The CLI keeps credentials (the
 /// `.credentials.json` file, or the macOS Keychain entry named after this

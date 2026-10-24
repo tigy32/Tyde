@@ -4,9 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fixture::{Fixture, next_frame_matching_on};
-use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::{Peer, RoleClient, ServiceExt};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -38,7 +38,22 @@ marker.with_suffix('.namespace').write_text(json.dumps({'logical_cwd':os.getcwd(
 if marker.with_suffix('.hold').exists():
  control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
  control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL']);control.sendall(b'D')
+ mode_path=marker.with_suffix('.mode')
+ if mode_path.exists():
+  host_port=int(os.environ['TYDE_DEV_HOST_BIND_ADDR'].rsplit(':',1)[1])
+  ui_port=int(os.environ['TYDE_DEV_UI_DEBUG_BIND_ADDR'].rsplit(':',1)[1])
+  control.sendall(host_port.to_bytes(2,'big')+ui_port.to_bytes(2,'big'))
  assert control.recv(1)==b'R'
+ if mode_path.exists():
+  def notify(signal):
+   address,port=os.environ['TYDE_DEV_INSTANCE_STARTUP_ADDR'].rsplit(':',1)
+   with socket.create_connection((address,int(port))) as stream:
+    stream.sendall(json.dumps({'protocol':json.load(open(pathlib.Path.cwd()/'devtools-protocol/dev-instance-startup.json'))['protocol'],'instance_id':os.environ['TYDE_DEV_INSTANCE_ID'],'signal':signal}).encode())
+    stream.shutdown(socket.SHUT_WR)
+  notify({'kind':'host_listening','address':os.environ['TYDE_DEV_HOST_BIND_ADDR']})
+  if mode_path.read_text()=='ready':notify({'kind':'ui_ready'})
+  # No deadline: the owner stops this process after actual readiness/error.
+  assert control.recv(1)==b'X'
 
 PYCONFIG
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -196,19 +211,40 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
             .any(|line| line == "CLAUDE_CREDENTIAL_MATCH=1"),
         "dev instance Claude must still read the parent's credentials"
     );
-    #[cfg(target_os = "linux")]
-    for scenario in [
+    let scenarios = [
+        DevScenario::NativeProtocolMismatch,
+        DevScenario::NativeReady,
+        #[cfg(target_os = "linux")]
         DevScenario::BubblewrapExit,
+        #[cfg(target_os = "linux")]
         DevScenario::RemoveDuringFrontend,
+        #[cfg(target_os = "linux")]
         DevScenario::RemoveDuringDesktop,
-    ] {
+    ];
+    for scenario in scenarios {
         if desktop_marker.exists() {
             std::fs::remove_file(&desktop_marker).expect("reset completed desktop marker");
         }
         std::fs::remove_file(&control_path).expect("remove completed readiness socket");
-        if matches!(scenario, DevScenario::RemoveDuringDesktop) {
-            std::fs::write(desktop_marker.with_extension("hold"), "held")
-                .expect("hold desktop readiness at real process boundary");
+        let hold = desktop_marker.with_extension("hold");
+        if hold.exists() {
+            std::fs::remove_file(&hold).expect("reset desktop gate");
+        }
+        let mode = desktop_marker.with_extension("mode");
+        if mode.exists() {
+            std::fs::remove_file(&mode).expect("reset native readiness mode");
+        }
+        if scenario.holds_desktop() {
+            std::fs::write(&hold, "held").expect("hold desktop readiness at real process boundary");
+        }
+        match scenario {
+            DevScenario::NativeProtocolMismatch => {
+                std::fs::write(&mode, "mismatch").expect("select real handshake rejection")
+            }
+            DevScenario::NativeReady => {
+                std::fs::write(&mode, "ready").expect("select typed readiness")
+            }
+            _ => {}
         }
         let error = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -219,7 +255,17 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
                 &desktop_marker,
                 scenario,
             ));
-        if matches!(scenario, DevScenario::BubblewrapExit) {
+        if matches!(scenario, DevScenario::NativeReady) {
+            assert!(
+                error.is_empty(),
+                "ready attempt must complete without startup error"
+            );
+        } else if matches!(scenario, DevScenario::NativeProtocolMismatch) {
+            assert!(
+                error.contains("IncompatibleProtocol"),
+                "real protocol rejection must be a terminal startup error"
+            );
+        } else if !scenario.removes_pending() {
             assert!(
                 error.contains("exited before ready"),
                 "DEV must reach the real child exit, not fail host chdir"
@@ -230,7 +276,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
                 "pending startup must observe explicit cancellation"
             );
         }
-        if !matches!(scenario, DevScenario::RemoveDuringFrontend) {
+        if !scenario.is_native() && !scenario.holds_frontend() {
             let proof: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(desktop_marker.with_extension("namespace"))
                     .expect("actual desktop process proof"),
@@ -247,6 +293,8 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
 #[derive(Clone, Copy, Debug)]
 enum DevScenario {
     NativeExit,
+    NativeProtocolMismatch,
+    NativeReady,
     #[cfg(target_os = "linux")]
     BubblewrapExit,
     #[cfg(target_os = "linux")]
@@ -256,6 +304,18 @@ enum DevScenario {
 }
 
 impl DevScenario {
+    fn is_native(self) -> bool {
+        matches!(
+            self,
+            Self::NativeExit | Self::NativeProtocolMismatch | Self::NativeReady
+        )
+    }
+
+    fn holds_desktop(self) -> bool {
+        matches!(self, Self::NativeProtocolMismatch | Self::NativeReady)
+            || (self.removes_pending() && !self.holds_frontend())
+    }
+
     fn removes_pending(self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -303,7 +363,7 @@ async fn start_dev_instance_expecting_exit(
     })
     .await;
     let fixture_root = tempfile::tempdir().expect("disposable project container");
-    let workbench = if !matches!(scenario, DevScenario::NativeExit) {
+    let workbench = if !scenario.is_native() {
         assert!(
             matches!(
                 fixture.bootstrap.workbench_support.bubblewrap,
@@ -338,6 +398,15 @@ async fn start_dev_instance_expecting_exit(
         std::fs::create_dir_all(source.join("frontend/tauri-shell"))
             .expect("DEV fixture config directory");
         std::fs::create_dir(source.join("tools")).expect("DEV fixture tools directory");
+        let contract = source.join(devtools_protocol::DEV_INSTANCE_STARTUP_CONTRACT_PATH);
+        std::fs::create_dir_all(contract.parent().expect("contract parent"))
+            .expect("DEV fixture contract directory");
+        std::fs::write(
+            contract,
+            serde_json::to_vec(&devtools_protocol::DEV_INSTANCE_STARTUP_CONTRACT)
+                .expect("typed child contract"),
+        )
+        .expect("declare supported fixture startup protocol");
         std::fs::write(
             source.join("tools/trunk-command.mjs"),
             "// explicit DEV workload fixture\n",
@@ -455,10 +524,44 @@ async fn start_dev_instance_expecting_exit(
                 .to_path_buf()
         }
     };
-    let transport = StreamableHttpClientTransport::from_uri(
-        fixture.host_for_test().debug_mcp_url_for_test().await,
-    );
+    let debug_url = fixture.host_for_test().debug_mcp_url_for_test().await;
+    let transport = StreamableHttpClientTransport::from_uri(debug_url.clone());
     let service = ().serve(transport).await.expect("connect to debug MCP");
+    if matches!(scenario, DevScenario::NativeExit) {
+        let unsupported = tempfile::tempdir().expect("unsupported source checkout");
+        let contract = unsupported
+            .path()
+            .join(devtools_protocol::DEV_INSTANCE_STARTUP_CONTRACT_PATH);
+        for declaration in [None, Some(r#"{"protocol":"unsupported"}"#)] {
+            if let Some(declaration) = declaration {
+                std::fs::create_dir_all(contract.parent().expect("contract parent"))
+                    .expect("contract directory");
+                std::fs::write(&contract, declaration).expect("unsupported child declaration");
+            }
+            let rejected = debug_call(
+                service.peer(),
+                "tyde_dev_instance_start",
+                json!({"project_dir": unsupported.path().display().to_string()}),
+            )
+            .await;
+            assert_eq!(
+                rejected.is_error,
+                Some(true),
+                "unsupported source must fail before launching"
+            );
+            let content = rejected.content.first().expect("contract rejection");
+            assert!(
+                matches!(&content.raw, RawContent::Text(text) if text.text.contains("startup contract"))
+            );
+            let inventory =
+                debug_json(&debug_call(service.peer(), "tyde_dev_instance_list", json!({})).await);
+            assert!(
+                inventory.as_array().expect("inventory").is_empty(),
+                "rejected source must not create a startup attempt"
+            );
+            assert!(!desktop_marker.exists());
+        }
+    }
     let (release_probe, held_probe) = std::sync::mpsc::channel();
     let (probe_entered_tx, probe_entered) = tokio::sync::oneshot::channel();
     let probe_root =
@@ -472,63 +575,21 @@ async fn start_dev_instance_expecting_exit(
             let _ = probe_entered_tx.send(());
             let _ = held_probe.recv();
         });
-    let mut start = Box::pin(
-        service.call_tool(CallToolRequestParams {
-            meta: None,
-            name: "tyde_dev_instance_start".into(),
-            arguments: json!({ "project_dir": repo_root.display().to_string() })
-                .as_object()
-                .cloned(),
-            task: None,
-        }),
-    );
-    let (mut control, _) = tokio::select! {
-        result = &mut start => {
-            let details = match result {
-                Ok(result) => result.content.into_iter().filter_map(|content| match content.raw {
-                    RawContent::Text(text) => Some(text.text.replace(CREDENTIAL_SENTINEL, "[redacted]")),
-                    _ => None,
-                }).collect::<Vec<_>>(),
-                Err(error) => vec![error.to_string()],
-            };
-            let producer = match std::fs::read_to_string(&producer_proof) {
-                Ok(value) => value,
-                Err(error) => format!("producer_proof_unavailable={:?}", error.kind()),
-            };
-            panic!("DEV READINESS scenario={scenario:?} settled before frontend gate: producer={producer} details={details:?}");
-        },
-        connected = control_listener.accept() => connected.expect("frontend entered actual readiness gate"),
-    };
-    let marker = match control.read_u8().await {
-        Ok(marker) => marker,
-        Err(error) => {
-            drop(release_probe);
-            let result = start
-                .as_mut()
-                .await
-                .expect("frontend failure settles start");
-            let output = result
-                .content
-                .iter()
-                .filter_map(|content| match &content.raw {
-                    RawContent::Text(text) => {
-                        Some(text.text.replace(CREDENTIAL_SENTINEL, "[redacted]"))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let producer = match std::fs::read_to_string(&producer_proof) {
-                Ok(value) => value,
-                Err(error) => format!("producer_proof_unavailable={:?}", error.kind()),
-            };
-            panic!(
-                "DEV READINESS scenario={scenario:?} phase=control-before-bound-closed error={:?} producer={producer:?} startup_output={output:?} tool_error={}",
-                error.kind(),
-                result.is_error == Some(true)
-            );
-        }
-    };
+    let peer = service.peer().clone();
+    let source = repo_root.display().to_string();
+    let start = tokio::spawn(async move {
+        debug_call(
+            &peer,
+            "tyde_dev_instance_start",
+            json!({ "project_dir": source }),
+        )
+        .await
+    });
+    let (mut control, _) = control_listener
+        .accept()
+        .await
+        .expect("frontend entered actual readiness gate");
+    let marker = control.read_u8().await.expect("owned frontend bound event");
     assert_eq!(marker, b'B');
     assert!(
         !desktop_marker.exists(),
@@ -539,6 +600,73 @@ async fn start_dev_instance_expecting_exit(
         .await
         .expect("real canonical probe is held before connecting");
     eprintln!("DEV READINESS scenario={scenario:?} phase=canonical-probe-held producer_bound=true");
+    // Fails immediately on the old implementation while the real child is
+    // held: its ready-only registry incorrectly reports no owned attempt.
+    let listed = debug_json(&debug_call(service.peer(), "tyde_dev_instance_list", json!({})).await);
+    let entries = listed.as_array().expect("DEV inventory array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "pending startup must be registered before readiness"
+    );
+    let instance_id = entries[0]["instanceId"]
+        .as_str()
+        .expect("public pending handle")
+        .to_owned();
+    assert_eq!(entries[0]["status"]["kind"], "starting");
+    assert!(
+        entries[0].get("hostAddr").is_none(),
+        "pending state must not attest host readiness"
+    );
+    let accepted = debug_json(&start.await.expect("immediate start acknowledgement"));
+    assert!(
+        accepted["instanceId"].as_str() == Some(instance_id.as_str()),
+        "ack and inventory must identify one attempt"
+    );
+    // Discard the original connection/receipt. A new MCP client recovers the
+    // same actor-owned attempt, rather than silently starting another child.
+    service
+        .cancel()
+        .await
+        .expect("disconnect original caller while startup is held");
+    let service =
+        ().serve(StreamableHttpClientTransport::from_uri(debug_url))
+            .await
+            .expect("reattach debug client");
+    let snapshot = debug_json(
+        &debug_call(
+            service.peer(),
+            "tyde_debug_snapshot",
+            json!({"instance_id": instance_id}),
+        )
+        .await,
+    );
+    assert_eq!(snapshot["ready"], false);
+    assert!(snapshot["instance"]["instanceId"].as_str() == Some(instance_id.as_str()));
+    let duplicate = debug_call(
+        service.peer(),
+        "tyde_dev_instance_start",
+        json!({"project_dir": repo_root.display().to_string()}),
+    )
+    .await;
+    assert_eq!(
+        duplicate.is_error,
+        Some(true),
+        "duplicate source start must be rejected"
+    );
+    let output = debug_json(
+        &debug_call(
+            service.peer(),
+            "tyde_debug_events",
+            json!({"instance_id": instance_id}),
+        )
+        .await,
+    );
+    assert!(
+        output["nextCursor"].is_u64(),
+        "pending output must expose a resumable cursor"
+    );
+
     // The old producer announced B with no listener, letting a competing
     // endpoint (or self-connect) answer before the intended readiness gate.
     // B now attests a bound child; release only the real probe, not HTTP200.
@@ -574,17 +702,84 @@ async fn start_dev_instance_expecting_exit(
         "DEV READINESS scenario={scenario:?} phase=owned-http-request local=127.0.0.1:{port} peer=127.0.0.1:{peer_port} self_connected=false awaiting_http200=true"
     );
     let mut desktop_control = None;
+    let mut host_probe = None;
+    let mut ui_probe = None;
     if !scenario.holds_frontend() {
         control
             .write_all(b"R")
             .await
             .expect("release actual frontend readiness");
-        if scenario.removes_pending() {
-            let (mut connected, _) = tokio::select! {
-                result = &mut start => panic!("dev start settled before desktop readiness gate: tool_completed={}", result.is_ok()),
-                connected = control_listener.accept() => connected.expect("desktop entered actual readiness gate"),
-            };
+        if scenario.holds_desktop() {
+            let (mut connected, _) = control_listener
+                .accept()
+                .await
+                .expect("desktop entered actual readiness gate");
             assert_eq!(connected.read_u8().await.expect("desktop held event"), b'D');
+            if scenario.is_native() {
+                let host_port = connected.read_u16().await.expect("owned host port");
+                let ui_port = connected.read_u16().await.expect("owned UI-debug port");
+                let host_listener =
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, host_port))
+                        .await
+                        .expect("bind actual host protocol endpoint");
+                let mismatch = matches!(scenario, DevScenario::NativeProtocolMismatch);
+                host_probe = Some(tokio::spawn(async move {
+                    let (stream, _) = host_listener
+                        .accept()
+                        .await
+                        .expect("launcher connected to announced host");
+                    let mut config = server::ServerConfig::current();
+                    if mismatch {
+                        config.protocol_version += 1;
+                    }
+                    match server::accept(&config, stream).await {
+                        Ok(connection) => {
+                            assert!(!mismatch, "incompatible real protocol must reject");
+                            drop(connection);
+                        }
+                        Err(server::HandshakeError::IncompatibleProtocol { client, server }) => {
+                            assert!(mismatch);
+                            assert_eq!(client, protocol::PROTOCOL_VERSION);
+                            assert_eq!(server, protocol::PROTOCOL_VERSION + 1);
+                        }
+                        Err(_) => panic!("unexpected host handshake failure"),
+                    }
+                }));
+                if !mismatch {
+                    let ui_listener =
+                        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, ui_port))
+                            .await
+                            .expect("bind real UI-debug transport fixture");
+                    ui_probe = Some(tokio::spawn(async move {
+                        let (mut stream, _) = ui_listener
+                            .accept()
+                            .await
+                            .expect("launcher UI readiness request");
+                        let mut body = Vec::new();
+                        stream
+                            .read_to_end(&mut body)
+                            .await
+                            .expect("read typed UI request");
+                        assert!(matches!(
+                            serde_json::from_slice::<devtools_protocol::UiDebugRequest>(&body)
+                                .expect("typed UI request"),
+                            devtools_protocol::UiDebugRequest::Ping
+                        ));
+                        stream
+                            .write_all(
+                                &serde_json::to_vec(&devtools_protocol::UiDebugResponse::Pong)
+                                    .expect("serialize typed Pong"),
+                            )
+                            .await
+                            .expect("send UI readiness result");
+                        stream.shutdown().await.expect("finish UI readiness result");
+                    }));
+                }
+                connected
+                    .write_all(b"R")
+                    .await
+                    .expect("release owned desktop startup notifications");
+            }
             desktop_control = Some(connected);
         }
     }
@@ -600,7 +795,11 @@ async fn start_dev_instance_expecting_exit(
             .await
             .expect("remove workbench while actual startup readiness is held");
         let (start_result, removed) = tokio::join!(
-            start.as_mut(),
+            debug_call(
+                service.peer(),
+                "tyde_dev_instance_wait",
+                json!({"instance_id": instance_id})
+            ),
             next_frame_matching_on(&mut fixture.client, "pending DEV workbench removed", |e| {
                 e.kind == protocol::FrameKind::CommandError
                     || (e.kind == protocol::FrameKind::ProjectNotify
@@ -616,20 +815,127 @@ async fn start_dev_instance_expecting_exit(
             !repo_root.exists(),
             "joined workbench removal must remove the host root"
         );
-        start_result.expect("cancelled DEV tool completes")
+        start_result
     } else {
-        start.as_mut().await.expect("call tyde_dev_instance_start")
+        debug_call(
+            service.peer(),
+            "tyde_dev_instance_wait",
+            json!({"instance_id": instance_id}),
+        )
+        .await
     };
-    drop(start);
-    let startup_error = result
-        .content
-        .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    if let Some(probe) = host_probe {
+        probe.await.expect("join actual host handshake");
+    }
+    if let Some(probe) = ui_probe {
+        probe.await.expect("join actual UI readiness transport");
+    }
+    let terminal = debug_json(&result);
+    assert!(
+        terminal["instanceId"].as_str() == Some(instance_id.as_str()),
+        "terminal result must belong to the original attempt"
+    );
+    let startup_error = if matches!(scenario, DevScenario::NativeReady) {
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(terminal["status"]["kind"], "ready");
+        assert_eq!(terminal["storesEphemeral"], true);
+        let store = terminal["storeDir"]
+            .as_str()
+            .expect("canonical ready store");
+        assert!(Path::new(store).is_dir());
+        let stop = debug_call(
+            service.peer(),
+            "tyde_dev_instance_stop",
+            json!({"instance_id": instance_id}),
+        )
+        .await;
+        assert_ne!(stop.is_error, Some(true));
+        assert_eq!(debug_json(&stop)["status"]["kind"], "stopped");
+        assert!(
+            !Path::new(store).exists(),
+            "explicit stop must join private resource cleanup"
+        );
+        String::new()
+    } else {
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "actual startup failure must remain a tool error"
+        );
+        assert_eq!(terminal["status"]["kind"], "failed");
+        if matches!(scenario, DevScenario::NativeProtocolMismatch) {
+            assert_eq!(terminal["status"]["phase"], "host_handshake");
+            assert_eq!(
+                terminal["status"]["failure"]["kind"],
+                "host_protocol_incompatible"
+            );
+            assert_eq!(
+                terminal["status"]["failure"]["client"],
+                protocol::PROTOCOL_VERSION
+            );
+            assert_eq!(
+                terminal["status"]["failure"]["server"],
+                protocol::PROTOCOL_VERSION + 1
+            );
+        }
+        let replay = debug_call(
+            service.peer(),
+            "tyde_dev_instance_wait",
+            json!({"instance_id": instance_id}),
+        )
+        .await;
+        assert_eq!(replay.is_error, Some(true));
+        assert!(
+            debug_json(&replay) == terminal,
+            "reattach must preserve the same terminal failure"
+        );
+        let output = debug_json(
+            &debug_call(
+                service.peer(),
+                "tyde_debug_events",
+                json!({"instance_id": instance_id}),
+            )
+            .await,
+        );
+        let snapshot = debug_json(
+            &debug_call(
+                service.peer(),
+                "tyde_debug_snapshot",
+                json!({"instance_id": instance_id}),
+            )
+            .await,
+        );
+        assert!(
+            output["nextCursor"]
+                .as_u64()
+                .expect("settled output cursor")
+                > 1,
+            "fixture must exercise a nontrivial output window"
+        );
+        assert_eq!(
+            snapshot["outputCursor"], output["nextCursor"],
+            "snapshot must identify the actual output head"
+        );
+        let resumed = debug_json(
+            &debug_call(
+                service.peer(),
+                "tyde_debug_events",
+                json!({"instance_id": instance_id, "cursor": snapshot["outputCursor"]}),
+            )
+            .await,
+        );
+        assert!(
+            resumed["events"]
+                .as_array()
+                .expect("resumed output events")
+                .is_empty(),
+            "resuming a settled snapshot must not replay old output"
+        );
+        terminal["status"]["error"]
+            .as_str()
+            .expect("typed startup failure")
+            .to_owned()
+    };
     assert_eq!(
         desktop_marker.exists(),
         !scenario.holds_frontend(),
@@ -669,16 +975,7 @@ async fn start_dev_instance_expecting_exit(
     assert_eq!(released.kind(), std::io::ErrorKind::ConnectionRefused);
     eprintln!("DEV READINESS scenario={scenario:?} phase=endpoint-released-after-cleanup");
     service.cancel().await.expect("cancel debug MCP client");
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "failed or cancelled actual DEV process must report a tool error"
-    );
-    let content = result.content.first().expect("start error content");
-    let RawContent::Text(text) = &content.raw else {
-        panic!("expected text start error, got {:?}", content.raw);
-    };
-    let error = text.text.clone();
+    let error = startup_error;
     if let Some(project) = workbench
         && !scenario.removes_pending()
     {
@@ -695,4 +992,27 @@ async fn start_dev_instance_expecting_exit(
     }
     eprintln!("DEV READINESS scenario={scenario:?} phase=terminal-cleanup-joined");
     error
+}
+
+async fn debug_call(
+    peer: &Peer<RoleClient>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> CallToolResult {
+    peer.call_tool(CallToolRequestParams {
+        meta: None,
+        name: name.to_owned().into(),
+        arguments: arguments.as_object().cloned(),
+        task: None,
+    })
+    .await
+    .expect("debug MCP boundary call")
+}
+
+fn debug_json(result: &CallToolResult) -> serde_json::Value {
+    let content = result.content.first().expect("debug MCP JSON content");
+    let RawContent::Text(text) = &content.raw else {
+        panic!("debug MCP result must contain JSON text");
+    };
+    serde_json::from_str(&text.text).expect("typed debug MCP JSON result")
 }

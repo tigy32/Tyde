@@ -16,6 +16,11 @@ pub fn start_dev_host_listener(host: server::HostHandle) -> Result<Option<String
     let local_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to resolve dev host listener addr: {err}"))?;
+    devtools_protocol::notify_dev_instance_startup(
+        devtools_protocol::DevInstanceStartupSignal::HostListening {
+            address: local_addr,
+        },
+    )?;
 
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {

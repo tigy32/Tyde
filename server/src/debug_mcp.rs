@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::process_env::launch::{
     AsyncCommandGroup, AsyncGroupChild, GroupCommand as Command, ProcessStdio as Stdio,
@@ -12,8 +12,12 @@ use client::ClientConfig;
 use devtools_protocol::{
     BoundedDebugOutput, CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV, DEV_INSTANCE_DENY_PROXY_URL,
     DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_HOME_ENV,
-    DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS,
-    DebugOutputSlice, DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
+    DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_ID_ENV,
+    DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DEV_INSTANCE_STARTUP_ADDR_ENV,
+    DEV_INSTANCE_STARTUP_CONTRACT, DEV_INSTANCE_STARTUP_CONTRACT_PATH, DebugOutputSlice,
+    DevInstanceFailureKind, DevInstanceHermesEnvironmentAttestation, DevInstanceId,
+    DevInstanceStartupCleanup, DevInstanceStartupContract, DevInstanceStartupNotification,
+    DevInstanceStartupPhase, DevInstanceStartupSignal, DevInstanceStatus,
     DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
     UiDebugResponse, dev_instance_mutable_paths, is_provider_environment_key,
     parent_claude_credential_store_dir, prepare_disposable_hermes_environment,
@@ -35,9 +39,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -103,57 +106,101 @@ enum InstanceCommand {
         project_dir: PathBuf,
         input: StartInstanceToolInput,
         execution_project: Option<Box<Project>>,
-        cancellation: CancellationToken,
-        reply: oneshot::Sender<Result<StartInstanceResult, String>>,
+        reply: oneshot::Sender<Result<DevInstanceSummary, String>>,
+    },
+    Wait {
+        id: DevInstanceId,
+        reply: oneshot::Sender<Result<DevInstanceSummary, String>>,
     },
     CloseProject {
         project_id: ProjectId,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Remove {
-        id: String,
+        id: DevInstanceId,
         reply: oneshot::Sender<Result<DevInstanceSummary, String>>,
     },
     List {
         reply: oneshot::Sender<Vec<DevInstanceSummary>>,
     },
     Address {
-        id: String,
+        id: DevInstanceId,
         reply: oneshot::Sender<Result<SocketAddr, String>>,
     },
     Output {
-        id: String,
+        id: DevInstanceId,
         cursor: Option<u64>,
         max_bytes: usize,
         reply: oneshot::Sender<Result<DebugOutputSlice, String>>,
     },
     Snapshot {
-        id: String,
+        id: DevInstanceId,
         reply: oneshot::Sender<Result<DebugSnapshotResult, String>>,
     },
 }
 
-struct PendingDevStart {
+struct DevAttempt {
+    instance_id: DevInstanceId,
     project_id: Option<ProjectId>,
+    project_dir: PathBuf,
+    started_at_ms: u64,
+    status: DevInstanceStatus,
     cancellation: CancellationToken,
-    reply: oneshot::Sender<Result<StartInstanceResult, String>>,
+    output: StartupOutput,
+    waiters: Vec<oneshot::Sender<Result<DevInstanceSummary, String>>>,
+    stops: Vec<oneshot::Sender<Result<DevInstanceSummary, String>>>,
+}
+
+struct StartupProgress {
+    instance_id: DevInstanceId,
+    phase: DevInstanceStartupPhase,
+}
+
+#[derive(Clone)]
+struct StartupReporter {
+    instance_id: DevInstanceId,
+    updates: mpsc::UnboundedSender<StartupProgress>,
+}
+
+impl StartupReporter {
+    fn phase(&self, phase: DevInstanceStartupPhase) -> Result<(), String> {
+        self.updates
+            .send(StartupProgress {
+                instance_id: self.instance_id.clone(),
+                phase,
+            })
+            .map_err(|_| "DEV startup owner stopped".to_owned())
+    }
 }
 
 struct DevStartFailure {
+    kind: DevInstanceFailureKind,
     message: String,
     cleanup_error: Option<String>,
 }
 
 impl From<String> for DevStartFailure {
     fn from(message: String) -> Self {
-        Self {
-            message,
-            cleanup_error: None,
-        }
+        Self::new(DevInstanceFailureKind::Startup, message)
     }
 }
 
 impl DevStartFailure {
+    fn new(kind: DevInstanceFailureKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            cleanup_error: None,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self::new(
+            DevInstanceFailureKind::Cancelled,
+            "DEV startup cancelled".to_owned(),
+        )
+    }
+
     fn with_cleanup(mut self, error: String) -> Self {
         self.message = format!("{}; {error}", self.message);
         self.cleanup_error = Some(match self.cleanup_error {
@@ -177,69 +224,107 @@ fn start_instance_registry(
     >,
 ) {
     tokio::spawn(async move {
-        let mut records = HashMap::<String, DevInstanceRecord>::new();
+        let mut records = HashMap::<DevInstanceId, DevInstanceRecord>::new();
+        let mut attempts = HashMap::<DevInstanceId, DevAttempt>::new();
         let mut closed_projects = std::collections::HashSet::new();
         let mut closing = HashMap::<ProjectId, ClosingDevProject>::new();
         let mut starts = tokio::task::JoinSet::new();
-        let mut pending = HashMap::<tokio::task::Id, PendingDevStart>::new();
+        let mut pending = HashMap::<tokio::task::Id, DevInstanceId>::new();
+        let (updates, mut progress) = mpsc::unbounded_channel::<StartupProgress>();
         let mut receiving = true;
         loop {
             let command = tokio::select! {
+                biased;
+                Some(update) = progress.recv() => {
+                    if let Some(attempt) = attempts.get_mut(&update.instance_id)
+                        && matches!(attempt.status, DevInstanceStatus::Starting { .. }) {
+                        attempt.status = DevInstanceStatus::Starting { phase: update.phase };
+                    }
+                    None
+                },
+                completed = starts.join_next_with_id(), if !starts.is_empty() => {
+                    if let Some(completed) = completed {
+                        let (task_id, result) = match completed {
+                            Ok(value) => value,
+                            Err(error) => (error.id(), Err(DevStartFailure::new(
+                                DevInstanceFailureKind::TaskFailed, "DEV startup task failed".to_owned(),
+                            ).with_cleanup("DEV startup cleanup could not be confirmed".to_owned()))),
+                        };
+                        if let Some(id) = pending.remove(&task_id)
+                            && let Some(attempt) = attempts.get_mut(&id) {
+                            let result = match result {
+                                Ok(record) if attempt.cancellation.is_cancelled() => {
+                                    let error = DevStartFailure::cancelled();
+                                    match stop_record(record).await {
+                                        Ok(()) => Err(error),
+                                        Err(cleanup) => Err(error.with_cleanup(cleanup)),
+                                    }
+                                },
+                                other => other,
+                            };
+                            match result {
+                                Ok(record) => {
+                                    records.insert(id.clone(), record);
+                                    attempt.status = DevInstanceStatus::Ready;
+                                },
+                                Err(error) => {
+                                    if let Some(project) = &attempt.project_id
+                                        && let Some(state) = closing.get_mut(project)
+                                        && let Some(cleanup) = &error.cleanup_error {
+                                            state.error = Some(cleanup.clone());
+                                        }
+                                    attempt.status = match attempt.status {
+                                        DevInstanceStatus::Starting { phase } => {
+                                            tracing::warn!(phase = ?phase, "DEV startup failed; inspect its typed instance status");
+                                            DevInstanceStatus::Failed {
+                                                phase,
+                                                failure: error.kind,
+                                                error: error.message,
+                                                cleanup_error: error.cleanup_error,
+                                            }
+                                        },
+                                        _ => DevInstanceStatus::StatusError {
+                                            error: "DEV startup completed outside its starting state".to_owned(),
+                                        },
+                                    };
+                                },
+                            }
+                            let summary = dev_instance_summary(attempt, records.get_mut(&id));
+                            for waiter in attempt.waiters.drain(..) {
+                                let _ = waiter.send(Ok(summary.clone()));
+                            }
+                            if !attempt.stops.is_empty() {
+                                let cleanup_error = match &attempt.status {
+                                    DevInstanceStatus::Failed { cleanup_error, .. } => cleanup_error.clone(),
+                                    _ => None,
+                                };
+                                let mut stopped = summary.clone();
+                                stopped.status = DevInstanceStatus::Stopped;
+                                stopped.ready = None;
+                                for reply in attempt.stops.drain(..) {
+                                    let result = match &cleanup_error {
+                                        Some(error) => Err(error.clone()),
+                                        None => Ok(stopped.clone()),
+                                    };
+                                    let _ = reply.send(result);
+                                }
+                                if cleanup_error.is_none() {
+                                    attempts.remove(&id);
+                                }
+                            }
+                        }
+                    }
+                    None
+                },
                 command = receiver.recv(), if receiving => match command {
                     Some(command) => Some(command),
                     None => {
                         receiving = false;
-                        for start in pending.values() {
-                            start.cancellation.cancel();
+                        for attempt in attempts.values() {
+                            attempt.cancellation.cancel();
                         }
                         None
                     },
-                },
-                completed = starts.join_next_with_id(), if !starts.is_empty() => {
-                    if let Some(completed) = completed {
-                        let (id, result) = match completed {
-                            Ok(value) => value,
-                            Err(error) => (error.id(), Err(DevStartFailure::from(
-                                "DEV startup task failed".to_owned(),
-                            ).with_cleanup("DEV startup cleanup could not be confirmed".to_owned()))),
-                        };
-                        if let Some(start) = pending.remove(&id) {
-                            let result = match result {
-                                Ok((record, result)) => {
-                                    if start.reply.is_closed() || start.project_id.as_ref().is_some_and(|project| closed_projects.contains(project)) {
-                                        match stop_record(record).await {
-                                            Ok(_) => Err("DEV startup ownership was withdrawn; its processes were stopped".to_owned()),
-                                            Err(error) => {
-                                                if let Some(project) = &start.project_id
-                                                    && let Some(state) = closing.get_mut(project) {
-                                                        state.error = Some(error.clone());
-                                                    }
-                                                Err(error)
-                                            }
-                                        }
-                                    } else if records.contains_key(&record.instance_id) {
-                                        match stop_record(record).await {
-                                            Ok(_) => Err("Duplicate DEV instance identity".to_owned()),
-                                            Err(error) => Err(error),
-                                        }
-                                    } else {
-                                        records.insert(record.instance_id.clone(), record);
-                                        Ok(result)
-                                    }
-                                },
-                                Err(error) => {
-                                    if let Some(project) = &start.project_id
-                                        && let Some(state) = closing.get_mut(project)
-                                        && let Some(cleanup) = error.cleanup_error {
-                                            state.error = Some(cleanup);
-                                        }
-                                    Err(error.message)
-                                },
-                            };
-                            let _ = start.reply.send(result);
-                        }
-                    }
-                    None
                 },
                 else => break,
             };
@@ -249,15 +334,11 @@ fn start_instance_registry(
                         project_dir,
                         input,
                         execution_project,
-                        cancellation,
                         reply,
                     } => {
                         let project_id =
                             execution_project.as_ref().map(|project| project.id.clone());
-                        if cancellation.is_cancelled() {
-                            let _ =
-                                reply.send(Err("DEV startup cancelled before launch".to_owned()));
-                        } else if project_id
+                        if project_id
                             .as_ref()
                             .is_some_and(|project| closed_projects.contains(project))
                         {
@@ -265,72 +346,173 @@ fn start_instance_registry(
                                 "Workbench is being removed; no DEV process was launched"
                                     .to_owned(),
                             ));
+                        } else if let Some(existing) = attempts
+                            .values()
+                            .find(|attempt| attempt.project_dir == project_dir)
+                        {
+                            let _ = reply.send(Err(format!("DEV source already has an attempt ({}); observe or await it instead of launching again", existing.instance_id.0)));
                         } else {
+                            let instance_id = DevInstanceId(Uuid::new_v4().simple().to_string());
+                            let cancellation = CancellationToken::new();
+                            let output = StartupOutput::new();
+                            let reporter = StartupReporter {
+                                instance_id: instance_id.clone(),
+                                updates: updates.clone(),
+                            };
+                            let mut attempt = DevAttempt {
+                                instance_id: instance_id.clone(),
+                                project_id,
+                                project_dir: project_dir.clone(),
+                                started_at_ms: now_ms(),
+                                status: DevInstanceStatus::Starting {
+                                    phase: DevInstanceStartupPhase::Preparing,
+                                },
+                                cancellation: cancellation.clone(),
+                                output: output.clone(),
+                                waiters: Vec::new(),
+                                stops: Vec::new(),
+                            };
+                            let summary = dev_instance_summary(&mut attempt, None);
+                            attempts.insert(instance_id.clone(), attempt);
                             let task = starts.spawn(build_instance(
                                 project_dir,
                                 input,
                                 execution_project.map(|project| *project),
-                                cancellation.clone(),
+                                cancellation,
+                                output,
+                                reporter,
                                 #[cfg(all(feature = "test-support", unix))]
                                 frontend_listener.take(),
                             ));
-                            pending.insert(
-                                task.id(),
-                                PendingDevStart {
-                                    project_id,
-                                    cancellation,
-                                    reply,
-                                },
-                            );
+                            pending.insert(task.id(), instance_id);
+                            // Losing this reply does not withdraw the actor's process ownership.
+                            let _ = reply.send(Ok(summary));
                         }
                     }
+                    InstanceCommand::Wait { id, reply } => match attempts.get_mut(&id) {
+                        Some(attempt)
+                            if matches!(attempt.status, DevInstanceStatus::Starting { .. }) =>
+                        {
+                            attempt.waiters.retain(|waiter| !waiter.is_closed());
+                            attempt.waiters.push(reply);
+                        }
+                        Some(attempt) => {
+                            let _ =
+                                reply.send(Ok(dev_instance_summary(attempt, records.get_mut(&id))));
+                        }
+                        None => {
+                            let _ = reply.send(Err("Unknown DEV instance".to_owned()));
+                        }
+                    },
                     InstanceCommand::CloseProject { project_id, reply } => {
                         closed_projects.insert(project_id.clone());
-                        for start in pending.values() {
-                            if start.project_id.as_ref() == Some(&project_id) {
-                                start.cancellation.cancel();
-                            }
-                        }
                         closing
                             .entry(project_id.clone())
                             .or_default()
                             .replies
                             .push(reply);
-                        let ids = records
+                        let ids = attempts
                             .iter()
-                            .filter(|(_, record)| record.project_id.as_ref() == Some(&project_id))
+                            .filter(|(_, attempt)| attempt.project_id.as_ref() == Some(&project_id))
                             .map(|(id, _)| id.clone())
                             .collect::<Vec<_>>();
                         for id in ids {
-                            if let Some(record) = records.remove(&id)
-                                && let Err(error) = stop_record(record).await
-                            {
-                                closing.entry(project_id.clone()).or_default().error = Some(error);
+                            if let Some(attempt) = attempts.get(&id) {
+                                attempt.cancellation.cancel();
+                                let cleanup_error = match &attempt.status {
+                                    DevInstanceStatus::Failed { cleanup_error, .. } => {
+                                        cleanup_error.as_ref()
+                                    }
+                                    DevInstanceStatus::CleanupFailed { error } => Some(error),
+                                    _ => None,
+                                };
+                                if let Some(error) = cleanup_error {
+                                    closing.entry(project_id.clone()).or_default().error =
+                                        Some(error.clone());
+                                }
+                            }
+                            if let Some(record) = records.remove(&id) {
+                                match stop_record(record).await {
+                                    Ok(()) => {
+                                        if let Some(attempt) = attempts.get_mut(&id) {
+                                            attempt.status = DevInstanceStatus::Stopped;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let Some(attempt) = attempts.get_mut(&id) {
+                                            attempt.status = DevInstanceStatus::CleanupFailed {
+                                                error: error.clone(),
+                                            };
+                                        }
+                                        closing.entry(project_id.clone()).or_default().error =
+                                            Some(error);
+                                    }
+                                }
                             }
                         }
                     }
-                    InstanceCommand::Remove { id, reply } => {
-                        let result = match records.remove(&id) {
-                            Some(record) => stop_record(record).await,
-                            None => Err("Unknown DEV instance".to_owned()),
-                        };
-                        let _ = reply.send(result);
-                    }
+                    InstanceCommand::Remove { id, reply } => match attempts.get_mut(&id) {
+                        Some(attempt)
+                            if matches!(attempt.status, DevInstanceStatus::Starting { .. }) =>
+                        {
+                            attempt.cancellation.cancel();
+                            attempt.stops.push(reply);
+                        }
+                        Some(attempt) => {
+                            let mut summary = dev_instance_summary(attempt, records.get_mut(&id));
+                            summary.status = DevInstanceStatus::Stopped;
+                            summary.ready = None;
+                            let result = match records.remove(&id) {
+                                Some(record) => stop_record(record).await.map(|()| summary),
+                                None => match &attempt.status {
+                                    DevInstanceStatus::Failed {
+                                        cleanup_error: Some(error),
+                                        ..
+                                    }
+                                    | DevInstanceStatus::CleanupFailed { error } => {
+                                        Err(error.clone())
+                                    }
+                                    _ => Ok(summary),
+                                },
+                            };
+                            if let Err(error) = &result {
+                                attempt.status = DevInstanceStatus::CleanupFailed {
+                                    error: error.clone(),
+                                };
+                            }
+                            if result.is_ok() {
+                                attempts.remove(&id);
+                            }
+                            let _ = reply.send(result);
+                        }
+                        None => {
+                            let _ = reply.send(Err("Unknown DEV instance".to_owned()));
+                        }
+                    },
                     InstanceCommand::List { reply } => {
-                        let mut summaries = records
-                            .values_mut()
-                            .map(dev_instance_summary)
+                        let mut summaries = attempts
+                            .iter_mut()
+                            .map(|(id, attempt)| dev_instance_summary(attempt, records.get_mut(id)))
                             .collect::<Vec<_>>();
-                        summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+                        summaries
+                            .sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
                         let _ = reply.send(summaries);
                     }
                     InstanceCommand::Address { id, reply } => {
-                        let _ = reply.send(
-                            records
-                                .get(&id)
-                                .map(|record| record.ui_debug_addr)
-                                .ok_or_else(|| format!("unknown instance_id '{id}'")),
-                        );
+                        let result = match attempts.get_mut(&id) {
+                            Some(attempt) => {
+                                let summary = dev_instance_summary(attempt, records.get_mut(&id));
+                                match (summary.status, records.get(&id)) {
+                                    (DevInstanceStatus::Ready, Some(record)) => {
+                                        Ok(record.ui_debug_addr)
+                                    }
+                                    _ => Err("DEV instance is not ready; inspect its typed status"
+                                        .to_owned()),
+                                }
+                            }
+                            None => Err("Unknown DEV instance".to_owned()),
+                        };
+                        let _ = reply.send(result);
                     }
                     InstanceCommand::Output {
                         id,
@@ -338,37 +520,29 @@ fn start_instance_registry(
                         max_bytes,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            records
-                                .get(&id)
-                                .map(|record| {
-                                    record
-                                        .startup_output
-                                        .lock()
-                                        .expect("startup output mutex poisoned")
-                                        .read(cursor, max_bytes)
-                                })
-                                .ok_or_else(|| format!("unknown instance_id '{id}'")),
-                        );
+                        let result = match attempts.get(&id) {
+                            Some(attempt) => attempt.output.read(cursor, max_bytes).await,
+                            None => Err("Unknown DEV instance".to_owned()),
+                        };
+                        let _ = reply.send(result);
                     }
                     InstanceCommand::Snapshot { id, reply } => {
-                        let result = records
-                            .get_mut(&id)
-                            .map(|record| {
-                                let output_cursor = record
-                                    .startup_output
-                                    .lock()
-                                    .expect("startup output mutex poisoned")
-                                    .next_cursor();
-                                let instance = dev_instance_summary(record);
-                                DebugSnapshotResult {
-                                    ready: instance.status == "running",
-                                    instance,
-                                    output_cursor,
-                                    capabilities: debug_capabilities(),
+                        let result = match attempts.get_mut(&id) {
+                            Some(attempt) => match attempt.output.head().await {
+                                Ok(output_cursor) => {
+                                    let instance =
+                                        dev_instance_summary(attempt, records.get_mut(&id));
+                                    Ok(DebugSnapshotResult {
+                                        ready: matches!(instance.status, DevInstanceStatus::Ready),
+                                        instance,
+                                        output_cursor,
+                                        capabilities: debug_capabilities(),
+                                    })
                                 }
-                            })
-                            .ok_or_else(|| format!("unknown instance_id '{id}'"));
+                                Err(error) => Err(error),
+                            },
+                            None => Err("Unknown DEV instance".to_owned()),
+                        };
                         let _ = reply.send(result);
                     }
                 }
@@ -376,9 +550,11 @@ fn start_instance_registry(
             let settled = closing
                 .keys()
                 .filter(|project| {
-                    !pending
-                        .values()
-                        .any(|start| start.project_id.as_ref() == Some(*project))
+                    !pending.values().any(|id| {
+                        attempts
+                            .get(id)
+                            .is_some_and(|attempt| attempt.project_id.as_ref() == Some(*project))
+                    })
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -392,6 +568,9 @@ fn start_instance_registry(
                         let _ = reply.send(result.clone());
                     }
                 }
+            }
+            if !receiving && starts.is_empty() {
+                break;
             }
         }
         for (_, record) in records {
@@ -421,7 +600,7 @@ impl DebugMcpState {
 struct DevBuildProcesses {
     frontend: Option<AsyncGroupChild>,
     desktop: Option<AsyncGroupChild>,
-    captures: Vec<tokio::task::JoinHandle<()>>,
+    captures: Vec<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl DevBuildProcesses {
@@ -436,8 +615,10 @@ impl DevBuildProcesses {
             }
         }
         for task in self.captures.drain(..) {
-            if let Err(error) = task.await {
-                errors.push(format!("DEV output capture did not join: {error}"));
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(error) => errors.push(format!("DEV output capture did not join: {error}")),
             }
         }
         if errors.is_empty() {
@@ -449,9 +630,6 @@ impl DevBuildProcesses {
 }
 
 struct DevInstanceRecord {
-    project_id: Option<ProjectId>,
-    instance_id: String,
-    project_dir: PathBuf,
     frontend_port: u16,
     host_addr: SocketAddr,
     ui_debug_addr: SocketAddr,
@@ -459,18 +637,27 @@ struct DevInstanceRecord {
     config_path: PathBuf,
     store_dir: PathBuf,
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
-    startup_output: Arc<StdMutex<BoundedDebugOutput>>,
-    startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
+
+    startup_capture_tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
     child: AsyncGroupChild,
     frontend_child: AsyncGroupChild,
-    started_at_ms: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DevInstanceSummary {
-    instance_id: String,
+    instance_id: DevInstanceId,
+    project_id: Option<ProjectId>,
     project_dir: String,
+    status: DevInstanceStatus,
+    started_at_ms: u64,
+    #[serde(flatten)]
+    ready: Option<DevInstanceReady>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevInstanceReady {
     store_dir: String,
     session_store_path: String,
     stores_ephemeral: bool,
@@ -479,9 +666,7 @@ struct DevInstanceSummary {
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
-    status: String,
     frontend_port: u16,
-    started_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -510,7 +695,7 @@ struct StartInstanceToolInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StopInstanceToolInput {
-    instance_id: String,
+    instance_id: DevInstanceId,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -520,7 +705,7 @@ struct EmptyToolInput {}
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EvaluateToolInput {
-    instance_id: String,
+    instance_id: DevInstanceId,
     expression: String,
     timeout_ms: Option<u64>,
 }
@@ -528,7 +713,7 @@ struct EvaluateToolInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DebugEventsToolInput {
-    instance_id: String,
+    instance_id: DevInstanceId,
     cursor: Option<u64>,
     #[schemars(range(min = 1, max = 32768))]
     max_bytes: Option<usize>,
@@ -537,7 +722,7 @@ struct DebugEventsToolInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DebugSnapshotToolInput {
-    instance_id: String,
+    instance_id: DevInstanceId,
 }
 
 #[derive(Debug, Serialize)]
@@ -556,7 +741,7 @@ struct DebugCapabilities {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DebugEventsResult {
-    instance_id: String,
+    instance_id: DevInstanceId,
     events: Vec<DebugOutputEvent>,
     next_cursor: u64,
     oldest_cursor: u64,
@@ -578,22 +763,6 @@ struct DebugSnapshotResult {
     ready: bool,
     output_cursor: u64,
     capabilities: DebugCapabilities,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StartInstanceResult {
-    instance_id: String,
-    status: &'static str,
-    project_dir: String,
-    store_dir: String,
-    session_store_path: String,
-    stores_ephemeral: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
-    frontend_url: String,
-    host_addr: String,
-    ui_debug_addr: String,
 }
 
 fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
@@ -640,7 +809,7 @@ fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
 #[tool_router]
 impl TydeDebugMcpServer {
     #[tool(
-        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input contains Hermes behind an IPv4 loopback stub. Returns canonical store and containment attestations after the typed host and UI-debug loopback endpoints are ready. Stop and restart it to pick up code changes."
+        description = "Start exactly one actor-owned Tyde desktop DEV attempt with isolated ephemeral stores and hot reload disabled. Returns its starting handle immediately. Observe pending/failed state with list, events or snapshot; await this same instance_id with tyde_dev_instance_wait for typed host/UI readiness and canonical store attestations. A lost caller response never cancels the attempt. Duplicate source starts fail explicitly."
     )]
     async fn tyde_dev_instance_start(
         &self,
@@ -651,6 +820,29 @@ impl TydeDebugMcpServer {
         match start_instance(&self.state, repo_root.as_deref(), input).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Await this existing DEV startup until ready or failed. Reattach with the same instance_id after a lost response; dropping the wait never cancels startup. No startup deadline."
+    )]
+    async fn tyde_dev_instance_wait(
+        &self,
+        Parameters(input): Parameters<StopInstanceToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .state
+            .instance_request(|reply| InstanceCommand::Wait {
+                id: input.instance_id,
+                reply,
+            })
+            .await
+        {
+            Ok(Ok(summary)) => match &summary.status {
+                DevInstanceStatus::Ready => ok_json(summary),
+                _ => Ok(CallToolResult::error(vec![Content::json(summary)?])),
+            },
+            Ok(Err(error)) | Err(error) => Ok(err_text(error)),
         }
     }
 
@@ -665,7 +857,9 @@ impl TydeDebugMcpServer {
         }
     }
 
-    #[tool(description = "List all Tyde dev instances currently launched by this MCP server.")]
+    #[tool(
+        description = "List all DEV attempts owned by this MCP server, including starting and failed attempts. Only ready status attests typed host/UI readiness; pending attempts have no store or endpoint attestation."
+    )]
     async fn tyde_dev_instance_list(
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
@@ -734,7 +928,7 @@ impl ServerHandler for TydeDebugMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start; inspect process output with tyde_debug_events, take a non-visual status snapshot with tyde_debug_snapshot, and drive its frontend with tyde_debug_evaluate. Check tyde_debug_capabilities before requiring screenshots or a second client; unsupported capabilities are reported false. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes."
+                "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start, then await the same handle with tyde_dev_instance_wait; inspect process output with tyde_debug_events, take a non-visual status snapshot with tyde_debug_snapshot, and drive its frontend with tyde_debug_evaluate. Check tyde_debug_capabilities before requiring screenshots or a second client; unsupported capabilities are reported false. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -822,8 +1016,15 @@ async fn start_instance(
     state: &Arc<DebugMcpState>,
     repo_root: Option<&Path>,
     input: StartInstanceToolInput,
-) -> Result<StartInstanceResult, String> {
+) -> Result<DevInstanceSummary, String> {
     let project_dir = resolve_project_dir(repo_root, &input.project_dir)?;
+    let contract_bytes = tokio::fs::read(project_dir.join(DEV_INSTANCE_STARTUP_CONTRACT_PATH)).await
+        .map_err(|error| format!("DEV child startup contract is unavailable: {error}; update this exact source checkout with the launcher startup contract before launching"))?;
+    let contract: DevInstanceStartupContract = serde_json::from_slice(&contract_bytes)
+        .map_err(|error| format!("Unsupported DEV child startup contract: {error}; update the launcher and this exact source checkout together"))?;
+    if contract != DEV_INSTANCE_STARTUP_CONTRACT {
+        return Err("Unsupported DEV child startup contract; update the launcher and this exact source checkout together".to_owned());
+    }
     let host = state
         .project_host
         .get()
@@ -850,19 +1051,14 @@ async fn start_instance(
     if execution_project.is_none() && unresolved_roots {
         return Err("Cannot establish DEV source ownership while registered roots are unavailable; repair the unavailable root assignments before launching an unregistered source".to_owned());
     }
-    let cancellation = CancellationToken::new();
-    let cancel_on_drop = cancellation.clone().drop_guard();
-    let result = state
+    state
         .instance_request(|reply| InstanceCommand::Start {
             project_dir,
             input,
             execution_project: execution_project.map(Box::new),
-            cancellation,
             reply,
         })
-        .await?;
-    cancel_on_drop.disarm();
-    result
+        .await?
 }
 
 async fn build_instance(
@@ -870,10 +1066,12 @@ async fn build_instance(
     input: StartInstanceToolInput,
     execution_project: Option<Project>,
     cancellation: CancellationToken,
+    startup_output: StartupOutput,
+    reporter: StartupReporter,
     #[cfg(all(feature = "test-support", unix))] frontend_listener: Option<
         Arc<std::net::TcpListener>,
     >,
-) -> Result<(DevInstanceRecord, StartInstanceResult), DevStartFailure> {
+) -> Result<DevInstanceRecord, DevStartFailure> {
     let logical_project_dir = match execution_project.as_ref().map(|project| &project.source) {
         Some(ProjectSource::GitWorkbench {
             environment: protocol::WorkbenchEnvironment::Bubblewrap { logical_root, .. },
@@ -888,7 +1086,7 @@ async fn build_instance(
         )
         | None => project_dir.clone(),
     };
-    let instance_id = Uuid::new_v4().simple().to_string();
+    let instance_id = reporter.instance_id.clone();
     #[cfg(all(feature = "test-support", unix))]
     let frontend_port = match &frontend_listener {
         Some(listener) => listener
@@ -909,7 +1107,7 @@ async fn build_instance(
         .as_ref()
         .map(|_| resolve_parent_hermes_runtime_for_dev_instance())
         .transpose()?;
-    let store_dir = dev_instance_store_dir(&instance_id);
+    let store_dir = dev_instance_store_dir(&instance_id.0);
     let mut startup_cleanup = DevInstanceStartupCleanup::new(store_dir.clone());
     let mut processes = DevBuildProcesses::default();
     let result: Result<_, DevStartFailure> = async {
@@ -925,7 +1123,7 @@ async fn build_instance(
             store_dir.display()
         )
     })?;
-    seed_dev_project_store(&store_dir, &project_dir, &instance_id)?;
+    seed_dev_project_store(&store_dir, &project_dir, &instance_id.0)?;
     let prepared_hermes = input
         .hermes
         .as_ref()
@@ -933,8 +1131,8 @@ async fn build_instance(
         .map(|(hermes, runtime)| prepare_disposable_hermes_environment(&store_dir, hermes, runtime))
         .transpose()?;
 
-    startup_cleanup.track_config(dev_instance_config_path(&instance_id));
-    let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
+    startup_cleanup.track_config(dev_instance_config_path(&instance_id.0));
+    let config_path = write_dev_config(&project_dir, frontend_port, &instance_id.0)?;
     let mut frontend_command =
         devtools_protocol::frontend::command(&logical_project_dir, &store_dir, frontend_port)?;
     #[cfg(all(feature = "test-support", unix))]
@@ -957,6 +1155,7 @@ async fn build_instance(
         &store_dir,
         prepared_hermes.as_ref(),
     )?;
+        reporter.phase(DevInstanceStartupPhase::Frontend)?;
         processes.frontend = Some(
             frontend_command
                 .group_spawn()
@@ -967,9 +1166,6 @@ async fn build_instance(
             .frontend
             .as_mut()
             .ok_or_else(|| "DEV frontend ownership missing".to_owned())?;
-        let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
-            STARTUP_LOG_TAIL_BYTES,
-        )));
         let stdout = frontend_child
             .take_stdout()
             .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
@@ -977,8 +1173,8 @@ async fn build_instance(
             .take_stderr()
             .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
         processes.captures = vec![
-            tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
-            tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+            tokio::spawn(capture_startup_output(stdout, startup_output.clone())),
+            tokio::spawn(capture_startup_output(stderr, startup_output.clone())),
         ];
 
         #[cfg(feature = "test-support")]
@@ -994,15 +1190,17 @@ async fn build_instance(
             .map_err(|error| format!("DEV frontend probe observer failed: {error}"))?;
         }
 
-        let readiness = tokio::select! {
+        tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err("DEV startup cancelled".to_owned()),
-            result = devtools_protocol::frontend::wait_until_ready(frontend_child, frontend_port) => result,
-        };
-        if let Err(error) = readiness {
-            return Err(with_startup_diagnostics(error, &startup_output).into());
-        }
+            _ = cancellation.cancelled() => Err(DevStartFailure::cancelled()),
+            result = devtools_protocol::frontend::wait_until_ready(frontend_child, frontend_port) => result.map_err(DevStartFailure::from),
+        }?;
         tracing::debug!("dev frontend ready before desktop launch");
+        reporter.phase(DevInstanceStartupPhase::Desktop)?;
+        let startup_listener = TcpListener::bind("127.0.0.1:0").await
+            .map_err(|error| format!("Cannot bind DEV startup notification endpoint: {error}"))?;
+        let startup_addr = startup_listener.local_addr()
+            .map_err(|error| format!("Cannot read DEV startup notification endpoint: {error}"))?;
         let mut command = tauri_dev_command(&config_path)?;
         if let Some(project) = &execution_project {
             command.in_project(project.clone());
@@ -1010,6 +1208,8 @@ async fn build_instance(
         command
             .current_dir(&logical_project_dir)
             .env("TYDE_DEV_INSTANCE", "1")
+            .env(DEV_INSTANCE_STARTUP_ADDR_ENV, startup_addr.to_string())
+            .env(DEV_INSTANCE_ID_ENV, &instance_id.0)
             .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
             .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
             .stdout(Stdio::piped())
@@ -1034,14 +1234,11 @@ async fn build_instance(
             .take_stderr()
             .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
         processes.captures.extend([
-            tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
-            tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+            tokio::spawn(capture_startup_output(stdout, startup_output.clone())),
+            tokio::spawn(capture_startup_output(stderr, startup_output.clone())),
         ]);
 
         let mut record = DevInstanceRecord {
-            project_id: execution_project.as_ref().map(|project| project.id.clone()),
-            instance_id: instance_id.clone(),
-            project_dir,
             frontend_port,
             host_addr,
             ui_debug_addr,
@@ -1049,7 +1246,6 @@ async fn build_instance(
             config_path,
             store_dir,
             hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
-            startup_output,
             startup_capture_tasks: std::mem::take(&mut processes.captures),
             child: processes
                 .desktop
@@ -1059,37 +1255,22 @@ async fn build_instance(
                 .frontend
                 .take()
                 .ok_or_else(|| "DEV frontend ownership missing".to_owned())?,
-            started_at_ms: now_ms(),
         };
 
         let readiness = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err("DEV startup cancelled".to_owned()),
-            result = wait_for_instance_ready(&mut record) => result,
+            _ = cancellation.cancelled() => Err(DevStartFailure::cancelled()),
+            result = wait_for_instance_ready(&mut record, startup_listener, &reporter) => result,
         };
         if let Err(error) = readiness {
-            let error = DevStartFailure::from(error);
             return match stop_record(record).await {
-                Ok(_) => Err(error),
+                Ok(()) => Err(error),
                 Err(cleanup) => Err(error.with_cleanup(cleanup)),
             };
         }
 
-        let result = StartInstanceResult {
-            instance_id: instance_id.clone(),
-            status: "ready",
-            project_dir: record.project_dir.display().to_string(),
-            store_dir: record.store_dir.display().to_string(),
-            session_store_path: record.store_dir.join("sessions.json").display().to_string(),
-            stores_ephemeral: true,
-            hermes_environment: record.hermes_environment.clone(),
-            frontend_url: frontend_url.clone(),
-            host_addr: record.host_addr.to_string(),
-            ui_debug_addr: record.ui_debug_addr.to_string(),
-        };
-
         startup_cleanup.disarm();
-        Ok((record, result))
+        Ok(record)
     }
     .await;
     match result {
@@ -1101,6 +1282,7 @@ async fn build_instance(
             if let Err(cleanup) = startup_cleanup.cleanup() {
                 error = error.with_cleanup(cleanup);
             }
+            error.message = with_startup_diagnostics(error.message, &startup_output).await;
             Err(error)
         }
     }
@@ -1327,17 +1509,17 @@ fn seed_dev_project_store(
 
 async fn stop_instance(
     state: &Arc<DebugMcpState>,
-    instance_id: &str,
+    instance_id: &DevInstanceId,
 ) -> Result<DevInstanceSummary, String> {
     state
         .instance_request(|reply| InstanceCommand::Remove {
-            id: instance_id.to_owned(),
+            id: instance_id.clone(),
             reply,
         })
         .await?
 }
 
-async fn stop_record(mut record: DevInstanceRecord) -> Result<DevInstanceSummary, String> {
+async fn stop_record(mut record: DevInstanceRecord) -> Result<(), String> {
     let mut errors = Vec::new();
     if let Err(error) = record.child.kill().await {
         errors.push(format!("failed to stop dev desktop: {error}"));
@@ -1346,8 +1528,10 @@ async fn stop_record(mut record: DevInstanceRecord) -> Result<DevInstanceSummary
         errors.push(format!("failed to stop dev frontend: {error}"));
     }
     for task in record.startup_capture_tasks.drain(..) {
-        if let Err(error) = task.await {
-            errors.push(format!("DEV output capture did not join: {error}"));
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(format!("DEV output capture did not join: {error}")),
         }
     }
     let mut files = DevInstanceStartupCleanup::new(record.store_dir.clone());
@@ -1356,7 +1540,7 @@ async fn stop_record(mut record: DevInstanceRecord) -> Result<DevInstanceSummary
         errors.push(error);
     }
     if errors.is_empty() {
-        Ok(dev_instance_summary(&mut record))
+        Ok(())
     } else {
         Err(errors.join("; "))
     }
@@ -1416,7 +1600,7 @@ async fn debug_events(
     Ok(debug_events_result(input.instance_id, output))
 }
 
-fn debug_events_result(instance_id: String, output: DebugOutputSlice) -> DebugEventsResult {
+fn debug_events_result(instance_id: DevInstanceId, output: DebugOutputSlice) -> DebugEventsResult {
     let events = (!output.output.is_empty())
         .then_some(DebugOutputEvent {
             cursor: output.cursor,
@@ -1436,110 +1620,191 @@ fn debug_events_result(instance_id: String, output: DebugOutputSlice) -> DebugEv
 
 async fn debug_snapshot(
     state: &Arc<DebugMcpState>,
-    instance_id: &str,
+    instance_id: &DevInstanceId,
 ) -> Result<DebugSnapshotResult, String> {
     state
         .instance_request(|reply| InstanceCommand::Snapshot {
-            id: instance_id.to_owned(),
+            id: instance_id.clone(),
             reply,
         })
         .await?
 }
 
-async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), String> {
-    loop {
-        match record.frontend_child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(status)) => {
-                return Err(with_startup_diagnostics(
-                    format!("dev frontend exited before desktop ready: {status}"),
-                    &record.startup_output,
-                ));
+async fn wait_for_instance_ready(
+    record: &mut DevInstanceRecord,
+    listener: TcpListener,
+    reporter: &StartupReporter,
+) -> Result<(), DevStartFailure> {
+    let host_addr = record.host_addr;
+    let ui_debug_addr = record.ui_debug_addr;
+    let readiness = async {
+        let mut host_ready = false;
+        let mut ui_ready = false;
+        while !host_ready || !ui_ready {
+            let (stream, remote) = listener
+                .accept()
+                .await
+                .map_err(|error| format!("DEV startup notification accept failed: {error}"))?;
+            if !remote.ip().is_loopback() {
+                return Err("DEV startup notification was not loopback-owned"
+                    .to_owned()
+                    .into());
             }
-            Err(error) => {
-                return Err(with_startup_diagnostics(
-                    format!("failed to inspect dev frontend: {error}"),
-                    &record.startup_output,
-                ));
+            let mut body = Vec::new();
+            stream
+                .take(4097)
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| format!("DEV startup notification read failed: {error}"))?;
+            if body.len() > 4096 {
+                return Err("DEV startup notification exceeded its bound"
+                    .to_owned()
+                    .into());
+            }
+            let notification: DevInstanceStartupNotification = serde_json::from_slice(&body)
+                .map_err(|error| format!("Invalid DEV startup notification: {error}"))?;
+            if notification.protocol != DEV_INSTANCE_STARTUP_CONTRACT.protocol {
+                return Err("Unsupported DEV startup notification protocol"
+                    .to_owned()
+                    .into());
+            }
+            if notification.instance_id != reporter.instance_id {
+                return Err("DEV startup notification ownership mismatch"
+                    .to_owned()
+                    .into());
+            }
+            match notification.signal {
+                DevInstanceStartupSignal::HostListening { address } => {
+                    if host_ready || address != host_addr {
+                        return Err("Invalid or duplicate DEV host readiness notification"
+                            .to_owned()
+                            .into());
+                    }
+                    reporter.phase(DevInstanceStartupPhase::HostHandshake)?;
+                    connect_host_endpoint(host_addr).await?;
+                    host_ready = true;
+                }
+                DevInstanceStartupSignal::UiReady => {
+                    if ui_ready {
+                        return Err("Duplicate DEV UI readiness notification".to_owned().into());
+                    }
+                    reporter.phase(DevInstanceStartupPhase::UiHandshake)?;
+                    match send_ui_debug_request(ui_debug_addr, UiDebugRequest::Ping)
+                        .await
+                        .map_err(|error| {
+                            DevStartFailure::new(DevInstanceFailureKind::UiHandshake, error)
+                        })? {
+                        UiDebugResponse::Pong => ui_ready = true,
+                        UiDebugResponse::Error { message } => {
+                            return Err(DevStartFailure::new(
+                                DevInstanceFailureKind::UiHandshake,
+                                format!("DEV UI readiness failed: {message}"),
+                            ));
+                        }
+                        _ => {
+                            return Err(DevStartFailure::new(
+                                DevInstanceFailureKind::UiHandshake,
+                                "DEV UI readiness returned an unexpected response".to_owned(),
+                            ));
+                        }
+                    }
+                }
             }
         }
-        match record.child.try_wait() {
-            Ok(Some(exit_status)) => {
-                return Err(with_startup_diagnostics(
-                    format!(
-                        "dev instance {} exited before ready: {exit_status}",
-                        record.instance_id
-                    ),
-                    &record.startup_output,
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(with_startup_diagnostics(
-                    format!(
-                        "failed to read dev instance {} process status: {err}",
-                        record.instance_id
-                    ),
-                    &record.startup_output,
-                ));
-            }
-        }
-
-        let host_ready = matches!(
-            timeout(
-                Duration::from_secs(2),
-                connect_host_endpoint(record.host_addr)
-            )
-            .await,
-            Ok(Ok(()))
-        );
-
-        let ui_ready = matches!(
-            timeout(
-                Duration::from_secs(2),
-                send_ui_debug_request(record.ui_debug_addr, UiDebugRequest::Ping),
-            )
-            .await,
-            Ok(Ok(UiDebugResponse::Pong))
-        );
-
-        if host_ready && ui_ready {
-            return Ok(());
-        }
-
-        sleep(Duration::from_millis(250)).await;
-    }
-}
-
-fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSummary {
-    let status = match record.child.try_wait() {
-        Ok(Some(exit_status)) => format!("exited({exit_status})"),
-        Ok(None) => "running".to_string(),
-        Err(err) => format!("status_error({err})"),
+        Ok::<(), DevStartFailure>(())
     };
-    DevInstanceSummary {
-        instance_id: record.instance_id.clone(),
-        project_dir: record.project_dir.display().to_string(),
-        store_dir: record.store_dir.display().to_string(),
-        session_store_path: record.store_dir.join("sessions.json").display().to_string(),
-        stores_ephemeral: true,
-        hermes_environment: record.hermes_environment.clone(),
-        frontend_url: record.frontend_url.clone(),
-        host_addr: record.host_addr.to_string(),
-        ui_debug_addr: record.ui_debug_addr.to_string(),
-        status,
-        frontend_port: record.frontend_port,
-        started_at_ms: record.started_at_ms,
+    tokio::select! {
+        biased;
+        status = record.frontend_child.wait() => match status {
+            Ok(status) => Err(DevStartFailure::new(DevInstanceFailureKind::ChildExit, format!("dev frontend exited before desktop ready: {status}"))),
+            Err(error) => Err(format!("failed to wait for dev frontend: {error}").into()),
+        },
+        status = record.child.wait() => match status {
+            Ok(status) => Err(DevStartFailure::new(DevInstanceFailureKind::ChildExit, format!("dev instance exited before ready: {status}"))),
+            Err(error) => Err(format!("failed to wait for dev desktop: {error}").into()),
+        },
+        result = readiness => result,
     }
 }
 
-async fn connect_host_endpoint(addr: SocketAddr) -> Result<(), String> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|err| format!("failed to connect to host endpoint {addr}: {err}"))?;
-    let _connection = client::connect(&ClientConfig::current(), stream)
-        .await
-        .map_err(|err| format!("host handshake failed for {addr}: {err:?}"))?;
+fn dev_instance_summary(
+    attempt: &mut DevAttempt,
+    record: Option<&mut DevInstanceRecord>,
+) -> DevInstanceSummary {
+    if matches!(attempt.status, DevInstanceStatus::Ready) && record.is_none() {
+        attempt.status = DevInstanceStatus::StatusError {
+            error: "Ready DEV instance has no owned process record".to_owned(),
+        };
+    }
+    let ready = record.map(|record| {
+        if matches!(attempt.status, DevInstanceStatus::Ready) {
+            for child in [&mut record.child, &mut record.frontend_child] {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        attempt.status = DevInstanceStatus::Exited {
+                            exit_status: status.to_string(),
+                        };
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        attempt.status = DevInstanceStatus::StatusError {
+                            error: error.to_string(),
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+        DevInstanceReady {
+            store_dir: record.store_dir.display().to_string(),
+            session_store_path: record.store_dir.join("sessions.json").display().to_string(),
+            stores_ephemeral: true,
+            hermes_environment: record.hermes_environment.clone(),
+            frontend_url: record.frontend_url.clone(),
+            host_addr: record.host_addr.to_string(),
+            ui_debug_addr: record.ui_debug_addr.to_string(),
+            frontend_port: record.frontend_port,
+        }
+    });
+    DevInstanceSummary {
+        instance_id: attempt.instance_id.clone(),
+        project_id: attempt.project_id.clone(),
+        project_dir: attempt.project_dir.display().to_string(),
+        status: attempt.status.clone(),
+        started_at_ms: attempt.started_at_ms,
+        ready,
+    }
+}
+
+async fn connect_host_endpoint(addr: SocketAddr) -> Result<(), DevStartFailure> {
+    let stream = TcpStream::connect(addr).await.map_err(|err| {
+        DevStartFailure::new(
+            DevInstanceFailureKind::HostHandshake,
+            format!("failed to connect to host endpoint {addr}: {err}"),
+        )
+    })?;
+    let config = ClientConfig::current();
+    let _connection = client::connect(&config, stream).await.map_err(|error| {
+        let kind = match &error {
+            client::HandshakeError::IncompatibleProtocol { client, server } => {
+                DevInstanceFailureKind::HostProtocolIncompatible {
+                    client: *client,
+                    server: *server,
+                }
+            }
+            client::HandshakeError::Rejected(rejection)
+                if rejection.code == protocol::RejectCode::IncompatibleProtocol =>
+            {
+                DevInstanceFailureKind::HostProtocolIncompatible {
+                    client: config.protocol_version,
+                    server: rejection.server_protocol_version,
+                }
+            }
+            _ => DevInstanceFailureKind::HostHandshake,
+        };
+        DevStartFailure::new(kind, format!("host handshake failed for {addr}: {error:?}"))
+    })?;
     Ok(())
 }
 
@@ -1659,36 +1924,104 @@ fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Result<
     Ok(command)
 }
 
-async fn capture_startup_output(
-    mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    output: Arc<StdMutex<BoundedDebugOutput>>,
-) {
-    let mut chunk = [0_u8; 4096];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => return,
-            Ok(count) => append_startup_output(&output, &chunk[..count]),
-            Err(_) => return,
-        }
+enum StartupOutputCommand {
+    Append(Vec<u8>),
+    Head(oneshot::Sender<u64>),
+    Read {
+        cursor: Option<u64>,
+        max_bytes: usize,
+        reply: oneshot::Sender<DebugOutputSlice>,
+    },
+}
+
+#[derive(Clone)]
+struct StartupOutput(mpsc::Sender<StartupOutputCommand>);
+
+impl StartupOutput {
+    fn new() -> Self {
+        let (sender, mut commands) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut output = BoundedDebugOutput::new(STARTUP_LOG_TAIL_BYTES);
+            while let Some(command) = commands.recv().await {
+                match command {
+                    StartupOutputCommand::Append(bytes) => output.append(&bytes),
+                    StartupOutputCommand::Head(reply) => {
+                        let _ = reply.send(output.next_cursor());
+                    }
+                    StartupOutputCommand::Read {
+                        cursor,
+                        max_bytes,
+                        reply,
+                    } => {
+                        let _ = reply.send(output.read(cursor, max_bytes));
+                    }
+                }
+            }
+        });
+        Self(sender)
+    }
+
+    async fn read(
+        &self,
+        cursor: Option<u64>,
+        max_bytes: usize,
+    ) -> Result<DebugOutputSlice, String> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(StartupOutputCommand::Read {
+                cursor,
+                max_bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| "DEV output owner stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "DEV output owner dropped its response".to_owned())
+    }
+
+    async fn head(&self) -> Result<u64, String> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(StartupOutputCommand::Head(reply))
+            .await
+            .map_err(|_| "DEV output owner stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "DEV output owner dropped its cursor".to_owned())
     }
 }
 
-fn append_startup_output(output: &StdMutex<BoundedDebugOutput>, bytes: &[u8]) {
-    let mut output = output.lock().expect("startup output mutex poisoned");
-    output.append(bytes);
+async fn capture_startup_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    output: StartupOutput,
+) -> Result<(), String> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| format!("DEV output capture failed: {error}"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        output
+            .0
+            .send(StartupOutputCommand::Append(chunk[..count].to_vec()))
+            .await
+            .map_err(|_| "DEV output owner stopped during capture".to_owned())?;
+    }
 }
 
-fn with_startup_diagnostics(message: String, output: &StdMutex<BoundedDebugOutput>) -> String {
-    let output = output.lock().expect("startup output mutex poisoned");
-    let diagnostics = if output.is_empty() {
-        "startup output was empty".to_string()
-    } else {
-        let tail = output.read(None, STARTUP_LOG_TAIL_BYTES);
-        format!(
+async fn with_startup_diagnostics(message: String, output: &StartupOutput) -> String {
+    let diagnostics = match output.read(None, STARTUP_LOG_TAIL_BYTES).await {
+        Ok(tail) if tail.output.is_empty() => "startup output was empty".to_owned(),
+        Ok(tail) => format!(
             "startup output (last {} bytes):\n{}",
-            output.len(),
+            tail.output.len(),
             tail.output.trim_end()
-        )
+        ),
+        Err(error) => format!("startup output unavailable: {error}"),
     };
     format!("{message}\n{diagnostics}")
 }

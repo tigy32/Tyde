@@ -167,7 +167,7 @@ closed another provider's gap. Report the actual tested commit and case.
 
 | Existing surface | What it actually observes | Certification limit |
 | --- | --- | --- |
-| `server/src/debug_mcp.rs`: `tyde_dev_instance_start/list/stop`, `tyde_debug_evaluate/events/snapshot/capabilities` | Isolated desktop instance; Promise-aware rendered DOM evaluation; cursor-based **process output**; process/readiness snapshot | The audited built-in driver advertised `screenshot: false`, `secondClient: false`; query current capabilities for the actual run. No `tyde_debug_query_screenshot` or product-event subscription tool. Process output/snapshot is not a chat protocol trace or a console collector. |
+| `server/src/debug_mcp.rs`: `tyde_dev_instance_start/wait/list/stop`, `tyde_debug_evaluate/events/snapshot/capabilities` | Isolated desktop instance; Promise-aware rendered DOM evaluation; cursor-based **process output**; process/readiness snapshot | The audited built-in driver advertised `screenshot: false`, `secondClient: false`; query current capabilities for the actual run. No `tyde_debug_query_screenshot` or product-event subscription tool. Process output/snapshot is not a chat protocol trace or a console collector. |
 | `frontend/src/devtools.rs`, `devtools-protocol/src/lib.rs` | Typed UI evaluation transport; evaluation awaits Promises | DOM is evidence, not a screenshot. Use an attached browser/native driver for pixels, console/page errors, input and independently controlled clients; record its identity and prove it targets the child instance. |
 | `playwright.mobile.config.mjs`, `mobile-frontend/e2e/` | Real mounted mobile DOM with deterministic fixture state; WebKit composer flow; viewport probe | No real host/backend. Useful coverage inventory, not real-provider or native-phone certification. Run repository validation only through `./dev.sh check`, not these configs directly. |
 | `playwright.mobile.live.config.mjs`, `mobile-frontend/e2e/live/` | Deployed mobile login, pairing, connection and reload with a persistent sensitive browser profile | Does not send prompts or certify this workbench. Never reuse its ordinary paired host/profile for this audit. A separately verified disposable profile paired only to the ephemeral host is required. |
@@ -219,24 +219,52 @@ This proves that this client timeout did **not** cancel startup. It does not
 by itself certify rendered UI, backend readiness for turns, screenshots, or a
 second client, and does not diagnose the cause of the slow startup.
 
-Source evidence: `server/src/debug_mcp.rs::start_instance` inserts its record
-only **after** frontend and typed host/UI readiness waits. Therefore an empty
-list while startup is pending cannot prove no child process exists. The
-launcher still has no pending-attempt/reattach handle to recover before that
-registration boundary. An MCP client deadline is a transport observation, not
-a product startup deadline or an observed child-exit/startup error.
+The canonical server launcher now registers an actor-owned attempt **before**
+launching work. `tyde_dev_instance_start` returns its starting handle promptly;
+it does not certify readiness. `tyde_dev_instance_list` includes pending and
+failed attempts, with exact `instanceId`, `projectId`, `projectDir`, start time
+and typed `status`. Pending state carries a startup phase, not inferred endpoint
+or store attestations. Output/events and snapshots work before readiness.
 
-After a lost start response, record the one attempt and reconcile with list
-before any new launch. Correlate exact project root, preflight inventory and
-returned store attestation; ambiguity or an unregistered attempt is BLOCKED,
-not permission to guess ownership, kill processes or retry until green.
-Use bounded startup-output diagnostics/snapshot only for an identified
-instance whose control has not been transferred. Never stop/control an
-instance after the coordinator assigns it to a tester. Transfer its cleanup
-responsibility explicitly. The recovered instance still has
-`screenshot: false` and `secondClient: false`; recovery does not erase those
-observation gaps. No launcher/product change is part of this documentation
-work item.
+Call `tyde_dev_instance_wait` with that exact `instance_id` to await the same
+attempt's completion. This is an event wait with no startup deadline. A lost
+MCP response or disconnected waiter does not cancel actor-owned work. Recover
+a lost start handle from the exact root/owner in the inventory and reattach;
+never call start again to discover the result. Duplicate source starts fail
+explicitly. Do not infer cancellation or absence from a client timeout.
+
+Before creating an attempt or starting a child, the launcher requires the typed
+`devtools-protocol/dev-instance-startup.json` contract in the exact source
+checkout. Missing/unsupported contracts fail explicitly; merging the launcher
+fix into the resident alone does not make older consumer checkouts launchable.
+The declaration and matching notification producer must travel together.
+
+The child sends typed, identity-bound host-listening and UI-ready notifications
+to the owning launcher. The launcher performs the real host handshake and typed
+UI Ping/Pong once notified, while observing child-exit events. UI startup
+notification ownership is consumed once; later webview boots keep their normal
+listener readiness without reconnecting to the retired startup endpoint. An incompatible
+host protocol, malformed notification or failed UI response becomes an explicit
+terminal failure, not a discarded probe and infinite retry. Failed state retains
+its phase, typed failure kind, diagnostics and any cleanup error; wait returns
+that same JSON state with MCP `isError: true`. Ready state alone exposes canonical
+store/containment and endpoint attestations. No total build deadline is added.
+
+Terminal results and bounded output remain observable for the owner's lifetime,
+including cancelled startup when a workbench is removed. Explicit instance stop
+joins process/resource cleanup and removes the attempt; failed cleanup remains
+an error, not an empty success. Do not stop/control an instance after the
+coordinator assigns it to a tester. Transfer cleanup responsibility explicitly.
+
+These guarantees apply to the updated **server-hosted** launcher and matching
+child source, not the separate legacy stdio driver. They survive MCP client
+reconnection, not replacement of the owning server process. A workbench edit
+cannot update an already-running launcher, adopt its unregistered child, or
+retroactively provide its missing completion handle. Updating resident controls
+requires explicit approval at a safe owner-coordinated checkpoint; do not restart,
+relaunch, signal or migrate an existing pending attempt to apply this fix.
+`screenshot: false` and `secondClient: false` remain unchanged; startup recovery
+is not full rendered product QA.
 
 ### Capability and tool-family audit
 
@@ -680,6 +708,10 @@ a test-harness correction, not a new product behavior or a current UI pass.
 ## 2. Start a clean Tyde dev instance
 
 1. Call `tyde_dev_instance_start` with the repository root as `project_dir`.
+   Save its starting `instanceId`, then call `tyde_dev_instance_wait` with that
+   same `instance_id`. Require `status.kind: "ready"` before using endpoints or
+   store attestations. Reattach to this same handle if the MCP wait response is
+   lost; never start a duplicate.
    For no-paid Hermes QA, also pass a disposable profile and a stub that is
    already listening on numeric loopback:
 
