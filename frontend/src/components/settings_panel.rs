@@ -2686,6 +2686,11 @@ pub(super) fn ReviewConfigurationFields(
                     on:click=move |_| send_host_replace(&state, "/review/default_mode", mode)>{mode.label()}</button> }
             }).collect_view()}
         </div>
+        <dl class="review-mode-help" aria-label="Review mode descriptions">
+            <div><dt>"Inline"</dt><dd>"The authoring agent reviews its own work. No separate reviewers or Review-panel findings."</dd></div>
+            <div><dt>"Single reviewer"</dt><dd>"One reviewer inherits the authoring agent’s context, backend and model to check all selected aspects. Requires native forks and enforced read-only support."</dd></div>
+            <div><dt>"Review team"</dt><dd>"Reviewers use your configured sources and team layout to cover the selected aspects."</dd></div>
+        </dl>
         <Show when=move || settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::ReviewTeam)>
             <h3 class="settings-section-title">"Team layout"</h3>
             <div class="settings-segmented-control review-segments" role="group" aria-label="Team layout">
@@ -21821,6 +21826,32 @@ mod wasm_tests {
         assert!(modes.text_content().unwrap().contains("Inline"));
         assert!(modes.text_content().unwrap().contains("Single reviewer"));
         assert!(modes.text_content().unwrap().contains("Review team"));
+        let mode_help: HtmlElement = container
+            .query_selector("dl[aria-label='Review mode descriptions']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let help_text = mode_help.text_content().unwrap();
+        assert!(help_text.contains("The authoring agent reviews its own work"));
+        assert!(
+            help_text
+                .contains("One reviewer inherits the authoring agent’s context, backend and model")
+        );
+        assert!(help_text.contains("Requires native forks and enforced read-only support"));
+        assert!(help_text.contains("Reviewers use your configured sources and team layout"));
+        container.set_attribute("style", "width: 320px").unwrap();
+        next_tick().await;
+        let help_rect = mode_help.get_bounding_client_rect();
+        assert!(
+            help_rect.width() > 0.0 && help_rect.height() > 0.0,
+            "Review mode descriptions must be visible"
+        );
+        assert_eq!(
+            mode_help.scroll_width(),
+            mode_help.client_width(),
+            "Review mode descriptions must wrap without horizontal overflow"
+        );
         find_button_by_text(&container, "Inline").unwrap().click();
         next_tick().await;
         let writes = recorded_settings_write_ops(&calls);
