@@ -114,7 +114,7 @@ fn empty_bottom() -> SidebarPane {
 
 impl SidebarLayout {
     pub fn new(mode: InterfaceMode) -> Self {
-        let tabs = if mode == InterfaceMode::Dinosaur {
+        let left_tabs = if mode == InterfaceMode::Dinosaur {
             vec![
                 SidebarTab::Files,
                 SidebarTab::Git,
@@ -122,27 +122,31 @@ impl SidebarLayout {
                 SidebarTab::References,
             ]
         } else {
+            vec![SidebarTab::Agents, SidebarTab::Sessions]
+        };
+        let right_tabs = if mode == InterfaceMode::Dinosaur {
+            SidebarTab::ALL
+                .into_iter()
+                .filter(|tab| tab.default_side() == SidebarSide::Right)
+                .collect()
+        } else {
             vec![]
         };
-        let active = tabs.first().copied();
         Self {
             left: SidebarPane {
-                visible: !tabs.is_empty(),
-                tabs,
-                active,
-                width: 300.0,
+                visible: !left_tabs.is_empty(),
+                active: left_tabs.first().copied(),
+                tabs: left_tabs,
+                width: if mode == InterfaceMode::Vibe {
+                    360.0
+                } else {
+                    300.0
+                },
             },
             right: SidebarPane {
-                tabs: SidebarTab::ALL
-                    .into_iter()
-                    .filter(|tab| {
-                        tab.default_side() == SidebarSide::Right
-                            && (mode == InterfaceMode::Dinosaur
-                                || matches!(tab, SidebarTab::Agents | SidebarTab::Sessions))
-                    })
-                    .collect(),
-                active: Some(SidebarTab::Agents),
-                visible: true,
+                active: right_tabs.first().copied(),
+                visible: !right_tabs.is_empty(),
+                tabs: right_tabs,
                 width: 360.0,
             },
             bottom: empty_bottom(),

@@ -369,7 +369,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn sidebar_modes_keep_one_agents_mount_and_independent_layouts() {
-        use crate::sidebar_layout::{STORAGE_KEY, SidebarSide, SidebarTab};
+        use crate::sidebar_layout::{ClientLayouts, STORAGE_KEY, SidebarSide, SidebarTab};
         use crate::state::TabContent;
         let window = web_sys::window().unwrap();
         let storage = window.local_storage().unwrap().unwrap();
@@ -460,11 +460,56 @@ mod wasm_tests {
                 .width(),
             0.0
         );
+        let left = element(&container, ".sidebar-bar-left");
+        assert!(
+            left.get_bounding_client_rect().width() > 0.0,
+            "A fresh Vibe layout opens its sidebar on the left"
+        );
+        assert!(left.text_content().unwrap().contains("Agents"));
+        assert!(left.text_content().unwrap().contains("History"));
+        assert!(
+            element(&container, "section[aria-label='Agents panel']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+        assert_eq!(
+            element(&container, ".sidebar-bar-right")
+                .get_bounding_client_rect()
+                .width(),
+            0.0,
+            "A fresh Vibe layout leaves the right dock closed"
+        );
+
+        // Preserve an explicit older right-docked Vibe layout instead of
+        // treating the new default as a migration for saved client choices.
+        let mut saved = ClientLayouts::default();
+        saved
+            .vibe
+            .move_tab(SidebarTab::Agents, SidebarSide::Right, None);
+        saved
+            .vibe
+            .move_tab(SidebarTab::Sessions, SidebarSide::Right, None);
+        saved.vibe.left.visible = false;
+        saved.vibe.right.active = Some(SidebarTab::Agents);
+        drop(handle);
+        storage
+            .set_item(STORAGE_KEY, &serde_json::to_string(&saved).unwrap())
+            .unwrap();
+        let handle = shell(&container, state.clone());
+        tick().await;
         assert_eq!(
             element(&container, ".sidebar-bar-left")
                 .get_bounding_client_rect()
                 .width(),
-            0.0
+            0.0,
+            "An explicit saved Vibe layout keeps its right dock"
+        );
+        assert!(
+            element(&container, ".sidebar-bar-right button[aria-label='Agents']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
         );
         let center_left = element(&container, ".sidebar-center")
             .get_bounding_client_rect()
@@ -474,10 +519,9 @@ mod wasm_tests {
             element(&container, ".workbench")
                 .get_bounding_client_rect()
                 .left(),
-            "Vibe reserves no rail, empty tab bar or resize gutter"
+            "A saved empty left dock reserves no gutter"
         );
-        // Version 1 saved the default empty left pane as visible, although
-        // its old rendering predicate hid it. Upgrade preserves that geometry.
+        // A version 1 saved empty left pane must remain closed after upgrade.
         let mut legacy: serde_json::Value =
             serde_json::from_str(&storage.get_item(STORAGE_KEY).unwrap().unwrap()).unwrap();
         legacy["version"] = serde_json::json!(1);
@@ -1300,6 +1344,11 @@ mod wasm_tests {
             Some("{}"),
             "Invalid layouts are not replaced by defaults"
         );
+        invalid.sidebar_layout.update(|layouts| {
+            layouts
+                .dinosaur
+                .move_tab(SidebarTab::Agents, SidebarSide::Left, None);
+        });
         element(&container, "button[title='Settings']").click();
         tick().await;
         let nav = container.query_selector_all(".settings-nav-item").unwrap();
@@ -1322,11 +1371,29 @@ mod wasm_tests {
         tick().await;
         assert!(!invalid.sidebar_storage_blocked.get_untracked());
         assert!(
-            element(&container, ".sidebar-bar-right .dock-tab-bar")
+            element(&container, ".sidebar-bar-left button[aria-label='Agents']")
                 .get_bounding_client_rect()
-                .height()
-                > 0.0
+                .width()
+                > 0.0,
+            "Reset restores the Vibe sidebar on the left"
         );
+        mode(&container, "dinosaur").await;
+        tick().await;
+        assert!(
+            element(&container, ".sidebar-bar-left button[aria-label='Agents']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0,
+            "Resetting Vibe leaves the customized Dinosaur dock unchanged"
+        );
+        assert!(
+            element(&container, ".sidebar-bar-right")
+                .text_content()
+                .unwrap()
+                .contains("History")
+        );
+        mode(&container, "vibe").await;
+        tick().await;
         assert_ne!(
             storage.get_item(STORAGE_KEY).unwrap().as_deref(),
             Some("{}")
