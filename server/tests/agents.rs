@@ -2660,7 +2660,70 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     assert_eq!(payload.breakdown[2].tree_index, 2);
     assert_known_task_scope(&payload.breakdown[2].usage, MOCK_TURN_TOKEN_TOTAL);
 
-    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let host = fixture.host_for_test();
+    let snapshot_gate = host.install_next_bootstrap_snapshot_reply_test_gate().await;
+    let late_connection = tokio::spawn(fixture::connect_host(host));
+    snapshot_gate.wait_until_entered().await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions while an agent snapshot reply is held");
+    let sessions = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "host remains responsive during an admitted agent snapshot read",
+    )
+    .await;
+    let _: SessionListPayload = sessions
+        .parse_payload()
+        .expect("session list during blocked usage read");
+    let pending = spawn_token_usage_agent(
+        &mut fixture.client,
+        "usage-during-bootstrap",
+        "pending usage",
+    )
+    .await;
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &pending.instance_stream,
+        "mock backend response to: pending usage",
+    )
+    .await;
+    expect_task_token_usage_matching(
+        &mut usage_client,
+        &pending.agent_id,
+        "pending agent settles while bootstrap is held",
+        |usage| usage.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL,
+    )
+    .await;
+    snapshot_gate.release_one();
+    let (mut late_client, bootstrap) = late_connection.await.expect("late bootstrap task");
+    assert!(
+        !bootstrap
+            .agents
+            .iter()
+            .any(|agent| agent.agent_id == pending.agent_id)
+    );
+    let advertised = expect_new_agent(&mut late_client, "pending NewAgent follows baseline").await;
+    assert_eq!(advertised.agent_id, pending.agent_id);
+    let pending_usage = expect_task_token_usage_matching(
+        &mut late_client,
+        &pending.agent_id,
+        "settled pending usage follows its advertisement",
+        |usage| usage.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL,
+    )
+    .await;
+    let pending_entry = pending_usage
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == pending.agent_id)
+        .expect("pending agent usage breakdown");
+    assert_eq!(
+        pending_entry.navigation,
+        protocol::TaskUsageNavigation::LiveAgent,
+        "queued canonical usage must become navigable after ordered NewAgent delivery"
+    );
     let bootstrapped = bootstrap
         .task_token_usages
         .iter()
@@ -10730,6 +10793,75 @@ async fn spawn_operation_capacity_and_shutdown_are_typed_and_drained() {
             break;
         }
     }
+
+    let mut fixture = Fixture::new().await;
+    let host = fixture.host_for_test();
+    let (publication, cancelled) = host.install_next_agent_publication_start_test_gate().await;
+    fixture
+        .client
+        .spawn_agent(spawn_payload(0))
+        .await
+        .expect("enqueue publication before owner execution");
+    publication.wait_until_entered().await;
+    let shutdown = tokio::spawn(async move {
+        host.shutdown_spawn_operations().await;
+    });
+    cancelled
+        .await
+        .expect("publication reply cancelled before owner execution");
+    publication.release_one();
+    shutdown
+        .await
+        .expect("queued publication shutdown completed");
+    let terminal = loop {
+        let event = fixture
+            .client
+            .next_event()
+            .await
+            .expect("queued publication cancellation event")
+            .expect("connection remains open");
+        assert_ne!(
+            event.kind,
+            FrameKind::NewAgent,
+            "cancelled unstarted publication must not send NewAgent"
+        );
+        if event.kind == FrameKind::CommandError {
+            break event
+                .parse_payload::<CommandErrorPayload>()
+                .expect("queued publication terminal payload");
+        }
+    };
+    assert_eq!(terminal.request_kind, FrameKind::SpawnAgent);
+    assert!(terminal.message.contains("host shut down"));
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("drained publication barrier");
+    loop {
+        let event = fixture
+            .client
+            .next_event()
+            .await
+            .expect("drained publication event")
+            .expect("connection remains open");
+        assert_ne!(
+            event.kind,
+            FrameKind::NewAgent,
+            "queued publication must not outlive its failure terminal"
+        );
+        if event.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload =
+                event.parse_payload().expect("post-drain error payload");
+            assert!(
+                !error.message.contains("host shut down"),
+                "one shutdown terminal per request"
+            );
+        }
+        if event.kind == FrameKind::SessionList {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -11184,6 +11316,284 @@ async fn startup_fanout_advertises_all_subscribers_before_any_attach_wait() {
                 bootstrap.events.first(),
                 Some(AgentBootstrapEvent::AgentStart(_))
             ));
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
+    for fail_cleanup in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let host = fixture.host_for_test();
+        let (handoff, discarded, cleaned) =
+            host.install_next_agent_creation_reply_test_gate().await;
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("Unclaimed creation".into()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec!["/tmp/test".into()],
+                    prompt: "cancel before creation ownership transfers".into(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await
+            .expect("request unclaimed creation");
+        handoff.wait_until_entered().await;
+        let (mut pending, bootstrap) = fixture.connect_with_bootstrap().await;
+        assert!(
+            bootstrap.agents.is_empty(),
+            "creation has not published NewAgent"
+        );
+        assert!(
+            !bootstrap.task_token_usages.is_empty(),
+            "pending actor retains usage ownership"
+        );
+        for usage in &bootstrap.task_token_usages {
+            for entry in &usage.breakdown {
+                assert_eq!(
+                    entry.navigation,
+                    protocol::TaskUsageNavigation::Unavailable,
+                    "a pending creation reply must not expose a missing live chat"
+                );
+            }
+        }
+        pending
+            .list_sessions(ListSessionsPayload::default())
+            .await
+            .expect("pending bootstrap completion barrier");
+        loop {
+            let frame = pending
+                .next_event()
+                .await
+                .expect("pending publication event")
+                .expect("pending publication connection stays open");
+            assert_ne!(
+                frame.kind,
+                FrameKind::NewAgent,
+                "creation reply has not been claimed"
+            );
+            if frame.kind == FrameKind::TaskTokenUsage {
+                let usage: protocol::TaskTokenUsagePayload =
+                    frame.parse_payload().expect("pending usage payload");
+                for entry in usage.breakdown {
+                    assert_eq!(
+                        entry.navigation,
+                        protocol::TaskUsageNavigation::Unavailable,
+                        "pending live publication must not expose a missing chat"
+                    );
+                }
+            }
+            if frame.kind == FrameKind::SessionList {
+                break;
+            }
+        }
+        let failure = if fail_cleanup {
+            let agent_id = host
+                .agent_ids()
+                .await
+                .into_iter()
+                .next()
+                .expect("unclaimed actor exists");
+            host.wait_for_agent_startup_for_test(&agent_id)
+                .await
+                .expect("actual actor startup completed");
+            let withdrawal = host.install_restore_marker_withdraw_test_gate().await;
+            fixture.shutdown_spawn_operations().await;
+            discarded.await.expect("creation reply discarded");
+            withdrawal.wait_until_entered().await;
+            let failure = fixture.fail_next_session_commit();
+            withdrawal.release_one();
+            Some((failure, withdrawal))
+        } else {
+            fixture.shutdown_spawn_operations().await;
+            discarded.await.expect("creation reply discarded");
+            None
+        };
+        drop(cleaned.await.expect("unclaimed cleanup settlement"));
+        if fail_cleanup {
+            loop {
+                let frame = expect_kind(
+                    &mut fixture.client,
+                    FrameKind::CommandError,
+                    "unclaimed cleanup failure",
+                )
+                .await;
+                let error: CommandErrorPayload =
+                    frame.parse_payload().expect("typed cleanup error");
+                if error.operation == "cancel_unclaimed_agent" {
+                    assert_eq!(error.code, CommandErrorCode::Internal);
+                    assert_eq!(error.request_kind, FrameKind::SpawnAgent);
+                    break;
+                }
+            }
+            let (mut late, bootstrap) = fixture.connect_with_bootstrap().await;
+            assert!(
+                !bootstrap.task_token_usages.is_empty(),
+                "failed cleanup must retain canonical ownership"
+            );
+            for usage in &bootstrap.task_token_usages {
+                for entry in &usage.breakdown {
+                    assert_eq!(
+                        entry.navigation,
+                        protocol::TaskUsageNavigation::Unavailable,
+                        "unpublished retained cleanup must not enable a missing live chat"
+                    );
+                }
+            }
+            let frame = expect_kind(
+                &mut late,
+                FrameKind::CommandError,
+                "retained cleanup failure replay",
+            )
+            .await;
+            let error: CommandErrorPayload = frame
+                .parse_payload()
+                .expect("typed replayed cleanup failure");
+            assert_eq!(error.operation, "cancel_unclaimed_agent");
+            let retained_stream = error.stream;
+            drop(failure);
+            // An unpublished failure has no AgentStart/client sequence counter.
+            // Recover through the typed error's explicit stream, not a fabricated advertisement.
+            let close = Envelope::from_payload(
+                retained_stream,
+                FrameKind::CloseAgent,
+                0,
+                &protocol::CloseAgentPayload::default(),
+            )
+            .expect("serialize retained cleanup close");
+            protocol::write_envelope(&mut late.writer, &close)
+                .await
+                .expect("retry retained cleanup after storage recovery");
+            expect_kind(
+                &mut late,
+                FrameKind::AgentClosed,
+                "recovered unclaimed cleanup",
+            )
+            .await;
+            let (mut recovered, bootstrap) = fixture.connect_with_bootstrap().await;
+            assert!(
+                bootstrap.task_token_usages.is_empty(),
+                "successful close removes retained ownership"
+            );
+            recovered
+                .list_sessions(ListSessionsPayload::default())
+                .await
+                .expect("recovered bootstrap publication barrier");
+            loop {
+                let frame = recovered
+                    .next_event()
+                    .await
+                    .expect("recovered state event")
+                    .expect("recovered connection remains open");
+                if frame.kind == FrameKind::CommandError {
+                    let error: CommandErrorPayload =
+                        frame.parse_payload().expect("typed post-recovery error");
+                    assert_ne!(
+                        error.operation, "cancel_unclaimed_agent",
+                        "completed cleanup must not replay a stale failure"
+                    );
+                }
+                if frame.kind == FrameKind::SessionList {
+                    break;
+                }
+            }
+            continue;
+        }
+        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        assert!(
+            bootstrap.agents.is_empty(),
+            "cancelled creation must not leave a live agent"
+        );
+        assert!(
+            bootstrap.task_token_usages.is_empty(),
+            "cancelled creation must not leave a live usage root"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_prepared_fanout_releases_subscriber_ordering_holds() {
+    let mut fixture = Fixture::new().await;
+    let (root, root_session) = spawn_named_session(
+        &mut fixture,
+        "Fanout cancellation root",
+        BackendKind::Claude,
+    )
+    .await;
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    observer
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("subscribe observer to counts");
+    let initial = expect_kind(
+        &mut observer,
+        FrameKind::SessionList,
+        "observer session baseline",
+    )
+    .await;
+    let initial: SessionListPayload = initial.parse_payload().expect("observer baseline payload");
+    let before = initial
+        .sessions
+        .iter()
+        .find(|session| session.id == root_session)
+        .expect("root saved session")
+        .message_count;
+    let host = fixture.host_for_test();
+    let (handoff, discarded) = host.install_next_fanout_handoff_test_gate().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Cancelled fanout child".into()),
+            custom_agent_id: None,
+            parent_agent_id: Some(root.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".into()],
+                prompt: "cancel before publication".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("start fanout cancellation");
+    handoff.wait_until_entered().await;
+    fixture.shutdown_spawn_operations().await;
+    discarded
+        .await
+        .expect("discarded reply enqueues hold release");
+    fixture
+        .client
+        .send_message(&root.instance_stream, "after cancelled fanout".into())
+        .await
+        .expect("continue existing agent");
+    loop {
+        let frame = observer
+            .next_event()
+            .await
+            .expect("read observer after fanout cancellation")
+            .expect("observer remains connected");
+        if frame.kind != FrameKind::SessionSummaryCountUpdated {
+            continue;
+        }
+        let count: protocol::SessionSummaryCountUpdatedPayload =
+            frame.parse_payload().expect("typed session count");
+        if count.session_id == root_session && count.assistant_turn_count > before {
             break;
         }
     }
@@ -12013,32 +12423,39 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
 #[tokio::test]
 async fn disabling_activity_summaries_discards_in_flight_result() {
     let mut fixture = Fixture::new().await;
-    set_activity_summaries(&mut fixture.client, true).await;
-
-    let agent = fixture
-        .spawn(
-            "summary-offswitch",
-            "__mock_slow_activity_summary__ keep working",
-        )
-        .await;
-
+    let agent = fixture.spawn("summary-offswitch", "keep working").await;
     expect_strict_mock_turn(
         &mut fixture.client,
         &agent.stream,
-        "mock backend response to: __mock_slow_activity_summary__ keep working",
+        "mock backend response to: keep working",
     )
     .await;
-    let _pending = expect_activity_summary_matching(
-        &mut fixture.client,
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    let (generation, settled) = fixture
+        .host_for_test()
+        .install_next_activity_summary_generation_test_gate()
+        .await;
+    set_activity_summaries(&mut fixture.client, true).await;
+    generation.wait_until_entered().await;
+    eprintln!("SUMMARY OFFSWITCH phase=generation-held");
+    let pending = expect_activity_summary_matching(
+        &mut observer,
         &agent.new_agent.agent_id,
-        "slow Pending",
+        "held Pending",
         |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
     )
     .await;
+    assert!(matches!(
+        pending.state,
+        AgentActivitySummaryState::Pending { .. }
+    ));
 
+    // HostSettings -> Disabled -> SettingsWriteResult is valid ordered delivery.
+    // The write-result helper consumes intervening frames, so observe summary
+    // state on another real connection rather than wait for a discarded Disabled.
     set_activity_summaries(&mut fixture.client, false).await;
     let disabled = expect_activity_summary_matching(
-        &mut fixture.client,
+        &mut observer,
         &agent.new_agent.agent_id,
         "Disabled",
         |state| matches!(state, AgentActivitySummaryState::Disabled),
@@ -12048,18 +12465,52 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
         disabled.state,
         AgentActivitySummaryState::Disabled
     ));
-
-    expect_no_event(
-        &mut fixture.client,
-        Duration::from_secs(3),
-        "late activity summary after disabling",
-    )
-    .await;
+    eprintln!("SUMMARY OFFSWITCH phase=disabled-observed");
+    generation.release_one();
+    settled
+        .await
+        .expect("summary result handled after off switch");
+    eprintln!("SUMMARY OFFSWITCH phase=result-settled");
+    observer
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("summary publication barrier");
+    loop {
+        let frame = observer
+            .next_event()
+            .await
+            .expect("off-switch completion event")
+            .expect("off-switch connection remains open");
+        assert_ne!(
+            frame.kind,
+            FrameKind::NewAgent,
+            "summary helpers must remain unregistered"
+        );
+        if frame.kind == FrameKind::AgentActivitySummary {
+            let summary: AgentActivitySummaryPayload =
+                frame.parse_payload().expect("post-switch summary");
+            assert_eq!(summary.agent_id, agent.new_agent.agent_id);
+            assert!(
+                matches!(summary.state, AgentActivitySummaryState::Disabled),
+                "an in-flight result must not replace Disabled after completion"
+            );
+        }
+        if frame.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
     assert_eq!(
-        fixture.agent_ids().await,
-        vec![agent.new_agent.agent_id],
-        "off switch must not leave registered summary agents"
+        bootstrap.agents.len(),
+        1,
+        "off switch must not register helper agents"
     );
+    let replayed = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
+    assert!(matches!(
+        replayed.activity_summary,
+        AgentActivitySummaryState::Disabled
+    ));
+    eprintln!("SUMMARY OFFSWITCH phase=disabled-replayed");
 }
 
 #[tokio::test]

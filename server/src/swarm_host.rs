@@ -314,23 +314,34 @@ async fn validate_migration_locked(
 impl HostHandle {
     #[cfg(feature = "test-support")]
     pub async fn fail_next_swarm_directory_sync_for_test(&self) -> Result<(), SwarmFailure> {
-        self.state
-            .lock()
-            .await
-            .swarm_registry
-            .fail_next_directory_sync()
-            .await
+        {
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move { state.swarm_registry.fail_next_directory_sync().await })
+                })
+                .await
+        }
     }
     #[cfg(feature = "test-support")]
     pub async fn install_swarm_admission_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        self.state.lock().await.swarm_admission_test_gate = Some(gate.shared());
+        {
+            let gate = gate.shared();
+            self.state
+                .with(move |state| state.swarm_admission_test_gate = Some(gate))
+                .await
+        };
         gate
     }
     #[cfg(feature = "test-support")]
     pub async fn install_swarm_conversion_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        self.state.lock().await.swarm_conversion_test_gate = Some(gate.shared());
+        {
+            let gate = gate.shared();
+            self.state
+                .with(move |state| state.swarm_conversion_test_gate = Some(gate))
+                .await
+        };
         gate
     }
     #[cfg(feature = "test-support")]
@@ -338,7 +349,12 @@ impl HostHandle {
         &self,
     ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        self.state.lock().await.swarm_startup_test_gates.reservation = Some(gate.shared());
+        {
+            let gate = gate.shared();
+            self.state
+                .with(move |state| state.swarm_startup_test_gates.reservation = Some(gate))
+                .await
+        };
         gate
     }
     #[cfg(feature = "test-support")]
@@ -346,20 +362,40 @@ impl HostHandle {
         &self,
     ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        self.state.lock().await.swarm_startup_test_gates.session = Some(gate.shared());
+        {
+            let gate = gate.shared();
+            self.state
+                .with(move |state| state.swarm_startup_test_gates.session = Some(gate))
+                .await
+        };
         gate
     }
     pub(crate) async fn is_swarm_agent(&self, agent: &AgentId) -> Result<bool, SwarmFailure> {
-        let state = self.state.lock().await;
-        if state
-            .registry
-            .agent_handle(agent)
-            .is_some_and(|handle| handle.snapshot().swarm_membership.is_some())
-        {
-            return Ok(true);
-        }
-        let registry = state.swarm_registry.clone();
-        drop(state);
+        let (registry,) = {
+            let agent = agent.to_owned();
+            match self
+                .state
+                .with(move |state| {
+                    let agent = &agent;
+
+                    if state
+                        .registry
+                        .agent_handle(agent)
+                        .is_some_and(|handle| handle.snapshot().swarm_membership.is_some())
+                    {
+                        return std::ops::ControlFlow::Break(Ok(true));
+                    }
+                    let registry = state.swarm_registry.clone();
+
+                    std::ops::ControlFlow::Continue((registry,))
+                })
+                .await
+            {
+                std::ops::ControlFlow::Break(result) => return result,
+                std::ops::ControlFlow::Continue(value) => value,
+            }
+        };
+
         registry.contains_agent(agent.clone()).await
     }
     pub(crate) async fn swarm_session_owner(
@@ -367,11 +403,16 @@ impl HostHandle {
         session: &SessionId,
     ) -> Result<Option<(SwarmId, SwarmMemberId)>, SwarmFailure> {
         let (registry, store) = {
-            let state = self.state.lock().await;
-            (
-                state.swarm_registry.clone(),
-                Arc::clone(&state.session_store),
-            )
+            {
+                self.state
+                    .with(move |state| {
+                        (
+                            state.swarm_registry.clone(),
+                            Arc::clone(&state.session_store),
+                        )
+                    })
+                    .await
+            }
         };
         if let Some(membership) = store
             .get(session)
@@ -392,14 +433,22 @@ impl HostHandle {
         Ok(None)
     }
     async fn swarm_snapshot(&self) -> Result<SwarmStoreSnapshot, SwarmFailure> {
-        let registry = self.state.lock().await.swarm_registry.clone();
+        let registry = {
+            self.state
+                .with(move |state| state.swarm_registry.clone())
+                .await
+        };
         registry.snapshot().await
     }
     pub(crate) async fn describe_swarm_for_agent(
         &self,
         agent: AgentId,
     ) -> Result<SwarmDescribe, SwarmFailure> {
-        let registry = self.state.lock().await.swarm_registry.clone();
+        let registry = {
+            self.state
+                .with(move |state| state.swarm_registry.clone())
+                .await
+        };
         let mut describe = registry.describe(agent).await?;
         describe.workspace_projects = self
             .swarm_workspace_projects(&describe.swarm.constraints)
@@ -494,7 +543,11 @@ impl HostHandle {
         image_id: protocol::SwarmImageId,
     ) -> Result<(protocol::SwarmImage, protocol::ImageData), SwarmFailure> {
         let describe = self.describe_swarm_for_agent(agent).await?;
-        let registry = self.state.lock().await.swarm_registry.clone();
+        let registry = {
+            self.state
+                .with(move |state| state.swarm_registry.clone())
+                .await
+        };
         let snapshot = registry.snapshot().await?;
         if !snapshot.posts.iter().any(|post| {
             post.swarm_id == describe.swarm.id
@@ -577,7 +630,13 @@ impl HostHandle {
         agent: &AgentId,
         input: &AgentInput,
     ) -> Result<bool, SwarmFailure> {
-        let mut state = self.state.lock().await;
+        let (registry, session, batch, receipt) = {
+            let agent = agent.to_owned();
+            let input = input.to_owned();
+            match self.state.with_async(move |state| Box::pin(async move {
+let agent = &agent;
+let input = &input;
+
         let registry = state.swarm_registry.clone();
         if !registry.snapshot().await?.swarms.iter().any(|swarm| {
             swarm
@@ -585,7 +644,7 @@ impl HostHandle {
                 .iter()
                 .any(|member| member.agent_id.as_ref() == Some(agent))
         }) {
-            return Ok(false);
+            return Ok(std::ops::ControlFlow::Break(Ok(false)));
         }
         let payload = match input {
             AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload) => payload.clone(),
@@ -593,20 +652,20 @@ impl HostHandle {
             | AgentInput::GoalControl(
                 protocol::GoalControl::Set { .. } | protocol::GoalControl::Resume,
             ) => {
-                return Err(fail(
+                return Ok(std::ops::ControlFlow::Break(Err(fail(
                     SwarmErrorCode::Unsupported,
                     "Swarm member execution must use admitted board notifications or an idle private message, not independent goal/queue activation",
-                ));
+                ))));
             }
             AgentInput::UpdateSessionSettings(_) => {
-                return Err(fail(
+                return Ok(std::ops::ControlFlow::Break(Err(fail(
                     SwarmErrorCode::Conflict,
                     "Swarm launch/model selection changes require a reviewed Manage swarm preview, not independent session edits",
-                ));
+                ))));
             }
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
-            | AgentInput::CancelQueuedMessage(_) => return Ok(false),
+            | AgentInput::CancelQueuedMessage(_) => return Ok(std::ops::ControlFlow::Break(Ok(false))),
         };
         let handle = state.registry.agent_handle(agent).ok_or_else(|| {
             fail(
@@ -620,12 +679,12 @@ impl HostHandle {
                 "Swarm member has no runtime status source",
             )
         })?;
-        let status = status_handle.snapshot().await;
+        let status = status_handle.current();
         if status.terminated || handle.is_closing() {
-            return Err(fail(
+            return Ok(std::ops::ControlFlow::Break(Err(fail(
                 SwarmErrorCode::Lifecycle,
                 "Swarm member runtime is no longer accepting private execution",
-            ));
+            ))));
         }
         let events = registry
             .status(
@@ -636,7 +695,7 @@ impl HostHandle {
                 None,
             )
             .await?;
-        fan_out_swarm_events_locked(&mut state, events);
+        fan_out_swarm_events_locked(state, events);
         let session = state.agent_sessions.get(agent).cloned().ok_or_else(|| {
             fail(
                 SwarmErrorCode::Lifecycle,
@@ -647,7 +706,7 @@ impl HostHandle {
         let (batch, events) = registry
             .private_admission(agent.clone(), starts_turn)
             .await?;
-        fan_out_swarm_events_locked(&mut state, events);
+        fan_out_swarm_events_locked(state, events);
         let permitted = registry.snapshot().await?.swarms.iter().any(|swarm| {
             swarm.recovery_requirement == protocol::SwarmRecoveryRequirement::None
                 && matches!(
@@ -662,12 +721,12 @@ impl HostHandle {
         if !permitted {
             if let Some(batch) = batch {
                 let events = registry.defer(batch).await?;
-                fan_out_swarm_events_locked(&mut state, events);
+                fan_out_swarm_events_locked(state, events);
             }
-            return Err(fail(
+            return Ok(std::ops::ControlFlow::Break(Err(fail(
                 SwarmErrorCode::Conflict,
                 "Committed swarm admission requires attention before execution",
-            ));
+            ))));
         }
         // Enqueue under the admission lock; native acknowledgement must not
         // hold unrelated host commands or Pause behind provider IO.
@@ -676,32 +735,49 @@ impl HostHandle {
         } else {
             handle.enqueue_message(payload)
         };
-        drop(state);
+
+Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue((registry, session, batch, receipt,)))
+
+})).await? { std::ops::ControlFlow::Break(result) => return result, std::ops::ControlFlow::Continue(value) => value }
+        };
+
         let delivered = match receipt {
             Ok(receipt) => receipt.wait().await,
             Err(error) => Err(error),
         };
-        let mut state = self.state.lock().await;
-        if let Some(batch) = batch {
-            let events = match &delivered {
-                Ok(()) => {
-                    registry
-                        .complete(batch, Ok((agent.clone(), session.clone())))
-                        .await?
-                }
-                Err(_) => registry.defer(batch).await?,
-            };
-            fan_out_swarm_events_locked(&mut state, events);
+        {
+            let delivery_succeeded = delivered.is_ok();
+            let agent = agent.to_owned();
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        let agent = &agent;
+
+                        if let Some(batch) = batch {
+                            let events = match delivery_succeeded {
+                                true => {
+                                    registry
+                                        .complete(batch, Ok((agent.clone(), session.clone())))
+                                        .await?
+                                }
+                                false => registry.defer(batch).await?,
+                            };
+                            fan_out_swarm_events_locked(state, events);
+                        }
+                        record_swarm_status_locked(
+                            state,
+                            agent.clone(),
+                            AgentControlStatus::Failed,
+                            None,
+                            true,
+                        )
+                        .await?;
+
+                        Ok::<_, SwarmFailure>(())
+                    })
+                })
+                .await?
         }
-        record_swarm_status_locked(
-            &mut state,
-            agent.clone(),
-            AgentControlStatus::Failed,
-            None,
-            true,
-        )
-        .await?;
-        drop(state);
         self.schedule_swarm_dispatch().await;
         delivered.map_err(delivery_failure)?;
         Ok(true)
@@ -711,8 +787,11 @@ impl HostHandle {
         constraints: &SwarmConstraints,
     ) -> Result<(), SwarmFailure> {
         let (project_store, mock) = {
-            let state = self.state.lock().await;
-            (Arc::clone(&state.project_store), state.use_mock_backend)
+            {
+                self.state
+                    .with(move |state| (Arc::clone(&state.project_store), state.use_mock_backend))
+                    .await
+            }
         };
         let project = project_store
             .get(&constraints.project_id)
@@ -889,19 +968,27 @@ impl HostHandle {
             Ok(()) => Ok(()),
             Err(error) => {
                 tracing::warn!(code = ?error.code, "Swarm command rejected");
-                let mut state = self.state.lock().await;
-                emit_swarm_events_locked(
-                    &mut state,
-                    vec![SwarmEventPayload::Error(SwarmErrorNotifyPayload {
-                        swarm_id: subject.0,
-                        draft_id: subject.1,
-                        publication_id: subject.2,
-                        code: error.code,
-                        message: error.message,
-                    })],
-                    Some(requester),
-                );
-                Ok(())
+                {
+                    let requester = requester.to_owned();
+                    self.state
+                        .with(move |state| {
+                            let requester = &requester;
+
+                            emit_swarm_events_locked(
+                                state,
+                                vec![SwarmEventPayload::Error(SwarmErrorNotifyPayload {
+                                    swarm_id: subject.0,
+                                    draft_id: subject.1,
+                                    publication_id: subject.2,
+                                    code: error.code,
+                                    message: error.message,
+                                })],
+                                Some(requester),
+                            );
+                            Ok(())
+                        })
+                        .await
+                }
             }
         }
     }
@@ -910,7 +997,11 @@ impl HostHandle {
         requester: &StreamPath,
         payload: SwarmCommandPayload,
     ) -> Result<(), SwarmFailure> {
-        let registry = self.state.lock().await.swarm_registry.clone();
+        let registry = {
+            self.state
+                .with(move |state| state.swarm_registry.clone())
+                .await
+        };
         match &payload {
             SwarmCommandPayload::GenerateDraft { constraints, .. }
             | SwarmCommandPayload::PreviewChange { constraints, .. } => {
@@ -928,8 +1019,18 @@ impl HostHandle {
                     .ok_or_else(|| fail(SwarmErrorCode::NotFound, "Draft does not exist"))?;
                 self.validate_swarm_member(member, &draft.constraints)
                     .await?;
-                let state = self.state.lock().await;
-                validate_retained_session_locked(&state, &draft, member).await?;
+                {
+                    let member = member.clone();
+                    self.state
+                        .with_async(move |state| {
+                            Box::pin(async move {
+                                validate_retained_session_locked(state, &draft, &member).await?;
+
+                                Ok::<_, SwarmFailure>(())
+                            })
+                        })
+                        .await?
+                }
             }
             SwarmCommandPayload::Launch { draft_id, .. }
             | SwarmCommandPayload::ApplyMigration { draft_id, .. } => {
@@ -947,7 +1048,11 @@ impl HostHandle {
                 }
                 if let Some(team_id) = &draft.legacy_team_id {
                     self.ensure_legacy_team_quiescent(team_id).await?;
-                    let team_registry = self.state.lock().await.team_registry.clone();
+                    let team_registry = {
+                        self.state
+                            .with(move |state| state.team_registry.clone())
+                            .await
+                    };
                     let legacy = team_registry
                         .snapshot()
                         .await
@@ -1016,7 +1121,11 @@ impl HostHandle {
             }
             SwarmCommandPayload::PreviewMigration { team_id } => {
                 self.ensure_legacy_team_quiescent(team_id).await?;
-                let team_registry = self.state.lock().await.team_registry.clone();
+                let team_registry = {
+                    self.state
+                        .with(move |state| state.team_registry.clone())
+                        .await
+                };
                 let snapshot = team_registry
                     .snapshot()
                     .await
@@ -1049,7 +1158,11 @@ impl HostHandle {
                             "Legacy members require an explicit common project",
                         )
                     })?;
-                let session_store = Arc::clone(&self.state.lock().await.session_store);
+                let session_store = {
+                    self.state
+                        .with(move |state| Arc::clone(&state.session_store))
+                        .await
+                };
                 for member in &members {
                     let record = match &member.session_id {
                         Some(id) => Some(session_store.get(id).await.ok_or_else(|| {
@@ -1169,13 +1282,21 @@ impl HostHandle {
             &payload,
             SwarmCommandPayload::Launch { .. } | SwarmCommandPayload::ApplyMigration { .. }
         ) {
-            let gate = self.state.lock().await.swarm_conversion_test_gate.clone();
+            let gate = {
+                self.state
+                    .with(move |state| state.swarm_conversion_test_gate.clone())
+                    .await
+            };
             if let Some(gate) = gate {
                 wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
         }
         {
-            let mut state = self.state.lock().await;
+            {
+                let requester = requester.to_owned();
+                match self.state.with_async(move |state| Box::pin(async move {
+let requester = &requester;
+
             if let SwarmCommandPayload::Launch { draft_id, .. }
             | SwarmCommandPayload::ApplyMigration { draft_id, .. } = &payload
             {
@@ -1189,7 +1310,7 @@ impl HostHandle {
                     .ok_or_else(|| {
                         fail(SwarmErrorCode::NotFound, "Draft disappeared before commit")
                     })?;
-                validate_migration_locked(&state, &draft).await?;
+                validate_migration_locked(state, &draft).await?;
             }
             let legacy_team = match &payload {
                 SwarmCommandPayload::Launch { draft_id, .. }
@@ -1239,10 +1360,10 @@ impl HostHandle {
                         .any(|binding| binding.current_agent_id.is_some())
                         || legacy.pending_member_ids.iter().any(|id| ids.contains(id))
                     {
-                        return Err(fail(
+                        return Ok(std::ops::ControlFlow::Break(Err(fail(
                             SwarmErrorCode::Conflict,
                             "Legacy member became active before conversion commit",
-                        ));
+                        ))));
                     }
                     Some(TeamRegistryEvents {
                         team_notifies: vec![TeamNotifyPayload::Delete { team }],
@@ -1308,10 +1429,10 @@ impl HostHandle {
                             binding_present = member.agent_id.is_some(),
                             "Swarm retry diagnostic: retirement rejected before runtime cleanup"
                         );
-                        return Err(fail(
+                        return Ok(std::ops::ControlFlow::Break(Err(fail(
                             SwarmErrorCode::Conflict,
                             "Retiring or retired swarm members cannot retry",
-                        ));
+                        ))));
                     }
                     if let Some(agent) = member.agent_id.clone() {
                         if state
@@ -1324,13 +1445,13 @@ impl HostHandle {
                                 member_state = ?member.state,
                                 "Swarm retry diagnostic: closing runtime rejected before cleanup"
                             );
-                            return Err(fail(
+                            return Ok(std::ops::ControlFlow::Break(Err(fail(
                                 SwarmErrorCode::Conflict,
                                 "Closing swarm members cannot retry before runtime teardown",
-                            ));
+                            ))));
                         }
                         record_swarm_status_locked(
-                            &mut state,
+                            state,
                             agent,
                             AgentControlStatus::Failed,
                             None,
@@ -1349,10 +1470,15 @@ impl HostHandle {
                         | SwarmEventPayload::Image(_)
                 )
             });
-            emit_swarm_events_locked(&mut state, pages, Some(requester));
-            fan_out_swarm_events_locked(&mut state, shared);
-            if let Some(events) = legacy_events {
-                fan_out_team_registry_events(&mut state, events);
+            emit_swarm_events_locked(state, pages, Some(requester));
+            fan_out_swarm_events_locked(state, shared);
+
+if let Some(events) = legacy_events {
+                fan_out_team_registry_events(state, events);
+            }
+Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(()))
+
+})).await? { std::ops::ControlFlow::Break(result) => return result, std::ops::ControlFlow::Continue(value) => value }
             }
         }
         if let Some(id) = pause_id {
@@ -1435,7 +1561,11 @@ impl HostHandle {
                 "Legacy team is already converted",
             ));
         }
-        let registry = self.state.lock().await.team_registry.clone();
+        let registry = {
+            self.state
+                .with(move |state| state.team_registry.clone())
+                .await
+        };
         let snapshot = registry
             .snapshot()
             .await
@@ -1468,13 +1598,23 @@ impl HostHandle {
     }
     pub(super) async fn swarm_mutation<T, F, Fut>(&self, operation: F) -> Result<T, SwarmFailure>
     where
-        F: FnOnce(SwarmRegistryHandle) -> Fut,
-        Fut: std::future::Future<Output = Result<(T, Vec<SwarmEventPayload>), SwarmFailure>>,
+        T: Send + 'static,
+        F: FnOnce(SwarmRegistryHandle) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(T, Vec<SwarmEventPayload>), SwarmFailure>>
+            + Send
+            + 'static,
     {
-        let mut state = self.state.lock().await;
-        let (result, events) = operation(state.swarm_registry.clone()).await?;
-        fan_out_swarm_events_locked(&mut state, events);
-        Ok(result)
+        {
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        let (result, events) = operation(state.swarm_registry.clone()).await?;
+                        fan_out_swarm_events_locked(state, events);
+                        Ok(result)
+                    })
+                })
+                .await
+        }
     }
     pub(super) async fn record_swarm_status(
         &self,
@@ -1483,8 +1623,15 @@ impl HostHandle {
         session: Option<SessionId>,
         terminated: bool,
     ) -> Result<bool, SwarmFailure> {
-        let mut state = self.state.lock().await;
-        record_swarm_status_locked(&mut state, id, status, session, terminated).await
+        {
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        record_swarm_status_locked(state, id, status, session, terminated).await
+                    })
+                })
+                .await
+        }
     }
 
     async fn reconcile_swarm_dispatch(
@@ -1492,15 +1639,28 @@ impl HostHandle {
         batch: SwarmDispatch,
         result: Result<(AgentId, SessionId), SwarmFailure>,
     ) -> Result<(), SwarmFailure> {
-        let mut state = self.state.lock().await;
-        let agent = result.as_ref().ok().map(|(agent, _)| agent.clone());
-        let events = state.swarm_registry.complete(batch, result).await?;
-        fan_out_swarm_events_locked(&mut state, events);
-        if let Some(agent) = agent {
-            record_swarm_status_locked(&mut state, agent, AgentControlStatus::Failed, None, true)
-                .await?;
+        {
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        let agent = result.as_ref().ok().map(|(agent, _)| agent.clone());
+                        let events = state.swarm_registry.complete(batch, result).await?;
+                        fan_out_swarm_events_locked(state, events);
+                        if let Some(agent) = agent {
+                            record_swarm_status_locked(
+                                state,
+                                agent,
+                                AgentControlStatus::Failed,
+                                None,
+                                true,
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await
         }
-        Ok(())
     }
 
     /// Replaces every Failed member whose backoff has elapsed and returns the
@@ -1597,37 +1757,50 @@ impl HostHandle {
     }
 
     async fn reserve_swarm_dispatches(&self) -> Result<Vec<SwarmDispatch>, SwarmFailure> {
-        let mut state = self.state.lock().await;
-        let registry = state.swarm_registry.clone();
-        let mut eligible_live_agents = Vec::new();
-        for swarm in registry.snapshot().await?.swarms {
-            for member in swarm.members {
-                if let Some(agent) = member.agent_id
-                    && let Some(handle) = state.registry.agent_status_handle(&agent)
-                {
-                    let status = handle.snapshot().await;
-                    let idle = status.status() == AgentControlStatus::Idle;
-                    if idle || status.terminated {
-                        state.swarm_wakes_awaiting_idle.remove(&agent);
-                    }
-                    if !status.terminated
-                        && (idle
-                            || status.status() == AgentControlStatus::Thinking
-                                && !state.swarm_wakes_awaiting_idle.contains(&agent))
-                        && !status.has_queued_messages
-                    {
-                        eligible_live_agents.push(agent);
-                    }
-                }
-            }
+        {
+            self.state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        let registry = state.swarm_registry.clone();
+                        let mut eligible_live_agents = Vec::new();
+                        for swarm in registry.snapshot().await?.swarms {
+                            for member in swarm.members {
+                                if let Some(agent) = member.agent_id
+                                    && let Some(handle) = state.registry.agent_status_handle(&agent)
+                                {
+                                    let status = handle.current();
+                                    let idle = status.status() == AgentControlStatus::Idle;
+                                    if idle || status.terminated {
+                                        state.swarm_wakes_awaiting_idle.remove(&agent);
+                                    }
+                                    if !status.terminated
+                                        && (idle
+                                            || status.status() == AgentControlStatus::Thinking
+                                                && !state
+                                                    .swarm_wakes_awaiting_idle
+                                                    .contains(&agent))
+                                        && !status.has_queued_messages
+                                    {
+                                        eligible_live_agents.push(agent);
+                                    }
+                                }
+                            }
+                        }
+                        let (batches, events) = registry.reserve(eligible_live_agents).await?;
+                        fan_out_swarm_events_locked(state, events);
+                        Ok(batches)
+                    })
+                })
+                .await
         }
-        let (batches, events) = registry.reserve(eligible_live_agents).await?;
-        fan_out_swarm_events_locked(&mut state, events);
-        Ok(batches)
     }
 
     pub(super) async fn schedule_swarm_dispatch(&self) {
-        match self.state.lock().await.swarm_dispatch_tx.try_send(()) {
+        match {
+            self.state
+                .with(move |state| state.swarm_dispatch_tx.try_send(()))
+                .await
+        } {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
             Err(mpsc::error::TrySendError::Closed(())) => {
                 tracing::error!("Swarm dispatch worker closed")
@@ -1651,7 +1824,11 @@ impl HostHandle {
                 wake_bytes = prompt.len(),
                 "Swarm dispatch diagnostic: prepared final admission"
             );
-            let gate = self.state.lock().await.swarm_admission_test_gate.clone();
+            let gate = {
+                self.state
+                    .with(move |state| state.swarm_admission_test_gate.clone())
+                    .await
+            };
             if let Some(gate) = gate {
                 wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
@@ -1668,7 +1845,11 @@ impl HostHandle {
                 prompt: None,
             },
             None => {
-                let store = Arc::clone(&self.state.lock().await.project_store);
+                let store = {
+                    self.state
+                        .with(move |state| Arc::clone(&state.project_store))
+                        .await
+                };
                 let project = store.get(&batch.constraints.project_id).ok_or_else(|| {
                     fail(SwarmErrorCode::NotFound, "Swarm project no longer exists")
                 })?;
@@ -1755,52 +1936,72 @@ impl HostHandle {
         agent: &AgentId,
         prompt: String,
     ) -> Result<(AgentId, SessionId), SwarmFailure> {
-        let state = self.state.lock().await;
-        let snapshot = state.swarm_registry.snapshot().await?;
-        let admitted = snapshot
-            .swarms
-            .iter()
-            .find(|swarm| swarm.id == batch.swarm_id)
-            .is_some_and(|swarm| {
-                swarm.recovery_requirement == protocol::SwarmRecoveryRequirement::None
-                    && matches!(
-                        swarm.lifecycle,
-                        SwarmLifecycle::Running | SwarmLifecycle::Transitioning
-                    )
-                    && swarm.members.iter().any(|member| {
-                        member.spec.id == batch.member.spec.id
-                            && member.state == SwarmMemberState::Reserved
-                            && member.agent_id.as_ref() == Some(agent)
+        let (session, receipt) = {
+            let batch = batch.to_owned();
+            let agent = agent.to_owned();
+            match self
+                .state
+                .with_async(move |state| {
+                    Box::pin(async move {
+                        let batch = &batch;
+                        let agent = &agent;
+
+                        let snapshot = state.swarm_registry.snapshot().await?;
+                        let admitted = snapshot
+                            .swarms
+                            .iter()
+                            .find(|swarm| swarm.id == batch.swarm_id)
+                            .is_some_and(|swarm| {
+                                swarm.recovery_requirement
+                                    == protocol::SwarmRecoveryRequirement::None
+                                    && matches!(
+                                        swarm.lifecycle,
+                                        SwarmLifecycle::Running | SwarmLifecycle::Transitioning
+                                    )
+                                    && swarm.members.iter().any(|member| {
+                                        member.spec.id == batch.member.spec.id
+                                            && member.state == SwarmMemberState::Reserved
+                                            && member.agent_id.as_ref() == Some(agent)
+                                    })
+                            });
+                        if !admitted {
+                            tracing::info!("Swarm delivery deferred at final lifecycle admission");
+                            return Ok(std::ops::ControlFlow::Break(Err(fail(
+                                SwarmErrorCode::Conflict,
+                                "Swarm lifecycle changed before native admission",
+                            ))));
+                        }
+                        let handle = state.registry.agent_handle(agent).ok_or_else(|| {
+                            fail(
+                                SwarmErrorCode::Lifecycle,
+                                "Swarm member has no live agent handle",
+                            )
+                        })?;
+                        let session = batch.member.session_id.clone().ok_or_else(|| {
+                            fail(
+                                SwarmErrorCode::Lifecycle,
+                                "Live swarm member has no bound session",
+                            )
+                        })?;
+                        let receipt = handle
+                            .enqueue_swarm_wake(SendMessagePayload {
+                                message: prompt,
+                                images: None,
+                                origin: Some(protocol::MessageOrigin::AgentControl),
+                                tool_response: None,
+                            })
+                            .map_err(delivery_failure)?;
+
+                        Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue((session, receipt)))
                     })
-            });
-        if !admitted {
-            tracing::info!("Swarm delivery deferred at final lifecycle admission");
-            return Err(fail(
-                SwarmErrorCode::Conflict,
-                "Swarm lifecycle changed before native admission",
-            ));
-        }
-        let handle = state.registry.agent_handle(agent).ok_or_else(|| {
-            fail(
-                SwarmErrorCode::Lifecycle,
-                "Swarm member has no live agent handle",
-            )
-        })?;
-        let session = batch.member.session_id.clone().ok_or_else(|| {
-            fail(
-                SwarmErrorCode::Lifecycle,
-                "Live swarm member has no bound session",
-            )
-        })?;
-        let receipt = handle
-            .enqueue_swarm_wake(SendMessagePayload {
-                message: prompt,
-                images: None,
-                origin: Some(protocol::MessageOrigin::AgentControl),
-                tool_response: None,
-            })
-            .map_err(delivery_failure)?;
-        drop(state);
+                })
+                .await?
+            {
+                std::ops::ControlFlow::Break(result) => return result,
+                std::ops::ControlFlow::Continue(value) => value,
+            }
+        };
+
         receipt.wait().await.map_err(delivery_failure)?;
         Ok((agent.clone(), session))
     }
@@ -1819,7 +2020,7 @@ async fn record_swarm_status_locked(
     }
     let (status, session, terminated, failure) = match state.registry.agent_status_handle(&id) {
         Some(handle) => {
-            let current = handle.snapshot().await;
+            let current = handle.current();
             (
                 current.status(),
                 state.agent_sessions.get(&id).cloned().or(session),
@@ -1983,7 +2184,11 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
                 return;
             }
             replacement_due_at_ms = None;
-            let registry = host.state.lock().await.swarm_registry.clone();
+            let registry = {
+                host.state
+                    .with(move |state| state.swarm_registry.clone())
+                    .await
+            };
             let snapshot = match registry.snapshot().await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -2120,11 +2325,16 @@ pub(super) fn spawn_swarm_dispatch_task(host: HostHandle, mut rx: mpsc::Receiver
                     .as_ref()
                     .is_err_and(|error| error.code == SwarmErrorCode::Busy);
                 if refused_busy && let Some(agent) = &batch.member.agent_id {
-                    host.state
-                        .lock()
-                        .await
-                        .swarm_wakes_awaiting_idle
-                        .insert(agent.clone());
+                    {
+                        let agent = agent.to_owned();
+                        host.state
+                            .with(move |state| {
+                                let agent = &agent;
+
+                                state.swarm_wakes_awaiting_idle.insert(agent.clone())
+                            })
+                            .await
+                    };
                 }
                 if lifecycle_changed || refused_busy {
                     if let Err(error) = host
@@ -2395,10 +2605,14 @@ fn parse_swarm_decider(
 
 impl HostHandle {
     /// Starts one worker per thread with outstanding naming or reply work.
-    /// The worker set is guarded by the host state lock on both insert and
-    /// exit, so a human post is never left without a worker.
+    /// The host actor owns worker insertion and exit, so a human post is
+    /// never left without a worker.
     pub(super) async fn schedule_swarm_helpers(&self) {
-        let mut state = self.state.lock().await;
+        {
+            let host = self.clone();
+            self.state.with_async(move |state| Box::pin(async move {
+
+
         let snapshot = match state.swarm_registry.snapshot().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2408,7 +2622,7 @@ impl HostHandle {
         };
         for key in swarm_helper_work(&snapshot) {
             if state.swarm_helper_jobs.insert(key.clone()) {
-                let host = self.clone();
+                let host = host.clone();
                 let Ok(runtime) = tokio::runtime::Handle::try_current() else {
                     tracing::error!("Swarm helper requires a running Tokio runtime");
                     state.swarm_helper_jobs.remove(&key);
@@ -2416,6 +2630,9 @@ impl HostHandle {
                 };
                 runtime.spawn(async move { host.run_swarm_helper(key).await });
             }
+        }
+
+})).await
         }
     }
 
@@ -2450,16 +2667,30 @@ impl HostHandle {
                     progress = work => progress,
                 }
             } else {
-                let mut state = self.state.lock().await;
-                let remaining = match state.swarm_registry.snapshot().await {
-                    Ok(snapshot) => swarm_helper_work(&snapshot).contains(&key),
-                    Err(_) => false,
-                };
-                if !remaining {
-                    state.swarm_helper_jobs.remove(&key);
-                    return;
+                {
+                    let key = key.clone();
+                    match self
+                        .state
+                        .with_async(move |state| {
+                            Box::pin(async move {
+                                let remaining = match state.swarm_registry.snapshot().await {
+                                    Ok(snapshot) => swarm_helper_work(&snapshot).contains(&key),
+                                    Err(_) => false,
+                                };
+                                if !remaining {
+                                    state.swarm_helper_jobs.remove(&key);
+                                    return std::ops::ControlFlow::Break(());
+                                }
+
+                                std::ops::ControlFlow::Continue(true)
+                            })
+                        })
+                        .await
+                    {
+                        std::ops::ControlFlow::Break(result) => return result,
+                        std::ops::ControlFlow::Continue(value) => value,
+                    }
                 }
-                true
             };
             if progress {
                 backoff = Duration::from_millis(500);
@@ -2485,7 +2716,11 @@ impl HostHandle {
             .allocations
             .first()
             .ok_or_else(|| "Swarm has no backend allocation for its helper".to_owned())?;
-        let capacity_tx = self.state.lock().await.capacity_tx.clone();
+        let capacity_tx = {
+            self.state
+                .with(move |state| state.capacity_tx.clone())
+                .await
+        };
         let turn = crate::agent::run_helper_text_turn(crate::agent::HelperTextTurn {
             label,
             backend_kind: allocation.backend_kind,

@@ -960,31 +960,40 @@ async fn publish_events(
         };
         match event {
             Publication::Progress(stream) => {
-                let mut state = host.state.lock().await;
-                if let Some(progress) = snapshot
-                    .borrow()
-                    .operations
-                    .iter()
-                    .find(|operation| operation.stream == stream)
-                {
-                    publish_progress(&mut state, progress);
-                }
+                let snapshot = snapshot.clone();
+                host.state
+                    .with(move |state| {
+                        if let Some(progress) = snapshot
+                            .borrow()
+                            .operations
+                            .iter()
+                            .find(|operation| operation.stream == stream)
+                        {
+                            publish_progress(state, progress);
+                        }
+                    })
+                    .await
             }
             Publication::Final {
                 progress,
                 output,
                 error,
             } => {
-                let mut state = host.state.lock().await;
-                publish_progress(&mut state, &progress);
-                if let (Some(output), Some(error)) = (output, error) {
-                    match serde_json::to_value(error) {
-                        Ok(value) => {
-                            let _ = output.send_value(FrameKind::CommandError, value);
+                host.state
+                    .with(move |state| {
+                        publish_progress(state, &progress);
+                        if let (Some(output), Some(error)) = (output, error) {
+                            match serde_json::to_value(error) {
+                                Ok(value) => {
+                                    let _ = output.send_value(FrameKind::CommandError, value);
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "cannot serialize mutation error")
+                                }
+                            }
                         }
-                        Err(error) => tracing::error!(%error, "cannot serialize mutation error"),
-                    }
-                }
+                    })
+                    .await
             }
             Publication::Commit {
                 stream,

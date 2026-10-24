@@ -326,9 +326,33 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
             agentless.tychat.settings_application,
             TychatSettingsApplication::Inactive
         );
+        let publication = host
+            .install_tychat_test_gate(server::tychat::TychatTestBoundary::StatePublication)
+            .await;
+        host.set_tychat_bridge_status(&generation, TychatBridgeStatus::Connecting)
+            .await
+            .unwrap();
+        publication.wait_until_entered().await;
         host.set_tychat_bridge_status(&generation, TychatBridgeStatus::Connected)
             .await
             .unwrap();
+        let (mut late, baseline) = fixture.connect_with_bootstrap().await;
+        assert_eq!(baseline.tychat.status, TychatBridgeStatus::Connected);
+        publication.release_one();
+        let notified = fixture::next_frame_matching_on(
+            &mut late,
+            "Tychat publication after bootstrap",
+            |env| env.kind == FrameKind::TychatState,
+        )
+        .await;
+        assert_eq!(
+            notified
+                .parse_payload::<TychatStatePayload>()
+                .unwrap()
+                .status,
+            TychatBridgeStatus::Connected,
+            "a queued publisher must not regress the bootstrap baseline"
+        );
         fixture::next_frame_matching_on(&mut observer, "agentless bridge connected", |env| {
             env.kind == FrameKind::TychatState
                 && matches!(

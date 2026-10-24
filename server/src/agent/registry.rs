@@ -782,6 +782,10 @@ impl AgentStatusHandle {
     }
 
     pub async fn snapshot(&self) -> AgentStatus {
+        self.current()
+    }
+
+    pub fn current(&self) -> AgentStatus {
         self.status.borrow().clone()
     }
 }
@@ -1083,11 +1087,11 @@ impl AgentRegistry {
         self.agents.get(agent_id)?.parent_agent_id.clone()
     }
 
-    pub async fn has_background_work(&self, agent_id: &AgentId) -> bool {
+    pub fn has_background_work(&self, agent_id: &AgentId) -> bool {
         let Some(entry) = self.agents.get(agent_id) else {
             return false;
         };
-        let status = entry.status_handle.snapshot().await;
+        let status = entry.status_handle.current();
         if status.terminated {
             return false;
         }
@@ -1096,7 +1100,7 @@ impl AgentRegistry {
         }
         for child in self.agents.values() {
             if child.parent_agent_id.as_ref() == Some(agent_id)
-                && child.status_handle.snapshot().await.is_active()
+                && child.status_handle.current().is_active()
             {
                 return true;
             }

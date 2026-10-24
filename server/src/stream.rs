@@ -527,6 +527,10 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
+    pub fn close(&self) {
+        self.queue.close();
+    }
+
     pub fn new(path: StreamPath, queue: OutputQueue) -> Self {
         queue.add_stream();
         Self { path, queue }

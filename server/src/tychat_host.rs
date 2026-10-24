@@ -73,11 +73,12 @@ impl HostHandle {
         boundary: crate::tychat::TychatTestBoundary,
     ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
-        self.state
-            .lock()
-            .await
-            .tychat
-            .install_test_gate(boundary, gate.shared());
+        {
+            let gate = gate.shared();
+            self.state
+                .with(move |state| state.tychat.install_test_gate(boundary, gate))
+                .await
+        };
         gate
     }
 
@@ -89,7 +90,7 @@ impl HostHandle {
 
     #[cfg(feature = "test-support")]
     async fn wait_tychat_test_boundary(&self, boundary: crate::tychat::TychatTestBoundary) {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         if let Some(gate) = service.take_test_gate(boundary).await {
             wait_for_spawn_operation_test_gate_inner(&gate).await;
         }
@@ -97,27 +98,31 @@ impl HostHandle {
 
     #[cfg(feature = "test-support")]
     pub async fn cancel_tychat_bridge_task_for_test(&self) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service.bridge.cancel_task_for_test().await
     }
 
     pub async fn tychat_settings(&self) -> Result<protocol::TychatSettings, String> {
-        let store = self.state.lock().await.settings_store.clone();
+        let store = {
+            self.state
+                .with(move |state| state.settings_store.clone())
+                .await
+        };
         Ok(store.get()?.tychat)
     }
 
     pub async fn tychat_state(&self) -> protocol::TychatStatePayload {
-        self.state.lock().await.tychat.snapshot()
+        self.state.with(move |state| state.tychat.snapshot()).await
     }
 
     pub async fn subscribe_tychat(&self) -> watch::Receiver<u64> {
-        self.state.lock().await.tychat.subscribe()
+        self.state.with(move |state| state.tychat.subscribe()).await
     }
 
     pub async fn tychat_bot_state(
         &self,
     ) -> Result<Option<(protocol::TychatPairingId, String, SecretBotState)>, String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         Ok(service
             .pairing()
             .await?
@@ -130,7 +135,7 @@ impl HostHandle {
         secret: SecretBotState,
         fingerprints: protocol::TychatFingerprints,
     ) -> Result<protocol::TychatPairingId, String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .lifecycle(self.clone(), |reply| Lifecycle::Install {
                 secret,
@@ -148,7 +153,7 @@ impl HostHandle {
         if secret.0.is_empty() || fingerprints.bot.is_empty() || fingerprints.owner.is_empty() {
             return Err("Incomplete Tychat pairing".into());
         }
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         #[cfg(feature = "test-support")]
         self.wait_tychat_test_boundary(crate::tychat::TychatTestBoundary::PairingInstall)
             .await;
@@ -172,7 +177,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
         secret: SecretBotState,
     ) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .update(Update::PersistBot {
                 generation: generation.clone(),
@@ -186,7 +191,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
         status: TychatBridgeStatus,
     ) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .update(Update::BridgeStatus {
                 generation: generation.clone(),
@@ -199,7 +204,7 @@ impl HostHandle {
         &self,
         generation: &protocol::TychatPairingId,
     ) -> Result<protocol::TychatOutboundSnapshot, String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service.outbound(generation).await
     }
 
@@ -208,7 +213,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
         message_id: protocol::TychatOutboundId,
     ) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .update(Update::AcknowledgeOutbound {
                 generation: generation.clone(),
@@ -222,7 +227,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
         message: protocol::TychatOwnerMessage,
     ) -> Result<protocol::TychatDeliveryReceipt, String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .lifecycle(self.clone(), |reply| Lifecycle::Deliver {
                 generation: generation.clone(),
@@ -237,7 +242,7 @@ impl HostHandle {
         generation: &protocol::TychatPairingId,
         message: protocol::TychatOwnerMessage,
     ) -> Result<protocol::TychatDeliveryReceipt, String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         if !self.tychat_settings().await?.enabled {
             return Err("Tychat is disabled".into());
         }
@@ -275,7 +280,7 @@ impl HostHandle {
     }
 
     pub(super) async fn pair_tychat_now(&self, code: String) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .lifecycle(self.clone(), |reply| Lifecycle::Command {
                 command: TychatCommandPayload::Pair { code },
@@ -294,7 +299,7 @@ impl HostHandle {
         }
         // The bridge may await this queue; hold transport outside it through erasure,
         // including a generation installed by an earlier Pair still in the queue.
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         let disconnected = if matches!(command, TychatCommandPayload::Unpair) {
             let disconnected = service.bridge.disconnect().await?;
             #[cfg(feature = "test-support")]
@@ -325,7 +330,7 @@ impl HostHandle {
     }
 
     pub(crate) async fn pair_tychat_owned(&self, code: String) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         if service.pairing().await?.is_some() {
             return Err("Unpair before pairing another bot".into());
         }
@@ -356,7 +361,7 @@ impl HostHandle {
         &self,
         generation: Option<&protocol::TychatPairingId>,
     ) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .lifecycle(self.clone(), |reply| Lifecycle::Forget {
                 generation: generation.cloned(),
@@ -369,7 +374,7 @@ impl HostHandle {
         &self,
         generation: Option<&protocol::TychatPairingId>,
     ) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         let Some(pairing) = service.pairing().await? else {
             return Ok(());
         };
@@ -384,9 +389,10 @@ impl HostHandle {
     }
 
     pub(super) async fn start_tychat(&self) {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         let mut changed = service.subscribe();
         let host = self.clone();
+        #[cfg(feature = "test-support")]
         let publisher = service.clone();
         tokio::spawn(async move {
             loop {
@@ -394,13 +400,16 @@ impl HostHandle {
                     _ = host.restart.stopped.cancelled() => break,
                     result = changed.changed() => {
                         if result.is_err() { break; }
-                        let snapshot = publisher.snapshot();
-                        let state = host.state.lock().await;
-                        for subscriber in state.host_streams.values() {
-                            if subscriber.bootstrapped {
-                                let _ = subscriber.stream.send_value(FrameKind::TychatState, serde_json::to_value(&snapshot).expect("Tychat snapshot serializes"));
-                            }
+                        #[cfg(feature = "test-support")]
+                        if let Some(gate) = publisher.take_test_gate(crate::tychat::TychatTestBoundary::StatePublication).await {
+                            wait_for_spawn_operation_test_gate_inner(&gate).await;
                         }
+                        host.state.with(move |state| {
+                            let payload = serde_json::to_value(state.tychat.snapshot()).expect("Tychat snapshot serializes");
+                            state.host_streams.retain(|_, subscriber| {
+                                emit_or_queue_host_frame(subscriber, FrameKind::TychatState, payload.clone()).is_ok()
+                            });
+                        }).await;
                     }
                 }
             }
@@ -410,26 +419,34 @@ impl HostHandle {
         }
         #[cfg(feature = "test-support")]
         {
-            let disabled = self.state.lock().await.tychat_bridge_disabled;
+            let disabled = {
+                self.state
+                    .with(move |state| state.tychat_bridge_disabled)
+                    .await
+            };
             if disabled {
                 service.bridge.shutdown().await;
                 return;
             }
         }
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service.bridge.start(self.clone(), service.clone()).await;
     }
 
     pub(super) async fn reconcile_tychat(&self, reset: bool) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
         service
             .lifecycle(self.clone(), |reply| Lifecycle::Reconcile { reset, reply })
             .await?
     }
 
     pub(crate) async fn reconcile_tychat_owned(&self, reset: bool) -> Result<(), String> {
-        let service = self.state.lock().await.tychat.clone();
-        let settings_store = self.state.lock().await.settings_store.clone();
+        let service = { self.state.with(move |state| state.tychat.clone()).await };
+        let settings_store = {
+            self.state
+                .with(move |state| state.settings_store.clone())
+                .await
+        };
         let settings = settings_store.get()?;
         let paired = service.pairing().await?.is_some();
         let (saved, live) = service.reconcile_state().await?;
@@ -471,28 +488,37 @@ impl HostHandle {
             }
         }
         if saved.is_none() || reset {
-            let custom_store = self.state.lock().await.custom_agent_store.clone();
-            let custom_agents = custom_store.lock().await.clone();
-            let custom_exists = match settings.tychat.custom_agent_id.as_ref() {
-                Some(id) => custom_agents.get(id).is_some(),
-                None => true,
-            };
-            let state = self.state.lock().await;
-            validate_tychat_settings(&state, &settings, custom_exists)?;
+            let settings = settings.clone();
+            self.state
+                .with(move |state| {
+                    let custom_exists = settings
+                        .tychat
+                        .custom_agent_id
+                        .as_ref()
+                        .is_none_or(|id| state.custom_agent_store.get(id).is_some());
+                    validate_tychat_settings(state, &settings, custom_exists)
+                })
+                .await?;
         }
         let desired_profile = {
-            let state = self.state.lock().await;
-            settings
-                .tychat
-                .launch_profile_id
-                .as_ref()
-                .map(|id| {
-                    resolve_launch_profile_from_catalog(
-                        &launch_profile_catalog_for_settings(&state, &settings),
-                        id,
-                    )
-                })
-                .transpose()
+            {
+                let settings = settings.clone();
+                self.state
+                    .with(move |state| {
+                        settings
+                            .tychat
+                            .launch_profile_id
+                            .as_ref()
+                            .map(|id| {
+                                resolve_launch_profile_from_catalog(
+                                    &launch_profile_catalog_for_settings(state, &settings),
+                                    id,
+                                )
+                            })
+                            .transpose()
+                    })
+                    .await
+            }
         };
         if let Some(id) = live {
             if reset {
@@ -514,21 +540,37 @@ impl HostHandle {
                 if application == TychatSettingsApplication::Live
                     && saved.settings.session_settings != settings.tychat.session_settings
                 {
-                    let handle = self
-                        .state
-                        .lock()
-                        .await
-                        .registry
-                        .agent_handle(&id)
-                        .ok_or("Tychat agent is unavailable")?;
+                    let handle = {
+                        self.state
+                            .with(move |state| {
+                                state
+                                    .registry
+                                    .agent_handle(&id)
+                                    .ok_or("Tychat agent is unavailable")
+                            })
+                            .await
+                    }?;
                     let mut values = match settings.tychat.launch_profile_id.as_ref() {
                         Some(profile_id) => {
-                            let state = self.state.lock().await;
-                            resolve_launch_profile_from_catalog(
-                                &launch_profile_catalog_for_settings(&state, &settings),
-                                profile_id,
-                            )?
-                            .session_settings
+                            let settings = settings.clone();
+                            {
+                                let profile_id = profile_id.to_owned();
+                                self.state
+                                    .with(move |state| {
+                                        let profile_id = &profile_id;
+
+                                        Ok::<_, String>(
+                                            resolve_launch_profile_from_catalog(
+                                                &launch_profile_catalog_for_settings(
+                                                    state, &settings,
+                                                ),
+                                                profile_id,
+                                            )?
+                                            .session_settings,
+                                        )
+                                    })
+                                    .await
+                            }?
                         }
                         None => protocol::SessionSettingsValues::default(),
                     };
@@ -605,13 +647,17 @@ impl HostHandle {
                 tracing::warn!(code = ?error.code(), restoring, "Tychat lifecycle spawn failed");
                 error.to_string()
             })?;
-        let handle = self
-            .state
-            .lock()
-            .await
-            .registry
-            .agent_handle(&id)
-            .ok_or("Tychat agent startup disappeared")?;
+        let handle = {
+            let id = id.clone();
+            self.state
+                .with(move |state| {
+                    state
+                        .registry
+                        .agent_handle(&id)
+                        .ok_or("Tychat agent startup disappeared")
+                })
+                .await
+        }?;
         let session_id = match handle.wait_for_tychat_startup().await {
             Ok(session_id) => session_id,
             Err(error) => {
@@ -646,13 +692,17 @@ impl HostHandle {
             })
             .await?;
         tracing::info!(restoring, "Tychat lifecycle session admitted");
-        let status = self
-            .state
-            .lock()
-            .await
-            .registry
-            .agent_status_handle(&id)
-            .ok_or("Tychat status is missing")?;
+        let status = {
+            let id = id.clone();
+            self.state
+                .with(move |state| {
+                    state
+                        .registry
+                        .agent_status_handle(&id)
+                        .ok_or("Tychat status is missing")
+                })
+                .await
+        }?;
         let activity = status.snapshot().await.activity();
         tracing::info!(?activity, "Tychat initial activity projection");
         self.fan_out_agent_turn_state(&id).await;

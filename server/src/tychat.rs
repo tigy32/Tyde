@@ -251,6 +251,7 @@ pub(crate) enum DeliveryTarget {
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TychatTestBoundary {
+    StatePublication,
     OutboundAcknowledgement,
     PairingInstall,
     UnpairDisconnected,

@@ -387,6 +387,26 @@ enum RunningTurnRedirect {
     Interrupt,
 }
 
+struct UsageSnapshotReply {
+    sender: oneshot::Sender<AgentUsageSnapshot>,
+    #[cfg(feature = "test-support")]
+    gate: Option<Arc<crate::host::SpawnOperationTestGateInner>>,
+}
+
+impl UsageSnapshotReply {
+    fn send(self, snapshot: AgentUsageSnapshot) {
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = self.gate {
+            tokio::spawn(async move {
+                crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+                let _ = self.sender.send(snapshot);
+            });
+            return;
+        }
+        let _ = self.sender.send(snapshot);
+    }
+}
+
 enum AgentCommand {
     MarkAccountingSessionShared {
         reply: oneshot::Sender<Result<(), String>>,
@@ -509,7 +529,7 @@ enum AgentCommand {
         reply: oneshot::Sender<AgentActivityHistorySnapshot>,
     },
     ReadUsageSnapshot {
-        reply: oneshot::Sender<AgentUsageSnapshot>,
+        reply: UsageSnapshotReply,
     },
     Interrupt {
         reply: oneshot::Sender<InterruptOutcome>,
@@ -2197,7 +2217,12 @@ impl AgentHandle {
             .map_err(|_| "Accounting ownership acknowledgement was lost".to_owned())?
     }
 
-    pub async fn read_usage_snapshot(&self) -> Option<AgentUsageSnapshot> {
+    pub(crate) async fn read_usage_snapshot(
+        &self,
+        #[cfg(feature = "test-support")] gate: Option<
+            Arc<crate::host::SpawnOperationTestGateInner>,
+        >,
+    ) -> Option<AgentUsageSnapshot> {
         if self.actor_finished() {
             return self.final_usage.borrow().clone();
         }
@@ -2223,7 +2248,13 @@ impl AgentHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
-            .send(AgentCommand::ReadUsageSnapshot { reply: reply_tx })
+            .send(AgentCommand::ReadUsageSnapshot {
+                reply: UsageSnapshotReply {
+                    sender: reply_tx,
+                    #[cfg(feature = "test-support")]
+                    gate,
+                },
+            })
             .is_err()
         {
             return None;
@@ -2958,7 +2989,7 @@ pub(crate) async fn generate_agent_activity_summary(
     }
 
     if request.use_mock_backend {
-        return generate_mock_activity_summary(request).await;
+        return generate_mock_activity_summary(request);
     }
 
     let prompt =
@@ -4152,7 +4183,7 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(Ok(()));
                         }
                         AgentCommand::ReadUsageSnapshot { reply } => {
-                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                            reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
                                 &event_log,
@@ -10402,7 +10433,7 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(Ok(()));
                         }
                         AgentCommand::ReadUsageSnapshot { reply } => {
-                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                            reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
                                 &event_log,
@@ -11568,7 +11599,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ = reply.send(Ok(()));
                         }
                         AgentCommand::ReadUsageSnapshot { reply } => {
-                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                            reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
                                 &activity_stats,
                                 &event_log,
@@ -12879,7 +12910,7 @@ async fn park_terminal_agent(
                 ) {
                     snapshot.timing = event_log.timing.snapshot();
                 }
-                let _ = reply.send(snapshot);
+                reply.send(snapshot);
             }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber_with_latest_output(
@@ -13139,7 +13170,7 @@ async fn park_relay_terminal_agent(
                 let mut snapshot = usage.clone();
                 snapshot.start = current_start.clone();
                 snapshot.timing = event_log.timing.snapshot();
-                let _ = reply.send(snapshot);
+                reply.send(snapshot);
             }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber_with_latest_output(
@@ -17449,15 +17480,9 @@ Recent activity:\n{rendered_history}"
     )
 }
 
-async fn generate_mock_activity_summary(
+fn generate_mock_activity_summary(
     request: GenerateAgentActivitySummaryRequest,
 ) -> Result<AgentActivitySummary, String> {
-    if request
-        .rendered_history
-        .contains("__mock_slow_activity_summary__")
-    {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
     if request
         .rendered_history
         .contains("__mock_fail_activity_summary__")
