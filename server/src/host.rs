@@ -60,15 +60,15 @@ use protocol::{
     McpServerUpsertPayload, MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
     ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathPayload, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
-    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
-    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
-    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
+    ProjectDiscardFilePayload, ProjectFileViewPayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectNotifyPayload, ProjectOpenPathPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchCompletePayload,
+    ProjectSearchFileResult, ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    RequestedCompactionAvailability, RequestedCompactionRoute, ReviewActionPayload,
+    ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
+    SendMessagePayload, SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
     SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
     SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
     SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
@@ -147,8 +147,8 @@ use crate::mobile_access::{
 };
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectFileDelivery, ProjectStreamHandle, ProjectStreamSubscription,
-    SearchSummary, build_dir_listing, commit, discard_file, read_diff, root_is_git_repository,
-    search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
+    SearchSummary, commit, discard_file, read_diff, root_is_git_repository, search_project,
+    spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::reviewer::{
     ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
@@ -16829,40 +16829,25 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         }
     }
 
-    pub(crate) async fn list_project_dir(
+    pub(crate) async fn set_project_file_view(
         &self,
         connection_host_stream: &StreamPath,
         project_output_stream: &Stream,
         project_id: ProjectId,
-        payload: ProjectListDirPayload,
+        payload: ProjectFileViewPayload,
     ) -> AppResult<()> {
-        const OPERATION: &str = "project_list_dir";
-        self.ensure_host_project_subscription(
-            connection_host_stream,
-            project_output_stream,
-            project_id.clone(),
-            OPERATION,
-        )
-        .await?;
-        let project_store = {
-            {
-                self.state
-                    .with(move |state| Arc::clone(&state.project_store))
-                    .await
-            }
-        };
-        let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let listing = build_dir_listing(&project, &payload.root, &payload.path)
-            .map_err(|error| project_command_error(OPERATION, error))?;
-        let payload = serde_json::to_value(&listing).map_err(|error| {
-            AppError::internal_message(
+        const OPERATION: &str = "project_file_view";
+        let handle = self
+            .ensure_host_project_subscription(
+                connection_host_stream,
+                project_output_stream,
+                project_id,
                 OPERATION,
-                "failed to serialize project dir listing payload",
-                error,
             )
-        })?;
-        let _ = project_output_stream.send_value(FrameKind::ProjectFileList, payload);
-        Ok(())
+            .await?;
+        handle
+            .set_file_view(payload, connection_host_stream.clone())
+            .map_err(|error| project_command_error(OPERATION, error))
     }
 
     pub(crate) async fn read_project_diff(

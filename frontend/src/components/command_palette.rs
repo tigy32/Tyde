@@ -11,7 +11,8 @@ use crate::state::{
 };
 
 use protocol::{
-    ProjectFileKind, ProjectId, ProjectPath, WorkflowId, WorkflowInputSpec, WorkflowSourceScope,
+    ProjectFileView, ProjectFileViewState, ProjectFileWindow, ProjectId, ProjectPath, WorkflowId,
+    WorkflowInputSpec, WorkflowSourceScope,
 };
 
 /// Every command the app can execute. Typed rather than string-keyed so
@@ -709,14 +710,72 @@ fn do_select(
 pub fn CommandPalette() -> impl IntoView {
     let state = expect_context::<AppState>();
     let open = state.command_palette_open;
-    let file_tree = state.file_tree;
+    let file_views = state.file_views;
+    let file_view_epochs = state.file_view_epochs;
     let active_project = state.active_project;
     let workflow_state = state.clone();
+    let project_state = state.clone();
+    let open_project = Callback::new(move |_: web_sys::MouseEvent| {
+        project_state.command_palette_open.set(false);
+        crate::components::host_browser::open_project_browser(&project_state);
+    });
 
     let input = RwSignal::new(String::new());
     let selected_index = RwSignal::new(0usize);
 
     let is_command_mode = Memo::new(move |_| input.get().starts_with('>'));
+    let file_window = RwSignal::new(None::<(crate::state::ActiveProjectRef, ProjectFileWindow)>);
+    let desired_file_view = Memo::new(move |_| {
+        let project = active_project.get();
+        ProjectFileView::QuickOpen {
+            query: input.get().trim().to_owned(),
+            window: file_window.with(|selected| {
+                selected
+                    .as_ref()
+                    .filter(|(owner, _)| Some(owner) == project.as_ref())
+                    .map(|(_, window)| window.clone())
+                    .unwrap_or(ProjectFileWindow::First)
+            }),
+        }
+    });
+    let file_epoch = Memo::new(move |_| {
+        active_project
+            .get()
+            .and_then(|project| file_view_epochs.with(|epochs| epochs.get(&project).copied()))
+    });
+    Effect::new(
+        move |previous: Option<Option<(crate::state::ActiveProjectRef, ProjectFileView)>>| {
+            let current = if open.get() && !is_command_mode.get() {
+                active_project.get().map(|project| {
+                    file_epoch.get();
+                    (project, desired_file_view.get())
+                })
+            } else {
+                None
+            };
+            if let Some(Some((project, view))) = previous
+                && current
+                    .as_ref()
+                    .is_none_or(|(current, _)| *current != project)
+            {
+                crate::send::project_file_view(project, view, false);
+            }
+            if let Some((project, view)) = current.clone() {
+                crate::send::project_file_view(project, view, true);
+            }
+            current
+        },
+    );
+    let file_page = Memo::new(move |_| {
+        let project = active_project.get()?;
+        let desired = desired_file_view.get();
+        file_views.with(|map| {
+            map.get(&project)?
+                .iter()
+                .find(|page| page.view == desired)
+                .map(|page| (project.clone(), page.state.clone()))
+        })
+    });
 
     let results: Memo<Vec<PaletteResult>> = Memo::new(move |_| {
         let query_raw = input.get();
@@ -787,58 +846,26 @@ pub fn CommandPalette() -> impl IntoView {
                 .map(|(result, _)| result)
                 .collect()
         } else {
-            let query = query_raw.trim();
-            let tree = file_tree.get();
-            let Some(active_project) = active_project.get() else {
-                return Vec::new();
-            };
-            let mut scored: Vec<(String, ProjectPath, String, String, u32)> = Vec::new();
-            if let Some(root_listings) = tree.get(&active_project.project_id) {
-                for root_listing in root_listings {
-                    let root_label = root_display_name(&root_listing.root);
-                    for entry in &root_listing.entries {
-                        if entry.kind != ProjectFileKind::File {
-                            continue;
+            match file_page.get() {
+                Some((_, ProjectFileViewState::Ready { entries, .. })) => entries
+                    .into_iter()
+                    .map(|entry| {
+                        let display_path = entry.path.relative_path.clone();
+                        let name = display_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&display_path)
+                            .to_owned();
+                        PaletteResult::File {
+                            name,
+                            root_label: root_display_name(&entry.path.root),
+                            path: entry.path,
+                            display_path,
                         }
-                        let path = &entry.relative_path;
-                        let file_name = path.rsplit('/').next().unwrap_or(path);
-                        let score = if query.is_empty() {
-                            Some(0)
-                        } else {
-                            fuzzy_score(query, file_name).or_else(|| fuzzy_score(query, path))
-                        };
-                        if let Some(s) = score {
-                            scored.push((
-                                file_name.to_owned(),
-                                ProjectPath {
-                                    root: root_listing.root.clone(),
-                                    relative_path: path.clone(),
-                                },
-                                path.clone(),
-                                root_label.clone(),
-                                s,
-                            ));
-                        }
-                    }
-                }
+                    })
+                    .collect(),
+                _ => Vec::new(),
             }
-            scored.sort_by(|a, b| {
-                b.4.cmp(&a.4)
-                    .then_with(|| a.3.cmp(&b.3))
-                    .then_with(|| a.2.cmp(&b.2))
-            });
-            scored
-                .into_iter()
-                .take(10)
-                .map(
-                    |(name, path, display_path, root_label, _)| PaletteResult::File {
-                        name,
-                        path,
-                        display_path,
-                        root_label,
-                    },
-                )
-                .collect()
         }
     });
 
@@ -886,6 +913,7 @@ pub fn CommandPalette() -> impl IntoView {
         let target = ev.target().unwrap();
         let el: web_sys::HtmlInputElement = target.unchecked_into();
         input.set(el.value());
+        file_window.set(None);
         selected_index.set(0);
         notice.set(None);
     };
@@ -899,6 +927,7 @@ pub fn CommandPalette() -> impl IntoView {
     Effect::new(move |_| {
         if open.get() {
             input.set(String::new());
+            file_window.set(None);
             selected_index.set(0);
             notice.set(None);
             if let Some(el) = input_ref.get() {
@@ -1044,9 +1073,31 @@ pub fn CommandPalette() -> impl IntoView {
                                 }
                             }).collect_view()
                         }}
-                        <Show when=move || results.get().is_empty()>
-                            <div class="cp-empty">"No results"</div>
-                        </Show>
+                        {move || if is_command_mode.get() {
+                            results.get().is_empty().then(|| view! { <div class="cp-empty">"No results"</div> }).into_any()
+                        } else if active_project.get().is_none() {
+                            view! { <button class="cp-empty" on:click=move |event| open_project.run(event)>"Open project"</button> }.into_any()
+                        } else {
+                            match file_page.get() {
+                                None | Some((_, ProjectFileViewState::Loading)) => view! { <div class="cp-empty" role="status">"Searching…"</div> }.into_any(),
+                                Some((_, ProjectFileViewState::Unavailable { message })) => view! { <div role="alert">{message}</div> }.into_any(),
+                                Some((project, ProjectFileViewState::Ready { entries, previous, next })) => {
+                                    let choose_window = Callback::new(move |window: ProjectFileWindow| {
+                                        selected_index.set(0);
+                                        file_window.set(Some((project.clone(), window)));
+                                    });
+                                    view! {
+                                    {entries.is_empty().then(|| view! { <div class="cp-empty">"No results"</div> })}
+                                    <div class="fe-pages">
+                                        {previous.map(|cursor| view! { <button on:click=move |_| { choose_window.run(ProjectFileWindow::Before(cursor.clone())); }>"Previous"</button> })}
+                                        {next.map(|cursor| view! { <button on:click=move |_| { choose_window.run(ProjectFileWindow::After(cursor.clone())); }>"Next"</button> })}
+                                    </div>
+                                }.into_any()
+                                },
+                                Some((_, ProjectFileViewState::Closed)) => ().into_any(),
+                                Some((_, ProjectFileViewState::DirectoryMissing)) => view! { <div role="alert">"Directory no longer exists"</div> }.into_any(),
+                            }
+                        }}
                     </div>
                 </div>
             </div>
@@ -1059,7 +1110,7 @@ mod wasm_tests {
     use super::*;
     use crate::state::ActiveProjectRef;
     use leptos::mount::mount_to;
-    use protocol::{FileEntryOp, ProjectFileEntry, ProjectRootListing, ProjectRootPath};
+    use protocol::ProjectRootPath;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -1161,29 +1212,26 @@ mod wasm_tests {
             host_id: "h1".to_owned(),
             project_id: ProjectId("proj-1".to_owned()),
         }));
-        state.file_tree.update(|tree| {
-            tree.insert(
-                ProjectId("proj-1".to_owned()),
-                vec![ProjectRootListing {
-                    status: protocol::ProjectRootStatus::Available,
-                    root: ProjectRootPath("/repo".to_owned()),
-                    // The shape the server actually emits: one entry per path,
-                    // `Add` for a path present in the listing
-                    // (server/src/project_stream.rs). A directory rides along so
-                    // the fixture proves the palette honors the protocol's
-                    // `kind` rather than treating every entry as a file.
-                    entries: vec![
-                        ProjectFileEntry {
-                            relative_path: "main.rs".to_owned(),
-                            kind: ProjectFileKind::File,
-                            op: FileEntryOp::Add,
-                        },
-                        ProjectFileEntry {
-                            relative_path: "src".to_owned(),
-                            kind: ProjectFileKind::Directory,
-                            op: FileEntryOp::Add,
-                        },
-                    ],
+        state.file_views.update(|views| {
+            views.insert(
+                state.active_project.get_untracked().unwrap(),
+                vec![protocol::ProjectFileViewStatePayload {
+                    view: ProjectFileView::QuickOpen {
+                        query: String::new(),
+                        window: ProjectFileWindow::First,
+                    },
+                    state: ProjectFileViewState::Ready {
+                        entries: vec![protocol::ProjectFileCursor {
+                            path: ProjectPath {
+                                root: ProjectRootPath("/repo".to_owned()),
+                                relative_path: "main.rs".to_owned(),
+                            },
+                            kind: protocol::ProjectFileKind::File,
+                            score: 0,
+                        }],
+                        previous: None,
+                        next: None,
+                    },
                 }],
             );
         });
@@ -1203,8 +1251,7 @@ mod wasm_tests {
                 .unwrap()
                 .length(),
             1,
-            "the listing holds a file and a directory; only the file may be \
-             offered as a result"
+            "the server file result is offered for opening"
         );
         let row: HtmlElement = container
             .query_selector(".cp-result-item")
@@ -1237,6 +1284,56 @@ mod wasm_tests {
             !hints.contains("Side"),
             "splits are drag-only: the row must not advertise Open to the Side, \
              got {hints:?}"
+        );
+        let child = state.active_project.get_untracked().unwrap();
+        let mut parent_page = state.file_views.get_untracked()[&child][0].clone();
+        state.file_views.update(|views| {
+            if let ProjectFileViewState::Ready { entries, next, .. } =
+                &mut views.get_mut(&child).unwrap()[0].state
+            {
+                *next = entries.first().cloned();
+            }
+        });
+        settle().await;
+        let next = (0..container.query_selector_all("button").unwrap().length())
+            .filter_map(|index| container.query_selector_all("button").unwrap().item(index))
+            .find(|button| button.text_content().as_deref() == Some("Next"))
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        next.click();
+        settle().await;
+        let parent = ActiveProjectRef {
+            host_id: child.host_id,
+            project_id: ProjectId("parent".into()),
+        };
+        if let ProjectFileViewState::Ready { entries, .. } = &mut parent_page.state {
+            entries[0].path = ProjectPath {
+                root: ProjectRootPath("/parent".into()),
+                relative_path: "earlier.rs".into(),
+            };
+        }
+        state.file_views.update(|views| {
+            views.insert(parent.clone(), vec![parent_page]);
+        });
+        state.active_project.set(Some(parent));
+        settle().await;
+        assert!(
+            container.text_content().unwrap().contains("earlier.rs"),
+            "switching from a paged child starts the parent's canonical First page"
+        );
+        assert!(!container.text_content().unwrap().contains("Searching…"));
+        state.active_project.set(None);
+        settle().await;
+        assert!(
+            !container.text_content().unwrap().contains("Searching…"),
+            "no project means no pending search"
+        );
+        assert!(
+            (0..container.query_selector_all("button").unwrap().length())
+                .filter_map(|index| container.query_selector_all("button").unwrap().item(index))
+                .any(|button| button.text_content().as_deref() == Some("Open project")),
+            "the missing prerequisite is an action, not an endless spinner"
         );
     }
 }

@@ -3797,6 +3797,8 @@ pub struct AppState {
     pub sidebar_storage_blocked: RwSignal<bool>,
     pub sidebar_drag: RwSignal<Option<SidebarTab>>,
     pub project_editor: RwSignal<Option<ActiveProjectRef>>,
+    pub file_views: RwSignal<HashMap<ActiveProjectRef, Vec<protocol::ProjectFileViewStatePayload>>>,
+    pub file_view_epochs: RwSignal<HashMap<ActiveProjectRef, u64>>,
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     /// Server-authored code-intelligence overview per project (full-replacement
@@ -4354,6 +4356,8 @@ impl AppState {
             sidebar_storage_blocked: RwSignal::new(false),
             sidebar_drag: RwSignal::new(None),
             project_editor: RwSignal::new(None),
+            file_views: RwSignal::new(HashMap::new()),
+            file_view_epochs: RwSignal::new(HashMap::new()),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
             code_intel_overview: RwSignal::new(HashMap::new()),
@@ -7011,6 +7015,10 @@ impl AppState {
         let mut host_review_ids = review_ids;
         host_review_ids.extend(summary_review_ids);
 
+        self.file_views
+            .update(|map| map.retain(|key, _| key.host_id != host_id));
+        self.file_view_epochs
+            .update(|map| map.retain(|key, _| key.host_id != host_id));
         self.file_tree.update(|map| {
             map.retain(|project_id, _| !host_project_ids.contains(project_id));
         });

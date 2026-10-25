@@ -1461,6 +1461,11 @@ impl ProtocolValidator {
                 envelope,
                 "ProjectBootstrap",
             ),
+            FrameKind::ProjectFileViewState => parse_stream_payload::<
+                crate::ProjectFileViewStatePayload,
+            >(
+                &self.recent, envelope, "ProjectFileViewState"
+            ),
             FrameKind::ProjectFileList => parse_stream_payload::<ProjectFileListPayload>(
                 &self.recent,
                 envelope,

@@ -26,8 +26,8 @@ use protocol::{
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
     PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
     ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectFileViewPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
     ProjectOpenPathPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, ProtocolFrame,
     QueuedMessagesPayload, RejectPayload, ReviewActionPayload, ReviewBootstrapPayload,
@@ -1007,12 +1007,12 @@ impl Connection {
             .await
     }
 
-    pub async fn project_list_dir(
+    pub async fn project_file_view(
         &mut self,
         project_id: &ProjectId,
-        payload: ProjectListDirPayload,
+        payload: ProjectFileViewPayload,
     ) -> Result<(), FrameError> {
-        self.send_project_payload(project_id, FrameKind::ProjectListDir, &payload)
+        self.send_project_payload(project_id, FrameKind::ProjectFileView, &payload)
             .await
     }
 
@@ -1849,6 +1849,10 @@ impl Connection {
                     self.outgoing_seq
                         .entry(envelope.stream.clone())
                         .or_insert(0);
+                }
+                FrameKind::ProjectFileViewState => {
+                    let _: protocol::ProjectFileViewStatePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::ProjectFileList => {
                     let _: ProjectFileListPayload =

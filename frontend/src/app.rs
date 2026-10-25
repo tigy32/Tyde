@@ -1095,7 +1095,7 @@ pub(crate) async fn install_host_listeners(
     let line_state = state.clone();
     handles.push(
         bridge::listen_host_line(move |event| {
-            let _diagnostic = crate::perf::UiSpan::new(
+            let mut diagnostic = crate::perf::UiSpan::new(
                 crate::perf::UiOperation::HostReceive,
                 event.line.len(),
                 1,
@@ -1105,6 +1105,7 @@ pub(crate) async fn install_host_listeners(
             }
             match serde_json::from_str::<Envelope>(&event.line) {
                 Ok(envelope) => {
+                    diagnostic.set_frame(envelope.kind);
                     log::trace!(
                         "host_frame_rx host={} stream={} seq={} kind={}",
                         event.host_id,
@@ -1523,6 +1524,7 @@ pub(crate) fn is_managed_remote_host(state: &AppState, host_id: &str) -> bool {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use wasm_bindgen::JsValue;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1714,5 +1716,248 @@ mod wasm_tests {
             vec![(1, 0), (2, 0)],
             "each replacement connection has a fresh server-side validator, so its first project frame must start at sequence zero"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn ui_stall_log_names_the_slow_host_frame_apart_from_pending_waits() {
+        let host_id = "stall-attribution-host";
+        let clock = crate::perf::diagnostic_tests::LocalMonitorClock::install();
+        let recorded = js_sys::eval(
+            r#"
+            (() => {
+                window.__stallHandlers = {};
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__stallSaved = {
+                    listen: window.__TAURI__.event.listen,
+                    invoke: window.__TAURI__.core.invoke,
+                };
+                window.__TAURI__.event.listen = (name, handler) => {
+                    window.__stallHandlers[name] = handler;
+                    return Promise.resolve(() => {});
+                };
+                window.__stallViewEntered = new Promise(entered => {
+                    window.__stallViewSent = entered;
+                });
+                window.__stallWaitEntered = new Promise(entered => {
+                    window.__stallEntered = entered;
+                });
+                return new Promise(recorded => {
+                    window.__TAURI__.core.invoke = (cmd, args) => {
+                        if (cmd === 'log_ui_diagnostic') {
+                            recorded(JSON.stringify(args.record));
+                            return Promise.resolve(null);
+                        }
+                        if (cmd === 'send_host_line' && args.line === '{}') {
+                            return new Promise(release => {
+                                window.__stallRelease = release;
+                                window.__stallEntered();
+                            });
+                        }
+                        if (cmd === 'send_host_line' && args.hostId === 'stall-attribution-host') {
+                            window.__stallViewSent(args.line);
+                        }
+                        return Promise.resolve(null);
+                    };
+                });
+            })()
+            "#,
+        )
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
+        let state = AppState::new();
+        let handles = install_host_listeners(state.clone()).await.unwrap();
+
+        // An ordinary host wait stays pending across the observed gap.
+        let waiting = wasm_bindgen_futures::future_to_promise(async move {
+            crate::bridge::send_host_line(crate::bridge::SendHostLineRequest {
+                host_id: host_id.to_owned(),
+                line: "{}".to_owned(),
+            })
+            .await
+            .map(|()| JsValue::NULL)
+            .map_err(JsValue::from)
+        });
+        wasm_bindgen_futures::JsFuture::from(
+            js_sys::eval("window.__stallWaitEntered")
+                .unwrap()
+                .dyn_into::<js_sys::Promise>()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let project_id = protocol::ProjectId("stall-attribution".to_owned());
+        let listing = protocol::ProjectFileListPayload {
+            incremental: false,
+            roots: vec![protocol::ProjectRootListing {
+                root: ProjectRootPath("/repo".to_owned()),
+                status: protocol::ProjectRootStatus::Available,
+                entries: ["README.md", "src", "src/main.rs"]
+                    .into_iter()
+                    .map(|path| protocol::ProjectFileEntry {
+                        relative_path: path.to_owned(),
+                        kind: if path == "src" {
+                            protocol::ProjectFileKind::Directory
+                        } else {
+                            protocol::ProjectFileKind::File
+                        },
+                        op: protocol::FileEntryOp::Add,
+                    })
+                    .collect(),
+                partial_dirs: Vec::new(),
+            }],
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host_id,
+            Envelope::from_payload(
+                StreamPath(format!("/project/{}", project_id.0)),
+                FrameKind::ProjectFileList,
+                0,
+                &listing,
+            )
+            .unwrap(),
+        );
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host_id.into(),
+                project_id: project_id.clone(),
+            }));
+        let document = web_sys::window().unwrap().document().unwrap();
+        let element = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&element).unwrap();
+        let container = crate::wasm_test_support::ScopedRoot::new(element, "stall-file-view");
+        let mounted_state = state.clone();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <crate::components::file_explorer::FileExplorer /> }
+        });
+        let mounted = crate::wasm_test_support::Mounted::new(handle, ());
+        leptos::task::tick().await;
+        let page = protocol::ProjectFileViewStatePayload {
+            view: protocol::ProjectFileView::Directory {
+                path: protocol::ProjectPath {
+                    root: ProjectRootPath("/repo".into()),
+                    relative_path: String::new(),
+                },
+                window: protocol::ProjectFileWindow::First,
+                show_hidden: false,
+                filter: String::new(),
+            },
+            state: protocol::ProjectFileViewState::Ready {
+                entries: ["README.md", "main.rs", "lib.rs"]
+                    .into_iter()
+                    .map(|name| protocol::ProjectFileCursor {
+                        path: protocol::ProjectPath {
+                            root: ProjectRootPath("/repo".into()),
+                            relative_path: name.into(),
+                        },
+                        kind: protocol::ProjectFileKind::File,
+                        score: 0,
+                    })
+                    .collect(),
+                previous: None,
+                next: None,
+            },
+        };
+        let declaration: Envelope = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(
+                js_sys::eval("window.__stallViewEntered")
+                    .unwrap()
+                    .dyn_into::<js_sys::Promise>()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(declaration.kind, FrameKind::ProjectFileView);
+        assert_eq!(
+            declaration
+                .parse_payload::<protocol::ProjectFileViewPayload>()
+                .unwrap()
+                .view,
+            page.view
+        );
+        // Gate9 observed two legitimate waits: the held call and this mounted
+        // component's declaration. Fence its completion before measuring the
+        // gap; a render tick alone does not settle an async bridge invocation.
+        crate::send::settle_stream(host_id, &declaration.stream).await;
+        let line = serde_json::to_string(
+            &Envelope::from_payload(
+                StreamPath(format!("/project/{}", project_id.0)),
+                FrameKind::ProjectFileViewState,
+                1,
+                &page,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let deliver = js_sys::Function::new_with_args(
+            "line",
+            "window.__stallHandlers['tyde://host-line']({event: 'tyde://host-line', \
+             payload: {hostId: 'stall-attribution-host', line}});",
+        );
+        deliver.call1(&JsValue::NULL, &line.clone().into()).unwrap();
+        leptos::task::tick().await;
+        let files = container.query_selector_all(".fe-file .fe-name").unwrap();
+        let visible: Vec<_> = (0..files.length())
+            .map(|index| files.item(index).unwrap().text_content().unwrap())
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["README.md", "main.rs", "lib.rs"],
+            "the attributed frame must render the actual files"
+        );
+
+        clock.advance(2000.0);
+        clock.tick();
+        let record: serde_json::Value = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(recorded)
+                .await
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        let gap = &record["diagnostic"];
+        assert_eq!(gap["event"], "event_loop_gap");
+        assert!(gap["interval_ms"].as_u64().unwrap() >= 1250);
+        assert_eq!(
+            gap["pending_bridge_calls"], 1,
+            "the pending host wait is reported as waiting, not as the slow work"
+        );
+        let work = &gap["longest_work"];
+        assert_eq!(work["operation"], "host_receive");
+        assert_eq!(work["frame"], "project_file_view_state");
+        assert_eq!(work["bytes"].as_u64(), Some(line.len() as u64));
+        assert_eq!(work["items"], 1);
+        assert!(work["duration_ms"].as_u64().unwrap() >= 100);
+
+        js_sys::eval("window.__stallRelease(null)").unwrap();
+        wasm_bindgen_futures::JsFuture::from(waiting).await.unwrap();
+        js_sys::eval(
+            "window.__TAURI__.event.listen = window.__stallSaved.listen; \
+             window.__TAURI__.core.invoke = window.__stallSaved.invoke; \
+             delete window.__stallSaved; delete window.__stallHandlers; \
+             delete window.__stallRelease; delete window.__stallEntered; \
+             delete window.__stallWaitEntered; delete window.__stallViewEntered; \
+             delete window.__stallViewSent;",
+        )
+        .unwrap();
+        drop(mounted);
+        leptos::task::tick().await;
+        drop(handles);
+        drop(clock);
     }
 }

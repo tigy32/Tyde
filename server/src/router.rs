@@ -18,10 +18,10 @@ use protocol::{
     MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
     MobilePairingStartPayload, MobilePushSubscribePayload, MobilePushUnsubscribePayload,
     ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectOpenPathPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchPayload, ProjectStageFilePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectFileViewPayload,
+    ProjectGitCommitPayload, ProjectId, ProjectOpenPathPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
+    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload, ProjectStageFilePayload,
     ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
     ReviewId, ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentGroupsPayload, SetAgentNamePayload, SetAgentPinsPayload,
@@ -978,10 +978,23 @@ pub(crate) async fn route_client_envelope(
                 host.project_accessed(connection_host_stream, &project_output_stream, project_id)
                     .await?;
             }
-            FrameKind::ProjectListDir => {
-                let payload: ProjectListDirPayload = parse_payload(&envelope, "project_list_dir")?;
-                ensure_non_empty("project_list_dir", "root", payload.root.0.as_str())?;
-                host.list_project_dir(
+            FrameKind::ProjectFileView => {
+                let payload: ProjectFileViewPayload =
+                    parse_payload(&envelope, "project_file_view")?;
+                #[cfg(feature = "test-support")]
+                if let Some(action) = crate::project_stream::scan_test_support::take(
+                    std::path::Path::new(&envelope.stream.0),
+                    crate::project_stream::scan_test_support::ScanPoint::FileViewRouting,
+                ) {
+                    tokio::task::spawn_blocking(action).await.map_err(|error| {
+                        AppError::internal_message(
+                            "project_file_view",
+                            "file view routing gate failed",
+                            error,
+                        )
+                    })?;
+                }
+                host.set_project_file_view(
                     connection_host_stream,
                     &project_output_stream,
                     project_id,

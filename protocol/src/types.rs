@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 90;
+pub const PROTOCOL_VERSION: u32 = 91;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1115,7 +1115,7 @@ pub enum FrameKind {
     ProjectUnstageFile,
     ProjectDiscardFile,
     ProjectGitCommit,
-    ProjectListDir,
+    ProjectFileView,
     HostBrowseStart,
     HostBrowseList,
     HostBrowseClose,
@@ -1189,6 +1189,7 @@ pub enum FrameKind {
     TeamDraftNotify,
     TeamMemberShuffleSuggestionNotify,
     ProjectFileList,
+    ProjectFileViewState,
     ProjectGitStatus,
     ProjectFileContents,
     ProjectSearchResults,
@@ -1342,7 +1343,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectUnstageFile => f.write_str("project_unstage_file"),
             Self::ProjectDiscardFile => f.write_str("project_discard_file"),
             Self::ProjectGitCommit => f.write_str("project_git_commit"),
-            Self::ProjectListDir => f.write_str("project_list_dir"),
+            Self::ProjectFileView => f.write_str("project_file_view"),
             Self::HostBrowseStart => f.write_str("host_browse_start"),
             Self::HostBrowseList => f.write_str("host_browse_list"),
             Self::HostBrowseClose => f.write_str("host_browse_close"),
@@ -1413,6 +1414,7 @@ impl fmt::Display for FrameKind {
                 f.write_str("team_member_shuffle_suggestion_notify")
             }
             Self::ProjectFileList => f.write_str("project_file_list"),
+            Self::ProjectFileViewState => f.write_str("project_file_view_state"),
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
             Self::ProjectSearchResults => f.write_str("project_search_results"),
@@ -6639,11 +6641,65 @@ pub struct ProjectGitCommitResultPayload {
     pub commit_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectListDirPayload {
-    pub root: ProjectRootPath,
-    /// Relative path of the directory to list. Empty string means root.
-    pub path: String,
+/// A retained, connection-owned file view. Replacing a view supersedes its
+/// in-flight read; closing it releases its server state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFileViewPayload {
+    pub view: ProjectFileView,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectFileView {
+    Directory {
+        path: ProjectPath,
+        window: ProjectFileWindow,
+        show_hidden: bool,
+        filter: String,
+    },
+    QuickOpen {
+        query: String,
+        window: ProjectFileWindow,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "direction", content = "cursor", rename_all = "snake_case")]
+pub enum ProjectFileWindow {
+    #[default]
+    First,
+    After(ProjectFileCursor),
+    Before(ProjectFileCursor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFileCursor {
+    pub path: ProjectPath,
+    pub kind: ProjectFileKind,
+    pub score: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFileViewStatePayload {
+    pub view: ProjectFileView,
+    pub state: ProjectFileViewState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectFileViewState {
+    Closed,
+    Loading,
+    DirectoryMissing,
+    Ready {
+        entries: Vec<ProjectFileCursor>,
+        previous: Option<ProjectFileCursor>,
+        next: Option<ProjectFileCursor>,
+    },
+    Unavailable {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6659,6 +6715,17 @@ pub struct ProjectRootListing {
     #[serde(default)]
     pub status: ProjectRootStatus,
     pub entries: Vec<ProjectFileEntry>,
+    /// Directories whose children exceeded the listing bound, so only some of
+    /// them are in `entries`. Carried by full listings only.
+    pub partial_dirs: Vec<ProjectPartialDir>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPartialDir {
+    /// Relative path of the directory; empty for the root itself.
+    pub relative_path: String,
+    /// Children left out of the listing.
+    pub omitted: u32,
 }
 
 /// Whether the server could read a project root. An unavailable root (missing,

@@ -16,7 +16,13 @@ enum Command {
     Event(Event),
     Rescan,
     Failure(String),
-    Observe(PathBuf, oneshot::Sender<notify::Result<()>>),
+    Observe(ProjectPath, oneshot::Sender<notify::Result<()>>),
+    ViewDirectories(
+        HashSet<ProjectPath>,
+        HashSet<ProjectPath>,
+        Arc<AtomicBool>,
+        oneshot::Sender<notify::Result<()>>,
+    ),
     Stop,
 }
 
@@ -97,10 +103,16 @@ impl Routes {
             }
         };
         if !event.need_rescan()
-            && matches!(
-                event.kind,
-                EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-            )
+            && (matches!(event.kind, EventKind::Access(_))
+                || (matches!(
+                    event.kind,
+                    EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                ) && !event.paths.iter().any(|path| {
+                    self.owners.contains_key(path)
+                        || path
+                            .parent()
+                            .is_some_and(|parent| self.owners.contains_key(parent))
+                })))
         {
             return;
         }
@@ -379,11 +391,21 @@ impl Drop for WatchLease {
 
 pub(crate) struct ProjectWatcher {
     tx: sync::Sender<Command>,
-    pub(crate) observed: HashSet<ProjectPath>,
+    view_paths: Option<(HashSet<ProjectPath>, HashSet<ProjectPath>)>,
+    view_cancel: Option<Arc<AtomicBool>>,
+}
+
+pub(crate) struct ViewWatchUpdate {
+    pub(crate) added: HashSet<ProjectPath>,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) response: oneshot::Receiver<notify::Result<()>>,
 }
 
 impl Drop for ProjectWatcher {
     fn drop(&mut self) {
+        if let Some(cancel) = &self.view_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
         let _ = self.tx.send(Command::Stop);
     }
 }
@@ -420,8 +442,12 @@ impl ProjectWatcher {
             registered: HashSet::new(),
             explicit: HashSet::new(),
             inventory: Inventory::default(),
+            base_registered: HashSet::new(),
+            view_directories: HashSet::new(),
+            query_scopes: HashSet::new(),
+            query_directories: HashSet::new(),
         };
-        state.reconcile()?;
+        state.reconcile(false)?;
         #[cfg(feature = "test-support")]
         for root in &state.roots {
             crate::project_stream::scan_test_support::run(
@@ -436,8 +462,14 @@ impl ProjectWatcher {
                     let event = match command {
                         Command::Stop => break,
                         Command::Observe(path, reply) => {
-                            let result = state.observe(path);
+                            let result = fs::canonicalize(&path.root.0)
+                                .map_err(notify::Error::io)
+                                .and_then(|root| state.observe(root.join(path.relative_path)));
                             let _ = reply.send(result);
+                            continue;
+                        }
+                        Command::ViewDirectories(paths, queries, cancel, reply) => {
+                            let _ = reply.send(state.set_view_directories(paths, queries, &cancel));
                             continue;
                         }
                         Command::Event(event) => {
@@ -477,26 +509,62 @@ impl ProjectWatcher {
             .map_err(notify::Error::io)?;
         Ok(Self {
             tx,
-            observed: HashSet::new(),
+            view_paths: None,
+            view_cancel: None,
         })
     }
 
-    pub(crate) async fn observe(&mut self, path: &ProjectPath) -> notify::Result<()> {
-        if self.observed.contains(path) {
-            return Ok(());
+    pub(crate) fn set_view_directories(
+        &mut self,
+        paths: HashSet<ProjectPath>,
+        queries: HashSet<ProjectPath>,
+    ) -> notify::Result<Option<ViewWatchUpdate>> {
+        if self
+            .view_paths
+            .as_ref()
+            .is_some_and(|configured| configured.0 == paths && configured.1 == queries)
+        {
+            return Ok(None);
         }
-        let absolute = fs::canonicalize(&path.root.0)
-            .map_err(notify::Error::io)?
-            .join(&path.relative_path);
+        let added = match &self.view_paths {
+            Some(configured) => paths.difference(&configured.0).cloned().collect(),
+            None => paths.clone(),
+        };
+        if let Some(cancel) = &self.view_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(Command::Observe(absolute, reply))
+            .send(Command::ViewDirectories(
+                paths.clone(),
+                queries.clone(),
+                cancel.clone(),
+                reply,
+            ))
             .map_err(|_| watch_error("project filesystem watcher stopped"))?;
-        response
-            .await
-            .map_err(|_| watch_error("project filesystem watcher stopped"))??;
-        self.observed.insert(path.clone());
-        Ok(())
+        self.view_paths = Some((paths, queries));
+        self.view_cancel = Some(cancel.clone());
+        Ok(Some(ViewWatchUpdate {
+            added,
+            cancel,
+            response,
+        }))
+    }
+
+    pub(crate) fn forget_view_directories(&mut self) {
+        self.view_paths = None;
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        path: &ProjectPath,
+    ) -> notify::Result<oneshot::Receiver<notify::Result<()>>> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Command::Observe(path.clone(), reply))
+            .map_err(|_| watch_error("project filesystem watcher stopped"))?;
+        Ok(response)
     }
 }
 
@@ -527,6 +595,10 @@ struct WatchState {
     registered: HashSet<PathBuf>,
     explicit: HashSet<PathBuf>,
     inventory: Inventory,
+    base_registered: HashSet<PathBuf>,
+    view_directories: HashSet<PathBuf>,
+    query_scopes: HashSet<PathBuf>,
+    query_directories: HashSet<PathBuf>,
 }
 
 fn walk(path: &Path, depth: Option<usize>) -> ignore::Walk {
@@ -582,7 +654,7 @@ impl WatchState {
         Ok(())
     }
 
-    fn reconcile(&mut self) -> notify::Result<()> {
+    fn reconcile(&mut self, queries_changed: bool) -> notify::Result<()> {
         let mut next = Inventory::default();
         let mut desired = HashSet::new();
         for root in self.roots.clone() {
@@ -698,6 +770,11 @@ impl WatchState {
         for path in self.explicit.clone() {
             self.register_explicit(&path, &mut desired)?;
         }
+        self.base_registered = desired.clone();
+        if queries_changed {
+            self.query_directories = self.query_directories_for(&self.query_scopes, None)?;
+        }
+        self.register_view_directories(&mut desired, None)?;
         for path in self.registered.clone().difference(&desired) {
             if let Err(error) = self.watcher.unwatch(path)
                 && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
@@ -744,25 +821,179 @@ impl WatchState {
             return Ok(());
         }
         let path = resolved.join(path.strip_prefix(parent).map_err(watch_error)?);
-        self.register_explicit(&path, &mut HashSet::new())?;
+        if self.explicit.contains(&path) {
+            return Ok(());
+        }
+        let mut desired = self.base_registered.clone();
+        self.register_explicit(&path, &mut desired)?;
+        self.base_registered = desired;
         self.explicit.insert(path);
         Ok(())
     }
 
+    fn query_directories_for(
+        &self,
+        scopes: &HashSet<PathBuf>,
+        cancel: Option<&AtomicBool>,
+    ) -> notify::Result<HashSet<PathBuf>> {
+        let mut directories = HashSet::new();
+        for scope in scopes {
+            for entry in WalkBuilder::new(scope)
+                .standard_filters(false)
+                .follow_links(false)
+                .filter_entry(|entry| entry.file_name() != ".git")
+                .build()
+            {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err(watch_error("file view watch superseded"));
+                }
+                let entry = entry.map_err(watch_error)?;
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    directories.insert(entry.path().to_owned());
+                }
+            }
+        }
+        Ok(directories)
+    }
+
+    fn register_view_directories(
+        &mut self,
+        desired: &mut HashSet<PathBuf>,
+        cancel: Option<&AtomicBool>,
+    ) -> notify::Result<()> {
+        for directory in self
+            .view_directories
+            .clone()
+            .into_iter()
+            .chain(self.query_scopes.clone())
+        {
+            for path in directory.ancestors() {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err(watch_error("file view watch superseded"));
+                }
+                if !self.roots.iter().any(|root| path.starts_with(root)) {
+                    break;
+                }
+                self.register(path, desired)?;
+            }
+        }
+        for directory in self.query_directories.clone() {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                return Err(watch_error("file view watch superseded"));
+            }
+            self.register(&directory, desired)?;
+        }
+        Ok(())
+    }
+
+    fn set_view_directories(
+        &mut self,
+        paths: HashSet<ProjectPath>,
+        queries: HashSet<ProjectPath>,
+        cancel: &AtomicBool,
+    ) -> notify::Result<()> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(watch_error("file view watch superseded"));
+        }
+        let resolve = |paths: HashSet<ProjectPath>| -> notify::Result<HashSet<PathBuf>> {
+            paths
+                .into_iter()
+                .map(|path| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(watch_error("file view watch superseded"));
+                    }
+                    let root = fs::canonicalize(&path.root.0).map_err(notify::Error::io)?;
+                    if !self.roots.contains(&root) {
+                        return Err(watch_error("file view root is not watched"));
+                    }
+                    Ok(root.join(path.relative_path))
+                })
+                .collect()
+        };
+        let directories = resolve(paths)?;
+        let mut scopes: Vec<PathBuf> = Vec::new();
+        for query in resolve(queries)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if scopes.last().is_none_or(|scope| !query.starts_with(scope)) {
+                scopes.push(query);
+            }
+        }
+        let queries: HashSet<_> = scopes.into_iter().collect();
+        let mut query_directories: HashSet<_> = self
+            .query_directories
+            .iter()
+            .filter(|path| queries.iter().any(|scope| path.starts_with(scope)))
+            .cloned()
+            .collect();
+        let added = queries.difference(&self.query_scopes).cloned().collect();
+        query_directories.extend(self.query_directories_for(&added, Some(cancel))?);
+        self.view_directories = directories;
+        self.query_scopes = queries;
+        self.query_directories = query_directories;
+        let mut desired = self.base_registered.clone();
+        self.register_view_directories(&mut desired, Some(cancel))?;
+        for path in self.registered.clone().difference(&desired) {
+            if let Err(error) = self.watcher.unwatch(path)
+                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+            {
+                return Err(error);
+            }
+            self.registered.remove(path);
+            #[cfg(feature = "test-support")]
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherUnregistered,
+            );
+        }
+        Ok(())
+    }
+
     fn process(&mut self, mut event: Event) -> notify::Result<Option<Event>> {
+        if !event.need_rescan() && matches!(event.kind, EventKind::Access(_)) {
+            return Ok(None);
+        }
         if !event.need_rescan()
             && matches!(
                 event.kind,
-                EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                EventKind::Modify(notify::event::ModifyKind::Metadata(_))
             )
         {
-            return Ok(None);
+            event.paths.retain(|path| {
+                self.view_directories
+                    .iter()
+                    .any(|directory| directory.starts_with(path))
+                    || self.query_directories.contains(path)
+                    || self
+                        .query_scopes
+                        .iter()
+                        .any(|scope| scope.starts_with(path))
+            });
+            return Ok((!event.paths.is_empty()).then_some(event));
         }
         let mut relevant = Vec::new();
         let mut reconcile = event.need_rescan();
+        let mut queries_changed = event.need_rescan();
         let mut ref_leaf_paths = 0;
         for path in &event.paths {
+            if self.view_directories.iter().any(|directory| {
+                path.parent() == Some(directory.as_path()) || directory.starts_with(path)
+            }) {
+                relevant.push(path.clone());
+            }
+            let query_path = self
+                .query_scopes
+                .iter()
+                .any(|scope| path.starts_with(scope) || scope.starts_with(path));
+            if query_path {
+                relevant.push(path.clone());
+            }
             let directory = self.registered.contains(path) || path.is_dir();
+            if directory && (self.view_directories.contains(path) || query_path) {
+                reconcile = true;
+                queries_changed |= query_path;
+            }
             if directory {
                 for explicit in self.explicit.iter().chain(&self.inventory.tracked) {
                     if explicit != path && explicit.starts_with(path) {
@@ -883,7 +1114,7 @@ impl WatchState {
                 }
             }
             let previous = self.inventory.visible.clone();
-            self.reconcile()?;
+            self.reconcile(queries_changed)?;
             // Files can be created before a new directory's watch is installed.
             relevant.extend(
                 self.inventory

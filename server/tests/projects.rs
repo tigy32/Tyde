@@ -7,8 +7,9 @@ use protocol::{
     HostBrowseEntriesPayload, HostBrowseInitial, HostBrowseOpenedPayload, HostBrowseStartPayload,
     Project, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiffScope, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload,
-    ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathAction,
+    ProjectFileListPayload, ProjectFileView, ProjectFileViewPayload, ProjectFileViewState,
+    ProjectFileViewStatePayload, ProjectFileWindow, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectOpenPathAction,
     ProjectOpenPathPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
     ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
     ProjectRootStatus, ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus,
@@ -1631,29 +1632,28 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
     );
     fixture
         .client
-        .project_list_dir(
+        .project_file_view(
             &project.id,
-            ProjectListDirPayload {
-                root: ProjectRootPath(project_root(&project, 0)),
-                path: "src".to_owned(),
+            ProjectFileViewPayload {
+                view: directory_view(&project_root(&project, 0), "src"),
+                active: true,
             },
         )
         .await
         .unwrap();
-    let listing = next_frame_matching_on(&mut fixture.client, "folder during slow Git", |event| {
-        event.kind == FrameKind::ProjectFileList
-            && event.stream == StreamPath(format!("/project/{}", project.id))
-            && event
-                .parse_payload::<ProjectFileListPayload>()
-                .unwrap()
-                .roots[0]
-                .entries
-                .iter()
-                .any(|entry| entry.relative_path == "src/lib.rs")
-    })
-    .await;
-    let listing: ProjectFileListPayload = listing.parse_payload().unwrap();
-    assert_eq!(listing.roots[0].root.0, project_root(&project, 0));
+    let ProjectFileViewState::Ready { entries, .. } = file_view_state(
+        &mut fixture.client,
+        &directory_view(&project_root(&project, 0), "src"),
+    )
+    .await
+    else {
+        panic!("folder failed");
+    };
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.path.relative_path == "src/lib.rs")
+    );
     assert!(
         !repo.path().join(".git/monitor-release").exists(),
         "folder expansion waited for the slow Git refresh to finish"
@@ -4034,94 +4034,786 @@ async fn project_stream_emits_live_file_and_git_updates() {
     );
 }
 
-#[tokio::test]
-async fn project_list_dir_returns_deeper_entries() {
-    let mut fixture = Fixture::new().await;
-    // Create a repo with files 4 levels deep. The initial depth-2 listing will
-    // show entries down to a/b/c/ but NOT a/b/c/hidden.rs (3 folders deep).
-    let repo = init_git_repo(
-        "list-dir",
-        &[
-            ("top.rs", "// top\n"),
-            ("a/mid.rs", "// mid\n"),
-            ("a/b/deep.rs", "// deep\n"),
-            ("a/b/c/hidden.rs", "// hidden\n"),
-        ],
-    );
+fn directory_view(root: &str, path: &str) -> ProjectFileView {
+    ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.to_owned()),
+            relative_path: path.to_owned(),
+        },
+        window: ProjectFileWindow::First,
+        show_hidden: true,
+        filter: String::new(),
+    }
+}
 
-    let project = create_project(
-        &mut fixture.client,
-        "List Dir",
-        vec![repo.path().to_string_lossy().to_string()],
-    )
-    .await;
+async fn file_view_state(
+    client: &mut client::Connection,
+    view: &ProjectFileView,
+) -> ProjectFileViewState {
+    file_view_state_matching(client, view, |_| true).await
+}
 
-    let ProjectBootstrapPayload {
-        file_list: baseline,
-        ..
-    } = expect_project_bootstrap(
-        &mut fixture.client,
-        "server-pushed baseline project bootstrap",
-    )
-    .await;
-    let paths: Vec<&str> = baseline.roots[0]
-        .entries
-        .iter()
-        .map(|e| e.relative_path.as_str())
-        .collect();
+async fn file_view_state_matching(
+    client: &mut client::Connection,
+    view: &ProjectFileView,
+    matches: impl Fn(&ProjectFileViewState) -> bool,
+) -> ProjectFileViewState {
+    next_frame_matching_on(client, "settled file view", |event| {
+        event.kind == FrameKind::ProjectFileViewState
+            && event
+                .parse_payload::<ProjectFileViewStatePayload>()
+                .is_ok_and(|page| {
+                    page.view == *view
+                        && page.state != ProjectFileViewState::Loading
+                        && matches(&page.state)
+                })
+    })
+    .await
+    .parse_payload::<ProjectFileViewStatePayload>()
+    .unwrap()
+    .state
+}
 
-    // Depth-2 listing: root contents + 2 levels of subdirectory contents
-    assert!(paths.contains(&"top.rs"), "missing top.rs in {paths:?}");
-    assert!(paths.contains(&"a"), "missing a in {paths:?}");
-    assert!(paths.contains(&"a/mid.rs"), "missing a/mid.rs in {paths:?}");
-    assert!(paths.contains(&"a/b"), "missing a/b in {paths:?}");
-    assert!(
-        paths.contains(&"a/b/deep.rs"),
-        "missing a/b/deep.rs in {paths:?}"
-    );
-    assert!(paths.contains(&"a/b/c"), "missing a/b/c in {paths:?}");
-    // 3 folders deep should NOT appear
-    assert!(
-        !paths.contains(&"a/b/c/hidden.rs"),
-        "a/b/c/hidden.rs should NOT appear in depth-2 listing but got {paths:?}"
-    );
-
-    // Now request a listing of subdirectory "a/b/c" — this should return a/b/c/hidden.rs
-    fixture
-        .client
-        .project_list_dir(
-            &project.id,
-            ProjectListDirPayload {
-                root: ProjectRootPath(project_root(&project, 0)),
-                path: "a/b/c".to_owned(),
+async fn subscribe_file_view(
+    client: &mut client::Connection,
+    project: &ProjectId,
+    view: ProjectFileView,
+) -> ProjectFileViewState {
+    client
+        .project_file_view(
+            project,
+            ProjectFileViewPayload {
+                view: view.clone(),
+                active: true,
             },
         )
         .await
-        .expect("project_list_dir failed");
+        .unwrap();
+    file_view_state(client, &view).await
+}
 
-    let listing =
-        expect_project_file_list_matching(&mut fixture.client, "list_dir response", |listing| {
-            listing.roots[0]
-                .entries
-                .iter()
-                .any(|entry| entry.relative_path == "a/b/c/hidden.rs")
+#[tokio::test]
+async fn project_file_views_page_every_file_and_retain_visible_directories() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "file-views",
+        &[("top.rs", "// top"), (".gitignore", "wide/\n")],
+    );
+    const FILES: usize = 10_050;
+    fs::create_dir(repo.path().join("wide")).unwrap();
+    for file in 0..FILES {
+        fs::write(repo.path().join(format!("wide/f{file:05}")), "").unwrap();
+    }
+    for dir in 0..70 {
+        fs::create_dir_all(repo.path().join(format!("deep/d{dir:02}/nested"))).unwrap();
+        fs::write(
+            repo.path()
+                .join(format!("deep/d{dir:02}/nested/visible.rs")),
+            "// visible",
+        )
+        .unwrap();
+    }
+    for dir in 0..130 {
+        fs::create_dir_all(repo.path().join(format!("edge/d{dir:03}"))).unwrap();
+        fs::write(
+            repo.path().join(format!("edge/d{dir:03}/child.rs")),
+            "// child",
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(repo.path().join("wide/unopened/nested")).unwrap();
+    let project = create_project(
+        &mut fixture.client,
+        "File Views",
+        vec![repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut fixture.client, "bounded preview").await;
+    assert!(bootstrap.file_list.roots[0].entries.len() <= 256);
+    let root = project_root(&project, 0);
+    let mut view = directory_view(&root, "wide");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut first_next = None;
+    loop {
+        let ProjectFileViewState::Ready { entries, next, .. } =
+            subscribe_file_view(&mut fixture.client, &project.id, view.clone()).await
+        else {
+            panic!("directory did not load");
+        };
+        assert!(entries.len() <= 128);
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind != protocol::ProjectFileKind::Directory)
+        {
+            assert!(
+                seen.insert(entry.path.relative_path.clone()),
+                "page repeated a file"
+            );
+        }
+        if first_next.is_none() {
+            first_next = next.clone();
+        }
+        let Some(cursor) = next else {
+            break;
+        };
+        view = ProjectFileView::Directory {
+            path: ProjectPath {
+                root: ProjectRootPath(root.clone()),
+                relative_path: "wide".to_owned(),
+            },
+            window: ProjectFileWindow::After(cursor),
+            show_hidden: true,
+            filter: String::new(),
+        };
+    }
+    eprintln!("FILE VIEW FLOW: exhaustive pages settled");
+    assert_eq!(
+        seen.len(),
+        FILES,
+        "every file is reachable, not just the old 10k cap"
+    );
+    assert!(seen.contains("wide/f10049"));
+    // Reverse navigation, including from a boundary whose file was deleted.
+    let cursor = first_next.unwrap();
+    fs::remove_file(repo.path().join(&cursor.path.relative_path)).unwrap();
+    let previous = ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path: "wide".to_owned(),
+        },
+        window: ProjectFileWindow::Before(cursor),
+        show_hidden: true,
+        filter: String::new(),
+    };
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, previous).await
+    else {
+        panic!("reverse page did not load");
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.kind == protocol::ProjectFileKind::File)
+            .unwrap()
+            .path
+            .relative_path,
+        "wide/f00000"
+    );
+
+    eprintln!("FILE VIEW FLOW: reverse page settled");
+    let ignored_view = ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path: "wide".to_owned(),
+        },
+        window: ProjectFileWindow::First,
+        show_hidden: true,
+        filter: "zz-added".to_owned(),
+    };
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, ignored_view.clone()).await
+    else {
+        panic!("ignored view failed");
+    };
+    assert!(entries.is_empty());
+    fs::write(repo.path().join("wide/zz-added.rs"), "// added").unwrap();
+    let ProjectFileViewState::Ready { entries, .. } =
+        file_view_state_matching(&mut fixture.client, &ignored_view, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path == "wide/zz-added.rs"))).await
+    else {
+        panic!("ignored view update failed");
+    };
+    assert_eq!(entries.len(), 1, "expanded ignored folders stay live");
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: ignored_view.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        file_view_state_matching(&mut fixture.client, &ignored_view, |state| *state
+            == ProjectFileViewState::Closed)
+        .await,
+        ProjectFileViewState::Closed
+    );
+    eprintln!("FILE VIEW FLOW: ignored directory live update settled");
+    let filtered_tree = ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path: String::new(),
+        },
+        window: ProjectFileWindow::First,
+        show_hidden: true,
+        filter: "visible".to_owned(),
+    };
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, filtered_tree.clone()).await
+    else {
+        panic!("tree filter failed");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].path.relative_path, "deep",
+        "filter preserves the path to matching descendants"
+    );
+    let (released, release_done) = tokio::sync::oneshot::channel();
+    let filter_release_hook = fixture.on_project_scan(
+        repo.path().join("wide/unopened/nested"),
+        server::ScanPoint::WatcherUnregistered,
+        move || {
+            released.send(()).unwrap();
+        },
+    );
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: filtered_tree.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    file_view_state_matching(&mut fixture.client, &filtered_tree, |state| {
+        *state == ProjectFileViewState::Closed
+    })
+    .await;
+    eprintln!("FILE VIEW FLOW: waiting filtered scope native release");
+    release_done.await.unwrap();
+    drop(filter_release_hook);
+    eprintln!("FILE VIEW FLOW: filtered scope released");
+    for query in ["f10049", "d69/nested/visible"] {
+        let view = ProjectFileView::QuickOpen {
+            query: query.to_owned(),
+            window: ProjectFileWindow::First,
+        };
+        let ProjectFileViewState::Ready { entries, .. } =
+            subscribe_file_view(&mut fixture.client, &project.id, view.clone()).await
+        else {
+            panic!("quick-open failed");
+        };
+        assert_eq!(
+            entries.len(),
+            1,
+            "quick-open searches unmaterialized and ignored directories"
+        );
+        let (released, release_done) = tokio::sync::oneshot::channel();
+        let hook = fixture.on_project_scan(
+            repo.path().join("wide/unopened/nested"),
+            server::ScanPoint::WatcherUnregistered,
+            move || {
+                released.send(()).unwrap();
+            },
+        );
+        fixture
+            .client
+            .project_file_view(
+                &project.id,
+                ProjectFileViewPayload {
+                    view: view.clone(),
+                    active: false,
+                },
+            )
+            .await
+            .unwrap();
+        file_view_state_matching(&mut fixture.client, &view, |state| {
+            *state == ProjectFileViewState::Closed
         })
         .await;
-    assert!(
-        listing.roots[0]
-            .entries
-            .iter()
-            .all(|e| e.op == FileEntryOp::Add),
-        "all list_dir entries should be Add ops"
+        release_done.await.unwrap();
+        drop(hook);
+    }
+    eprintln!("FILE VIEW FLOW: quick-open scopes released");
+    // Both connections must share the watcher actor being held below.
+    let mut duplicate_reader = fixture.connect().await;
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let hook = fixture.on_project_scan(
+        repo.path().join("wide/unopened/nested"),
+        server::ScanPoint::WatcherRegistered,
+        move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        },
     );
-    let deep_paths: Vec<&str> = listing.roots[0]
-        .entries
-        .iter()
-        .map(|e| e.relative_path.as_str())
-        .collect();
+    let cancelled = ProjectFileView::QuickOpen {
+        query: "cancelled-scope".into(),
+        window: ProjectFileWindow::First,
+    };
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: cancelled.clone(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+    eprintln!("FILE VIEW FLOW: waiting held native scope install");
+    reached.await.unwrap();
+    // Created after the scope's directory walk: neither read can rely on it.
+    fs::create_dir(repo.path().join("wide/duplicate")).unwrap();
+    let observed_file = repo.path().join("wide/duplicate/observed.rs");
+    fs::write(&observed_file, "// observed").unwrap();
+    let observed = ProjectPath {
+        root: ProjectRootPath(root.clone()),
+        relative_path: "wide/duplicate/observed.rs".into(),
+    };
+    let (first_wait, first_waiting) = watch_completion(
+        &fixture,
+        &observed_file,
+        server::ScanPoint::FileObservationWaiting,
+    );
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: observed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    first_waiting.await.unwrap();
+    drop(first_wait);
+    let (second_wait, mut second_waiting) = watch_completion(
+        &fixture,
+        &observed_file,
+        server::ScanPoint::FileObservationWaiting,
+    );
+    duplicate_reader
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: observed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    // Positive event or a real premature reply: no absence window or racing fence.
+    let mut release = Some(release);
+    loop {
+        tokio::select! {
+            waiting = &mut second_waiting => { waiting.unwrap(); break; }
+            event = duplicate_reader.next_event() => {
+                let event = event.unwrap().unwrap();
+                if event.kind == FrameKind::ProjectFileContents {
+                    release.take().unwrap().send(()).unwrap();
+                    panic!("duplicate read succeeded before its native watch acknowledgement");
+                }
+                assert_ne!(event.kind, FrameKind::CommandError);
+            }
+        }
+    }
+    drop(second_wait);
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: cancelled.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        let event = fixture.client.next_event().await.unwrap().unwrap();
+        if event.kind == FrameKind::ProjectFileContents {
+            release.take().unwrap().send(()).unwrap();
+            panic!("read succeeded while its native watch worker was held");
+        }
+        if event.kind == FrameKind::ProjectFileViewState {
+            let page: ProjectFileViewStatePayload = event.parse_payload().unwrap();
+            if page.view == cancelled && page.state == ProjectFileViewState::Closed {
+                break;
+            }
+        }
+    }
+    eprintln!("FILE VIEW FLOW: both reads await native ack; close delivered before worker release");
+    release.take().unwrap().send(()).unwrap();
+    let contents = expect_project_file_contents(
+        &mut fixture.client,
+        "read settles after cancelled watch registration",
+    )
+    .await;
+    let duplicate = expect_project_file_contents(
+        &mut duplicate_reader,
+        "duplicate read settles after native observation",
+    )
+    .await;
+    assert_eq!(contents.contents.as_deref(), Some("// observed"));
+    assert_eq!(duplicate.contents.as_deref(), Some("// observed"));
+    fs::write(&observed_file, "// changed").unwrap();
+    for client in [&mut fixture.client, &mut duplicate_reader] {
+        next_frame_matching_on(client, "both readers retain live ignored-file observation", |event| event.kind == FrameKind::ProjectEvent && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path == observed))).await;
+    }
+    drop(hook);
+    eprintln!("FILE VIEW FLOW: read settled after native scope cancellation");
+    let live_query = ProjectFileView::QuickOpen {
+        query: "query-live-only".into(),
+        window: ProjectFileWindow::First,
+    };
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, live_query.clone()).await
+    else {
+        panic!("initial live query failed");
+    };
+    assert!(entries.is_empty());
+    fs::write(
+        repo.path().join("wide/unopened/nested/query-live-only.rs"),
+        "// live",
+    )
+    .unwrap();
+    file_view_state_matching(&mut fixture.client, &live_query, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path == "wide/unopened/nested/query-live-only.rs"))).await;
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: live_query.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    file_view_state_matching(&mut fixture.client, &live_query, |state| {
+        *state == ProjectFileViewState::Closed
+    })
+    .await;
+    eprintln!("FILE VIEW FLOW: unchanged ignored query updated");
+    let live_filter = ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path: String::new(),
+        },
+        window: ProjectFileWindow::First,
+        show_hidden: true,
+        filter: "filter-live-only".into(),
+    };
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, live_filter.clone()).await
+    else {
+        panic!("initial live filter failed");
+    };
+    assert!(entries.is_empty());
+    fs::write(
+        repo.path().join("wide/unopened/nested/filter-live-only.rs"),
+        "// live",
+    )
+    .unwrap();
+    file_view_state_matching(&mut fixture.client, &live_filter, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path == "wide"))).await;
+
+    eprintln!("FILE VIEW FLOW: unchanged ignored filter updated");
+    let (unwatched, watch_released) = tokio::sync::oneshot::channel();
+    let release_hook = fixture.on_project_scan(
+        repo.path().join("wide/unopened/nested"),
+        server::ScanPoint::WatcherUnregistered,
+        move || {
+            unwatched.send(()).unwrap();
+        },
+    );
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: live_filter.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    file_view_state_matching(&mut fixture.client, &live_filter, |state| {
+        *state == ProjectFileViewState::Closed
+    })
+    .await;
+    watch_released.await.unwrap();
+    drop(release_hook);
+    eprintln!("FILE VIEW FLOW: last live scope released");
+    for dir in 0..70 {
+        let view = directory_view(&root, &format!("deep/d{dir:02}/nested"));
+        let ProjectFileViewState::Ready { entries, .. } =
+            subscribe_file_view(&mut fixture.client, &project.id, view).await
+        else {
+            panic!("expanded directory failed");
+        };
+        assert_eq!(entries.len(), 1);
+    }
+    eprintln!("FILE VIEW FLOW: seventy views loaded");
+    let first = directory_view(&root, "deep/d00/nested");
+    fs::write(repo.path().join("deep/d00/nested/added.rs"), "// added").unwrap();
+    let ProjectFileViewState::Ready { entries, .. } =
+        file_view_state_matching(&mut fixture.client, &first, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path.ends_with("/added.rs")))).await
+    else {
+        panic!("retained directory failed");
+    };
+    assert_eq!(
+        entries.len(),
+        2,
+        "opening >64 directories must not evict a visible view"
+    );
+
+    let failed = repo.path().join("deep/d00/nested");
+    fs::remove_dir_all(&failed).unwrap();
     assert!(
-        deep_paths.contains(&"a/b/c/hidden.rs"),
-        "a/b/c/hidden.rs should appear in list_dir response but got {deep_paths:?}"
+        matches!(
+            file_view_state_matching(&mut fixture.client, &first, |state| matches!(
+                state,
+                ProjectFileViewState::DirectoryMissing
+            ))
+            .await,
+            ProjectFileViewState::DirectoryMissing
+        ),
+        "a deleted directory is explicit even without a pending request"
+    );
+    fs::create_dir(&failed).unwrap();
+    fs::write(failed.join("restored.rs"), "// restored").unwrap();
+    let ProjectFileViewState::Ready { entries, .. } =
+        file_view_state_matching(&mut fixture.client, &first, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path.ends_with("/restored.rs")))).await
+    else {
+        panic!("retained failed view did not recover");
+    };
+    assert_eq!(entries[0].path.relative_path, "deep/d00/nested/restored.rs");
+
+    eprintln!("FILE VIEW FLOW: deleted view recovered");
+    let edge = directory_view(&root, "edge");
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut fixture.client, &project.id, edge.clone()).await
+    else {
+        panic!("edge page failed");
+    };
+    assert_eq!(entries.len(), 128);
+    let expanded = directory_view(&root, "edge/d127");
+    subscribe_file_view(&mut fixture.client, &project.id, expanded.clone()).await;
+    fs::create_dir(repo.path().join("edge/a-new")).unwrap();
+    let ProjectFileViewState::Ready { entries, .. } = file_view_state_matching(&mut fixture.client, &edge, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path == "edge/a-new"))).await else { panic!("edge update failed"); };
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.path.relative_path == "edge/d127"),
+        "live page shifts must retain the still-expanded boundary directory"
+    );
+    assert_eq!(
+        entries.len(),
+        129,
+        "only declared active child rows extend the bounded page"
+    );
+    fs::write(repo.path().join("edge/d127/arrived.rs"), "// arrived").unwrap();
+    file_view_state_matching(&mut fixture.client, &expanded, |state| matches!(state, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path.ends_with("arrived.rs")))).await;
+
+    eprintln!("FILE VIEW FLOW: expanded edge retained");
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let held_hook = fixture.on_project_scan(
+        repo.path().join("deep/d01/nested"),
+        server::ScanPoint::ReadDirectory,
+        move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        },
+    );
+    let metadata_view = ProjectFileView::Directory {
+        path: ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path: "deep/d01/nested".into(),
+        },
+        window: ProjectFileWindow::First,
+        show_hidden: true,
+        filter: "visible".into(),
+    };
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: metadata_view.clone(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+    reached.await.unwrap();
+    fixture
+        .client
+        .project_rename(ProjectRenamePayload {
+            id: project.id.clone(),
+            name: "Renamed file views".into(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "metadata changed while view held", |event| event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Upsert { project: changed } if changed.id == project.id && changed.name == "Renamed file views")).await;
+    release.send(()).unwrap();
+    let ProjectFileViewState::Ready { entries, .. } =
+        file_view_state(&mut fixture.client, &metadata_view).await
+    else {
+        panic!("view stranded by metadata change");
+    };
+    assert_eq!(entries.len(), 1);
+    drop(held_hook);
+
+    // A fresh host has no hidden list of previously opened directories. Clients
+    // re-declare the same views on replay, and receive real children again.
+    eprintln!("FILE VIEW FLOW: catalog-generation read recovered");
+    let mut restarted = fixture.connect_fresh_host().await;
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut restarted, &project.id, edge.clone()).await
+    else {
+        panic!("replayed parent failed");
+    };
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.path.relative_path == "edge/d127")
+    );
+    restarted
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: expanded.clone(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+    let mut parent_retained = false;
+    let mut child_restored = false;
+    while !parent_retained || !child_restored {
+        let event =
+            next_frame_matching_on(&mut restarted, "replayed expanded page edge", |event| {
+                event.kind == FrameKind::ProjectFileViewState
+            })
+            .await;
+        let page: ProjectFileViewStatePayload = event.parse_payload().unwrap();
+        if let ProjectFileViewState::Ready { entries, .. } = page.state {
+            if page.view == edge {
+                parent_retained |= entries
+                    .iter()
+                    .any(|entry| entry.path.relative_path == "edge/d127");
+            }
+            if page.view == expanded {
+                child_restored |= entries
+                    .iter()
+                    .any(|entry| entry.path.relative_path == "edge/d127/child.rs");
+            }
+        }
+    }
+    eprintln!("FILE VIEW FLOW: reconnect restores off-page parent pin and child");
+    let ProjectFileViewState::Ready { entries, .. } =
+        subscribe_file_view(&mut restarted, &project.id, first.clone()).await
+    else {
+        panic!("redeclared view failed");
+    };
+    assert_eq!(entries.len(), 1);
+    let routing_key = std::path::PathBuf::from(format!("/project/{}", project.id));
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let routing_hook = fixture.on_project_scan(
+        routing_key.clone(),
+        server::ScanPoint::FileViewRouting,
+        move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        },
+    );
+    let (pressure_hook, mut pressure) = watch_completion(
+        &fixture,
+        &routing_key,
+        server::ScanPoint::FileViewBackpressure,
+    );
+    restarted
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: first.clone(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+    reached.await.unwrap();
+    for dir in 1..70 {
+        restarted
+            .project_file_view(
+                &project.id,
+                ProjectFileViewPayload {
+                    view: directory_view(&root, &format!("deep/d{dir:02}/nested")),
+                    active: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mut release = Some(release);
+    loop {
+        tokio::select! {
+            waiting = &mut pressure => {waiting.unwrap(); break;}
+            event = restarted.next_event() => {
+                let event = event.unwrap().unwrap();
+                if event.kind == FrameKind::CommandError {
+                    release.take().unwrap().send(()).unwrap();
+                    panic!("replay declaration rejected instead of awaiting bounded capacity");
+                }
+            }
+        }
+    }
+    release.take().unwrap().send(()).unwrap();
+    drop(routing_hook);
+    drop(pressure_hook);
+    let mut received = std::collections::HashSet::new();
+    while received.len() < 70 {
+        let event = restarted.next_event().await.unwrap().unwrap();
+        assert_ne!(
+            event.kind,
+            FrameKind::CommandError,
+            "replay declarations must backpressure, never drop"
+        );
+        if event.kind == FrameKind::ProjectFileViewState {
+            let page: ProjectFileViewStatePayload = event.parse_payload().unwrap();
+            if let (
+                ProjectFileView::Directory { path, .. },
+                ProjectFileViewState::Ready { entries, .. },
+            ) = (page.view, page.state)
+                && path.relative_path.starts_with("deep/d")
+                && path.relative_path.ends_with("/nested")
+            {
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry.path.relative_path.ends_with(".rs"))
+                );
+                received.insert(path);
+            }
+        }
+    }
+    eprintln!(
+        "FILE VIEW FLOW: seventy replay declarations survive controlled control-lane backpressure"
+    );
+    // A refresh Ready may already be queued. Release completes on Closed, not
+    // on whichever view event happens to be next in the stream.
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: first.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        file_view_state_matching(&mut fixture.client, &first, |state| *state
+            == ProjectFileViewState::Closed)
+        .await,
+        ProjectFileViewState::Closed
     );
 }
 
@@ -5851,19 +6543,25 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
 
     fixture
         .client
-        .project_list_dir(
+        .project_file_view(
             &project.id,
-            ProjectListDirPayload {
-                root: ProjectRootPath(project_root(&project, 0)),
-                path: "vanishing-dir".to_owned(),
+            ProjectFileViewPayload {
+                view: directory_view(&project_root(&project, 0), "vanishing-dir"),
+                active: true,
             },
         )
         .await
         .expect("request deleted directory");
-    let error = expect_command_error(&mut fixture.client, "explicit missing directory").await;
-    assert_eq!(error.operation, "project_list_dir");
-    assert!(!error.fatal);
-    assert!(error.message.contains("vanishing-dir"));
+    // The fixture deleted this directory: NotFound is the typed deletion state,
+    // not a transient read error. Keep requiring that exact explicit outcome.
+    assert!(matches!(
+        file_view_state(
+            &mut fixture.client,
+            &directory_view(&project_root(&project, 0), "vanishing-dir")
+        )
+        .await,
+        ProjectFileViewState::DirectoryMissing
+    ));
 
     fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
     fs::write(repo.path().join("keep.rs"), "// updated\n").expect("update keep.rs");

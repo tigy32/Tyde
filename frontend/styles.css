@@ -7613,6 +7613,7 @@ math merror {
     overflow-wrap: anywhere;
 }
 
+
 .fe-root-remove:hover {
     background: var(--surface-2);
     color: var(--text-primary);
@@ -17936,3 +17937,10 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .learning-tray > summary { width: fit-content; margin-left: auto; padding: var(--space-1) var(--space-2); color: var(--text-secondary); cursor: pointer; border-radius: 4px; }
 .learning-tray > summary:hover, .learning-tray > summary:focus-visible { color: var(--text-primary); background: var(--surface-2); }
 .learning-tray-content { display: flex; flex-direction: column; gap: var(--space-3); max-height: min(42vh, 360px); overflow-y: auto; margin-top: var(--space-2); }
+
+.fe-pages {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px;
+}

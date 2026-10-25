@@ -31,7 +31,26 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   instrumented synchronous operation >=100ms since the preceding tick, and
   the number of pending bridge waits. The operation duration is inclusive;
   it is not a union, sum, CPU sample or proof of causation. Bridge waits are
-  **not** blocking time. No operation details or arguments are recorded.
+  **not** blocking time. `longest_work` carries `operation`, `duration_ms`,
+  `frame` (the protocol frame kind for `host_receive`/`host_dispatch`, else
+  `null`), `bytes` and `items`. Their meaning depends on the operation:
+
+  | `operation` | `bytes` | `items` |
+  |---|---|---|
+  | `host_receive` | received line | 1 |
+  | `host_dispatch` | 0 | 1 |
+  | `markdown` | source text | inline tokens |
+  | `syntax_highlight` | source text | 0 |
+  | `worker_submit` | 0 | lines |
+  | `worker_receive`, `composer_input`, `composer_resize` | 0 | 1 |
+  | `global_keydown` | 0 | 0 |
+  | `file_tree_build` | 0 | listing entries |
+
+  No other details or arguments are recorded. The desktop shell drops a record
+  whose `frame` is not a protocol frame kind. Example:
+  `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
+  Reactive rendering, layout and paint after a frame is dispatched are not
+  instrumented: they appear only as interval beyond `longest_work`.
 - `layer=native event=dispatch_pending/dispatch_completed`: a background task
   queued a main-thread callback, observed it still pending at the next tick,
   and later measured its queue interval. At most one callback is pending.
@@ -64,6 +83,11 @@ cannot be diagnosed while suspended. File timestamps are receipt times;
 `since_wasm_ms` is a page-relative source timestamp. Missing lines are not proof
 of responsiveness, and these diagnostics cannot establish the reported work
 Mac's cause retrospectively. No affected-machine reproduction is claimed.
+
+**App-build coverage:** startup, gap and native dispatch lines ship from
+v0.9.6-beta.7. The `frame`, `bytes`, `items` fields and `file_tree_build`
+operation ship in builds after v0.9.6-beta.8; earlier gap lines name only the
+operation and duration.
 
 ## Existing opt-in detailed capture
 
@@ -98,8 +122,9 @@ bridge wait initiated by that work.
 
 - `client_work`: measured inclusive synchronous execution of named call sites.
   Covered paths: global keyboard handling, composer input/autosize, host JSON
-  receive/typed dispatch, markdown/synchronous highlighting, highlight worker
-  submission/callback. Nested durations must not be added together.
+  receive/typed dispatch, file explorer tree build, markdown/synchronous
+  highlighting, highlight worker submission/callback. Nested durations must not
+  be added together.
 - `async_wait`: bridge invocation-to-settlement interval. It includes transport,
   native/server/remote work **and** delayed delivery back to the client. It is
   not UI-thread blocking time or proof of a slow server. Pending intervals are

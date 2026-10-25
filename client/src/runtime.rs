@@ -200,8 +200,10 @@ pub enum AgentEvent {
 }
 
 pub enum ProjectEvent {
+    CommandError(CommandErrorPayload),
     Bootstrap(ProjectBootstrapPayload),
     FileList(ProjectFileListPayload),
+    FileViewState(protocol::ProjectFileViewStatePayload),
     GitStatus(ProjectGitStatusPayload),
     CodeIntelOverview(CodeIntelOverviewPayload),
     CodeIntelStatus(CodeIntelStatusPayload),
@@ -498,6 +500,15 @@ impl AgentCommands {
 }
 
 impl ProjectCommands {
+    pub async fn file_view(
+        &self,
+        payload: protocol::ProjectFileViewPayload,
+    ) -> Result<(), ClientError> {
+        self.shared
+            .send(self.stream.clone(), FrameKind::ProjectFileView, &payload)
+            .await
+    }
+
     pub async fn accessed(&self) -> Result<(), ClientError> {
         self.shared
             .send(
@@ -1736,12 +1747,24 @@ async fn handle_project_envelope(
     };
 
     let event = match envelope.kind {
+        FrameKind::CommandError => {
+            let payload = envelope
+                .parse_payload()
+                .map_err(ClientError::InvalidPayload)?;
+            ProjectEvent::CommandError(payload)
+        }
         FrameKind::ProjectBootstrap => {
             let payload: ProjectBootstrapPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::Bootstrap(payload)
+        }
+        FrameKind::ProjectFileViewState => {
+            let payload = envelope
+                .parse_payload()
+                .map_err(ClientError::InvalidPayload)?;
+            ProjectEvent::FileViewState(payload)
         }
         FrameKind::ProjectFileList => {
             let payload: ProjectFileListPayload = match envelope.parse_payload() {

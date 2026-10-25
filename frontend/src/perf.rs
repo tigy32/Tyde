@@ -10,7 +10,9 @@
 //! // …request flight…
 //! perf::log_phase("file_open", "response", "file:src/foo.rs", " bytes=12345");
 //! ```
-use host_config::diagnostics::{FrontendDiagnostic, FrontendDiagnosticRecord, SlowUiWork};
+use host_config::diagnostics::{
+    FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, SlowUiWork,
+};
 pub(crate) use host_config::diagnostics::{FrontendStartupPhase, UiOperation};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -58,6 +60,7 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::SyntaxHighlight => "syntax_highlight",
         UiOperation::WorkerSubmit => "highlight_worker_submit",
         UiOperation::WorkerReceive => "highlight_worker_receive",
+        UiOperation::FileTreeBuild => "file_tree_build",
     }
 }
 
@@ -246,17 +249,39 @@ fn emit_local(diagnostic: FrontendDiagnostic) {
 // callers must never pass IDs, paths, errors, arguments or user content here.
 pub(crate) struct UiSpan {
     capture: f64,
-    local: Option<(f64, UiOperation, bool)>,
+    local: Option<LocalSpan>,
+}
+
+struct LocalSpan {
+    start: f64,
+    operation: UiOperation,
+    waiting: bool,
+    frame: Option<protocol::FrameKind>,
+    bytes: usize,
+    items: usize,
 }
 
 impl UiSpan {
-    fn local(operation: UiOperation, waiting: bool) -> Option<(f64, UiOperation, bool)> {
+    fn local(
+        operation: UiOperation,
+        waiting: bool,
+        frame: Option<protocol::FrameKind>,
+        bytes: usize,
+        items: usize,
+    ) -> Option<LocalSpan> {
         LOCAL_MONITOR.with_borrow_mut(|slot| {
             let m = slot.as_mut()?;
             if waiting {
                 m.pending = m.pending.saturating_add(1);
             }
-            Some((local_monitor_now(&m.handle), operation, waiting))
+            Some(LocalSpan {
+                start: local_monitor_now(&m.handle),
+                operation,
+                waiting,
+                frame,
+                bytes,
+                items,
+            })
         })
     }
 
@@ -267,7 +292,7 @@ impl UiSpan {
             } else {
                 0.0
             },
-            local: Self::local(operation, false),
+            local: Self::local(operation, false, None, bytes, items),
         }
     }
 
@@ -284,7 +309,7 @@ impl UiSpan {
             } else {
                 0.0
             },
-            local: Self::local(UiOperation::HostDispatch, false),
+            local: Self::local(UiOperation::HostDispatch, false, Some(kind), 0, 1),
         }
     }
 
@@ -295,7 +320,14 @@ impl UiSpan {
             } else {
                 0.0
             },
-            local: Self::local(UiOperation::Bridge, true),
+            local: Self::local(UiOperation::Bridge, true, None, 0, 0),
+        }
+    }
+
+    /// Attributes a receive span to the frame it parsed.
+    pub(crate) fn set_frame(&mut self, kind: protocol::FrameKind) {
+        if let Some(local) = &mut self.local {
+            local.frame = Some(kind);
         }
     }
 
@@ -307,27 +339,42 @@ impl UiSpan {
     }
 }
 
+fn count(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 impl Drop for UiSpan {
     fn drop(&mut self) {
         if self.capture != 0.0 {
             diagnostic_end(self.capture, "scope_end");
         }
-        let Some((start, operation, waiting)) = self.local else {
+        let Some(span) = self.local.take() else {
             return;
         };
         LOCAL_MONITOR.with_borrow_mut(|slot| {
             let Some(m) = slot else {
                 return;
             };
-            if waiting {
+            if span.waiting {
                 m.pending = m.pending.saturating_sub(1);
                 return;
             }
-            let duration_ms = millis(local_monitor_now(&m.handle) - start);
-            if duration_ms >= 100 && m.longest.is_none_or(|work| duration_ms > work.duration_ms) {
+            let duration_ms = millis(local_monitor_now(&m.handle) - span.start);
+            if duration_ms >= 100
+                && m.longest
+                    .as_ref()
+                    .is_none_or(|work| duration_ms > work.duration_ms)
+            {
                 m.longest = Some(SlowUiWork {
-                    operation,
+                    operation: span.operation,
                     duration_ms,
+                    frame: span.frame.map(|kind| {
+                        serde_json::to_value(kind)
+                            .and_then(serde_json::from_value::<FrameName>)
+                            .expect("protocol frame kinds serialize as snake_case identifiers")
+                    }),
+                    bytes: count(span.bytes),
+                    items: count(span.items),
                 });
             }
         });
@@ -378,6 +425,59 @@ export function diagnosticTestCall(object, method, source, amount) {
         fn test_environment() -> JsValue;
         #[wasm_bindgen(js_name = diagnosticTestCall)]
         fn call(object: &JsValue, method: &str, source: &str, amount: f64) -> JsValue;
+    }
+
+    #[wasm_bindgen(inline_js = r#"
+export function localMonitorTestEnvironment() {
+    let time = 1000, timer = null;
+    return {
+        document: {
+            visibilityState: 'visible', hasFocus: () => true,
+            addEventListener() {}, removeEventListener() {},
+        },
+        // Every reading advances the injected clock, so synchronous work has a
+        // deterministic nonzero duration without real time passing.
+        performance: {now: () => (time += 150)},
+        setTimeout(fn) { timer = fn; return 1; }, clearTimeout() { timer = null; },
+        advance(amount) { time += amount; },
+        tick() { const fn = timer; timer = null; if (fn) fn(); },
+    };
+}
+export function localMonitorTestCall(env, method, amount) { return env[method](amount); }
+"#)]
+    extern "C" {
+        #[wasm_bindgen(js_name = localMonitorTestEnvironment)]
+        fn local_monitor_test_environment() -> JsValue;
+        #[wasm_bindgen(js_name = localMonitorTestCall)]
+        fn local_monitor_test_call(env: &JsValue, method: &str, amount: f64);
+    }
+
+    /// The automatic local monitor on an injected clock and timer; dropping it
+    /// uninstalls the monitor.
+    pub(crate) struct LocalMonitorClock {
+        env: JsValue,
+    }
+
+    impl LocalMonitorClock {
+        pub(crate) fn install() -> Self {
+            let env = local_monitor_test_environment();
+            super::install_local_monitor(&env);
+            Self { env }
+        }
+
+        pub(crate) fn advance(&self, amount: f64) {
+            local_monitor_test_call(&self.env, "advance", amount);
+        }
+
+        pub(crate) fn tick(&self) {
+            local_monitor_test_call(&self.env, "tick", 0.0);
+        }
+    }
+
+    impl Drop for LocalMonitorClock {
+        fn drop(&mut self) {
+            super::LOCAL_MONITOR.with_borrow_mut(|slot| *slot = None);
+        }
     }
 
     pub(crate) struct Capture {

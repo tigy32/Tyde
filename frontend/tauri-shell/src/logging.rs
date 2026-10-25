@@ -171,6 +171,18 @@ impl DiagnosticSink {
         &self,
         record: host_config::diagnostics::FrontendDiagnosticRecord,
     ) -> Result<(), &'static str> {
+        if let host_config::diagnostics::FrontendDiagnostic::EventLoopGap {
+            longest_work: Some(work),
+            ..
+        } = &record.diagnostic
+            && let Some(frame) = &work.frame
+            && serde_json::from_value::<protocol::FrameKind>(serde_json::Value::String(
+                frame.as_str().to_owned(),
+            ))
+            .is_err()
+        {
+            return Err("Local diagnostic names an unknown frame kind");
+        }
         let (settled, result) = tokio::sync::oneshot::channel();
         self.0
             .try_send(DiagnosticRequest { record, settled })

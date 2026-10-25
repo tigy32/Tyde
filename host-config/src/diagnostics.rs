@@ -14,6 +14,7 @@ pub enum UiOperation {
     SyntaxHighlight,
     WorkerSubmit,
     WorkerReceive,
+    FileTreeBuild,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -30,14 +31,53 @@ pub enum FrontendStartupPhase {
     ReadyAcknowledged,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+/// A protocol frame kind name. This crate only bounds its shape to a
+/// snake_case identifier; the desktop shell, which knows the protocol, admits a
+/// record only when the name is a real frame kind.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FrameName(String);
+
+impl FrameName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for FrameName {
+    type Error = &'static str;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        let valid = (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        if valid {
+            Ok(Self(name))
+        } else {
+            Err("frame name must be a snake_case identifier")
+        }
+    }
+}
+
+impl From<FrameName> for String {
+    fn from(name: FrameName) -> Self {
+        name.0
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlowUiWork {
     pub operation: UiOperation,
     pub duration_ms: u32,
+    /// The host frame being handled, when the operation handles one.
+    pub frame: Option<FrameName>,
+    pub bytes: u32,
+    pub items: u32,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FrontendDiagnostic {
     Startup {
@@ -53,7 +93,7 @@ pub enum FrontendDiagnostic {
     },
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrontendDiagnosticRecord {
     pub diagnostic: FrontendDiagnostic,

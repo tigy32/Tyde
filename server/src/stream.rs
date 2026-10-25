@@ -746,6 +746,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::ProjectGitDiff
         | FrameKind::ProjectGitStatus
         | FrameKind::ProjectFileContents
+        | FrameKind::ProjectFileViewState
         | FrameKind::ProjectFileList
         | FrameKind::ProjectSearchResults
         | FrameKind::ProjectSearchComplete
@@ -859,7 +860,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::ProjectUnstageFile
         | FrameKind::ProjectDiscardFile
         | FrameKind::ProjectGitCommit
-        | FrameKind::ProjectListDir
+        | FrameKind::ProjectFileView
         | FrameKind::HostBrowseStart
         | FrameKind::HostBrowseList
         | FrameKind::HostBrowseClose

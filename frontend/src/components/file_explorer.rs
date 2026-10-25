@@ -5,81 +5,13 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::{delete_project_root, open_project_path_at};
 use crate::components::host_browser::open_add_root_browser;
-use crate::send::send_frame;
-use crate::state::{AppState, OpenTarget, display_path_name, root_display_name};
+use crate::state::{ActiveProjectRef, AppState, OpenTarget, display_path_name, root_display_name};
 
 use protocol::{
-    CodeIntelOverviewHeadline, CodeIntelOverviewSummary, CodeIntelState, FrameKind,
-    ProjectFileEntry, ProjectFileKind, ProjectId, ProjectListDirPayload, ProjectPath,
-    ProjectRootPath, ProjectRootStatus, StreamPath,
+    CodeIntelOverviewHeadline, CodeIntelOverviewSummary, CodeIntelState, ProjectFileKind,
+    ProjectFileView, ProjectFileViewState, ProjectFileWindow, ProjectId, ProjectPath,
+    ProjectRootPath, ProjectRootStatus,
 };
-
-/// A node in the file tree built from the flat entry list.
-#[derive(Clone, Debug, PartialEq)]
-struct TreeNode {
-    name: String,
-    kind: ProjectFileKind,
-    relative_path: String,
-    children: Vec<TreeNode>,
-}
-
-fn build_tree(entries: &[ProjectFileEntry]) -> Vec<TreeNode> {
-    // Intermediate map: path segment -> (kind, children map)
-    // We'll build a nested HashMap and then flatten to Vec<TreeNode>.
-    struct DirEntry {
-        kind: ProjectFileKind,
-        relative_path: String,
-        children: HashMap<String, DirEntry>,
-    }
-
-    let mut root_children: HashMap<String, DirEntry> = HashMap::new();
-
-    for entry in entries {
-        let parts: Vec<&str> = entry.relative_path.split('/').collect();
-        let mut current = &mut root_children;
-
-        for (i, part) in parts.iter().enumerate() {
-            let is_last = i == parts.len() - 1;
-            let dir_entry = current.entry(part.to_string()).or_insert_with(|| DirEntry {
-                kind: if is_last {
-                    entry.kind
-                } else {
-                    ProjectFileKind::Directory
-                },
-                relative_path: parts[..=i].join("/"),
-                children: HashMap::new(),
-            });
-            if is_last {
-                dir_entry.kind = entry.kind;
-                dir_entry.relative_path = entry.relative_path.clone();
-            }
-            current = &mut dir_entry.children;
-        }
-    }
-
-    fn to_tree_nodes(map: HashMap<String, DirEntry>) -> Vec<TreeNode> {
-        let mut nodes: Vec<TreeNode> = map
-            .into_iter()
-            .map(|(name, entry)| TreeNode {
-                name,
-                kind: entry.kind,
-                relative_path: entry.relative_path,
-                children: to_tree_nodes(entry.children),
-            })
-            .collect();
-        // Sort: directories first, then alphabetically
-        nodes.sort_by(|a, b| {
-            let a_dir = matches!(a.kind, ProjectFileKind::Directory);
-            let b_dir = matches!(b.kind, ProjectFileKind::Directory);
-            b_dir
-                .cmp(&a_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        nodes
-    }
-
-    to_tree_nodes(root_children)
-}
 
 fn file_type_icon(name: &str) -> &'static str {
     if let Some(ext) = name.rsplit('.').next() {
@@ -103,23 +35,159 @@ pub fn FileExplorer() -> impl IntoView {
     let state = expect_context::<AppState>();
     let filter = RwSignal::new(String::new());
     let show_hidden = RwSignal::new(false);
-    let expanded_dirs = RwSignal::new(HashSet::<String>::new());
+    let expanded_dirs = RwSignal::new(HashSet::<ProjectPath>::new());
+    let windows = RwSignal::new(HashMap::<ProjectPath, ProjectFileWindow>::new());
     let collapsed_roots = RwSignal::new(HashSet::<String>::new());
 
-    let tree = Memo::new(move |_| {
+    // Other projects' listings change the shared map; selecting the active
+    // project's roots first keeps their updates from rebuilding this tree.
+    let active_roots = Memo::new(move |_| {
         let pid = state.active_project.get()?.project_id;
-        let file_map = state.file_tree.get();
-        let roots = file_map.get(&pid)?;
-        Some(
-            roots
-                .iter()
-                .map(|root| RootTree {
+        state.file_tree.with(|file_map| {
+            file_map.get(&pid).map(|roots| {
+                roots
+                    .iter()
+                    .map(|root| RootTree {
+                        root: root.root.clone(),
+                        status: root.status.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+    });
+    let tree = active_roots;
+    // Declaration lifetime follows explicit UI intent, not transient row mounting.
+    let declared = StoredValue::new((
+        None::<ActiveProjectRef>,
+        None::<u64>,
+        Vec::<ProjectFileView>::new(),
+    ));
+    Effect::new(move |_| {
+        let project = state.active_project.get();
+        let previous = declared.get_value();
+        if previous.0 != project {
+            windows.update(HashMap::clear);
+        }
+        let epoch = project.as_ref().and_then(|project| {
+            state
+                .file_view_epochs
+                .with(|epochs| epochs.get(project).copied())
+        });
+        let expanded = expanded_dirs.get();
+        let collapsed = collapsed_roots.get();
+        let mut desired = Vec::new();
+        if project.is_some()
+            && let Some(roots) = active_roots.get()
+        {
+            for root in roots {
+                if collapsed.contains(&root.root.0) || root.status != ProjectRootStatus::Available {
+                    continue;
+                }
+                let root_path = ProjectPath {
                     root: root.root.clone(),
-                    status: root.status.clone(),
-                    nodes: build_tree(&root.entries),
+                    relative_path: String::new(),
+                };
+                let paths = std::iter::once(root_path).chain(
+                    expanded
+                        .iter()
+                        .filter(|path| {
+                            if path.root != root.root {
+                                return false;
+                            }
+                            let mut ancestor = path.relative_path.as_str();
+                            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                                if !expanded.contains(&ProjectPath {
+                                    root: path.root.clone(),
+                                    relative_path: parent.to_owned(),
+                                }) {
+                                    return false;
+                                }
+                                ancestor = parent;
+                            }
+                            true
+                        })
+                        .cloned(),
+                );
+                for path in paths {
+                    let window = windows
+                        .with(|windows| windows.get(&path).cloned())
+                        .unwrap_or(ProjectFileWindow::First);
+                    desired.push(ProjectFileView::Directory {
+                        path,
+                        window,
+                        show_hidden: show_hidden.get(),
+                        filter: filter.get().to_lowercase(),
+                    });
+                }
+            }
+        }
+        if let Some(previous_project) = previous.0.as_ref() {
+            for view in &previous.2 {
+                if previous.0 != project
+                    || !desired.iter().any(|current| match (view, current) {
+                        (
+                            ProjectFileView::Directory { path: old, .. },
+                            ProjectFileView::Directory { path: new, .. },
+                        ) => old == new,
+                        _ => false,
+                    })
+                {
+                    crate::send::project_file_view(previous_project.clone(), view.clone(), false);
+                }
+            }
+        }
+        if let Some(project) = project.as_ref() {
+            for view in &desired {
+                if previous.0.as_ref() != Some(project)
+                    || previous.1 != epoch
+                    || !previous.2.contains(view)
+                {
+                    crate::send::project_file_view(project.clone(), view.clone(), true);
+                }
+            }
+        }
+        declared.set_value((project, epoch, desired));
+    });
+    Effect::new(move |_| {
+        let Some(project) = state.active_project.get() else {
+            return;
+        };
+        let removed = state.file_views.with(|views| {
+            views
+                .get(&project)
+                .into_iter()
+                .flatten()
+                .filter_map(|page| match (&page.view, &page.state) {
+                    (
+                        ProjectFileView::Directory { path, .. },
+                        ProjectFileViewState::DirectoryMissing,
+                    ) if !path.relative_path.is_empty() => Some(path.clone()),
+                    _ => None,
                 })
-                .collect::<Vec<_>>(),
-        )
+                .collect::<Vec<_>>()
+        });
+        if removed.is_empty() {
+            return;
+        }
+        let keep = |path: &ProjectPath| {
+            !removed.iter().any(|removed| {
+                path.root == removed.root
+                    && (path == removed
+                        || path
+                            .relative_path
+                            .starts_with(&format!("{}/", removed.relative_path)))
+            })
+        };
+        expanded_dirs.update(|expanded| expanded.retain(keep));
+        windows.update(|windows| windows.retain(|path, _| keep(path)));
+    });
+    on_cleanup(move || {
+        let (project, _, views) = declared.get_value();
+        if let Some(project) = project {
+            for view in views {
+                crate::send::project_file_view(project.clone(), view, false);
+            }
+        }
     });
 
     let project_header = Memo::new(move |_| {
@@ -152,11 +220,17 @@ pub fn FileExplorer() -> impl IntoView {
     });
 
     let on_filter_input = move |ev: leptos::ev::Event| {
-        filter.set(event_target_value(&ev));
+        batch(|| {
+            windows.update(HashMap::clear);
+            filter.set(event_target_value(&ev));
+        });
     };
 
     let toggle_hidden = move |_| {
-        show_hidden.update(|v| *v = !*v);
+        batch(|| {
+            windows.update(HashMap::clear);
+            show_hidden.update(|v| *v = !*v);
+        });
     };
 
     let state_for_add_root = state.clone();
@@ -234,18 +308,7 @@ pub fn FileExplorer() -> impl IntoView {
                             let filter_val = filter.get().to_lowercase();
                             let hidden = show_hidden.get();
                             let active = state.active_project.get();
-                            // Only thread an (host_id, project_id) into
-                            // render_root_section when root edits are valid
-                            // for this project — that tuple is what gates the
-                            // per-root remove button. The check tracks the
-                            // projects signal so adding a workbench child
-                            // immediately removes the affordance from the
-                            // parent's roots.
-                            let project_ref = active.as_ref().and_then(|a| {
-                                state
-                                    .can_manage_project_roots(&a.host_id, &a.project_id)
-                                    .then(|| (a.host_id.clone(), a.project_id.clone()))
-                            });
+                            let project_ref = active.map(|active| (active.host_id, active.project_id));
                             root_trees
                                 .into_iter()
                                 .flat_map(|root_tree| {
@@ -254,6 +317,7 @@ pub fn FileExplorer() -> impl IntoView {
                                         &filter_val,
                                         hidden,
                                         expanded_dirs,
+                                        windows,
                                         collapsed_roots,
                                         project_ref.clone(),
                                     )
@@ -483,51 +547,22 @@ fn render_root_overview(root: protocol::CodeIntelRootOverview) -> impl IntoView 
     }
 }
 
-/// Send a ProjectListDir request so the server returns 2 levels of entries under `dir_path`.
-fn request_dir_listing(state: &AppState, root: ProjectRootPath, dir_relative_path: &str) {
-    let Some(active_project) = state.active_project_ref_untracked() else {
-        return;
-    };
-    let project_id = active_project.project_id.clone();
-    let stream = StreamPath(format!("/project/{}", project_id.0));
-    let payload = ProjectListDirPayload {
-        root,
-        path: dir_relative_path.to_owned(),
-    };
-    spawn_local(async move {
-        if let Err(e) = send_frame(
-            &active_project.host_id,
-            stream,
-            FrameKind::ProjectListDir,
-            &payload,
-        )
-        .await
-        {
-            log::error!("failed to send ProjectListDir: {e}");
-        }
-    });
-}
-
 #[derive(Clone, PartialEq)]
 struct RootTree {
     root: ProjectRootPath,
     status: ProjectRootStatus,
-    nodes: Vec<TreeNode>,
 }
 
 fn render_root_section(
     root_tree: RootTree,
     filter: &str,
     show_hidden: bool,
-    expanded_dirs: RwSignal<HashSet<String>>,
+    expanded_dirs: RwSignal<HashSet<ProjectPath>>,
+    windows: RwSignal<HashMap<ProjectPath, ProjectFileWindow>>,
     collapsed_roots: RwSignal<HashSet<String>>,
     project_ref: Option<(String, ProjectId)>,
 ) -> Vec<AnyView> {
-    let RootTree {
-        root,
-        status,
-        nodes,
-    } = root_tree;
+    let RootTree { root, status } = root_tree;
     let unavailable = match status {
         ProjectRootStatus::Available => None,
         ProjectRootStatus::Unavailable { message } => Some(message),
@@ -541,6 +576,13 @@ fn render_root_section(
         Signal::derive(move || !collapsed_roots.with(|roots| roots.contains(&root_key)))
     };
     let remove_button = project_ref.map(|(host_id, project_id)| {
+        let state = expect_context::<AppState>();
+        let host_for_manage = host_id.clone();
+        let project_for_manage = project_id.clone();
+        // Catalog edits must not remount directory views.
+        let can_manage = Memo::new(move |_| {
+            state.can_manage_project_roots(&host_for_manage, &project_for_manage)
+        });
         let root_for_remove = root.clone();
         let on_remove = move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
@@ -557,9 +599,11 @@ fn render_root_section(
             });
         };
         view! {
-            <button class="fe-root-remove" title="Remove root" on:click=on_remove>
-                "×"
-            </button>
+            <Show when=move || can_manage.get()>
+                <button class="fe-root-remove" title="Remove root" on:click=on_remove.clone()>
+                    "×"
+                </button>
+            </Show>
         }
     });
     views.push(
@@ -594,152 +638,137 @@ fn render_root_section(
         }
         .into_any(),
     );
+    let available = unavailable.is_none();
     if let Some(message) = unavailable {
         views.push(
             view! { <div class="fe-root-unavailable" role="alert">{message}</div> }.into_any(),
         );
     }
-    let filter_for_nodes = filter.to_owned();
-    views.push(
-        view! {
-            <Show when=move || is_expanded.get()>
-                {
-                    let root = root.clone();
-                    let nodes = nodes.clone();
-                    let filter = filter_for_nodes.clone();
-                    move || render_nodes(
-                        root.clone(),
-                        nodes.clone(),
-                        0,
-                        &filter,
-                        show_hidden,
-                        expanded_dirs,
-                    )
-                }
-            </Show>
-        }
-        .into_any(),
-    );
+    let filter = filter.to_owned();
+    views.push(view! {
+        <Show when=move || available && is_expanded.get()>
+            <DirectoryContents root=root.clone() path=String::new() depth=0 filter=filter.clone() show_hidden=show_hidden expanded_dirs=expanded_dirs windows=windows />
+        </Show>
+    }.into_any());
     views
 }
 
-fn expanded_key(root: &ProjectRootPath, relative_path: &str) -> String {
-    format!("{}\u{0}{relative_path}", root.0)
+#[component]
+fn DirectoryContents(
+    root: ProjectRootPath,
+    path: String,
+    depth: usize,
+    filter: String,
+    show_hidden: bool,
+    expanded_dirs: RwSignal<HashSet<ProjectPath>>,
+    windows: RwSignal<HashMap<ProjectPath, ProjectFileWindow>>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let project = state.active_project.get_untracked();
+    let directory = ProjectPath {
+        root,
+        relative_path: path,
+    };
+    let directory_for_view = directory.clone();
+    let child_filter = filter.clone();
+    let view = Memo::new(move |_| ProjectFileView::Directory {
+        path: directory_for_view.clone(),
+        window: windows
+            .with(|windows| windows.get(&directory_for_view).cloned())
+            .unwrap_or(ProjectFileWindow::First),
+        show_hidden,
+        filter: filter.clone(),
+    });
+    let page = Memo::new(move |_| {
+        let project = project.as_ref()?;
+        let desired = view.get();
+        state.file_views.with(|map| {
+            map.get(project)?
+                .iter()
+                .find(|page| page.view == desired)
+                .map(|page| page.state.clone())
+        })
+    });
+    view! {
+        <div class="fe-directory-contents">
+            <For
+                each=move || match page.get() {
+                    Some(ProjectFileViewState::Ready { entries, .. }) => {
+                        let _diagnostic = crate::perf::UiSpan::new(crate::perf::UiOperation::FileTreeBuild, 0, entries.len());
+                        entries
+                    }
+                    _ => Vec::new(),
+                }
+                key=|entry| (entry.path.clone(), entry.kind == ProjectFileKind::Directory)
+                children=move |entry| view! { <DirectoryEntry entry=entry depth=depth filter=child_filter.clone() show_hidden=show_hidden expanded_dirs=expanded_dirs windows=windows /> }
+            />
+            {move || match page.get() {
+                None | Some(ProjectFileViewState::Loading) => view! { <div role="status">"Loading…"</div> }.into_any(),
+                Some(ProjectFileViewState::Closed) => ().into_any(),
+                Some(ProjectFileViewState::DirectoryMissing) => view! { <div role="alert">"Directory no longer exists"</div> }.into_any(),
+                Some(ProjectFileViewState::Unavailable { message }) => view! { <div class="fe-root-unavailable" role="alert">{message}</div> }.into_any(),
+                Some(ProjectFileViewState::Ready { entries, previous, next }) => view! {
+                    {entries.is_empty().then(|| view! { <div class="panel-empty">"No entries"</div> })}
+                    <div class="fe-pages">
+                        {previous.map(|cursor| { let directory = directory.clone(); view! { <button on:click=move |_| windows.update(|windows| { windows.insert(directory.clone(), ProjectFileWindow::Before(cursor.clone())); })>"Previous"</button> } })}
+                        {next.map(|cursor| { let directory = directory.clone(); view! { <button on:click=move |_| windows.update(|windows| { windows.insert(directory.clone(), ProjectFileWindow::After(cursor.clone())); })>"Next"</button> } })}
+                    </div>
+                }.into_any(),
+            }}
+        </div>
+    }
 }
 
-fn render_nodes(
-    root: ProjectRootPath,
-    nodes: Vec<TreeNode>,
+#[component]
+fn DirectoryEntry(
+    entry: protocol::ProjectFileCursor,
     depth: usize,
-    filter: &str,
+    filter: String,
     show_hidden: bool,
-    expanded_dirs: RwSignal<HashSet<String>>,
-) -> Vec<AnyView> {
-    nodes
-        .into_iter()
-        .filter(|node| {
-            if !show_hidden && node.name.starts_with('.') {
-                return false;
-            }
-            if filter.is_empty() {
-                return true;
-            }
-            // For directories, show if any child matches
-            if matches!(node.kind, ProjectFileKind::Directory) {
-                return node_matches_filter(node, filter, show_hidden);
-            }
-            node.name.to_lowercase().contains(filter)
-        })
-        .map(|node| {
-            let indent = depth * 16;
-            match node.kind {
-                ProjectFileKind::Directory => {
-                    let name = node.name.clone();
-                    let dir_path = node.relative_path.clone();
-                    let children = node.children.clone();
-                    let filter_owned = filter.to_owned();
-                    let root_for_expand = root.clone();
-                    let key = expanded_key(&root_for_expand, &dir_path);
-                    let is_expanded = {
-                        let key = key.clone();
-                        Signal::derive(move || expanded_dirs.with(|set| set.contains(&key)))
-                    };
-                    let root_for_click = root.clone();
-                    let root_for_children = root.clone();
-                    let root_for_ctx = root.clone();
-                    let dir_path_for_ctx = dir_path.clone();
-                    // Resolve the context once, in render scope, rather than on
-                    // every right-click inside the event callback.
-                    let state_for_ctx = expect_context::<AppState>();
-
-                    view! {
-                        <div class="fe-dir-group">
-                            <button
-                                class="fe-item fe-dir"
-                                style=format!("padding-left: {}px", indent + 4)
-                                title="Right-click to search in this folder"
-                                on:contextmenu={
-                                    let root = root_for_ctx.clone();
-                                    let dir_path = dir_path_for_ctx.clone();
-                                    let state = state_for_ctx.clone();
-                                    move |ev: web_sys::MouseEvent| {
-                                        ev.prevent_default();
-                                        crate::actions::search_in_folder(
-                                            &state,
-                                            root.clone(),
-                                            dir_path.clone(),
-                                        );
-                                    }
-                                }
-                                on:click={
-                                    let dir_path = dir_path.clone();
-                                    let root = root_for_click.clone();
-                                    let key = key.clone();
-                                    move |_| {
-                                        let opening = !expanded_dirs
-                                            .with_untracked(|set| set.contains(&key));
-                                        expanded_dirs.update(|set| {
-                                            if opening {
-                                                set.insert(key.clone());
-                                            } else {
-                                                set.remove(&key);
-                                            }
-                                        });
-                                        if opening {
-                                            let state = expect_context::<AppState>();
-                                            request_dir_listing(&state, root.clone(), &dir_path);
-                                        }
-                                    }
-                                }
-                            >
-                                <span class="fe-chevron">{move || if is_expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
-                                <span class="fe-icon fe-folder-icon">{move || if is_expanded.get() { "\u{1f4c2}" } else { "\u{1f4c1}" }}</span>
-                                <span class="fe-name">{name.clone()}</span>
-                            </button>
-                            <Show when=move || is_expanded.get()>
-                                {
-                                    let children = children.clone();
-                                    let filter_owned = filter_owned.clone();
-                                    let root = root_for_children.clone();
-                                    move || render_nodes(root.clone(), children.clone(), depth + 1, &filter_owned, show_hidden, expanded_dirs)
-                                }
-                            </Show>
-                        </div>
-                    }
-                    .into_any()
+    expanded_dirs: RwSignal<HashSet<ProjectPath>>,
+    windows: RwSignal<HashMap<ProjectPath, ProjectFileWindow>>,
+) -> AnyView {
+    let root = entry.path.root;
+    let dir_path = entry.path.relative_path;
+    let name = dir_path.rsplit('/').next().unwrap_or(&dir_path).to_owned();
+    if entry.kind != ProjectFileKind::Directory {
+        return view! { <FileRow root=root relative_path=dir_path name=name indent=depth*16 /> }
+            .into_any();
+    }
+    let state = expect_context::<AppState>();
+    let key = ProjectPath {
+        root: root.clone(),
+        relative_path: dir_path.clone(),
+    };
+    let key_for_click = key.clone();
+    let expanded = Signal::derive(move || expanded_dirs.with(|set| set.contains(&key)));
+    let root_for_context = root.clone();
+    let path_for_context = dir_path.clone();
+    view! {
+        <div class="fe-dir-group">
+            <button class="fe-item fe-dir" style=format!("padding-left: {}px", depth * 16 + 4)
+                aria-expanded=move || expanded.get().to_string()
+                on:contextmenu=move |ev: web_sys::MouseEvent| {
+                    ev.prevent_default();
+                    crate::actions::search_in_folder(&state, root_for_context.clone(), path_for_context.clone());
                 }
-                _ => view! {
-                    <FileRow
-                        root=root.clone()
-                        relative_path=node.relative_path.clone()
-                        name=node.name.clone()
-                        indent=indent
-                    />
-                }
-                .into_any(),
-            }
-        })
-        .collect()
+                on:click=move |_| {
+                    expanded_dirs.update(|set| {
+                        if !set.insert(key_for_click.clone()) {
+                            let prefix = format!("{}/", key_for_click.relative_path);
+                            set.retain(|path| path.root != key_for_click.root || (path != &key_for_click && !path.relative_path.starts_with(&prefix)));
+                        }
+                    });
+                    windows.update(|windows| windows.retain(|path, _| expanded_dirs.with_untracked(|expanded| expanded.contains(path)) || path.relative_path.is_empty()));
+                }>
+                <span class="fe-chevron">{move || if expanded.get() { "▾" } else { "▸" }}</span>
+                <span class="fe-name">{name}</span>
+            </button>
+            <Show when=move || expanded.get()>
+                <DirectoryContents root=root.clone() path=dir_path.clone() depth=depth+1 filter=filter.clone() show_hidden=show_hidden expanded_dirs=expanded_dirs windows=windows />
+            </Show>
+        </div>
+    }.into_any()
 }
 
 /// One file row: clicking it opens the file in the focused pane. Splits are
@@ -777,18 +806,6 @@ fn FileRow(
     }
 }
 
-fn node_matches_filter(node: &TreeNode, filter: &str, show_hidden: bool) -> bool {
-    if !show_hidden && node.name.starts_with('.') {
-        return false;
-    }
-    if node.name.to_lowercase().contains(filter) {
-        return true;
-    }
-    node.children
-        .iter()
-        .any(|child| node_matches_filter(child, filter, show_hidden))
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
@@ -798,7 +815,7 @@ mod wasm_tests {
     use protocol::{
         CodeIntelLanguageId, CodeIntelOverviewHeadline, CodeIntelOverviewPayload,
         CodeIntelProviderId, CodeIntelProviderStatus, CodeIntelResourceMode, CodeIntelRootOverview,
-        CodeIntelState,
+        CodeIntelState, FrameKind, ProjectFileEntry, StreamPath,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -807,6 +824,22 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    struct FileViewBridge(wasm_bindgen::JsValue);
+    impl FileViewBridge {
+        fn install() -> Self {
+            let previous =
+                js_sys::Reflect::get(&web_sys::window().unwrap(), &"__TAURI__".into()).unwrap();
+            js_sys::eval("window.__fileViewCommands = []; window.__TAURI__ = {core: {invoke: (cmd, args) => { if (cmd === 'send_host_line') window.__fileViewCommands.push(JSON.parse(args.line)); return Promise.resolve(null); }}};").unwrap();
+            Self(previous)
+        }
+    }
+    impl Drop for FileViewBridge {
+        fn drop(&mut self) {
+            js_sys::Reflect::set(&web_sys::window().unwrap(), &"__TAURI__".into(), &self.0)
+                .unwrap();
+        }
+    }
 
     fn make_container() -> ScopedRoot {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -817,6 +850,57 @@ mod wasm_tests {
             container.dyn_into::<HtmlElement>().unwrap(),
             "file-explorer",
         )
+    }
+
+    fn directory_page(
+        path: &str,
+        entries: Vec<ProjectFileEntry>,
+    ) -> protocol::ProjectFileViewStatePayload {
+        protocol::ProjectFileViewStatePayload {
+            view: ProjectFileView::Directory {
+                path: ProjectPath {
+                    root: ProjectRootPath(ROOT.to_owned()),
+                    relative_path: path.to_owned(),
+                },
+                window: ProjectFileWindow::First,
+                show_hidden: false,
+                filter: String::new(),
+            },
+            state: ProjectFileViewState::Ready {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| protocol::ProjectFileCursor {
+                        path: ProjectPath {
+                            root: ProjectRootPath(ROOT.to_owned()),
+                            relative_path: entry.relative_path,
+                        },
+                        kind: entry.kind,
+                        score: 0,
+                    })
+                    .collect(),
+                previous: None,
+                next: None,
+            },
+        }
+    }
+
+    fn publish_page(
+        state: &AppState,
+        host: &str,
+        seq: u64,
+        page: &protocol::ProjectFileViewStatePayload,
+    ) {
+        crate::dispatch::dispatch_envelope(
+            state,
+            host,
+            protocol::Envelope::from_payload(
+                StreamPath(format!("/project/{PROJECT}")),
+                FrameKind::ProjectFileViewState,
+                seq,
+                page,
+            )
+            .unwrap(),
+        );
     }
 
     async fn next_tick() {
@@ -974,8 +1058,12 @@ mod wasm_tests {
                         root: ProjectRootPath(ROOT.to_owned()),
                         status: protocol::ProjectRootStatus::Available,
                         entries: entries.clone(),
+                        partial_dirs: Vec::new(),
                     }],
                 );
+            });
+            state.file_views.update(|views| {
+                views.insert(active_project(), vec![directory_page("", entries.clone())]);
             });
             for name in &loaded {
                 let key = file_key(name);
@@ -1636,6 +1724,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn unavailable_root_shows_reason_and_remove_control_beside_live_roots() {
         // Priming leaves this host connected; keep it off the shared test host.
+        let _bridge = FileViewBridge::install();
         const HOST: &str = "fe-unavailable-root";
         const MISSING: &str = "/work/moved-away";
         const MESSAGE: &str = "Failed to stat project root '/work/moved-away': No such file or directory (os error 2)";
@@ -1676,11 +1765,19 @@ mod wasm_tests {
                     protocol::ProjectRootListing {
                         root: ProjectRootPath(ROOT.to_owned()),
                         status: ProjectRootStatus::Available,
-                        entries: vec![ProjectFileEntry {
-                            relative_path: "main.rs".to_owned(),
-                            kind: ProjectFileKind::File,
+                        entries: [
+                            ("main.rs", ProjectFileKind::File),
+                            ("big", ProjectFileKind::Directory),
+                            ("big/a.rs", ProjectFileKind::File),
+                        ]
+                        .into_iter()
+                        .map(|(path, kind)| ProjectFileEntry {
+                            relative_path: path.to_owned(),
+                            kind,
                             op: protocol::FileEntryOp::Add,
-                        }],
+                        })
+                        .collect(),
+                        partial_dirs: Vec::new(),
                     },
                     protocol::ProjectRootListing {
                         root: ProjectRootPath(MISSING.to_owned()),
@@ -1688,6 +1785,7 @@ mod wasm_tests {
                             message: MESSAGE.to_owned(),
                         },
                         entries: Vec::new(),
+                        partial_dirs: Vec::new(),
                     },
                 ],
             },
@@ -1707,6 +1805,17 @@ mod wasm_tests {
         );
         next_tick().await;
 
+        let root_page = directory_page(
+            "",
+            bootstrap.file_list.roots[0]
+                .entries
+                .iter()
+                .filter(|entry| !entry.relative_path.contains('/'))
+                .cloned()
+                .collect(),
+        );
+        publish_page(&state, HOST, 1, &root_page);
+        next_tick().await;
         let rows = file_rows(&container);
         assert_eq!(rows.len(), 1, "the readable root still lists its file");
         let row_text = rows[0].text_content().unwrap_or_default();
@@ -1743,5 +1852,450 @@ mod wasm_tests {
             "the remove control is visible without hovering"
         );
         assert!(missing_remove.get_bounding_client_rect().width() > 0.0);
+
+        let explorer_text = || container.text_content().unwrap_or_default();
+        container
+            .query_selector("button.fe-dir")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            explorer_text().contains("Loading…"),
+            "an expanded folder is loading, not silently empty"
+        );
+        let mut page = directory_page(
+            "big",
+            vec![ProjectFileEntry {
+                relative_path: "big/a.rs".to_owned(),
+                kind: ProjectFileKind::File,
+                op: protocol::FileEntryOp::Add,
+            }],
+        );
+        let cursor = protocol::ProjectFileCursor {
+            path: ProjectPath {
+                root: ProjectRootPath(ROOT.to_owned()),
+                relative_path: "big/a.rs".to_owned(),
+            },
+            kind: ProjectFileKind::File,
+            score: 0,
+        };
+        if let ProjectFileViewState::Ready { next, .. } = &mut page.state {
+            *next = Some(cursor.clone());
+        }
+        publish_page(&state, HOST, 2, &page);
+        next_tick().await;
+        assert_eq!(file_rows(&container).len(), 2);
+        let before_unrelated = js_sys::eval("window.__fileViewCommands.length")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        let mut unrelated = bootstrap.clone();
+        unrelated.project.id = ProjectId("unrelated-file-view".to_owned());
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                StreamPath("/project/unrelated-file-view".to_owned()),
+                FrameKind::ProjectBootstrap,
+                0,
+                &unrelated,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert_eq!(
+            file_rows(&container).len(),
+            2,
+            "other projects cannot clear visible expanded children"
+        );
+        assert_eq!(
+            js_sys::eval("window.__fileViewCommands.length")
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            before_unrelated,
+            "another project's bootstrap must not re-declare active views"
+        );
+        let next = (0..container.query_selector_all("button").unwrap().length())
+            .filter_map(|index| container.query_selector_all("button").unwrap().item(index))
+            .find(|button| button.text_content().as_deref() == Some("Next"))
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        next.click();
+        next_tick().await;
+        assert!(explorer_text().contains("Loading…"));
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        assert!(
+            commands
+                .iter()
+                .filter(|command| command.kind == FrameKind::ProjectFileView)
+                .any(|command| {
+                    command
+                        .parse_payload::<protocol::ProjectFileViewPayload>()
+                        .is_ok_and(|command| {
+                            command.active
+                                && matches!(
+                                    command.view,
+                                    ProjectFileView::Directory {
+                                        window: ProjectFileWindow::After(_),
+                                        ..
+                                    }
+                                )
+                        })
+                }),
+            "Next declares a real server page, rather than hiding inaccessible files"
+        );
+        if let ProjectFileView::Directory { window, .. } = &mut page.view {
+            *window = ProjectFileWindow::After(cursor.clone());
+        }
+        page.state = ProjectFileViewState::Unavailable {
+            message: "Directory read failed".to_owned(),
+        };
+        publish_page(&state, HOST, 3, &page);
+        next_tick().await;
+        assert!(explorer_text().contains("Directory read failed"));
+        assert!(!explorer_text().contains("No entries"));
+
+        // Replaying bootstrap must re-declare both the root and the still-open
+        // child, even though the server forgot all connection-owned views.
+        let before = js_sys::eval("window.__fileViewCommands.length")
+            .unwrap()
+            .as_f64()
+            .unwrap() as usize;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                StreamPath(format!("/project/{PROJECT}")),
+                FrameKind::ProjectBootstrap,
+                4,
+                &bootstrap,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(explorer_text().contains("Loading…"));
+        publish_page(&state, HOST, 5, &root_page);
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        assert!(commands[before..].iter().any(|command| command.kind == FrameKind::ProjectFileView && command.parse_payload::<protocol::ProjectFileViewPayload>().is_ok_and(|command| command.active && matches!(command.view, ProjectFileView::Directory { path, .. } if path.relative_path == "big"))), "expanded directory is re-declared on replay");
+        let mut page = directory_page(
+            "big",
+            vec![ProjectFileEntry {
+                relative_path: "big/restored.rs".to_owned(),
+                kind: ProjectFileKind::File,
+                op: protocol::FileEntryOp::Add,
+            }],
+        );
+        if let ProjectFileView::Directory { window, .. } = &mut page.view {
+            *window = ProjectFileWindow::After(cursor);
+        }
+        publish_page(&state, HOST, 6, &page);
+        next_tick().await;
+        assert!(explorer_text().contains("restored.rs"));
+        let mut edge_entries: Vec<_> = (0..128)
+            .map(|index| ProjectFileEntry {
+                relative_path: format!("edge{index:03}"),
+                kind: ProjectFileKind::Directory,
+                op: protocol::FileEntryOp::Add,
+            })
+            .collect();
+        publish_page(&state, HOST, 7, &directory_page("", edge_entries.clone()));
+        next_tick().await;
+        let edge_row = container
+            .query_selector_all(".fe-dir")
+            .unwrap()
+            .item(127)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        edge_row.click();
+        next_tick().await;
+        publish_page(
+            &state,
+            HOST,
+            8,
+            &directory_page(
+                "edge127",
+                vec![ProjectFileEntry {
+                    relative_path: "edge127/edge-child.rs".into(),
+                    kind: ProjectFileKind::File,
+                    op: protocol::FileEntryOp::Add,
+                }],
+            ),
+        );
+        next_tick().await;
+        assert!(explorer_text().contains("edge-child.rs"));
+        // The server's page includes its 128 selected rows plus the declared child.
+        edge_entries.insert(
+            0,
+            ProjectFileEntry {
+                relative_path: "a-new".into(),
+                kind: ProjectFileKind::Directory,
+                op: protocol::FileEntryOp::Add,
+            },
+        );
+        publish_page(&state, HOST, 9, &directory_page("", edge_entries.clone()));
+        next_tick().await;
+        assert!(
+            edge_row.is_connected(),
+            "live page insertion must not replace the expanded row"
+        );
+        assert_eq!(
+            edge_row.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        assert!(
+            explorer_text().contains("edge-child.rs"),
+            "expanded children remain visible at the page boundary"
+        );
+        let commands_before = js_sys::eval("window.__fileViewCommands.length")
+            .unwrap()
+            .as_f64()
+            .unwrap() as usize;
+        let mut failed_parent = directory_page("", Vec::new());
+        failed_parent.state = ProjectFileViewState::Unavailable {
+            message: "Temporary parent read failure".into(),
+        };
+        publish_page(&state, HOST, 10, &failed_parent);
+        next_tick().await;
+        assert!(explorer_text().contains("Temporary parent read failure"));
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        assert!(!commands[commands_before..].iter().any(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().is_ok_and(|command| !command.active && matches!(command.view, ProjectFileView::Directory {path, ..} if path.relative_path == "edge127"))), "a temporary parent error must not release its expanded child");
+        publish_page(&state, HOST, 11, &directory_page("", edge_entries.clone()));
+        next_tick().await;
+        assert!(
+            explorer_text().contains("edge-child.rs"),
+            "parent recovery restores the expanded child without user action"
+        );
+        let before_replay = js_sys::eval("window.__fileViewCommands.length")
+            .unwrap()
+            .as_f64()
+            .unwrap() as usize;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                StreamPath(format!("/project/{PROJECT}")),
+                FrameKind::ProjectBootstrap,
+                12,
+                &bootstrap,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        assert!(commands[before_replay..].iter().any(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().is_ok_and(|command| command.active && matches!(command.view, ProjectFileView::Directory {path, ..} if path.relative_path == "edge127"))), "replay re-declares off-page expansion before any parent rows exist");
+        assert!(!commands[before_replay..].iter().any(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().is_ok_and(|command| !command.active && matches!(command.view, ProjectFileView::Directory {path, ..} if path.relative_path == "edge127"))), "transient row teardown must not withdraw replayed intent");
+        publish_page(&state, HOST, 13, &directory_page("", edge_entries));
+        publish_page(
+            &state,
+            HOST,
+            14,
+            &directory_page(
+                "edge127",
+                vec![ProjectFileEntry {
+                    relative_path: "edge127/after-replay.rs".into(),
+                    kind: ProjectFileKind::File,
+                    op: protocol::FileEntryOp::Add,
+                }],
+            ),
+        );
+        next_tick().await;
+        assert!(explorer_text().contains("after-replay.rs"));
+        let mut missing = directory_page("edge127", Vec::new());
+        missing.state = ProjectFileViewState::DirectoryMissing;
+        publish_page(&state, HOST, 15, &missing);
+        next_tick().await;
+        let before_deleted_replay = js_sys::eval("window.__fileViewCommands.length")
+            .unwrap()
+            .as_f64()
+            .unwrap() as usize;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                StreamPath(format!("/project/{PROJECT}")),
+                FrameKind::ProjectBootstrap,
+                16,
+                &bootstrap,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        assert!(!commands[before_deleted_replay..].iter().any(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().is_ok_and(|command| command.active && matches!(command.view, ProjectFileView::Directory {path, ..} if path.relative_path == "edge127"))), "server-authored deletion retires expansion instead of accumulating history");
+        let mut first = directory_page(
+            "",
+            vec![ProjectFileEntry {
+                relative_path: "a-first.rs".into(),
+                kind: ProjectFileKind::File,
+                op: protocol::FileEntryOp::Add,
+            }],
+        );
+        let boundary = protocol::ProjectFileCursor {
+            path: ProjectPath {
+                root: ProjectRootPath(ROOT.into()),
+                relative_path: "z-last.rs".into(),
+            },
+            kind: ProjectFileKind::File,
+            score: 0,
+        };
+        if let ProjectFileViewState::Ready { next, .. } = &mut first.state {
+            *next = Some(boundary.clone());
+        }
+        publish_page(&state, HOST, 17, &first);
+        next_tick().await;
+        let next_button = || {
+            (0..container.query_selector_all("button").unwrap().length())
+                .filter_map(|index| container.query_selector_all("button").unwrap().item(index))
+                .find(|button| button.text_content().as_deref() == Some("Next"))
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        next_button().click();
+        next_tick().await;
+        let input = container
+            .query_selector(".panel-search-input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.set_value("a-first");
+        input
+            .dispatch_event(
+                &web_sys::Event::new_with_event_init_dict("input", &{
+                    let init = web_sys::EventInit::new();
+                    init.set_bubbles(true);
+                    init
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        let last = commands
+            .iter()
+            .rev()
+            .filter(|command| command.kind == FrameKind::ProjectFileView)
+            .map(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().unwrap())
+            .find(|command| matches!(&command.view, ProjectFileView::Directory {path, ..} if path.relative_path.is_empty()))
+            .unwrap();
+        assert!(
+            last.active
+                && matches!(last.view, ProjectFileView::Directory {path, window: ProjectFileWindow::First, filter, ..} if path.relative_path.is_empty() && filter == "a-first"),
+            "filtering after Next starts at First, so earlier matches stay reachable"
+        );
+        if let ProjectFileView::Directory { filter, .. } = &mut first.view {
+            *filter = "a-first".into();
+        }
+        publish_page(&state, HOST, 18, &first);
+        next_tick().await;
+        assert!(explorer_text().contains("a-first.rs"));
+        next_button().click();
+        next_tick().await;
+        container
+            .query_selector(".fe-toggle-hidden")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        let last = commands
+            .iter()
+            .rev()
+            .filter(|command| command.kind == FrameKind::ProjectFileView)
+            .map(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().unwrap())
+            .find(|command| matches!(&command.view, ProjectFileView::Directory {path, ..} if path.relative_path.is_empty()))
+            .unwrap();
+        assert!(
+            last.active
+                && matches!(last.view, ProjectFileView::Directory {path, window: ProjectFileWindow::First, show_hidden: true, ..} if path.relative_path.is_empty()),
+            "revealing hidden files after Next starts at First"
+        );
+        if let ProjectFileView::Directory { show_hidden, .. } = &mut first.view {
+            *show_hidden = true;
+        }
+        if let ProjectFileViewState::Ready { entries, .. } = &mut first.state {
+            entries[0].path.relative_path = ".a-first.rs".into();
+        }
+        publish_page(&state, HOST, 19, &first);
+        next_tick().await;
+        assert!(explorer_text().contains(".a-first.rs"));
+        next_button().click();
+        next_tick().await;
+        let mut other = bootstrap.clone();
+        other.project.id = ProjectId("same-path-other-project".into());
+        let other_stream = StreamPath("/project/same-path-other-project".into());
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                other_stream.clone(),
+                FrameKind::ProjectBootstrap,
+                0,
+                &other,
+            )
+            .unwrap(),
+        );
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: HOST.into(),
+            project_id: other.project.id,
+        }));
+        next_tick().await;
+        let commands: Vec<protocol::Envelope> =
+            serde_wasm_bindgen::from_value(js_sys::eval("window.__fileViewCommands").unwrap())
+                .unwrap();
+        let declared_root = commands.iter().rev().filter(|command| command.stream == other_stream && command.kind == FrameKind::ProjectFileView).map(|command| command.parse_payload::<protocol::ProjectFileViewPayload>().unwrap()).find(|command| matches!(&command.view, ProjectFileView::Directory {path, ..} if path.relative_path.is_empty())).unwrap();
+        assert!(
+            declared_root.active
+                && matches!(
+                    declared_root.view,
+                    ProjectFileView::Directory {
+                        window: ProjectFileWindow::First,
+                        ..
+                    }
+                ),
+            "a different project starts at First even when its root spelling matches"
+        );
+        if let ProjectFileViewState::Ready { entries, .. } = &mut first.state {
+            entries[0].path.relative_path = ".a-first-other.rs".into();
+        }
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                other_stream,
+                FrameKind::ProjectFileViewState,
+                1,
+                &first,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(explorer_text().contains(".a-first-other.rs"));
+        drop(_mounted);
+        next_tick().await;
     }
 }

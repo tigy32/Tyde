@@ -63,6 +63,12 @@ pub async fn send_binary_frame<T: serde::Serialize>(
     }
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) async fn settle_stream(host_id: &str, stream: &StreamPath) {
+    let completed = acquire_send_lock(host_id, stream).await;
+    drop(completed);
+}
+
 struct SequenceCursor {
     next: u64,
     host_epoch: u64,
@@ -1385,4 +1391,23 @@ mod wasm_tests {
         assert!(has_sequence_cursor(host_id, &stream));
         assert_eq!(current_seq(host_id, &stream), 1);
     }
+}
+
+pub(crate) fn project_file_view(
+    project: crate::state::ActiveProjectRef,
+    view: protocol::ProjectFileView,
+    active: bool,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(error) = send_frame(
+            &project.host_id,
+            StreamPath(format!("/project/{}", project.project_id.0)),
+            FrameKind::ProjectFileView,
+            &protocol::ProjectFileViewPayload { view, active },
+        )
+        .await
+        {
+            log::error!("failed to send file view: {error}");
+        }
+    });
 }

@@ -285,6 +285,12 @@ pub struct ProjectRootListing {
     pub root: ProjectRootPath,
     pub status: ProjectRootStatus,
     pub entries: Vec<ProjectFileEntry>,
+    pub partial_dirs: Vec<ProjectPartialDir>,
+}
+
+pub struct ProjectPartialDir {
+    pub relative_path: String, // empty for the root
+    pub omitted: u32,
 }
 
 pub enum ProjectRootStatus {
@@ -307,19 +313,52 @@ pub enum ProjectFileKind {
 }
 ```
 
-Design choice:
+The bootstrap and `project_file_list` carry a small shared preview: at most
+256 entries per root, breadth-first through three levels. `partial_dirs` is a
+required protocol-91 field reporting truncated preview directories. It is not
+the explorer or quick-open's access boundary.
 
-- emit full per-root listings, not incremental tree patches
+File access uses `project_file_view` and server-authored
+`project_file_view_state` events. A view is either a directory (root, relative
+path, hidden-file preference, filter and window) or project-wide quick-open
+(query and window). Each page contains at most 128 typed file cursors plus
+previous/next boundaries. A cursor is a value boundary, not an index into an
+evictable listing. Every matching child is reachable by paging; quick-open
+walks all roots, including ignored and unexpanded directories, excluding `.git`
+and without following directory symlinks. Read failures render `Unavailable`,
+not successful empty pages. A settled empty directory is explicitly `Ready`.
 
-Why:
+The project actor owns each connection's active views. A new declaration
+supersedes an in-flight read, collapse/unmount releases it, and disconnect drops
+all its views. There is no directory-count eviction or shared file-count cap.
+The UI re-declares visible expanded directories on bootstrap replay. It renders
+loading/error/ready state from those events and never reconstructs children
+from preview/history. Root snapshots cannot wipe out expanded directory pages.
 
-- simpler semantics
-- one call path
-- easier replay and easier correctness
-- no hidden cache invalidation logic in the UI
+One background view read runs per project at a time. Selection retains at most
+128 selected entries while enumerating, so even a huge flat directory does not allocate
+or transmit its whole listing. Pending input coalesces by view; superseded
+reads check cancellation during enumeration. Active directory views add nonrecursive watches, including ignored folders,
+and release them on collapse/disconnect. Directory metadata changes revalidate
+readability without a whole-root inventory scan. A directory filter retains
+ancestors of matching descendants, preserving tree navigation; it enumerates
+in the same cancellable worker with bounded selection. Structural filesystem events
+invalidate affected visible directory views through the normal debounce;
+quick-open is invalidated by structural changes anywhere in its roots. Content
+writes do not rewalk filename views. A full explicit refresh revalidates active
+views individually, never as a growing whole-project frame. Retained work is
+proportional to declared visible views, not previously expanded folders.
 
-If performance later proves this too expensive, we can optimize with profiling
-data. Not before.
+Profiling established that the old eager listing reached every desktop client
+whenever a project/workbench appeared: a 40k-entry repository sent two 3.6 MB
+bootstraps and delayed the Linux UI; a 301k-entry tree exceeded the 16 MiB frame
+limit and reconnected indefinitely. These are reproduced defects, not proof of
+the reporter's exact >=5s Mac incident. Automatic local diagnostics correlate
+future gaps with typed frame kind, bytes, items and named synchronous work;
+they do not claim universal stack attribution or count bridge waits as stalls.
+
+Protocol 91 replaces `project_list_dir`; incompatible peers fail the normal
+handshake explicitly rather than dropping new omission/view semantics.
 
 ### 6.2 `project_git_status`
 
@@ -519,7 +558,7 @@ Rules:
 
 Examples:
 
-- stale directory path during `project_list_dir` -> `not_found`, `fatal: false`
+- stale directory path during `project_file_view` -> typed `Unavailable` view state
 - permission denied reading a file -> `permission_denied`, `fatal: false`
 - `git diff` process exits non-zero -> `git_failed`, `fatal: false`
 - project deleted while a live subscription is active -> `not_found`,
@@ -742,3 +781,43 @@ for browse, read, status, diff, and staging.
 Protocol v4 note: every project stream starts with `project_bootstrap` seq 0
 containing the project, initial file list, initial git status, and review
 summaries. Granular project events are live deltas after that bootstrap.
+
+Active child directory declarations also retain their real rows in a parent's
+live page, outside its 128-entry selection. This memory/render allowance is
+proportional only to currently expanded views, never tree size or expansion
+history. Page cursors are computed from the selected slice before retention;
+a sibling insertion cannot evict an expanded row or skip a pagination boundary.
+The worker requeues reads whose catalog or active-child selection changed while
+they ran, rather than publishing obsolete state or stranding a view in Loading.
+
+Quick-open leases watch scopes for all project roots; a descendant-name filter
+leases its searched subtree. The existing watcher worker registers directories
+without ignore filtering (except `.git`), not an inventory of searched files.
+Query changes reuse those watches. Structural directory changes and lost-event
+rescans reconcile them; ordinary file and Git-only events do not rewalk query
+watch scopes. Scopes release with their last active query/connection. Native
+watch failures surface explicitly and retry; there is no polling search path.
+
+Watch installation and per-file watch acknowledgements complete through the
+project actor's select loop. New intents can cancel obsolete installation while
+reads are pending; no actor awaits a full query-scope walk. Permission metadata
+for owned scopes remains observable through their parent watches.
+
+A watch failure emits the typed project warning but never suppresses unrelated
+readable pages. Ready is the result of the canonical filesystem read; watch
+health is explicit in the project warning. Actual read failures remain
+Unavailable on the affected view, and retained declarations recover normally.
+There is no alternate read path when watching fails.
+
+Directory expansion and pagination are explicit UI intent. Their subscription
+lifetime belongs to the explorer, not to row mounting: bootstrap replay and a
+temporary parent read error cannot close an expanded off-page child. The server
+pins active child directories in each parent's page and re-reads the parent when
+a child is declared. A typed `DirectoryMissing` state retires deleted-directory
+intent; transient `Unavailable` does not. Collapse releases descendant views.
+File-view controls use an ordered connection lane separate from file operations,
+so closing a view cannot queue behind a read awaiting that view's native-watch
+installation. The bounded control queue backpressures replay/filter bursts rather
+than dropping declarations; it never awaits file enumeration or native watch
+installation. Every observed-file read awaits its own canonical watcher-worker
+acknowledgement, including concurrent reads of the same path.

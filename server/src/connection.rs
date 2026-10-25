@@ -724,7 +724,13 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
             }
         }
     });
-    let mut project_queues = HashMap::<protocol::StreamPath, mpsc::Sender<Envelope>>::new();
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum ProjectRequestLane {
+        FileViews,
+        Operations,
+    }
+    let mut project_queues =
+        HashMap::<(protocol::StreamPath, ProjectRequestLane), mpsc::Sender<Envelope>>::new();
     let mut project_tasks = tokio::task::JoinSet::<()>::new();
     let mut voice_ingress = VoiceIngressState::default();
     loop {
@@ -837,7 +843,10 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                 }
 
                 if envelope.stream.0.starts_with("/project/") {
-                    let queue = project_queues.entry(envelope.stream.clone()).or_insert_with(|| {
+                    // Closing a view cancels native watch installation; a read awaiting
+                    // that installation must not sit ahead of its cancellation.
+                    let lane = if envelope.kind == FrameKind::ProjectFileView { ProjectRequestLane::FileViews } else { ProjectRequestLane::Operations };
+                    let queue = project_queues.entry((envelope.stream.clone(), lane)).or_insert_with(|| {
                         let (tx, rx) = mpsc::channel::<Envelope>(32);
                         let host = host.clone();
                         let host_stream = host_stream.clone();
@@ -847,8 +856,24 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         project_tasks.spawn(route_project_requests(host, host_stream, output, origin, cancel, rx));
                         tx
                     });
-                    if queue.try_send(envelope).is_err() {
-                        let error = AppError::invalid("project_request", "project request queue is full or closed");
+                    let (failed, message) = match lane {
+                        ProjectRequestLane::FileViews => {
+                            let delivery = queue.send(envelope);
+                            tokio::pin!(delivery);
+                            let accepted = std::future::poll_fn(|context| {
+                                let accepted = std::future::Future::poll(delivery.as_mut(), context);
+                                #[cfg(feature = "test-support")]
+                                if accepted.is_pending() {
+                                    crate::project_stream::scan_test_support::run(std::path::Path::new(&request_stream.0), crate::project_stream::scan_test_support::ScanPoint::FileViewBackpressure);
+                                }
+                                accepted
+                            }).await;
+                            (accepted.is_err(), "file view control queue is closed")
+                        },
+                        ProjectRequestLane::Operations => (queue.try_send(envelope).is_err(), "project request queue is full or closed"),
+                    };
+                    if failed {
+                        let error = AppError::invalid("project_request", message);
                         emit_command_error(&host_output_stream, request_stream, request_kind, request_id, request_context, &error);
                     }
                     first_request.notify_one();

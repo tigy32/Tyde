@@ -1,8 +1,12 @@
 use crate::process_env::launch::{GroupCommand as Command, ProcessStdio as Stdio};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use notify::{Event, EventKind};
@@ -13,14 +17,15 @@ use protocol::{
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
     CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
     ProjectBinaryFilePayload, ProjectDiffRevision, ProjectDiffScope, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind, ProjectFileListPayload,
-    ProjectFileVersion, ProjectFileVersionChange, ProjectGitChangeKind, ProjectGitCommitSummary,
-    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId,
-    ProjectOpenPathAction, ProjectOpenPathPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectRootStatus, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
-    ReviewSummary, StreamPath,
+    ProjectFileContentsPayload, ProjectFileCursor, ProjectFileEntry, ProjectFileKind,
+    ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange, ProjectFileView,
+    ProjectFileViewPayload, ProjectFileViewState, ProjectFileViewStatePayload, ProjectFileWindow,
+    ProjectGitChangeKind, ProjectGitCommitSummary, ProjectGitDiffFile, ProjectGitDiffHunk,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
+    ProjectGitStatusPayload, ProjectId, ProjectOpenPathAction, ProjectOpenPathPayload,
+    ProjectPartialDir, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectRootStatus,
+    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -95,8 +100,47 @@ pub(crate) type RawFileEntry = (String, ProjectFileKind);
 /// failing the scan, so the project's other roots keep loading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RootScan {
-    Available(BTreeSet<RawFileEntry>),
+    Available(RootEntries),
     Unavailable(String),
+}
+
+/// A readable root's listing, plus the listed directories whose children were
+/// cut off at the bound and how many of them were left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RootEntries {
+    entries: BTreeSet<RawFileEntry>,
+    partial: BTreeMap<String, u32>,
+}
+
+impl RootEntries {
+    fn add(&mut self, dir: &str, listing: Listing) {
+        self.entries.extend(listing.entries);
+        if listing.omitted > 0 {
+            self.partial.insert(
+                dir.to_owned(),
+                u32::try_from(listing.omitted).unwrap_or(u32::MAX),
+            );
+        }
+    }
+}
+
+pub(crate) struct FileScan {
+    roots: BTreeMap<ProjectRootPath, RootScan>,
+}
+
+struct FileViewRead {
+    view: ProjectFileView,
+    generation: u64,
+    last_read: u64,
+    dirty: bool,
+    refresh_pending: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for FileViewRead {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +221,7 @@ impl ProjectFileDelivery {
 struct ProjectSubscriber {
     stream: Stream,
     file_delivery: ProjectFileDelivery,
+    views: HashMap<Option<ProjectPath>, FileViewRead>,
 }
 
 struct PendingProjectSubscriber {
@@ -246,6 +291,10 @@ enum ProjectStreamCommand {
     },
     RemoveSubscriber {
         host_path: StreamPath,
+    },
+    FileView {
+        payload: ProjectFileViewPayload,
+        requester: StreamPath,
     },
     Refresh {
         reply: oneshot::Sender<Result<(), String>>,
@@ -368,6 +417,16 @@ impl ProjectStreamHandle {
         let _ = self
             .tx
             .send(ProjectStreamCommand::RemoveSubscriber { host_path });
+    }
+
+    pub(crate) fn set_file_view(
+        &self,
+        payload: ProjectFileViewPayload,
+        requester: StreamPath,
+    ) -> Result<(), String> {
+        self.tx
+            .send(ProjectStreamCommand::FileView { payload, requester })
+            .map_err(|_| "project stream subscription stopped".to_owned())
     }
 
     pub(crate) async fn refresh(&self) -> Result<(), String> {
@@ -638,16 +697,17 @@ async fn background_project_read<T: Send + 'static>(
     .map_err(|error| format!("project {operation} task failed: {error}"))?
 }
 
-fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String> {
+fn initialize_snapshot(project: &Project) -> Result<(ProjectSnapshotState, FileScan), String> {
+    let mut scan = scan_project_files(project)?;
     let mut snapshot = ProjectSnapshotState {
-        file_entries: scan_raw_entries(project)?,
+        file_entries: std::mem::take(&mut scan.roots),
         git_status: None,
         diff_context_modes: HashMap::new(),
         code_intel_overview: initial_code_intel_overview(project.root_paths()),
     };
     let git_status = build_git_status(project)?;
     snapshot.git_status = Some(serialize_git_status(&git_status)?);
-    Ok(snapshot)
+    Ok((snapshot, scan))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -727,6 +787,14 @@ async fn run_project_subscription(
     let mut initialization_tasks = JoinSet::new();
     let mut pending_subscribers = Vec::new();
     let mut pending_files = PendingFileRefresh::default();
+    let mut file_view_tasks = JoinSet::new();
+    let mut view_watch_tasks = JoinSet::new();
+    let mut observation_tasks = JoinSet::new();
+    let mut view_watch_generation = 0_u64;
+    let mut view_watch_pending = false;
+    let mut view_watch_retry = Instant::now();
+    let mut view_generation = 0_u64;
+    let mut view_read_ordinal = 0_u64;
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
     let mut git_poll = interval_at(
         Instant::now() + GIT_STATUS_POLL_INTERVAL,
@@ -745,6 +813,7 @@ async fn run_project_subscription(
                 snapshot
                     .file_entries
                     .retain(|root, _| project.root_paths().contains(root));
+                invalidate_file_views(&mut subscribers, None, &watcher_roots);
                 snapshot
                     .diff_context_modes
                     .retain(|(_, key), _| project.root_paths().contains(&key.root));
@@ -764,8 +833,10 @@ async fn run_project_subscription(
             let record = catalog.borrow().clone();
             initialization_tasks.spawn(async move {
                 let initial =
-                    background_project_read(&record.project, "initialize", initialize_snapshot)
-                        .await;
+                    background_project_read(&record.project, "initialize", move |project| {
+                        initialize_snapshot(project)
+                    })
+                    .await;
                 (record.generation, initial)
             });
         }
@@ -774,13 +845,118 @@ async fn run_project_subscription(
             let project = project.clone();
             let generation = catalog_generation;
             file_tasks.spawn(async move {
-                let result = background_project_read(&project, "files", scan_raw_entries).await;
+                let result = background_project_read(&project, "files", move |project| {
+                    scan_project_files(project)
+                })
+                .await;
                 CompletedFileRefresh {
                     generation,
                     request,
                     result,
                 }
             });
+        }
+        if let Some(watcher) = watcher.as_mut()
+            && Instant::now() >= view_watch_retry
+        {
+            let directories = subscribers
+                .values()
+                .flat_map(|subscriber| subscriber.views.keys().flatten())
+                .filter(|path| validate_directory_view(&project, path).is_ok())
+                .cloned()
+                .collect();
+            let queries = subscribers
+                .values()
+                .flat_map(|subscriber| subscriber.views.values())
+                .flat_map(|read| match &read.view {
+                    ProjectFileView::QuickOpen { .. } => project
+                        .root_paths()
+                        .into_iter()
+                        .map(|root| ProjectPath {
+                            root,
+                            relative_path: String::new(),
+                        })
+                        .collect::<Vec<_>>(),
+                    ProjectFileView::Directory { path, filter, .. } if !filter.is_empty() => {
+                        vec![path.clone()]
+                    }
+                    ProjectFileView::Directory { .. } => Vec::new(),
+                })
+                .filter(|path| validate_directory_view(&project, path).is_ok())
+                .collect();
+            match watcher.set_view_directories(directories, queries) {
+                Ok(Some(update)) => {
+                    view_watch_generation += 1;
+                    let generation = view_watch_generation;
+                    view_watch_pending = true;
+                    view_watch_tasks.spawn(async move {
+                        let result = update
+                            .response
+                            .await
+                            .map_err(|_| {
+                                notify::Error::generic("project filesystem watcher stopped")
+                            })
+                            .and_then(|result| result);
+                        (generation, update.added, update.cancel, result)
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    view_watch_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
+                    warn_project_retry(
+                        &project_id,
+                        &mut subscribers,
+                        "project_watch",
+                        error.to_string(),
+                        &mut watcher_warning,
+                    )
+                    .await;
+                }
+            }
+        }
+        if file_view_tasks.is_empty() && !view_watch_pending {
+            let next = subscribers
+                .iter_mut()
+                .flat_map(|(requester, subscriber)| {
+                    subscriber
+                        .views
+                        .iter_mut()
+                        .map(move |(key, read)| (requester.clone(), key.clone(), read))
+                })
+                .filter(|(_, _, read)| read.dirty)
+                .min_by_key(|(_, _, read)| read.last_read)
+                .map(|(requester, key, read)| {
+                    view_read_ordinal += 1;
+                    read.last_read = view_read_ordinal;
+                    read.dirty = false;
+                    (
+                        requester,
+                        key,
+                        read.generation,
+                        read.view.clone(),
+                        read.cancel.clone(),
+                    )
+                });
+            if let Some((requester, key, generation, view, cancel)) = next {
+                let retained = retained_directory_children(&subscribers[&requester], &key);
+                let retained_for_read = retained.clone();
+                let project = project.clone();
+                let view_catalog_generation = catalog_generation;
+                file_view_tasks.spawn(async move {
+                    let result = background_project_read(&project, "file view", move |project| {
+                        read_file_view(project, view, &retained_for_read, &cancel)
+                    })
+                    .await;
+                    (
+                        view_catalog_generation,
+                        requester,
+                        key,
+                        generation,
+                        retained,
+                        result,
+                    )
+                });
+            }
         }
         if reviews.take_changed() || emit_reviews {
             emit_reviews = false;
@@ -810,7 +986,7 @@ async fn run_project_subscription(
                     }
                     ProjectStreamCommand::EmitReviewListChanged => { emit_reviews = true; }
                     ProjectStreamCommand::AddSubscriber { host_path, stream, file_delivery, reply } => {
-                        let pending = PendingProjectSubscriber { host_path, subscriber: ProjectSubscriber { stream, file_delivery }, reply };
+                        let pending = PendingProjectSubscriber { host_path, subscriber: ProjectSubscriber { stream, file_delivery, views: HashMap::new() }, reply };
                         let current = catalog.borrow();
                         if snapshot_initialized && current.generation == catalog_generation {
                             publish_subscriber(pending, &current.project, &mut snapshot, reviews.summaries(), &mut subscribers,
@@ -824,7 +1000,36 @@ async fn run_project_subscription(
                         subscribers.remove(&host_path);
                         snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
                     }
+                    ProjectStreamCommand::FileView { payload, requester } => {
+                        view_watch_retry = Instant::now();
+                        if let Some(subscriber) = subscribers.get_mut(&requester) {
+                            let key = file_view_key(&payload.view);
+                            if !payload.active {
+                                if subscriber.views.get(&key).is_none_or(|read| read.view != payload.view) { continue; }
+                                subscriber.views.remove(&key);
+                                if let Some(path) = &key && let Some(parent) = Path::new(&path.relative_path).parent() {
+                                    let parent_key = Some(ProjectPath { root: path.root.clone(), relative_path: parent.to_string_lossy().into_owned() });
+                                    if let Some(read) = subscriber.views.get_mut(&parent_key) { read.dirty = true; }
+                                }
+                                let state = ProjectFileViewStatePayload { view: payload.view, state: ProjectFileViewState::Closed };
+                                send_file_view_state(&mut subscribers, &requester, state);
+                            } else {
+                                view_generation += 1;
+                                let view = payload.view;
+                                let read = FileViewRead { view: view.clone(), generation: view_generation, last_read: 0,
+                                    dirty: true, refresh_pending: false, cancel: Arc::new(AtomicBool::new(false)) };
+                                if let Some(path) = &key && let Some(parent) = Path::new(&path.relative_path).parent() {
+                                    let parent_key = Some(ProjectPath { root: path.root.clone(), relative_path: parent.to_string_lossy().into_owned() });
+                                    if let Some(parent_read) = subscriber.views.get_mut(&parent_key) { parent_read.dirty = true; }
+                                }
+                                subscriber.views.insert(key, read);
+                                let state = ProjectFileViewStatePayload { view, state: ProjectFileViewState::Loading };
+                                send_file_view_state(&mut subscribers, &requester, state);
+                            }
+                        }
+                    }
                     ProjectStreamCommand::Refresh { reply } => {
+                        invalidate_file_views(&mut subscribers, None, &watcher_roots);
                         pending_files.request(true);
                         pending_files.replies.push(reply);
                     }
@@ -880,14 +1085,15 @@ async fn run_project_subscription(
                                 .unwrap_or(ProjectFileVersion(0));
                             contents
                         });
-                        if let Ok(contents) = &result {
+                        let observation = if let Ok(contents) = &result {
                             observed_files.insert(contents.path.clone());
-                            if let Some(watcher) = watcher.as_mut()
-                                && let Err(error) = watcher.observe(&contents.path).await {
-                                let _ = watch_tx.send(Err(error));
-                            }
+                            match watcher.as_mut() { Some(watcher) => watcher.observe(&contents.path).map(Some), None => Ok(None) }
+                        } else { Ok(None) };
+                        #[cfg(feature = "test-support")]
+                        if matches!(&observation, Ok(Some(_))) && let Ok(contents) = &result {
+                            scan_test_support::run(&Path::new(&contents.path.root.0).join(&contents.path.relative_path), scan_test_support::ScanPoint::FileObservationWaiting);
                         }
-                        let _ = reply.send(result);
+                        complete_after_file_watch(&mut observation_tasks, watch_tx.clone(), observation, move || { let _ = reply.send(result); });
                     }
                     ProjectStreamCommand::CurrentFileVersion { path, reply } => {
                         let result = current_file_version(&command_project, &path, &file_versions);
@@ -901,13 +1107,10 @@ async fn run_project_subscription(
                         listener,
                         reply,
                     } => {
-                        if validate_project_path(&command_project, &path).is_ok() {
+                        let observation = if validate_project_path(&command_project, &path).is_ok() {
                             observed_files.insert(path.clone());
-                            if let Some(watcher) = watcher.as_mut()
-                                && let Err(error) = watcher.observe(&path).await {
-                                let _ = watch_tx.send(Err(error));
-                            }
-                        }
+                            match watcher.as_mut() { Some(watcher) => watcher.observe(&path).map(Some), None => Ok(None) }
+                        } else { Ok(None) };
                         let result = register_file_version_listener_and_current_version(
                             &command_project,
                             path,
@@ -915,7 +1118,7 @@ async fn run_project_subscription(
                             &mut file_version_listeners,
                             listener,
                         );
-                        let _ = reply.send(result);
+                        complete_after_file_watch(&mut observation_tasks, watch_tx.clone(), observation, move || { let _ = reply.send(result); });
                     }
                 }
             }
@@ -930,18 +1133,12 @@ async fn run_project_subscription(
                 watcher_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
                 match maybe_watcher {
                     Some(Ok(mut ready_watcher)) => {
-                        let mut observe_error = None;
                         for path in &observed_files {
-                            if let Err(error) = ready_watcher.observe(path).await {
-                                observe_error = Some(error.to_string());
-                                break;
-                            }
-                        }
-                        if let Some(error) = observe_error {
-                            warn_project_retry(&project_id, &mut subscribers, "project_watch", error, &mut watcher_warning).await;
-                            continue;
+                            let observation = ready_watcher.observe(path).map(Some);
+                            complete_after_file_watch(&mut observation_tasks, watch_tx.clone(), observation, || {});
                         }
                         watcher = Some(ready_watcher);
+                        invalidate_file_views(&mut subscribers, None, &watcher_roots);
                         if watcher_warning.take().is_some() {
                             tracing::info!(%project_id, observed_files = observed_files.len(), "project filesystem watching recovered");
                             // Changes during the watch gap have no OS events to replay.
@@ -987,8 +1184,9 @@ async fn run_project_subscription(
                         watcher_roots.sync(project.root_paths());
                         let changes = bump_watched_paths(&watcher_roots, &event, &mut file_versions);
                         merge_file_version_changes(&mut pending_file_version_changes, changes);
+                        let views_changed = invalidate_file_views(&mut subscribers, Some(&event), &watcher_roots);
                         let refresh = classify_watch_event(&event);
-                        if !refresh.is_empty() || !pending_file_version_changes.is_empty() {
+                        if views_changed || !refresh.is_empty() || !pending_file_version_changes.is_empty() {
                             pending_update.merge(refresh);
                             tracing::debug!(
                                 project_id = %project_id,
@@ -1030,6 +1228,11 @@ async fn run_project_subscription(
             }
             _ = &mut debounce_sleep, if debounce_active => {
                 debounce_active = false;
+                for subscriber in subscribers.values_mut() {
+                    for read in subscriber.views.values_mut() {
+                        read.dirty |= std::mem::take(&mut read.refresh_pending);
+                    }
+                }
                 let refresh = pending_update.take();
                 let full = watcher.is_none();
                 if refresh.files || full { pending_files.request(full); }
@@ -1097,7 +1300,7 @@ async fn run_project_subscription(
                 let current = catalog.borrow();
                 if generation != current.generation { continue; }
                 match result {
-                    Ok(initial) => {
+                    Ok((initial, _scan)) => {
                         snapshot = initial;
                         snapshot_initialized = true;
                         for pending in pending_subscribers.drain(..) {
@@ -1125,7 +1328,7 @@ async fn run_project_subscription(
                     continue;
                 }
                 match completed.result {
-                    Ok(entries) => {
+                    Ok(scan) => {
                         let publication = {
                             let current = catalog.borrow();
                             if completed.generation != current.generation {
@@ -1133,8 +1336,8 @@ async fn run_project_subscription(
                                 pending_files.replies.extend(completed.request.replies);
                                 continue;
                             }
-                            let changed = snapshot.file_entries != entries;
-                            snapshot.file_entries = entries;
+                            let changed = snapshot.file_entries != scan.roots;
+                            snapshot.file_entries = scan.roots;
                             (|| -> Result<(), String> {
                                 if changed || completed.request.full {
                                     let payload = full_file_list_from_raw(&current.project, &snapshot.file_entries);
@@ -1147,7 +1350,7 @@ async fn run_project_subscription(
                             })()
                         };
                         if let Err(error) = publication {
-                            warn_project_retry(&project_id, &mut subscribers, "project_files", error, &mut file_warning).await;
+                        warn_project_retry(&project_id, &mut subscribers, "project_files", error, &mut file_warning).await;
                         } else if file_warning.take().is_some() { tracing::info!(%project_id, "project file refresh recovered"); }
                         pending_git.request(completed.request.full, true);
                         pending_git.replies.extend(completed.request.replies);
@@ -1159,6 +1362,57 @@ async fn run_project_subscription(
                         debounce_active = true;
                         debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
                     }
+                }
+            }
+            _ = sleep_until(view_watch_retry), if Instant::now() < view_watch_retry && watcher.is_some() => {}
+            completed = observation_tasks.join_next(), if !observation_tasks.is_empty() => {
+                if let Some(Err(error)) = completed { return Err(format!("file observation task failed: {error}")); }
+            }
+            completed = view_watch_tasks.join_next(), if !view_watch_tasks.is_empty() => {
+                let Some(Ok((generation, added, cancel, result))) = completed else { return Err("file view watch completion failed".into()); };
+                if generation != view_watch_generation { continue; }
+                view_watch_pending = false;
+                if cancel.load(Ordering::Relaxed) { continue; }
+                match result {
+                    Ok(()) => {
+                        if watcher_warning.take().is_some() { tracing::info!(%project_id, "active file view watches recovered"); }
+                        for subscriber in subscribers.values_mut() {
+                            for (key, read) in &mut subscriber.views {
+                                if key.as_ref().is_some_and(|path| added.contains(path)) { read.dirty = true; }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(watcher) = &mut watcher { watcher.forget_view_directories(); }
+                        view_watch_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
+                        for subscriber in subscribers.values_mut() {
+                            for read in subscriber.views.values_mut() { read.dirty = true; }
+                        }
+                        warn_project_retry(&project_id, &mut subscribers, "project_watch", error.to_string(), &mut watcher_warning).await;
+                    }
+                }
+            }
+            completed = file_view_tasks.join_next(), if !file_view_tasks.is_empty() => {
+                match completed {
+                    Some(Ok((generation_catalog, requester, key, generation, retained, result))) => {
+                        if let Some(subscriber) = subscribers.get_mut(&requester) {
+                            let current_retained = retained_directory_children(subscriber, &key);
+                            let Some(read) = subscriber.views.get_mut(&key) else { continue; };
+                            if read.generation != generation { continue; }
+                            if generation_catalog != catalog.borrow().generation || retained != current_retained {
+                                read.dirty = true;
+                                continue;
+                            }
+                            let state = match result {
+                                Ok(state) => state,
+                                Err(message) => ProjectFileViewState::Unavailable { message },
+                            };
+                            let state = ProjectFileViewStatePayload { view: read.view.clone(), state };
+                            send_file_view_state(&mut subscribers, &requester, state);
+                        }
+                    }
+                    Some(Err(error)) => return Err(format!("file view worker failed: {error}")),
+                    None => {}
                 }
             }
             completed = git_tasks.join_next(), if !git_tasks.is_empty() => {
@@ -1221,16 +1475,48 @@ async fn run_project_subscription(
         git_reads = git_tasks.len(), file_reads = file_tasks.len(),
         bootstrap_reads = initialization_tasks.len(), "settling owned project reads");
     drop(watcher);
-    let (git, files, initialization) = tokio::join!(
+    subscribers.clear();
+    let (git, files, initialization, views) = tokio::join!(
         settle_project_reads(&mut git_tasks),
         settle_project_reads(&mut file_tasks),
         settle_project_reads(&mut initialization_tasks),
+        settle_project_reads(&mut file_view_tasks),
     );
     git?;
     files?;
     initialization?;
+    views?;
+    settle_project_reads(&mut view_watch_tasks).await?;
+    settle_project_reads(&mut observation_tasks).await?;
     tracing::info!(target: "tyde::project_operation", stage = "cleanup", "owned project reads settled");
     Ok(())
+}
+
+fn complete_after_file_watch(
+    tasks: &mut JoinSet<()>,
+    events: mpsc::UnboundedSender<notify::Result<Event>>,
+    observation: notify::Result<Option<oneshot::Receiver<notify::Result<()>>>>,
+    complete: impl FnOnce() + Send + 'static,
+) {
+    match observation {
+        Ok(Some(response)) => {
+            tasks.spawn(async move {
+                let result = response
+                    .await
+                    .map_err(|_| notify::Error::generic("project filesystem watcher stopped"))
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    let _ = events.send(Err(error));
+                }
+                complete();
+            });
+        }
+        Ok(None) => complete(),
+        Err(error) => {
+            let _ = events.send(Err(error));
+            complete();
+        }
+    }
 }
 
 async fn settle_project_reads<T: 'static>(tasks: &mut JoinSet<T>) -> Result<(), String> {
@@ -1262,7 +1548,7 @@ impl PendingFileRefresh {
 struct CompletedFileRefresh {
     generation: u64,
     request: PendingFileRefresh,
-    result: Result<BTreeMap<ProjectRootPath, RootScan>, String>,
+    result: Result<FileScan, String>,
 }
 
 #[derive(Default)]
@@ -1831,11 +2117,13 @@ fn full_file_list_from_raw(
                     message: message.clone(),
                 },
                 entries: Vec::new(),
+                partial_dirs: Vec::new(),
             },
-            Some(RootScan::Available(entries)) => ProjectRootListing {
+            Some(RootScan::Available(listing)) => ProjectRootListing {
                 root,
                 status: ProjectRootStatus::Available,
-                entries: entries
+                entries: listing
+                    .entries
                     .iter()
                     .map(|(path, kind)| ProjectFileEntry {
                         relative_path: path.clone(),
@@ -1843,11 +2131,20 @@ fn full_file_list_from_raw(
                         op: FileEntryOp::Add,
                     })
                     .collect(),
+                partial_dirs: listing
+                    .partial
+                    .iter()
+                    .map(|(relative_path, omitted)| ProjectPartialDir {
+                        relative_path: relative_path.clone(),
+                        omitted: *omitted,
+                    })
+                    .collect(),
             },
             None => ProjectRootListing {
                 root,
                 status: ProjectRootStatus::Available,
                 entries: Vec::new(),
+                partial_dirs: Vec::new(),
             },
         })
         .collect();
@@ -2116,26 +2413,26 @@ fn emit_project_command_error(
 /// Directories at this depth are listed but not recursed into.
 const DEFAULT_FILE_LIST_DEPTH: usize = 2;
 
-/// Scan the filesystem and return raw (path, kind) entries per root at the default depth.
-pub(crate) fn scan_raw_entries(
-    project: &Project,
-) -> Result<BTreeMap<ProjectRootPath, RootScan>, String> {
-    scan_raw_entries_with_depth(project, DEFAULT_FILE_LIST_DEPTH)
-}
+/// Most entries in one root's listing. Bootstraps reach every desktop client
+/// whenever a project or workbench appears, so an unbounded tree blocks the
+/// UI while it is decoded and rendered, and can exceed the frame size limit.
+const FILE_LIST_ENTRY_BUDGET: usize = 256;
 
-fn scan_raw_entries_with_depth(
-    project: &Project,
-    max_depth: usize,
-) -> Result<BTreeMap<ProjectRootPath, RootScan>, String> {
-    let mut result = BTreeMap::new();
+/// Small bootstrap preview only. File access uses retained, paged views rather
+/// than growing this shared snapshot with every client's expanded folders.
+fn scan_project_files(project: &Project) -> Result<FileScan, String> {
+    let mut roots = BTreeMap::new();
     for root in project.root_paths() {
         let scan = match root_unavailable_reason(&root) {
             Some(message) => RootScan::Unavailable(message),
             None => {
                 let root_path = Path::new(&root.0);
-                let mut raw = Vec::new();
-                match collect_raw_entries(root_path, root_path, &mut raw, 0, max_depth) {
-                    Ok(_) => RootScan::Available(raw.into_iter().collect()),
+                match collect_raw_entries(root_path, root_path, DEFAULT_FILE_LIST_DEPTH) {
+                    Ok(listing) => {
+                        let mut entries = RootEntries::default();
+                        entries.add("", listing);
+                        RootScan::Available(entries)
+                    }
                     // The root itself disappeared while it was being scanned.
                     Err(error) => match root_unavailable_reason(&root) {
                         Some(message) => RootScan::Unavailable(message),
@@ -2147,9 +2444,369 @@ fn scan_raw_entries_with_depth(
         if let RootScan::Unavailable(message) = &scan {
             tracing::debug!(%root, %message, "project root is unavailable");
         }
-        result.insert(root, scan);
+        roots.insert(root, scan);
     }
-    Ok(result)
+    Ok(FileScan { roots })
+}
+
+fn send_file_view_state(
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    requester: &StreamPath,
+    state: ProjectFileViewStatePayload,
+) {
+    if let Some(subscriber) = subscribers.get(requester)
+        && let Err(error) =
+            send_payload(&subscriber.stream, FrameKind::ProjectFileViewState, &state)
+    {
+        tracing::warn!(%error, "file view subscriber closed");
+        subscribers.remove(requester);
+    }
+}
+
+fn file_view_key(view: &ProjectFileView) -> Option<ProjectPath> {
+    match view {
+        ProjectFileView::Directory { path, .. } => Some(path.clone()),
+        ProjectFileView::QuickOpen { .. } => None,
+    }
+}
+
+fn retained_directory_children(
+    subscriber: &ProjectSubscriber,
+    parent: &Option<ProjectPath>,
+) -> HashSet<ProjectPath> {
+    let Some(parent) = parent else {
+        return HashSet::new();
+    };
+    subscriber
+        .views
+        .keys()
+        .flatten()
+        .filter(|&path| {
+            path.root == parent.root
+                && path != parent
+                && !path.relative_path.is_empty()
+                && Path::new(&path.relative_path).parent() == Some(Path::new(&parent.relative_path))
+        })
+        .cloned()
+        .collect()
+}
+
+fn invalidate_file_views(
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    event: Option<&Event>,
+    roots: &WatcherRootPaths,
+) -> bool {
+    if event.is_some_and(|event| {
+        matches!(
+            event.kind,
+            EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Data(_))
+        )
+    }) {
+        return false;
+    }
+    let mut pending = false;
+    for subscriber in subscribers.values_mut() {
+        for read in subscriber.views.values_mut() {
+            let affected = match (&read.view, event) {
+                (_, None) => true,
+                (ProjectFileView::QuickOpen { .. }, Some(event)) => {
+                    event.paths.is_empty() || event.paths.iter().any(|path| !is_inside_git(path))
+                }
+                (ProjectFileView::Directory { path, filter, .. }, Some(event)) => roots
+                    .prefixes
+                    .iter()
+                    .filter(|(root, _)| *root == path.root)
+                    .any(|(_, prefixes)| {
+                        prefixes.iter().any(|prefix| {
+                            let dir = prefix.join(&path.relative_path);
+                            event.paths.is_empty()
+                                || event.paths.iter().any(|changed| {
+                                    changed.parent() == Some(dir.as_path())
+                                        || dir.starts_with(changed)
+                                        || (!filter.is_empty()
+                                            && changed.starts_with(&dir)
+                                            && !is_inside_git(changed))
+                                })
+                        })
+                    }),
+            };
+            pending |= affected;
+            if event.is_some() {
+                read.refresh_pending |= affected;
+            } else {
+                read.dirty |= affected;
+            }
+        }
+    }
+    pending
+}
+
+type FileOrder = (std::cmp::Reverse<u32>, bool, String, String, String);
+
+fn file_order(entry: &ProjectFileCursor) -> FileOrder {
+    (
+        std::cmp::Reverse(entry.score),
+        entry.kind != ProjectFileKind::Directory,
+        entry.path.root.0.clone(),
+        entry.path.relative_path.to_lowercase(),
+        entry.path.relative_path.clone(),
+    )
+}
+
+const FILE_VIEW_PAGE_SIZE: usize = 128;
+
+/// Selection is bounded even for a flat directory with millions of children.
+/// Cursors are value boundaries, not offsets into an evictable server cache.
+fn validate_directory_view(project: &Project, path: &ProjectPath) -> Result<(), String> {
+    validate_root(project, &path.root)?;
+    if !path.relative_path.is_empty() {
+        validate_relative_path(&path.relative_path)?;
+    }
+    Ok(())
+}
+
+fn read_file_view(
+    project: &Project,
+    view: ProjectFileView,
+    retained: &HashSet<ProjectPath>,
+    cancel: &AtomicBool,
+) -> Result<ProjectFileViewState, String> {
+    let window = match &view {
+        ProjectFileView::Directory { window, .. } | ProjectFileView::QuickOpen { window, .. } => {
+            window
+        }
+    };
+    let boundary = match window {
+        ProjectFileWindow::First => None,
+        ProjectFileWindow::After(cursor) | ProjectFileWindow::Before(cursor) => {
+            Some(file_order(cursor))
+        }
+    };
+    let backwards = matches!(window, ProjectFileWindow::Before(_));
+    let mut selected = BTreeMap::new();
+    let mut retained_entries = BTreeMap::new();
+    let mut has_before = false;
+    let mut has_after = false;
+    let mut admit = |entry: ProjectFileCursor| {
+        let key = file_order(&entry);
+        if let Some(boundary) = &boundary {
+            if backwards && key >= *boundary {
+                has_after = true;
+                return;
+            }
+            if !backwards && key <= *boundary {
+                has_before = true;
+                return;
+            }
+        }
+        selected.insert(key, entry);
+        if selected.len() > FILE_VIEW_PAGE_SIZE {
+            if backwards {
+                selected.pop_first();
+                has_before = true;
+            } else {
+                selected.pop_last();
+                has_after = true;
+            }
+        }
+    };
+    match &view {
+        ProjectFileView::Directory {
+            path,
+            show_hidden,
+            filter,
+            ..
+        } => {
+            validate_directory_view(project, path)?;
+            let dir = Path::new(&path.root.0).join(&path.relative_path);
+            #[cfg(feature = "test-support")]
+            scan_test_support::run(&dir, scan_test_support::ScanPoint::ReadDirectory);
+            let children = match fs::read_dir(&dir) {
+                Ok(children) => children,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ProjectFileViewState::DirectoryMissing);
+                }
+                Err(error) => return Err(format!("Read directory '{}': {error}", dir.display())),
+            };
+            let filter = filter.to_lowercase();
+            for child in children {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("File view cancelled".to_owned());
+                }
+                let child = child
+                    .map_err(|error| format!("Enumerate directory '{}': {error}", dir.display()))?;
+                let name = child
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "File name is not valid UTF-8".to_owned())?;
+                if name == ".git" || (!show_hidden && name.starts_with('.')) {
+                    continue;
+                }
+                let kind = child
+                    .file_type()
+                    .map_err(|error| format!("Read file type: {error}"))?;
+                if !filter.is_empty()
+                    && !name.to_lowercase().contains(&filter)
+                    && !(kind.is_dir()
+                        && directory_matches_filter(&child.path(), &filter, *show_hidden, cancel)?)
+                {
+                    continue;
+                }
+                let relative_path = if path.relative_path.is_empty() {
+                    name
+                } else {
+                    format!("{}/{name}", path.relative_path)
+                };
+                let entry = ProjectFileCursor {
+                    path: ProjectPath {
+                        root: path.root.clone(),
+                        relative_path,
+                    },
+                    kind: file_kind(kind),
+                    score: 0,
+                };
+                if entry.kind == ProjectFileKind::Directory && retained.contains(&entry.path) {
+                    retained_entries.insert(file_order(&entry), entry.clone());
+                }
+                admit(entry);
+            }
+        }
+        ProjectFileView::QuickOpen { query, .. } => {
+            if query.len() > 4096 {
+                return Err("File query exceeds 4096 bytes".to_owned());
+            }
+            for root in project.root_paths() {
+                validate_root(project, &root)?;
+                let walk = ignore::WalkBuilder::new(&root.0)
+                    .standard_filters(false)
+                    .follow_links(false)
+                    .filter_entry(|entry| entry.file_name() != ".git")
+                    .build();
+                for entry in walk {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("File view cancelled".to_owned());
+                    }
+                    let entry = entry.map_err(|error| format!("Find project files: {error}"))?;
+                    let Some(kind) = entry.file_type() else {
+                        return Err("Missing file type while finding project files".to_owned());
+                    };
+                    if kind.is_dir() {
+                        continue;
+                    }
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&root.0)
+                        .map_err(|error| format!("File outside project root: {error}"))?;
+                    let relative_path = relative
+                        .to_str()
+                        .ok_or("File path is not valid UTF-8")?
+                        .replace('\\', "/");
+                    if let Some(score) = file_name_score(query.trim(), &relative_path) {
+                        admit(ProjectFileCursor {
+                            path: ProjectPath {
+                                root: root.clone(),
+                                relative_path,
+                            },
+                            kind: file_kind(kind),
+                            score,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let entries: Vec<_> = selected.values().cloned().collect();
+    let cursor = match window {
+        ProjectFileWindow::First => None,
+        ProjectFileWindow::After(cursor) | ProjectFileWindow::Before(cursor) => Some(cursor),
+    };
+    let previous = has_before
+        .then(|| entries.first().or(cursor).cloned())
+        .flatten();
+    let next = has_after
+        .then(|| entries.last().or(cursor).cloned())
+        .flatten();
+    // Active child declarations pin real directory rows, never historical entries.
+    selected.extend(retained_entries);
+    let state = ProjectFileViewState::Ready {
+        entries: selected.into_values().collect(),
+        previous,
+        next,
+    };
+    ensure_json_payload_is_transportable(&state, "file view")?;
+    Ok(state)
+}
+
+fn directory_matches_filter(
+    directory: &Path,
+    filter: &str,
+    show_hidden: bool,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let walk = ignore::WalkBuilder::new(directory)
+        .standard_filters(false)
+        .hidden(!show_hidden)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    for entry in walk {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("File view cancelled".to_owned());
+        }
+        let entry = entry.map_err(|error| format!("Filter directory: {error}"))?;
+        if entry
+            .file_name()
+            .to_str()
+            .ok_or("File name is not valid UTF-8")?
+            .to_lowercase()
+            .contains(filter)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn file_kind(kind: fs::FileType) -> ProjectFileKind {
+    if kind.is_dir() {
+        ProjectFileKind::Directory
+    } else if kind.is_symlink() {
+        ProjectFileKind::Symlink
+    } else {
+        ProjectFileKind::File
+    }
+}
+
+fn file_name_score(query: &str, path: &str) -> Option<u32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = query.to_lowercase();
+    let path = path.to_lowercase();
+    let name = path.rsplit('/').next()?;
+    if name == query {
+        return Some(1_000_000);
+    }
+    if name.starts_with(&query) {
+        return Some(500_000);
+    }
+    if name.contains(&query) {
+        return Some(250_000);
+    }
+    let mut wanted = query.chars();
+    let mut next = wanted.next();
+    let mut gaps = 0_u32;
+    for ch in path.chars() {
+        if next == Some(ch) {
+            next = wanted.next();
+            if next.is_none() {
+                return Some(100_000_u32.saturating_sub(gaps));
+            }
+        } else {
+            gaps = gaps.saturating_add(1);
+        }
+    }
+    None
 }
 
 fn root_unavailable_reason(root: &ProjectRootPath) -> Option<String> {
@@ -2158,52 +2815,6 @@ fn root_unavailable_reason(root: &ProjectRootPath) -> Option<String> {
         Ok(_) => Some(format!("Project root '{root}' is not a directory")),
         Err(err) => Some(format!("Failed to stat project root '{root}': {err}")),
     }
-}
-
-/// List entries within a specific subdirectory of a root (all Add ops).
-pub(crate) fn build_dir_listing(
-    project: &Project,
-    root: &ProjectRootPath,
-    dir_relative_path: &str,
-) -> Result<ProjectFileListPayload, String> {
-    validate_root(project, root)?;
-    if !dir_relative_path.is_empty() {
-        validate_relative_path(dir_relative_path)?;
-    }
-
-    let root_path = Path::new(&root.0);
-    let dir_path = if dir_relative_path.is_empty() {
-        root_path.to_path_buf()
-    } else {
-        root_path.join(dir_relative_path)
-    };
-
-    let metadata = fs::metadata(&dir_path)
-        .map_err(|err| format!("Failed to stat directory '{}': {err}", dir_path.display()))?;
-    if !metadata.is_dir() {
-        return Err(format!("'{}' is not a directory", dir_path.display()));
-    }
-
-    let mut raw = Vec::new();
-    collect_raw_entries(root_path, &dir_path, &mut raw, 0, DEFAULT_FILE_LIST_DEPTH)?;
-
-    let entries: Vec<ProjectFileEntry> = raw
-        .into_iter()
-        .map(|(path, kind)| ProjectFileEntry {
-            relative_path: path,
-            kind,
-            op: FileEntryOp::Add,
-        })
-        .collect();
-
-    Ok(ProjectFileListPayload {
-        incremental: true,
-        roots: vec![ProjectRootListing {
-            root: root.clone(),
-            status: ProjectRootStatus::Available,
-            entries,
-        }],
-    })
 }
 
 pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayload, String> {
@@ -3656,6 +4267,9 @@ pub mod scan_test_support {
         WatcherInvalidated,
         WatcherRegistered,
         WatcherUnregistered,
+        FileObservationWaiting,
+        FileViewRouting,
+        FileViewBackpressure,
         DevFrontendProbe,
         PreferencesPinsApplied,
     }
@@ -3688,13 +4302,16 @@ pub mod scan_test_support {
         }
     }
 
-    pub(crate) fn run(path: &Path, point: ScanPoint) -> bool {
-        let action = HOOKS
+    pub(crate) fn take(path: &Path, point: ScanPoint) -> Option<ScanAction> {
+        HOOKS
             .get_or_init(Mutex::default)
             .lock()
             .unwrap()
-            .remove(&(path.to_owned(), point));
-        if let Some(action) = action {
+            .remove(&(path.to_owned(), point))
+    }
+
+    pub(crate) fn run(path: &Path, point: ScanPoint) -> bool {
+        if let Some(action) = take(path, point) {
             action();
             true
         } else {
@@ -3703,21 +4320,109 @@ pub mod scan_test_support {
     }
 }
 
-/// A vanished descendant returns false so its parent omits the directory entry.
-fn collect_raw_entries(
-    root: &Path,
+/// Entries below one listing start; `omitted` counts the start's children
+/// left out at the budget.
+struct Listing {
+    entries: Vec<RawFileEntry>,
+    omitted: usize,
+}
+
+/// Lists entries below `start` breadth-first, `max_depth + 1` levels deep and
+/// at most `FILE_LIST_ENTRY_BUDGET` entries. `start` keeps its children in path
+/// order up to the budget and counts the rest; a deeper directory lists its
+/// children only when all of them fit, so no other directory is partial.
+/// Directories left unlisted load on demand through `ProjectFileView`. A
+/// directory that vanishes before it is read is omitted.
+fn collect_raw_entries(root: &Path, start: &Path, max_depth: usize) -> Result<Listing, String> {
+    let mut out: Vec<Option<RawFileEntry>> = Vec::new();
+    let mut omitted = 0;
+    let mut queue = VecDeque::from([(start.to_path_buf(), None::<usize>, 0usize)]);
+    while let Some((current, entry_index, depth)) = queue.pop_front() {
+        let remaining = FILE_LIST_ENTRY_BUDGET - out.len();
+        let children = match read_listing_children(&current, entry_index.is_none(), remaining)? {
+            ListingChildren::Listed { children, cut } => {
+                omitted += cut;
+                children
+            }
+            ListingChildren::Vanished => {
+                if let Some(index) = entry_index {
+                    out[index] = None;
+                }
+                continue;
+            }
+            ListingChildren::OverBudget => continue,
+        };
+
+        for path in children {
+            #[cfg(feature = "test-support")]
+            scan_test_support::run(&path, scan_test_support::ScanPoint::Metadata);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "project scan metadata failed after directory enumeration");
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        continue;
+                    }
+                    return Err(format!("Failed to stat path '{}': {error}", path.display()));
+                }
+            };
+            let relative_path = path
+                .strip_prefix(root)
+                .map_err(|err| {
+                    format!(
+                        "failed to strip root prefix from '{}': {}",
+                        path.display(),
+                        err
+                    )
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            let kind = if metadata.file_type().is_symlink() {
+                ProjectFileKind::Symlink
+            } else if metadata.is_dir() {
+                ProjectFileKind::Directory
+            } else {
+                ProjectFileKind::File
+            };
+
+            out.push(Some((relative_path, kind)));
+            if metadata.is_dir() && depth < max_depth {
+                queue.push_back((path, Some(out.len() - 1), depth + 1));
+            }
+        }
+        if out.len() == FILE_LIST_ENTRY_BUDGET {
+            break;
+        }
+    }
+
+    Ok(Listing {
+        entries: out.into_iter().flatten().collect(),
+        omitted,
+    })
+}
+
+enum ListingChildren {
+    Listed { children: Vec<PathBuf>, cut: usize },
+    Vanished,
+    OverBudget,
+}
+
+/// Reads one directory's children, excluding `.git`. Only the listing start
+/// is truncated; any other directory with more children than `remaining` is
+/// abandoned without reading the rest of it.
+fn read_listing_children(
     current: &Path,
-    out: &mut Vec<RawFileEntry>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<bool, String> {
+    is_start: bool,
+    remaining: usize,
+) -> Result<ListingChildren, String> {
     #[cfg(feature = "test-support")]
     scan_test_support::run(current, scan_test_support::ScanPoint::ReadDirectory);
     let directory = match fs::read_dir(current) {
         Ok(directory) => directory,
-        Err(error) if depth > 0 && error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if !is_start && error.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(path = %current.display(), %error, "project scan directory disappeared before descent");
-            return Ok(false);
+            return Ok(ListingChildren::Vanished);
         }
         Err(error) => {
             return Err(format!(
@@ -3726,67 +4431,37 @@ fn collect_raw_entries(
             ));
         }
     };
-    let mut entries = directory
-        .filter_map(|entry| match entry {
+    let mut children = std::collections::BinaryHeap::new();
+    let mut count: usize = 0;
+    for entry in directory {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(path = %current.display(), %error, "project scan entry disappeared during enumeration");
-                None
+                continue;
             }
-            entry => Some(entry),
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("Failed to iterate directory '{}': {err}", current.display()))?;
-    entries.sort_by_key(|entry| entry.path());
-
-    for entry in entries {
-        let path = entry.path();
-        let file_name = entry.file_name();
-        if file_name == ".git" {
+            Err(error) => {
+                return Err(format!(
+                    "Failed to iterate directory '{}': {error}",
+                    current.display()
+                ));
+            }
+        };
+        if entry.file_name() == ".git" {
             continue;
         }
-
-        #[cfg(feature = "test-support")]
-        scan_test_support::run(&path, scan_test_support::ScanPoint::Metadata);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::debug!(path = %path.display(), %error, "project scan metadata failed after directory enumeration");
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    continue;
-                }
-                return Err(format!("Failed to stat path '{}': {error}", path.display()));
-            }
-        };
-        let relative_path = path
-            .strip_prefix(root)
-            .map_err(|err| {
-                format!(
-                    "failed to strip root prefix from '{}': {}",
-                    path.display(),
-                    err
-                )
-            })?
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let kind = if metadata.file_type().is_symlink() {
-            ProjectFileKind::Symlink
-        } else if metadata.is_dir() {
-            ProjectFileKind::Directory
-        } else {
-            ProjectFileKind::File
-        };
-
-        out.push((relative_path, kind));
-        if metadata.is_dir()
-            && depth < max_depth
-            && !collect_raw_entries(root, &path, out, depth + 1, max_depth)?
-        {
-            out.pop();
+        count += 1;
+        children.push(entry.path());
+        if !is_start && children.len() > remaining {
+            return Ok(ListingChildren::OverBudget);
+        }
+        if children.len() > remaining {
+            children.pop();
         }
     }
-
-    Ok(true)
+    let children = children.into_sorted_vec();
+    let cut = count.saturating_sub(remaining);
+    Ok(ListingChildren::Listed { children, cut })
 }
 
 fn validate_root(project: &Project, root: &ProjectRootPath) -> Result<(), String> {

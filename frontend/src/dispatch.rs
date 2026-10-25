@@ -1835,6 +1835,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse project_notify payload: {error}"),
             ),
         },
+        FrameKind::ProjectFileViewState => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                return;
+            };
+            match envelope.parse_payload::<protocol::ProjectFileViewStatePayload>() {
+                Ok(payload) => {
+                    let key = ActiveProjectRef {
+                        host_id: host_id.to_owned(),
+                        project_id,
+                    };
+                    state.file_views.update(|map| {
+                        let views = map.entry(key).or_default();
+                        views.retain(|existing| !same_file_view(&existing.view, &payload.view));
+                        if payload.state != protocol::ProjectFileViewState::Closed {
+                            views.push(payload);
+                        }
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_file_view_state payload: {error}"),
+                ),
+            }
+        }
         FrameKind::ProjectFileList => {
             let Some(project_id) = resolve_project_id(&envelope.stream) else {
                 log::warn!(
@@ -4262,6 +4289,12 @@ pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &p
     // Delete notification, so this covers both standalone project deletes
     // and workbench removals.
     let deleted_id = &project.id;
+    state
+        .file_views
+        .update(|map| map.retain(|key, _| key.host_id != host_id || &key.project_id != deleted_id));
+    state
+        .file_view_epochs
+        .update(|map| map.retain(|key, _| key.host_id != host_id || &key.project_id != deleted_id));
     state.file_tree.update(|map| {
         map.remove(deleted_id);
     });
@@ -4285,6 +4318,20 @@ pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &p
     });
 }
 
+pub(crate) fn same_file_view(a: &protocol::ProjectFileView, b: &protocol::ProjectFileView) -> bool {
+    match (a, b) {
+        (
+            protocol::ProjectFileView::Directory { path: a, .. },
+            protocol::ProjectFileView::Directory { path: b, .. },
+        ) => a == b,
+        (
+            protocol::ProjectFileView::QuickOpen { .. },
+            protocol::ProjectFileView::QuickOpen { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
 fn apply_project_file_list(
     file_tree: &mut HashMap<ProjectId, Vec<protocol::ProjectRootListing>>,
     project_id: ProjectId,
@@ -4305,29 +4352,26 @@ fn apply_project_file_list(
                     root: incoming_root.root.clone(),
                     status: incoming_root.status.clone(),
                     entries: Vec::new(),
+                    partial_dirs: Vec::new(),
                 });
                 existing_roots.len() - 1
             });
         let existing_root = &mut existing_roots[root_index];
 
+        // The last operation for a path wins; an Add carries the server's
+        // current kind for that path.
+        let mut changes = HashMap::with_capacity(incoming_root.entries.len());
         for entry in incoming_root.entries {
-            match entry.op {
-                protocol::FileEntryOp::Add => {
-                    if !existing_root
-                        .entries
-                        .iter()
-                        .any(|existing| existing.relative_path == entry.relative_path)
-                    {
-                        existing_root.entries.push(entry);
-                    }
-                }
-                protocol::FileEntryOp::Remove => {
-                    existing_root
-                        .entries
-                        .retain(|existing| existing.relative_path != entry.relative_path);
-                }
-            }
+            changes.insert(entry.relative_path.clone(), entry);
         }
+        existing_root
+            .entries
+            .retain(|existing| !changes.contains_key(&existing.relative_path));
+        existing_root.entries.extend(
+            changes
+                .into_values()
+                .filter(|entry| entry.op == protocol::FileEntryOp::Add),
+        );
         existing_root
             .entries
             .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -6618,7 +6662,7 @@ fn token_change_phrase(metrics: &protocol::CompactionMetrics) -> Option<String> 
 
 /// `384168` → `"384,168"`. Screen readers read an ungrouped run of digits
 /// inconsistently (often digit-by-digit); grouping makes it a number.
-fn group_digits(value: u64) -> String {
+pub(crate) fn group_digits(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
@@ -7484,6 +7528,16 @@ fn apply_project_bootstrap(
         }
     });
 
+    let key = ActiveProjectRef {
+        host_id: host_id.to_owned(),
+        project_id: project_id.clone(),
+    };
+    state.file_views.update(|map| {
+        map.remove(&key);
+    });
+    state.file_view_epochs.update(|map| {
+        *map.entry(key).or_default() += 1;
+    });
     state.file_tree.update(|file_tree| {
         // The bootstrap file_list is a full snapshot. Force non-incremental
         // apply so we replace the per-root listing rather than merging.
