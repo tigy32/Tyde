@@ -730,7 +730,9 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                         && payload.assistant_turn_count >= 2;
                     let _ = session_count_tx.send(payload).await;
                 }
-                HostEvent::HostSettings(_)
+                HostEvent::ConnectionError(_) => panic!("client connection failed"),
+                HostEvent::AgentProjectChanged(_)
+                | HostEvent::HostSettings(_)
                 | HostEvent::SettingsWriteResult(_)
                 | HostEvent::AgentActivitySummary(_)
                 | HostEvent::TaskTokenUsage(_)
@@ -1002,6 +1004,435 @@ async fn runtime_preserves_project_bootstrap_until_project_endpoint_is_opened() 
         }
         _ => panic!("expected ProjectBootstrap"),
     }
+}
+
+#[tokio::test]
+async fn project_deletion_preserves_high_level_client_and_active_conversation() {
+    use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
+
+    let directory = tempfile::tempdir().expect("create deletion flow stores");
+    let root = tempfile::tempdir().expect("create project source");
+    let source = root.path().join("keep.txt");
+    std::fs::write(&source, "Preserve source").expect("write source");
+    let roots = vec![root.path().to_string_lossy().into_owned()];
+    let host = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("initialize deletion host");
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let connection_host = host.clone();
+    let (identity_fault_tx, mut identity_fault_rx) = oneshot::channel();
+    let (forwarding_task_tx, forwarding_task_rx) = oneshot::channel();
+    let connection_task = tokio::spawn(async move {
+        let connection = server::accept(&server::ServerConfig::current(), server_stream)
+            .await
+            .expect("real server handshake");
+        let (forward_writer, forward_reader) = tokio::io::duplex(8192);
+        let mut writer = connection.writer;
+        let forwarding_task = tokio::spawn(async move {
+            let mut reader = protocol::FrameReader::new(forward_reader);
+            let mut corrupt_identity = false;
+            while let Some(mut frame) = reader.read_frame().await? {
+                if identity_fault_rx.try_recv().is_ok() {
+                    corrupt_identity = true;
+                }
+                // Corrupt one real server ownership frame, not backend lifecycle events.
+                if corrupt_identity
+                    && frame.envelope.kind == protocol::FrameKind::AgentProjectChanged
+                {
+                    let mut start: protocol::AgentStartPayload = frame.envelope.parse_payload()?;
+                    start.agent_id = protocol::AgentId(uuid::Uuid::new_v4().to_string());
+                    frame.envelope.payload = serde_json::to_value(start)?;
+                    corrupt_identity = false;
+                }
+                protocol::write_frame(&mut writer, &frame).await?;
+            }
+            Ok::<_, protocol::FrameError>(())
+        });
+        forwarding_task_tx
+            .send(forwarding_task)
+            .expect("transfer owned forwarding task");
+        let connection = server::Connection {
+            writer: Box::new(forward_writer),
+            ..connection
+        };
+        server::run_connection(connection, connection_host).await
+    });
+    let HostEndpoint {
+        mut events,
+        commands,
+    } = client::connect_host_endpoint(&client::ClientConfig::current(), client_stream)
+        .await
+        .expect("high-level client handshake");
+    commands
+        .project_create(protocol::ProjectCreatePayload {
+            name: "Typed client deletion".into(),
+            roots: roots.iter().cloned().map(ProjectRootPath).collect(),
+        })
+        .await
+        .expect("create project through typed client");
+    let project = loop {
+        match events
+            .recv()
+            .await
+            .expect("host remains connected until project creation")
+        {
+            HostEvent::ProjectNotify(protocol::ProjectNotifyPayload::Upsert { project }) => {
+                break project;
+            }
+            HostEvent::ConnectionError(_) => panic!("high-level client connection failed"),
+            HostEvent::CommandError(_) => panic!("project creation rejected"),
+            _ => {}
+        }
+    };
+    let gate = MockGateHandle::new();
+    let reservation = host
+        .reserve_next_mock_launch(
+            "typed-deletion",
+            MockScript::one(MockTurn::text_completion_after_gate(
+                "Active turn survives",
+                &gate,
+            ))
+            .then(MockTurn::text("Conversation continues")),
+        )
+        .await;
+    commands
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("typed-deletion".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: roots.clone(),
+                prompt: "Remain active".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn project conversation");
+    let mut agent = loop {
+        match events
+            .recv()
+            .await
+            .expect("host remains connected until agent start")
+        {
+            HostEvent::NewAgent(agent) => break agent,
+            HostEvent::ConnectionError(_) => panic!("high-level client connection failed"),
+            HostEvent::CommandError(_) => panic!("agent creation rejected"),
+            _ => {}
+        }
+    };
+    drop(reservation);
+    assert_eq!(agent.info.project_id.as_ref(), Some(&project.id));
+    let session_id = agent
+        .info
+        .session_id
+        .clone()
+        .expect("authoritative logical session");
+    gate.wait_until_entered().await;
+    let mut working = false;
+    while !working {
+        match agent
+            .events
+            .recv()
+            .await
+            .expect("agent remains attached before deletion")
+        {
+            AgentEvent::Bootstrap(bootstrap) => {
+                working = bootstrap.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
+                    )
+                });
+            }
+            AgentEvent::Chat(chat) => {
+                working = matches!(*chat, ChatEvent::TypingStatusChanged(true))
+            }
+            AgentEvent::Error(_) => panic!("active agent failed before deletion"),
+            _ => {}
+        }
+    }
+    eprintln!("TYPED DELETE: high-level client observes working; completion gate held");
+    let startup_gate = host.install_agent_startup_completion_test_gate("typed-startup");
+    commands
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("typed-startup".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: roots.clone(),
+                prompt: "Start after project removal".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("start second conversation with initialization held");
+    startup_gate.wait_until_entered().await;
+
+    commands
+        .project_delete(protocol::ProjectDeletePayload {
+            id: project.id.clone(),
+        })
+        .await
+        .expect("delete project through high-level commands");
+    let mut assignments = std::collections::HashMap::new();
+    loop {
+        match events
+            .recv()
+            .await
+            .expect("high-level host reader must survive project change")
+        {
+            HostEvent::AgentProjectChanged(start) => {
+                if start.agent_id == agent.info.agent_id {
+                    assert!(
+                        start.session_id.as_ref() == Some(&session_id),
+                        "logical session unchanged"
+                    );
+                } else {
+                    assert_eq!(start.name, "typed-startup");
+                }
+                assert!(start.project_id.is_none());
+                assert_eq!(start.workspace_roots, roots);
+                assignments.insert(start.agent_id.clone(), start);
+            }
+            HostEvent::ProjectNotify(protocol::ProjectNotifyPayload::Delete {
+                project: deleted,
+            }) => {
+                assert_eq!(deleted.id, project.id);
+                assert!(
+                    assignments.len() == 2 && assignments.contains_key(&agent.info.agent_id),
+                    "authoritative ownership arrives before catalog deletion"
+                );
+                break;
+            }
+            HostEvent::ConnectionError(_) => panic!("high-level client connection failed"),
+            HostEvent::CommandError(_) => panic!("project deletion rejected"),
+            _ => {}
+        }
+    }
+    eprintln!(
+        "TYPED DELETE: host publishes typed detached ownership before deletion; roots/session preserved"
+    );
+    let starting_id = assignments
+        .values()
+        .find(|start| start.name == "typed-startup")
+        .expect("starting ownership published")
+        .agent_id
+        .clone();
+    startup_gate.release_one();
+    let mut starting_agent = loop {
+        match events
+            .recv()
+            .await
+            .expect("starting conversation initializes after detachment")
+        {
+            HostEvent::NewAgent(starting) => {
+                assert_eq!(starting.info.agent_id, starting_id);
+                assert!(
+                    starting.info.project_id.is_none(),
+                    "deferred endpoint must not republish deleted ownership"
+                );
+                assert_eq!(starting.info.workspace_roots, roots);
+                assert!(starting.info.session_id.is_some());
+                break starting;
+            }
+            HostEvent::ConnectionError(_) => panic!("client failed during detached startup"),
+            HostEvent::CommandError(_) => panic!("detached startup rejected"),
+            _ => {}
+        }
+    };
+    match starting_agent
+        .events
+        .recv()
+        .await
+        .expect("detached startup bootstrap")
+    {
+        AgentEvent::Bootstrap(bootstrap) => {
+            let start = bootstrap
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    AgentBootstrapEvent::AgentStart(start) => Some(start),
+                    _ => None,
+                })
+                .expect("authoritative startup projection");
+            assert!(start.project_id.is_none());
+            assert_eq!(start.workspace_roots, roots);
+        }
+        _ => panic!("starting agent first event must be bootstrap"),
+    }
+    eprintln!("TYPED DELETE: deferred endpoint and startup bootstrap preserve detached ownership");
+    gate.release_one();
+    for expected in ["Active turn survives", "Conversation continues"] {
+        if expected == "Conversation continues" {
+            agent
+                .commands
+                .send_message(SendMessagePayload {
+                    message: "Continue after deletion".into(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                })
+                .await
+                .expect("send subsequent conversation input");
+        }
+        let mut completed = false;
+        loop {
+            tokio::select! {
+                host_event = events.recv() => {
+                    match host_event.expect("host remains connected through conversation") {
+                        HostEvent::ConnectionError(_) => panic!("high-level client connection failed"),
+            HostEvent::CommandError(_) => panic!("conversation command rejected"),
+                        _ => {}
+                    }
+                }
+                agent_event = agent.events.recv() => {
+                    match agent_event.expect("agent remains connected through conversation") {
+                        AgentEvent::Chat(chat) => match *chat {
+                            ChatEvent::StreamEnd(end) => {
+                                assert!(end.message.content.ends_with(expected), "expected turn completed");
+                                completed = true;
+                            }
+                            ChatEvent::TypingStatusChanged(false) => {
+                                assert!(completed, "idle follows completed turn");
+                                break;
+                            }
+                            _ => {}
+                        },
+                        AgentEvent::Error(_) => panic!("preserved conversation failed"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    commands
+        .list_sessions()
+        .await
+        .expect("host command still usable");
+    loop {
+        let event = events.recv().await.expect("host remains connected");
+        assert!(
+            !matches!(event, HostEvent::ConnectionError(_)),
+            "host read failed after conversation"
+        );
+        if let HostEvent::SessionList(list) = event {
+            let session = list
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .expect("saved conversation retained");
+            assert!(session.project_id.is_none());
+            break;
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(source).expect("source retained"),
+        "Preserve source"
+    );
+    eprintln!(
+        "TYPED DELETE: active turn completed; subsequent conversation and host command succeeded"
+    );
+    commands
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "typed-client-move".into(),
+            agent_id: agent.info.agent_id.clone(),
+            project_id: None,
+        })
+        .await
+        .expect("move detached conversation through normal protocol");
+    let mut moved = false;
+    let mut projected = false;
+    while !moved || !projected {
+        tokio::select! {
+            event = events.recv() => match event.expect("host remains usable during move") {
+                HostEvent::AgentMoveResult(result) => {
+                    let start = result.result.expect("move succeeds");
+                    assert_eq!(start.agent_id, agent.info.agent_id);
+                    assert!(start.project_id.is_none());
+                    moved = true;
+                }
+                HostEvent::ConnectionError(_) => panic!("client connection failed on move"),
+                HostEvent::CommandError(_) => panic!("move rejected"),
+                _ => {}
+            },
+            event = agent.events.recv() => match event.expect("agent remains attached during move") {
+                AgentEvent::Start(start) => {
+                    assert_eq!(start.agent_id, agent.info.agent_id);
+                    assert!(start.session_id.as_ref() == Some(&session_id), "logical session unchanged on move");
+                    assert!(start.project_id.is_none());
+                    assert_eq!(start.workspace_roots, roots);
+                    projected = true;
+                }
+                AgentEvent::Error(_) => panic!("agent move failed"),
+                _ => {}
+            },
+        }
+    }
+    eprintln!("TYPED DELETE: attached agent stream also publishes canonical ownership projection");
+    identity_fault_tx
+        .send(())
+        .expect("arm transport identity fault");
+    commands
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "typed-client-invalid-identity".into(),
+            agent_id: agent.info.agent_id.clone(),
+            project_id: None,
+        })
+        .await
+        .expect("request real ownership frame for boundary rejection");
+    loop {
+        match events
+            .recv()
+            .await
+            .expect("protocol failure must be surfaced")
+        {
+            HostEvent::ConnectionError(client::ClientError::AgentIdentityMismatch {
+                stream,
+                kind,
+            }) => {
+                assert_eq!(stream, agent.info.instance_stream);
+                assert_eq!(kind, protocol::FrameKind::AgentProjectChanged);
+                break;
+            }
+            HostEvent::ConnectionError(_) => panic!("wrong protocol failure"),
+            _ => {}
+        }
+    }
+    assert!(matches!(
+        commands.list_sessions().await,
+        Err(client::ClientError::ConnectionClosed)
+    ));
+    let server_result = connection_task
+        .await
+        .expect("owned server connection must not panic");
+    let forwarding_result = forwarding_task_rx
+        .await
+        .expect("owned forwarding handle")
+        .await
+        .expect("owned forwarding task must not panic");
+    host.shutdown_agents_for_conformance().await;
+    eprintln!(
+        "TYPED DELETE: mismatched identity surfaced; commands reject failed connection; owned server/transport joined (server error={}, transport error={})",
+        server_result.is_err(),
+        forwarding_result.is_err()
+    );
 }
 
 async fn send_chat_probe(

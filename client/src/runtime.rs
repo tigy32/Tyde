@@ -51,6 +51,8 @@ pub enum ClientError {
     InvalidPayload(serde_json::Error),
     ConnectionClosed,
     StreamAlreadyRegistered(StreamPath),
+    UnexpectedFrame { stream: StreamPath, kind: FrameKind },
+    AgentIdentityMismatch { stream: StreamPath, kind: FrameKind },
 }
 
 impl From<FrameError> for ClientError {
@@ -131,6 +133,8 @@ pub struct TerminalCommands {
 }
 
 pub enum HostEvent {
+    ConnectionError(ClientError),
+    AgentProjectChanged(Box<AgentStartPayload>),
     HostBootstrap(Box<HostBootstrapPayload>),
     HostSettings(HostSettingsPayload),
     SettingsWriteResult(protocol::SettingsWriteResultPayload),
@@ -579,7 +583,6 @@ impl Drop for TerminalEvents {
 
 struct Shared {
     routes: Mutex<HashMap<StreamPath, Route>>,
-    pending_agent_endpoints: Mutex<HashMap<StreamPath, PendingAgentEndpoint>>,
     pending_project_events: Mutex<HashMap<ProjectId, mpsc::Receiver<ProjectEvent>>>,
     write_tx: mpsc::Sender<WriteRequest>,
     _read_task: JoinHandle<()>,
@@ -615,15 +618,22 @@ enum WriteRequest {
 fn spawn_runtime(parts: ConnectedParts) -> HostEndpoint {
     let (host_tx, host_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (write_tx, write_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (writer_shutdown_tx, writer_shutdown_rx) = oneshot::channel();
 
     let shared = Arc::new_cyclic(|weak| {
-        let write_task = tokio::spawn(write_pump(parts.writer, parts.outgoing_seq, write_rx));
+        let write_task = tokio::spawn(write_pump(
+            parts.writer,
+            parts.outgoing_seq,
+            write_rx,
+            writer_shutdown_rx,
+        ));
         let read_task = tokio::spawn(read_pump(
             parts.reader,
             parts.incoming_seq,
             parts.host_stream.clone(),
             host_tx.clone(),
             weak.clone(),
+            writer_shutdown_tx,
         ));
 
         let mut routes = HashMap::new();
@@ -631,7 +641,6 @@ fn spawn_runtime(parts: ConnectedParts) -> HostEndpoint {
 
         Shared {
             routes: Mutex::new(routes),
-            pending_agent_endpoints: Mutex::new(HashMap::new()),
             pending_project_events: Mutex::new(HashMap::new()),
             write_tx,
             _read_task: read_task,
@@ -663,51 +672,8 @@ impl Shared {
     }
 
     fn unregister_route(&self, stream: &StreamPath) {
-        {
-            let mut routes = self.routes.lock().expect("route registry poisoned");
-            routes.remove(stream);
-        }
-        self.pending_agent_endpoints
-            .lock()
-            .expect("pending agent endpoint registry poisoned")
-            .remove(stream);
-    }
-
-    async fn resolve_pending_agent_endpoint(
-        self: &Arc<Self>,
-        stream: &StreamPath,
-        session_id: Option<protocol::SessionId>,
-    ) {
-        let pending = {
-            self.pending_agent_endpoints
-                .lock()
-                .expect("pending agent endpoint registry poisoned")
-                .remove(stream)
-        };
-        let Some(mut pending) = pending else {
-            return;
-        };
-        pending.payload.session_id = session_id;
-        let endpoint = AgentEndpoint {
-            info: pending.payload,
-            events: AgentEvents {
-                stream: stream.clone(),
-                shared: self.clone(),
-                rx: pending.events,
-            },
-            commands: AgentCommands {
-                stream: stream.clone(),
-                shared: self.clone(),
-            },
-        };
-        if pending
-            .host_tx
-            .send(HostEvent::NewAgent(endpoint))
-            .await
-            .is_err()
-        {
-            self.unregister_route(stream);
-        }
+        let mut routes = self.routes.lock().expect("route registry poisoned");
+        routes.remove(stream);
     }
 
     async fn pre_register_project_endpoint(
@@ -831,57 +797,71 @@ async fn read_pump(
     host_stream: StreamPath,
     host_tx: mpsc::Sender<HostEvent>,
     shared: std::sync::Weak<Shared>,
+    writer_shutdown: oneshot::Sender<()>,
 ) {
-    let mut voice_state = ServerVoiceState::default();
-    while let Ok(Some(frame)) = reader.read_frame().await {
-        let envelope = &frame.envelope;
-        if incoming_seq
-            .validate(&envelope.stream, envelope.seq, envelope.kind)
-            .is_err()
-        {
-            break;
-        }
-
-        let Some(shared) = shared.upgrade() else {
-            break;
-        };
-
-        if is_voice_frame(&frame) {
-            let event = match accept_server_voice_frame(&mut voice_state, &host_stream, &frame) {
-                Ok(Some(event)) => event,
-                Ok(None) | Err(_) => break,
+    let result = async {
+        let mut voice_state = ServerVoiceState::default();
+        let mut pending_agent_endpoints = HashMap::new();
+        loop {
+            let frame = reader
+                .read_frame()
+                .await?
+                .ok_or(ClientError::ConnectionClosed)?;
+            let envelope = &frame.envelope;
+            incoming_seq
+                .validate(&envelope.stream, envelope.seq, envelope.kind)
+                .map_err(FrameError::from)?;
+            let Some(shared) = shared.upgrade() else {
+                return Ok(());
             };
-            if host_tx.send(HostEvent::Voice(event)).await.is_err() {
-                break;
+            if is_voice_frame(&frame) {
+                let event = accept_server_voice_frame(&mut voice_state, &host_stream, &frame)?
+                    .ok_or_else(|| ClientError::UnexpectedFrame {
+                        stream: envelope.stream.clone(),
+                        kind: envelope.kind,
+                    })?;
+                host_tx
+                    .send(HostEvent::Voice(event))
+                    .await
+                    .map_err(|_| ClientError::ConnectionClosed)?;
+                continue;
             }
-            continue;
-        }
-        if !frame.binary.is_empty() {
-            break;
-        }
-        let envelope = frame.envelope;
-
-        if envelope.stream == host_stream {
-            if !handle_host_envelope(envelope, host_tx.clone(), shared).await {
-                break;
+            if !frame.binary.is_empty() {
+                return Err(ClientError::UnexpectedFrame {
+                    stream: envelope.stream.clone(),
+                    kind: envelope.kind,
+                });
             }
-            continue;
+            let envelope = frame.envelope;
+            if envelope.stream == host_stream {
+                if !handle_host_envelope(
+                    envelope,
+                    host_tx.clone(),
+                    shared,
+                    &mut pending_agent_endpoints,
+                )
+                .await?
+                {
+                    return Err(ClientError::ConnectionClosed);
+                }
+            } else if envelope.stream.0.starts_with("/agent/") {
+                handle_agent_envelope(envelope, &shared, &mut pending_agent_endpoints).await?;
+            } else if envelope.stream.0.starts_with("/project/") {
+                handle_project_envelope(envelope, &shared).await?;
+            } else if envelope.stream.0.starts_with("/terminal/") {
+                handle_terminal_envelope(envelope, &shared).await?;
+            } else {
+                return Err(ClientError::UnexpectedFrame {
+                    stream: envelope.stream,
+                    kind: envelope.kind,
+                });
+            }
         }
-
-        if envelope.stream.0.starts_with("/agent/") {
-            handle_agent_envelope(envelope, &shared).await;
-            continue;
-        }
-
-        if envelope.stream.0.starts_with("/project/") {
-            handle_project_envelope(envelope, &shared).await;
-            continue;
-        }
-
-        if envelope.stream.0.starts_with("/terminal/") {
-            handle_terminal_envelope(envelope, &shared).await;
-            continue;
-        }
+    }
+    .await;
+    let _ = writer_shutdown.send(());
+    if let Err(error) = result {
+        let _ = host_tx.send(HostEvent::ConnectionError(error)).await;
     }
 }
 
@@ -889,39 +869,47 @@ async fn write_pump(
     mut writer: Box<dyn AsyncWrite + Unpin + Send>,
     mut outgoing_seq: HashMap<StreamPath, u64>,
     mut rx: mpsc::Receiver<WriteRequest>,
+    shutdown: oneshot::Receiver<()>,
 ) {
-    while let Some(request) = rx.recv().await {
-        match request {
-            WriteRequest::RegisterStream {
-                stream,
-                initial_seq,
-            } => {
-                outgoing_seq.entry(stream).or_insert(initial_seq);
-            }
-            WriteRequest::Send {
-                stream,
-                kind,
-                payload,
-                result_tx,
-            } => {
-                let result = match outgoing_seq.get_mut(&stream) {
-                    Some(seq) => {
-                        let envelope = Envelope {
-                            stream: stream.clone(),
-                            kind,
-                            seq: *seq,
-                            payload,
-                        };
-                        *seq += 1;
-                        write_envelope(&mut writer, &envelope)
-                            .await
-                            .map_err(ClientError::Frame)
-                    }
-                    None => Err(ClientError::ConnectionClosed),
-                };
-                let _ = result_tx.send(result);
+    let write_requests = async {
+        while let Some(request) = rx.recv().await {
+            match request {
+                WriteRequest::RegisterStream {
+                    stream,
+                    initial_seq,
+                } => {
+                    outgoing_seq.entry(stream).or_insert(initial_seq);
+                }
+                WriteRequest::Send {
+                    stream,
+                    kind,
+                    payload,
+                    result_tx,
+                } => {
+                    let result = match outgoing_seq.get_mut(&stream) {
+                        Some(seq) => {
+                            let envelope = Envelope {
+                                stream: stream.clone(),
+                                kind,
+                                seq: *seq,
+                                payload,
+                            };
+                            *seq += 1;
+                            write_envelope(&mut writer, &envelope)
+                                .await
+                                .map_err(ClientError::Frame)
+                        }
+                        None => Err(ClientError::ConnectionClosed),
+                    };
+                    let _ = result_tx.send(result);
+                }
             }
         }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown => {},
+        _ = write_requests => {},
     }
 }
 
@@ -929,12 +917,13 @@ async fn handle_host_envelope(
     envelope: Envelope,
     host_tx: mpsc::Sender<HostEvent>,
     shared: Arc<Shared>,
-) -> bool {
-    match envelope.kind {
+    pending_agent_endpoints: &mut HashMap<StreamPath, PendingAgentEndpoint>,
+) -> Result<bool, ClientError> {
+    let handled = match envelope.kind {
         FrameKind::HostBootstrap => {
             let payload: HostBootstrapPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let agents = payload.agents.clone();
             let projects = payload.projects.clone();
@@ -944,15 +933,17 @@ async fn handle_host_envelope(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return Ok(false);
                 }
             }
             let _ = host_tx
                 .send(HostEvent::HostBootstrap(Box::new(payload)))
                 .await;
             for agent in agents {
-                if !emit_new_agent_endpoint(agent, &host_tx, &shared).await {
-                    return false;
+                if !emit_new_agent_endpoint(agent, &host_tx, &shared, pending_agent_endpoints)
+                    .await?
+                {
+                    return Ok(false);
                 }
             }
             true
@@ -960,7 +951,7 @@ async fn handle_host_envelope(
         FrameKind::HostSettings => {
             let payload: HostSettingsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::HostSettings(payload)).await;
             true
@@ -968,7 +959,7 @@ async fn handle_host_envelope(
         FrameKind::SettingsWriteResult => {
             let payload: protocol::SettingsWriteResultPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SettingsWriteResult(payload)).await;
             true
@@ -976,7 +967,7 @@ async fn handle_host_envelope(
         FrameKind::AgentActivitySummary => {
             let payload: AgentActivitySummaryPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::AgentActivitySummary(payload)).await;
             true
@@ -994,7 +985,7 @@ async fn handle_host_envelope(
         FrameKind::TaskTokenUsage => {
             let payload: TaskTokenUsagePayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TaskTokenUsage(Box::new(payload)))
@@ -1004,7 +995,7 @@ async fn handle_host_envelope(
         FrameKind::AgentsViewPreferencesNotify => {
             let payload: AgentsViewPreferencesNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::AgentsViewPreferencesNotify(payload))
@@ -1014,7 +1005,7 @@ async fn handle_host_envelope(
         FrameKind::BackendSetup => {
             let payload: BackendSetupPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::BackendSetup(payload)).await;
             true
@@ -1022,7 +1013,7 @@ async fn handle_host_envelope(
         FrameKind::BackendConfigSchemas => {
             let payload: BackendConfigSchemasPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::BackendConfigSchemas(payload)).await;
             true
@@ -1030,7 +1021,7 @@ async fn handle_host_envelope(
         FrameKind::BackendConfigSnapshots => {
             let payload: BackendConfigSnapshotsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::BackendConfigSnapshots(payload))
@@ -1040,7 +1031,7 @@ async fn handle_host_envelope(
         FrameKind::BackendCapacity => {
             let payload: BackendCapacityPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::BackendCapacity(payload)).await;
             true
@@ -1048,7 +1039,7 @@ async fn handle_host_envelope(
         FrameKind::TychatState => {
             let payload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::TychatState(payload)).await;
             true
@@ -1056,7 +1047,7 @@ async fn handle_host_envelope(
         FrameKind::MobileAccessState => {
             let payload: MobileAccessStatePayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::MobileAccessState(payload)).await;
             true
@@ -1064,7 +1055,7 @@ async fn handle_host_envelope(
         FrameKind::MobilePairingOffer => {
             let payload: MobilePairingOfferPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::MobilePairingOffer(payload)).await;
             true
@@ -1072,7 +1063,7 @@ async fn handle_host_envelope(
         FrameKind::SessionList => {
             let payload: SessionListPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SessionList(payload)).await;
             true
@@ -1080,7 +1071,7 @@ async fn handle_host_envelope(
         FrameKind::SessionSummaryCountUpdated => {
             let payload: SessionSummaryCountUpdatedPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::SessionSummaryCountUpdated(payload))
@@ -1090,7 +1081,7 @@ async fn handle_host_envelope(
         FrameKind::ProjectOperation => {
             let payload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::ProjectOperation(payload)).await;
             true
@@ -1098,7 +1089,7 @@ async fn handle_host_envelope(
         FrameKind::ProjectNotify => {
             let payload: ProjectNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             match &payload {
                 ProjectNotifyPayload::Upsert { project } => {
@@ -1107,7 +1098,7 @@ async fn handle_host_envelope(
                         .await
                         .is_err()
                     {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 ProjectNotifyPayload::Delete { project } => {
@@ -1120,7 +1111,7 @@ async fn handle_host_envelope(
         FrameKind::CustomAgentNotify => {
             let payload: CustomAgentNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::CustomAgentNotify(payload)).await;
             true
@@ -1128,7 +1119,7 @@ async fn handle_host_envelope(
         FrameKind::SelfImprovementNotify => {
             let payload: protocol::SelfImprovementState = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::SelfImprovementNotify(payload))
@@ -1138,7 +1129,7 @@ async fn handle_host_envelope(
         FrameKind::SteeringNotify => {
             let payload: SteeringNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SteeringNotify(payload)).await;
             true
@@ -1146,7 +1137,7 @@ async fn handle_host_envelope(
         FrameKind::SkillNotify => {
             let payload: SkillNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SkillNotify(payload)).await;
             true
@@ -1154,7 +1145,7 @@ async fn handle_host_envelope(
         FrameKind::McpServerNotify => {
             let payload: McpServerNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::McpServerNotify(payload)).await;
             true
@@ -1162,7 +1153,7 @@ async fn handle_host_envelope(
         FrameKind::WorkflowNotify => {
             let payload: WorkflowNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::WorkflowNotify(payload)).await;
             true
@@ -1170,7 +1161,7 @@ async fn handle_host_envelope(
         FrameKind::WorkflowRunNotify => {
             let payload: WorkflowRunNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::WorkflowRunNotify(payload)).await;
             true
@@ -1178,7 +1169,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmNotify => {
             let payload: protocol::SwarmNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmNotify(payload)).await;
             true
@@ -1186,7 +1177,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmDraftNotify => {
             let payload: protocol::SwarmDraftNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmDraftNotify(payload)).await;
             true
@@ -1194,7 +1185,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmPostNotify => {
             let payload: protocol::SwarmPostNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmPostNotify(payload)).await;
             true
@@ -1202,7 +1193,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmBoardNotify => {
             let payload: protocol::SwarmBoardNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmBoardNotify(payload)).await;
             true
@@ -1210,7 +1201,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmThreadNotify => {
             let payload: protocol::SwarmThreadNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmThreadNotify(payload)).await;
             true
@@ -1218,7 +1209,7 @@ async fn handle_host_envelope(
         FrameKind::SwarmErrorNotify => {
             let payload: protocol::SwarmErrorNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SwarmErrorNotify(payload)).await;
             true
@@ -1226,7 +1217,7 @@ async fn handle_host_envelope(
         FrameKind::TeamNotify => {
             let payload: TeamNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::TeamNotify(payload)).await;
             true
@@ -1234,7 +1225,7 @@ async fn handle_host_envelope(
         FrameKind::TeamsStoreStatusNotify => {
             let payload: protocol::TeamsStoreStatusNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TeamsStoreStatusNotify(payload))
@@ -1244,7 +1235,7 @@ async fn handle_host_envelope(
         FrameKind::AgentRestorationStatus => {
             let payload: protocol::AgentRestorationStatusPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::AgentRestorationStatus(payload))
@@ -1254,7 +1245,7 @@ async fn handle_host_envelope(
         FrameKind::TeamMemberNotify => {
             let payload: TeamMemberNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::TeamMemberNotify(payload)).await;
             true
@@ -1262,7 +1253,7 @@ async fn handle_host_envelope(
         FrameKind::TeamMemberBindingNotify => {
             let payload: TeamMemberBindingNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TeamMemberBindingNotify(payload))
@@ -1272,7 +1263,7 @@ async fn handle_host_envelope(
         FrameKind::TeamPresetCatalogNotify => {
             let payload: TeamPresetCatalogNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TeamPresetCatalogNotify(payload))
@@ -1282,7 +1273,7 @@ async fn handle_host_envelope(
         FrameKind::TeamDraftNotify => {
             let payload: TeamDraftNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::TeamDraftNotify(payload)).await;
             true
@@ -1290,7 +1281,7 @@ async fn handle_host_envelope(
         FrameKind::TeamMemberShuffleSuggestionNotify => {
             let payload: TeamMemberShuffleSuggestionNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TeamMemberShuffleSuggestionNotify(payload))
@@ -1300,7 +1291,7 @@ async fn handle_host_envelope(
         FrameKind::TeamContextCompactionNotify => {
             let payload: TeamContextCompactionNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::TeamContextCompactionNotify(payload))
@@ -1310,7 +1301,7 @@ async fn handle_host_envelope(
         FrameKind::SessionSchemas => {
             let payload: SessionSchemasPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::SessionSchemas(payload)).await;
             true
@@ -1318,7 +1309,7 @@ async fn handle_host_envelope(
         FrameKind::LaunchProfileCatalogNotify => {
             let payload: LaunchProfileCatalogPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx
                 .send(HostEvent::LaunchProfileCatalogNotify(payload))
@@ -1328,15 +1319,31 @@ async fn handle_host_envelope(
         FrameKind::CommandError => {
             let payload: CommandErrorPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::CommandError(payload)).await;
+            true
+        }
+        FrameKind::AgentProjectChanged => {
+            let payload: AgentStartPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
+            };
+            for pending in pending_agent_endpoints.values_mut() {
+                if pending.payload.agent_id == payload.agent_id {
+                    pending.payload.project_id = payload.project_id.clone();
+                    pending.payload.workspace_roots = payload.workspace_roots.clone();
+                }
+            }
+            let _ = host_tx
+                .send(HostEvent::AgentProjectChanged(Box::new(payload)))
+                .await;
             true
         }
         FrameKind::AgentMoveResult => {
             let payload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::AgentMoveResult(payload)).await;
             true
@@ -1344,7 +1351,7 @@ async fn handle_host_envelope(
         FrameKind::AgentClosed => {
             let payload: AgentClosedPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let _ = host_tx.send(HostEvent::AgentClosed(payload)).await;
             true
@@ -1352,14 +1359,14 @@ async fn handle_host_envelope(
         FrameKind::NewAgent => {
             let payload: NewAgentPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
-            emit_new_agent_endpoint(payload, &host_tx, &shared).await
+            emit_new_agent_endpoint(payload, &host_tx, &shared, pending_agent_endpoints).await?
         }
         FrameKind::NewTerminal => {
             let payload: NewTerminalPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return false,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream = payload.stream.clone();
             let stream_parts = parse_terminal_stream(&stream);
@@ -1374,7 +1381,7 @@ async fn handle_host_envelope(
                 .register_route(stream.clone(), Route::Terminal(terminal_tx))
                 .is_err()
             {
-                return false;
+                return Ok(false);
             }
             if shared
                 .register_writable_stream(stream.clone(), 0)
@@ -1382,7 +1389,7 @@ async fn handle_host_envelope(
                 .is_err()
             {
                 shared.unregister_route(&stream);
-                return false;
+                return Ok(false);
             }
 
             let endpoint = TerminalEndpoint {
@@ -1406,18 +1413,22 @@ async fn handle_host_envelope(
             }
             true
         }
-        other => panic!(
-            "unexpected server frame kind {} on host stream {}",
-            other, envelope.stream
-        ),
-    }
+        kind => {
+            return Err(ClientError::UnexpectedFrame {
+                stream: envelope.stream,
+                kind,
+            });
+        }
+    };
+    Ok(handled)
 }
 
 async fn emit_new_agent_endpoint(
     payload: NewAgentPayload,
     host_tx: &mpsc::Sender<HostEvent>,
     shared: &Arc<Shared>,
-) -> bool {
+    pending_agent_endpoints: &mut HashMap<StreamPath, PendingAgentEndpoint>,
+) -> Result<bool, ClientError> {
     let stream = payload.instance_stream.clone();
     let stream_parts = parse_agent_stream(&stream);
     assert_eq!(
@@ -1431,7 +1442,7 @@ async fn emit_new_agent_endpoint(
         .register_route(stream.clone(), Route::Agent(agent_tx))
         .is_err()
     {
-        return false;
+        return Ok(false);
     }
     if shared
         .register_writable_stream(stream.clone(), 0)
@@ -1439,25 +1450,21 @@ async fn emit_new_agent_endpoint(
         .is_err()
     {
         shared.unregister_route(&stream);
-        return false;
+        return Ok(false);
     }
 
     if payload.session_id.is_none() {
         // Keep wire-level NewAgent early while exposing the authoritative
         // session id on the higher-level endpoint once its bootstrap arrives.
-        shared
-            .pending_agent_endpoints
-            .lock()
-            .expect("pending agent endpoint registry poisoned")
-            .insert(
-                stream,
-                PendingAgentEndpoint {
-                    payload,
-                    events: agent_rx,
-                    host_tx: host_tx.clone(),
-                },
-            );
-        return true;
+        pending_agent_endpoints.insert(
+            stream,
+            PendingAgentEndpoint {
+                payload,
+                events: agent_rx,
+                host_tx: host_tx.clone(),
+            },
+        );
+        return Ok(true);
     }
 
     let endpoint = AgentEndpoint {
@@ -1475,7 +1482,40 @@ async fn emit_new_agent_endpoint(
     if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
         shared.unregister_route(&stream);
     }
-    true
+    Ok(true)
+}
+
+async fn resolve_pending_agent_endpoint(
+    shared: &Arc<Shared>,
+    pending_agent_endpoints: &mut HashMap<StreamPath, PendingAgentEndpoint>,
+    stream: &StreamPath,
+    session_id: Option<protocol::SessionId>,
+) {
+    let pending = pending_agent_endpoints.remove(stream);
+    let Some(mut pending) = pending else {
+        return;
+    };
+    pending.payload.session_id = session_id;
+    let endpoint = AgentEndpoint {
+        info: pending.payload,
+        events: AgentEvents {
+            stream: stream.clone(),
+            shared: shared.clone(),
+            rx: pending.events,
+        },
+        commands: AgentCommands {
+            stream: stream.clone(),
+            shared: shared.clone(),
+        },
+    };
+    if pending
+        .host_tx
+        .send(HostEvent::NewAgent(endpoint))
+        .await
+        .is_err()
+    {
+        shared.unregister_route(stream);
+    }
 }
 
 fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
@@ -1533,36 +1573,41 @@ fn bootstrap_agent_session_id(payload: &AgentBootstrapPayload) -> Option<protoco
     logical_session_id
 }
 
-async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
+async fn handle_agent_envelope(
+    envelope: Envelope,
+    shared: &Arc<Shared>,
+    pending_agent_endpoints: &mut HashMap<StreamPath, PendingAgentEndpoint>,
+) -> Result<(), ClientError> {
     let Some(RouteRef::Agent(tx)) = shared.route_for(&envelope.stream) else {
-        return;
+        return Ok(());
     };
 
     let event = match envelope.kind {
         FrameKind::AgentBootstrap => {
             let payload: AgentBootstrapPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::Bootstrap(payload)
         }
-        FrameKind::AgentStart => {
+        FrameKind::AgentStart | FrameKind::AgentProjectChanged => {
             let payload: AgentStartPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
-            assert_eq!(
-                payload.agent_id, stream_parts.agent_id,
-                "agent_start payload agent_id {} does not match stream {}",
-                payload.agent_id, envelope.stream
-            );
+            if payload.agent_id != stream_parts.agent_id {
+                return Err(ClientError::AgentIdentityMismatch {
+                    stream: envelope.stream,
+                    kind: envelope.kind,
+                });
+            }
             AgentEvent::Start(Box::new(payload))
         }
         FrameKind::AgentError => {
             let payload: AgentErrorPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
             assert_eq!(
@@ -1575,7 +1620,7 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::AgentRenamed => {
             let payload: AgentRenamedPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
             assert_eq!(
@@ -1588,7 +1633,7 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::AgentActivityStats => {
             let payload: AgentActivityStatsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
             assert_eq!(
@@ -1601,14 +1646,14 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::AgentActivityChanged => {
             let payload: AgentActivityChangedPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::ActivityChanged(payload)
         }
         FrameKind::ContextCompactionNotify => {
             let payload: ContextCompactionNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
             assert_eq!(
@@ -1621,7 +1666,7 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::ContextCompactionCapability => {
             let payload: ContextCompactionCapabilityPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             let stream_parts = parse_agent_stream(&envelope.stream);
             assert_eq!(
@@ -1634,141 +1679,151 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::ChatEvent => {
             let payload: ChatEvent = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::Chat(Box::new(payload))
         }
         FrameKind::SessionHistory => {
             let payload: SessionHistoryPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::SessionHistory(payload)
         }
         FrameKind::SessionSettings => {
             let payload: SessionSettingsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::SessionSettings(payload)
         }
         FrameKind::QueuedMessages => {
             let payload: QueuedMessagesPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             AgentEvent::QueuedMessages(payload)
         }
-        other => panic!(
-            "unexpected server frame kind {} on agent stream {}",
-            other, envelope.stream
-        ),
+        kind => {
+            return Err(ClientError::UnexpectedFrame {
+                stream: envelope.stream,
+                kind,
+            });
+        }
     };
 
-    shared
-        .resolve_pending_agent_endpoint(&envelope.stream, agent_event_session_id(&event))
-        .await;
+    resolve_pending_agent_endpoint(
+        shared,
+        pending_agent_endpoints,
+        &envelope.stream,
+        agent_event_session_id(&event),
+    )
+    .await;
     let _ = tx.send(event).await;
+    Ok(())
 }
 
 fn project_stream(project_id: &ProjectId) -> StreamPath {
     StreamPath(format!("/project/{}", project_id.0))
 }
 
-async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
+async fn handle_project_envelope(
+    envelope: Envelope,
+    shared: &Arc<Shared>,
+) -> Result<(), ClientError> {
     let Some(RouteRef::Project(tx)) = shared.route_for(&envelope.stream) else {
-        return;
+        return Ok(());
     };
 
     let event = match envelope.kind {
         FrameKind::ProjectBootstrap => {
             let payload: ProjectBootstrapPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::Bootstrap(payload)
         }
         FrameKind::ProjectFileList => {
             let payload: ProjectFileListPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::FileList(payload)
         }
         FrameKind::ProjectGitStatus => {
             let payload: ProjectGitStatusPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::GitStatus(payload)
         }
         FrameKind::CodeIntelOverview => {
             let payload: CodeIntelOverviewPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelOverview(payload)
         }
         FrameKind::CodeIntelStatus => {
             let payload: CodeIntelStatusPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelStatus(payload)
         }
         FrameKind::CodeIntelFileModel => {
             let payload: CodeIntelFileModelPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelFileModel(payload)
         }
         FrameKind::CodeIntelDiagnostics => {
             let payload: CodeIntelDiagnosticsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelDiagnostics(payload)
         }
         FrameKind::CodeIntelHoverResult => {
             let payload: CodeIntelHoverResultPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelHoverResult(payload)
         }
         FrameKind::CodeIntelNavigateResult => {
             let payload: CodeIntelNavigateResultPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelNavigateResult(payload)
         }
         FrameKind::CodeIntelReferencesResults => {
             let payload: CodeIntelReferencesResultsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelReferencesResults(payload)
         }
         FrameKind::CodeIntelReferencesComplete => {
             let payload: CodeIntelReferencesCompletePayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelReferencesComplete(payload)
         }
         FrameKind::CodeIntelError => {
             let payload: CodeIntelErrorPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::CodeIntelError(payload)
         }
         FrameKind::ProjectFileContents => {
             let payload: ProjectFileContentsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             assert!(
                 !payload.path.relative_path.trim().is_empty(),
@@ -1779,50 +1834,56 @@ async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::ProjectGitDiff => {
             let payload: ProjectGitDiffPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::GitDiff(payload)
         }
         FrameKind::ProjectEvent => {
             let payload: ProjectEventPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             ProjectEvent::Notify(payload)
         }
-        other => panic!(
-            "unexpected server frame kind {} on project stream {}",
-            other, envelope.stream
-        ),
+        kind => {
+            return Err(ClientError::UnexpectedFrame {
+                stream: envelope.stream,
+                kind,
+            });
+        }
     };
 
     let _ = tx.send(event).await;
+    Ok(())
 }
 
-async fn handle_terminal_envelope(envelope: Envelope, shared: &Arc<Shared>) {
+async fn handle_terminal_envelope(
+    envelope: Envelope,
+    shared: &Arc<Shared>,
+) -> Result<(), ClientError> {
     let Some(RouteRef::Terminal(tx)) = shared.route_for(&envelope.stream) else {
-        return;
+        return Ok(());
     };
 
     let event = match envelope.kind {
         FrameKind::TerminalBootstrap => {
             let payload: TerminalBootstrapPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             TerminalEvent::Bootstrap(payload)
         }
         FrameKind::TerminalStart => {
             let payload: TerminalStartPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             TerminalEvent::Start(payload)
         }
         FrameKind::TerminalOutput => {
             let payload: TerminalOutputPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             assert!(
                 !payload.data.is_empty(),
@@ -1833,22 +1894,25 @@ async fn handle_terminal_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         FrameKind::TerminalExit => {
             let payload: TerminalExitPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             TerminalEvent::Exit(payload)
         }
         FrameKind::TerminalError => {
             let payload: TerminalErrorPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
-                Err(_) => return,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
             };
             TerminalEvent::Error(payload)
         }
-        other => panic!(
-            "unexpected server frame kind {} on terminal stream {}",
-            other, envelope.stream
-        ),
+        kind => {
+            return Err(ClientError::UnexpectedFrame {
+                stream: envelope.stream,
+                kind,
+            });
+        }
     };
 
     let _ = tx.send(event).await;
+    Ok(())
 }

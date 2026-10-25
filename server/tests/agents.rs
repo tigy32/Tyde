@@ -3982,6 +3982,67 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .restored_agents(&bootstrap, std::slice::from_ref(&session))
             .await;
         let restored_agent = &restored_agents[&session];
+        // Bootstrap may arrive before, during or after the restart turn.
+        let (mut completion_observer, observed_bootstrap) = fixture.connect_with_bootstrap().await;
+        let completion_stream = observed_bootstrap
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == restored_agent.agent_id)
+            .expect("observer's restored agent descriptor")
+            .instance_stream
+            .clone();
+        eprintln!(
+            "Restart completion observer: distinct_stream={}",
+            completion_stream != restored_agent.instance_stream
+        );
+        let mut continuing = false;
+        loop {
+            let event = completion_observer
+                .next_event()
+                .await
+                .expect("restart completion protocol read")
+                .expect("restart completion connection stays open");
+            if event.stream != completion_stream {
+                continue;
+            }
+            match event.kind {
+                FrameKind::AgentBootstrap => {
+                    let bootstrap: protocol::AgentBootstrapPayload =
+                        event.parse_payload().expect("restart completion bootstrap");
+                    continuing |= bootstrap.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::RestartRecovery {
+                                phase: protocol::RestartRecoveryPhase::Continuing
+                            })
+                        )
+                    });
+                    eprintln!(
+                        "Restart completion bootstrap: continuing={continuing} activity={:?}",
+                        bootstrap.activity
+                    );
+                    if continuing && bootstrap.activity == protocol::AgentActivity::Idle {
+                        break;
+                    }
+                }
+                FrameKind::ChatEvent => {
+                    let chat: ChatEvent = event
+                        .parse_payload()
+                        .expect("restart completion chat event");
+                    continuing |= matches!(
+                        chat,
+                        ChatEvent::RestartRecovery {
+                            phase: protocol::RestartRecoveryPhase::Continuing
+                        }
+                    );
+                    if continuing && matches!(chat, ChatEvent::TypingStatusChanged(false)) {
+                        eprintln!("Restart completion: observed live idle");
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
         let (_, replay) = fixture.connect_with_bootstrap().await;
         let restored = replay
             .task_token_usages

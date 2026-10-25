@@ -157,11 +157,11 @@ run-wrapper = "macos-test-binary"
 
 # Retain causal evidence: independent protocol work finishes before held I/O is released.
 [[profile.default.overrides]]
-filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure)'
+filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure) | binary_id(tests::client_runtime) & test(project_deletion_preserves_high_level_client_and_active_conversation) | binary_id(server::agents) & test(task_timing_observes_overlap_background_completion_and_restart_without_replay)'
 success-output = "final"
 
 [[profile.ci.overrides]]
-filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure)'
+filter = 'binary_id(server::workbenches) & (test(workbench_create_and_remove_round_trip_real_git_repo) | test(workbench_remove_cascades_agents_terminals_sessions_and_steering)) | binary_id(server::projects) & (test(add_root_emits_updated_upsert) | test(create_project_emits_upsert)) | binary_id(server::session_resume) & test(session_reads_remain_responsive_during_uncommitted_write) | binary_id(server::supervisor) & test(replacement_compaction_reports_required_close_failure) | binary_id(tests::client_runtime) & test(project_deletion_preserves_high_level_client_and_active_conversation) | binary_id(server::agents) & test(task_timing_observes_overlap_background_completion_and_restart_without_replay)'
 success-output = "final"
 
 # Retain state/event evidence for the returned watcher flow.
