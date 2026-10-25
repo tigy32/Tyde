@@ -12395,6 +12395,27 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
 conformance2_scenario!(real_session_settings, [BackendCapability::SessionSettings]);
 
 async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
+    let helper_config = server::supervision_spawn_config(
+        Some(protocol::SpawnCostHint::Low),
+        host.config.session_settings.clone(),
+    );
+    let agent_config = std::mem::replace(&mut host.config, helper_config);
+    let prompt = launch_prompt();
+    let helper = spawn_agent(host, &prompt).await;
+    let initial = collect_turn(host, &helper, &prompt).await;
+    assert!(
+        initial.final_text().contains(READY_MARKER),
+        "InferenceOnly helper must answer its initial turn"
+    );
+    let continued = ask(host, &helper, prompt).await;
+    assert!(
+        continued.final_text().contains(READY_MARKER),
+        "InferenceOnly helper must answer its follow-up turn"
+    );
+    assert_universal_contract(&[initial, continued]);
+    assert_clean_close(host, &helper).await;
+    host.config = agent_config;
+
     let schema = await_session_schema(host).await;
     assert!(
         B::has_dynamic_session_schema(),

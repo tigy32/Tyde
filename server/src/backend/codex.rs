@@ -9028,17 +9028,10 @@ impl CodexInner {
                     // turn start; the next turn/started belongs to it.
                     state.interrupt_next_root_turn = false;
                     state.awaiting_root_turn_start = true;
-                    let (model_override, effort_override) = match state.execution_mode {
-                        BackendExecutionMode::Agent => (
-                            state.model_override.clone(),
-                            state.reasoning_effort_override.clone(),
-                        ),
-                        BackendExecutionMode::InferenceOnly => (None, None),
-                    };
                     (
                         state.thread_id.clone(),
-                        model_override,
-                        effort_override,
+                        state.model_override.clone(),
+                        state.reasoning_effort_override.clone(),
                         state.approval_policy.clone(),
                         state.access_mode,
                         state.execution_mode,
@@ -24673,11 +24666,7 @@ impl CodexBackend {
             *task_compaction_handle
                 .lock()
                 .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
-            let resolved_settings = if inference_only {
-                protocol::SessionSettingsValues::default()
-            } else {
-                resolve_session_settings(&config)
-            };
+            let resolved_settings = resolve_session_settings(&config);
             let model_override = match resolved_settings.0.get("model") {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
@@ -24702,8 +24691,10 @@ impl CodexBackend {
                 let mut settings = json!({
                     "model": model_override,
                     "reasoning_effort": effort_override,
-                    "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
                 });
+                if !inference_only {
+                    settings["approval_policy"] = json!(CODEX_FORCED_APPROVAL_POLICY);
+                }
                 if resolved_settings.0.contains_key("speed") {
                     settings["speed"] =
                         session_settings_to_json(&resolved_settings)["speed"].clone();

@@ -1814,3 +1814,29 @@ hooks are suppressed. No credentials are copied to the fixture or retained in
 its diagnostics. The shared `real_enforced_review_feedback` and
 `real_enforced_read_only` cases continue to cover transport failure and native
 restriction contracts.
+
+
+## InferenceOnly helpers preserve selected settings
+
+`real_session_settings` now opens an ordinary InferenceOnly helper with the
+fixture's selected settings, checks two completed text turns against the
+unchanged universal model pin, closes it, and runs the existing normal-agent
+settings flow. It uses the existing supervision configuration, whose model,
+cost hint and InferenceOnly configuration match the naming helper; it adds no
+helper mode or title-generation behavior.
+
+The real Codex negative control failed on the helper's model pin: selected
+`gpt-5.6-luna` reported `gpt-6.1-sol`. Codex discarded configured settings at
+startup and omitted model/effort overrides when starting InferenceOnly turns.
+Both paths now propagate the existing resolved settings, retaining the helper's
+existing approval policy. Normal-agent startup and all other adapters are
+unchanged.
+
+The entire extended case passed on all eight SessionSettings-capable backends:
+Claude, Codex, Kiro, Grok, Hermes, Muse, Antigravity and OpenCode. These are real
+Backend runs, not title-generation certification or rendered-UI coverage. Codex
+used its configured native route with Luna/low; Claude and Hermes used the
+approved small-test API credentials without copying or modifying native OAuth
+or global configuration. The other backends retained their normal profiles.
+Content-safe receipts and complete private diagnostics are retained under
+`/home/tyggs/tyde-evidence/codex-helper-selected-model/`.
