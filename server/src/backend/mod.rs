@@ -2865,11 +2865,11 @@ pub(crate) fn validate_custom_launch_profile(
 pub(crate) fn learning_analyzer_capability(
     kind: BackendKind,
 ) -> protocol::LearningAnalyzerCapability {
-    match kind {
-        BackendKind::Codex => protocol::LearningAnalyzerCapability::ToolFreeReusable,
-        _ => protocol::LearningAnalyzerCapability::Unsupported {
-            reason: "This backend does not support Tyde's reusable tool-free analyzer contract"
-                .into(),
-        },
+    if SUPPORTED_BACKENDS.contains(&kind) {
+        protocol::LearningAnalyzerCapability::TextAnalysis
+    } else {
+        protocol::LearningAnalyzerCapability::Unsupported {
+            reason: "This backend has been removed".into(),
+        }
     }
 }

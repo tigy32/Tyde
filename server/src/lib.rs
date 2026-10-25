@@ -71,6 +71,15 @@ pub use host::{
 pub use process_env::init_process_env;
 #[cfg(feature = "test-support")]
 pub use project_stream::scan_test_support::{InstalledScanHook, ScanPoint};
+#[cfg(feature = "test-support")]
+pub use self_improvement::{learning_analysis_prompt, parse_learning_analysis};
+
+#[cfg(feature = "test-support")]
+pub fn feedback_analysis_spawn_config_for_test(
+    settings: Option<protocol::SessionSettingsValues>,
+) -> backend::BackendSpawnConfig {
+    agent::agent_name_generation_spawn_config(settings)
+}
 
 use std::collections::HashMap;
 

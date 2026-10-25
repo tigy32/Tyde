@@ -91,10 +91,31 @@ pub struct LearningOperation {
     pub reason: String,
     pub origin_id: HumanInputId,
 }
+/// The analyzer's reply. The server, not the model, resolves rule identity,
+/// scope, and the canonical current text of an updated rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningAnalysis {
-    pub operations: Vec<LearningOperation>,
+    pub operations: Vec<LearningProposal>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningTarget {
+    Steering,
+    ReviewAspect,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningProposal {
+    pub origin_id: HumanInputId,
+    pub target: LearningTarget,
+    /// True to revise the existing rule `id` in this scope; false to create
+    /// a rule with the new identifier `id`.
+    pub update: bool,
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    pub reason: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -203,7 +224,7 @@ pub struct LearningJournal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LearningAnalyzerCapability {
-    ToolFreeReusable,
+    TextAnalysis,
     Unsupported { reason: String },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -177,7 +177,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench"
+                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_feedback_analysis"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -10260,6 +10260,136 @@ conformance2_scenario!(
         BackendCapability::ResumeSession
     ]
 );
+
+fn parse_feedback_analysis_reply(turn: &Turn, phase: &str) -> protocol::LearningAnalysis {
+    let reply = turn.final_text();
+    let json = serde_json::from_str::<serde_json::Value>(&reply);
+    let typed = server::parse_learning_analysis(&reply);
+    eprintln!(
+        "FEEDBACK_ANALYSIS {}",
+        serde_json::json!({
+            "phase": phase,
+            "bytes": reply.len(),
+            "code_fence_prefix": reply.trim_start().starts_with("```"),
+            "code_fence_suffix": reply.trim_end().ends_with("```"),
+            "json_syntax_valid": json.is_ok(),
+            "typed_schema_valid": typed.is_ok(),
+            "operations": typed.as_ref().ok().map(|value| value.operations.len()),
+        "proposal_shape": typed.as_ref().ok().map(|value| value.operations.iter().map(|proposal| serde_json::json!({
+            "target": proposal.target,
+            "update": proposal.update,
+            "origin_matches_input": proposal.origin_id.0 == if phase == "overlap" { "feedback-1" } else { "feedback-2" },
+            "id_is_existing": proposal.id == "explain-non-obvious-code",
+            "text_mentions_terminology": proposal.text.to_lowercase().contains("terminolog"),
+        })).collect::<Vec<_>>()),
+        "reported_models": turn.events().iter().filter_map(|event| match event {
+            ChatEvent::StreamStart(start) => start.model.clone(),
+            ChatEvent::StreamEnd(end) => end.message.model_info.as_ref().map(|info| info.model.clone()),
+            _ => None,
+        }).collect::<BTreeSet<_>>(),
+            "stream_starts": turn.events().iter().filter(|event| matches!(event, ChatEvent::StreamStart(_))).count(),
+            "stream_ends": turn.events().iter().filter(|event| matches!(event, ChatEvent::StreamEnd(_))).count(),
+        })
+    );
+    typed.unwrap_or_else(|error| panic!("{}: {error}", turn.label()))
+}
+
+async fn real_feedback_analysis<B: Backend>(host: &mut Harness<B>) {
+    host.config =
+        server::feedback_analysis_spawn_config_for_test(host.config.session_settings.clone());
+    let aspect_id = "explain-non-obvious-code";
+    let scope = protocol::SteeringScope::Host;
+    let existing = protocol::LearningRule::ReviewAspect {
+        id: aspect_id.into(),
+        scope: scope.clone(),
+        aspect: protocol::ReviewAspectConfig {
+            name: "Explain non-obvious code".into(),
+            description: String::new(),
+            instructions: "Flag non-obvious logic or unexplained constants that lack a brief explanation of why.".into(),
+            enabled: true,
+        },
+    };
+    let mut feedback = protocol::AcceptedHumanInput {
+        id: protocol::HumanInputId("feedback-1".into()),
+        source: protocol::HumanInputSource::Chat,
+        agent_id: AgentId("conformance-author".into()),
+        session_id: None,
+        project_id: None,
+        message: "Add a comment explaining why the sampler uses 0.75 as its smoothing factor; I had to guess what that number means.".into(),
+        assistant_context: "I tuned the audio sampler and set smoothing = 0.75.".into(),
+    };
+    let mut config = protocol::LearningConfig {
+        enabled: true,
+        steering: true,
+        review_aspects: true,
+        ..Default::default()
+    };
+    let prompt = server::learning_analysis_prompt(
+        &scope,
+        std::slice::from_ref(&feedback),
+        std::slice::from_ref(&existing),
+        &BTreeMap::new(),
+        "",
+        &config,
+    )
+    .expect("build analysis input");
+    let agent = spawn_agent(host, &prompt).await;
+    let overlap = collect_turn(host, &agent, &prompt).await;
+    assert_no_error_message("feedback analysis", overlap.events());
+    let analysis = parse_feedback_analysis_reply(&overlap, "overlap");
+    for proposal in analysis.operations {
+        assert!(
+            proposal.update
+                && proposal.target == protocol::LearningTarget::ReviewAspect
+                && proposal.id == aspect_id
+                && proposal.origin_id == feedback.id,
+            "Overlapping feedback must refine the existing aspect or propose nothing"
+        );
+        assert!(
+            !proposal.text.contains("0.75"),
+            "Durable guidance must not repeat incident-specific constants"
+        );
+    }
+    feedback.id = protocol::HumanInputId("feedback-2".into());
+    // Four real providers returned no proposal when this fixture repeated
+    // the analyzer's own atomic-policy guidance. Terminology is independent
+    // of both that guidance and the existing code-explanation aspect.
+    feedback.message = "For all future work, use consistent terminology for the same concept across UI labels, documentation and code rather than inventing competing names.".into();
+    feedback.assistant_context.clear();
+    // Claude correctly chose a new review aspect when both targets were
+    // enabled. Restrict this input to steering before asserting that target.
+    config.review_aspects = false;
+    let prompt = server::learning_analysis_prompt(
+        &scope,
+        std::slice::from_ref(&feedback),
+        &[existing],
+        &BTreeMap::new(),
+        "",
+        &config,
+    )
+    .expect("build independent feedback input");
+    let independent = ask(host, &agent, &prompt).await;
+    assert_no_error_message("reused feedback analysis", independent.events());
+    let analysis = parse_feedback_analysis_reply(&independent, "independent");
+    assert_eq!(
+        analysis.operations.len(),
+        1,
+        "One clear independent instruction needs one atomic proposal"
+    );
+    let proposal = &analysis.operations[0];
+    assert!(
+        !proposal.update
+            && proposal.target == protocol::LearningTarget::Steering
+            && proposal.id != aspect_id
+            && proposal.origin_id == feedback.id,
+        "Independent feedback must create one new steering rule for the current input"
+    );
+    assert!(!proposal.title.is_empty() && !proposal.text.is_empty() && !proposal.reason.is_empty());
+    assert_universal_contract(&[overlap, independent]);
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(real_feedback_analysis, []);
 
 async fn real_native_child_hierarchy<B: Backend>(host: &mut Harness<B>) {
     let marker = unique_payload();

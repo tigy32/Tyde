@@ -44,7 +44,37 @@ fn operation(before: Option<LearningRule>, after: LearningRule, input: &str) -> 
         origin_id: HumanInputId(input.into()),
     }
 }
+/// The analyzer names a target, an update flag, an identifier, and text; the
+/// server resolves scope and the current rule.
 fn response(operations: Vec<LearningOperation>) -> String {
+    let operations = operations
+        .into_iter()
+        .map(|operation| {
+            let (target, id, title, text) = match operation.after {
+                LearningRule::Steering { steering } => (
+                    LearningTarget::Steering,
+                    steering.id.0,
+                    steering.title,
+                    steering.content,
+                ),
+                LearningRule::ReviewAspect { id, aspect, .. } => (
+                    LearningTarget::ReviewAspect,
+                    id,
+                    aspect.name,
+                    aspect.instructions,
+                ),
+            };
+            LearningProposal {
+                origin_id: operation.origin_id,
+                target,
+                update: operation.before.is_some(),
+                id,
+                title,
+                text,
+                reason: operation.reason,
+            }
+        })
+        .collect();
     serde_json::to_string(&LearningAnalysis { operations }).expect("encode analyzer response")
 }
 async fn save(fixture: &mut Fixture, before: LearningConfig, after: LearningConfig) {
@@ -424,6 +454,15 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
         BackendKind::Codex,
     ])
     .await;
+    let advertised = &fixture.bootstrap.self_improvement.analyzers;
+    assert_eq!(advertised.len(), server::backend::SUPPORTED_BACKENDS.len());
+    for kind in server::backend::SUPPORTED_BACKENDS {
+        assert!(
+            advertised.iter().any(|option| option.backend_kind == kind
+                && option.capability == LearningAnalyzerCapability::TextAnalysis),
+            "Every supported backend must be advertised for ordinary text analysis"
+        );
+    }
     let agent = fixture.spawn("Author", "One-off task").await;
     fixture.finish_turn(&agent).await;
     human(
@@ -435,12 +474,14 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
     )
     .await;
     fixture.finish_turn(&agent).await;
+    // The user chose best-effort analysis on every supported backend, so
+    // unsupported coverage now uses the removed backend, not a live provider.
     let mut unsupported = config(LearningMode::Automatic);
     unsupported
         .analyzer
         .as_mut()
         .expect("selected model")
-        .backend_kind = BackendKind::Muse;
+        .backend_kind = BackendKind::Tycode;
     save(&mut fixture, LearningConfig::default(), unsupported.clone()).await;
     human(
         &mut fixture,
@@ -471,6 +512,81 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
     .await;
     assert!(restored.usage.is_empty());
     assert!(restored.changes.is_empty());
+
+    // Launch input is accepted feedback too. Prepare the author while its
+    // analyzer is disabled so the fenced reply belongs to fenced-input.
+    let author = fixture.spawn("Fenced author", "One-off task").await;
+    fixture.finish_turn(&author).await;
+    eprintln!("LEARNING FENCED phase=author_prepared_analyzer_disabled");
+    let fenced = format!(
+        "```json\n{}\n```",
+        response(vec![operation(
+            None,
+            steering("Retain explicit constraints."),
+            "fenced-input",
+        )])
+    );
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(fenced)))
+        .expect("install fenced analyzer reply");
+    save(&mut fixture, unsupported, config(LearningMode::Automatic)).await;
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.self_improvement.usage.is_empty());
+    assert!(bootstrap.self_improvement.changes.is_empty());
+    eprintln!("LEARNING FENCED phase=enabled_before_explicit_feedback");
+    human(
+        &mut fixture,
+        &author,
+        "fenced-input",
+        HumanInputAction::Send,
+        "Always retain my explicit constraints.",
+    )
+    .await;
+    let rejected: SelfImprovementState =
+        next_frame_matching_on(&mut observer, "fenced analyzer run settled", |frame| {
+            frame.kind == FrameKind::SelfImprovementNotify
+                && frame
+                    .parse_payload::<SelfImprovementState>()
+                    .is_ok_and(|state| {
+                        state.usage.len() == 1
+                            && state
+                                .scopes
+                                .iter()
+                                .all(|scope| !matches!(scope.status, LearningStatus::Running))
+                    })
+        })
+        .await
+        .parse_payload()
+        .expect("parse fenced analyzer state");
+    eprintln!("LEARNING FENCED phase=invalid_reply_settled");
+    assert!(
+        rejected.scopes.iter().any(|scope| matches!(
+            &scope.status,
+            LearningStatus::Failed { reason }
+                if reason == "Analyzer returned invalid structured results; no changes applied"
+        )),
+        "A fenced reply must fail as invalid structured results, got {:?}",
+        rejected
+            .scopes
+            .iter()
+            .map(|scope| &scope.status)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rejected.changes.is_empty(),
+        "A reply outside the canonical JSON contract must not propose or apply a rule"
+    );
+    assert!(
+        fixture
+            .connect_with_bootstrap()
+            .await
+            .1
+            .steering
+            .iter()
+            .all(|steering| steering.content != "Retain explicit constraints."),
+        "Automatic mode must not apply a rule from a non-canonical reply"
+    );
 }
 
 #[tokio::test]
@@ -943,6 +1059,19 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     shutdown.wait_until_entered().await;
     let generated = scoped_rule("Keep project changes focused.");
     let revised = scoped_rule("Explain focused project changes.");
+    let outside = fixture
+        .bootstrap
+        .steering
+        .first()
+        .expect("a rule outside this project")
+        .clone();
+    assert_ne!(outside.scope, scope);
+    let escape = LearningRule::Steering {
+        steering: Steering {
+            content: "Cannot escape this project.".into(),
+            ..outside.clone()
+        },
+    };
     fixture
         .host_for_test()
         .set_learning_script_for_test(
@@ -957,8 +1086,10 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
                 "project-protected",
             )])))
             .then(MockTurn::text(response(vec![operation(
-                None,
-                steering("Cannot escape this project."),
+                Some(LearningRule::Steering {
+                    steering: outside.clone(),
+                }),
+                escape,
                 "project-escape",
             )]))),
         )
@@ -1109,5 +1240,10 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         .expect("scope failure")
     };
     assert_eq!(failed.usage.len(), 4);
-    assert_eq!(fixture.connect_with_bootstrap().await.1.steering.len(), 2);
+    let steering = fixture.connect_with_bootstrap().await.1.steering;
+    assert_eq!(steering.len(), 2);
+    assert!(
+        steering.contains(&outside),
+        "A project analyzer must not edit a rule outside its scope"
+    );
 }

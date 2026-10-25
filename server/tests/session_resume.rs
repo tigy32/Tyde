@@ -1604,32 +1604,31 @@ async fn restart_without_an_ambient_runtime_restores_working_agents() {
     .expect("host construction thread")
     .expect("construct replacement host off-runtime");
 
-    (async {
-        loop {
-            if host.live_agent_session_ids().await.contains(&session) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-
-    let (mut client, bootstrap) = fixture::connect_host(host.clone()).await;
-    let restored = bootstrap
-        .agents
-        .iter()
-        .find(|restored| restored.session_id.as_ref() == Some(&session))
-        .expect("restored agent in bootstrap")
-        .clone();
+    // live_agent_session_ids includes unpublished bindings. The failed run
+    // observed that reservation before its descriptor reached HostBootstrap;
+    // wait for canonical publication and initialized replay, not membership.
+    let (client, bootstrap) = fixture::connect_host(host.clone()).await;
+    eprintln!(
+        "RUNTIMELESS RESTORE initial_descriptor_count={}",
+        bootstrap.agents.len()
+    );
+    fixture.client = client;
+    let restored = fixture
+        .restored_agents(&bootstrap, std::slice::from_ref(&session))
+        .await
+        .remove(&session)
+        .expect("restored agent announced and initialized");
+    eprintln!("RUNTIMELESS RESTORE canonical descriptor and initialized replay observed");
 
     // The restored card is only worth anything if its actor is still alive to
     // answer. A dropped restoration runtime leaves the card and loses the
     // actor, which is exactly the failure this asserts against.
-    client
+    fixture
+        .client
         .send_message(&restored.instance_stream, "are you alive".to_owned())
         .await
         .expect("send to restored agent");
-    fixture::next_frame_matching_on(&mut client, "restored agent reply", |env| {
+    fixture::next_frame_matching_on(&mut fixture.client, "restored agent reply", |env| {
         env.stream == restored.instance_stream
             && env.kind == FrameKind::ChatEvent
             && matches!(

@@ -1814,6 +1814,26 @@ hooks are suppressed. No credentials are copied to the fixture or retained in
 its diagnostics. The shared `real_enforced_review_feedback` and
 `real_enforced_read_only` cases continue to cover transport failure and native
 restriction contracts.
+## Feedback analysis
+
+Feedback analysis reuses the existing naming/summary utility path:
+`agent_name_generation_spawn_config` and `Backend::spawn` in `InferenceOnly`
+mode. All eight supported backends are eligible; the selected backend and
+model retain their normal provider/auth routing. Protocol 90 replaces the
+misleading analyzer capability name with `TextAnalysis`. Read-only means best-effort
+no-action guidance, not a new containment guarantee. `EnforcedReadOnly` and
+ordinary coding/review launches are unchanged.
+
+The owner explicitly narrowed this feature from provider containment to text
+analysis. The unlanded protected-launch engines, ambient-executable canaries
+and compression/isolation assertions were archived and removed, not treated
+as unrelated contracts to weaken. Existing title/inference/enforced-access
+conformance remains unchanged. `real_feedback_analysis` covers typed replies,
+semantic overlap, generic guidance and reuse through the existing utility
+configuration, with identical scenarios/assertions for all eight backends.
+Invalid JSON or provider failures are explicit failures; there is no parser,
+provider or authentication fallback. Source eligibility is not live proof:
+report the actual scenario/provider receipts separately.
 
 
 ## InferenceOnly helpers preserve selected settings

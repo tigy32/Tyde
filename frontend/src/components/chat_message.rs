@@ -1418,6 +1418,48 @@ mod wasm_tests {
             long_card_rect.width(),
         );
 
+        // Native light-theme captures showed black text on the unchanged
+        // dark-blue bubble. Check the rendered colour pair, not theme tokens.
+        let luminance = |color: &str| {
+            let channels = color
+                .trim_start_matches("rgb(")
+                .trim_end_matches(')')
+                .split(',')
+                .map(|part| {
+                    let channel = part.trim().parse::<f64>().unwrap() / 255.0;
+                    if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    }
+                })
+                .collect::<Vec<_>>();
+            channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+        };
+        for theme in [
+            "dark",
+            "light",
+            "github-light",
+            "github-dark",
+            "catppuccin-latte",
+            "catppuccin-mocha",
+        ] {
+            short_container.set_attribute("data-theme", theme).unwrap();
+            let style = web_sys::window()
+                .unwrap()
+                .get_computed_style(&short_body)
+                .unwrap()
+                .unwrap();
+            let foreground = luminance(&style.get_property_value("color").unwrap());
+            let background = luminance(&style.get_property_value("background-color").unwrap());
+            let contrast =
+                (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+            assert!(
+                contrast >= 4.5,
+                "User text must remain readable in {theme}: contrast {contrast}"
+            );
+        }
+
         let short_root: HtmlElement = (*short_container).clone();
         let long_root: HtmlElement = (*long_container).clone();
         drop(short_container);

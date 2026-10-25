@@ -28,6 +28,7 @@ pub mod inflight_tray;
 pub mod ink_transcript;
 pub mod inline_review;
 pub mod launch_menu;
+pub mod learning_change;
 pub mod orchestration_view;
 pub mod project_rail;
 pub mod references_panel;

@@ -3066,7 +3066,7 @@ kbd {
 
 .chat-card-user .chat-card-body {
     background: #264f78;
-    color: var(--text-bright);
+    color: #ffffff;
     border-radius: 6px;
     padding: 6px 10px;
     max-width: 85%;
@@ -17519,31 +17519,36 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .review-add-link { min-height: 32px; padding-left: 12px; padding-right: 12px; border-radius: 6px; }
 
 .self-improvement-settings { max-width: 720px; }
-.learning-heading, .learning-change header, .learning-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
-.learning-heading { margin-bottom: var(--space-5); }
-.learning-heading .settings-panel-title { margin-bottom: var(--space-2); }
-.learning-config { border: 1px solid var(--border-primary); border-radius: 6px; padding: 0 var(--space-4); background: var(--surface-1); }
-.learning-row { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: var(--space-3); padding: var(--space-3) 0; border-bottom: 1px solid var(--border-primary); align-items: start; }
-.learning-row > label { padding-top: var(--space-2); font-weight: 600; }
-.learning-row .settings-description { margin: var(--space-2) 0 0; }
-.learning-targets, .learning-analyzer { display: flex; flex-wrap: wrap; gap: var(--space-4); }
-.learning-target { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex: 1 1 160px; }
-.learning-row .review-segments { margin: 0; }
-.learning-analyzer .settings-select { max-width: 100%; min-width: 0; }
-.self-improvement-settings > h3 { margin-top: var(--space-4); font-size: 1.077rem; }
-.learning-analyzer .settings-description { flex-basis: 100%; }
-.learning-footer { flex-wrap: wrap; padding: var(--space-3) 0; color: var(--text-secondary); font-size: .9em; }
-.learning-change { padding: var(--space-4) 0; border-bottom: 1px solid var(--border-primary); }
-.learning-change header > div { display: flex; gap: var(--space-2); }
-.learning-change dl { display: grid; grid-template-columns: 65px minmax(0, 1fr); gap: var(--space-2); }
-.learning-change dt { color: var(--text-secondary); }
-.learning-change dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-@media (max-width: 640px) { .learning-row { grid-template-columns: 1fr; } .learning-heading { align-items: start; } }
-
-@container settings-page (max-width: 440px) {
-    .learning-row { grid-template-columns: 1fr; gap: var(--space-2); }
-    .learning-row > label { padding-top: 0; }
-}
+.learning-status { overflow-wrap: anywhere; }
+.learning-analyzer { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-2); }
+.learning-analyzer .settings-select { flex: 1 1 200px; min-width: 0; max-width: 100%; }
+.learning-error { color: var(--error); margin: 0 0 var(--space-4); }
+.learning-changes { display: flex; flex-direction: column; gap: var(--space-3); }
+.learning-change { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) var(--space-4); border: 1px solid var(--border-primary); border-radius: 6px; background: var(--surface-1); min-width: 0; }
+.learning-change-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-3); min-width: 0; }
+.learning-change-kind { font-weight: 600; color: var(--text-bright); overflow-wrap: anywhere; }
+.learning-change-target { font-size: .846rem; color: var(--text-secondary); }
+.learning-change-status { margin-left: auto; font-size: .846rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+.learning-change-title { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.learning-change-text { margin: 0; color: var(--text-primary); overflow-wrap: anywhere; }
+.learning-change-text > :first-child { margin-top: 0; }
+.learning-change-text > :last-child { margin-bottom: 0; }
+.learning-change-reason { margin: 0; font-size: .923rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+.learning-change-details { font-size: .923rem; color: var(--text-secondary); }
+.learning-change-details summary { cursor: pointer; width: fit-content; }
+.learning-change-details[open] summary { margin-bottom: var(--space-2); }
+.learning-change-detail { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-2); }
+.learning-change-detail > span { font-size: .846rem; font-weight: 600; }
+.learning-change-detail > p { margin: 0; color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; }
+.learning-change-origin { max-height: 8.5em; overflow-y: auto; padding-left: var(--space-3); border-left: 2px solid var(--border-primary); }
+.learning-change-editor { display: flex; flex-direction: column; gap: var(--space-2); }
+.learning-change-editor .settings-text-input { width: 100%; box-sizing: border-box; resize: vertical; }
+.learning-change-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.learning-link { border: 0; background: transparent; color: var(--accent-link); padding: 0; cursor: pointer; font: inherit; }
+.learning-link:hover, .learning-link:focus-visible { text-decoration: underline; }
+.learning-usage { margin-top: var(--space-5); font-size: .923rem; color: var(--text-secondary); }
+.learning-usage summary { cursor: pointer; }
+.learning-usage p { margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 @container settings-overlay (max-width: 560px) {
     .settings-root { padding: 16px; }
     .settings-layout { flex-direction: column; gap: var(--space-3); }
@@ -17926,3 +17931,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .sidebar-bar-bottom { grid-row: 4 / 6; display: flex; flex-direction: column; }
 .sidebar-bar .dock-tab-bar { height: 34px; flex-shrink: 0; }
 .sidebar-bar .dock-empty { flex: 1; }
+
+.learning-tray { flex: 0 0 auto; min-width: 0; margin: 0 var(--space-4) var(--space-2); font-size: .923rem; }
+.learning-tray > summary { width: fit-content; margin-left: auto; padding: var(--space-1) var(--space-2); color: var(--text-secondary); cursor: pointer; border-radius: 4px; }
+.learning-tray > summary:hover, .learning-tray > summary:focus-visible { color: var(--text-primary); background: var(--surface-2); }
+.learning-tray-content { display: flex; flex-direction: column; gap: var(--space-3); max-height: min(42vh, 360px); overflow-y: auto; margin-top: var(--space-2); }

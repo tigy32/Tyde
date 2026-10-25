@@ -17721,23 +17721,16 @@ impl LearningHelper {
         use_mock: bool,
         mock_launch: Option<crate::backend::mock::MockLaunch>,
     ) -> Result<Self, String> {
-        if !matches!(
-            crate::backend::learning_analyzer_capability(analyzer.backend_kind),
-            protocol::LearningAnalyzerCapability::ToolFreeReusable
-        ) {
-            return Err(
-                "Reusable tool-free analysis is currently supported only by Codex".to_owned(),
-            );
+        if let protocol::LearningAnalyzerCapability::Unsupported { reason } =
+            crate::backend::learning_analyzer_capability(analyzer.backend_kind)
+        {
+            return Err(reason);
         }
         let workspace = tempfile::tempdir().map_err(|_| "Cannot create analyzer workspace")?;
         let mut values = SessionSettingsValues::default();
         values.0.insert(
             "model".into(),
             protocol::SessionSettingValue::String(analyzer.model.clone()),
-        );
-        values.0.insert(
-            "reasoning_effort".into(),
-            protocol::SessionSettingValue::String("low".into()),
         );
         let mut config = agent_name_generation_spawn_config(Some(values));
         config.mock_launch = mock_launch;
@@ -17754,9 +17747,7 @@ impl LearningHelper {
             },
         )
         .await
-        .map_err(|_| {
-            "Analyzer backend failed to start; check selected model and backend setup".to_owned()
-        })?;
+        .map_err(|error| format!("Analyzer backend failed to start: {error}"))?;
         Ok(Self {
             backend,
             events,
@@ -17824,11 +17815,15 @@ impl LearningHelper {
                         ChatEvent::StreamEnd(end)
                             if matches!(end.message.sender, MessageSender::Assistant { .. }) =>
                         {
-                            if !end.message.tool_calls.is_empty()
-                                || end.message.content.len() > 32768
-                            {
+                            if end.message.content.len() > 32768 {
                                 failure =
-                                    Some("Analyzer violated the tool-free output contract".into());
+                                    Some("Analyzer exceeded its structured output budget".into());
+                                break;
+                            }
+                            if !end.message.tool_calls.is_empty() {
+                                failure = Some(
+                                    "Analyzer attempted tools despite no-action guidance".into(),
+                                );
                                 break;
                             }
                             output = Some(end.message.content);
@@ -17836,23 +17831,26 @@ impl LearningHelper {
                         ChatEvent::MessageAdded(message)
                             if matches!(message.sender, MessageSender::Error) =>
                         {
-                            failure = Some("Analyzer provider reported a failure".into());
+                            failure =
+                                Some(format!("Analyzer provider failed: {}", message.content));
                             break;
                         }
                         ChatEvent::ToolRequest(_) | ChatEvent::ToolExecutionCompleted(_) => {
-                            failure = Some("Analyzer violated the tool-free contract".into());
+                            failure =
+                                Some("Analyzer attempted tools despite no-action guidance".into());
                             break;
                         }
                         ChatEvent::TypingStatusChanged(false) if output.is_some() => break,
-                        ChatEvent::OperationCancelled(_) | ChatEvent::RetryAttempt(_) => {
-                            failure = Some("Analyzer was cancelled or attempted a retry".into());
+                        ChatEvent::OperationCancelled(_) => {
+                            failure = Some("Analyzer turn was cancelled".into());
                             break;
                         }
                         _ => {}
                     }
                 }
-                _ => {
-                    failure = Some("Analyzer emitted an unexpected lifecycle event".into());
+                crate::backend::BackendEvent::Compaction(_) => {}
+                crate::backend::BackendEvent::ResumeReplayComplete(_) => {
+                    failure = Some("Analyzer emitted an unexpected resume event".into());
                     break;
                 }
             }
@@ -17890,12 +17888,7 @@ impl LearningHelper {
             Some(reason) => Err(reason),
             None => output
                 .ok_or_else(|| "Analyzer ended without a completed response".to_owned())
-                .and_then(|text| {
-                    serde_json::from_str(&text).map_err(|_| {
-                        "Analyzer returned invalid structured results; no changes applied"
-                            .to_owned()
-                    })
-                }),
+                .and_then(|text| crate::self_improvement::parse_learning_analysis(&text)),
         };
         (result, usage)
     }
