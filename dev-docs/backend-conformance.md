@@ -1685,6 +1685,74 @@ failures remain limitations, not passing conformance. Ordinary repository
 validation, retained real-provider evidence and focused review are separate
 requirements; none substitutes for another.
 
+## Codex rejoin streaming and polling
+
+Commit 44909734 (first published in v0.9.6-beta.8) bound every ordinary Codex
+Resume and Fork to the process-owned native execution trace so raw-only polling
+cards survived rejoin. That trace releases model items only at a terminal
+inference record, so resumed and forked narrative was buffered until the
+request ended, and response boundaries came only from trace deliveries. A
+trace error failed the trace closed: later narrative and raw responses were
+dropped and every later `turn/start` was refused, so the backend loop exited
+and the agent terminated. The beta8 host log records two resumed agents
+terminated this way immediately after an interrupt, with
+`native_trace_inference_terminal_payload_missing` followed by the refused
+follow-up.
+
+Streaming inside the trace is not close: live item notifications carry no
+inference-attempt identity, and a Tyde-only streaming-first candidate lost
+interrupted text. That behavior is reverted. Ordinary Resume again negotiates
+`experimentalRawEvents`, ordinary Fork uses the typed item projection, and
+neither installs the trace. Typed narrative, commands and usage stream live.
+Codex CLI 0.162.1 does not deliver raw events after rejoin, so the adapter
+shows its existing warning that polling cannot appear. Protected
+`EnforcedReadOnly` Resume/Fork keep the trace exactly as before 44909734: their
+read-only enforcement is unchanged, their narrative remains terminal-buffered
+and a trace failure still refuses further turns.
+
+Known limitation: raw-only polling (`write_stdin` cells and `wait`
+continuations) is not shown after ordinary rejoin. The warning discloses this;
+no poll card is fabricated or reconstructed from provider history.
+
+`real_watched_command_shows_every_interaction` keeps the full polling oracle
+for the fresh session. A rejoined turn gets the same oracle unless the adapter
+showed its exact raw-events-unavailable warning before the turn acted. Then the
+turn must show no `write_stdin` or `wait` card at all; any partial set must
+satisfy the full oracle. It must still show exactly the launch and FIFO-release
+commands, and the launch must complete with its actual output. The fork's late
+nested command must still complete after idle.
+
+`real_narrative_streams_live` routes real inference bytes through a local
+proxy using a temporary `CODEX_HOME` with copied auth. Per armed phase the
+proxy holds the first `response.output_text.done` frame after a text delta.
+The test waits for the adapter's content-free post-dispatch receipt (debug
+target `tyde_codex_dispatch_receipt`, captured only by its own filter), then
+requires live text and no response end before releasing that frame. Fresh,
+resumed and forked turns write commentary before a FIFO-held command. A forked
+turn is interrupted while its post-command commentary is held, and must keep
+the actual command result and its partial text in its own response end. The
+interrupted fork is then resumed and streams again. Every response must end
+with exactly its streamed text. No events are synthesized or reordered.
+
+After the fresh, resumed, forked and restored held turns, the same agent runs a
+chained-read turn. Each file names the next, so every read needs its own model
+request. Each read must be declared by exactly one response end, later than
+the previous read's, and every read's tool request must follow the previous
+response's end. A final tool-free response must carry the last file's
+contents. This is the live model-request boundary contract; saved history
+replays these same emitted events.
+
+Only Codex declares `YieldedCodeCells`, so only Codex is eligible for either
+case. Real runs on 2026-10-26 used CLI 0.162.1 with the default test profile.
+Against main d0e40291 the narrative case streamed fresh text and failed at
+resume with no live text (nextest `8c61d810-ea24-4b06-bb45-d54a26729634`). With
+the revert the narrative case, including the chained-read boundaries, passed
+every phase in 77.7 seconds (`b74fb9f0-eb72-483b-a46f-c3c558b35864`). The
+watched case passed in 101.9 seconds with four poll and two wait cards fresh
+and disclosed zero-card resumed and forked turns
+(`96a47d98-70b9-4a88-83aa-aaf8f255a2f8`). Content-free logs are retained under
+`/home/tyggs/tyde-evidence/codex-beta8-recovery/`.
+
 ## Claude reviewer native configuration
 
 Enforced read-only Claude launches use native safe mode with user settings

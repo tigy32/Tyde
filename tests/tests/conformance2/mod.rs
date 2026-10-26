@@ -1,4 +1,6 @@
 mod control;
+mod live_narrative;
+pub use live_narrative::*;
 
 use protocol::{
     AgentInput, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
@@ -480,6 +482,46 @@ pub struct Agent {
     pub replayed_history: Vec<ChatEvent>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeReceipt {
+    Narrative,
+    ToolCompletion,
+}
+
+thread_local! {
+    pub(super) static NARRATIVE_RECEIPTS: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<NativeReceipt>>> = const { std::cell::RefCell::new(None) };
+}
+
+const DISPATCH_RECEIPT_TARGET: &str = "tyde_codex_dispatch_receipt";
+
+struct NarrativeReceiptCapture;
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NarrativeReceiptCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Receipt(Option<NativeReceipt>);
+        impl tracing::field::Visit for Receipt {
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                if value {
+                    self.0 = match field.name() {
+                        "codex_narrative_delta_processed" => Some(NativeReceipt::Narrative),
+                        "codex_tool_completion_processed" => Some(NativeReceipt::ToolCompletion),
+                        _ => self.0,
+                    };
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut receipt = Receipt(None);
+        event.record(&mut receipt);
+        if let Some(receipt) = receipt.0 {
+            NARRATIVE_RECEIPTS.with(|sender| {
+                if let Some(sender) = sender.borrow().as_ref() {
+                    let _ = sender.send(receipt);
+                }
+            });
+        }
+    }
+}
+
 const TURN_EMITTER_TARGET: &str = "server::backend::turn_emitter";
 
 thread_local! {
@@ -552,6 +594,12 @@ impl<B: Backend> Harness<B> {
                     ProtocolViolationCapture.with_filter(
                         tracing_subscriber::filter::Targets::new()
                             .with_target(TURN_EMITTER_TARGET, tracing::Level::ERROR),
+                    ),
+                )
+                .with(
+                    NarrativeReceiptCapture.with_filter(
+                        tracing_subscriber::filter::Targets::new()
+                            .with_target(DISPATCH_RECEIPT_TARGET, tracing::Level::DEBUG),
                     ),
                 )
                 .try_init();

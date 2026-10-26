@@ -100,7 +100,7 @@ const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "test-support")]
 const CODEX_LEGACY_DYNAMIC_AWAIT_MARKER: &str = ".tyde-conformance-legacy-dynamic-await";
-const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "The installed Codex app-server does not deliver raw tool events for resumed or forked sessions. Some tool activity, including process polling and plan updates, cannot appear in chat. Start a new Codex session to receive those events.";
+pub const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "The installed Codex app-server does not deliver raw tool events for resumed or forked sessions. Some tool activity, including process polling and plan updates, cannot appear in chat. Start a new Codex session to receive those events.";
 
 fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
     if !strict {
@@ -10038,6 +10038,22 @@ impl CodexInner {
                     return;
                 }
                 self.handle_notification(&method, &params).await;
+                if method == "item/agentMessage/delta"
+                    && params
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .is_some_and(contains_non_whitespace)
+                {
+                    tracing::debug!(target: "tyde_codex_dispatch_receipt", codex_narrative_delta_processed = true,
+                        "Processed a live Codex narrative notification");
+                }
+                if method == "item/completed"
+                    && params.pointer("/item/type").and_then(Value::as_str)
+                        == Some("commandExecution")
+                {
+                    tracing::debug!(target: "tyde_codex_dispatch_receipt", codex_tool_completion_processed = true,
+                        "Processed a native Codex command completion receipt");
+                }
             }
             CodexInbound::ServerRequest { id, method, params } => {
                 self.handle_server_request(id, &method, &params).await;
@@ -18437,8 +18453,9 @@ let stream_key = stream_key.as_str();
             error,
             normalization_failure,
         );
-        eprintln!(
-            "TYDE CODEX TOOL TERMINAL source=provider tool_name={tool_name} outcome={outcome:?}"
+        tracing::debug!(
+            succeeded = matches!(outcome, ToolExecutionOutcome::Succeeded { .. }),
+            "Codex provider tool completed"
         );
         self.emitter.tool_completed(tool_call_id, outcome);
         self.mark_tool_completed(tool_call_id).await;
