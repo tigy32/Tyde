@@ -27,6 +27,14 @@ import release_tool
 
 SERVER_MEMBER = "release/tyde-server"
 
+# Observed in release runs: Apple's ticket (CloudKit) and notary status
+# endpoints drop connections mid-request (-1005) or report offline (-1009),
+# and a fresh process then succeeds. Only idempotent reads are retried.
+APPLE_TRANSIENT_NETWORK_CODES = frozenset({"-1005", "-1009"})
+APPLE_IDEMPOTENT_PHASES = ("staple-", "validate-", "wait-")
+APPLE_NETWORK_ATTEMPTS = 5
+GITHUB_TRANSPORT_ATTEMPTS = 3
+
 TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 CONTROLLER = Path(__file__).resolve().parents[1]
 MACOS_SCHEMA = "frontend/tauri-shell/gen/schemas/macOS-schema.json"
@@ -210,29 +218,39 @@ def api(args, endpoint, *, response=GitHubResponse.JSON, operation=None, method=
     argv += ["-H", f"Accept: {accept}"]
     if body is not None:
         argv += ["--input", "-"]
-    result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None, capture_output=True)
-    raw = result.stdout
-    statuses = []
-    content_type = None
-    while raw.startswith(b"HTTP/"):
-        header, separator, body = raw.partition(b"\r\n\r\n")
-        if not separator:
-            header, separator, body = raw.partition(b"\n\n")
-        match = re.match(rb"HTTP/[^ ]+ (\d{3})\b", header)
-        if not separator or not match:
-            raise ControllerError(f"GitHub {operation}: malformed HTTP response")
-        statuses.append(int(match[1]))
-        content_type = next((line.split(b":", 1)[1].strip().split(b";", 1)[0].lower()
-                             for line in header.splitlines() if line.lower().startswith(b"content-type:")), None)
-        raw = body
-    status = statuses[-1] if statuses else None
-    if result.returncode or status != 200:
+    # A GET that never received an HTTP response is an idempotent read; any
+    # HTTP status, and every mutation, stays a single terminal attempt.
+    attempts = GITHUB_TRANSPORT_ATTEMPTS if method == "GET" else 1
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None, capture_output=True)
+        raw = result.stdout
+        statuses = []
+        content_type = None
+        while raw.startswith(b"HTTP/"):
+            header, separator, rest = raw.partition(b"\r\n\r\n")
+            if not separator:
+                header, separator, rest = raw.partition(b"\n\n")
+            match = re.match(rb"HTTP/[^ ]+ (\d{3})\b", header)
+            if not separator or not match:
+                raise ControllerError(f"GitHub {operation}: malformed HTTP response")
+            statuses.append(int(match[1]))
+            content_type = next((line.split(b":", 1)[1].strip().split(b";", 1)[0].lower()
+                                 for line in header.splitlines() if line.lower().startswith(b"content-type:")), None)
+            raw = rest
+        status = statuses[-1] if statuses else None
+        if not result.returncode and status == 200:
+            break
         if status is None:
             match = re.search(rb"\bHTTP (\d{3})\b", result.stderr)
             status = int(match[1]) if match else None
+        if status is None and result.returncode and attempt < attempts:
+            print(f"GitHub {operation}: no HTTP response (gh exit {result.returncode}); "
+                  f"retrying idempotent read, attempt {attempt + 1}/{attempts}", file=sys.stderr)
+            continue
         category = {401: "authentication rejected", 403: "authorization or rate limit rejected",
                     404: "not found", 429: "rate limit rejected"}.get(status, "API/transport failure")
-        raise ControllerError(f"GitHub {operation}: HTTP {status if status else 'unavailable'}; {category} (gh exit {result.returncode})")
+        raise ControllerError(f"GitHub {operation}: HTTP {status if status else 'unavailable'}; {category} "
+                              f"(gh exit {result.returncode}; attempt {attempt}/{attempts})")
     expected = {GitHubResponse.JSON: {b"application/json"},
                 GitHubResponse.ARTIFACT_ZIP: {b"application/zip"},
                 GitHubResponse.RELEASE_ASSET: {b"application/octet-stream"}}[response]
@@ -594,32 +612,44 @@ def prepare(args):
     save(args.retained / "receipt.json", data)
 
 
-def remote(args, data, phase, argv):
-    data["events"].append({"phase": phase, "state": "started"})
-    save(args.retained / "receipt.json", data)
-    result = subprocess.run([str(a) for a in argv], capture_output=True)
-    event = {"phase": phase, "exit_code": result.returncode}
-    if result.returncode:
-        # Never retain raw tool output: it can contain credentials and submission URLs.
-        text = (result.stdout + result.stderr).decode(errors="replace")
-        event["network_codes"] = sorted(set(re.findall(r"(?:Code[=: ]+|Error[ :]+)(-?\d+)", text)))
-        event["endpoints"] = sorted(set(re.findall(r"(?:https://)?([\w.-]+\.(?:apple\.com|icloud\.com))", text)))
-        event["routes"] = []
-        for host in ("appstoreconnect.apple.com", "api.apple-cloudkit.com"):
-            route = {"host": host}
-            dns = subprocess.run(["dscacheutil", "-q", "host", "-a", "name", host], capture_output=True)
-            route["dns_exit_code"] = dns.returncode
-            route["addresses"] = re.findall(r"(?:ip_address|ipv6_address): ([0-9a-fA-F:.]+)", dns.stdout.decode(errors="replace"))
-            routing = subprocess.run(["route", "-n", "get", host], capture_output=True)
-            route["route_exit_code"] = routing.returncode
-            route["route"] = re.findall(r"^\s*(destination|gateway|interface):\s*([\w.:%-]+)\s*$", routing.stdout.decode(errors="replace"), re.M)
-            event["routes"].append(route)
-    data["events"].append(event)
-    if not phase.startswith("submit-") or result.returncode:
-        save(args.retained / "receipt.json", data)
-    if result.returncode:
-        raise ControllerError(f"{phase} failed (exit {result.returncode}); retained checkpoint and sanitized diagnostics available")
-    return result.stdout
+def remote(record, data, phase, argv):
+    attempts = APPLE_NETWORK_ATTEMPTS if phase.startswith(APPLE_IDEMPOTENT_PHASES) else 1
+    for attempt in range(1, attempts + 1):
+        data["events"].append({"phase": phase, "state": "started", "attempt": attempt})
+        save(record, data)
+        result = subprocess.run([str(a) for a in argv], capture_output=True)
+        event = {"phase": phase, "attempt": attempt, "exit_code": result.returncode}
+        if result.returncode:
+            # Never retain raw tool output: it can contain credentials and submission URLs.
+            text = (result.stdout + result.stderr).decode(errors="replace")
+            apple_codes = set(re.findall(r"(?:NSURLErrorDomain|kCFErrorDomainCFNetwork) Code=(-\d+)", text))
+            event["network_codes"] = sorted(set(re.findall(r"(?:Code[=: ]+|Error[ :]+)(-?\d+)", text)))
+            event["endpoints"] = sorted(set(re.findall(r"(?:https://)?([\w.-]+\.(?:apple\.com|apple-cloudkit\.com|icloud\.com))", text)))
+            event["transient"] = bool(apple_codes) and apple_codes <= APPLE_TRANSIENT_NETWORK_CODES
+            event["routes"] = []
+            for host in ("appstoreconnect.apple.com", "api.apple-cloudkit.com"):
+                route = {"host": host}
+                dns = subprocess.run(["dscacheutil", "-q", "host", "-a", "name", host], capture_output=True)
+                route["dns_exit_code"] = dns.returncode
+                route["addresses"] = re.findall(r"(?:ip_address|ipv6_address): ([0-9a-fA-F:.]+)", dns.stdout.decode(errors="replace"))
+                routing = subprocess.run(["route", "-n", "get", host], capture_output=True)
+                route["route_exit_code"] = routing.returncode
+                route["route"] = re.findall(r"^\s*(destination|gateway|interface):\s*([\w.:%-]+)\s*$", routing.stdout.decode(errors="replace"), re.M)
+                event["routes"].append(route)
+        data["events"].append(event)
+        if not phase.startswith("submit-") or result.returncode:
+            save(record, data)
+        if not result.returncode:
+            return result.stdout
+        if not event["transient"] or attempt == attempts:
+            break
+        print(f"{phase}: transient Apple network failure (exit {result.returncode}; "
+              f"codes {','.join(event['network_codes'])}); retrying idempotent {phase.split('-', 1)[0]}, "
+              f"attempt {attempt + 1}/{attempts}", file=sys.stderr)
+    kind = ("single attempt; phase is never retried" if attempts == 1 else
+            "transient Apple network failure persisted" if event["transient"] else "not a transient network failure")
+    raise ControllerError(f"{phase} failed (exit {result.returncode}; attempt {attempt}/{attempts}; {kind}); "
+                          "retained checkpoint and sanitized diagnostics available")
 
 
 def auth():
@@ -636,7 +666,7 @@ def submit(args):
     name = {"app": "app.zip", "server": "server.zip", "dmg": "signed.dmg"}[kind]
     if name not in data["payloads"]:
         raise ControllerError("Missing signed payload receipt")
-    raw = remote(args, data, f"submit-{kind}", ["xcrun", "notarytool", "submit", args.retained / name, *auth(), "--output-format", "json"])
+    raw = remote(args.retained / "receipt.json", data, f"submit-{kind}", ["xcrun", "notarytool", "submit", args.retained / name, *auth(), "--output-format", "json"])
     response = json.loads(raw)
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", response["id"]):
         raise ControllerError("Invalid Apple submission response")
@@ -652,7 +682,7 @@ def wait_accepted(args, data, kind, name):
     if submission["sha256"] != data["payloads"][name]:
         raise ControllerError("Submission payload digest mismatch")
     if submission.get("status") != "Accepted":
-        raw = remote(args, data, f"wait-{kind}", ["xcrun", "notarytool", "wait", submission["id"], *auth(), "--output-format", "json"])
+        raw = remote(args.retained / "receipt.json", data, f"wait-{kind}", ["xcrun", "notarytool", "wait", submission["id"], *auth(), "--output-format", "json"])
         status = json.loads(raw)
         if status["id"].lower() != submission["id"].lower() or status["status"] != "Accepted":
             raise ControllerError("Notarization not Accepted; refusing completion")
@@ -663,10 +693,10 @@ def wait_accepted(args, data, kind, name):
 
 def gatekeeper(args, data, label, path):
     for action in ("staple", "validate"):
-        remote(args, data, f"{action}-{label}", ["xcrun", "stapler", action, path])
+        remote(args.retained / "receipt.json", data, f"{action}-{label}", ["xcrun", "stapler", action, path])
     argv = ["spctl", "-a", "-v"]
     argv += ["-t", "exec"] if label == "app" else ["-t", "open", "--context", "context:primary-signature"]
-    remote(args, data, f"gatekeeper-{label}", [*argv, path])
+    remote(args.retained / "receipt.json", data, f"gatekeeper-{label}", [*argv, path])
 
 
 def package(args):
@@ -893,6 +923,7 @@ def verify_release_payloads(args, assembly, root):
     release = draft(args)
     release_tool.validate_release(release, args.tag)
     data = receipt(args)
+    apple = {"events": []}
     for asset in release["assets"]:
         name = asset["name"]
         if Path(name).name != name:
@@ -918,7 +949,7 @@ def verify_release_payloads(args, assembly, root):
         if name.endswith(".dmg"):
             command(["hdiutil", "verify", path])
             command(["codesign", "--verify", "--strict", path])
-            command(["xcrun", "stapler", "validate", path])
+            remote(args.evidence / "finalize-apple.json", apple, f"validate-{name}", ["xcrun", "stapler", "validate", path])
             command(["spctl", "-a", "-v", "-t", "open", "--context", "context:primary-signature", path])
     for path in root.glob("*.sha256"):
         package = path.with_suffix("")

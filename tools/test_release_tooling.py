@@ -1141,10 +1141,19 @@ name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]; root=pathlib.Path(os.env
 with open(os.environ['FIXTURE_LOG'],'a') as f: f.write(json.dumps([name,*[a for a in args if not len(a)==36]])+'\n')
 def request(path,data=None,method=None):
  return urllib.request.urlopen(urllib.request.Request(os.environ['FIXTURE_HTTP']+path,data=data,method=method)).read()
+def dropped(marker):
+ # An empty marker fails every call; a count fails that many calls, then clears.
+ path=root/marker
+ if not path.exists() or path.read_text()=='0': return False
+ if path.read_text(): path.write_text(str(int(path.read_text())-1))
+ return True
 if name=='gh':
  if args[0]=='api':
   method=args[args.index('--method')+1] if '--method' in args else 'GET'
   fields=json.load(sys.stdin) if '--input' in args else None
+  if dropped('github-transport-drop-'+method):
+   print('Get "https://api.github.com/PRIVATE-ID?token=SECRET": read tcp: connection reset by peer',file=sys.stderr)
+   sys.exit(1)
   try:
    headers=dict(args[i+1].split(':',1) for i,a in enumerate(args) if a=='-H')
    headers={k:v.strip() for k,v in headers.items()}
@@ -1228,15 +1237,27 @@ elif name=='npx':
 elif name=='xcrun':
  if args[:2]==['notarytool','submit']:
   if '--wait' in args: raise SystemExit(68)
+  if (root/'submit-network-failure').exists():
+   print('Error Domain=NSURLErrorDomain Code=-1005 https://appstoreconnect.apple.com/notary/v2/submissions?token=SECRET',file=sys.stderr)
+   raise SystemExit(68)
   print(json.dumps({'id':{'server.zip':'1','app.zip':'2','signed.dmg':'3'}[pathlib.Path(args[2]).name]*8+'-1111-1111-1111-111111111111'}))
  elif args[:2]==['notarytool','wait']:
   if (root/'block-wait').exists(): request('/repos/fixture/Tyde/wait-event')
-  if (root/'network-failure').exists():
+  if dropped('network-failure'):
    print('NSURLErrorDomain Code=-1009 https://appstoreconnect.apple.com/notary/v2/submissions/PRIVATE-ID?token=SECRET',file=sys.stderr)
    raise SystemExit(68)
   print(json.dumps({'id':args[2],'status':'Invalid' if (root/'invalid-notary').exists() else 'Accepted'}))
  elif args[0]=='stapler':
   path=pathlib.Path(args[2])
+  if dropped('cloudkit-drop-'+args[1]):
+   print('error is Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost." UserInfo={_kCFStreamErrorCodeKey=-4, '
+         'NSUnderlyingError=0x6000 {Error Domain=kCFErrorDomainCFNetwork Code=-1005 "(null)"}, NSErrorFailingURLStringKey='
+         'https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup?PRIVATE-ID=SECRET}\n'
+         'The staple and validate action failed! Error 68.')
+   raise SystemExit(68)
+  if (root/'cloudkit-untrusted').exists():
+   print('error is Error Domain=NSURLErrorDomain Code=-1202 "The certificate for this server is invalid."\nThe staple and validate action failed! Error 68.')
+   raise SystemExit(68)
   if args[1]=='staple':
    if path.is_dir(): (path/'stapled').write_text('ticket')
    else: path.write_bytes(path.read_bytes()+b' stapled')
@@ -1528,7 +1549,7 @@ else: raise SystemExit(27)
         self.assertFalse(self.retained.exists())
 
 
-    def test_draft_lookup_pagination_http_failures_and_no_payload(self):
+    def test_draft_lookup_http_transport_failures_and_unretried_submit(self):
         # Reproduce the real published-only tag route while the same auth can
         # read this exact draft through list/by-ID. Execute both CLI boundaries.
         result = subprocess.run(["gh", "api", f"repos/{self.repository}/releases/tags/{self.tag}"],
@@ -1546,6 +1567,7 @@ else: raise SystemExit(27)
             self.http_failures["releases?per_page=100&page=2"] = status
             result = self.cli("verify", succeeds=False)
             self.assertIn(f"release-list: HTTP {status}", result.stderr)
+            self.assertIn("attempt 1/3)", result.stderr)
             self.assertFalse(self.retained.exists())
             self.assertIn("No retained payload", self.retention_state(False))
         self.http_failures.clear()
@@ -1559,8 +1581,34 @@ else: raise SystemExit(27)
         result = self.cli("verify", succeeds=False)
         self.assertIn("release-by-ID: HTTP 403", result.stderr)
         self.http_failures.clear()
+        # The beta8 continuation lost its release-list GET before any HTTP
+        # response. A fresh read recovers; a persistent loss stays bounded.
+        def release_list_reads():
+            return sum(c[:2] == ["gh", "api"] and c[2].endswith("releases?per_page=100&page=1")
+                       for c in map(json.loads, self.log.read_text().splitlines()))
+        self.log.write_text("")
+        (self.root / "github-transport-drop-GET").write_text("2")
+        result = self.cli("verify")
+        self.assertIn("release-list: no HTTP response (gh exit 1); retrying idempotent read, attempt 3/3", result.stderr)
+        self.assertEqual(release_list_reads(), 3)
+        (self.root / "github-transport-drop-GET").write_text("")
+        result = self.cli("verify", succeeds=False)
+        self.assertIn("release-list: HTTP unavailable; API/transport failure (gh exit 1; attempt 3/3)", result.stderr)
+        self.assertEqual(release_list_reads(), 6)
+        (self.root / "github-transport-drop-GET").unlink()
         self.prepare()
         self.assertIn("Retained payload receipt present", self.retention_state(True))
+        # Submission is not idempotent: the same network loss is terminal and
+        # leaves the ambiguity guard in place instead of a second upload.
+        self.log.write_text("")
+        (self.root / "submit-network-failure").touch()
+        result = self.cli("submit", "--kind", "server", succeeds=False)
+        self.assertIn("submit-server failed (exit 68; attempt 1/1; single attempt; phase is never retried)", result.stderr)
+        (self.root / "submit-network-failure").unlink()
+        result = self.cli("submit", "--kind", "server", succeeds=False)
+        self.assertIn("Ambiguous prior submission", result.stderr)
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(sum(c[:3] == ["xcrun", "notarytool", "submit"] for c in commands), 1)
         self.assertFalse(self.uploads)
         self.assertFalse(self.published)
 
@@ -1770,11 +1818,15 @@ else: raise SystemExit(27)
         original = {p.name: p.read_bytes() for p in self.retained.glob("*.zip")}
         original["signed.dmg"] = (self.retained / "signed.dmg").read_bytes()
         (self.root / "network-failure").touch()
-        self.cli("complete", succeeds=False)
+        result = self.cli("complete", succeeds=False)
+        self.assertIn("wait-dmg failed (exit 68; attempt 5/5; transient Apple network failure persisted)", result.stderr)
         receipt = json.loads((self.retained / "receipt.json").read_text())
         self.assertEqual(receipt["phase"], "submitted-dmg")
         self.assertEqual(set(receipt["submissions"]), {"app", "server", "dmg"})
+        self.assertEqual([(e["phase"], e["attempt"], e["exit_code"], e["transient"]) for e in receipt["events"][-10:] if "exit_code" in e],
+                         [("wait-dmg", attempt, 68, True) for attempt in range(1, 6)])
         self.assertEqual(receipt["events"][-1]["network_codes"], ["-1009"])
+        self.assertEqual(receipt["events"][-1]["endpoints"], ["appstoreconnect.apple.com"])
         (self.retained / "signed.dmg").unlink()
         self.cli("complete", succeeds=False)
         (self.retained / "signed.dmg").write_bytes(original["signed.dmg"])
@@ -1787,13 +1839,29 @@ else: raise SystemExit(27)
         self.responses["actions/runs/11"] = self.run_metadata(11)
         self.env["GITHUB_RUN_ID"] = "11"
         self.cli("restore", "--run-id", "10", "--artifact-id", "20")
+        restored_events = len(json.loads((self.retained / "receipt.json").read_text())["events"])
         self.log.write_text("")
-        self.cli("complete")
+        # The observed recurrences in one continuation: an offline notary poll,
+        # then the beta8 signature of a stapled DMG whose CloudKit ticket
+        # validation lost its connection. Fresh idempotent reads recover.
+        (self.root / "network-failure").write_text("1")
+        (self.root / "cloudkit-drop-validate").write_text("2")
+        result = self.cli("complete")
+        self.assertIn("validate-dmg: transient Apple network failure (exit 68; codes -1005,68); "
+                      "retrying idempotent validate, attempt 3/5", result.stderr)
+        finished = [e for e in json.loads((self.retained / "receipt.json").read_text())["events"][restored_events:] if "exit_code" in e]
+        self.assertEqual([(e["phase"], e["attempt"], e["exit_code"], e.get("transient")) for e in finished],
+                         [("wait-dmg", 1, 68, True), ("wait-dmg", 2, 0, None), ("staple-dmg", 1, 0, None),
+                          ("validate-dmg", 1, 68, True), ("validate-dmg", 2, 68, True), ("validate-dmg", 3, 0, None),
+                          ("gatekeeper-dmg", 1, 0, None)])
+        self.assertEqual(finished[3]["network_codes"], ["-1005", "68"])
+        self.assertEqual(finished[3]["endpoints"], ["api.apple-cloudkit.com"])
+        self.assertNotIn("SECRET", (self.retained / "receipt.json").read_text())
         self.cli("upload")
         self.cli("checkpoint")
         commands = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertFalse(any("submit" in c or "build" in c or c[0] == "cargo" for c in commands))
-        self.assertIn(["xcrun", "stapler", "validate", str(self.retained / "work/Tyde_1.2.3_aarch64-apple-darwin.dmg")], commands)
+        self.assertEqual(commands.count(["xcrun", "stapler", "validate", str(self.retained / "work/Tyde_1.2.3_aarch64-apple-darwin.dmg")]), 3)
         self.assertEqual(len(self.uploads), 3)
         self.assertTrue(next(v for n, v in self.uploads.items() if n.endswith(".dmg")).endswith(b"stapled"))
         self.assertEqual(original, {name: (self.retained / name).read_bytes() for name in original})
@@ -1985,8 +2053,16 @@ else: raise SystemExit(27)
         self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
         self.assertFalse(self.published)
         (self.root / "public-corruption").unlink()
+        (self.root / "github-transport-drop-PATCH").write_text("1")
+        result = self.cli("finalize", "--fragments-run-id", "10", "--confirm", succeeds=False)
+        self.assertIn("publish-stable: HTTP unavailable; API/transport failure (gh exit 1; attempt 1/1)", result.stderr)
+        self.assertFalse(self.published)
+        (self.root / "cloudkit-drop-validate").write_text("1")
         self.cli("finalize", "--fragments-run-id", "10", "--confirm")
         self.assertTrue(self.published)
+        apple = json.loads((self.evidence / "finalize-apple.json").read_text())
+        self.assertEqual([(e["phase"].endswith(".dmg"), e["attempt"], e["exit_code"]) for e in apple["events"] if "exit_code" in e],
+                         [(True, 1, 68), (True, 2, 0), (True, 1, 0)])
         finalization = json.loads((self.retained / "finalization.json").read_text())
         self.assertEqual(finalization["state"], "published")
         self.assertEqual(len(finalization["assets"]), 22)
@@ -2023,9 +2099,14 @@ else: raise SystemExit(27)
         self.cli("complete", succeeds=False)
         (self.root / "invalid-notary").unlink()
         (self.root / "reject-spctl").touch()
-        self.cli("complete", succeeds=False)
+        result = self.cli("complete", succeeds=False)
+        self.assertIn("gatekeeper-dmg failed (exit 3; attempt 1/1; single attempt; phase is never retried)", result.stderr)
         self.cli("upload", succeeds=False)
         (self.root / "reject-spctl").unlink()
+        (self.root / "cloudkit-untrusted").touch()
+        result = self.cli("complete", succeeds=False)
+        self.assertIn("staple-dmg failed (exit 68; attempt 1/5; not a transient network failure)", result.stderr)
+        (self.root / "cloudkit-untrusted").unlink()
         self.cli("complete")
         updater = next((self.retained / "output/artifacts").iterdir())
         updater.write_bytes(b"corrupt signed updater")
@@ -2055,7 +2136,7 @@ else: raise SystemExit(27)
         self.assertNotEqual(process.returncode, 0)
         self.retention_state(True)
         data = json.loads((self.retained / "receipt.json").read_text())
-        self.assertEqual(data["events"][-1], {"phase": "wait-dmg", "state": "started"})
+        self.assertEqual(data["events"][-1], {"phase": "wait-dmg", "state": "started", "attempt": 1})
         self.seal_artifact(20, self.retained)
         shutil.rmtree(self.retained)
         (self.root / "block-wait").unlink()

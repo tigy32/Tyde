@@ -295,7 +295,15 @@ updater before submitting the DMG. That submission ID is checkpointed before
 DMG wait/staple/validate/Gatekeeper. A standalone binary's ZIP is notarized but
 cannot itself be stapled; this is Apple's documented standalone-binary contract.
 
-A network failure does not establish a signing rejection. Receipts retain exact
+A network failure does not establish a signing rejection. Notary waits and
+stapler staple/validate (including stable finalization's DMG validation) are
+idempotent reads. Release runs repeatedly lost them to Apple connection drops,
+NSURLErrorDomain `-1005` and `-1009`. When a read fails only with those codes,
+the controller reruns it in a fresh process, up to five attempts. Every attempt
+is recorded with its own classification. A GitHub API GET that receives no HTTP
+response gets up to three attempts. Submissions, uploads, publication,
+Gatekeeper, HTTP statuses and every other error stay single terminal attempts.
+Receipts retain exact
 started/completed phases, exit codes, Apple endpoint hostnames, network error
 codes, DNS results and route/interface observations, never raw tool output,
 credentials, submission URLs or signed upload URLs. They are diagnostic evidence,
