@@ -1685,53 +1685,6 @@ failures remain limitations, not passing conformance. Ordinary repository
 validation, retained real-provider evidence and focused review are separate
 requirements; none substitutes for another.
 
-## Codex polling after native rejoin
-
-`real_watched_command_shows_every_interaction` holds a real command on a FIFO,
-requires three empty still-running polls, then yields a fourth polling code
-cell and observes an empty native wait before explicitly releasing the command.
-It checks fresh, resumed and forked sessions with the same prompt and oracle.
-Native process identities must agree, every poll completes once, the yielded
-cell retains its continuation identity and empty content, and the final wait
-carries the command's real output. Successful cells deliberately print a
-failure-looking line so stdout cannot override the native execution outcome.
-Only Codex currently declares the case's yielding capabilities.
-
-The same flow admits a nested command only after its original model slot has
-been published, then lets a second nested command outlive the turn. FIFO
-release follows actual tool admission and idle events, not elapsed time. Its
-late terminal receipt must complete the original command card exactly once.
-
-On Codex CLI 0.162.1, ordinary native resume delivered typed command and usage
-events but no raw polling declarations. The unchanged adapter therefore showed
-the fresh session's three empty polls and zero after resume, despite the native
-provider record containing the actual calls and results. Native provider
-history replay is text-oriented and is not Tyde's saved canonical transcript;
-this fix does not reconstruct live calls from that history.
-
-All rejoined Codex sessions now bind the existing process-owned execution
-source. Original model slots, native code-cell replies and direct continuation
-results feed the adapter's canonical response/tool pipeline. Runtime-to-model
-slot correlation uses native identities, including commands admitted after a
-code cell yields. Full native code-cell replies preserve `Result`/`Yielded`,
-cell identity and content separately from execution success. Missing required
-native results fail explicitly at a completed-turn fence. Typed command items
-still own command output and exit/cancel outcomes; native assistant messages
-use the same command-promotion path as their stdout equivalents. No shared
-server/UI lifecycle or provider-specific rendering logic changes.
-
-A rejoin without the required native observation transport fails explicitly
-rather than silently dropping polling activity. This includes SSH-launched CLI
-processes that cannot expose their process-owned trace. A Tyde server running
-locally on a remote host is not that unsupported launch mode. Existing saved
-messages that already omitted calls are not backfilled from provider history.
-
-The regression failed against the original adapter after resume (zero poll
-cards) and passed the complete extended flow on CLI 0.162.1 with Luna/low on
-2026-10-23: nextest `3368a93a-3b13-47e0-8686-4f9023bb7c52`, 97.802 seconds.
-No other backend declares the required yielding capabilities. The isolated
-source build took 5m46s and is not a warmed validation-gate measurement.
-
 ## Claude reviewer native configuration
 
 Enforced read-only Claude launches use native safe mode with user settings

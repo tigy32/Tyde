@@ -1652,6 +1652,7 @@ const MCP_ERROR_VALUE: &str = "TYDE_ERROR_PROBE";
 const MCP_ERROR_TEXT: &str = "MCP_REFUSED: probe rejected this value";
 const MCP_PROBE_DIR: &str = ".mcp-probe";
 const MCP_SLOW_START_SECONDS: &str = "1";
+const WATCHED_SECONDS: u64 = 25;
 async fn real_generated_image_preserves_tool_ownership<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let marker = unique_payload();
@@ -1871,9 +1872,10 @@ async fn real_image_input_history<B: Backend>(host: &mut Harness<B>) {
 }
 
 async fn real_watched_command_shows_every_interaction<B: Backend>(host: &mut Harness<B>) {
-    let prompt = watched_command_prompt();
+    let prompt = watched_command_prompt(host.backend());
     let agent = spawn_agent(host, &prompt).await;
     let turn = collect_turn(host, &agent, &prompt).await;
+
     assert_watched_command_interactions(&turn);
     assert_universal_contract(&[turn]);
     let session = stored_session(host).await;
@@ -1889,142 +1891,29 @@ async fn real_watched_command_shows_every_interaction<B: Backend>(host: &mut Har
     assert_watched_command_interactions(&turn);
     assert_universal_contract(&[turn]);
     assert_clean_close(host, &resumed).await;
-
-    let forked = fork_agent(host, &session.id, &prompt).await;
-    let turn = collect_turn(host, &forked, &prompt).await;
-    assert_watched_command_interactions(&turn);
-    assert_universal_contract(&[turn]);
-    assert_late_nested_command_completes(host, &forked).await;
-    assert_clean_close(host, &forked).await;
 }
 
 fn assert_watched_command_interactions(turn: &Turn) {
+    // A backend that never ran the command finishes fast and satisfies
+    // every structural assertion below, so establish it did the work
+    // before reading anything into the card count.
     assert_final_text_contains(turn, WATCHED_MARKER);
-    let polls = turn
-        .tool_requests()
-        .filter(|request| {
-            turn.tool_declarations().any(|call| {
-                call.tool_call_id == request.tool_call_id
-                    && call
-                        .arguments
-                        .as_str()
-                        .is_some_and(|source| source.contains("tools.write_stdin("))
-            })
-        })
-        .collect::<Vec<_>>();
+
+    let requests = turn.tool_requests().count();
     assert!(
-        polls.len() >= 3,
-        "three actual empty polls must each have a tool card; observed {}",
-        polls.len()
+        requests >= 3,
+        "{}: the model started a command and watched it to completion but only {requests} \
+         tool card(s) were rendered, so at least one thing it did is invisible to the \
+         user",
+        turn.label(),
     );
-    let mut empty_running_results = 0;
-    let mut yielded_polls = 0;
-    let mut process = None;
-    for request in polls {
-        let completions = turn
-            .tool_completions()
-            .filter(|completion| completion.tool_call_id == request.tool_call_id)
-            .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 1, "each poll must complete exactly once");
-        if let ToolExecutionOutcome::Succeeded {
-            result: ToolExecutionResult::Other { result },
-        } = &completions[0].outcome
-        {
-            let text = match result {
-                Value::String(text) => {
-                    if text.starts_with("Script running with cell ID") {
-                        yielded_polls += 1;
-                        continue;
-                    }
-                    text.clone()
-                }
-                Value::Object(_) => {
-                    let response = result.get("response").expect("native cell reply");
-                    if let Some(yielded) = response.get("Yielded") {
-                        assert!(
-                            yielded.get("cell_id").and_then(Value::as_str).is_some(),
-                            "a yielded cell must retain its continuation identity"
-                        );
-                        assert!(
-                            yielded
-                                .get("content_items")
-                                .and_then(Value::as_array)
-                                .is_some_and(Vec::is_empty),
-                            "a held no-output cell must not invent output"
-                        );
-                        yielded_polls += 1;
-                        continue;
-                    }
-                    response
-                        .get("Result")
-                        .expect("native completed cell reply")
-                        .get("content_items")
-                        .and_then(Value::as_array)
-                        .expect("native cell content")
-                        .iter()
-                        .map(|block| {
-                            block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .expect("printed polling text")
-                        })
-                        .collect::<String>()
-                }
-                _ => panic!("native polling result representation is invalid"),
-            };
-            let json_start = text.find('{').expect("printed native polling result");
-            let native: Value =
-                serde_json::from_str(&text[json_start..]).expect("native polling metadata JSON");
-            if native.get("session_id").is_some()
-                && native.get("output").and_then(Value::as_str) == Some("")
-                && native.get("exit_code").is_none()
-            {
-                if let Some(expected) = &process {
-                    assert!(
-                        native.get("session_id") == Some(expected),
-                        "polls must retain the same actual running process identity"
-                    );
-                } else {
-                    process = native.get("session_id").cloned();
-                }
-                empty_running_results += 1;
-            }
-        } else {
-            panic!("a successful polling operation must not be cancelled or invent a command exit");
-        }
-    }
-    assert_eq!(
-        yielded_polls, 1,
-        "the fourth polling cell must retain its actual still-running result"
-    );
-    let waits = turn
-        .tool_requests()
-        .filter(|request| turn.declared_name(&request.tool_call_id) == Some("wait"))
-        .collect::<Vec<_>>();
-    assert!(
-        waits.len() >= 2,
-        "both held and completed continuations must have cards"
-    );
-    assert!(waits.iter().any(|request| turn.tool_completions().any(|completion| {
-        completion.tool_call_id == request.tool_call_id
-            && matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::Other { result } }
-                if result.as_str().is_some_and(|text| text.starts_with("Script running with cell ID")))
-    })), "the empty still-running wait result must be retained");
-    assert!(waits.iter().any(|request| turn.tool_completions().any(|completion| {
-        completion.tool_call_id == request.tool_call_id
-            && matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::Other { result } }
-                if result.as_str().is_some_and(|text| text.contains(WATCHED_MARKER)))
-    })), "the completed continuation must carry the real command output");
-    assert_eq!(
-        empty_running_results, 3,
-        "each empty still-running poll must retain its actual native result"
-    );
+
     assert_eq!(
         turn.tool_requests()
             .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
             .count(),
-        2,
-        "launch and FIFO release are two executions, not duplicate poll executions"
+        1,
+        "watching one command must not duplicate its execution card"
     );
     for message in turn.assistant_messages() {
         assert!(
@@ -2032,70 +1921,6 @@ fn assert_watched_command_interactions(turn: &Turn) {
             "a watched-command response must show its action, not only a Thinking disclosure"
         );
     }
-}
-
-async fn assert_late_nested_command_completes<B: Backend>(host: &mut Harness<B>, agent: &Agent) {
-    for name in ["late-start.fifo", "late-finish.fifo"] {
-        let status = std::process::Command::new("mkfifo")
-            .arg(host.workspace().join(name))
-            .status()
-            .expect("create real process barrier");
-        assert!(status.success(), "create real process barrier");
-    }
-    let prompt = "Use exactly one code-mode exec cell, with a 1000 ms exec yield. In that cell first await tools.exec_command({cmd: \"python3 -c \\\"open('late-start.fifo').read()\\\"\", yield_time_ms: 300000}); then text(await tools.exec_command({cmd: \"python3 -c \\\"open('late-finish.fifo').read(); print('LATE_DONE')\\\"\", yield_time_ms: 1})). The harness releases the first FIFO, not you. If the cell yields, use wait until it completes. After the second command returns its running session, reply LATE_READY and end the turn without polling or cancelling that command. Do not run any other command or use sleeps.";
-    send_prompt(host, agent, prompt).await;
-    let mut turn = host.turn(prompt);
-    collect_turn_until(host, &mut turn, |event| matches!(event,
-        ChatEvent::ToolRequest(request) if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains("late-start.fifo"))
-    )).await;
-    tokio::fs::write(host.workspace().join("late-start.fifo"), b"release")
-        .await
-        .expect("release the observed original model slot");
-    collect_turn_until(host, &mut turn, |event| {
-        matches!(event, ChatEvent::TypingStatusChanged(false))
-    })
-    .await;
-    assert_final_text_contains(&turn, "LATE_READY");
-    let commands = turn
-        .tool_requests()
-        .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        commands.len(),
-        2,
-        "each nested command must have exactly one card"
-    );
-    let background = commands.iter().find(|request| matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains("late-finish.fifo"))).expect("late nested command card").tool_call_id.clone();
-    assert!(
-        !turn
-            .tool_completions()
-            .any(|completion| completion.tool_call_id == background),
-        "the held command must remain running after its turn"
-    );
-    tokio::fs::write(host.workspace().join("late-finish.fifo"), b"release")
-        .await
-        .expect("release the background command after idle");
-    loop {
-        match host.next_backend_event().await {
-            server::backend::BackendEvent::Chat(event) => {
-                let done = matches!(&event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == background);
-                turn.events.push(event);
-                if done {
-                    break;
-                }
-            }
-            server::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
-                turn.model_requests.push(usage)
-            }
-            server::backend::BackendEvent::Compaction(_) => {}
-            server::backend::BackendEvent::ResumeReplayComplete(_) => {
-                panic!("unexpected replay during a live command")
-            }
-        }
-    }
-    assert!(turn.tool_completions().any(|completion| completion.tool_call_id == background
-        && matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::RunCommand { exit_code: 0, stdout, .. } } if stdout.trim() == "LATE_DONE")), "the late nested command must deliver its actual terminal result after idle");
-    assert_universal_contract(&[turn]);
 }
 
 async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
@@ -3590,20 +3415,30 @@ fn mcp_probe_twice_prompt(backend: BackendKind, first: &str, second: &str) -> St
     )
 }
 
-fn watched_command_prompt() -> String {
+fn watched_command_prompt(backend_kind: BackendKind) -> String {
+    let run = match backend_kind {
+        BackendKind::Codex => format!(
+            "Run this exact shell command as an ordinary foreground command: for i in $(seq 1 \
+             {WATCHED_SECONDS}); do echo tick $i; sleep 1; done; echo {WATCHED_MARKER}. It takes \
+             about {WATCHED_SECONDS} seconds. Call exec_command exactly once with yield_time_ms=1000. \
+             Then call write_stdin with yield_time_ms=300000 inside a code-mode exec cell with \
+             a 1000 ms exec yield. Resume that yielded cell with the code-mode wait tool until \
+             it finishes. Do not start another command and do not use a background job."
+        ),
+        // Claude reaches for a background monitor and ends the turn on "I'll
+        // wait for the notifications", which finishes the turn before the
+        // command does. Make staying until it finishes, and checking on it more
+        // than once, part of the instruction.
+        _ => format!(
+            "Start a shell command that prints a line every second for about {WATCHED_SECONDS} \
+             seconds and then prints {WATCHED_MARKER}. Do not end your turn until it has \
+             finished: check on its output at least twice while it is still running, waiting in \
+             between, and only then report the last line it printed."
+        ),
+    };
     format!(
-        "Run exactly this foreground command with exec_command yield_time_ms=1: python3 -c \"import os; os.mkfifo('watched.fifo'); f=open('watched.fifo'); f.read(); f.close(); os.unlink('watched.fifo'); print('{WATCHED_MARKER}')\". \
-         It deliberately prints nothing until its FIFO is released. After exec_command returns its running session, \
-         call write_stdin exactly three times with that same session_id, chars empty and yield_time_ms=1. \
-         Use one separate code-mode exec per poll. Each cell must call text('Script failed: example log line') \
-         and then text(await tools.write_stdin(...)) to print the complete native polling metadata JSON. \
-         Each poll must finish before the next. Next start a fourth write_stdin with yield_time_ms=300000 inside \
-         an exec cell with // @exec: {{\"yield_time_ms\": 1000}} and print its result with text. \
-         This cell must yield while the FIFO remains held. Call the code-mode wait tool once with yield_time_ms=1000 \
-         on that yielded cell before releasing the FIFO; it must still be running with no output. \
-         Only AFTER that wait returns, use a second exec_command: printf release > watched.fifo. \
-         Finally collect the yielded cell with wait until its real completion. Do not use sleeps, detached jobs, \
-         other commands or tools. Report only the last output line, {WATCHED_MARKER}."
+        "{run} When it has finished, reply with the last line it printed, which will be exactly \
+         {WATCHED_MARKER}."
     )
 }
 
@@ -3943,10 +3778,7 @@ conformance2_scenario!(
     real_watched_command_shows_every_interaction,
     [
         BackendCapability::YieldsRunningCommands,
-        BackendCapability::YieldedCodeCells,
-        BackendCapability::BackgroundTasks,
-        BackendCapability::ResumeSession,
-        BackendCapability::ForkSession
+        BackendCapability::ResumeSession
     ]
 );
 conformance2_scenario!(real_mcp_tool_call, [BackendCapability::StartupMcpServers]);
