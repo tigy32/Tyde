@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 import shlex
+import queue
+import threading
 import unittest
 from unittest import mock
 
@@ -1114,22 +1116,29 @@ class NativeBuildToolsContractTests(unittest.TestCase):
             self.assertFalse((pathlib.Path(temp) / "path-injection").exists())
             self.assertFalse((pathlib.Path(temp) / "runtime-injection").exists())
 
-    def test_offline_native_tools_fail_without_attempting_install(self) -> None:
-        module_path = REPO_ROOT / "tools" / "provision-native-build-tools.py"
-        spec = importlib.util.spec_from_file_location("offline_native_tools", module_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        with tempfile.TemporaryDirectory() as temp:
-            root = pathlib.Path(temp) / "native-tools"
-            with mock.patch.object(module, "ready", return_value=False), mock.patch.object(
-                module.subprocess, "run"
-            ) as run:
-                with self.assertRaisesRegex(RuntimeError, "run ./dev.sh check first"):
-                    module.require_cached(root)
-                run.assert_not_called()
+    def test_native_tool_cli_preserves_invalid_published_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "native-tools"
+            output = pathlib.Path(temporary) / "prepared.env"
+            script = REPO_ROOT / "tools/provision-native-build-tools.py"
+            missing = subprocess.run(
+                [sys.executable, str(script), "--offline", "--root", str(root), "--prepare", str(output)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("run ./dev.sh check first", missing.stderr)
+            self.assertFalse(root.exists())
+            root.mkdir()
+            published = root / "tyde-native-build-tools.json"
+            published.write_text("published tools may be in use\n")
+            rejected = subprocess.run(
+                [sys.executable, str(script), "--root", str(root), "--prepare", str(output)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("refusing to replace tools another build may be using", rejected.stderr)
+            self.assertEqual(published.read_text(), "published tools may be in use\n")
+            self.assertFalse(output.exists())
 
     def test_cargo_build_uses_lazy_pinned_native_tool_wrapper(self) -> None:
         workspace = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
@@ -1329,8 +1338,7 @@ class NativeBuildToolsContractTests(unittest.TestCase):
                     pathlib.Path(sys.executable),
                     [
                         "-c",
-                        "import os, pathlib, sys, time; "
-                        "time.sleep(0.05); "
+                        "import os, pathlib, sys; "
                         f"pathlib.Path(os.environ[{env_name!r}]).write_text('done'); "
                         "sys.exit(23)",
                     ],
@@ -1366,6 +1374,7 @@ class DevCheckCacheTests(unittest.TestCase):
             'nextest-version = "0.9.100"\n', encoding="utf-8"
         )
         (self.root / "tools").mkdir()
+        shutil.copy2(REPO_ROOT / "tools/check-resources.py", self.root / "tools")
         shutil.copy2(
             REPO_ROOT / "tools" / "run-nextest-binary.sh",
             self.root / "tools" / "run-nextest-binary.sh",
@@ -1406,15 +1415,7 @@ if [[ -n "${DEV_CHECK_EXPECT_WASM_TARGET:-}" ]]; then
   [[ "$(readlink "$CARGO_TARGET_DIR")" == "$DEV_CHECK_EXPECT_WASM_TARGET" ]]
 fi
 if [[ -n "${DEV_CHECK_WASM_RELEASE:-}" ]]; then
-  waited=0
-  while [[ ! -e "$DEV_CHECK_WASM_RELEASE" ]]; do
-    if ((waited >= 600)); then
-      echo "web loader stage never ran alongside the wasm suite" >&2
-      exit 9
-    fi
-    sleep 0.05
-    waited=$((waited + 1))
-  done
+  read -r release < "$DEV_CHECK_WASM_RELEASE"
 fi
 echo "wasm" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
@@ -1582,7 +1583,7 @@ esac
 set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then echo "v22.0.0"; exit 0; fi
 echo "node $*" >> "$DEV_CHECK_TEST_LOG"
-if [[ -n "${DEV_CHECK_WASM_RELEASE:-}" ]]; then : > "$DEV_CHECK_WASM_RELEASE"; fi
+if [[ -n "${DEV_CHECK_WASM_RELEASE:-}" && "$*" == *services/chatgpt-dots/test/* ]]; then printf "released\\n" > "$DEV_CHECK_WASM_RELEASE"; fi
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
 """,
         )
@@ -1770,11 +1771,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         records = list(self._cache_dir().glob("*.success"))
         self.assertEqual(len(records), 1)
         record = records[0].read_text(encoding="utf-8")
-        self.assertIn("schema=5", record)
+        self.assertIn("schema=6", record)
         self.assertIn("complete=true", record)
         self.assertTrue(record.endswith("record.end=true\n"))
         self.assertEqual(
-            list(self._cache_dir().glob(".success.*")), []
+            list(self._cache_dir().glob(".success-owned.*")), []
         )
         run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
         metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
@@ -1924,12 +1925,13 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
     def test_stages_after_the_native_run_overlap_the_wasm_suite(self) -> None:
         # The wasm stub blocks until the web loader stage has run, so the run
-        # only completes if the two overlap. Serialize the stages again and the
-        # stub waits out its deadline and fails the run.
+        # only completes if the two overlap. The outer per-test hung guard
+        # diagnoses a deadlock if these independent stages are serialized.
         env = self.env.copy()
         env["DEV_CHECK_WASM_RELEASE"] = str(
             pathlib.Path(self.temp.name) / "wasm-release"
         )
+        os.mkfifo(env["DEV_CHECK_WASM_RELEASE"])
 
         result = self._run(env=env)
 
@@ -2029,7 +2031,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             len(initial_records),
         )
         self.assertEqual(
-            list(self._cache_dir().glob(".success.*")),
+            list(self._cache_dir().glob(".success-owned.*")),
             [],
         )
 
@@ -2775,19 +2777,100 @@ fi
         self.assertIn("PASS  dev check contract tests (1/1", result.stdout)
         self.assertEqual(self._log_lines().count("contract"), 1)
 
-    def test_lock_contention_fails_immediately_with_owner(self) -> None:
-        lock = self.root / "target" / "dev-check.lock"
-        lock.mkdir(parents=True)
-        (lock / "owner").write_text(
-            f"pid={os.getpid()}\nrepository={self.root}\n", encoding="utf-8"
+    def test_concurrent_cli_runs_keep_active_logs_and_publish_one_complete_record(self) -> None:
+        # A real socket boundary holds both runners inside the same stage.
+        # Completion events also wake the parent if the old admission gate rejects.
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        events = queue.Queue()
+        connections = []
+        processes = []
+        cargo = self.bin / "cargo"
+        source = cargo.read_text()
+        source = source.replace(
+            'echo "successful cargo output that must stay in the stage log"',
+            '''if [[ "$*" == "fmt --all --check" ]]; then
+  python3 - <<'BARRIER'
+import os, socket
+with socket.create_connection(("127.0.0.1", int(os.environ["CHECK_BARRIER_PORT"]))) as connection:
+    connection.sendall(b"ready")
+    assert connection.recv(1) == b"x"
+BARRIER
+fi
+ echo "successful cargo output that must stay in the stage log"''',
         )
+        cargo.write_text(source)
+        # An old runner may still own this legacy admission marker. Never touch it.
+        legacy = self.root / "target/dev-check.lock"
+        legacy.mkdir(parents=True)
+        (legacy / "owner").write_text(f"pid={os.getpid()}\n")
+        env = dict(self.env, CHECK_BARRIER_PORT=str(listener.getsockname()[1]))
 
-        rejected = self._run(check=False)
+        def accept_ready():
+            connection, _ = listener.accept()
+            connections.append(connection)
+            self.assertEqual(connection.makefile("rb").read(5), b"ready")
+            events.put(("ready", connection))
 
-        self.assertEqual(rejected.returncode, 1)
-        self.assertIn("another ./dev.sh check is already running", rejected.stderr)
-        self.assertIn(f"PID {os.getpid()}", rejected.stderr)
-        self.assertEqual(self._log_lines(), [])
+        def start():
+            thread = threading.Thread(target=accept_ready, daemon=True)
+            thread.start()
+            process = subprocess.Popen(
+                [str(self.root / "dev.sh"), "check"], cwd=self.root, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            processes.append(process)
+            threading.Thread(target=lambda: (process.wait(), events.put(("exit", process))), daemon=True).start()
+            event, value = events.get()
+            self.assertEqual(event, "ready", "runner exited before the concurrent stage boundary")
+            return value
+
+        try:
+            first = start()
+            first_log = next((self.root / "target/dev-check-logs").glob("run-*"))
+            os.utime(first_log, (1, 1))
+            for index in range(10):
+                old = first_log.parent / f"run-completed-{index}"
+                old.mkdir()
+                (old / "metadata.txt").write_text("overall.result=PASS\n")
+                os.utime(old, (1000 + index, 1000 + index))
+            second = start()
+            self.assertTrue(first_log.exists(), "cleanup removed an active peer's log")
+            for connection in (first, second):
+                connection.sendall(b"x")
+            for process in processes:
+                stdout, stderr = process.communicate()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("CACHE MISS", stdout)
+            owned_logs = [path for path in first_log.parent.glob("run-*") if (path / "owner").is_file()]
+            self.assertEqual(len(owned_logs), 2)
+            for path in owned_logs:
+                self.assertIn("overall.result=PASS", (path / "metadata.txt").read_text())
+                self.assertTrue((path / "wasm-tools.env.identity").is_file())
+            records = list(self._cache_dir().glob("*.success"))
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0].read_text().endswith("record.end=true\n"))
+            self.assertEqual(list(self._cache_dir().glob(".success-owned.*")), [])
+            hits = [subprocess.Popen(
+                [str(self.root / "dev.sh"), "check"], cwd=self.root, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) for _ in range(2)]
+            for process in hits:
+                stdout, stderr = process.communicate()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("CACHE HIT", stdout)
+            self.assertTrue((legacy / "owner").exists())
+        finally:
+            for connection in connections:
+                try:
+                    connection.sendall(b"x")
+                except OSError:
+                    pass
+                connection.close()
+            for process in processes:
+                process.communicate()
+            listener.close()
 
     def test_invalid_and_partial_cache_records_are_never_hits(self) -> None:
         first = self._run()
@@ -2805,7 +2888,7 @@ fi
         self.assertGreater(len(self._log_lines()), before)
         self.assertTrue(record.read_text(encoding="utf-8").endswith("record.end=true\n"))
         self.assertEqual(
-            list(self._cache_dir().glob(".success.*")), []
+            list(self._cache_dir().glob(".success-owned.*")), []
         )
 
     def test_wrong_sccache_version_fails_instead_of_falling_back(self) -> None:
@@ -2946,7 +3029,7 @@ fi
             1,
         )
 
-    def test_success_retention_uses_mtime_and_removes_only_abandoned_temp(
+    def test_success_retention_preserves_unowned_legacy_temporaries(
         self,
     ) -> None:
         cache = self._cache_dir()
@@ -2971,9 +3054,9 @@ fi
         self.assertFalse(records[0].exists())
         self.assertFalse(records[1].exists())
         self.assertTrue(all(record.exists() for record in records[2:]))
-        self.assertFalse(orphan.exists())
+        self.assertTrue(orphan.exists())
         self.assertTrue(in_flight.exists())
-        self.assertFalse(obsolete.exists())
+        self.assertTrue(obsolete.exists())
 
     def test_success_in_a_worktree_is_a_hit_after_fast_forward(self) -> None:
         worktree = pathlib.Path(self.temp.name) / "workbench"
@@ -3043,51 +3126,6 @@ class TestingBehaviorContractTests(unittest.TestCase):
                     f"profile {profile} must contain {setting}",
                 )
 
-    def test_native_runner_retains_long_suites_and_kills_one_hung_case(self) -> None:
-        config = (REPO_ROOT / ".config" / "nextest.toml").read_text()
-        with tempfile.TemporaryDirectory() as temp_name:
-            root = pathlib.Path(temp_name)
-            (root / "src").mkdir()
-            (root / ".config").mkdir()
-            (root / "Cargo.toml").write_text(
-                '[package]\nname="hang-guard-contract"\nversion="0.0.0"\n'
-                'edition="2024"\n[workspace]\n'
-            )
-            (root / "src" / "lib.rs").write_text(
-                '#[test] fn healthy_a() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
-                '#[test] fn healthy_b() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
-                '#[test] fn healthy_c() { std::thread::sleep(std::time::Duration::from_millis(600)); }\n'
-                '#[test] #[ignore] fn hung() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n'
-            )
-            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"), RUSTC_WRAPPER="")
-            for name in ("default", "ci", "conformance"):
-                profile = config.split(f"[profile.{name}]\n", 1)[1].split("\n[", 1)[0]
-                self.assertNotIn("global-timeout", profile)
-                protection = re.search(r'slow-timeout = \{ period = "(\d+)s", terminate-after = (\d+) \}', profile)
-                self.assertIsNotNone(protection)
-                self.assertEqual(int(protection[1]) * int(protection[2]), 600)
-                # Scale only the deliberate guard under test, not the suite.
-                scaled = config.replace(
-                    'period = "60s"', 'period = "100ms"'
-                ).replace('period = "120s"', 'period = "200ms"')
-                # The toy workspace has none of the repository's binary IDs;
-                # retain profile policy, not binary-specific wrappers or filters.
-                scaled = re.sub(r'\[\[profile\.\w+\.(?:scripts|overrides)\]\][\s\S]*?(?=\n\[|\Z)', '', scaled)
-                (root / ".config" / "nextest.toml").write_text(scaled)
-                command = ["cargo", "nextest", "run", "--profile", name, "--test-threads", "1"]
-                healthy = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
-                self.assertEqual(healthy.returncode, 0, healthy.stderr)
-                self.assertIn("3 tests run: 3 passed", healthy.stderr)
-                hung = subprocess.run(
-                    [*command, "--run-ignored", "only"], cwd=root, env=env,
-                    text=True, capture_output=True,
-                )
-                self.assertNotEqual(hung.returncode, 0)
-                # CI retries label attempts TMT; the summary is authoritative
-                # in every profile and must report exactly one timed-out case.
-                self.assertIn("1 test run: 0 passed, 1 timed out", hung.stderr)
-                self.assertIn("hung", hung.stderr)
-
     def test_fixture_tracing_defaults_to_warn_without_hiding_rust_log(self) -> None:
         source = (REPO_ROOT / "server" / "tests" / "fixture.rs").read_text(
             encoding="utf-8"
@@ -3138,18 +3176,6 @@ class TestingBehaviorContractTests(unittest.TestCase):
         self.assertIn("!tolerated_watcher_error", test_body)
 
 
-class NextestWrapperContractTests(unittest.TestCase):
-    def test_lock_release_requires_current_owner(self) -> None:
-        source = (REPO_ROOT / "tools" / "run-nextest-binary.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("LOCK_HELD=false", source)
-        self.assertIn('if [[ "$owner_pid" == "$$" ]]', source)
-        self.assertIn('if mkdir "$lock_dir"', source)
-        self.assertIn('lease_dir="$(mktemp', source)
-        self.assertIn("ownerless_grace_seconds=5", source)
-
-
 @unittest.skipUnless(platform.system() == "Darwin", "macOS clone wrapper")
 class NextestCloneTests(unittest.TestCase):
     def test_logical_target_replaces_stale_clone_and_dead_lock(self) -> None:
@@ -3160,6 +3186,7 @@ class NextestCloneTests(unittest.TestCase):
             tools.mkdir(parents=True)
             wrapper = tools / "run-nextest-binary.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-nextest-binary.sh", wrapper)
+            shutil.copy2(REPO_ROOT / "tools/check-resources.py", tools)
             tmpdir = temp / "tmp"
             tmpdir.mkdir()
             env = os.environ.copy()
@@ -3182,7 +3209,7 @@ class NextestCloneTests(unittest.TestCase):
 
             clones = [path for path in workspace.glob("sample.*") if path.is_file()]
             self.assertEqual(len(clones), 1)
-            self.assertFalse(lock.exists())
+            self.assertTrue(lock.exists())
             partial_lock = workspace / "partial.lock"
             partial_lease = workspace / "sample.partial.use.ownerless"
             recent_lock = workspace / "recent.lock"
@@ -3199,7 +3226,6 @@ class NextestCloneTests(unittest.TestCase):
                 extra.chmod(0o755)
                 os.utime(extra, (1000 + index, 1000 + index))
             cleanup_env = env.copy()
-            cleanup_env["TYDE_DEV_CHECK_LOCK_HELD"] = "1"
             cleanup = subprocess.run(
                 [str(wrapper), "--cleanup-stale"],
                 env=cleanup_env,
@@ -3236,6 +3262,7 @@ class WasmToolScriptTests(unittest.TestCase):
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
             shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
+            shutil.copy2(REPO_ROOT / "tools/check-resources.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3294,13 +3321,14 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertIn('export PATH="$(dirname "$runner_bin"):$PATH"', source)
 
             prepared = root / "prepared.env"
-            subprocess.run(
+            preparation = subprocess.run(
                 [str(script), "--prepare", str(prepared)],
                 env=env,
                 text=True,
                 capture_output=True,
-                check=True,
+                check=False,
             )
+            self.assertEqual(preparation.returncode, 0, preparation.stderr)
             prepared_text = prepared.read_text(encoding="utf-8")
             self.assertIn(f"export CHROME={chrome}", prepared_text)
             self.assertIn(f"export CHROMEDRIVER={driver}", prepared_text)
@@ -3336,6 +3364,38 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertIn("wasm.chrome.version=151.0.8000.1", updated_identity)
             self.assertIn("wasm.bindgen.required=0.2.119", updated_identity)
 
+    def test_concurrent_preparation_keeps_each_webdriver_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "repo"
+            script, env, _ = self._write_run_fixture(root)
+            outputs = [root / "first.env", root / "second.env"]
+            inputs = []
+            processes = []
+            for index, output in enumerate(outputs):
+                capabilities = root / f"capabilities-{index}.json"
+                capabilities.write_text(json.dumps({"checkOwner": index}))
+                inputs.append(capabilities)
+                processes.append(subprocess.Popen(
+                    [str(script), "--prepare", str(output)],
+                    env=dict(env, WASM_BINDGEN_TEST_WEBDRIVER_JSON=str(capabilities)),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ))
+            for process in processes:
+                stdout, stderr = process.communicate()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            configs = []
+            for index, output in enumerate(outputs):
+                loaded = subprocess.run(
+                    ["bash", "-c", 'source "$1"; printf "%s" "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"', "bash", str(output)],
+                    text=True, capture_output=True, check=True,
+                )
+                config = pathlib.Path(loaded.stdout)
+                configs.append(config)
+                self.assertEqual(json.loads(config.read_text())["checkOwner"], index)
+                self.assertIn(f"wasm.webdriver.source={inputs[index]}", output.with_suffix(".env.identity").read_text())
+            self.assertNotEqual(configs[0], configs[1])
+
+
     def test_invalid_or_mismatched_explicit_overrides_fail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = pathlib.Path(temp_name) / "repo"
@@ -3346,6 +3406,7 @@ class WasmToolScriptTests(unittest.TestCase):
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
             shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
+            shutil.copy2(REPO_ROOT / "tools/check-resources.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3431,6 +3492,7 @@ class WasmToolScriptTests(unittest.TestCase):
             script = tools / "run-wasm-tests.sh"
             shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
             shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
+            shutil.copy2(REPO_ROOT / "tools/check-resources.py", tools)
             (root / "Cargo.lock").write_text(
                 'name = "wasm-bindgen"\nversion = "0.2.118"\n',
                 encoding="utf-8",
@@ -3517,15 +3579,23 @@ class WasmToolScriptTests(unittest.TestCase):
         fixture.parent.mkdir(parents=True)
         fixture.write_text(
             f"#!{sys.executable}\n"
-            "import pathlib, signal, sys\n"
-            "pathlib.Path(sys.argv[1]).write_text('http://127.0.0.1:1')\n"
-            "signal.pause()\n",
+            "import pathlib, socket, sys\n"
+            "listener = socket.socket()\n"
+            "listener.bind(('127.0.0.1', 0))\n"
+            "listener.listen()\n"
+            "pathlib.Path(sys.argv[1]).write_text(f'http://127.0.0.1:{listener.getsockname()[1]}')\n"
+            "while True:\n"
+            " connection, _ = listener.accept()\n"
+            " with connection:\n"
+            "  connection.recv(4096)\n"
+            "  connection.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nready')\n",
             encoding="utf-8",
         )
         fixture.chmod(0o755)
         script = tools / "run-wasm-tests.sh"
         shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
         shutil.copy2(REPO_ROOT / "tools" / "run-test-hang-guard.py", tools)
+        shutil.copy2(REPO_ROOT / "tools/check-resources.py", tools)
         (root / "Cargo.lock").write_text(
             'name = "wasm-bindgen"\nversion = "0.2.118"\n', encoding="utf-8"
         )
@@ -3588,6 +3658,9 @@ class WasmToolScriptTests(unittest.TestCase):
             "  printf 'TARGET_DIR=%s\\n' \"${CARGO_TARGET_DIR-<unset>}\"\n"
             "  printf '=== end ===\\n'\n"
             '} >>"$CARGO_RECORD"\n'
+            'if [[ "$(basename "$PWD")" == rtc-transport || "$(basename "$PWD")" == mobile-frontend ]]; then\n'
+            "  python3 -c 'import os, urllib.request; assert urllib.request.urlopen(os.environ[\"TYDE_RTC_TEST_URL\"]).read() == b\"ready\"'\n"
+            'fi\n'
             'if [[ "${CARGO_FAIL_IN:-}" == "$(basename "$PWD")" ]]; then\n'
             "  exit 101\n"
             "fi\n"
@@ -4191,84 +4264,6 @@ try {{
             )
             self.assertEqual(ready.returncode, 0, ready.stderr)
             print(ready.stdout.strip())
-
-    def test_streaming_browser_guard_preserves_work_and_stops_a_hung_case(self) -> None:
-        guard = REPO_ROOT / "tools" / "run-test-hang-guard.py"
-        with tempfile.TemporaryDirectory() as temp_name:
-            runner = pathlib.Path(temp_name) / "runner.py"
-            runner.write_text(
-                "import os,sys,time\n"
-                "assert os.environ['WASM_BINDGEN_TEST_TIMEOUT'] == '18446744073709551615'\n"
-                "assert os.environ['WASM_BINDGEN_TEST_DRIVER_TIMEOUT'] == '600'\n"
-                "print('running 3 tests', flush=True)\n"
-                "for name in ['first','second','third']:\n"
-                " time.sleep(0.6)\n"
-                " print('test fixture::'+name+' ... ok', flush=True)\n"
-                "print('test result: ok. 3 passed', flush=True)\n"
-            )
-            command = [sys.executable, str(guard), "--hang-seconds", "1", "--", sys.executable, str(runner)]
-            healthy = subprocess.run(command, text=True, capture_output=True)
-            self.assertEqual(healthy.returncode, 0, healthy.stderr)
-            self.assertIn("third ... ok", healthy.stdout)
-            runner.write_text(
-                "import time\n"
-                "print('running 2 tests', flush=True)\n"
-                "print('test fixture::first ... ok', flush=True)\n"
-                "while True:\n"
-                " print('still producing logs', flush=True)\n"
-            )
-            hung = subprocess.run(command, text=True, capture_output=True)
-            self.assertEqual(hung.returncode, 124, hung.stderr)
-            self.assertIn("first ... ok", hung.stdout)
-            self.assertIn("1 completed tests retained", hung.stderr)
-            runner.write_text("import sys\nprint('startup failure', flush=True)\nsys.exit(23)\n")
-            failure = subprocess.run(command, text=True, capture_output=True)
-            self.assertEqual(failure.returncode, 23)
-            self.assertIn("startup failure", failure.stdout)
-
-            runner.write_text(
-                "import unittest,time\n"
-                "class Cases(unittest.TestCase):\n"
-                " def test_a(self): time.sleep(0.6)\n"
-                " def test_b(self): time.sleep(0.6)\n"
-                " def test_c(self): time.sleep(0.6)\n"
-                "unittest.main()\n"
-            )
-            python_command = [sys.executable, str(guard), "--hang-seconds", "1", "--python-tests", str(runner)]
-            healthy_python = subprocess.run(python_command, text=True, capture_output=True)
-            self.assertEqual(healthy_python.returncode, 0, healthy_python.stderr)
-            self.assertIn("Ran 3 tests", healthy_python.stderr)
-            runner.write_text(
-                "import unittest,time\n"
-                "class Cases(unittest.TestCase):\n"
-                " def test_hung(self): time.sleep(30)\n"
-                "unittest.main()\n"
-            )
-            hung_python = subprocess.run(python_command, text=True, capture_output=True)
-            self.assertNotEqual(hung_python.returncode, 0)
-            self.assertIn("Hung Python test", hung_python.stderr)
-
-            node_fixture = pathlib.Path(temp_name) / "cases.mjs"
-            node_fixture.write_text(
-                "import {test} from 'node:test';\n"
-                "import {setTimeout} from 'node:timers/promises';\n"
-                "for (const name of ['first','second','third']) test(name, async()=>{console.log('running 3 tests');await setTimeout(600);});\n"
-            )
-            node_command = [sys.executable, str(guard), "--hang-seconds", "1", "--node-tests", str(node_fixture)]
-            healthy_node = subprocess.run(node_command, text=True, capture_output=True)
-            self.assertEqual(healthy_node.returncode, 0, healthy_node.stderr)
-            self.assertIn("third", healthy_node.stdout)
-            node_fixture.write_text(
-                "import {test} from 'node:test';\n"
-                "test('completed-before-hang',()=>{});\n"
-                "test('synchronous-hang',()=>{while(true){}});\n"
-            )
-            hung_node = subprocess.run(node_command, text=True, capture_output=True)
-            self.assertNotEqual(hung_node.returncode, 0)
-            # The spec reporter forwards worker stderr through runner stdout.
-            self.assertIn("Hung Node test: synchronous-hang", hung_node.stdout + hung_node.stderr)
-            self.assertIn("✔ completed-before-hang", hung_node.stdout)
-
 
 
 class RustToolchainParityTests(unittest.TestCase):

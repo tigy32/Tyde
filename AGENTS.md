@@ -118,8 +118,11 @@ validated in a workbench and fast-forwarded onto clean `main` satisfies the
 post-land `main` gate as a cache hit for that identical commit and content.
 There is no cache-bypass mode for local, release, or CI validation.
 
-Checks are single-instance per repository and fail immediately if the local
-check lock is held. The wrapper pins repository-local sccache configuration,
+Agents may start builds and checks concurrently without permission. Never add
+whole-run admission locks, artificial queues, or host-load/CPU gates. Synchronize
+only mutable resources during provisioning/publication; each run owns its logs,
+configuration and temporary artifacts. Cleanup must not remove active peer state.
+The wrapper pins repository-local sccache configuration,
 disables Cargo incremental compilation for the check, records cache metrics,
 and never falls back when sccache setup is invalid. The shared compiler cache
 has a 10 GiB default cap. Set a persistent machine-local cap for this repository
@@ -464,10 +467,13 @@ no real reason), internal DOM structure beyond what's needed to find rendered
 output, or anything an AI refactor could trivially "fix" by editing the
 assertion rather than the code.
 
-**Never weaken, delete, or rewrite a test to make it pass.** A red test is a
-claim that something is wrong; deleting the claim does not make it false. Green
-is not the goal — correct is. This applies to every test in the repository, not
-just the wasm ones.
+**Preserve deterministic product assertions, not noisy test counts.** A red test
+is evidence to diagnose, not permission to loosen its assertion. Load-dependent
+or timing-flaky tests must cheaply synchronize valuable behavior through explicit
+events/state or be deleted. Never retune thresholds/samples, average results,
+retry to green, add arbitrary sleeps, or gate tests on host load. Per-test hung
+watchdogs may diagnose deadlock, not impose performance requirements. The
+assertion-correction rules below apply to deterministic product behavior.
 
 When a test fails, work from evidence:
 

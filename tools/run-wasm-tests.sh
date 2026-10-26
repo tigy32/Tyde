@@ -340,7 +340,7 @@ find_cft_chrome_bin() {
 write_webdriver_config() {
     local chrome_bin="$1"
     local source_json="${WASM_BINDGEN_TEST_WEBDRIVER_JSON:-}"
-    local output_json="$cache_dir/webdriver-chrome-$chrome_major-$cft_platform.json"
+    local output_json="${prepare_output:-$(mktemp "$cache_dir/webdriver-XXXXXX")}.webdriver.json"
     python3 - "$chrome_bin" "$source_json" "$output_json" <<'PY'
 import json, os, sys
 
@@ -408,6 +408,13 @@ print_identity() {
         printf 'wasm.webdriver.source=default\n'
     fi
 }
+
+# Preparation owns mutable downloads only; browser execution is independent.
+if [[ "$mode" == prepare || ( "$mode" == run && "${TYDE_WASM_TOOLS_PREPARED:-0}" != 1 ) ]]; then
+    mkdir -p "$cache_dir"
+    exec 8>"$cache_dir/.provision.lock"
+    python3 "$repo_root/tools/check-resources.py" lock-fd 8
+fi
 
 # ── Platform detection ────────────────────────────────────────────────────
 case "$(uname -s)-$(uname -m)" in
@@ -600,6 +607,8 @@ if [[ -n "$runner_bin" ]]; then
     [[ "$installed" == "$wb_version" ]] && needs_install=0
 fi
 if [[ $needs_install -eq 1 ]]; then
+    [[ -z "${WASM_BINDGEN_TEST_RUNNER:-}" ]] ||
+        die "explicit wasm-bindgen-test-runner ${installed:-unreadable} does not match required $wb_version"
     [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" != 1 ]] ||
         die "prepared wasm-bindgen-test-runner ${installed:-missing} does not match required $wb_version"
     if [[ "$mode" == "identity" ]]; then
@@ -614,8 +623,11 @@ if [[ $needs_install -eq 1 ]]; then
         exit 0
     fi
     log "installing wasm-bindgen-cli@$wb_version (this may take a minute)…"
-    cargo install wasm-bindgen-cli --version "$wb_version" --locked
-    runner_bin="$(command -v wasm-bindgen-test-runner)"
+    runner_root="$cache_dir/wasm-bindgen-$wb_version"
+    runner_bin="$runner_root/bin/wasm-bindgen-test-runner"
+    if [[ ! -x "$runner_bin" ]]; then
+        cargo install wasm-bindgen-cli --version "$wb_version" --locked --root "$runner_root"
+    fi
     installed="$("$runner_bin" --version 2>/dev/null | awk '{print $NF}')"
     [[ "$installed" == "$wb_version" ]] ||
         die "installed wasm-bindgen-test-runner $installed does not match required $wb_version"
@@ -638,6 +650,8 @@ if [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]; then
 else
     write_webdriver_config "$chrome_bin"
 fi
+
+exec 8>&-
 
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
@@ -694,36 +708,25 @@ cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
 wasm_cargo_test "$@"
 
-fixture_ready="$(mktemp "$cache_dir/rtc-ready.XXXXXX")"
-fixture_log="$cache_dir/rtc-fixture.log"
-"${TYDE_RTC_FIXTURE_EXECUTABLE:?canonical check must provide the native RTC fixture executable}" "$fixture_ready" >"$fixture_log" 2>&1 &
-fixture_pid=$!
-cleanup_rtc_fixture() {
-    if kill -0 "$fixture_pid" 2>/dev/null; then kill "$fixture_pid"; fi
-    wait "$fixture_pid" 2>/dev/null || true
-    rm -f "$fixture_ready"
-}
-trap cleanup_rtc_fixture EXIT
-while [[ ! -s "$fixture_ready" ]]; do
-    kill -0 "$fixture_pid" 2>/dev/null || { cat "$fixture_log" >&2; die "TURN fixture exited before readiness"; }
-    sleep 0.1
-done
-export TYDE_RTC_TEST_URL="$(cat "$fixture_ready")"
-cd "$repo_root/rtc-transport"
-log "running: cargo test --target wasm32-unknown-unknown $* (rtc-transport)"
-if ! wasm_cargo_test "$@"; then
-    cat "$fixture_log" >&2
-    die "browser/native TURN tests failed"
-fi
-
-cd "$repo_root/mobile-frontend"
-log "running: cargo test --target wasm32-unknown-unknown $* (mobile-frontend)"
-wasm_cargo_test "$@"
+export -f wasm_cargo_test
+export wasm_runner_config repo_root
+python3 "$repo_root/tools/check-resources.py" rtc \
+    "${TYDE_RTC_FIXTURE_EXECUTABLE:?canonical check must provide the native RTC fixture executable}" -- \
+    bash -c '
+        set -euo pipefail
+        cd "$repo_root/rtc-transport"
+        wasm_cargo_test "$@"
+        cd "$repo_root/mobile-frontend"
+        wasm_cargo_test "$@"
+    ' _ "$@"
 
 # The existing fixture harness mounts the production mobile composer in WebKit.
 cd "$repo_root"
-npm ci --ignore-scripts --no-audit --no-fund
-npm exec -- playwright install webkit
-# Build once before the server starts; cold compilation has no deadline.
-(cd "$repo_root/mobile-frontend" && NO_COLOR=true trunk build --features ui-fixtures)
-npm exec -- playwright test --config playwright.mobile.config.mjs --project composer-webkit
+python3 "$repo_root/tools/check-resources.py" lock "$repo_root/target/javascript.lock" exclusive -- \
+    bash -c '
+        set -euo pipefail
+        npm ci --ignore-scripts --no-audit --no-fund
+        npm exec -- playwright install webkit
+        (cd mobile-frontend && NO_COLOR=true trunk build --features ui-fixtures)
+        npm exec -- playwright test --config playwright.mobile.config.mjs --project composer-webkit
+    '

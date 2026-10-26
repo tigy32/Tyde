@@ -10,7 +10,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 from contextlib import contextmanager
 
 
@@ -87,36 +86,39 @@ def provisioning_lock(root: pathlib.Path):
     root.parent.mkdir(parents=True, exist_ok=True)
     lock_path = root.with_name(f".{root.name}.lock")
     with lock_path.open("a+b") as lock:
-        while True:
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class Overlapped(ctypes.Structure):
+                _fields_ = [("internal", ctypes.c_void_p), ("internal_high", ctypes.c_void_p),
+                            ("offset", wintypes.DWORD), ("offset_high", wintypes.DWORD),
+                            ("event", wintypes.HANDLE)]
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = wintypes.HANDLE(msvcrt.get_osfhandle(lock.fileno()))
+            overlapped = Overlapped()
+            kernel.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                           wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped)]
+            kernel.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                             wintypes.DWORD, ctypes.POINTER(Overlapped)]
+            if not kernel.LockFileEx(handle, 2, 0, 1, 0, ctypes.byref(overlapped)):
+                raise ctypes.WinError(ctypes.get_last_error())
             try:
-                if os.name == "nt":
-                    import msvcrt
+                yield
+            finally:
+                if not kernel.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(overlapped)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            import fcntl
 
-                    lock.seek(0)
-                    if lock.read(1) == b"":
-                        lock.write(b"0")
-                        lock.flush()
-                    lock.seek(0)
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except (BlockingIOError, OSError):
-                time.sleep(0.1)
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                import msvcrt
-
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
 
 
 def provision(root: pathlib.Path) -> pathlib.Path:
@@ -135,6 +137,8 @@ def require_cached(root: pathlib.Path) -> pathlib.Path:
 
 def provision_locked(root: pathlib.Path) -> pathlib.Path:
     if not ready(root):
+        if (root / "tyde-native-build-tools.json").exists():
+            raise RuntimeError("published native build tools failed verification; refusing to replace tools another build may be using")
         shutil.rmtree(root, ignore_errors=True)
         root.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(root)], check=True)

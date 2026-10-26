@@ -5,13 +5,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")"
 
-readonly DEV_CHECK_CACHE_SCHEMA="5"
-readonly DEV_CHECK_OBSOLETE_CACHE_DIR="target/dev-check-cache"
+readonly DEV_CHECK_CACHE_SCHEMA="6"
 readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
-readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
-readonly DEV_CHECK_LOG_RETENTION=8
-readonly DEV_CHECK_CACHE_RETENTION=64
-readonly DEV_CHECK_CACHE_TEMP_MAX_AGE_MINUTES=1440
 readonly DEV_CHECK_SCCACHE_VERSION="0.16.0"
 
 DEV_CHECK_CACHE_DIR=""
@@ -20,7 +15,6 @@ RUN_METADATA=""
 RUN_SUMMARY=""
 RUN_STARTED_EPOCH=0
 RUN_FINALIZED=false
-CHECK_LOCK_HELD=false
 STAGE_NUMBER=0
 CLEANUP_RECLAIMED_BYTES=0
 SCCACHE_STATS_BEFORE=""
@@ -64,14 +58,6 @@ record_disk_snapshot() {
     done
 }
 
-release_check_lock() {
-    if [[ "$CHECK_LOCK_HELD" == true ]]; then
-        rm -f "$DEV_CHECK_LOCK_DIR/owner"
-        rmdir "$DEV_CHECK_LOCK_DIR" 2>/dev/null || true
-        CHECK_LOCK_HELD=false
-    fi
-}
-
 finish_on_exit() {
     local status=$?
     local finished_epoch
@@ -95,7 +81,6 @@ finish_on_exit() {
         rm -f "$WASM_CARGO_TARGET_ALIAS"
         WASM_CARGO_TARGET_ALIAS=""
     fi
-    release_check_lock
 }
 
 trap finish_on_exit EXIT
@@ -103,103 +88,27 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-acquire_check_lock() {
-    local owner_pid=""
-    mkdir -p target
-
-    if ! mkdir "$DEV_CHECK_LOCK_DIR" 2>/dev/null; then
-        if [[ -r "$DEV_CHECK_LOCK_DIR/owner" ]]; then
-            owner_pid="$(sed -n 's/^pid=//p' "$DEV_CHECK_LOCK_DIR/owner")"
-        fi
-        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
-            die "another ./dev.sh check is already running (PID $owner_pid, lock $DEV_CHECK_LOCK_DIR)"
-        fi
-        [[ -n "$owner_pid" ]] ||
-            die "check lock exists without a readable owner: $DEV_CHECK_LOCK_DIR"
-        mv "$DEV_CHECK_LOCK_DIR" "$DEV_CHECK_LOCK_DIR.stale.$$" 2>/dev/null ||
-            die "could not reclaim stale check lock: $DEV_CHECK_LOCK_DIR"
-        rm -rf "$DEV_CHECK_LOCK_DIR.stale.$$"
-        mkdir "$DEV_CHECK_LOCK_DIR" 2>/dev/null ||
-            die "another ./dev.sh check acquired the lock: $DEV_CHECK_LOCK_DIR"
-    fi
-
-    {
-        printf 'pid=%s\n' "$$"
-        printf 'started_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        printf 'repository=%s\n' "$PWD"
-    } >"$DEV_CHECK_LOCK_DIR/owner"
-    CHECK_LOCK_HELD=true
-    export TYDE_DEV_CHECK_LOCK_HELD=1
-}
-
-directory_bytes() {
-    local path="$1"
-    local kib=0
-    if [[ -e "$path" ]]; then
-        kib="$(du -sk "$path" 2>/dev/null | awk 'NR == 1 { print $1 }')"
-    fi
-    printf '%s\n' "$((kib * 1024))"
-}
-
-remove_old_entries() {
-    local directory="$1"
-    local pattern="$2"
-    local keep="$3"
-    local count=0 entry bytes
-
-    [[ -d "$directory" ]] || return 0
-    while IFS=$'\t' read -r _ entry; do
-        count=$((count + 1))
-        if ((count > keep)); then
-            bytes="$(directory_bytes "$entry")"
-            rm -rf "$entry"
-            CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
-        fi
-    done < <(
-        {
-            while IFS= read -r entry; do
-                if [[ "$(uname -s)" == "Darwin" ]]; then
-                    printf '%s\t%s\n' "$(stat -f '%m' "$entry")" "$entry"
-                else
-                    printf '%s\t%s\n' "$(stat -c '%Y' "$entry")" "$entry"
-                fi
-            done < <(find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" \
-                -print 2>/dev/null)
-        } | LC_ALL=C sort -rn
-    )
-}
-
 cleanup_check_artifacts() {
-    local reclaimed entry bytes
-
-    remove_old_entries "$DEV_CHECK_LOG_DIR" 'run-*' "$((DEV_CHECK_LOG_RETENTION - 1))"
-    remove_old_entries "$DEV_CHECK_CACHE_DIR" '*.success' "$DEV_CHECK_CACHE_RETENTION"
-    # Other worktrees write records here concurrently, so only abandoned
-    # temporary records are old enough to remove.
-    while IFS= read -r entry; do
-        bytes="$(directory_bytes "$entry")"
-        rm -f "$entry"
-        CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
-    done < <(find "$DEV_CHECK_CACHE_DIR" -mindepth 1 -maxdepth 1 -type f -name '.success.*' \
-        -mmin "+$DEV_CHECK_CACHE_TEMP_MAX_AGE_MINUTES" -print 2>/dev/null)
-    if [[ -d "$DEV_CHECK_OBSOLETE_CACHE_DIR" ]]; then
-        bytes="$(directory_bytes "$DEV_CHECK_OBSOLETE_CACHE_DIR")"
-        rm -rf "$DEV_CHECK_OBSOLETE_CACHE_DIR"
-        CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
-    fi
+    local reclaimed
+    CLEANUP_RECLAIMED_BYTES="$(python3 tools/check-resources.py cleanup \
+        "$DEV_CHECK_CACHE_DIR" "$DEV_CHECK_LOG_DIR")"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         reclaimed="$(tools/run-nextest-binary.sh --cleanup-stale)"
-        [[ "$reclaimed" =~ ^[0-9]+$ ]] ||
-            die "nextest cleanup returned an invalid byte count: $reclaimed"
+        [[ "$reclaimed" =~ ^[0-9]+$ ]] || die "invalid nextest cleanup byte count"
         CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + reclaimed))
     fi
 }
 
 initialize_run_log() {
-    local timestamp
+    local timestamp staging
     timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
-    RUN_DIR="$DEV_CHECK_LOG_DIR/run-$timestamp-$$"
-    mkdir -p "$RUN_DIR"
+    mkdir -p "$DEV_CHECK_LOG_DIR"
+    staging="$(mktemp -d "$DEV_CHECK_LOG_DIR/.run-XXXXXX")"
+    printf '%s\n' "$$" >"$staging/owner"
+    exec 9>"$staging/.lease"
+    python3 tools/check-resources.py lock-fd 9 shared
+    RUN_DIR="$DEV_CHECK_LOG_DIR/run-$timestamp-$$-${staging##*.run-}"
+    mv "$staging" "$RUN_DIR"
     RUN_METADATA="$RUN_DIR/metadata.txt"
     RUN_SUMMARY="$RUN_DIR/summary.txt"
     RUN_STARTED_EPOCH="$(date +%s)"
@@ -521,7 +430,7 @@ configure_wasm_cargo_target() {
     fi
 
     repository_hash="$(printf '%s' "$PWD" | hash_text)"
-    alias_path="/tmp/tyde-wasm-target-$repository_hash"
+    alias_path="/tmp/tyde-wasm-target-$repository_hash-$$"
     if [[ -e "$alias_path" || -L "$alias_path" ]]; then
         [[ -L "$alias_path" && "$(readlink "$alias_path")" == "$PWD/target" ]] ||
             die "wasm target alias is occupied by another path: $alias_path"
@@ -601,9 +510,8 @@ write_cache_record() {
     local key="$2"
     local temp_path
 
-    mkdir -p "$DEV_CHECK_CACHE_DIR"
-    temp_path="$(mktemp "$DEV_CHECK_CACHE_DIR/.success.XXXXXX")"
-    if ! {
+    temp_path="$RUN_DIR/cache-record"
+    {
         printf 'schema=%s\n' "$DEV_CHECK_CACHE_SCHEMA"
         printf 'key=%s\n' "$key"
         printf 'complete=true\n'
@@ -612,10 +520,9 @@ write_cache_record() {
         cat "$RUN_SUMMARY"
         printf 'summary.end\n'
         printf 'record.end=true\n'
-    } >"$temp_path" || ! mv -f "$temp_path" "$path"; then
-        rm -f "$temp_path"
-        die "could not write dev check cache record"
-    fi
+    } >"$temp_path"
+    python3 tools/check-resources.py cache-publish "$DEV_CHECK_CACHE_DIR" "$temp_path" "$path"
+    rm "$temp_path"
 }
 
 print_cached_summary() {
@@ -769,7 +676,8 @@ run_check_stages() {
         done
     fi
     run_stage "Provision JavaScript test tools" 1 \
-        npm ci --ignore-scripts --no-audit --no-fund
+        python3 tools/check-resources.py lock target/javascript.lock exclusive -- \
+            npm ci --ignore-scripts --no-audit --no-fund
     # Avoid host /tmp churn, inherited Git roots, and long Unix socket paths.
     mkdir -p "$native_temp_dir"
     run_stage "cargo nextest run" "$repetitions" \
@@ -795,6 +703,7 @@ run_check_stages() {
     (
         trap - EXIT INT TERM HUP
         run_stage_at "$n_loader" "web loader tests" "$repetitions" \
+            python3 tools/check-resources.py lock target/javascript.lock shared -- \
             bash -c 'python3 tools/run-test-hang-guard.py --node-tests services/chatgpt-dots/test/*.test.mjs && cd web/loader && exec python3 ../../tools/run-test-hang-guard.py --node-tests test/*.test.js' &&
             run_stage_at "$n_docs" "customer documentation" 1 \
                 python3 docs/build.py --check &&
@@ -869,7 +778,6 @@ check() {
         return
     fi
 
-    acquire_check_lock
     cleanup_check_artifacts
     initialize_run_log
     printf 'overall.cache_requested=%s\n' "$cache_state" >>"$RUN_METADATA"
@@ -904,12 +812,14 @@ check() {
     record_path="$DEV_CHECK_CACHE_DIR/$key.success"
     printf 'cache.key=%s\n' "$key" >>"$RUN_METADATA"
 
-    if cache_record_is_valid "$record_path" "$key"; then
+    python3 tools/check-resources.py cache-read "$DEV_CHECK_CACHE_DIR" \
+        "$record_path" "$RUN_DIR/cached-record"
+    if cache_record_is_valid "$RUN_DIR/cached-record" "$key"; then
         refreshed_inputs="$(cache_inputs)"
         refreshed_key="$(cache_key_for_inputs "$refreshed_inputs")"
         if [[ "$refreshed_key" == "$key" ]]; then
             printf 'CACHE HIT %s\n' "$key"
-            print_cached_summary "$record_path"
+            print_cached_summary "$RUN_DIR/cached-record"
             finish_success hit
             return
         fi

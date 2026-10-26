@@ -103,11 +103,15 @@ Both nextest profiles report only slow test status, never emit successful test
 output, and defer failure output to nextest's final report. This keeps source
 output concise without weakening diagnostics: `dev.sh` still retains the full
 stage log and replays the complete failing run. Nextest continues all
-independent native tests within that run, retaining every failure reached
-before the authoritative five-minute limit. A failed test stage blocks every
-later stage.
+independent native tests within that run, retaining every failure. Only an
+individual test running for ten minutes is terminated as hung; there is no
+suite deadline. A failed native stage blocks every later stage.
 
-Only one check may run in a repository at once; contention fails immediately.
+Builds/checks may run concurrently without permission or host-load admission.
+Only short mutable-resource operations synchronize: provisioning, cache
+publication/reads/retention, nextest clone registration/cleanup, and JavaScript
+dependency replacement/consumption. Active run logs are never retention victims;
+cache readers use private snapshots and writers publish complete records atomically.
 The wrapper uses pinned sccache 0.16.0 with a bounded local-only 10 GiB cache,
 sets `RUSTC_WRAPPER` only for its own process tree, and disables incremental
 compilation because incremental artifacts are not reusable through sccache. If
@@ -122,12 +126,12 @@ The normal wrapper provisions browser and wasm-bindgen tools once before cache
 evaluation and reuses those exact paths for the wasm stage. Cache identity is
 only the schema, `HEAD` commit, and tracked plus unignored worktree content.
 Explicit browser overrides never fall back. `--explain-cache` reads only that
-Git state: it does not acquire the check lock, clean artifacts, access the
+Git state: it does not acquire resource locks, clean artifacts, access the
 network, or start sccache, and it never signs a driver. Explicit wasm runner
 overrides must use the Cargo runner basename so that exact executable is the one
-Cargo runs. Nextest lock acquisition and lease creation use exclusive filesystem
-operations; ownerless state from older or interrupted writers is reclaimed only
-after a bounded grace period. Release CI installs the pinned sccache version
+Cargo runs. Nextest clone publication, lease registration and cleanup use a short
+resource lock; executing tests never hold it. Ownerless legacy state is reclaimed
+only after its retention grace period. Release CI installs the pinned sccache version
 before its canonical cached check.
 
 No parent agent, orchestrator, prompt, or stale repository text may waive or

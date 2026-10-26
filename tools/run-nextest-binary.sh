@@ -16,13 +16,6 @@ workspace_key="$(stat -f '%d-%i' "$repo_root")"
 cache_root="${TMPDIR:-/tmp}/tyde-nextest"
 cache_dir="$cache_root/$workspace_key"
 ownerless_grace_seconds=5
-# A workspace directory is named after the inode of a repository root that the
-# AGENTS.md workflow deletes as its final step, so nothing can ever find it
-# again. Each one records the root it belongs to and is swept once that root is
-# gone. Directories predating the marker are only swept after a full day idle.
-workspace_marker=".workspace-root"
-legacy_grace_seconds=86400
-
 state_mtime() {
     stat -f '%m' "$1"
 }
@@ -48,44 +41,12 @@ state_owner_pid() {
     return 0
 }
 
-workspace_dir_is_live() {
-    local peer="$1"
-    local marker="$peer/$workspace_marker"
-    local recorded modified now
-
-    if [[ -f "$marker" ]]; then
-        recorded="$(<"$marker")"
-        [[ -n "$recorded" && -d "$recorded" ]] || return 1
-        [[ "$(stat -f '%d-%i' "$recorded" 2>/dev/null)" == "$(basename "$peer")" ]]
-        return
-    fi
-
-    now="$(date +%s)"
-    modified="$(state_mtime "$peer" 2>/dev/null || true)"
-    [[ "$modified" =~ ^[0-9]+$ ]] || return 0
-    ((now - modified < legacy_grace_seconds))
-}
-
-workspace_dir_is_busy() {
-    local peer="$1"
-    local state owner_pid
-
-    for state in "$peer"/*.lock "$peer"/*.use.*; do
-        [[ -e "$state" || -L "$state" ]] || continue
-        owner_pid="$(state_owner_pid "$state")"
-        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
-            return 0
-        fi
-    done
-    return 1
-}
+# Only clone publication/lease registration and cleanup share this lock.
+mkdir -p "$cache_dir"
+exec 8>"$cache_dir/.ownership.lock"
+python3 "$repo_root/tools/check-resources.py" lock-fd 8
 
 if [[ "${1:-}" == "--cleanup-stale" ]]; then
-    [[ "${TYDE_DEV_CHECK_LOCK_HELD:-0}" == 1 ]] || {
-        printf '%s\n' \
-            'Refusing nextest cleanup without the repository dev-check lock' >&2
-        exit 1
-    }
     before_kib=0
     after_kib=0
     [[ -d "$cache_dir" ]] &&
@@ -126,17 +87,7 @@ if [[ "${1:-}" == "--cleanup-stale" ]]; then
         )
         after_kib="$(du -sk "$cache_dir" | awk 'NR == 1 { print $1 }')"
     fi
-    peers_kib=0
-    for peer in "$cache_root"/*; do
-        [[ -d "$peer" ]] || continue
-        [[ "$peer" != "$cache_dir" ]] || continue
-        workspace_dir_is_live "$peer" && continue
-        workspace_dir_is_busy "$peer" && continue
-        peer_kib="$(du -sk "$peer" | awk 'NR == 1 { print $1 }')"
-        rm -rf "$peer" 2>/dev/null || continue
-        peers_kib=$((peers_kib + peer_kib))
-    done
-    printf '%s\n' "$(((before_kib - after_kib + peers_kib) * 1024))"
+    printf '%s\n' "$(((before_kib - after_kib) * 1024))"
     exit 0
 fi
 
@@ -155,53 +106,10 @@ else
 fi
 binary_key="$(stat -f '%i-%m-%c-%z' "$binary")"
 cached_binary="$cache_dir/$logical_name.$binary_key"
-lock_dir="$cache_dir/$logical_name.lock"
 
 mkdir -p "$cache_dir"
-if [[ "$(cat "$cache_dir/$workspace_marker" 2>/dev/null || true)" != "$repo_root" ]]; then
-    printf '%s\n' "$repo_root" >"$cache_dir/$workspace_marker.tmp.$$"
-    mv "$cache_dir/$workspace_marker.tmp.$$" "$cache_dir/$workspace_marker"
-fi
-LOCK_HELD=false
-
-acquire_lock() {
-    local attempt owner_pid
-    for ((attempt = 1; attempt <= 200; attempt++)); do
-        if mkdir "$lock_dir" 2>/dev/null; then
-            printf 'pid=%s\n' "$$" >"$lock_dir/owner.tmp.$$"
-            mv "$lock_dir/owner.tmp.$$" "$lock_dir/owner"
-            LOCK_HELD=true
-            return
-        fi
-        owner_pid="$(state_owner_pid "$lock_dir")"
-        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-            if mv "$lock_dir" "$lock_dir.stale.$$" 2>/dev/null; then
-                rm -rf "$lock_dir.stale.$$"
-                continue
-            fi
-        elif [[ -z "$owner_pid" ]] && state_is_past_grace "$lock_dir"; then
-            if mv "$lock_dir" "$lock_dir.stale.$$" 2>/dev/null; then
-                rm -rf "$lock_dir.stale.$$"
-                continue
-            fi
-        fi
-        sleep 0.05
-    done
-    printf 'Timed out preparing nextest binary %s; lock: %s\n' \
-        "$binary" "$lock_dir" >&2
-    exit 1
-}
-
 release_lock() {
-    local owner_pid=""
-    if [[ "$LOCK_HELD" == true ]]; then
-        owner_pid="$(state_owner_pid "$lock_dir")"
-        if [[ "$owner_pid" == "$$" ]]; then
-            rm -f "$lock_dir/owner"
-            rmdir "$lock_dir" 2>/dev/null || true
-        fi
-        LOCK_HELD=false
-    fi
+    exec 8>&-
 }
 
 stale_binary_is_in_use() {
@@ -225,7 +133,6 @@ stale_binary_is_in_use() {
     [[ "$in_use" == true ]]
 }
 
-acquire_lock
 temporary_binary="$cached_binary.$$"
 lease_dir=""
 cleanup() {
