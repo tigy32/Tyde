@@ -64,6 +64,12 @@ verifies cohorts. Discovery never imports arbitrary host output as a baseline.
   in provenance. An effective sccache wrapper selects the same installed
   sccache version with an owned foreground namespace-local service and private
   endpoint/storage. Caching is not disabled and the host daemon is untouched.
+  Tyde's pinned Meson/Ninja provisioner uses the private execution runtime,
+  not Cargo's target tree, inside Bubblewrap. Its interpreter-referencing venv
+  is never sealed as a portable artifact. Normal native builds keep their
+  existing tool location; explicit tool-root overrides remain authoritative.
+  Runtime tools are provisioned on demand per launch, not claimed as restored
+  compiler artifacts.
 - JS/TS: one npm, pnpm or Yarn lockfile selects its package manager. Enforce
   a declared `packageManager` version; perform the locked install and run the
   declared `build` script when present. Retain dependencies and conventional
@@ -85,7 +91,9 @@ validated tests. `Snapshot` means verified private snapshot restoration; the
 normal build tool remains the incremental-rebuild authority. Neither state
 means the application is running. Per-root `build_blockers` expose unrecognized
 build layouts; a project with no supported build manifest reports `Blocked`,
-not a warm success. Tool/configuration, producer, namespace and storage errors
+not a warm success. Artifact-link errors identify the selected artifact and the offending link in
+its chain; absolute/external links remain rejected, including indirect links.
+Tool/configuration, producer, namespace and storage errors
 fail explicitly and roll back creation without a Native substitute.
 
 Automatic setup does not guess conflicting package managers, external output

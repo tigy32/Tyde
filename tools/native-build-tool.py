@@ -39,14 +39,9 @@ def main() -> int:
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
     repository = pathlib.Path(__file__).resolve().parent.parent
-    root = pathlib.Path(
-        os.environ.get(
-            "TYDE_NATIVE_BUILD_TOOLS_ROOT",
-            repository / "target" / "native-build-tools",
-        )
-    ).resolve()
     try:
         provisioner = load_provisioner()
+        root = provisioner.tools_root(repository)
         directory = provisioner.provision(root)
         executable = provisioner.executable(directory, tool)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:

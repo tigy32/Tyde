@@ -4987,7 +4987,7 @@ async fn bubblewrap_automatic_multiroot_builds_reuse_private_artifacts() {
         git(root, &["config", "user.name", "Tests"]);
         fs::write(
             root.join(".gitignore"),
-            "/target/\n/node_modules/\n/dist/\n",
+            "/target/\n/node_modules/\n/dist/\n__pycache__/\n",
         )
         .unwrap();
     }
@@ -5005,6 +5005,31 @@ async fn bubblewrap_automatic_multiroot_builds_reuse_private_artifacts() {
     )
     .unwrap();
     fs::write(shared.join("src/lib.rs"), "pub fn value() -> u32 { 42 }\n").unwrap();
+    fs::create_dir(rust.join("tools")).unwrap();
+    for name in ["native-build-tool.py", "provision-native-build-tools.py"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tools")
+                .join(name),
+            rust.join("tools").join(name),
+        )
+        .unwrap();
+    }
+    fs::write(
+        rust.join("build.rs"),
+        r#"fn main() {
+    let status = std::process::Command::new("python3")
+        .args(["tools/native-build-tool.py", "meson", "--", "--version"])
+        .env_remove("TYDE_NATIVE_BUILD_TOOLS_ROOT")
+        .status().unwrap();
+    assert!(status.success(), "real pinned native tool must run");
+    println!("cargo:rerun-if-changed=tools/native-build-tool.py");
+    println!("cargo:rerun-if-changed=tools/provision-native-build-tools.py");
+}
+"#,
+    )
+    .unwrap();
+
     fs::write(web.join("package.json"), serde_json::to_vec(&json!({"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"},"scripts":{"build":"node build.js"}})).unwrap()).unwrap();
     fs::write(web.join("package-lock.json"), serde_json::to_vec(&json!({"name":"web","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"}},"../library":{"name":"library","version":"1.0.0"},"node_modules/library":{"resolved":"../library","link":true}}})).unwrap()).unwrap();
     fs::write(web.join("build.js"), "const fs=require('fs'); const value=String(require('library')); fs.mkdirSync('dist',{recursive:true}); if(!fs.existsSync('dist/value') || fs.readFileSync('dist/value','utf8')!==value) fs.writeFileSync('dist/value',value);\n").unwrap();
@@ -5204,7 +5229,7 @@ async fn bubblewrap_automatic_multiroot_builds_reuse_private_artifacts() {
     .await;
     let js_artifact = Path::new(&second_roots[2].0).join("dist/value");
     let js_mtime = fs::metadata(&js_artifact).unwrap().modified().unwrap();
-    fixture.client.terminal_send(&terminal.terminal_id, protocol::TerminalSendPayload {data:r#"printf '\n'; cargo build --message-format=json && (cd ../web && npm run build); result=$?; printf '\n{"warm_flow_done":true,"status":%s}\n' "$result"
+    fixture.client.terminal_send(&terminal.terminal_id, protocol::TerminalSendPayload {data:r#"printf '\n'; python3 -c 'from pathlib import Path; assert not Path("target/native-build-tools").exists(), "runtime tools entered portable artifacts"' && cargo build --message-format=json && (cd ../web && npm run build); result=$?; printf '\n{"warm_flow_done":true,"status":%s}\n' "$result"
 "#.into()}).await.unwrap();
     let mut output = String::new();
     loop {
@@ -5246,10 +5271,15 @@ async fn bubblewrap_automatic_multiroot_builds_reuse_private_artifacts() {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|value| value["reason"] == "compiler-artifact")
         .collect::<Vec<_>>();
+    // The real provisioner adds a custom-build artifact alongside the two
+    // workspace outputs; every artifact must still be fresh below.
     assert_eq!(
-        artifacts.len(),
+        artifacts
+            .iter()
+            .filter(|value| value["target"]["kind"] != json!(["custom-build"]))
+            .count(),
         2,
-        "real Cargo must report both workspace artifacts"
+        "real Cargo must report both workspace binary/library artifacts"
     );
     assert!(
         artifacts.iter().all(|value| value["fresh"] == true),
@@ -5370,6 +5400,28 @@ PY
     assert!(
         rejection.message.contains("symlink") && rejection.message.contains("outside registered")
     );
+    fs::remove_file(web.join("vendor")).unwrap();
+    std::os::unix::fs::symlink("/mnt/tyde-workspace/library", web.join("vendor")).unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-qm", "Absolute chained artifact link"]);
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("reject-absolute-chain".into()),
+            name: "Rejected absolute chain".into(),
+        })
+        .await
+        .unwrap();
+    let rejection =
+        expect_command_error(&mut fixture.client, "reject absolute artifact chain").await;
+    assert!(
+        rejection
+            .message
+            .contains("/mnt/tyde-workspace/web/dist/assets")
+    );
+    assert!(rejection.message.contains("/mnt/tyde-workspace/web/vendor"));
+    assert!(rejection.message.contains("traverses absolute link"));
     fs::write(
         web.join("build.js"),
         "process.stderr.write('fixture compilation failed\\n'); process.exit(7);\n",

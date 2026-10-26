@@ -17,6 +17,18 @@ MESON_VERSION = "1.11.2"
 NINJA_PACKAGE_VERSION = "1.11.1.4"
 
 
+def tools_root(repository: pathlib.Path) -> pathlib.Path:
+    configured = os.environ.get("TYDE_NATIVE_BUILD_TOOLS_ROOT")
+    if configured is not None:
+        return pathlib.Path(configured).resolve()
+    runtime = os.environ.get("TYDE_WORKBENCH_RUNTIME")
+    if runtime is not None:
+        # A venv references the host interpreter; it is a runtime tool, not
+        # a portable compiler output eligible for an artifact snapshot.
+        return pathlib.Path(runtime) / "native-build-tools"
+    return repository / "target" / "native-build-tools"
+
+
 def executable(directory: pathlib.Path, name: str) -> pathlib.Path:
     suffix = ".exe" if os.name == "nt" else ""
     return directory / f"{name}{suffix}"
@@ -195,12 +207,7 @@ def main() -> int:
     if args.prepare is None and args.github_path is None:
         parser.error("one of --prepare or --github-path is required")
     repository = pathlib.Path(__file__).resolve().parent.parent
-    root = args.root or pathlib.Path(
-        os.environ.get(
-            "TYDE_NATIVE_BUILD_TOOLS_ROOT",
-            repository / "target" / "native-build-tools",
-        )
-    )
+    root = args.root or tools_root(repository)
     try:
         directory = require_cached(root.resolve()) if args.offline else provision(root.resolve())
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:

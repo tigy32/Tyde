@@ -202,7 +202,7 @@ def included_paths(root, config):
     return result
 
 
-def resolved_workspace_link(logical, records, files):
+def resolved_workspace_link(logical, records, files, artifact):
     # Resolve each component against authoritative mounts, not the host's
     # differently named sibling worktrees. Artifact-store overlays supply the
     # selected outputs while committed source supplies the remaining links.
@@ -215,7 +215,7 @@ def resolved_workspace_link(logical, records, files):
             if mapped is None:
                 if any(Path(record["logical_root"]).is_relative_to(prefix) for record in records):
                     continue
-                fail("incompatible_environment", "Artifact symlink resolves outside registered workspace roots")
+                fail("incompatible_environment", "Artifact symlink %s resolves outside registered workspace roots at %s" % (artifact, prefix))
             number, record = mapped
             relative = prefix.relative_to(record["logical_root"])
             physical = Path(record["root"]) / relative
@@ -225,10 +225,10 @@ def resolved_workspace_link(logical, records, files):
             if physical.is_symlink():
                 target = Path(os.readlink(physical))
                 if target.is_absolute():
-                    fail("incompatible_environment", "Artifact symlink chain contains an absolute link")
+                    fail("incompatible_environment", "Artifact symlink %s traverses absolute link %s -> %s" % (artifact, prefix, target))
                 links += 1
                 if links > 40:
-                    fail("incompatible_environment", "Artifact symlink chain is cyclic or exceeds the filesystem link limit")
+                    fail("incompatible_environment", "Artifact symlink %s is cyclic or exceeds the filesystem link limit at %s" % (artifact, prefix))
                 logical = Path(os.path.normpath(str(prefix.parent / target / Path(*logical.parts[index + 1:]))))
                 break
         else:
@@ -247,9 +247,9 @@ def artifact_inventory(root, config, logical_root, records, files):
             if value["kind"] == "symlink":
                 link = Path(value["link"])
                 if link.is_absolute():
-                    fail("incompatible_environment", "Snapshot symlinks must remain relative and inside registered workspace roots")
+                    fail("incompatible_environment", "Snapshot symlink %s -> %s must remain relative and inside registered workspace roots" % (Path(logical_root) / path.relative_to(root), link))
                 logical = Path(os.path.normpath(str(Path(logical_root) / path.relative_to(root).parent / link)))
-                resolved_workspace_link(logical, records, files)
+                resolved_workspace_link(logical, records, files, Path(logical_root) / path.relative_to(root))
             entries[str(path.relative_to(root))] = value
     return entries
 
